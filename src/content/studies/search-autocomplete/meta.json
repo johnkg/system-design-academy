@@ -1,0 +1,168 @@
+{
+  "name": "Design Search Autocomplete",
+  "difficulty": "intermediate",
+  "intent": "Suggest the most useful completions after every key a user presses, in a fraction of a second, for a search box used by hundreds of millions of people.",
+  "codeTitle": "a trie that stores the top suggestions at every node",
+  "finalIntro": "One person typing a search, key by key.",
+  "prompt": "Design the suggestion box under a search field. As the user types, show the five most popular searches that start with what they have typed so far, fast enough that the list keeps up with their typing.",
+  "functional": [
+    "Return the top 5 popular queries that start with the typed prefix",
+    "Update the suggestions on every keystroke",
+    "Reflect what people search for, including new trends, within an hour or so",
+    "Never suggest blocked or harmful queries",
+    "Optional: tolerate small typos, and prefer queries relevant to this user"
+  ],
+  "nonFunctional": [
+    "Respond in under about 100 ms, or the list lags behind the typing",
+    "Handle enormous load: every keystroke is a request, and there are several keystrokes per search",
+    "Highly available, but suggestions may be slightly stale or missing without breaking search",
+    "Results should be the same for every user of the same prefix, so they can be shared and cached",
+    "Fit the data in memory: the set of queries is large but each one is short"
+  ],
+  "firstAttempt": {
+    "text": "One server and a database table of past searches with a count for each query. On every keystroke the browser sends the prefix, and the server runs a query like: select the queries that start with the prefix, order them by count, take 5. The count is increased with an update whenever someone searches.",
+    "limits": [
+      "A short prefix such as 'a' matches millions of rows, which are all sorted just to return five",
+      "Every keystroke from every user is a database query",
+      "Updating a counter on every search puts a hot write on popular rows",
+      "One database is the only way in, and the only copy of the data",
+      "Fast typists send requests that are already out of date by the time the answers arrive"
+    ]
+  },
+  "nodes": [
+    { "id": "browser", "label": "Search box", "kind": "client", "x": 12, "y": 50 },
+    { "id": "single", "label": "Server + database", "kind": "compute", "x": 50, "y": 50, "at": 0, "until": 1 },
+    { "id": "lb", "label": "Load balancer", "kind": "edge", "x": 37, "y": 50, "at": 1 },
+    { "id": "service", "label": "Suggestion servers (tries in memory)", "kind": "compute", "x": 62, "y": 50, "at": 1, "until": 4 },
+    { "id": "shards", "label": "Tries sharded by prefix", "kind": "compute", "x": 62, "y": 50, "at": 4 },
+    { "id": "logs", "label": "Search logs", "kind": "async", "x": 62, "y": 84, "at": 2 },
+    { "id": "builder", "label": "Trie builder", "kind": "compute", "x": 87, "y": 84, "at": 2 },
+    { "id": "store", "label": "Trie snapshots", "kind": "data", "x": 87, "y": 50, "at": 2 },
+    { "id": "edge", "label": "CDN cache", "kind": "edge", "x": 37, "y": 16, "at": 3 },
+    { "id": "trending", "label": "Trending counters", "kind": "compute", "x": 37, "y": 84, "at": 5 },
+    { "id": "blocklist", "label": "Blocklist", "kind": "data", "x": 87, "y": 16, "at": 5 }
+  ],
+  "edges": [
+    { "from": "browser", "to": "single", "at": 0, "until": 1 },
+    { "from": "browser", "to": "lb", "at": 1, "until": 3 },
+    { "from": "browser", "to": "edge", "at": 3 },
+    { "from": "edge", "to": "lb", "at": 3 },
+    { "from": "lb", "to": "service", "at": 1, "until": 4 },
+    { "from": "lb", "to": "shards", "at": 4 },
+    { "from": "lb", "to": "logs", "at": 2 },
+    { "from": "logs", "to": "builder", "at": 2 },
+    { "from": "builder", "to": "store", "at": 2 },
+    { "from": "store", "to": "service", "at": 2, "until": 4 },
+    { "from": "store", "to": "shards", "at": 4 },
+    { "from": "logs", "to": "trending", "at": 5 },
+    { "from": "trending", "to": "shards", "at": 5 },
+    { "from": "blocklist", "to": "builder", "at": 5 }
+  ],
+  "steps": [
+    {
+      "title": "Keep a trie in memory with the best answers stored at each node",
+      "problem": "Finding every query that starts with a prefix and sorting them by popularity does far too much work for a question that only needs the top five.",
+      "fix": "Build a trie: a tree with one level per character, where every node stands for a prefix. At each node store the five most popular queries that pass through it, worked out in advance. To answer 'ca' the server follows two links from the root and returns the list already waiting there, with no scanning or sorting. The servers sit behind a load balancer and each holds the whole trie in memory.",
+      "tradeoff": "The work per request depends on the length of the prefix, not on the number of queries, so lookups take microseconds. The memory cost is higher, because each node stores a small list and all of it must fit in RAM, and any change to counts means rebuilding the lists.",
+      "concepts": [{ "slug": "database-indexing" }, { "slug": "caching" }, { "slug": "load-balancing" }]
+    },
+    {
+      "title": "Build the trie offline from the search logs",
+      "problem": "Updating counts and top lists on every search is expensive and creates hot spots, and it is not needed because suggestions only have to be roughly current.",
+      "fix": "Searches are written to a log stream. An offline job aggregates the logs into counts for each query, for example hourly with the last few weeks weighted so recent behaviour counts more, then builds a fresh trie and writes it to snapshot storage. Suggestion servers load the new snapshot in the background and switch to it in one step.",
+      "tradeoff": "The serving path is read-only, which makes it simple, fast and safe, and a bad build can be rolled back by loading the previous snapshot. Suggestions are up to an hour behind and sudden news takes a while to appear, which the trending layer fixes later.",
+      "concepts": [{ "slug": "message-queues" }, { "slug": "pub-sub" }, { "slug": "structured-logging" }]
+    },
+    {
+      "title": "Cache aggressively: in the browser and at the edge",
+      "problem": "Most keystrokes ask the same few questions, such as the first one or two letters, and every one of them reaches the servers.",
+      "fix": "Suggestions for a prefix are the same for every user, so the answers are marked cacheable for a short time and stored in the browser and in a CDN near the user. The page also waits a moment after each key (debouncing) before it asks, drops requests that are out of date when a newer key arrives, and keeps the previous answers on screen to filter locally while it waits.",
+      "tradeoff": "Most requests never reach the origin, which cuts both load and latency, since short prefixes are by far the hottest. Cached answers can be stale for as long as their lifetime, so it is kept to minutes.",
+      "concepts": [{ "slug": "caching" }, { "slug": "cdn" }, { "slug": "latency-and-round-trips" }, { "slug": "http-versions" }]
+    },
+    {
+      "title": "Shard the trie by prefix when one machine is not enough",
+      "problem": "A trie for all the queries of a large service, in every language, may not fit in one machine's memory, and a single group of servers must absorb all the traffic.",
+      "fix": "Split the trie by prefix ranges, for example one shard for queries starting with a to c and another for d to f, and send each request to the right shard by its first characters. Because letters are not equally common, the ranges are chosen from measured traffic rather than evenly from the alphabet, and busy ranges get more replicas. Each shard keeps replicas for availability.",
+      "tradeoff": "Memory and load are spread, and a request still touches one shard. Boundaries must be reviewed as the data changes, and popular prefixes such as 's' can overload a shard unless it has more replicas.",
+      "concepts": [{ "slug": "database-sharding" }, { "slug": "consistent-hashing" }, { "slug": "database-replication" }]
+    },
+    {
+      "title": "Add trending queries and filter what must not appear",
+      "problem": "An hourly rebuild misses breaking news, and raw search logs contain queries that must never be suggested.",
+      "fix": "A small streaming job counts queries over the last few minutes and keeps the sharp risers, and the suggestion servers merge these into the answers from the snapshot. A blocklist and a safety filter run in the builder, and again when the answers are served, so a newly added rule takes effect without waiting for a rebuild.",
+      "tradeoff": "Fresh news appears in minutes and harmful suggestions are removed in two places. Merging adds a little work per request, trending counts are noisy and can be gamed by bots, so they need minimum volumes and rate checks.",
+      "concepts": [{ "slug": "pub-sub" }, { "slug": "metrics" }, { "slug": "rate-limiting" }]
+    },
+    {
+      "title": "Fail soft: suggestions must never break search",
+      "problem": "Suggestions are a convenience, and a slow or failing suggestion service must not make the search box unusable.",
+      "fix": "The browser gives each request a short timeout and, if it fails, simply shows no list and lets the user keep typing and press search. Servers shed load when overloaded by answering from stale cache, and health checks take unhealthy replicas out of rotation. Rebuilds and snapshot loads are monitored so a bad snapshot is rolled back quickly.",
+      "tradeoff": "The core feature stays up when this one does not. Users sometimes see no suggestions, and there needs to be monitoring that tells the difference between 'few matches' and 'broken'.",
+      "concepts": [{ "slug": "circuit-breaker" }, { "slug": "health-checks" }, { "slug": "backpressure" }]
+    }
+  ],
+  "failures": [
+    {
+      "scenario": "A bad snapshot is built, for example with counts missing or the blocklist not applied",
+      "impact": "Every server loads it and suggestions become wrong or unsafe everywhere at once.",
+      "answer": "Builds are checked before release: sizes and sample queries are compared with the previous snapshot, and a build that differs too much is not published. Servers keep the previous snapshot and can switch back at once, and the blocklist is applied again at serving time as a second guard.",
+      "concepts": [{ "slug": "health-checks" }, { "slug": "alerting" }, { "slug": "metrics" }]
+    },
+    {
+      "scenario": "A suggestion shard loses a replica or all of them",
+      "impact": "Prefixes in that range have no suggestions, and typing in that range feels broken.",
+      "answer": "Each shard has several replicas behind the load balancer, and a replacement loads its snapshot from storage in a few minutes. Meanwhile the CDN and the browser cache serve the common prefixes, and the box shows no suggestions rather than an error for the rest.",
+      "concepts": [{ "slug": "database-replication" }, { "slug": "load-balancing" }, { "slug": "caching" }]
+    },
+    {
+      "scenario": "A big news event sends millions of people to type the same new query",
+      "impact": "Nothing suggests it for an hour, and the same few prefixes are hit extremely hard.",
+      "answer": "The trending layer picks the query up within minutes and promotes it in the merged results. The few hot prefixes are served from the CDN and the browser cache, so the extra traffic hits the cache rather than the servers.",
+      "concepts": [{ "slug": "cdn" }, { "slug": "pub-sub" }, { "slug": "backpressure" }]
+    }
+  ],
+  "alternatives": [
+    {
+      "title": "How to find matches for a prefix",
+      "options": [
+        { "name": "Database LIKE 'prefix%' with an index", "pro": "No new system to run, fine for a small catalog", "con": "Still sorts every match for short prefixes, and every keystroke is a database query" },
+        { "name": "Trie with top results stored at each node", "pro": "Work depends only on the length of the prefix, and answers are precomputed", "con": "Uses more memory and has to be rebuilt as counts change" },
+        { "name": "A search engine's prefix queries", "pro": "Handles typos and ranking features out of the box", "con": "Slower and more expensive per request than a precomputed trie" }
+      ],
+      "pick": "A trie with stored top results for the main path. Use a search engine only for typo tolerance and richer ranking."
+    },
+    {
+      "title": "How fresh the suggestions are",
+      "options": [
+        { "name": "Rebuild hourly or daily", "pro": "Simple and cheap, with a read-only serving path", "con": "New trends take a while to show up" },
+        { "name": "Update counts on every search", "pro": "Always current", "con": "Hot writes on popular nodes, and a much more complicated serving path" },
+        { "name": "Hourly snapshot plus a small trending layer", "pro": "Fresh for breaking news and still cheap", "con": "Two sources to merge, and trending must be protected from abuse" }
+      ],
+      "pick": "A snapshot plus trending. The snapshot covers the bulk, and trending covers the minutes that matter."
+    },
+    {
+      "title": "Where the trie lives",
+      "options": [
+        { "name": "In memory on every suggestion server", "pro": "Fastest, with no network hop to a data store", "con": "Every server holds a full copy, and restarts must reload it" },
+        { "name": "In a key-value store keyed by prefix", "pro": "Servers are stateless and easy to scale", "con": "A network call for each lookup, and a very large number of keys" }
+      ],
+      "pick": "In memory, loaded from snapshots. The data is small enough once it is sharded."
+    },
+    {
+      "title": "Whose popularity counts",
+      "options": [
+        { "name": "Global counts only", "pro": "One answer per prefix, which is perfect for caching", "con": "Not personal and not local" },
+        { "name": "Add a per-user or per-region layer", "pro": "More relevant suggestions", "con": "Answers can no longer be shared in a CDN, and personal data needs care" }
+      ],
+      "pick": "Global suggestions in the cached path, with an optional light personal layer added in the browser or in a separate request."
+    }
+  ],
+  "roles": [
+    { "id": "client", "label": "Browser", "description": "The search box and its local cache." },
+    { "id": "edge", "label": "Entry points", "description": "The load balancer and the CDN cache." },
+    { "id": "async", "label": "Messaging", "description": "The stream of search logs." },
+    { "id": "compute", "label": "Services", "description": "Suggestion servers, builder and trending counters." },
+    { "id": "data", "label": "State", "description": "Trie snapshots and the blocklist." }
+  ]
+}
