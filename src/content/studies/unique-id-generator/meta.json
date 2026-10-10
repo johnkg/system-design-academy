@@ -1,0 +1,171 @@
+{
+  "name": "Design a Unique ID Generator",
+  "difficulty": "intermediate",
+  "intent": "Hand out millions of unique, roughly time-ordered 64-bit IDs per second from many machines that never have to talk to each other to do it.",
+  "codeTitle": "a Snowflake-style ID generator",
+  "finalIntro": "Two machines creating IDs at the same moment, then a clock that goes wrong.",
+  "prompt": "Design a system that creates the unique ID for every new record (orders, posts, messages) in a company with hundreds of servers. The IDs must never repeat, should fit in 64 bits, and should be roughly ordered by creation time so that newer records sort after older ones.",
+  "functional": [
+    "Every ID is unique across all machines, forever",
+    "IDs are numbers that fit in 64 bits, so they work as database keys",
+    "IDs grow with time: an ID made later is normally larger, which makes them sortable by creation",
+    "Any server can make an ID at any moment, with no call to a central service"
+  ],
+  "nonFunctional": [
+    "Generate at least 10,000 IDs per second per machine, and millions per second across the fleet",
+    "Add a few microseconds at most to creating a record",
+    "Keep working when machines fail or the network is partitioned",
+    "Be safe against clock problems, so that a bad clock never produces a duplicate",
+    "Do not reveal business numbers, such as how many orders there are per day, more than necessary"
+  ],
+  "firstAttempt": {
+    "text": "A single database with an auto-increment column. To create a record, the application inserts a row and the database assigns the next number: 1, 2, 3 and so on. The numbers are unique, small and perfectly ordered.",
+    "limits": [
+      "Every ID is a round trip to one database, and its write rate is the limit for the whole company",
+      "If that database fails, nothing can be created",
+      "Splitting data over several databases makes each one count from 1, so IDs collide",
+      "The numbers reveal exactly how many records exist, and they are easy to guess",
+      "IDs are tied to the database, so you cannot make one before the record exists, for example in an offline app"
+    ]
+  },
+  "nodes": [
+    { "id": "apps", "label": "Application servers", "kind": "client", "x": 12, "y": 50 },
+    { "id": "single", "label": "One database with auto-increment", "kind": "compute", "x": 50, "y": 50, "at": 0, "until": 1 },
+    { "id": "db", "label": "Records database", "kind": "data", "x": 87, "y": 84, "at": 1 },
+    { "id": "tickets", "label": "Ticket databases (odd and even)", "kind": "data", "x": 62, "y": 50, "at": 1, "until": 2 },
+    { "id": "uuid", "label": "Random UUID in every app", "kind": "compute", "x": 62, "y": 50, "at": 2, "until": 3 },
+    { "id": "lb", "label": "Load balancer", "kind": "edge", "x": 37, "y": 50, "at": 6 },
+    { "id": "gen", "label": "Time + machine + sequence generator", "kind": "compute", "x": 62, "y": 50, "at": 3 },
+    { "id": "registry", "label": "Machine ID registry", "kind": "data", "x": 87, "y": 16, "at": 4 },
+    { "id": "clock", "label": "Time sync and guards", "kind": "edge", "x": 37, "y": 16, "at": 5 },
+    { "id": "alert", "label": "Clock alerts", "kind": "async", "x": 62, "y": 16, "at": 5 }
+  ],
+  "edges": [
+    { "from": "apps", "to": "single", "at": 0, "until": 1 },
+    { "from": "apps", "to": "tickets", "at": 1, "until": 2 },
+    { "from": "apps", "to": "uuid", "at": 2, "until": 3 },
+    { "from": "apps", "to": "gen", "at": 3, "until": 6 },
+    { "from": "apps", "to": "lb", "at": 6 },
+    { "from": "lb", "to": "gen", "at": 6 },
+    { "from": "apps", "to": "db", "at": 1 },
+    { "from": "registry", "to": "gen", "at": 4 },
+    { "from": "clock", "to": "gen", "at": 5 },
+    { "from": "clock", "to": "alert", "at": 5 }
+  ],
+  "steps": [
+    {
+      "title": "Use several ticket servers that count by steps",
+      "problem": "One database is a single point of failure and a bottleneck, but two databases both counting from 1 will hand out the same numbers.",
+      "fix": "Run N ticket databases, each counting in steps of N from a different start: with two, one hands out 1, 3, 5 and the other 2, 4, 6. Applications ask one of them, in turn, for a number. IDs stay unique, small and numeric, and if one server fails the others carry on.",
+      "tradeoff": "The bottleneck is spread and one failure is survivable. IDs are not ordered across servers, adding a third server is awkward because the steps change, and every ID is still a network call.",
+      "concepts": [{ "slug": "database-sharding" }, { "slug": "horizontal-vs-vertical-scaling" }, { "slug": "load-balancing" }]
+    },
+    {
+      "title": "Generate random UUIDs inside each application",
+      "problem": "Asking a server for each ID costs a network round trip, and the servers are still a dependency.",
+      "fix": "Each application creates a 128-bit random UUID on its own, with no network call. With 122 random bits the chance of two UUIDs ever being the same is so small that it can be ignored in practice, and nothing needs to be coordinated.",
+      "tradeoff": "It is simple, local and needs nothing. But 128 bits is twice the size of the key you wanted, the IDs are in no order, and random keys scatter inserts all over a database index, which is slow and wastes space because pages are rewritten constantly.",
+      "concepts": [{ "slug": "database-indexing" }, { "slug": "sql-vs-nosql" }, { "slug": "caching" }]
+    },
+    {
+      "title": "Build the ID from time, a machine number and a counter",
+      "problem": "We want IDs that are local to generate like UUIDs, but small and sorted like counters.",
+      "fix": "Pack three fields into 64 bits: 41 bits of milliseconds since a custom start date, 10 bits that identify the machine, and 12 bits of sequence that counts the IDs made by that machine within one millisecond. Time makes the numbers grow, the machine bits keep two machines apart even in the same millisecond, and the sequence keeps one machine apart from itself. One machine can make 4,096 IDs per millisecond, over four million a second, and the layout lasts about 69 years.",
+      "tradeoff": "IDs are unique without any communication, compact, and sorted by time to the millisecond, which keeps database inserts at the end of the index. They depend on a trustworthy clock and on every machine having its own number, and the time and machine can be read from the ID by anyone.",
+      "concepts": [{ "slug": "logical-clocks" }, { "slug": "database-indexing" }, { "slug": "idempotency" }]
+    },
+    {
+      "title": "Give every generator a machine number that no one else has",
+      "problem": "If two processes ever run with the same machine number, they will create the same IDs in the same millisecond, and the 'unique' guarantee fails silently.",
+      "fix": "A small coordination service, such as ZooKeeper or etcd, hands out machine numbers. When a generator starts it takes a lease on a free number and keeps renewing it. If it dies, its lease expires and the number goes back to the pool after a safe delay, long enough that its last IDs are in the past. The number is never taken from configuration by hand.",
+      "tradeoff": "Duplicate machine numbers become impossible, and instances can come and go freely. Starting up needs the registry, which is the only point where a coordination service is needed, and with 1,024 numbers the fleet size has a limit.",
+      "concepts": [{ "slug": "consensus" }, { "slug": "leader-election" }, { "slug": "health-checks" }]
+    },
+    {
+      "title": "Stay safe when clocks misbehave",
+      "problem": "Time can go backwards after a clock correction or a leap second, and then a machine could reuse a millisecond it already used and create duplicate IDs.",
+      "fix": "Each generator remembers the last millisecond it used. If the clock shows an earlier time, the generator refuses to issue IDs, or waits until the clock passes the last value, instead of going back. Machines keep their clocks in step with NTP using gradual 'slewing' rather than jumps, and a large clock offset raises an alert and removes the machine from service. If more than 4,096 IDs are needed in one millisecond, the generator waits for the next one.",
+      "tradeoff": "A bad clock causes a short pause or an error, and never a duplicate. A machine can stall for as long as its clock was set back, so large jumps are treated as an incident and the instance is replaced.",
+      "concepts": [{ "slug": "logical-clocks" }, { "slug": "alerting" }, { "slug": "health-checks" }]
+    },
+    {
+      "title": "Offer it as a library or as a small service",
+      "problem": "Embedding the generator in every service is fastest, but then every language and every service needs a correct copy and its own machine number. A shared service is easier to get right.",
+      "fix": "Choose per case. For services in one language, ship the generator as a library and let each process take a machine number at startup. Otherwise, run a few stateless ID services behind a load balancer, each with its own machine number, and let clients ask for IDs singly or in batches, and cache a batch locally to hide the network call.",
+      "tradeoff": "A library has no network hop and no extra service to keep up. A service gives one correct implementation for everyone, at the cost of a network call, which batching and local caching mostly remove.",
+      "concepts": [{ "slug": "load-balancing" }, { "slug": "caching" }, { "slug": "api-gateway" }]
+    }
+  ],
+  "failures": [
+    {
+      "scenario": "A server's clock is set back by a few seconds after a time-sync correction",
+      "impact": "The generator would reissue millisecond values it has already used, and so repeat IDs.",
+      "answer": "It sees that the current time is below the last time it used and refuses to issue IDs, or waits, until the clock catches up. An alert records the event, and if the offset is large the instance is taken out of rotation and replaced.",
+      "concepts": [{ "slug": "logical-clocks" }, { "slug": "alerting" }, { "slug": "health-checks" }]
+    },
+    {
+      "scenario": "The machine ID registry is unavailable",
+      "impact": "New generators cannot get a number, so they cannot start.",
+      "answer": "Generators that are already running keep their leases for their term and keep working. Only new instances wait, with retries. The registry is a small replicated cluster that can lose a minority of its members, so this is rare.",
+      "concepts": [{ "slug": "consensus" }, { "slug": "retries-and-backoff" }, { "slug": "database-replication" }]
+    },
+    {
+      "scenario": "A burst of more than 4,096 IDs is needed from one machine in one millisecond",
+      "impact": "The 12-bit sequence is used up for that millisecond.",
+      "answer": "The generator waits for the next millisecond and continues, so no duplicate is made. A fleet that really needs more adds machines, or the layout gives more bits to the sequence and fewer to the machine number.",
+      "concepts": [{ "slug": "backpressure" }, { "slug": "horizontal-vs-vertical-scaling" }, { "slug": "rate-limiting" }]
+    },
+    {
+      "scenario": "An instance crashes and another starts with the same machine number straight away",
+      "impact": "The new instance's clock may be earlier than the last millisecond the old one used.",
+      "answer": "The registry waits out a safety gap before giving a number to a new owner, and a new generator starts by waiting until its clock is later than the previous lease's last known time, so it can never overlap.",
+      "concepts": [{ "slug": "leader-election" }, { "slug": "logical-clocks" }, { "slug": "idempotency" }]
+    }
+  ],
+  "alternatives": [
+    {
+      "title": "Which kind of ID",
+      "options": [
+        { "name": "Database auto-increment", "pro": "Small, ordered, simple", "con": "A central bottleneck, and reveals counts" },
+        { "name": "Random UUID (v4)", "pro": "No coordination at all", "con": "128 bits, unordered, and bad for index locality" },
+        { "name": "Time-ordered UUID (v7 and similar)", "pro": "No coordination, sorted by time, standard format", "con": "Still 128 bits, which is twice the storage of a 64-bit key" },
+        { "name": "Snowflake-style 64-bit ID", "pro": "Compact, sorted by time and fast to generate", "con": "Needs machine numbers and a good clock" }
+      ],
+      "pick": "A Snowflake-style 64-bit ID when keys are stored in many places and size matters. A time-ordered UUID when coordinating machine numbers is not worth the trouble."
+    },
+    {
+      "title": "How to give each machine its number",
+      "options": [
+        { "name": "Set by hand in configuration", "pro": "Nothing to run", "con": "A single typo makes duplicate IDs, silently" },
+        { "name": "A lease from a coordination service", "pro": "Safe, automatic, and survives restarts", "con": "A new dependency at startup" },
+        { "name": "Derive from the IP address or a hash", "pro": "No coordination", "con": "Two machines can still collide, and containers reuse addresses" }
+      ],
+      "pick": "A lease from a coordination service, since a collision here breaks the whole guarantee."
+    },
+    {
+      "title": "When the clock goes backwards",
+      "options": [
+        { "name": "Ignore it", "pro": "Nothing to write", "con": "Duplicate IDs" },
+        { "name": "Refuse and raise an error", "pro": "Never a duplicate, and the problem is visible", "con": "Requests fail until the clock recovers" },
+        { "name": "Wait until the clock catches up", "pro": "Callers only see a short delay", "con": "A long wait ties up the caller, so large jumps still need an error" }
+      ],
+      "pick": "Wait for small differences, a few milliseconds, and refuse for large ones."
+    },
+    {
+      "title": "How to split the 64 bits",
+      "options": [
+        { "name": "41 time, 10 machine, 12 sequence", "pro": "The classic balance: 1,024 machines, 4,096 IDs per ms, 69 years", "con": "Fixed for ever once IDs exist" },
+        { "name": "More machine bits, fewer sequence bits", "pro": "A larger fleet, with less per machine", "con": "A machine saturates sooner" },
+        { "name": "More sequence bits, fewer machine bits", "pro": "A few very busy machines", "con": "A smaller fleet" }
+      ],
+      "pick": "The classic layout, changed only to match a fleet whose size you really know."
+    }
+  ],
+  "roles": [
+    { "id": "client", "label": "Applications", "description": "Servers that need an ID for a new record." },
+    { "id": "edge", "label": "Entry points", "description": "The load balancer and the clock guards." },
+    { "id": "async", "label": "Alerts", "description": "Notifications about clock problems." },
+    { "id": "compute", "label": "Generators", "description": "Code that makes IDs." },
+    { "id": "data", "label": "State", "description": "The records database and the machine number registry." }
+  ]
+}
