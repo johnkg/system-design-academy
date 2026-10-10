@@ -1,0 +1,179 @@
+{
+  "name": "Design a Ride-Sharing Service",
+  "difficulty": "advanced",
+  "intent": "Match riders with nearby drivers within seconds, keep a map of moving cars up to date, and run each trip from request to payment without double-booking anyone.",
+  "codeTitle": "finding the nearest driver with a grid index",
+  "finalIntro": "One ride from a driver's location update to the final payment.",
+  "prompt": "Design a service like Uber or Lyft. Riders request a ride from where they stand, the nearest suitable driver is offered the trip, and both of them watch each other move on a map until the ride ends and the rider is charged.",
+  "functional": [
+    "Drivers go online and report their location continuously",
+    "A rider requests a ride and is matched with a nearby available driver",
+    "A driver can accept or decline an offer",
+    "Rider and driver see each other's position live during pickup and the trip",
+    "Charge the rider once when the trip finishes",
+    "Optional: show an estimated price that rises when demand is high"
+  ],
+  "nonFunctional": [
+    "Matching takes a few seconds at most",
+    "One driver is never given two trips at the same time, and one rider never gets two cars",
+    "Location writes are constant and enormous: every online driver reports every few seconds",
+    "A slightly stale driver location is fine, but a lost trip or a double charge is not",
+    "Stay up during busy periods such as a stadium emptying or a rainy rush hour",
+    "Work on weak mobile connections that drop and reconnect"
+  ],
+  "firstAttempt": {
+    "text": "One web server and one database. A drivers table holds each driver's latest latitude, longitude and status. Drivers send their position every few seconds and the server updates their row. A ride request loads the available drivers, computes the distance to each one, and offers the trip to the closest. It works for a small town.",
+    "limits": [
+      "Finding the nearest driver means measuring the distance to every driver, so each request gets slower as the fleet grows",
+      "Thousands of location updates per second hammer the same table that matching and trips depend on",
+      "Two requests at the same moment can both pick the same free driver",
+      "Riders and drivers have to keep asking the server for new positions, which is slow and wastes battery",
+      "One machine and one database is the only way in, so any failure stops every ride"
+    ]
+  },
+  "nodes": [
+    { "id": "apps", "label": "Rider and driver apps", "kind": "client", "x": 12, "y": 50 },
+    { "id": "single", "label": "Server + database", "kind": "compute", "x": 50, "y": 50, "at": 0, "until": 1 },
+    { "id": "api", "label": "API", "kind": "edge", "x": 37, "y": 50, "at": 1 },
+    { "id": "geo", "label": "Location index", "kind": "data", "x": 62, "y": 50, "at": 1, "until": 2 },
+    { "id": "geoshards", "label": "Index shards by area", "kind": "data", "x": 62, "y": 50, "at": 2 },
+    { "id": "trips", "label": "Trip DB", "kind": "data", "x": 87, "y": 50, "at": 1 },
+    { "id": "stream", "label": "Location stream", "kind": "async", "x": 62, "y": 84, "at": 2 },
+    { "id": "history", "label": "Trail store", "kind": "data", "x": 87, "y": 84, "at": 2 },
+    { "id": "dispatch", "label": "Trip and matching service", "kind": "compute", "x": 62, "y": 16, "at": 3 },
+    { "id": "gateway", "label": "Push gateway", "kind": "edge", "x": 12, "y": 16, "at": 4 },
+    { "id": "payments", "label": "Payments", "kind": "compute", "x": 87, "y": 16, "at": 5 },
+    { "id": "surge", "label": "Demand counters", "kind": "compute", "x": 37, "y": 84, "at": 6 }
+  ],
+  "edges": [
+    { "from": "apps", "to": "single", "at": 0, "until": 1 },
+    { "from": "apps", "to": "api", "at": 1 },
+    { "from": "api", "to": "geo", "at": 1, "until": 2 },
+    { "from": "api", "to": "geoshards", "at": 2 },
+    { "from": "api", "to": "trips", "at": 1, "until": 3 },
+    { "from": "api", "to": "stream", "at": 2 },
+    { "from": "stream", "to": "history", "at": 2 },
+    { "from": "api", "to": "dispatch", "at": 3 },
+    { "from": "dispatch", "to": "geoshards", "at": 3 },
+    { "from": "dispatch", "to": "trips", "at": 3 },
+    { "from": "apps", "to": "gateway", "at": 4 },
+    { "from": "dispatch", "to": "gateway", "at": 4 },
+    { "from": "dispatch", "to": "payments", "at": 5 },
+    { "from": "stream", "to": "surge", "at": 6 },
+    { "from": "surge", "to": "api", "at": 6 }
+  ],
+  "steps": [
+    {
+      "title": "Index drivers by map cell, in memory",
+      "problem": "Measuring the distance to every driver for every request gets slower with every driver added, and the question is only ever about the few cars nearby.",
+      "fix": "Split the map into a grid of cells and keep each driver's latest position in an in-memory index under their cell. To find drivers near a rider, look in the rider's cell and then the rings of cells around it, widening only until no unvisited cell could hold a closer car. Production systems use geohashes or hexagonal cells for the same idea. Trips stay in a normal database, and the API sits in front of both.",
+      "tradeoff": "A search touches a handful of cells, however big the fleet is. A driver changes cells as they move, so every update may need to move them, and a car just across a cell border is missed if you only look in the rider's own cell.",
+      "concepts": [{ "slug": "database-indexing" }, { "slug": "caching" }, { "slug": "latency-and-round-trips" }]
+    },
+    {
+      "title": "Shard the index by area and keep the trail on a stream",
+      "problem": "Every online driver writes a new position every few seconds, which is far more than one machine handles, and storing every point in the main database would drown it.",
+      "fix": "Shard the location index by geographic area, so each shard owns a set of cells, for example by hashing the cell id. A location update overwrites the driver's single latest entry, which is cheap and needs no disk. The same update is also appended to a stream, and a consumer writes the trail into cheap storage for trip history, billing disputes and analytics.",
+      "tradeoff": "Writes spread over many machines and the live index stays small, because it only holds the latest position. Searches near a shard boundary must ask two shards, and a busy downtown area can overload its shard unless it is split into smaller cells.",
+      "concepts": [{ "slug": "database-sharding" }, { "slug": "consistent-hashing" }, { "slug": "message-queues" }]
+    },
+    {
+      "title": "Match with an atomic claim and a timeout",
+      "problem": "Two riders can pick the same driver in the same instant, and a driver who never answers an offer holds up the rider for as long as it takes.",
+      "fix": "A matching service finds the nearest candidates in the index and tries them one at a time. Before offering a trip it claims the driver with one atomic compare-and-set: free becomes offered for this trip, and the claim fails if anyone else got there first. The offer carries a 10 to 15 second timeout. A decline or a timeout releases the claim, and the service moves to the next candidate.",
+      "tradeoff": "A driver can never hold two trips, and a rider is never stuck on a silent phone. Matching one rider at a time can pick a worse overall pairing than looking at everyone waiting in the same moment, so busy cities also match in small batches.",
+      "concepts": [{ "slug": "idempotency" }, { "slug": "retries-and-backoff" }, { "slug": "rate-limiting" }]
+    },
+    {
+      "title": "Push offers and positions over persistent connections",
+      "problem": "Phones that keep asking the server where the car is waste battery and show the position late, and a driver cannot be offered a trip unless the server can reach them.",
+      "fix": "Every app keeps a WebSocket open to a push gateway. Offers, driver positions and trip updates travel down that connection the moment they happen. The gateway servers are stateless about trips: they know which connection belongs to which user and nothing else, and the apps reconnect and ask for the current trip state after any break.",
+      "tradeoff": "Updates arrive within a second or two and battery use drops, because the app is not polling. The gateway holds many open connections, so it is scaled and drained carefully, and a dropped connection must never lose an offer, so offers are also kept as trip state.",
+      "concepts": [{ "slug": "real-time-communication" }, { "slug": "load-balancing" }, { "slug": "health-checks" }]
+    },
+    {
+      "title": "Run the trip as a state machine and charge exactly once",
+      "problem": "A trip has many steps, such as requested, matched, picked up, completed and paid, and a crash or a retry between steps must not lose a trip or charge a rider twice.",
+      "fix": "Each trip is a row with a state and only allowed moves, for example matched to picked up but never completed to requested. Each move is a conditional update, so repeated or late messages do nothing. When a trip completes, the trip service records the fare and publishes a payment request carrying a key built from the trip id, so the payment service charges once however many times the request arrives.",
+      "tradeoff": "Trips survive crashes and duplicates, and every state change leaves an audit trail. Payment happens just after the trip rather than inside the same transaction, so there is a short window where a trip is complete and not yet paid, which a retry process and a reconciliation job close.",
+      "concepts": [{ "slug": "saga" }, { "slug": "transactional-outbox" }, { "slug": "idempotency" }]
+    },
+    {
+      "title": "Count demand per area to price surges",
+      "problem": "When riders far outnumber drivers in one area, matching slows and waits grow, and the system needs a way to bring more drivers in and slow down demand.",
+      "fix": "A counter service reads the same location and request streams and keeps, for each cell, the number of waiting riders and free drivers over the last minute or two. A price multiplier is derived from that ratio, smoothed so it does not jump, and the API quotes it to riders before they confirm. The price they were quoted is locked into the trip.",
+      "tradeoff": "Price follows real conditions and pulls drivers toward busy areas. The numbers lag by a little, the multiplier needs a cap and clear messages to stay fair and trusted, and a quoted price must never change after the rider confirms.",
+      "concepts": [{ "slug": "pub-sub" }, { "slug": "metrics" }, { "slug": "backpressure" }]
+    }
+  ],
+  "failures": [
+    {
+      "scenario": "A location shard crashes",
+      "impact": "Drivers in its area vanish from the map, and riders there get no matches.",
+      "answer": "The index only holds the latest positions, and drivers send a new one every few seconds, so a replacement shard (or a replica promoted to take over) is full again within a few seconds of the first updates. Meanwhile the matching service widens its search to neighbouring shards, and the trail kept on the stream is not affected.",
+      "concepts": [{ "slug": "database-replication" }, { "slug": "health-checks" }, { "slug": "bulkhead" }]
+    },
+    {
+      "scenario": "The matching service crashes in the middle of an offer",
+      "impact": "A driver is claimed for a trip that nobody is managing, so the rider waits and the driver is stuck.",
+      "answer": "A claim carries an expiry, so an orphaned claim releases itself after the offer timeout. Trips stay in the database in a requested state, and another matching worker picks up any request that has been waiting too long. Because claims and state changes are conditional, a second worker cannot create a double booking.",
+      "concepts": [{ "slug": "idempotency" }, { "slug": "retries-and-backoff" }, { "slug": "leader-election" }]
+    },
+    {
+      "scenario": "A stadium empties and thousands of riders request cars within two minutes",
+      "impact": "Requests far outnumber nearby drivers, matching searches pile up, and the cells around the stadium get overloaded.",
+      "answer": "Requests are queued per area and matched in order, with a cap on waiting time before riders are told the real wait. Surge pricing draws drivers toward the area and thins out demand, the index shards for that area can be split further, and rate limits stop one client from sending repeated requests.",
+      "concepts": [{ "slug": "backpressure" }, { "slug": "rate-limiting" }, { "slug": "message-queues" }]
+    },
+    {
+      "scenario": "The payment provider is down when a trip ends",
+      "impact": "The rider has arrived, and the charge cannot be made.",
+      "answer": "The trip is completed regardless and the payment request is kept safe in the outbox. The payment service retries with backoff using the same trip-based key, so the charge is made once when the provider returns. The rider is told the receipt will follow, and a daily reconciliation catches anything missed.",
+      "concepts": [{ "slug": "transactional-outbox" }, { "slug": "circuit-breaker" }, { "slug": "retries-and-backoff" }]
+    }
+  ],
+  "alternatives": [
+    {
+      "title": "How to index locations",
+      "options": [
+        { "name": "Latitude and longitude columns in a SQL table", "pro": "Nothing new to learn, and fine for a small fleet", "con": "Nearby searches scan lots of rows, and constant updates compete with trip data" },
+        { "name": "Geohash or hexagonal cells in an in-memory store", "pro": "A search reads a few cells, and updates are cheap overwrites", "con": "Cell borders need neighbour lookups, and the size of a cell is a choice that must be tuned" },
+        { "name": "A quadtree that splits busy areas", "pro": "Dense areas get small cells and empty areas stay large", "con": "More complicated to build, shard and rebalance as drivers move" }
+      ],
+      "pick": "Fixed cells (geohash or hexagons) in memory, with smaller cells for busy cities. It is simple, and easy to shard."
+    },
+    {
+      "title": "How to choose the driver",
+      "options": [
+        { "name": "Nearest driver first", "pro": "Simple, fast, and easy to explain", "con": "Straight-line distance can differ a lot from driving time across rivers and one-way streets" },
+        { "name": "Best estimated arrival time", "pro": "Better for riders, because it uses road distance and traffic", "con": "Needs a routing service, and an estimate for every candidate costs time" },
+        { "name": "Batch and match everyone waiting together", "pro": "Better overall pairing and shorter total waiting in busy areas", "con": "Every rider waits a few extra seconds for the batch to close" }
+      ],
+      "pick": "Rank a short list of nearby drivers by estimated arrival time, and match in small batches when demand is high."
+    },
+    {
+      "title": "How the apps get updates",
+      "options": [
+        { "name": "Polling every few seconds", "pro": "Works everywhere and needs no special servers", "con": "Wasteful, and positions are always a few seconds out of date" },
+        { "name": "WebSocket connection per app", "pro": "Instant two-way updates and the lowest battery use", "con": "Many open connections to manage, and every reconnect needs the current state" },
+        { "name": "Mobile push notifications", "pro": "Reaches an app that is closed", "con": "Delivery is not guaranteed or instant, so it is only a wake-up for the offer, not a live feed" }
+      ],
+      "pick": "WebSockets while the app is open, with a push notification to wake a driver's app when an offer arrives."
+    },
+    {
+      "title": "Who records a trip's state",
+      "options": [
+        { "name": "One row per trip with conditional updates", "pro": "Simple and fast to read, and easy to keep consistent", "con": "History of how it got to this state is only as good as the log you add" },
+        { "name": "An event log per trip (event sourcing)", "pro": "A complete audit trail, and states can be rebuilt", "con": "More machinery, and reading the current state needs a projection" }
+      ],
+      "pick": "A row with conditional updates and a small history table. Move to an event log only when audits or disputes make the full history essential."
+    }
+  ],
+  "roles": [
+    { "id": "client", "label": "Apps", "description": "The rider's and driver's phones." },
+    { "id": "edge", "label": "Entry points", "description": "The API and the push gateway." },
+    { "id": "async", "label": "Messaging", "description": "The location stream." },
+    { "id": "compute", "label": "Services", "description": "Matching, payments and demand counters." },
+    { "id": "data", "label": "State", "description": "The location index, the trail and the trip database." }
+  ]
+}

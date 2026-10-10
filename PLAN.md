@@ -26,7 +26,7 @@ Both live in `src/content/<collection>/<slug>/`, are found automatically, and ap
 Concept page order: problem, how it works, watch it flow, simulate it, trade-offs, code (if any), judgment, related.
 
 ## Wave 1 roadmap (4 areas, 24 concepts)
-Status: all four wave 1 areas are complete (24 of 24 concepts). Load Balancing is the reference implementation. The system design compare page (`/compare-concepts/`) is done. Six case studies are done (`url-shortener` is the reference, then `rate-limiter-service`, `notification-system`, `chat-system`, `news-feed` and `video-streaming`). Next: decide between more case studies, more areas, or a Python sample set.
+Status: all four wave 1 areas are complete (24 of 24 concepts). Load Balancing is the reference implementation. The system design compare page (`/compare-concepts/`) is done. Seven case studies are done (`url-shortener` is the reference, then `rate-limiter-service`, `notification-system`, `chat-system`, `news-feed`, `video-streaming` and `ride-sharing`). Next: decide between more case studies, more areas, or a Python sample set.
 
 **Scaling & infrastructure** (done): load balancing, caching, CDN, horizontal vs vertical scaling, database sharding, database replication
 **Data & consistency** (done): CAP theorem, ACID vs BASE, consistency models, database indexing, SQL vs NoSQL, consistent hashing
@@ -39,7 +39,7 @@ Status: all four wave 1 areas are complete (24 of 24 concepts). Load Balancing i
 **Observability** (done): structured logging, metrics, distributed tracing, SLOs and error budgets, alerting, health checks
 **Networking** (done): DNS, TCP vs UDP, HTTP versions, proxies, real-time communication, latency and round trips
 **Distributed systems** (done): leader election, consensus, quorums, logical clocks, gossip protocol, two-phase commit
-Next candidates: more case studies (ride sharing); data engineering; cloud and deployment; Python as a third language.
+Next candidates: more case studies (payment system, search autocomplete); data engineering; cloud and deployment; Python as a third language.
 
 Simulation ideas: caching (hit/miss ratio with eviction policies), sharding and consistent hashing (add or remove a node and watch keys move), CAP (partition the network and choose consistency or availability), rate limiting (token bucket vs sliding window), circuit breaker (open/half-open/closed under failing calls), message queues (producers, consumers, a slow consumer).
 
