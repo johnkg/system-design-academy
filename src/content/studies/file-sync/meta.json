@@ -1,0 +1,172 @@
+{
+  "name": "Design a File Sync Service",
+  "difficulty": "advanced",
+  "intent": "Keep a folder identical on a person's laptop, phone and the cloud, by sending only what changed, handling edits made in two places, and never losing a file.",
+  "codeTitle": "cutting files into chunks and uploading only the new ones",
+  "finalIntro": "One edit on a laptop, all the way to a phone.",
+  "prompt": "Design a service like Dropbox or Google Drive. A person puts files in a folder on their laptop, and they appear on their other devices and on the web. Edits sync quickly, large files are fine, and nothing is ever lost.",
+  "functional": [
+    "Upload and download files of any size, up to many gigabytes",
+    "Detect changes in the local folder and sync them to the cloud and to other devices",
+    "Show every device the new version within seconds of a change",
+    "Keep file history, and let the user restore old versions and deleted files",
+    "Share files and folders with other people"
+  ],
+  "nonFunctional": [
+    "Never lose a file: durability matters more than speed",
+    "Sync should send as little data as possible, because bandwidth is slow and expensive",
+    "Work on bad connections: uploads must resume, and the client must work offline and sync later",
+    "Detect conflicts when two devices change one file, and never overwrite silently",
+    "Handle hundreds of millions of users, with most files rarely changing after being written"
+  ],
+  "firstAttempt": {
+    "text": "A server with a disk and a database table of files. The desktop app watches the folder and, when a file changes, uploads the whole file, replacing the old copy on the server. Other devices poll every minute, and download any file whose modified time is newer than their copy.",
+    "limits": [
+      "Changing one line in a 2 GB file uploads all 2 GB again",
+      "An upload that fails halfway starts over from the beginning",
+      "Polling is slow to notice changes, and a lot of polling is wasted when nothing changed",
+      "Two devices editing at once means the later upload silently replaces the earlier work",
+      "One disk on one server holds everyone's files, and one failure loses them"
+    ]
+  },
+  "nodes": [
+    { "id": "devices", "label": "Laptop, phone and web", "kind": "client", "x": 12, "y": 50 },
+    { "id": "single", "label": "Server + disk", "kind": "compute", "x": 50, "y": 50, "at": 0, "until": 1 },
+    { "id": "api", "label": "Sync API", "kind": "edge", "x": 37, "y": 50, "at": 1 },
+    { "id": "blocks", "label": "Block storage", "kind": "data", "x": 62, "y": 50, "at": 1 },
+    { "id": "meta", "label": "Metadata DB", "kind": "data", "x": 87, "y": 50, "at": 1, "until": 5 },
+    { "id": "metashards", "label": "Metadata shards", "kind": "data", "x": 87, "y": 50, "at": 5 },
+    { "id": "chunkindex", "label": "Chunk index", "kind": "data", "x": 62, "y": 16, "at": 2 },
+    { "id": "notifier", "label": "Change notifier", "kind": "async", "x": 37, "y": 16, "at": 3 },
+    { "id": "revisions", "label": "Version history", "kind": "data", "x": 37, "y": 84, "at": 4 },
+    { "id": "cache", "label": "Metadata cache", "kind": "data", "x": 87, "y": 16, "at": 5 },
+    { "id": "scrubber", "label": "Integrity checker", "kind": "compute", "x": 62, "y": 84, "at": 6 }
+  ],
+  "edges": [
+    { "from": "devices", "to": "single", "at": 0, "until": 1 },
+    { "from": "devices", "to": "api", "at": 1 },
+    { "from": "api", "to": "blocks", "at": 1 },
+    { "from": "api", "to": "meta", "at": 1, "until": 5 },
+    { "from": "api", "to": "metashards", "at": 5 },
+    { "from": "api", "to": "chunkindex", "at": 2 },
+    { "from": "api", "to": "notifier", "at": 3 },
+    { "from": "notifier", "to": "devices", "at": 3 },
+    { "from": "api", "to": "revisions", "at": 4 },
+    { "from": "cache", "to": "metashards", "at": 5 },
+    { "from": "scrubber", "to": "blocks", "at": 6 }
+  ],
+  "steps": [
+    {
+      "title": "Cut files into chunks and store the chunks apart from the file list",
+      "problem": "Re-uploading a whole file for a small change wastes bandwidth, and one failure during a big upload throws away all the progress.",
+      "fix": "The client splits each file into chunks of a few megabytes, or less, and uploads them as separate requests, so a broken upload resumes from the last good chunk. The chunks go to block storage, and a metadata database records, for each file, its name, folder, version and the ordered list of chunk hashes that make it up. Downloading is fetching that list and then the chunks.",
+      "tradeoff": "Uploads resume and can run in parallel, and big files are no longer special. There are many more objects to track, and a file is only visible once all its chunks are stored and the metadata names them.",
+      "concepts": [{ "slug": "api-gateway" }, { "slug": "database-sharding" }, { "slug": "idempotency" }]
+    },
+    {
+      "title": "Chunk by content, hash every chunk and skip what the server has",
+      "problem": "With fixed-size chunks, inserting a few bytes near the start of a file shifts every later boundary, so every chunk looks new and the whole file is uploaded again.",
+      "fix": "The client cuts chunks where the content says so: a rolling hash slides along the bytes and ends a chunk when it matches a pattern. Boundaries follow the data, so after an insertion they line up again right after the edit. Each chunk is named by the hash of its bytes, and before uploading the client asks the chunk index which hashes the server already holds, then sends only the others. The same rule means two users, or two files, with the same chunk store it once.",
+      "tradeoff": "An edit costs about one chunk of upload however large the file, and duplicate data is stored once. The chunk index is a large, busy table, hashing costs CPU on the device, and sharing chunks between users needs care so that a hash does not reveal whether someone else has a file.",
+      "concepts": [{ "slug": "database-indexing" }, { "slug": "caching" }, { "slug": "latency-and-round-trips" }]
+    },
+    {
+      "title": "Tell the other devices as soon as something changes",
+      "problem": "Polling makes changes appear late, and thousands of idle devices ask 'anything new?' all day.",
+      "fix": "Every committed change gets a number in the user's change journal. Each device keeps a long-lived connection to a notification service and is told 'your journal moved to 4,812'. The device then asks the sync API for the changes after the last number it saw, which is a cheap, exact request. A device that was offline for a week simply asks for everything since its last number.",
+      "tradeoff": "Changes arrive in a second or two, and the idle cost is one open connection. Notifications can be lost, so devices also check occasionally, and the journal must be kept for long enough for slow devices to catch up.",
+      "concepts": [{ "slug": "real-time-communication" }, { "slug": "pub-sub" }, { "slug": "message-queues" }]
+    },
+    {
+      "title": "Detect conflicts and keep a history of versions",
+      "problem": "Two devices can edit the same file while one is offline, and a simple 'newest wins' silently destroys one person's work.",
+      "fix": "Every change names the version it was based on. The server accepts a change only if that base is still the current version. A change made on top of an old version is a conflict: the server keeps both and the client saves the loser as a separate conflicted copy for the user to merge. Old versions are never overwritten; they stay in a version history for a retention period, and deleting a file only marks it deleted.",
+      "tradeoff": "No edit is lost, restoring an old version or an undeleted file is possible, and conflicts are visible. Users sometimes get duplicate files to merge by hand, and history takes up storage, which is kept down because unchanged chunks are shared between versions.",
+      "concepts": [{ "slug": "logical-clocks" }, { "slug": "consistency-models" }, { "slug": "event-sourcing" }]
+    },
+    {
+      "title": "Shard and cache the metadata",
+      "problem": "Every sync action reads or writes metadata, and a single database cannot hold the file trees and journals of hundreds of millions of users.",
+      "fix": "Shard the metadata database by user (or by shared folder), so one user's file tree and change journal live together on one shard and a typical request touches one shard. A cache in front serves the hottest reads, such as 'list this folder' and 'what changed since 4,812'. Shared folders live in their own unit that all members point to.",
+      "tradeoff": "Metadata scales with the number of users and most requests need a single shard. Large shared folders can become hot spots, and operations that span users, such as moving a file into someone else's share, need extra care.",
+      "concepts": [{ "slug": "database-sharding" }, { "slug": "caching" }, { "slug": "sql-vs-nosql" }]
+    },
+    {
+      "title": "Make losing a file almost impossible",
+      "problem": "Disks fail quietly. A chunk that is damaged and never read again could go unnoticed until someone needs it.",
+      "fix": "Block storage keeps every chunk in several places, in different machines and zones, or as erasure-coded fragments that can rebuild it when some fragments are lost. A background integrity checker reads chunks regularly, compares their bytes with the hash they are named by, and repairs a bad copy from a good one. Chunks are deleted only when nothing in any version still refers to them.",
+      "tradeoff": "Durability measured in many nines, and damage is repaired long before it matters. Replication or erasure coding costs storage and the scrubber uses disk bandwidth, and deleting chunks safely needs reference counting or a careful garbage collection.",
+      "concepts": [{ "slug": "database-replication" }, { "slug": "health-checks" }, { "slug": "metrics" }]
+    }
+  ],
+  "failures": [
+    {
+      "scenario": "The laptop loses its connection in the middle of uploading a 5 GB video",
+      "impact": "Without chunking, the whole upload would start again, again and again on a weak connection.",
+      "answer": "Chunks that arrived are already stored under their hashes. When the connection returns the client asks which hashes are missing and sends only those. The file becomes visible only when the metadata update that names all its chunks is committed, so a half-uploaded file never appears.",
+      "concepts": [{ "slug": "idempotency" }, { "slug": "retries-and-backoff" }, { "slug": "latency-and-round-trips" }]
+    },
+    {
+      "scenario": "Two devices edit the same document, one of them offline",
+      "impact": "Both versions are valid and both claim to follow the previous one.",
+      "answer": "The first change to reach the server becomes the next version. The second names an older base, so the server rejects it as a conflict, and the client stores it as a conflicted copy next to the original. Both survive and the person decides.",
+      "concepts": [{ "slug": "logical-clocks" }, { "slug": "consistency-models" }, { "slug": "idempotency" }]
+    },
+    {
+      "scenario": "A storage node holding some chunks fails",
+      "impact": "Some chunks have fewer copies than they should, and a second failure could lose them.",
+      "answer": "The remaining copies or fragments still serve every read. The storage system notices the missing copies and rebuilds them on other nodes in the background, and the integrity checker confirms that the rebuilt data matches the hashes.",
+      "concepts": [{ "slug": "database-replication" }, { "slug": "health-checks" }, { "slug": "backpressure" }]
+    },
+    {
+      "scenario": "The notification service is down",
+      "impact": "Devices are not told about changes and stay out of date.",
+      "answer": "Devices fall back to asking for changes since their last journal number every minute or so, which is slower but still correct, because the journal is the source of truth and the notification is only a hint. Normal speed returns when the service does.",
+      "concepts": [{ "slug": "real-time-communication" }, { "slug": "circuit-breaker" }, { "slug": "retries-and-backoff" }]
+    }
+  ],
+  "alternatives": [
+    {
+      "title": "How to cut a file into chunks",
+      "options": [
+        { "name": "Fixed-size chunks", "pro": "Trivial to implement and very fast", "con": "An insertion shifts all later chunks, so the whole file looks changed" },
+        { "name": "Content-defined chunks", "pro": "An edit only changes the chunks around it", "con": "More CPU, and chunk sizes vary" },
+        { "name": "Whole files", "pro": "No chunk bookkeeping at all", "con": "Every change re-uploads the entire file" }
+      ],
+      "pick": "Content-defined chunks of about 4 MB or less for ordinary files. Fixed-size chunks suit files that only change by overwriting blocks in place, such as disk images."
+    },
+    {
+      "title": "How devices find out about changes",
+      "options": [
+        { "name": "Polling", "pro": "Simple and robust", "con": "Slow to notice, and most requests find nothing" },
+        { "name": "Long-lived connection with a change journal", "pro": "Near-instant and cheap while idle", "con": "Many open connections to manage" },
+        { "name": "Mobile push notifications", "pro": "Reaches an app that is not running", "con": "Not instant or guaranteed, so it is a wake-up call only" }
+      ],
+      "pick": "A persistent connection backed by a numbered journal, with push notifications to wake phones."
+    },
+    {
+      "title": "How to resolve conflicts",
+      "options": [
+        { "name": "Last writer wins", "pro": "No user interaction", "con": "Silently destroys someone's work" },
+        { "name": "Keep both and let the user merge", "pro": "Nothing is lost", "con": "Leaves messy duplicate files" },
+        { "name": "Real-time merge of edits", "pro": "Smooth for documents edited together", "con": "Needs an understanding of the file format, so it only suits specific types" }
+      ],
+      "pick": "Keep both for arbitrary files. Use real-time merging only for document types the product understands."
+    },
+    {
+      "title": "How to store chunks durably",
+      "options": [
+        { "name": "Three full copies", "pro": "Simple, fast to read and to repair", "con": "Triple the storage" },
+        { "name": "Erasure coding", "pro": "Similar durability for about 1.5 times the storage", "con": "Reads and repairs touch several machines and take more CPU" }
+      ],
+      "pick": "Full copies for new and frequently read data, and erasure coding for the cold bulk."
+    }
+  ],
+  "roles": [
+    { "id": "client", "label": "Devices", "description": "Laptops, phones and the web app." },
+    { "id": "edge", "label": "Entry point", "description": "The sync API." },
+    { "id": "async", "label": "Notifications", "description": "The change notifier and its journal." },
+    { "id": "compute", "label": "Workers", "description": "The integrity checker." },
+    { "id": "data", "label": "State", "description": "Blocks, metadata, chunk index, history and cache." }
+  ]
+}
