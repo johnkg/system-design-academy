@@ -1,0 +1,55 @@
+{
+  "actors": [
+    { "id": "shopper", "label": "Shopper", "role": "client", "x": 12, "y": 16 },
+    { "id": "gateway", "label": "Gateway + waiting room", "role": "edge", "x": 50, "y": 16 },
+    { "id": "order", "label": "Order service + saga", "role": "compute", "x": 88, "y": 16 },
+    { "id": "orderdb", "label": "Orders and outbox", "role": "data", "x": 88, "y": 50 },
+    { "id": "inventory", "label": "Inventory (stock 12)", "role": "compute", "x": 50, "y": 50 },
+    { "id": "payment", "label": "Payment service", "role": "compute", "x": 12, "y": 50 },
+    { "id": "bus", "label": "Event bus", "role": "async", "x": 50, "y": 84 },
+    { "id": "shipping", "label": "Shipping service", "role": "compute", "x": 88, "y": 84 }
+  ],
+  "frames": [
+    {
+      "narration": "The checkout page loaded with an idempotency key, k-77. The flash sale is open and the waiting room has let this shopper in with a short-lived token. Pressing Buy sends the order with the key.",
+      "messages": [{ "from": "shopper", "to": "gateway", "label": "Buy, key k-77, token ok" }, { "from": "gateway", "to": "order", "label": "place order" }],
+      "states": { "gateway": "admitted from queue" }
+    },
+    {
+      "narration": "The order service inserts order 5001 as PENDING under a unique constraint on k-77, together with an outbox row 'order.pending', in one transaction. If k-77 had been seen, the existing order would simply be returned.",
+      "messages": [{ "from": "order", "to": "orderdb", "label": "insert order 5001 + outbox row" }],
+      "states": { "orderdb": "5001 PENDING" }
+    },
+    {
+      "narration": "Saga step 1: reserve a unit. Inventory runs one conditional update, 'available = available - 1 where available >= 1'. Stock goes from 12 to 11 and a hold for order 5001 is stored, expiring in 5 minutes.",
+      "messages": [{ "from": "order", "to": "inventory", "label": "reserve 1 for 5001" }, { "from": "inventory", "to": "order", "label": "held until +5 min" }],
+      "states": { "inventory": "stock 11, 1 hold" }
+    },
+    {
+      "narration": "Saga step 2: charge the card. The order id is passed as the payment's idempotency key, so a repeat after a timeout cannot charge twice. The payment is approved.",
+      "messages": [{ "from": "order", "to": "payment", "label": "charge, key order-5001" }, { "from": "payment", "to": "order", "label": "approved" }],
+      "states": { "payment": "charged once" }
+    },
+    {
+      "narration": "Saga step 3: the hold is committed, so the unit stays taken and the hold is used up. The order becomes PAID, with a second outbox row 'order.paid' in the same transaction.",
+      "messages": [{ "from": "order", "to": "inventory", "label": "commit hold" }, { "from": "order", "to": "orderdb", "label": "5001 PAID + outbox row" }],
+      "states": { "inventory": "hold committed", "orderdb": "5001 PAID" }
+    },
+    {
+      "narration": "The relay publishes the unsent outbox rows to the event bus. Shipping consumes 'order.paid' and books a shipment, remembering the event id so that a repeat is ignored.",
+      "messages": [{ "from": "orderdb", "to": "bus", "label": "order.paid, id 178" }, { "from": "bus", "to": "shipping", "label": "order.paid" }],
+      "states": { "shipping": "shipment booked" }
+    },
+    {
+      "narration": "Meanwhile another shopper, with order 5002, had also reserved a unit, which took the stock down to 10. Their card is declined, so their saga compensates: the hold is released and the stock goes back up to 11, and the next shopper in the waiting room can be admitted.",
+      "messages": [{ "from": "order", "to": "payment", "label": "order 5002: declined" }, { "from": "order", "to": "inventory", "label": "release hold 5002" }],
+      "states": { "inventory": "stock 11 again" }
+    },
+    {
+      "narration": "Shipping reports the shipment and the order becomes CONFIRMED. The shopper is shown the confirmation. If they had pressed Buy twice, the second request would have returned order 5001 and nothing else would have happened.",
+      "messages": [{ "from": "shipping", "to": "bus", "label": "shipment created" }, { "from": "bus", "to": "order", "label": "confirm 5001" }, { "from": "order", "to": "shopper", "label": "order 5001 confirmed" }],
+      "states": { "shopper": "order 5001 confirmed", "orderdb": "5001 CONFIRMED" },
+      "highlight": ["shopper"]
+    }
+  ]
+}

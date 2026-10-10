@@ -1,0 +1,501 @@
+{
+  "name": "Design a Photo Sharing Service",
+  "difficulty": "intermediate",
+  "intent": "Let hundreds of millions of people upload photos and see them quickly anywhere, while a few viral posts collect tens of thousands of likes per second.",
+  "codeTitle": "likes with a unique row, sharded counters and batching",
+  "finalIntro": "One photo being uploaded, shown to a follower and liked.",
+  "prompt": "Design the photo side of an Instagram-style service with 500 million daily users and 100 million new photos a day. Users upload from phones on slow networks, and every photo must be shown quickly in several sizes. Posts get likes and comments, and a few posts go viral. Do not design the feed itself, only the media pipeline and the counters.",
+  "functional": [
+    "Upload a photo from a phone, and resume if the connection drops",
+    "Turn each photo into several sizes and formats, such as a thumbnail and a full-screen version",
+    "Show any photo fast from anywhere in the world",
+    "Like and unlike a post, and show its like count and comment count",
+    "Delete a photo or make it private, and make it disappear everywhere"
+  ],
+  "nonFunctional": [
+    "Uploads must never lose a photo once the app says it is posted",
+    "A new photo is visible in a reasonable time, about 10 seconds for the common sizes",
+    "A thumbnail appears in under 100 ms for most users",
+    "A viral post can receive 5,000 or more likes per second without failures",
+    "A like count may be a little behind, but every like must be counted exactly once",
+    "A deleted or private photo stops being shown within minutes",
+    "Storage grows by over 100 PB a year, so cost per photo matters"
+  ],
+  "firstAttempt": {
+    "text": "The app posts the photo to one application server. The server resizes it while the request waits, saves the files on its disk or in the database, and serves them to viewers. A like runs 'UPDATE posts SET likes = likes + 1' on the post's row, and the count is that column.",
+    "limits": [
+      "Every photo's megabytes pass through application servers, which then spend their time on bytes instead of logic",
+      "Resizing inside the request makes the upload slow, and a slow network or a big photo ties up a server for many seconds",
+      "Serving images from the same servers means viewers far away wait for a long round trip",
+      "A disk fills up and cannot be shared, and a lost disk means lost photos",
+      "Every like updates the same row, so a viral post queues thousands of updates behind one lock",
+      "Counting likes with a query over a table of likes is slow when a post has millions"
+    ]
+  },
+  "nodes": [
+    {
+      "id": "app",
+      "label": "Mobile app",
+      "kind": "client",
+      "x": 62,
+      "y": 63
+    },
+    {
+      "id": "mono",
+      "label": "One app server with disk",
+      "kind": "compute",
+      "x": 37,
+      "y": 63,
+      "at": 0,
+      "until": 1
+    },
+    {
+      "id": "api",
+      "label": "Post API",
+      "kind": "edge",
+      "x": 62,
+      "y": 88,
+      "at": 1
+    },
+    {
+      "id": "meta1",
+      "label": "Metadata DB",
+      "kind": "data",
+      "x": 87,
+      "y": 88,
+      "at": 1,
+      "until": 4
+    },
+    {
+      "id": "meta",
+      "label": "Metadata DB shards",
+      "kind": "data",
+      "x": 37,
+      "y": 88,
+      "at": 4
+    },
+    {
+      "id": "store",
+      "label": "Object storage",
+      "kind": "data",
+      "x": 37,
+      "y": 37,
+      "at": 1
+    },
+    {
+      "id": "queue",
+      "label": "Upload events",
+      "kind": "async",
+      "x": 12,
+      "y": 37,
+      "at": 2
+    },
+    {
+      "id": "workers",
+      "label": "Image workers",
+      "kind": "compute",
+      "x": 37,
+      "y": 12,
+      "at": 2
+    },
+    {
+      "id": "cdn",
+      "label": "CDN",
+      "kind": "edge",
+      "x": 37,
+      "y": 63,
+      "at": 3
+    },
+    {
+      "id": "cbuf",
+      "label": "Like buffer",
+      "kind": "async",
+      "x": 87,
+      "y": 88,
+      "at": 5
+    },
+    {
+      "id": "cshards",
+      "label": "Counter shards",
+      "kind": "data",
+      "x": 87,
+      "y": 63,
+      "at": 5
+    },
+    {
+      "id": "purge",
+      "label": "Purge service",
+      "kind": "compute",
+      "x": 12,
+      "y": 63,
+      "at": 6
+    }
+  ],
+  "edges": [
+    {
+      "from": "app",
+      "to": "mono",
+      "at": 0,
+      "until": 1
+    },
+    {
+      "from": "app",
+      "to": "api",
+      "at": 1
+    },
+    {
+      "from": "api",
+      "to": "meta1",
+      "at": 1,
+      "until": 4
+    },
+    {
+      "from": "app",
+      "to": "store",
+      "at": 1
+    },
+    {
+      "from": "store",
+      "to": "queue",
+      "at": 2
+    },
+    {
+      "from": "queue",
+      "to": "workers",
+      "at": 2
+    },
+    {
+      "from": "workers",
+      "to": "store",
+      "at": 2
+    },
+    {
+      "from": "app",
+      "to": "cdn",
+      "at": 3
+    },
+    {
+      "from": "cdn",
+      "to": "store",
+      "at": 3
+    },
+    {
+      "from": "api",
+      "to": "meta",
+      "at": 4
+    },
+    {
+      "from": "api",
+      "to": "cbuf",
+      "at": 5
+    },
+    {
+      "from": "cbuf",
+      "to": "cshards",
+      "at": 5
+    },
+    {
+      "from": "api",
+      "to": "purge",
+      "at": 6
+    },
+    {
+      "from": "purge",
+      "to": "cdn",
+      "at": 6
+    },
+    {
+      "from": "purge",
+      "to": "store",
+      "at": 6
+    }
+  ],
+  "steps": [
+    {
+      "title": "Upload straight to object storage with a signed URL",
+      "problem": "If every photo goes through an application server, those servers carry about 300 TB a day of bytes they have no use for, and a slow phone holds a server connection for as long as the upload takes.",
+      "fix": "The app asks the post API for an upload. The API checks the user and the limits, creates a post row with the status 'pending', and returns a signed URL: a link to one object key in object storage, valid for about 15 minutes, for one PUT, with a size limit. The phone sends the bytes straight to object storage. Large photos and videos use the store's multipart upload in chunks of a few megabytes, so a dropped connection resumes from the last finished chunk and not from zero. The object key is chosen by the API, never by the client.",
+      "tradeoff": "Application servers handle only small requests, and object storage absorbs the bandwidth and keeps the bytes safe on several disks. The API no longer sees the content, so it cannot check it during the upload, and abandoned uploads leave orphan objects and pending rows that a cleanup job has to remove.",
+      "concepts": [
+        {
+          "slug": "authentication-and-authorization"
+        },
+        {
+          "slug": "tls-and-https"
+        },
+        {
+          "slug": "rate-limiting"
+        }
+      ]
+    },
+    {
+      "title": "Process images asynchronously into several sizes",
+      "problem": "A 3 MB original is far too big to send to a phone that shows a 150 px thumbnail, and resizing it while the user waits makes uploading slow and fragile.",
+      "fix": "When the object is created, the store emits an event onto a queue. Image workers take the job, decode the original, check that it is a real image of a sane size, strip location data, turn it upright, and write 4 sizes (150, 320, 640 and 1080 px) in 2 formats, such as WebP and AVIF, back into storage. The metadata row changes from 'pending' to 'ready' when the common sizes exist. The work is idempotent: a job that runs twice produces the same files with the same names, so retries after a crash are safe. Slow outputs, such as AVIF, can finish later.",
+      "tradeoff": "Uploads return at once, and the number of workers can follow the backlog of the queue instead of the peak of requests. The photo appears a few seconds after the upload, not at the same moment, and a poisoned or oversized image needs a limit on memory and time and a dead-letter queue so that it cannot block everything behind it.",
+      "concepts": [
+        {
+          "slug": "message-queues"
+        },
+        {
+          "slug": "idempotency"
+        },
+        {
+          "slug": "retries-and-backoff"
+        }
+      ]
+    },
+    {
+      "title": "Serve every size from a CDN, using names that never change",
+      "problem": "Viewers are all over the world, and each photo is looked at thousands of times. Serving each image from one region is slow for most people and expensive for the origin.",
+      "fix": "Put a CDN in front of the storage. The URL of every variant contains the size and a hash of the file's content, such as '/640/9f2c1a.webp', and is sent with 'Cache-Control: public, max-age=31536000, immutable'. A name never refers to different bytes, so a cache can keep it for a year and nothing needs to be refreshed. The app builds the URL from the metadata and chooses a size that fits its screen (the 'srcset' idea). A second cache layer near the origin collapses a million simultaneous misses for a new photo into one request.",
+      "tradeoff": "At a 95% hit ratio, only about 5% of the 2 million requests per second at the peak reach storage, and most users get an image from a nearby node. It costs CDN bandwidth, which is the largest line of the bill, and a cache that is shared between all users can only hold public images. Private photos need signed, short-lived URLs.",
+      "concepts": [
+        {
+          "slug": "cdn"
+        },
+        {
+          "slug": "caching"
+        },
+        {
+          "slug": "latency-and-round-trips"
+        }
+      ]
+    },
+    {
+      "title": "Keep metadata in a sharded database",
+      "problem": "The files are not enough: the service needs to know who owns each photo, its caption, its status, which variants exist, and who liked it, and one database cannot hold billions of posts.",
+      "fix": "Store a small row for each post in a database sharded by post id (or by the owner id, if a profile page is the most common query). The post id is a time-sortable unique id made without coordination. The row holds the owner, the caption, the status, the content hashes of the variants, and the privacy setting. A separate likes table has the primary key (post id, user id), kept on the same shard as the post, and an index by user for 'photos I liked'. The big binary data never goes in this database, only its keys.",
+      "tradeoff": "The database stays small, fast and easy to back up, because each row is a few hundred bytes. A cross-shard question such as 'all photos with this tag' needs a separate index, and the pending row and the stored object are two systems that can disagree, which the cleanup job and the 'ready' status repair.",
+      "concepts": [
+        {
+          "slug": "database-sharding"
+        },
+        {
+          "slug": "database-indexing"
+        },
+        {
+          "slug": "sql-vs-nosql"
+        }
+      ]
+    },
+    {
+      "title": "Count likes and comments with sharded, batched counters",
+      "problem": "One counter row takes about 1,000 updates per second because each update holds its lock. A viral photo gets 5,000 to 50,000 likes per second, so likes would queue and time out, and counting rows on every view is slower still.",
+      "fix": "The unique (post, user) row makes a repeat tap harmless: the counter changes only if the insert succeeded. The count itself is split into N shards per post, such as 16, and each like adds to a random shard, so 16 rows share the load. Hot posts can go further: the API adds likes to an in-memory buffer, and a flush every second adds the whole batch to a shard in one update. A reader sums the shards, or reads a value cached for a second. Ordinary posts use a single row, and a post is promoted to shards when its rate crosses a threshold.",
+      "tradeoff": "Write contention disappears and the database sees a few writes per second for each hot post. The count is eventually correct and can trail by about a second, so the screen shows the user's own like at once. A crash can lose the buffer unless it sits in a durable queue, so the unique like rows remain the truth and counters can be rebuilt from them.",
+      "concepts": [
+        {
+          "slug": "database-sharding"
+        },
+        {
+          "slug": "idempotency"
+        },
+        {
+          "slug": "backpressure"
+        }
+      ]
+    },
+    {
+      "title": "Invalidate caches by changing names, and purge only when you must",
+      "problem": "A user deletes a photo, makes the account private, or replaces a cover image. Copies sit in CDN nodes around the world, in apps, and in the metadata caches.",
+      "fix": "Because content names are immutable, an edit makes a new file with a new name, and the metadata points to it, so there is nothing to invalidate. Only deletion, privacy changes and legal takedowns need a purge: the purge service first marks the post deleted in the database, so the API stops handing out its URLs. It then removes the objects and sends purge requests to the CDN by path. Private photos use signed URLs that expire in minutes, so a copy in a cache stops being usable on its own. Metadata caches are cleared with the same event.",
+      "tradeoff": "Ordinary changes need no purge, and the dangerous ones are handled with a short, bounded delay. Purges are best effort and take seconds to minutes across the nodes, so a deleted photo can be visible from a cache for a short time, and a viewer who saved the URL keeps it until it expires.",
+      "concepts": [
+        {
+          "slug": "cdn"
+        },
+        {
+          "slug": "caching"
+        },
+        {
+          "slug": "transactional-outbox"
+        }
+      ]
+    }
+  ],
+  "failures": [
+    {
+      "scenario": "An image worker crashes halfway through a photo",
+      "impact": "The post stays pending, and the user's photo never appears.",
+      "answer": "The queue hands the job to another worker after a visibility timeout. Because output names come from the content and the job is idempotent, the second run overwrites the partial files with identical ones. After a few failures the job goes to a dead-letter queue and an alert fires. The post moves to 'failed' and the app offers a retry.",
+      "concepts": [
+        {
+          "slug": "message-queues"
+        },
+        {
+          "slug": "idempotency"
+        },
+        {
+          "slug": "retries-and-backoff"
+        }
+      ]
+    },
+    {
+      "scenario": "The upload finishes but the app never reports it, or the user abandons it",
+      "impact": "An orphan object and a pending row are left, using storage and clutter for ever.",
+      "answer": "The storage event, not the app, starts processing, so a finished upload is never lost because the phone went offline. A cleanup job deletes pending posts older than a day, with their objects, and a lifecycle rule on the upload prefix removes incomplete multipart uploads. The app can resume a pending upload with a new signed URL.",
+      "concepts": [
+        {
+          "slug": "message-queues"
+        },
+        {
+          "slug": "transactional-outbox"
+        },
+        {
+          "slug": "retries-and-backoff"
+        }
+      ]
+    },
+    {
+      "scenario": "A celebrity posts and 50,000 people like it each second",
+      "impact": "A single counter row queues thousands of updates behind one lock, and likes fail with timeouts, while the database slows for other posts on the same shard.",
+      "answer": "The post is promoted to 16 or more counter shards, and likes go through the buffer in batches. The like rows are written with a unique key, so a retry is harmless. If the buffer fills up, the API sheds load by accepting the tap in the app and counting it later, and an alert marks the post as hot.",
+      "concepts": [
+        {
+          "slug": "backpressure"
+        },
+        {
+          "slug": "bulkhead"
+        },
+        {
+          "slug": "idempotency"
+        }
+      ]
+    },
+    {
+      "scenario": "A bad file arrives: a huge image, a corrupt file, or one made to crash the decoder",
+      "impact": "A worker runs out of memory, retries the same file again and again, and blocks the queue.",
+      "answer": "The signed URL limits the size. Workers check the header for dimensions before decoding, decode in a sandbox with limits on memory and time, and give up after a few attempts. The job then goes to a dead-letter queue and the post fails with a clear message. Workers are isolated from each other, so one bad file cannot take them all down.",
+      "concepts": [
+        {
+          "slug": "bulkhead"
+        },
+        {
+          "slug": "message-queues"
+        },
+        {
+          "slug": "injection-and-xss"
+        }
+      ]
+    }
+  ],
+  "alternatives": [
+    {
+      "title": "How the bytes get to storage",
+      "options": [
+        {
+          "name": "Through the application server",
+          "pro": "Simple, and the server can check everything during the upload",
+          "con": "Servers carry all the bytes, and slow phones hold connections open"
+        },
+        {
+          "name": "Straight to object storage with a signed URL",
+          "pro": "No server carries the bytes, and storage scales and resumes by itself",
+          "con": "No check during the upload, so a checking step must run afterwards"
+        },
+        {
+          "name": "A dedicated upload service in front of storage",
+          "pro": "Can check and resume in its own way",
+          "con": "A new fleet to run and scale, with the same bandwidth cost"
+        }
+      ],
+      "pick": "Signed URLs to object storage, with validation in the worker."
+    },
+    {
+      "title": "When to make the sizes",
+      "options": [
+        {
+          "name": "All sizes when uploaded",
+          "pro": "Predictable, and the first view is fast",
+          "con": "Storage and CPU for sizes that nobody asks for, and a new size means a backfill"
+        },
+        {
+          "name": "On demand at the CDN edge, from the original",
+          "pro": "Any size without a backfill, and nothing wasted",
+          "con": "The first request for each size is slow, and the resizer must handle spikes"
+        },
+        {
+          "name": "A few fixed sizes first, rare ones on demand",
+          "pro": "The common path is fast and cheap",
+          "con": "Two code paths"
+        }
+      ],
+      "pick": "Make the common 4 sizes on upload, and make any other size on demand, then cache it."
+    },
+    {
+      "title": "How to keep a like count",
+      "options": [
+        {
+          "name": "Count the rows when read",
+          "pro": "Always exact, and nothing to maintain",
+          "con": "A read scans millions of rows for a viral post"
+        },
+        {
+          "name": "One counter row",
+          "pro": "Simple, and a read is a single row",
+          "con": "About 1,000 updates a second per row, so a viral post queues"
+        },
+        {
+          "name": "Sharded counter rows",
+          "pro": "Throughput grows with the number of shards",
+          "con": "A read sums N rows, and idle posts waste rows"
+        },
+        {
+          "name": "Batched aggregation in memory",
+          "pro": "Only a few writes a second, however many likes",
+          "con": "The count lags, and the buffer needs to survive a crash"
+        }
+      ],
+      "pick": "Unique like rows as the truth, one row for ordinary posts, and shards plus batching for hot posts."
+    },
+    {
+      "title": "How to invalidate caches",
+      "options": [
+        {
+          "name": "Short time to live",
+          "pro": "Nothing to invalidate",
+          "con": "Many misses, and a deletion still shows for the whole time"
+        },
+        {
+          "name": "Purge by URL on every change",
+          "pro": "Changes show quickly",
+          "con": "Slow, rate-limited and unreliable across the nodes"
+        },
+        {
+          "name": "Content-hash names, purging only for deletes",
+          "pro": "Caches hold files for a year, and edits need no purge",
+          "con": "The metadata must be the single place that knows the current name"
+        }
+      ],
+      "pick": "Content-hash names, with purge and signed URLs only for deletion and privacy."
+    }
+  ],
+  "roles": [
+    {
+      "id": "client",
+      "label": "Apps",
+      "description": "Phones that upload and view photos."
+    },
+    {
+      "id": "edge",
+      "label": "Entry points and CDN",
+      "description": "The post API and the CDN that serves images."
+    },
+    {
+      "id": "async",
+      "label": "Queues and buffers",
+      "description": "Upload events and the like buffer."
+    },
+    {
+      "id": "compute",
+      "label": "Workers",
+      "description": "Image processing and the purge service."
+    },
+    {
+      "id": "data",
+      "label": "Storage",
+      "description": "Object storage, the metadata database and counter shards."
+    }
+  ]
+}

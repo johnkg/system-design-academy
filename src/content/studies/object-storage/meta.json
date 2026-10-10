@@ -1,0 +1,180 @@
+{
+  "name": "Design an S3-Style Object Store",
+  "difficulty": "advanced",
+  "intent": "Store trillions of immutable objects of any size under string keys, keep each one for years without losing a byte, and list them by prefix, on disks that fail every day.",
+  "codeTitle": "a Reed-Solomon erasure code with rack placement and repair",
+  "finalIntro": "One large upload, one disk dying, and one listing.",
+  "prompt": "Design an object store like Amazon S3. Customers put and get objects from a few bytes to several terabytes under keys such as 'photos/2026/10/a.jpg', inside buckets. Objects are never edited in place. The service must be cheap per gigabyte, must not lose data over years, and must support listing the keys under a prefix.",
+  "functional": [
+    "Put, get, head and delete an object by bucket and key",
+    "Upload a very large object in parts, in parallel, and resume a failed upload",
+    "Read a byte range of an object",
+    "List the keys in a bucket by prefix, in order, with pages",
+    "Keep old versions of an object when versioning is on",
+    "Delete data for real when an object is deleted or expires"
+  ],
+  "nonFunctional": [
+    "Durability of 99.999999999% per object per year (eleven nines)",
+    "Availability of 99.99% for reads, even when a rack or a whole zone is down",
+    "Read-after-write consistency: a successful put is visible to the next get and the next list",
+    "Handle trillions of objects and exabytes of data",
+    "Low cost per gigabyte, so far less than three copies of everything",
+    "Disks fail every day, and repair must run without anyone noticing"
+  ],
+  "firstAttempt": {
+    "text": "One server with a big disk array. The key is a file path, a put writes the file, a get reads it, and a list walks the directory. For safety the whole server is copied to a second server every night.",
+    "limits": [
+      "One machine has a ceiling on capacity and on throughput, and a file system with billions of files in it slows to a crawl",
+      "Anything written since the last nightly copy is lost if the server dies",
+      "A single bad disk or a bad controller can silently corrupt a file, and nobody finds out",
+      "Listing a directory with a billion entries ties up the server for minutes",
+      "Doubling every disk for safety doubles the cost, and still does not survive a fire in the room"
+    ]
+  },
+  "nodes": [
+    { "id": "clients", "label": "Clients", "kind": "client", "x": 12, "y": 50 },
+    { "id": "single", "label": "One server with a disk array", "kind": "compute", "x": 50, "y": 50, "at": 0, "until": 1 },
+    { "id": "front", "label": "S3 front end", "kind": "edge", "x": 33, "y": 50, "at": 1 },
+    { "id": "meta", "label": "Metadata service", "kind": "data", "x": 55, "y": 18, "at": 1 },
+    { "id": "data", "label": "Data nodes", "kind": "data", "x": 62, "y": 50, "at": 1 },
+    { "id": "placement", "label": "Placement by rack and zone", "kind": "compute", "x": 85, "y": 18, "at": 2 },
+    { "id": "repair", "label": "Scrub and repair workers", "kind": "async", "x": 85, "y": 82, "at": 3 },
+    { "id": "ec", "label": "Erasure coder", "kind": "compute", "x": 62, "y": 82, "at": 4 },
+    { "id": "mp", "label": "Multipart upload staging", "kind": "async", "x": 33, "y": 82, "at": 5 },
+    { "id": "index", "label": "Sorted key index", "kind": "data", "x": 85, "y": 50, "at": 6 }
+  ],
+  "edges": [
+    { "from": "clients", "to": "single", "at": 0, "until": 1 },
+    { "from": "clients", "to": "front", "at": 1 },
+    { "from": "front", "to": "meta", "at": 1 },
+    { "from": "front", "to": "data", "at": 1 },
+    { "from": "meta", "to": "placement", "at": 2 },
+    { "from": "placement", "to": "data", "at": 2 },
+    { "from": "repair", "to": "data", "at": 3 },
+    { "from": "front", "to": "ec", "at": 4 },
+    { "from": "ec", "to": "data", "at": 4 },
+    { "from": "clients", "to": "mp", "at": 5 },
+    { "from": "front", "to": "mp", "at": 5 },
+    { "from": "mp", "to": "ec", "at": 5 },
+    { "from": "meta", "to": "index", "at": 6 }
+  ],
+  "steps": [
+    {
+      "title": "Separate the metadata from the data",
+      "problem": "A file system mixes two very different jobs: finding an object by its key, which is small, hot and needs strong consistency, and storing its bytes, which is huge, cold and only needs to be cheap and durable.",
+      "fix": "Split them. A metadata service maps (bucket, key) to an object record: size, checksum, version, and the list of data nodes and shard ids that hold the bytes. Data nodes store opaque, immutable blobs named by id and know nothing about keys. A put writes the bytes to data nodes first, and only then commits the metadata record, which is the moment the object becomes visible. Because the record is committed after the bytes are safe, a crash in the middle leaves unreachable blobs that a cleanup job removes, and never a key that points at nothing.",
+      "tradeoff": "Each side can scale and be tuned on its own: metadata on fast storage with consensus, data on big cheap disks. Every operation now takes a hop to the metadata service, so that service becomes the busiest and most critical part, and it must be partitioned and replicated carefully.",
+      "concepts": [{ "slug": "database-sharding" }, { "slug": "consensus" }, { "slug": "sql-vs-nosql" }]
+    },
+    {
+      "title": "Keep three copies, on different failure domains",
+      "problem": "A disk fails in a few percent of cases each year, and a fleet of a million disks loses some every hour. A fire, a power feed or a top-of-rack switch takes out many disks at once.",
+      "fix": "Write every object to three data nodes. The placement logic does not choose at random: it knows the topology of disks, servers, racks and zones, and puts each copy in a different rack, ideally in a different zone with separate power and network. A write is acknowledged when enough copies are on disk. Losing a whole rack then costs each object one copy, not all of them. The same rule is used for the metadata service, whose replicas sit in different zones.",
+      "tradeoff": "Independent failure domains turn correlated failures, which are the real killers, into single losses that are easy to repair. Three copies cost three times the storage, writes cross racks and zones so they are slower, and the placement must keep track of capacity so that no rack fills up first.",
+      "concepts": [{ "slug": "database-replication" }, { "slug": "quorums" }, { "slug": "consistent-hashing" }]
+    },
+    {
+      "title": "Detect corruption and repair after a disk loss",
+      "problem": "Replicas are only useful if lost ones are replaced before more are lost. With three copies, two more failures in the same window destroy the object. Disks also rot silently: a bit flips and nobody notices until the data is read.",
+      "fix": "Every blob is stored with a checksum. Reads verify it, and a background scrubber reads all data on a slow cycle, so corruption is found long before anyone asks for the object. Data nodes send heartbeats, and when a disk or server is declared dead, repair workers use the metadata to list every object that had a piece on it and re-create the missing piece on a healthy disk in the right failure domain, reading from the survivors. Repair is spread over thousands of disks at once, so a 16 TB disk is rebuilt in hours and not days, and it is rate-limited so that it does not starve customer traffic.",
+      "tradeoff": "The window in which an object is under-replicated shrinks from weeks to hours, and that window is what durability maths depends on. Repair traffic is large and constant background load, and a bad rule (for example one that treats a short network blip as a dead rack) can trigger a repair storm.",
+      "concepts": [{ "slug": "health-checks" }, { "slug": "backpressure" }, { "slug": "gossip-protocol" }]
+    },
+    {
+      "title": "Use erasure coding for the bulk of the data",
+      "problem": "Three copies of exabytes is a vast bill, and eleven nines of durability needs more than a hand-wavy argument.",
+      "fix": "Cut an object into k data pieces and compute m extra parity pieces, so that any k of the k+m pieces can rebuild it. A 6+3 code uses 1.5 times the space and survives any 3 lost pieces, where three copies use 3 times and survive 2. A 10+4 code uses 1.4 times and survives 4. The pieces go on k+m different racks. Durability is a binomial tail: if each piece is lost with probability p in one repair window, the object is lost when more than m are, which is about C(k+m, m+1) times p to the power m+1. With a yearly disk failure rate of 2% and a 24-hour repair window p is about 0.00005, and 6+3 loses an object with a probability around 10 to the minus 13 per year, well beyond eleven nines, as long as failures are independent and repair is quick. Small objects, and hot data, still use plain copies, because splitting 4 KB into 6 pieces is not worth it.",
+      "tradeoff": "Storage drops by half or more. In return a read touches k disks, a write computes parity, and repairing one lost piece means reading k pieces, so repair traffic is k times the size of what is rebuilt. The code does not help if failures are correlated, which is why placing pieces across racks matters as much as the maths.",
+      "concepts": [{ "slug": "quorums" }, { "slug": "latency-and-round-trips" }, { "slug": "caching" }]
+    },
+    {
+      "title": "Upload large objects in parts",
+      "problem": "A 500 GB object cannot be sent in one request. A dropped connection at 99% would mean starting over, and one connection cannot use the bandwidth available.",
+      "fix": "A client starts a multipart upload and gets an upload id. It uploads numbered parts, each a few MB to a few GB, in parallel and in any order, and each part is stored, erasure coded and checksummed on its own. A failed part is simply sent again, and sending the same part number twice replaces the earlier one, so retries are safe. When all parts are in, the client sends a complete call with the list of part numbers and checksums, and the metadata service writes one object record that refers to the parts, in one atomic commit. Uploads that are never completed are removed after a time limit so they do not cost money forever.",
+      "tradeoff": "Large uploads become fast, parallel and resumable, and a range read can go straight to the right part. The server has to track upload state, abandoned parts waste space until cleaned up, and the final object is only visible at the instant of the complete call, which is what clients expect.",
+      "concepts": [{ "slug": "idempotency" }, { "slug": "retries-and-backoff" }, { "slug": "transactional-outbox" }]
+    },
+    {
+      "title": "List keys by prefix with a sorted index",
+      "problem": "Keys are flat strings, but people list them like folders with a prefix and a delimiter. Scanning trillions of records or using a hash of the key (which scatters neighbours) makes that impossible.",
+      "fix": "Keep the metadata as a sorted index, partitioned by key range, so that all keys with one prefix are next to each other. A list call is a range scan from the prefix, returning up to 1,000 keys and a continuation token, which is the last key returned. With a delimiter such as '/', keys under a deeper level are rolled up into a single 'common prefix' entry, which is how a folder view appears on top of flat keys. Hot ranges split into smaller partitions automatically, and the index is replicated with consensus so a list immediately sees a completed put or delete.",
+      "tradeoff": "Prefix and range queries are cheap, and results come out in order. Sequential keys such as timestamps hammer one partition until it splits, a very deep rollup still scans many keys, and keeping the index strongly consistent costs a little write latency.",
+      "concepts": [{ "slug": "pagination" }, { "slug": "database-indexing" }, { "slug": "database-sharding" }]
+    }
+  ],
+  "failures": [
+    {
+      "scenario": "A disk dies",
+      "impact": "Every object with a piece on it is one piece short, which for a 16 TB disk is millions of objects.",
+      "answer": "The metadata knows which objects had pieces on the disk. Repair workers rebuild them in parallel on healthy disks in the same failure domain, reading from the survivors, and the objects with the fewest pieces left are repaired first. Reads in the meantime use the remaining pieces.",
+      "concepts": [{ "slug": "health-checks" }, { "slug": "backpressure" }, { "slug": "database-replication" }]
+    },
+    {
+      "scenario": "A whole rack or a zone goes dark",
+      "impact": "Thousands of disks vanish at once. If an object's pieces were in that rack, it could be lost or unreadable.",
+      "answer": "Pieces were placed on different racks and zones, so each object lost at most one or a few, and k of the rest are still readable. Repair is not started in a panic: the system waits briefly to see if the rack comes back, since rebuilding a rack of data is a huge amount of traffic, and prioritises the objects at most risk.",
+      "concepts": [{ "slug": "bulkhead" }, { "slug": "quorums" }, { "slug": "retries-and-backoff" }]
+    },
+    {
+      "scenario": "A disk returns the wrong bytes without reporting an error",
+      "impact": "Silent corruption is served to a customer, or spreads into new copies when it is used for repair.",
+      "answer": "Every piece has a checksum that is verified on read, on repair and by the background scrubber. A bad piece is treated as lost and rebuilt from the others, and the object checksum is checked again after decoding, so corrupt data never becomes a source for repair.",
+      "concepts": [{ "slug": "health-checks" }, { "slug": "metrics" }, { "slug": "alerting" }]
+    },
+    {
+      "scenario": "A client crashes in the middle of a multipart upload",
+      "impact": "Hundreds of gigabytes of parts exist, but there is no object, and they cost storage forever.",
+      "answer": "The object does not exist until complete is called. A lifecycle rule removes incomplete uploads after a set number of days, and the client can instead list the parts already stored and resume with only the missing ones.",
+      "concepts": [{ "slug": "idempotency" }, { "slug": "retries-and-backoff" }, { "slug": "message-queues" }]
+    },
+    {
+      "scenario": "The metadata service loses a partition leader",
+      "impact": "Puts and lists for a range of keys stop, and a split brain could accept conflicting writes.",
+      "answer": "Each partition is a consensus group. A new leader is elected within seconds and only a majority can commit, so a deposed leader cannot make a write visible. Reads and writes to other key ranges are not affected.",
+      "concepts": [{ "slug": "leader-election" }, { "slug": "consensus" }, { "slug": "cap-theorem" }]
+    }
+  ],
+  "alternatives": [
+    {
+      "title": "How to protect the data",
+      "options": [
+        { "name": "Three full copies", "pro": "Simple, fast reads from any copy, and cheap repair (copy one blob)", "con": "Costs 3x, and survives only 2 losses" },
+        { "name": "Erasure coding, such as 6+3 or 10+4", "pro": "1.4 to 1.5x the space and tolerates 3 or 4 lost pieces", "con": "Reads touch k disks, repair reads k pieces to rebuild one, and small objects do not fit well" },
+        { "name": "Hybrid: copies for small and hot, coding for large and cold", "pro": "Gets the benefits of both where each matters", "con": "Two code paths and a policy for moving data between them" }
+      ],
+      "pick": "Hybrid, with erasure coding holding most of the bytes."
+    },
+    {
+      "title": "Where to put the pieces",
+      "options": [
+        { "name": "Random disks", "pro": "Very simple, and even load", "con": "Two failures in one rack can hit the same object, and a rack outage can be fatal" },
+        { "name": "One piece per rack (and per zone where possible)", "pro": "A rack or even a zone loss costs one or a few pieces per object", "con": "Needs at least k+m racks, and cross-rack traffic for writes and repair" },
+        { "name": "Everything in one rack", "pro": "Cheapest network", "con": "A single event loses every object stored there" }
+      ],
+      "pick": "One piece per failure domain, with the topology tracked by the placement service."
+    },
+    {
+      "title": "How to index the keys",
+      "options": [
+        { "name": "Hash partitioned by key", "pro": "Perfectly even load and no hot partitions", "con": "A prefix listing must ask every partition and merge" },
+        { "name": "Range partitioned by sorted key", "pro": "A prefix is a contiguous range, so listing is a scan", "con": "Sequential keys make hot partitions until they split" }
+      ],
+      "pick": "Range partitions that split on load, since listing by prefix is a core operation."
+    },
+    {
+      "title": "How consistent the metadata must be",
+      "options": [
+        { "name": "Eventually consistent", "pro": "Easier to make highly available and fast across regions", "con": "A get or a list right after a put can miss it, which breaks many applications" },
+        { "name": "Strongly consistent, through consensus", "pro": "Read-after-write for gets and lists, so applications need no workarounds", "con": "Each write needs a majority, and a minority partition cannot write" }
+      ],
+      "pick": "Strongly consistent metadata, with consensus groups spread across zones."
+    }
+  ],
+  "roles": [
+    { "id": "client", "label": "Clients", "description": "Applications that put, get and list objects." },
+    { "id": "edge", "label": "Front end", "description": "The API that authenticates and routes requests." },
+    { "id": "async", "label": "Background work", "description": "Multipart staging, scrubbing and repair." },
+    { "id": "compute", "label": "Placement and coding", "description": "Choosing failure domains and computing erasure codes." },
+    { "id": "data", "label": "State", "description": "The metadata service, the key index and the data nodes." }
+  ]
+}

@@ -1,0 +1,183 @@
+{
+  "name": "Design a Nearby-Places Service",
+  "difficulty": "intermediate",
+  "intent": "Let people search 200 million businesses within a radius of where they stand, filter and rank them, and answer in about a hundred milliseconds whether they are in a packed city centre or an empty desert.",
+  "codeTitle": "a radius search over cells sorted by a Z-order key",
+  "finalIntro": "One person searching for ramen nearby, and one owner changing opening hours.",
+  "prompt": "Design the 'near me' search of a review site like Yelp. Users give their location, a radius, and optionally a category, and they see the matching businesses nearby, best first. Business owners add and update their listings. There are about 200 million places and tens of millions of searches a day.",
+  "functional": [
+    "Search for businesses within a radius of a location",
+    "Filter by category, price, rating and whether they are open now",
+    "Sort by relevance, rating or distance, and page through the results",
+    "Show the details of a place",
+    "Owners can add, move, edit and remove a place, and the change appears in search soon after"
+  ],
+  "nonFunctional": [
+    "A search answers in about 100 ms at the 95th percentile",
+    "Reads outnumber writes by roughly a hundred to one",
+    "A search is complete: it never silently misses a place that is inside the radius",
+    "Handles a crowded city centre with thousands of places per square kilometre and an empty region with almost none",
+    "A new or changed place may take a few minutes to show up in search",
+    "Stays available when a machine or a whole region of the index fails"
+  ],
+  "firstAttempt": {
+    "text": "One table of places with latitude and longitude columns, and an index on each. A search selects the rows with latitude between two values and longitude between two values, computes the distance to each row, sorts and keeps the first 20.",
+    "limits": [
+      "The database can use only one of the two indexes well, so it reads a strip of the map that is thousands of kilometres long and then filters it",
+      "The box around the circle has about 27% more area than the circle, so a quarter of what it reads is thrown away",
+      "A city centre returns thousands of rows that must all be measured and sorted per request, while the countryside returns none and the user has to try a bigger radius",
+      "Every search hits one database, and the searches are most of its load",
+      "Category and open-now filters and the ranking happen in application code after fetching all the rows"
+    ]
+  },
+  "nodes": [
+    { "id": "users", "label": "Users' phones", "kind": "client", "x": 12, "y": 50 },
+    { "id": "single", "label": "SQL table with lat and lon", "kind": "data", "x": 54, "y": 50, "at": 0, "until": 1 },
+    { "id": "api", "label": "Search API", "kind": "edge", "x": 32, "y": 50, "at": 1 },
+    { "id": "cells", "label": "Geohash cell index", "kind": "data", "x": 54, "y": 50, "at": 1, "until": 2 },
+    { "id": "search", "label": "Search service", "kind": "compute", "x": 54, "y": 50, "at": 2 },
+    { "id": "quad", "label": "Quadtree in memory", "kind": "data", "x": 76, "y": 50, "at": 2, "until": 3 },
+    { "id": "regions", "label": "Regional index replicas", "kind": "data", "x": 76, "y": 50, "at": 3 },
+    { "id": "placesdb", "label": "Places database", "kind": "data", "x": 76, "y": 84, "at": 3 },
+    { "id": "cache", "label": "Result cache", "kind": "data", "x": 32, "y": 84, "at": 4 },
+    { "id": "rank", "label": "Filter and rank", "kind": "compute", "x": 54, "y": 16, "at": 5 },
+    { "id": "owners", "label": "Business owners", "kind": "client", "x": 12, "y": 84, "at": 6 },
+    { "id": "queue", "label": "Change queue", "kind": "async", "x": 54, "y": 84, "at": 6 }
+  ],
+  "edges": [
+    { "from": "users", "to": "single", "at": 0, "until": 1 },
+    { "from": "users", "to": "api", "at": 1 },
+    { "from": "api", "to": "cells", "at": 1, "until": 2 },
+    { "from": "api", "to": "search", "at": 2 },
+    { "from": "search", "to": "quad", "at": 2, "until": 3 },
+    { "from": "search", "to": "regions", "at": 3 },
+    { "from": "placesdb", "to": "regions", "at": 3 },
+    { "from": "api", "to": "cache", "at": 4 },
+    { "from": "cache", "to": "search", "at": 4 },
+    { "from": "search", "to": "rank", "at": 5 },
+    { "from": "owners", "to": "api", "at": 6 },
+    { "from": "api", "to": "queue", "at": 6 },
+    { "from": "queue", "to": "placesdb", "at": 6 }
+  ],
+  "steps": [
+    {
+      "title": "Index the map in cells, and read the neighbours too",
+      "problem": "Two separate indexes on latitude and on longitude cannot answer 'inside this circle', because a position needs both numbers together.",
+      "fix": "Cut the map into square cells and give every place the key of its cell. A geohash does this by interleaving the bits of the latitude and longitude and writing them in base 32, so that places in the same rectangle share a prefix, and the longer the prefix, the smaller the rectangle (5 characters is about 5 km by 5 km, 6 characters about 1.2 km by 0.6 km). An ordinary index on that string turns 'near here' into a few prefix lookups. Choose cells at least as wide as the radius, and read the query's cell and its 8 neighbours, because a place a few metres away can be in a cell with a completely different prefix. Then measure the true distance of the candidates and keep those inside the circle.",
+      "tradeoff": "It works on any database with an ordinary index and reads a bounded number of places. The neighbours step is easy to forget, and without it searches near an edge silently lose results. The cell size is fixed, so it is wrong somewhere: a cell that suits the countryside holds tens of thousands of places in a city centre.",
+      "concepts": [{ "slug": "database-indexing" }, { "slug": "sql-vs-nosql" }]
+    },
+    {
+      "title": "Let the cells shrink where places are crowded",
+      "problem": "One cell size cannot fit both a downtown with 800 places per square kilometre and a desert with none. Small cells make the desert query read dozens of empty cells, and big cells make the downtown query read thousands of places to keep a few hundred.",
+      "fix": "Use a quadtree in memory. Start with the whole map as one square. Whenever a square holds more than about 100 places, split it into four equal squares, and repeat. The squares end up small in cities and huge in empty land, and every square holds a similar number of places. A search starts at the root and descends only into squares that touch the circle, which also reads every neighbour of the spot automatically, so there is no edge case to forget. At the leaves it measures real distances. The same adaptive idea exists inside databases as S2 cells: the circle is covered by a few cells of different sizes, and each cell is a range of a sorted 64-bit id.",
+      "tradeoff": "The work per search follows the number of results rather than the density of the area, and boundaries need no special code. The tree lives in memory and must be built from the database. Places seldom move, so changes can be applied in place or by rebuilding from a snapshot. A tree that is too deep or has too many tiny leaves wastes memory and pointer chasing, so leaves have a minimum size.",
+      "concepts": [{ "slug": "database-indexing" }, { "slug": "caching" }, { "slug": "latency-and-round-trips" }]
+    },
+    {
+      "title": "Serve searches from index replicas, and keep the truth in a database",
+      "problem": "The index is read by every search and needs to be fast, while the full records (descriptions, hours, photos) are large and are not needed to find candidates.",
+      "fix": "The places database holds the full record of each place, about 2 KB, and is the source of truth. A search service keeps only a compact entry per place (id, position, category, rating, price, opening hours and a few ranking fields, about 200 bytes) in memory in the tree. For 200 million places that is about 40 GB, which fits one large machine, so the index is split by region rather than hashed. A query centred in Paris asks the Paris shards and at most a neighbour. Each region has several replicas that load the same snapshot, and busy regions get more.",
+      "tradeoff": "Reads scale by adding replicas, and a search touches one or two shards instead of all of them. Regions are uneven, so a big city needs more copies than a county, and a search near a border visits two regions. The index is a copy, so it can be rebuilt but it can lag the database.",
+      "concepts": [{ "slug": "database-sharding" }, { "slug": "database-replication" }, { "slug": "horizontal-vs-vertical-scaling" }]
+    },
+    {
+      "title": "Cache the results of popular searches",
+      "problem": "Searches are repetitive. Thousands of people near the same station look for 'coffee' every morning, and the answer hardly changes from minute to minute.",
+      "fix": "The Search API first looks in a cache. The key is the location rounded to about 100 m, the radius and the filters, and the value is the list of ranked place ids, kept for a few minutes. Place details for popular places and the static photos are cached too, with photos on a CDN. Around 60% of searches can be answered without touching the index in a busy area.",
+      "tradeoff": "Latency drops and the index only sees the misses, so about 40% of the peak load. Rounding the location moves the distances by up to about 70 m, and results are as old as the time to live. Only the common filter combinations should be cached, since the number of possible keys is huge.",
+      "concepts": [{ "slug": "caching" }, { "slug": "cdn" }, { "slug": "latency-and-round-trips" }]
+    },
+    {
+      "title": "Filter and rank the candidates inside the search service",
+      "problem": "A circle in a city centre holds thousands of places, and the user wants about twenty good ones, such as ramen shops open now with at least four stars.",
+      "fix": "The compact entries carry what the filters need, so the search service drops places that do not match the category, price or opening hours before it fetches anything. The survivors get a score that mixes text relevance, rating, popularity and distance, with ratings smoothed so that one five-star review does not beat a thousand reviews averaging 4.7. The top 20 are returned with a cursor for the next page. Text queries use an inverted index of names and categories, and its matching ids are intersected with the places in the circle.",
+      "tradeoff": "Thousands of candidates shrink to a short list without any database round trip, and one ranking function is easy to tune. The ranking fields are a second copy of data and must be kept in sync. A cursor stays stable while the user pages, but the ranking can change a little between requests.",
+      "concepts": [{ "slug": "pagination" }, { "slug": "database-indexing" }, { "slug": "sql-vs-nosql" }]
+    },
+    {
+      "title": "Apply owners' changes through a queue",
+      "problem": "Owners add places, move them, close them and edit hours, and the index must follow without rebuilding 200 million entries each time.",
+      "fix": "A change is written to the places database, and a change event is published through a queue, using a transactional outbox so the two never disagree. Index replicas consume the events and apply them in place: a new place is inserted, a closed place is removed, a moved place is removed and inserted again, and an hours change updates the entry. Because every replica applies the same ordered events, they converge. Every night a full snapshot is built from the database, checked, and swapped in.",
+      "tradeoff": "A change shows up in search in about a minute, and a failed replica catches up from the queue. The index is eventually consistent, so a closed place may be listed for a few minutes, longer if its result is cached. There is a second path, the nightly rebuild, to build and test.",
+      "concepts": [{ "slug": "message-queues" }, { "slug": "transactional-outbox" }, { "slug": "event-sourcing" }]
+    }
+  ],
+  "failures": [
+    {
+      "scenario": "A user stands next to a cell edge",
+      "impact": "If only the user's own cell is read, places a few metres away on the other side of the edge are missing, and a search can lose more than half of what is inside its radius.",
+      "answer": "Read the neighbouring cells as well, with cells at least as wide as the radius, or use a tree search that visits every square touching the circle. Tests include places on both sides of cell edges, near the equator and the 0 degree meridian where unrelated prefixes sit side by side, and near the poles where cells get narrow.",
+      "concepts": [{ "slug": "database-indexing" }]
+    },
+    {
+      "scenario": "A big event fills one city centre with searches",
+      "impact": "The replicas of that region are overloaded while every other region sits idle, and slow searches pile up.",
+      "answer": "Add replicas to that region, serve repeated searches from the cache, and shed work in order: shorten the radius, reduce the page size, and rate-limit abusive clients. Dense areas have small leaves, so each search stays cheap, and the load balancer sends it to a healthy replica.",
+      "concepts": [{ "slug": "caching" }, { "slug": "load-balancing" }, { "slug": "rate-limiting" }]
+    },
+    {
+      "scenario": "A replica in a region fails or runs out of memory",
+      "impact": "Searches for that region fail or become slow.",
+      "answer": "Health checks remove the replica from rotation and other replicas of the same region take its traffic. A new one loads the latest snapshot and replays the events since it was taken from the queue. If a whole region is lost, searches can fall back to a wider, slower path against the database, with a lower limit on results.",
+      "concepts": [{ "slug": "health-checks" }, { "slug": "database-replication" }, { "slug": "circuit-breaker" }]
+    },
+    {
+      "scenario": "The nightly snapshot is built wrongly",
+      "impact": "If a half-built index is swapped in, a region could lose thousands of places without anyone noticing.",
+      "answer": "Before the swap the new snapshot is checked: its place count per region must be within a small margin of the database, and a set of sample searches must return the same places as the live index. The old snapshot is kept so the swap can be rolled back in a minute, and an alert fires if the counts drift.",
+      "concepts": [{ "slug": "alerting" }, { "slug": "metrics" }]
+    },
+    {
+      "scenario": "Someone searches in a remote area where nothing is within the radius",
+      "impact": "An empty page looks like a broken service, and a user who widens the radius by hand repeats the request many times.",
+      "answer": "If fewer than a minimum number of places are found, the service doubles the radius up to a cap and says so in the response. A k-nearest search does this directly by walking the tree nearest-first. Both are cheap because the tree has big leaves in empty land.",
+      "concepts": [{ "slug": "latency-and-round-trips" }, { "slug": "slos-and-error-budgets" }]
+    }
+  ],
+  "alternatives": [
+    {
+      "title": "How to index positions",
+      "options": [
+        { "name": "Geohash prefix in an ordinary index", "pro": "Works in any database, and the prefix is a simple range lookup", "con": "Fixed cell sizes, 9 cells to read, and cells that shrink towards the poles" },
+        { "name": "Quadtree in memory", "pro": "Adapts to density, no boundary special case, and a k-nearest search is natural", "con": "Lives in memory and has to be built and kept in step with the database" },
+        { "name": "S2 or H3 cells", "pro": "Cells of mixed sizes cover a circle with a few ranges, and S2 follows a Hilbert curve for good locality", "con": "A library to learn and a coverage step to tune" },
+        { "name": "R-tree in the database (PostGIS)", "pro": "Mature, exact, and also handles polygons and lines", "con": "Harder to spread over many machines, and heavier to update" }
+      ],
+      "pick": "An in-memory quadtree behind the search service, or S2 cells if the index has to live in a database."
+    },
+    {
+      "title": "Where the index lives",
+      "options": [
+        { "name": "In the main database", "pro": "One system, and updates are instantly consistent", "con": "Searches compete with everything else, and scaling reads means scaling the database" },
+        { "name": "A dedicated in-memory search service", "pro": "Very fast, easy to replicate, and filters and ranking fit next to the data", "con": "A second copy of the data to keep in sync" },
+        { "name": "A search engine with geo queries", "pro": "Text, filters and distance in one query, and sharding is built in", "con": "Less control over the ranking path and heavier operations" }
+      ],
+      "pick": "A dedicated search service built from the database, with a search engine as an option for the text part."
+    },
+    {
+      "title": "How to bound a query",
+      "options": [
+        { "name": "A fixed radius", "pro": "Simple to explain, and the work is predictable in sparse areas", "con": "Thousands of results in a city and none in the countryside" },
+        { "name": "The k nearest places", "pro": "Always gives a useful page, and the tree finds them nearest first", "con": "The farthest result can be far away, which can surprise the user" }
+      ],
+      "pick": "A radius with a cap on the number of candidates, and widening to the k nearest when too few are found."
+    },
+    {
+      "title": "How the index stays fresh",
+      "options": [
+        { "name": "Rebuild everything on a schedule", "pro": "Simple and always consistent", "con": "Changes wait for the next build" },
+        { "name": "Apply change events as they happen", "pro": "A change appears in about a minute", "con": "Needs a queue and replicas that can fall behind" },
+        { "name": "Both", "pro": "Fast changes, and the nightly build repairs any drift", "con": "Two paths to run and test" }
+      ],
+      "pick": "Both: events for freshness and a checked nightly snapshot for repair."
+    }
+  ],
+  "roles": [
+    { "id": "client", "label": "People", "description": "Users who search and owners who edit their listing." },
+    { "id": "edge", "label": "Search API", "description": "Receives requests, checks the cache and applies owners' edits." },
+    { "id": "async", "label": "Change queue", "description": "Carries edits from the database to the index replicas." },
+    { "id": "compute", "label": "Search and ranking", "description": "Walks the index, filters and scores the candidates." },
+    { "id": "data", "label": "State", "description": "The places database, index replicas and the result cache." }
+  ]
+}

@@ -1,0 +1,95 @@
+---
+import PlaygroundShell from '../../components/PlaygroundShell.astro';
+---
+<PlaygroundShell title="Count a late, duplicated click stream" hint="400 real clicks happen over 5 minutes, but the network delays some and repeats others. Change the window, the watermark lateness and dedup, and compare what is counted with the truth.">
+  <ol class="how">
+    <li>Start with the defaults: <b>30 s windows, 5 s lateness, dedup off</b>. The count is <b>428 against 400 real clicks</b>. 35 clicks were counted twice (retries), and 7 real clicks were lost because they arrived after their window had closed (12 late events were dropped, and some of those were copies). Windows were final about 6.5 s after they ended.</li>
+    <li>Turn <b>dedup on</b>: the double counts drop to <b>0</b> and the count is <b>393</b>. It is now low, because the 7 lost clicks are still lost. Dedup fixes duplicates and does nothing for late clicks.</li>
+    <li>Raise the lateness to <b>30 s</b> with dedup on: <b>400 of 400</b>, nothing dropped, but windows are final only about <b>31 s</b> after they end. Move it to 0 to see the other side: results in under 2 s, but 8 clicks lost.</li>
+  </ol>
+  <div class="pg acb" data-acb>
+    <div class="pg-row">
+      <label>Window size <select class="pg-in" data-w><option value="10">10 seconds</option><option value="30" selected>30 seconds</option><option value="60">60 seconds</option></select></label>
+      <label>Watermark lateness (s) <input type="range" min="0" max="60" step="1" value="5" data-l /> <b data-lval></b></label>
+      <label><input type="checkbox" data-dd /> Dedup by click id</label>
+    </div>
+    <div class="pg-grid">
+      <div class="pg-box" data-b1><h3>Counted, against the true clicks</h3><span class="pg-mono" data-o1></span><span class="pg-note" data-n1></span></div>
+      <div class="pg-box" data-b2><h3>Real clicks lost</h3><span class="pg-mono" data-o2></span><span class="pg-note" data-n2></span></div>
+      <div class="pg-box" data-b3><h3>Duplicates counted</h3><span class="pg-mono" data-o3></span><span class="pg-note" data-n3></span></div>
+      <div class="pg-box" data-b4><h3>Late events dropped</h3><span class="pg-mono" data-o4></span><span class="pg-note" data-n4></span></div>
+      <div class="pg-box" data-b5><h3>Windows final after</h3><span class="pg-mono" data-o5></span><span class="pg-note" data-n5></span></div>
+    </div>
+    <div class="pg-box"><h3>Each window: counted / true</h3><div class="acb-cells" data-cells></div></div>
+    <p class="pg-out" data-verdict aria-live="polite"></p>
+    <p class="pg-note">Model: 400 clicks at random times in 300 s. 85% are delayed by under 2 s, 12% by 2 to 10 s and 3% by 10 to 45 s. About 12% of clicks are sent again, usually 1 to 7 s after the first (sometimes 15 to 55 s). The watermark is the newest event time seen minus the lateness. An event is late if its window has already closed, and a late copy of a counted click is not a lost click. The same stream is used for every setting.</p>
+  </div>
+</PlaygroundShell>
+<style>
+  .acb-cells { display: grid; grid-template-columns: repeat(auto-fill, minmax(5.5rem, 1fr)); gap: 2px 8px; font-family: var(--mono, ui-monospace, monospace); font-size: .85rem; }
+  .acb-cells span[hidden] { display: none; }
+  .acb-cells span.off { color: var(--bad); }
+</style>
+<script>
+  document.querySelectorAll<HTMLElement>('[data-acb]').forEach((root) => {
+    const q = <T extends HTMLElement>(s: string) => root.querySelector<T>(s)!;
+    type Ev = { id: number; t: number; arr: number };
+    const TOTAL = 400; const SPAN = 300; const MAXW = 30;
+    let seed = 7; const rnd = () => ((seed = (seed * 1664525 + 1013904223) % 4294967296) / 4294967296);
+    const events: Ev[] = [];
+    for (let i = 0; i < TOTAL; i++) {
+      const t = rnd() * SPAN; const u = rnd();
+      const d = u < 0.85 ? rnd() * 2 : u < 0.97 ? 2 + rnd() * 8 : 10 + rnd() * 35;
+      events.push({ id: i, t, arr: t + d });
+      if (rnd() < 0.12) { const e = rnd() < 0.8 ? 1 + rnd() * 6 : 15 + rnd() * 40; events.push({ id: i, t, arr: t + d + e }); }
+    }
+    events.sort((a, b) => a.arr - b.arr || a.id - b.id);
+    const cells: HTMLElement[] = Array.from({ length: MAXW }, () => { const s = document.createElement('span'); s.hidden = true; q('[data-cells]').append(s); return s; });
+    function simulate(W: number, L: number, dedup: boolean) {
+      let maxT = -1e9; let closed = -1; const seen = new Set<number>(); const counted = new Set<number>();
+      const perWin = new Array(Math.ceil(SPAN / W)).fill(0); const truth = new Array(perWin.length).fill(0);
+      let total = 0; let late = 0; let dup = 0; let delaySum = 0; let nClosed = 0; let maxDelay = 0;
+      const first = new Set<number>(); events.forEach((e) => { if (!first.has(e.id)) { first.add(e.id); truth[Math.floor(e.t / W)]++; } });
+      for (const e of events) {
+        const w = Math.floor(e.t / W);
+        if (w <= closed) { late++; continue; }
+        if (dedup && seen.has(e.id)) continue;
+        seen.add(e.id); total++; perWin[w]++;
+        if (counted.has(e.id)) dup++;
+        counted.add(e.id);
+        if (e.t > maxT) {
+          maxT = e.t; const wm = maxT - L;
+          while ((closed + 2) * W <= wm) { closed++; const dl = e.arr - (closed + 1) * W; if (closed < perWin.length) { delaySum += dl; nClosed++; maxDelay = Math.max(maxDelay, dl); } }
+        }
+      }
+      return { total, late, dup, lost: TOTAL - counted.size, avg: nClosed ? delaySum / nClosed : 0, maxDelay, perWin, truth };
+    }
+    function draw() {
+      const W = Number(q<HTMLSelectElement>('[data-w]').value); const L = Number(q<HTMLInputElement>('[data-l]').value); const dd = q<HTMLInputElement>('[data-dd]').checked;
+      q('[data-lval]').textContent = `${L} s`;
+      const r = simulate(W, L, dd);
+      q('[data-o1]').textContent = `${r.total} counted, ${TOTAL} real`;
+      q('[data-n1]').textContent = r.total === TOTAL ? 'exactly right' : `${r.total > TOTAL ? '+' : ''}${r.total - TOTAL} against the truth`;
+      q('[data-o2]').textContent = `${r.lost} clicks`; q('[data-n2]').textContent = 'never counted, because every copy arrived too late';
+      q('[data-o3]').textContent = `${r.dup} clicks`; q('[data-n3]').textContent = dd ? 'dedup ignores a click id it has counted' : 'each retry was added again';
+      q('[data-o4]').textContent = `${r.late} events`; q('[data-n4]').textContent = 'including late copies of clicks already counted';
+      q('[data-o5]').textContent = `${r.avg.toFixed(1)} s on average`; q('[data-n5]').textContent = `slowest window ${r.maxDelay.toFixed(1)} s after it ended`;
+      const set = (id: string, c: string) => q<HTMLElement>(id).style.setProperty('--c', c);
+      set('[data-b1]', r.total === TOTAL ? 'var(--good)' : 'var(--bad)'); set('[data-b2]', r.lost ? 'var(--bad)' : 'var(--good)');
+      set('[data-b3]', r.dup ? 'var(--bad)' : 'var(--good)'); set('[data-b4]', 'var(--accent)'); set('[data-b5]', 'var(--accent)');
+      cells.forEach((c, i) => {
+        c.hidden = i >= r.perWin.length;
+        if (!c.hidden) { c.textContent = `${i}: ${r.perWin[i]} / ${r.truth[i]}`; c.classList.toggle('off', r.perWin[i] !== r.truth[i]); }
+      });
+      const out = q('[data-verdict]'); const wrong = r.total !== TOTAL || r.dup > 0 || r.lost > 0; out.classList.toggle('bad', wrong);
+      const parts: string[] = [];
+      if (r.dup) parts.push(`${r.dup} clicks were counted twice, which a dedup on the click id would remove`);
+      if (r.lost) parts.push(`${r.lost} real clicks were lost, because their windows had closed before any copy arrived (a longer lateness would keep them, but windows would take longer to finish)`);
+      out.textContent = !wrong ? `Exact: ${r.total} of ${TOTAL}. The price is that each window is final about ${r.avg.toFixed(0)} s after it ends.`
+        : parts.length === 2 ? `Counted ${r.total} against ${TOTAL}: the errors partly cancel. ${parts[0]}, and ${parts[1]}.`
+        : `Counted ${r.total} against ${TOTAL}: ${parts[0]}.`;
+    }
+    root.addEventListener('input', draw); root.addEventListener('change', draw);
+    draw();
+  });
+</script>

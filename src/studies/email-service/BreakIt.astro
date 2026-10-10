@@ -1,0 +1,116 @@
+---
+import PlaygroundShell from '../../components/PlaygroundShell.astro';
+---
+<PlaygroundShell title="Send a campaign to 600 addresses" hint="Four providers accept different rates: gmail.com 30 a minute, yahoo.com 20, corp.example 5 and tiny.org 3. A reputation of 100 falls with hard bounces, throttling and hasty retries, and below 60 the providers block you. The campaign is sent twice to the same list, so you can see what the first send leaves behind.">
+  <ol class="how">
+    <li>Start with the default <b>one shared queue</b>, backoff and no suppression list. The queue ignores the domains' limits, so the small ones answer 421 (<b>throttled</b>, 19 times), and with the 24 hard bounces the reputation falls to <b>57</b>, under 60, in the first send. The second send is then <b>blocked</b> for all 600 messages, even to good addresses.</li>
+    <li>Switch to <b>a queue per domain</b>: no domain is sent more than it accepts, nothing is throttled, and the first send ends at reputation <b>76</b>, a cost of only the 24 hard bounces. All 576 good addresses are delivered, in half the time. But the second send mails the 24 bad addresses again, and the repeated bounces push the reputation to 59 and block most of it.</li>
+    <li>Now set <b>suppression</b> to skip hard bounces: those 24 addresses are skipped, the second send delivers 576 of 576 and the reputation stays at 76. Then try <b>retry every minute</b>: it still delivers, but each hasty retry costs reputation (it ends near 69, then 62). And <b>no retry</b> gives up on the 31 messages that only needed a second try.</li>
+  </ol>
+  <div class="pg emb" data-emb>
+    <div class="pg-row">
+      <label>Queues <select class="pg-in" data-mode>
+        <option value="shared" selected>one shared queue, one global rate</option>
+        <option value="perDomain">a queue per recipient domain</option>
+      </select></label>
+      <label>Global rate, messages per minute <input type="range" min="10" max="60" step="10" value="60" data-rate /> <b data-rateval></b></label>
+      <label>Retry policy <select class="pg-in" data-retry>
+        <option value="none">no retry</option>
+        <option value="fixed">retry every minute</option>
+        <option value="backoff" selected>backoff: 2, 4, 8, 16 minutes</option>
+      </select></label>
+      <label>Suppression list <select class="pg-in" data-sup>
+        <option value="off" selected>none: mail every address again</option>
+        <option value="on">skip addresses that hard bounced</option>
+      </select></label>
+    </div>
+    <div class="pg-grid">
+      <div class="pg-box" data-b1><h3>Delivered</h3><span class="pg-mono" data-o1></span><span class="pg-note" data-n1></span></div>
+      <div class="pg-box" data-b2><h3>Deferred (421 and 451)</h3><span class="pg-mono" data-o2></span><span class="pg-note" data-n2></span></div>
+      <div class="pg-box" data-b3><h3>Blocked (550, blocklisted)</h3><span class="pg-mono" data-o3></span><span class="pg-note" data-n3></span></div>
+      <div class="pg-box" data-b4><h3>Hard bounces</h3><span class="pg-mono" data-o4></span><span class="pg-note" data-n4></span></div>
+      <div class="pg-box" data-b5><h3>Reputation score (0 to 100)</h3><span class="pg-mono" data-o5></span><span class="pg-note" data-n5></span></div>
+    </div>
+    <p class="pg-out" data-verdict aria-live="polite"></p>
+    <p class="pg-note">Model: the sender starts at 100. A hard bounce costs 1, a 421 because a domain was sent too much costs 1, and a retry after one minute costs 0.2. Under 60, every attempt is refused with a 550 until the message is given up. A temporary 451 happens in 5 to 10 percent of the attempts. A message is given up after 5 attempts. The sending budget grows from 12 messages a minute by one each minute up to the global rate, like a warming IP. Time is in minutes here, and real systems use longer waits. The second send starts with the reputation the first one ended with.</p>
+  </div>
+</PlaygroundShell>
+<script>
+  document.querySelectorAll<HTMLElement>('[data-emb]').forEach((root) => {
+    const q = <T extends HTMLElement>(s: string) => root.querySelector<T>(s)!;
+    // SIM-START
+    const DOMAINS = [
+      { weight: 50, limit: 30, hard: 3, soft: 5 }, { weight: 25, limit: 20, hard: 4, soft: 5 },
+      { weight: 15, limit: 5, hard: 2, soft: 10 }, { weight: 10, limit: 3, hard: 5, soft: 5 },
+    ];
+    const mix = (id: number) => Math.imul(id, 2654435761) >>> 16;
+    const domainOf = (id: number) => { let r = mix(id) % 100; for (let d = 0; d < DOMAINS.length; d++) { if (r < DOMAINS[d].weight) return d; r -= DOMAINS[d].weight; } return 0; };
+    const exists = (id: number) => (mix(id + 7919) % 100) >= DOMAINS[domainOf(id)].hard; // fixed per address
+    type Msg = { id: number; d: number; tries: number; next: number; done: boolean; wasBlocked: boolean };
+    function simulate(mode: string, retry: string, rate: number, ids: number[], suppressed: Set<number>, startRep: number) {
+      let seed = 99;
+      const roll = () => { seed = (seed * 1664525 + 1013904223) % 4294967296; return Math.floor(seed / 65536) % 100; };
+      const msgs: Msg[] = ids.filter((id) => !suppressed.has(id)).map((id) => ({ id, d: domainOf(id), tries: 0, next: 0, done: false, wasBlocked: false }));
+      const s = { skipped: ids.length - msgs.length, delivered: 0, hard: 0, lost: 0, throttled: 0, deferred: 0, minutes: 0, blockedMsgs: 0 };
+      let rep = startRep; let pending = msgs.length;
+      const maxTries = retry === 'none' ? 1 : 5;
+      for (let minute = 0; pending > 0 && minute < 400; minute++) {
+        s.minutes = minute + 1;
+        const used = DOMAINS.map(() => 0); let budget = Math.min(rate, 12 + minute);
+        const fail = (m: Msg) => { m.tries++; if (m.tries >= maxTries) { m.done = true; pending--; s.lost++; } else m.next = minute + (retry === 'fixed' ? 1 : 1 << m.tries); };
+        const attempt = (m: Msg) => {
+          used[m.d]++;
+          if (m.tries > 0 && retry === 'fixed') rep = Math.max(0, rep - 2);
+          if (used[m.d] > DOMAINS[m.d].limit) { s.throttled++; rep = Math.max(0, rep - 10); fail(m); }
+          else if (rep < 600) { if (!m.wasBlocked) { m.wasBlocked = true; s.blockedMsgs++; } fail(m); }
+          else if (!exists(m.id)) { s.hard++; rep = Math.max(0, rep - 10); suppressed.add(m.id); m.done = true; pending--; }
+          else if (roll() < DOMAINS[m.d].soft) { s.deferred++; fail(m); }
+          else { s.delivered++; m.done = true; pending--; }
+        };
+        const ready = msgs.filter((m) => !m.done && m.next <= minute);
+        if (mode === 'shared') { for (const m of ready) { if (budget-- <= 0) break; attempt(m); } }
+        else {
+          const queues = DOMAINS.map((_, d) => ready.filter((m) => m.d === d));
+          for (let progress = true; budget > 0 && progress;) {
+            progress = false;
+            for (let d = 0; d < DOMAINS.length && budget > 0; d++) if (used[d] < DOMAINS[d].limit && queues[d].length) { attempt(queues[d].shift()!); budget--; progress = true; }
+          }
+        }
+      }
+      return { ...s, rep };
+    }
+    function campaign(mode: string, retry: string, rate: number, suppress: boolean) {
+      const ids = Array.from({ length: 600 }, (_, i) => i); const list = new Set<number>();
+      const a = simulate(mode, retry, rate, ids, list, 1000);
+      const b = simulate(mode, retry, rate, ids, suppress ? new Set(list) : new Set<number>(), a.rep);
+      return { a, b };
+    }
+    // SIM-END
+    const BLOCK = 600;
+    const score = (n: number) => (n / 10).toFixed(1).replace(/\.0$/, '');
+    const tone = (rep: number) => (rep >= 800 ? 'var(--good)' : rep >= BLOCK ? 'var(--accent)' : 'var(--bad)');
+    function draw() {
+      const mode = q<HTMLSelectElement>('[data-mode]').value; const retry = q<HTMLSelectElement>('[data-retry]').value;
+      const rate = Number(q<HTMLInputElement>('[data-rate]').value); const sup = q<HTMLSelectElement>('[data-sup]').value === 'on';
+      q('[data-rateval]').textContent = String(rate);
+      const { a, b } = campaign(mode, retry, rate, sup);
+      const set = (i: number, one: string, two: string, note: string, color: string) => {
+        q(`[data-o${i}]`).textContent = `send 1: ${one}\nsend 2: ${two}`; q(`[data-n${i}]`).textContent = note; q<HTMLElement>(`[data-b${i}]`).style.setProperty('--c', color);
+      };
+      set(1, `${a.delivered} of 600`, `${b.delivered} of ${600 - b.skipped}`, `${a.lost + b.lost} messages given up in total`, b.delivered >= 570 && a.delivered >= 570 ? 'var(--good)' : 'var(--bad)');
+      set(2, `${a.deferred + a.throttled}`, `${b.deferred + b.throttled}`, `${a.throttled + b.throttled} of them were 421 because a domain was sent too much`, a.throttled + b.throttled > 0 ? 'var(--bad)' : 'var(--accent)');
+      set(3, `${a.blockedMsgs}`, `${b.blockedMsgs}`, a.blockedMsgs + b.blockedMsgs > 0 ? 'messages refused because the reputation fell under 60' : 'nobody blocked us', a.blockedMsgs + b.blockedMsgs > 0 ? 'var(--bad)' : 'var(--good)');
+      set(4, `${a.hard}`, `${b.hard}`, b.skipped > 0 ? `${b.skipped} known bad addresses skipped in send 2` : 'bad addresses are mailed again in send 2', b.hard > 0 ? 'var(--bad)' : 'var(--good)');
+      set(5, score(a.rep), score(b.rep), b.rep < BLOCK ? 'under 60: the providers are blocking' : b.rep < 800 ? 'a warning level, and slow to recover' : 'healthy', tone(b.rep));
+      const out = q('[data-verdict]'); const bad = a.blockedMsgs + b.blockedMsgs > 0 || a.lost + b.lost > 40;
+      out.classList.toggle('bad', bad);
+      if (a.rep < BLOCK && b.blockedMsgs > 0) out.textContent = `The first send ended at reputation ${score(a.rep)} (${a.throttled} throttled replies and ${a.hard} hard bounces), so the second send was blocked for ${b.blockedMsgs} messages and delivered only ${b.delivered} of ${600 - b.skipped}.`;
+      else if (b.blockedMsgs > 0) out.textContent = `The second send starts at reputation ${score(a.rep)} and repeats ${b.hard} hard bounces, which pushes it under 60. ${b.blockedMsgs} messages were blocked and ${b.lost} given up. A suppression list would have avoided this.`;
+      else if (a.lost + b.lost > 40) out.textContent = `Nobody blocked us, but ${a.lost + b.lost} messages were given up: with ${retry === 'none' ? 'no retry, every temporary 451 loses its message' : 'the retries used'}, they never got a second chance.`;
+      else if (retry === 'fixed') out.textContent = `Everything was delivered, but retrying every minute cost reputation: it ended at ${score(b.rep)}, and a longer backoff would keep it higher.`;
+      else out.textContent = `Healthy: ${a.delivered} and ${b.delivered} delivered, nothing throttled or blocked, ${b.skipped} known bad addresses skipped${b.skipped ? '' : ' (none yet)'}, and the reputation ended at ${score(b.rep)}.`;
+    }
+    root.addEventListener('input', draw); root.addEventListener('change', draw);
+    draw();
+  });
+</script>

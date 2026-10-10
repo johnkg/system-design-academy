@@ -1,0 +1,57 @@
+{
+  "actors": [
+    { "id": "producer", "label": "Producer", "role": "client", "x": 14, "y": 16 },
+    { "id": "partitioner", "label": "Partitioner (in the client)", "role": "edge", "x": 50, "y": 16 },
+    { "id": "leader", "label": "Leader of partition 2 (broker 1)", "role": "async", "x": 86, "y": 16 },
+    { "id": "coord", "label": "Group coordinator", "role": "compute", "x": 14, "y": 50 },
+    { "id": "f1", "label": "Follower (broker 2)", "role": "data", "x": 50, "y": 50 },
+    { "id": "f2", "label": "Follower (broker 3)", "role": "data", "x": 86, "y": 50 },
+    { "id": "consumerA", "label": "Consumer A", "role": "client", "x": 14, "y": 84 },
+    { "id": "offsets", "label": "Committed offsets", "role": "data", "x": 50, "y": 84 },
+    { "id": "consumerB", "label": "Consumer B", "role": "client", "x": 86, "y": 84 }
+  ],
+  "frames": [
+    {
+      "narration": "A producer sends a batch of 3 records for key customer-42, with acks=all. The partitioner in the client hashes the key and takes it modulo the 6 partitions of the topic, which gives partition 2. The same key always gives partition 2, which keeps its records in order.",
+      "messages": [{ "from": "producer", "to": "partitioner", "label": "3 records, key customer-42" }],
+      "states": { "partitioner": "partition 2" }
+    },
+    {
+      "narration": "The client knows from its cached metadata that broker 1 leads partition 2, and sends the batch there. The leader appends the 3 records to the end of its active segment, as offsets 9,001, 9,002 and 9,003. The next offset is now 9,004.",
+      "messages": [{ "from": "partitioner", "to": "leader", "label": "batch for partition 2" }],
+      "states": { "leader": "appended, next offset 9,004" }
+    },
+    {
+      "narration": "The followers keep fetching from the leader, just as consumers do, and append what they get. Both are in the in-sync set, so the leader is waiting for both before it answers.",
+      "messages": [{ "from": "f1", "to": "leader", "label": "fetch from 9,001" }, { "from": "f2", "to": "leader", "label": "fetch from 9,001" }],
+      "states": { "f1": "copied to 9,004", "f2": "copied to 9,004" }
+    },
+    {
+      "narration": "Every in-sync replica now has offsets up to 9,003, so the high watermark moves to 9,004 and the leader acknowledges the write. If broker 1 died now, either follower could take over without losing these records. With acks=1 the answer would have come one step earlier, before the followers had them.",
+      "messages": [{ "from": "leader", "to": "producer", "label": "ack: offsets 9,001 to 9,003" }],
+      "states": { "leader": "high watermark 9,004", "producer": "acknowledged" },
+      "highlight": ["leader"]
+    },
+    {
+      "narration": "Consumer A, a member of the group billing, owns partition 2. After a restart it asks where the group stopped, and the answer is offset 9,001. It fetches from there and gets the 3 records. Records beyond the high watermark would not be shown.",
+      "messages": [{ "from": "consumerA", "to": "offsets", "label": "billing, partition 2?" }, { "from": "offsets", "to": "consumerA", "label": "9,001" }, { "from": "consumerA", "to": "leader", "label": "fetch from 9,001" }, { "from": "leader", "to": "consumerA", "label": "3 records" }],
+      "states": { "consumerA": "processing 9,001 to 9,003" }
+    },
+    {
+      "narration": "Only after processing the records does Consumer A commit the next offset, 9,004. If it had crashed before this commit, the three records would be delivered again, which is why processing should be idempotent. If it committed first and crashed, they would be skipped.",
+      "messages": [{ "from": "consumerA", "to": "offsets", "label": "commit 9,004" }],
+      "states": { "offsets": "billing, partition 2 = 9,004", "consumerA": "committed" }
+    },
+    {
+      "narration": "Consumer B joins the group. The coordinator rebalances: 6 partitions over 2 members, so A gets partitions 0 to 2 and B gets 3 to 5. A keeps partition 2 and continues at 9,004 with no gap and no repeat.",
+      "messages": [{ "from": "consumerB", "to": "coord", "label": "join group billing" }, { "from": "coord", "to": "consumerA", "label": "partitions 0, 1, 2" }, { "from": "coord", "to": "consumerB", "label": "partitions 3, 4, 5" }],
+      "states": { "coord": "rebalanced: 3 + 3" }
+    },
+    {
+      "narration": "Later broker 1 fails. The controller chooses broker 2, which was in the in-sync set and has every record up to 9,003, as the new leader. The producer gets an error, refreshes its metadata and retries its next batch there, with a sequence number so that a repeated record is recognised and dropped.",
+      "messages": [{ "from": "partitioner", "to": "f1", "label": "retry after metadata refresh" }],
+      "states": { "leader": "down", "f1": "new leader, next offset 9,004" },
+      "highlight": ["f1"]
+    }
+  ]
+}

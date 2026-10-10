@@ -1,0 +1,177 @@
+---
+import PlaygroundShell from '../../components/PlaygroundShell.astro';
+---
+<PlaygroundShell title="Places within a radius" hint="8,000 places on a 128 by 128 km map: a dense city, a small town and empty countryside. Search a radius around one spot five ways and see how many places each way examines, and which ones it misses. Figures come from a real search.">
+  <ol class="how">
+    <li>The default is <b>downtown, 3 km, geohash cell only</b> with <b>4 km cells</b>: the search examines 587 places and returns 386 of the 928 that are really within 3 km. The spot sits next to a cell edge, so the other 542 are <b>missed</b>, shown in red.</li>
+    <li>Switch to <b>geohash cell plus its 8 neighbours</b>: all 928 are found, at the price of examining 3,453 places in 9 lookups. Now raise the radius to <b>8 km</b>: it finds 3,331 of 4,196 and misses 865, because the circle reaches further than one cell. The cell must be at least as wide as the radius.</li>
+    <li>Switch to the <b>adaptive quadtree</b> at 3 km: all 928 found with 1,433 places examined in 72 nodes, and the cell size no longer matters. Choose <b>countryside</b> at 8 km and compare the <b>fixed grid with 1 km cells</b> (235 cells looked up to find 20 places) with the quadtree (8 nodes).</li>
+  </ol>
+  <div class="pg pxb" data-pxb>
+    <div class="pg-row">
+      <label>Search from <select class="pg-in" data-where>
+        <option value="down" selected>downtown, next to a cell edge (dense)</option>
+        <option value="town">the small town (medium)</option>
+        <option value="rural">the countryside (sparse)</option>
+      </select></label>
+      <label>Radius (km) <input type="range" min="1" max="10" value="3" data-r /> <b data-rval></b></label>
+      <label>Cell size <select class="pg-in" data-cell>
+        <option value="1">1 km (14-bit prefix)</option>
+        <option value="2">2 km (12-bit prefix)</option>
+        <option value="4" selected>4 km (10-bit prefix)</option>
+        <option value="8">8 km (8-bit prefix)</option>
+        <option value="16">16 km (6-bit prefix)</option>
+      </select></label>
+      <label>Search method <select class="pg-in" data-method>
+        <option value="scan">Check every place</option>
+        <option value="grid">Fixed grid, every cell the circle touches</option>
+        <option value="own">Geohash prefix, own cell only</option>
+        <option value="nbr">Geohash prefix, own cell and 8 neighbours</option>
+        <option value="quad">Adaptive quadtree (at most 50 places per leaf)</option>
+      </select></label>
+    </div>
+    <canvas data-cv width="560" height="560" role="img" aria-label="Map of places around the search spot" style="width:100%;max-width:560px;aspect-ratio:1;display:block;margin:8px 0;border:1px solid var(--border);border-radius:var(--radius)"></canvas>
+    <p class="pg-note" data-legend><span style="color:var(--good)">&#9679;</span> found <span style="color:var(--bad)">&#9679;</span> missed <span style="color:var(--role-4)">&#9679;</span> examined but outside the circle <span style="color:var(--muted)">&#9679;</span> never looked at. The shaded squares are the cells or tree leaves that were searched, and the ring is the radius.</p>
+    <div class="pg-grid">
+      <div class="pg-box" data-b1><h3>Answer</h3><span class="pg-mono" data-o1></span><span class="pg-note" data-n1></span></div>
+      <div class="pg-box" data-b2><h3>Places examined</h3><span class="pg-mono" data-o2></span><span class="pg-note" data-n2></span></div>
+      <div class="pg-box" data-b3><h3>Cells or tree nodes looked up</h3><span class="pg-mono" data-o3></span><span class="pg-note" data-n3></span></div>
+    </div>
+    <p class="pg-out" data-verdict aria-live="polite"></p>
+    <p class="pg-note">Model: 6,000 places in a city (spread 5 km), 800 in a town (2.5 km) and 1,200 anywhere, placed with a fixed seed. Distances are flat kilometres, and the cell edges are at multiples of the cell size, like a geohash prefix with a bit count shown next to it (a real geohash character is 5 bits, with cells that are not square). "Examined" counts the places whose distance was measured. Real services also rank, filter and cap the results, which this does not.</p>
+  </div>
+</PlaygroundShell>
+<script>
+  document.querySelectorAll<HTMLElement>('[data-pxb]').forEach((root) => {
+    const q = <T extends HTMLElement>(s: string) => root.querySelector<T>(s)!;
+    const WORLD = 128; const CAP = 50; const MIN_SIZE = 0.125;
+    type P = { x: number; y: number };
+    type Q = { x: number; y: number; s: number; pts: P[] | null; kids: Q[] | null };
+    type Rect = [number, number, number];
+    type Res = { cand: number; cells: number; hits: P[]; rects: Rect[]; cands: P[] };
+    let seed = 11; const rnd = () => ((seed = (seed * 1664525 + 1013904223) % 4294967296) / 4294967296);
+    const gauss = () => Math.sqrt(-2 * Math.log(1 - rnd())) * Math.cos(2 * Math.PI * rnd());
+    const clamp = (v: number) => Math.min(WORLD - 0.001, Math.max(0, v));
+    const pts: P[] = [];
+    const cluster = (n: number, cx: number, cy: number, sd: number) => { for (let i = 0; i < n; i++) pts.push({ x: clamp(cx + gauss() * sd), y: clamp(cy + gauss() * sd) }); };
+    cluster(6000, 30, 35, 5); cluster(800, 72, 70, 2.5);
+    for (let i = 0; i < 1200; i++) pts.push({ x: rnd() * WORLD, y: rnd() * WORLD });
+    const leaves: Rect[] = [];
+    function build(x: number, y: number, s: number, list: P[]): Q {
+      if (list.length <= CAP || s <= MIN_SIZE) { leaves.push([x, y, s]); return { x, y, s, pts: list, kids: null }; }
+      const h = s / 2; const parts: P[][] = [[], [], [], []];
+      for (const p of list) parts[(p.x >= x + h ? 1 : 0) + (p.y >= y + h ? 2 : 0)].push(p);
+      return { x, y, s, pts: null, kids: parts.map((part, i) => build(x + (i & 1 ? h : 0), y + (i & 2 ? h : 0), h, part)) };
+    }
+    const tree = build(0, 0, WORLD, pts);
+    // Distance from the circle's centre to a square is at most r when the square can contain a place inside the circle.
+    const near = (x0: number, y0: number, s: number, cx: number, cy: number, r: number) => {
+      const dx = Math.max(x0 - cx, 0, cx - (x0 + s)); const dy = Math.max(y0 - cy, 0, cy - (y0 + s)); return dx * dx + dy * dy <= r * r;
+    };
+    const grids = new Map<number, Map<string, P[]>>();
+    function gridFor(c: number) {
+      let g = grids.get(c); if (g) return g;
+      g = new Map(); for (const p of pts) { const k = `${Math.floor(p.x / c)},${Math.floor(p.y / c)}`; (g.get(k) ?? g.set(k, []).get(k)!).push(p); }
+      grids.set(c, g); return g;
+    }
+    function search(method: string, cx: number, cy: number, r: number, c: number): Res {
+      const res: Res = { cand: 0, cells: 0, hits: [], rects: [], cands: [] };
+      const test = (list: P[]) => { for (const p of list) { res.cand++; res.cands.push(p); if (Math.hypot(p.x - cx, p.y - cy) <= r) res.hits.push(p); } };
+      if (method === 'scan') { res.cells = 1; test(pts); return res; }
+      if (method === 'quad') {
+        const walk = (n: Q) => {
+          res.cells++;
+          if (n.pts) { res.rects.push([n.x, n.y, n.s]); test(n.pts); return; }
+          for (const k of n.kids!) if (near(k.x, k.y, k.s, cx, cy, r)) walk(k);
+        };
+        walk(tree); return res;
+      }
+      const g = gridFor(c); const ix = Math.floor(cx / c); const iy = Math.floor(cy / c);
+      let x0 = ix, x1 = ix, y0 = iy, y1 = iy;
+      if (method === 'nbr') { x0--; x1++; y0--; y1++; }
+      if (method === 'grid') { x0 = Math.floor((cx - r) / c); x1 = Math.floor((cx + r) / c); y0 = Math.floor((cy - r) / c); y1 = Math.floor((cy + r) / c); }
+      for (let i = x0; i <= x1; i++) for (let j = y0; j <= y1; j++) {
+        if (method === 'grid' && !near(i * c, j * c, c, cx, cy, r)) continue;
+        res.cells++; res.rects.push([i * c, j * c, c]);
+        const list = g.get(`${i},${j}`); if (list) test(list);
+      }
+      return res;
+    }
+
+    const spots: Record<string, [number, number, string]> = { down: [31.5, 35.5, 'downtown'], town: [72.3, 70.2, 'the town'], rural: [100.3, 20.2, 'the countryside'] };
+    const names: Record<string, string> = { scan: 'checking every place', grid: 'the fixed grid', own: 'the geohash cell alone', nbr: 'the geohash cell with its 8 neighbours', quad: 'the quadtree' };
+    const fmt = (n: number) => n.toLocaleString('en-US');
+    const cv = q<HTMLCanvasElement>('[data-cv]'); const g2 = cv.getContext('2d')!;
+    const token = (name: string) => getComputedStyle(document.documentElement).getPropertyValue(name).trim() || '#888';
+    let last: { cx: number; cy: number; r: number; c: number; method: string; res: Res; truth: Set<P> } | null = null;
+    let queued = false;
+
+    function paint() {
+      queued = false; if (!last) return;
+      const { cx, cy, r, c, method, res, truth } = last;
+      const W = cv.width; const H = Math.max(2.4 * r, 8);
+      const px = (x: number) => ((x - (cx - H)) / (2 * H)) * W; const py = (y: number) => ((cy + H - y) / (2 * H)) * W; const sc = W / (2 * H);
+      g2.fillStyle = token('--surface'); g2.fillRect(0, 0, W, W);
+      const inView = (x: number, y: number, s: number) => x + s >= cx - H && x <= cx + H && y + s >= cy - H && y <= cy + H;
+      g2.fillStyle = token('--accent-soft'); g2.strokeStyle = token('--accent'); g2.lineWidth = 1;
+      for (const [x, y, s] of res.rects) if (inView(x, y, s)) { g2.globalAlpha = 0.55; g2.fillRect(px(x), py(y + s), s * sc, s * sc); g2.globalAlpha = 0.5; g2.strokeRect(px(x), py(y + s), s * sc, s * sc); }
+      g2.globalAlpha = 0.28; g2.strokeStyle = token('--muted');
+      if (method === 'quad') { for (const [x, y, s] of leaves) if (inView(x, y, s) && s * sc > 3) g2.strokeRect(px(x), py(y + s), s * sc, s * sc); }
+      else if (method !== 'scan') {
+        for (let gx = Math.floor((cx - H) / c) * c; gx <= cx + H; gx += c) { g2.beginPath(); g2.moveTo(px(gx), 0); g2.lineTo(px(gx), W); g2.stroke(); }
+        for (let gy = Math.floor((cy - H) / c) * c; gy <= cy + H; gy += c) { g2.beginPath(); g2.moveTo(0, py(gy)); g2.lineTo(W, py(gy)); g2.stroke(); }
+      }
+      g2.globalAlpha = 1;
+      const examined = new Set(res.cands); const found = new Set(res.hits);
+      const dot = (p: P, colour: string, size: number) => { g2.fillStyle = colour; g2.fillRect(px(p.x) - size / 2, py(p.y) - size / 2, size, size); };
+      const muted = token('--muted'); const amber = token('--role-4'); const good = token('--good'); const bad = token('--bad');
+      g2.globalAlpha = 0.45;
+      for (const p of pts) if (Math.abs(p.x - cx) <= H && Math.abs(p.y - cy) <= H && !examined.has(p) && !truth.has(p)) dot(p, muted, 2);
+      g2.globalAlpha = 0.9;
+      for (const p of res.cands) if (!found.has(p) && Math.abs(p.x - cx) <= H && Math.abs(p.y - cy) <= H) dot(p, amber, 2.5);
+      for (const p of res.hits) if (Math.abs(p.x - cx) <= H && Math.abs(p.y - cy) <= H) dot(p, good, 3);
+      g2.globalAlpha = 1;
+      for (const p of truth) if (!found.has(p) && Math.abs(p.x - cx) <= H && Math.abs(p.y - cy) <= H) dot(p, bad, 4);
+      g2.strokeStyle = token('--accent'); g2.lineWidth = 2; g2.beginPath(); g2.arc(px(cx), py(cy), r * sc, 0, Math.PI * 2); g2.stroke();
+      g2.strokeStyle = token('--text'); g2.beginPath(); g2.moveTo(px(cx) - 6, py(cy)); g2.lineTo(px(cx) + 6, py(cy)); g2.moveTo(px(cx), py(cy) - 6); g2.lineTo(px(cx), py(cy) + 6); g2.stroke();
+      g2.fillStyle = token('--muted'); g2.font = '13px sans-serif'; g2.fillText(`${(2 * H).toFixed(0)} km wide window`, 8, W - 8);
+    }
+    const schedule = () => { if (!queued) { queued = true; requestAnimationFrame(paint); } };
+
+    function draw() {
+      const [cx, cy, place] = spots[q<HTMLSelectElement>('[data-where]').value];
+      const r = Number(q<HTMLInputElement>('[data-r]').value); const c = Number(q<HTMLSelectElement>('[data-cell]').value); const method = q<HTMLSelectElement>('[data-method]').value;
+      q('[data-rval]').textContent = String(r);
+      q<HTMLSelectElement>('[data-cell]').disabled = method === 'scan' || method === 'quad';
+      const truthRes = search('scan', cx, cy, r, c); const truth = new Set(truthRes.hits);
+      const res = search(method, cx, cy, r, c);
+      const missed = truth.size - res.hits.length;
+      last = { cx, cy, r, c, method, res, truth }; schedule();
+      q('[data-o1]').textContent = `${fmt(res.hits.length)} of ${fmt(truth.size)}`;
+      q('[data-n1]').textContent = missed ? `${fmt(missed)} places within ${r} km were missed` : `nothing missed within ${r} km`;
+      q('[data-o2]').textContent = fmt(res.cand);
+      q('[data-n2]').textContent = res.hits.length ? `${(res.cand / res.hits.length).toFixed(1)} examined for each place returned` : res.cand ? 'none of them were inside the circle' : 'nothing was examined';
+      q('[data-o3]').textContent = fmt(res.cells);
+      q('[data-n3]').textContent = method === 'scan' ? 'one pass over everything' : method === 'quad' ? 'tree nodes visited, from the root down to the leaves' : `${fmt(res.cells)} cell${res.cells === 1 ? '' : 's'} read from the index`;
+      q<HTMLElement>('[data-b1]').style.setProperty('--c', missed ? 'var(--bad)' : 'var(--good)');
+      q<HTMLElement>('[data-b2]').style.setProperty('--c', res.cand > 3 * Math.max(1, truth.size) ? 'var(--role-4)' : 'var(--accent)');
+      q<HTMLElement>('[data-b3]').style.setProperty('--c', res.cells > 40 ? 'var(--role-4)' : 'var(--accent)');
+      cv.setAttribute('aria-label', `Map around ${place}: ${res.hits.length} of ${truth.size} places found, ${res.cand} examined`);
+      const out = q('[data-verdict]'); out.classList.toggle('bad', missed > 0);
+      const ratio = res.cand / Math.max(1, truth.size);
+      let text: string;
+      if (method === 'scan') text = `Always right, but it measured all ${fmt(pts.length)} places to return ${fmt(truth.size)}. Fine for a thousand places, hopeless for a hundred million.`;
+      else if (missed > 0 && method === 'own') text = `${fmt(missed)} of the ${fmt(truth.size)} places were missed (${Math.round((100 * missed) / truth.size)}%). The circle spills across the edge of the ${c} km cell, and the places on the other side are in cells nobody looked at. This is the boundary problem.`;
+      else if (missed > 0) text = `${fmt(missed)} places were missed. The 9 cells reach only one cell beyond the spot, which is not enough when the ${r} km radius is wider than the ${c} km cell. Use cells at least as wide as the radius, or read every cell the circle touches.`;
+      else if (method === 'quad') text = `Right, and the cell size did not matter: the tree has small leaves where places are crowded and large leaves where they are rare, so it examined ${fmt(res.cand)} places (${ratio.toFixed(1)} per result) in ${fmt(res.cells)} nodes.`;
+      else if (ratio > 5 && res.cand > 150) text = `Right, but it examined ${fmt(res.cand)} places to return ${fmt(truth.size)}. The ${c} km cells are far larger than the circle for ${place}, so most of what it reads is wasted. A finer prefix would help here.`;
+      else if (res.cells > 40) text = `Right, and few places were examined (${fmt(res.cand)}), but it needed ${fmt(res.cells)} cell lookups, most of them empty. The ${c} km cells are small for this ${r} km radius, so the work moved from examining places to reading cells.`;
+      else if (method === 'own') text = `Right this time, but only because the ${r} km circle happens to sit inside one ${c} km cell here. Move to downtown, or widen the radius, and places across the cell edge are missed.`;
+      else text = `Right: ${truth.size === 1 ? 'the one place' : `all ${fmt(truth.size)} places`} found by examining ${fmt(res.cand)} (${ratio.toFixed(1)} per result) in ${fmt(res.cells)} cell${res.cells === 1 ? '' : 's'}, using ${names[method]}.`;
+      out.textContent = text;
+    }
+    root.addEventListener('input', draw); root.addEventListener('change', draw);
+    new MutationObserver(schedule).observe(document.documentElement, { attributes: true, attributeFilter: ['data-theme'] });
+    draw();
+  });
+</script>

@@ -1,0 +1,184 @@
+{
+  "name": "Design a Hotel Reservation System",
+  "difficulty": "intermediate",
+  "intent": "Sell room-nights without ever promising the same room twice, let people search any date range quickly, and keep a room held while a guest pays.",
+  "codeTitle": "per-night inventory with holds and idempotent booking",
+  "finalIntro": "One guest booking three nights while others compete for the last rooms.",
+  "prompt": "Design the booking system for a chain with 20,000 hotels. Guests search by city and dates, pick a room type, pay, and get a confirmation. A stay covers several nights, rooms of a type are interchangeable, and the last rooms of a popular weekend are fought over by many guests at once. A guest must never arrive to find the booking was not honoured because of a bug.",
+  "functional": [
+    "Search hotels with a free room of a given type for a date range",
+    "Hold a room while the guest pays, then confirm the booking",
+    "Cancel a booking and give the rooms back",
+    "Let hotel staff change room counts, prices and block rooms for maintenance",
+    "Optionally sell a few more rooms than exist, according to a policy"
+  ],
+  "nonFunctional": [
+    "Never confirm more bookings than the hotel's limit for any night, even with many simultaneous requests",
+    "A search answers in under 300 ms, and it may be a few seconds out of date",
+    "A booking is exact: the final check is always against the real inventory",
+    "A retry of the same booking request must not book twice or charge twice",
+    "Unpaid holds free their rooms automatically within minutes",
+    "Handle about 50 bookings per second at the peak and about 100 times as many searches"
+  ],
+  "firstAttempt": {
+    "text": "One bookings table with a room number, a check-in date and a check-out date. To book, the app searches for a room of the type that has no overlapping booking, and then inserts a row for it. Availability is the same overlap query run for every hotel in the city.",
+    "limits": [
+      "Two requests can both find the same room free and both insert, because the check and the insert are separate steps",
+      "The overlap query scans many rows for every search, and every search for a weekend hits the same table",
+      "There is no way to hold a room while the guest types a card number",
+      "A retried request after a timeout inserts a second booking",
+      "Selling a few rooms more than exist, on purpose, has nowhere to be expressed",
+      "One database serves searching, booking and hotel staff, so a busy search hurts bookings"
+    ]
+  },
+  "nodes": [
+    { "id": "guests", "label": "Guests", "kind": "client", "x": 12, "y": 50 },
+    { "id": "single", "label": "App with a bookings table", "kind": "compute", "x": 50, "y": 50, "at": 0, "until": 1 },
+    { "id": "api", "label": "Hotel API", "kind": "edge", "x": 37, "y": 50, "at": 1 },
+    { "id": "inv", "label": "Nightly inventory", "kind": "data", "x": 87, "y": 50, "at": 1 },
+    { "id": "book", "label": "Booking service", "kind": "compute", "x": 62, "y": 50, "at": 2 },
+    { "id": "pay", "label": "Payment provider", "kind": "compute", "x": 62, "y": 16, "at": 3 },
+    { "id": "sweeper", "label": "Hold expiry sweeper", "kind": "async", "x": 87, "y": 16, "at": 3 },
+    { "id": "cache", "label": "Availability cache", "kind": "data", "x": 37, "y": 84, "at": 4 },
+    { "id": "policy", "label": "Overbooking policy", "kind": "compute", "x": 37, "y": 16, "at": 5 },
+    { "id": "queue", "label": "Booking events", "kind": "async", "x": 62, "y": 84, "at": 6 },
+    { "id": "channels", "label": "Channel manager", "kind": "edge", "x": 87, "y": 84, "at": 6 }
+  ],
+  "edges": [
+    { "from": "guests", "to": "single", "at": 0, "until": 1 },
+    { "from": "guests", "to": "api", "at": 1 },
+    { "from": "api", "to": "inv", "at": 1, "until": 2 },
+    { "from": "api", "to": "book", "at": 2 },
+    { "from": "book", "to": "inv", "at": 2 },
+    { "from": "book", "to": "pay", "at": 3 },
+    { "from": "sweeper", "to": "inv", "at": 3 },
+    { "from": "api", "to": "cache", "at": 4 },
+    { "from": "inv", "to": "cache", "at": 4, "until": 6 },
+    { "from": "policy", "to": "book", "at": 5 },
+    { "from": "book", "to": "queue", "at": 6 },
+    { "from": "queue", "to": "cache", "at": 6 },
+    { "from": "queue", "to": "channels", "at": 6 }
+  ],
+  "steps": [
+    {
+      "title": "Store one inventory row per room type and night",
+      "problem": "Asking whether any room is free across a date range means comparing intervals against every booking, and interchangeable rooms make the individual room number irrelevant to the guest.",
+      "fix": "Sell a room type, not a room number. For each hotel, room type and night keep one row holding the capacity, the number sold, and the number on hold. A stay from the 16th to the 18th touches two rows, the nights of the 16th and the 17th, and the checkout day is not a night. Availability for a range is the smallest 'capacity minus sold minus held' over its nights. A room number is assigned at check-in, when the hotel knows who is leaving.",
+      "tradeoff": "Searching and booking become small lookups of a few rows, and double-booking turns into a counter that must not exceed a limit. A stay is now a set of rows, so the write for a long stay touches many rows, and the real room assignment is postponed to the front desk.",
+      "concepts": [{ "slug": "sql-vs-nosql" }, { "slug": "database-indexing" }, { "slug": "database-sharding" }]
+    },
+    {
+      "title": "Reserve all the nights with one conditional update",
+      "problem": "Reading the free count and then writing it back lets two guests both see one room left on a night, and both take it.",
+      "fix": "Do the check inside the write. For each night run 'UPDATE inventory SET held = held + 1 WHERE hotel = ? AND type = ? AND night = ? AND sold + held < limit', and look at the number of rows changed. All the nights are updated in one transaction, in a fixed order such as by date, so that two stays cannot wait on each other in a circle. If any night changes zero rows, the transaction rolls back and the guest is told that the room just went. A row lock with SELECT FOR UPDATE does the same job, and an optimistic version column does it with a retry.",
+      "tradeoff": "The database serialises competing guests on each row, so the count can never pass its limit, whatever the number of app servers. A very popular night becomes a hot row and its throughput is bounded by how fast one row can be updated, so a rejection must be cheap and quick.",
+      "concepts": [{ "slug": "acid-vs-base" }, { "slug": "consistency-models" }, { "slug": "database-indexing" }]
+    },
+    {
+      "title": "Hold the rooms while the guest pays, and make requests idempotent",
+      "problem": "Payment takes a minute and can fail or be abandoned, and a mobile client that times out will send the request again.",
+      "fix": "Booking has two phases. First the service places a hold: the 'held' counters go up and a hold record stores the stay, the guest and an expiry time about ten minutes away. Then the guest pays, and on success the hold becomes a booking, moving the counters from 'held' to 'sold'. A sweeper releases holds whose time has passed. Every request carries an idempotency key, and the hold record is created with that key as a unique value, so a repeat returns the earlier result instead of holding again. The payment call uses the same key.",
+      "tradeoff": "Rooms are not locked forever by people who walk away, and retries are safe. Held rooms are unavailable to others for the hold period, so a short hold sells more but annoys slow payers, and a payment that succeeds just after the hold expired needs a defined outcome, such as re-checking the inventory or refunding.",
+      "concepts": [{ "slug": "idempotency" }, { "slug": "retries-and-backoff" }, { "slug": "saga" }]
+    },
+    {
+      "title": "Answer searches from a cache, and check again when booking",
+      "problem": "Guests look at about a hundred hotels for each one they book, and answering that from the inventory table would be most of the load.",
+      "fix": "Searches read an availability cache keyed by hotel, room type and date range, or a compact copy of the inventory kept per city, refreshed when inventory changes and expiring after a few seconds. The search page says 'only 2 left' from this copy. The booking path never trusts the cache. It runs the conditional update on the real rows, and if that fails the guest sees that the room has gone and is offered alternatives.",
+      "tradeoff": "Most traffic never touches the database, and search latency is low. The cache can be seconds old, so a guest sometimes clicks on a room that just sold, which is acceptable only because the final check is exact. A cache that says 'sold out' wrongly costs a sale, so staleness is allowed to err towards showing a room.",
+      "concepts": [{ "slug": "caching" }, { "slug": "cqrs" }, { "slug": "consistency-models" }]
+    },
+    {
+      "title": "Sell a few more rooms than exist, within a policy",
+      "problem": "Some guests cancel or do not arrive, so a hotel that sells exactly its rooms ends the night with empty ones that nobody can buy any more.",
+      "fix": "Make the limit a number the hotel controls instead of the capacity. The limit for a night is the capacity plus an overbooking allowance, set per hotel, type and night from the history of cancellations and no-shows, for example 3 percent for a business hotel on a weekday and nothing for a small inn on a festival weekend. The conditional update compares against this limit. The policy also says what happens when too many arrive: upgrade the guest to a better room, or move them to a partner hotel at the chain's cost.",
+      "tradeoff": "Rooms stop being wasted, and revenue rises. If the allowance is higher than the real cancellation rate, real guests are turned away at the desk, which costs money and trust, so the allowance is tuned from data, kept small, and cut on nights with a low cancellation rate.",
+      "concepts": [{ "slug": "slos-and-error-budgets" }, { "slug": "metrics" }, { "slug": "alerting" }]
+    },
+    {
+      "title": "Publish booking events and keep partners in step",
+      "problem": "Travel sites, the hotel's own system and our cache all sell or show the same rooms, and each must hear about a booking, or a room gets sold twice in two places.",
+      "fix": "The booking transaction writes an event to an outbox in the same database commit, and a relay publishes it to a queue. Consumers update the availability cache, tell the channel manager to close or reduce the room on partner sites, send the confirmation email and update revenue reports. Events carry a version and an id, so each consumer can ignore a repeat. Inbound bookings from partners go through the same conditional update, so a partner can never bypass the limit.",
+      "tradeoff": "Every channel learns about a booking within seconds without the booking transaction waiting for them, and nothing is lost on a crash. Partner sites are always a little behind, so the hotel keeps a small safety margin on channels, and a booking that arrives after a stale partner price needs a rule for who pays.",
+      "concepts": [{ "slug": "transactional-outbox" }, { "slug": "message-queues" }, { "slug": "webhooks" }]
+    }
+  ],
+  "failures": [
+    {
+      "scenario": "Two guests book the last room for overlapping dates at the same moment",
+      "impact": "With a read followed by a write both succeed, and the hotel has two guests for one room on the night they share.",
+      "answer": "The conditional update on each night's row lets only one of them past the limit. The loser's transaction rolls back, including any nights it had already taken, and is offered other dates. Locking rows in date order keeps two stays from deadlocking.",
+      "concepts": [{ "slug": "acid-vs-base" }, { "slug": "consistency-models" }]
+    },
+    {
+      "scenario": "The client times out and sends the booking request again",
+      "impact": "Without protection the guest has two holds, and may pay twice.",
+      "answer": "The idempotency key is unique in the hold table, so the second request finds the first and returns its outcome. The payment provider receives the same key, so one charge is made even if the call is repeated.",
+      "concepts": [{ "slug": "idempotency" }, { "slug": "retries-and-backoff" }]
+    },
+    {
+      "scenario": "The guest pays after the hold has expired",
+      "impact": "The rooms may have gone to someone else, and the guest has been charged for nothing.",
+      "answer": "Confirmation checks that the hold is still live. If it is not, the service tries to take the rooms again with a new conditional update, and if that fails it asks the payment provider for a refund. A saga records each step so that a crash between payment and confirmation is repaired by a job.",
+      "concepts": [{ "slug": "saga" }, { "slug": "idempotency" }]
+    },
+    {
+      "scenario": "The availability cache is stale during a big event",
+      "impact": "Thousands of guests see a room that has just sold out and pile onto the same few rows.",
+      "answer": "The cache is allowed to be wrong because the booking path is exact, but the pile-on is limited by rate limits per hotel and by dropping the cache entry for a sold-out room as soon as the event arrives. A sold-out flag in the cache is set first, so most guests stop at the search page.",
+      "concepts": [{ "slug": "caching" }, { "slug": "rate-limiting" }, { "slug": "backpressure" }]
+    },
+    {
+      "scenario": "Overbooking meets a night when everyone shows up",
+      "impact": "More guests arrive than rooms exist, and some are turned away.",
+      "answer": "The policy was a bet on a cancellation rate, so it has a prepared answer: upgrade a guest, or book a nearby partner hotel and pay for it. The allowance for that hotel and night is lowered automatically when the walk-out rate goes over its target, and an alert tells revenue managers.",
+      "concepts": [{ "slug": "slos-and-error-budgets" }, { "slug": "alerting" }]
+    }
+  ],
+  "alternatives": [
+    {
+      "title": "How to stop double-booking",
+      "options": [
+        { "name": "Conditional update on the inventory row", "pro": "One statement, no explicit lock held while the app thinks, and simple to reason about", "con": "A hot row is a bottleneck, and all nights of a stay must be updated together" },
+        { "name": "Row lock with SELECT FOR UPDATE", "pro": "Reads the values first, so the app can apply rules before the write", "con": "Holds a lock for the whole transaction, so slow code in it blocks everyone" },
+        { "name": "Optimistic version number with retry", "pro": "No locks, and good when conflicts are rare", "con": "Under heavy competition for the last rooms most attempts fail and retry" },
+        { "name": "A distributed lock per hotel and night", "pro": "Works across several stores", "con": "A second system that can fail or expire while the update is still running" }
+      ],
+      "pick": "A conditional update inside one transaction, with locks taken in date order. Reserve the other options for special cases."
+    },
+    {
+      "title": "What to store",
+      "options": [
+        { "name": "Bookings with dates, find overlaps", "pro": "Natural to model, and every booking is a record", "con": "Overlap queries are slow, and the rule 'at most N at once' is hard to enforce" },
+        { "name": "Counters per room type and night", "pro": "Availability is a lookup, and the limit is one comparison", "con": "A lot of rows for a long horizon, and room numbers come later" },
+        { "name": "Per-room per-night rows", "pro": "Each room is assigned immediately, so guests can ask for a specific room", "con": "Many more rows, and interchangeable rooms make guests compete over a single one" }
+      ],
+      "pick": "Counters per room type and night, plus a bookings table. Per-room rows only for a hotel that sells specific rooms."
+    },
+    {
+      "title": "Where overbooking is applied",
+      "options": [
+        { "name": "No overbooking", "pro": "Nobody is turned away", "con": "Cancellations leave unsold rooms" },
+        { "name": "A fixed allowance as a percentage", "pro": "Easy to explain and to code", "con": "Ignores that cancellation rates differ by hotel, season and price" },
+        { "name": "An allowance learned from history", "pro": "Close to the true rate, so few walk-outs and few empty rooms", "con": "Needs data, a model, and guard rails when it is wrong" }
+      ],
+      "pick": "A limit per hotel, type and night, set from history, with a hard cap and automatic cut when walk-outs rise."
+    },
+    {
+      "title": "How long to hold the rooms",
+      "options": [
+        { "name": "No hold: book on click and refund later", "pro": "Simple state", "con": "Payment failures and abandoned carts become refunds" },
+        { "name": "A short hold of five to ten minutes", "pro": "Sells fast and wastes little", "con": "Slow payers lose their room" },
+        { "name": "A long hold of an hour or more", "pro": "Friendly to guests who need approval", "con": "Hoards inventory on busy nights" }
+      ],
+      "pick": "About ten minutes, extendable once during payment, with a sweeper to free expired holds."
+    }
+  ],
+  "roles": [
+    { "id": "client", "label": "Guests", "description": "People and partner sites who search and book." },
+    { "id": "edge", "label": "Entry points", "description": "The hotel API and the channel manager." },
+    { "id": "async", "label": "Background work", "description": "The hold sweeper and the booking events." },
+    { "id": "compute", "label": "Booking logic", "description": "The booking service, overbooking policy and payment." },
+    { "id": "data", "label": "State", "description": "Nightly inventory and the availability cache." }
+  ]
+}

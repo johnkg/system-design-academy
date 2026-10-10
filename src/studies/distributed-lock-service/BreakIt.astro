@@ -1,0 +1,157 @@
+---
+import PlaygroundShell from '../../components/PlaygroundShell.astro';
+---
+<PlaygroundShell title="The paused lock holder" hint="Worker A takes the lock, reads the value 100, and freezes (a garbage collection). Worker B takes over and adds 1. Then A wakes up and adds 1 as well. The right answer is 102. Change the lock store, the lease, the pause and the fencing check, and see whether the old write damages the data.">
+  <ol class="how">
+    <li>With the <b>defaults</b> (Raft, 10 s lease, 15 s pause, no tokens) the lease ends at 10 s, B gets the lock at 10.5 s and writes 101 at 12 s, and A wakes and writes 101 at 19.5 s. The <b>final value is 101</b>: one increment was lost and nobody saw an error.</li>
+    <li>Turn <b>tokens on</b> but leave the storage ignoring them: still 101, because a number nobody compares protects nothing. Set the storage to <b>check reads and writes</b>: A's write with 33 is refused after 34 was seen, A starts again, and the final value is <b>102</b>.</li>
+    <li>Set the pause to <b>7 s</b> and the storage to <b>check writes only</b>: A's write at 11.5 s falls between B's read (10.5 s) and B's write (12 s). The storage has not seen 34 yet, so it accepts the write, and the final value is 101 even with tokens. Checking <b>reads too</b> fixes it.</li>
+    <li>Switch the lock store to <b>one Redis with failover</b>: the new primary lacks A's lock and the last counter increment, so B is granted the <b>same token 33</b> as A, and even a full check cannot tell them apart. The final value is 101.</li>
+    <li>A <b>30 s lease</b> avoids the damage here, because A writes at 19.5 s while its lease is valid, but a crashed holder then blocks the lock for 30 s. <b>Renewal</b> rescues slow work (try a 2 s lease with no pause) but not the 15 s freeze, because the heartbeat thread is frozen too.</li>
+  </ol>
+  <div class="pg dlb" data-dlb>
+    <div class="pg-row">
+      <label>Lock store <select class="pg-in" data-store>
+        <option value="raft" selected>Consensus group (Raft)</option>
+        <option value="redis">One Redis, fails over at 2 s</option>
+      </select></label>
+      <label>Lease length <select class="pg-in" data-lease>
+        <option value="2">2 s</option>
+        <option value="5">5 s</option>
+        <option value="10" selected>10 s</option>
+        <option value="30">30 s</option>
+      </select></label>
+      <label>A freezes for (seconds) <input type="range" min="0" max="40" value="15" data-pause /> <b data-pauseval></b></label>
+      <label>Background renewal <select class="pg-in" data-renew>
+        <option value="off" selected>off</option>
+        <option value="on">on, three times per lease</option>
+      </select></label>
+      <label>Lock service hands out fencing tokens <select class="pg-in" data-tokens>
+        <option value="off" selected>no</option>
+        <option value="on">yes</option>
+      </select></label>
+      <label>Storage checks the token <select class="pg-in" data-check>
+        <option value="none" selected>never (ignores it)</option>
+        <option value="write">on writes only</option>
+        <option value="rw">on reads and writes</option>
+      </select></label>
+    </div>
+    <div class="pg-grid">
+      <div class="pg-box" data-b1><h3>A's lease</h3><span class="pg-mono" data-o1></span><span class="pg-note" data-n1></span></div>
+      <div class="pg-box" data-b2><h3>A's write after waking</h3><span class="pg-mono" data-o2></span><span class="pg-note" data-n2></span></div>
+      <div class="pg-box" data-b3><h3>Final value (right answer 102)</h3><span class="pg-mono" data-o3></span><span class="pg-note" data-n3></span></div>
+      <div class="pg-box" data-b4><h3>Tokens granted</h3><span class="pg-mono" data-o4></span><span class="pg-note" data-n4></span></div>
+    </div>
+    <ol class="log" data-log aria-label="What happened, in time order"></ol>
+    <p class="pg-out" data-verdict aria-live="polite"></p>
+    <p class="pg-note">Model: A reads at 0.5 s, works, freezes at 1 s for the chosen time and writes the value it read plus one, 4.5 s of work after the freeze. When A's lease ends, B waits 0.5 s (a wake-up from the queue), reads, and 1.5 s later writes the value it read plus one. Renewal runs every third of the lease and stops while A is frozen, and a renewal that comes after the lease has ended fails. Tokens are 33 for A and 34 for B, and a rejected writer takes the lock again after the others finish and redoes its work. The storage remembers the highest token it has seen. Redis fails over at 2 s and loses the newest lock key and counter value.</p>
+  </div>
+</PlaygroundShell>
+<style>
+  .log { list-style: none; margin: 0.6rem 0 0; padding: 0; display: grid; gap: 2px; font-family: var(--mono, ui-monospace, monospace); font-size: 0.82rem; }
+  .log li { padding: 2px 8px; border-left: 3px solid var(--border); background: var(--surface-2); border-radius: 4px; }
+  .log li[hidden] { display: none; }
+  .log li.bad { border-left-color: var(--bad); }
+  .log li.good { border-left-color: var(--good); }
+</style>
+<script>
+  document.querySelectorAll<HTMLElement>('[data-dlb]').forEach((root) => {
+    const q = <T extends HTMLElement>(s: string) => root.querySelector<T>(s)!;
+    const READ_A = 0.5; const FREEZE = 1; const A_WORK = 4.5; const B_WAKE = 0.5; const B_WORK = 1.5; const FAILOVER = 2; const BASE = 100; const TOKEN_A = 33;
+    type Ev = { t: number; text: string; cls: string };
+    type Opts = { store: string; lease: number; pause: number; renew: boolean; tokens: boolean; check: string };
+    const s1 = (n: number) => (Math.round(n * 10) / 10).toFixed(1);
+    function sim(o: Opts) {
+      const tw = A_WORK + o.pause; // when A sends its write
+      let exp = o.lease;
+      if (o.renew) {
+        for (let k = 1; ; k++) {
+          const rt = (k * o.lease) / 3; if (rt >= tw) break;
+          if (o.pause > 0 && rt > FREEZE && rt < FREEZE + o.pause) continue; // frozen: no heartbeat
+          if (rt > exp) break; // too late, the lease is gone
+          exp = rt + o.lease;
+        }
+      }
+      const redis = o.store === 'redis';
+      const end = redis ? Math.min(exp, FAILOVER) : exp; // when the lock service stops treating A as the holder
+      const staleA = tw > end;
+      const bAt = (staleA ? end : tw) + B_WAKE;
+      const tokenB = redis && staleA ? TOKEN_A : TOKEN_A + 1;
+      const check = o.tokens ? o.check : 'none';
+      let value = BASE; let maxTok = TOKEN_A - 1; const log: Ev[] = [];
+      const seen: Record<string, number> = {}; let aRejected = false;
+      const op = (t: number, who: string, kind: string, tok: number) => {
+        const checked = check !== 'none' && (kind === 'write' || check === 'rw');
+        let ok = true; if (checked && tok < maxTok) ok = false;
+        const before = maxTok; if (ok && checked) maxTok = Math.max(maxTok, tok);
+        if (kind === 'read') { seen[who] = value; log.push({ t, text: `${s1(t)} s  ${who} reads ${value}${o.tokens ? ` (token ${tok})` : ''}`, cls: '' }); return; }
+        const v = seen[who] + 1;
+        if (ok) { value = v; log.push({ t, text: `${s1(t)} s  ${who} writes ${v}${o.tokens ? ` (token ${tok})` : ''}: accepted${who === 'A' && staleA && t === tw ? ' (A is stale)' : ''}`, cls: who === 'A' && staleA && t === tw ? 'bad' : '' }); }
+        else { aRejected = who === 'A' || aRejected; log.push({ t, text: `${s1(t)} s  ${who} writes ${v} (token ${tok}): REJECTED, storage has seen ${before}`, cls: 'good' }); }
+      };
+      const evs = [
+        { t: READ_A, who: 'A', kind: 'read', tok: TOKEN_A },
+        { t: tw, who: 'A', kind: 'write', tok: TOKEN_A },
+        { t: bAt, who: 'B', kind: 'read', tok: tokenB },
+        { t: bAt + B_WORK, who: 'B', kind: 'write', tok: tokenB },
+      ].sort((x, y) => x.t - y.t);
+      evs.forEach((e) => op(e.t, e.who, e.kind, e.tok));
+      if (o.pause > 0) log.push({ t: FREEZE, text: `${s1(FREEZE)} s  A freezes for ${o.pause} s`, cls: '' });
+      if (o.pause > 0) log.push({ t: FREEZE + o.pause, text: `${s1(FREEZE + o.pause)} s  A wakes, still thinks it holds the lock`, cls: '' });
+      log.push({ t: end, text: redis && end === FAILOVER && exp > FAILOVER ? `${s1(end)} s  Redis fails over, the new primary does not have A's lock` : `${s1(end)} s  A's lease ends${staleA ? '' : ' (after A finished)'}`, cls: '' });
+      const staleAccepted = staleA && !aRejected;
+      if (aRejected) {
+        const t0 = Math.max(tw, bAt + B_WORK) + 0.5; const tk = Math.max(TOKEN_A, tokenB, maxTok) + 1;
+        log.push({ t: t0 - 0.01, text: `${s1(t0)} s  A takes the lock again (token ${tk}) and redoes its work`, cls: '' });
+        op(t0, 'A', 'read', tk); op(t0 + B_WORK, 'A', 'write', tk);
+      }
+      log.sort((x, y) => x.t - y.t);
+      return { value, log, staleA, staleAccepted, aRejected, end, tw, bAt, tokenB, exp, over: staleA ? tw - end : 0, redis };
+    }
+    const rows = Array.from({ length: 11 }, () => { const li = document.createElement('li'); li.hidden = true; q('[data-log]').append(li); return li; });
+    function draw() {
+      const o: Opts = {
+        store: q<HTMLSelectElement>('[data-store]').value, lease: Number(q<HTMLSelectElement>('[data-lease]').value), pause: Number(q<HTMLInputElement>('[data-pause]').value),
+        renew: q<HTMLSelectElement>('[data-renew]').value === 'on', tokens: q<HTMLSelectElement>('[data-tokens]').value === 'on', check: q<HTMLSelectElement>('[data-check]').value,
+      };
+      q('[data-pauseval]').textContent = String(o.pause);
+      q<HTMLSelectElement>('[data-check]').disabled = !o.tokens;
+      const r = sim(o);
+      const good = r.value === BASE + 2;
+      rows.forEach((li, i) => { const e = r.log[i]; li.hidden = !e; if (e) { li.textContent = e.text; li.className = e.cls; } });
+      q('[data-o1]').textContent = `ends at ${s1(r.end)} s`;
+      q('[data-n1]').textContent = r.redis && r.end < r.exp ? 'cut short by the failover; the lease itself had longer to run' : (o.renew ? `renewal moved it from ${o.lease} s to ${s1(r.exp)} s` : `granted for ${o.lease} s, never renewed`);
+      q('[data-o2]').textContent = !r.staleA ? 'not stale' : (r.aRejected ? 'rejected' : 'ACCEPTED');
+      q('[data-n2]').textContent = r.staleA ? `sent at ${s1(r.tw)} s, ${s1(r.over)} s after A lost the lock` : `sent at ${s1(r.tw)} s, inside the lease`;
+      q('[data-o3]').textContent = String(r.value);
+      q('[data-n3]').textContent = good ? 'both increments are in' : `${BASE + 2 - r.value} increment lost, silently`;
+      q('[data-o4]').textContent = o.tokens ? `A ${TOKEN_A}, B ${r.staleA ? r.tokenB : TOKEN_A + 1}` : 'none';
+      q('[data-n4]').textContent = !o.tokens ? 'the storage has nothing to compare' : (r.staleA && r.tokenB === TOKEN_A ? 'the same number twice: the counter went backwards' : 'B\'s is higher, as it must be');
+      q<HTMLElement>('[data-b1]').style.setProperty('--c', r.staleA ? 'var(--bad)' : 'var(--good)');
+      q<HTMLElement>('[data-b2]').style.setProperty('--c', !r.staleA ? 'var(--good)' : (r.aRejected ? 'var(--good)' : 'var(--bad)'));
+      q<HTMLElement>('[data-b3]').style.setProperty('--c', good ? 'var(--good)' : 'var(--bad)');
+      q<HTMLElement>('[data-b4]').style.setProperty('--c', 'var(--accent)');
+      const out = q('[data-verdict]'); out.classList.toggle('bad', !good);
+      const slack = r.end - A_WORK;
+      let msg: string;
+      if (!r.staleA) {
+        msg = `Safe here, but only because A's write (${s1(r.tw)} s) came before its lease ended (${s1(r.end)} s). That is timing, not a guarantee: a freeze longer than ${s1(slack)} s breaks it unless fencing is on.`;
+      } else if (r.aRejected) {
+        msg = `The stale write was refused: the storage had already seen B's token, which is higher than A's ${TOKEN_A}. A found out it lost the lock, took it again and redid the work, so the final value is ${r.value}. The decision was made where the data lives, so it holds whatever the timing.`;
+      } else if (good) {
+        msg = `The stale write was accepted, but it happened to land before B read the value, so B built on it and nothing was lost. That is luck: a little more or less pause and it would corrupt the data.`;
+      } else if (!o.tokens) {
+        msg = `A's lease ended ${s1(r.over)} s before its write, but A cannot know that, so it wrote anyway. Both workers did read, add one and write, so one increment vanished: the final value is ${r.value}, not ${BASE + 2}. The lock was correct while it lasted, and the data is still wrong. Turn tokens on and make the storage check them.`;
+      } else if (o.check === 'none') {
+        msg = `Tokens were issued, but the storage ignores them, so A's stale write went through and the final value is ${r.value}. A fencing token only works if the resource compares it.`;
+      } else if (r.tokenB === TOKEN_A) {
+        msg = `The failed-over Redis lost its newest counter value and granted B the same token ${TOKEN_A} as A. The storage cannot tell them apart, so the stale write is accepted and the final value is ${r.value}. Fencing needs tokens that never repeat or go backwards, which a consensus group gives and an asynchronous replica does not.`;
+      } else {
+        msg = `The storage checks only writes, and A's write (${s1(r.tw)} s) arrived before B's first write (${s1(r.bAt + B_WORK)} s), so it had not yet seen token 34 and accepted token ${TOKEN_A}. B then overwrote with a value based on an old read. Check the token on reads too, so B's read at ${s1(r.bAt)} s already raises the bar. The final value is ${r.value}.`;
+      }
+      out.textContent = msg;
+    }
+    root.addEventListener('input', draw); root.addEventListener('change', draw);
+    draw();
+  });
+</script>

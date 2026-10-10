@@ -1,0 +1,176 @@
+{
+  "name": "Design a Code Deployment System",
+  "difficulty": "advanced",
+  "intent": "Build a change once, deliver it to tens of thousands of hosts in controlled waves, notice a bad release from live metrics and undo it automatically, and change behaviour without deploying at all.",
+  "codeTitle": "a staged rollout with a canary, health gate and rollback",
+  "finalIntro": "One release going from a merged commit to the whole fleet.",
+  "prompt": "Design the system that ships code for a company with hundreds of services and about 50,000 hosts across several regions. Engineers merge a change and want it in production within an hour, safely. A bad release must hurt as few users as possible and be undone quickly, and nobody should have to log in to a host.",
+  "functional": [
+    "Build the code once and produce a versioned artifact",
+    "Roll an artifact out to a service's hosts in stages and report progress",
+    "Check health during the rollout, and stop or roll back when it is bad",
+    "Roll back to a previous version with one action",
+    "Change configuration and turn features on and off without a deploy",
+    "Prevent two conflicting deploys, and deploys at forbidden times"
+  ],
+  "nonFunctional": [
+    "A normal change reaches the whole fleet in under an hour",
+    "A bad release is detected and undone within minutes, while it is on a small share of hosts",
+    "Distributing a 500 MB artifact to 50,000 hosts must not overload the artifact store",
+    "Serving capacity stays above a safe floor during a rollout",
+    "Every host runs exactly the bits that were built and tested, and this can be proven",
+    "The deploy system itself is highly available, and a rollback works even when it is not"
+  ],
+  "firstAttempt": {
+    "text": "A script that logs in to each host in turn, copies the new build from the build server, restarts the service and moves to the next host. Settings live in files on each host, and an engineer decides by looking at graphs whether to go on.",
+    "limits": [
+      "Going through 50,000 hosts one at a time takes hours, and doing them in parallel makes the build server the bottleneck",
+      "Nothing checks health, so a broken build can be on every host before anyone looks at a graph",
+      "A host that is down or half updated leaves the fleet on a mix of versions that nobody tracks",
+      "Rolling back means building and copying the old version again, when speed matters most",
+      "Changing a setting needs a full deploy, and two engineers can run the script at the same time"
+    ]
+  },
+  "nodes": [
+    { "id": "eng", "label": "Engineers", "kind": "client", "x": 12, "y": 50 },
+    { "id": "script", "label": "Copy and restart script", "kind": "compute", "x": 37, "y": 50, "at": 0, "until": 2 },
+    { "id": "hosts", "label": "Hosts", "kind": "compute", "x": 87, "y": 50 },
+    { "id": "ci", "label": "Build pipeline", "kind": "compute", "x": 37, "y": 16, "at": 1 },
+    { "id": "registry", "label": "Artifact registry", "kind": "data", "x": 62, "y": 16, "at": 1 },
+    { "id": "controller", "label": "Deploy controller", "kind": "edge", "x": 37, "y": 50, "at": 2 },
+    { "id": "gate", "label": "Health gate", "kind": "compute", "x": 62, "y": 84, "at": 3 },
+    { "id": "tier", "label": "Regional cache tier", "kind": "async", "x": 62, "y": 33, "at": 4 },
+    { "id": "flags", "label": "Config and flag service", "kind": "data", "x": 87, "y": 84, "at": 5 },
+    { "id": "lock", "label": "Deploy lock and calendar", "kind": "data", "x": 12, "y": 16, "at": 6 }
+  ],
+  "edges": [
+    { "from": "eng", "to": "script", "at": 0, "until": 2 },
+    { "from": "script", "to": "hosts", "at": 0, "until": 2 },
+    { "from": "eng", "to": "ci", "at": 1 },
+    { "from": "ci", "to": "registry", "at": 1 },
+    { "from": "registry", "to": "hosts", "at": 1, "until": 4 },
+    { "from": "eng", "to": "controller", "at": 2 },
+    { "from": "controller", "to": "hosts", "at": 2 },
+    { "from": "hosts", "to": "gate", "at": 3 },
+    { "from": "gate", "to": "controller", "at": 3 },
+    { "from": "registry", "to": "tier", "at": 4 },
+    { "from": "tier", "to": "hosts", "at": 4 },
+    { "from": "controller", "to": "flags", "at": 5 },
+    { "from": "flags", "to": "hosts", "at": 5 },
+    { "from": "eng", "to": "lock", "at": 6 },
+    { "from": "lock", "to": "controller", "at": 6 }
+  ],
+  "steps": [
+    {
+      "title": "Build once and keep an immutable, versioned artifact",
+      "problem": "If each host builds or fetches its own copy, two hosts can end up running different code from the same commit, and rolling back means rebuilding.",
+      "fix": "A pipeline builds the commit once, runs the tests and produces a single artifact, named by its commit and a content hash and signed. It goes into an artifact registry and is never changed afterwards. Everything that runs in production, and everything that rolls back, is a version that already exists in the registry. Settings are not baked in: the same artifact runs in every environment and reads its configuration when it starts.",
+      "tradeoff": "What was tested is exactly what runs, deploys are repeatable, and old versions stay available. The registry stores many large artifacts and needs a retention policy, and a change to a setting can no longer be made by editing the build.",
+      "concepts": [{ "slug": "secrets-management" }, { "slug": "encryption" }, { "slug": "caching" }]
+    },
+    {
+      "title": "Let a controller roll out in waves, and watch each host",
+      "problem": "A script that touches hosts one at a time is slow, and one that touches them all at once takes the whole service down while it restarts.",
+      "fix": "A deploy controller owns the rollout as a recorded plan: a desired version for the service and a list of waves, such as 10% of the hosts at a time. A small agent on each host does the work. It takes the host out of the load balancer, waits for open requests to finish, fetches the artifact, starts the new version, runs a local health check and puts the host back. The controller moves on to the next wave only when the hosts in this wave report healthy. It never takes out more hosts than the capacity floor allows.",
+      "tradeoff": "Capacity stays high, progress is visible, and a stuck host stops the rollout instead of being skipped. Rolling in place means that for a while two versions serve traffic together, so they must be compatible with each other and with the database. The rollout is slower than doing everything at once.",
+      "concepts": [{ "slug": "load-balancing" }, { "slug": "health-checks" }, { "slug": "horizontal-vs-vertical-scaling" }]
+    },
+    {
+      "title": "Gate each wave on live metrics, and undo automatically",
+      "problem": "Local health checks only prove that the process started. A release can pass them and still return errors or become slow for real traffic.",
+      "fix": "The first wave is a canary: a small share of hosts, such as 1%, that takes real traffic for a bake time of some minutes. A health gate compares the canary's error rate, latency and saturation with the hosts still on the old version at the same moment. If any signal is worse than a threshold, the controller stops and rolls back by telling the hosts to run the previous version, which is already on their disk. If the canary is fine, the later waves each pass the same gate. A bug that only appears after a while, such as a memory leak, needs a bake time long enough to show.",
+      "tradeoff": "A bad release hurts only the share of users on the canary and is undone in minutes without a person. The gate needs good signals, and a threshold set too tight rolls back good releases because of noise, while one set too loose lets the bug through. A longer bake slows every release.",
+      "concepts": [{ "slug": "metrics" }, { "slug": "alerting" }, { "slug": "slos-and-error-budgets" }]
+    },
+    {
+      "title": "Distribute the artifact through caches and peers",
+      "problem": "50,000 hosts each downloading 500 MB from the registry is 25 TB, which the registry's network link cannot serve quickly and which would also be a single point of failure.",
+      "fix": "Put a cache tier in every region. The registry sends each artifact to a regional cache once, and hosts fetch from the cache, which serves from memory or disk. For the largest fleets the artifact is cut into chunks that hosts also exchange with their neighbours in the same rack, as in a swarm, so that each host that has a chunk can serve it. The controller starts the download ahead of the wave, so the install itself is quick and a rollback needs no download at all because the previous version is still on disk.",
+      "tradeoff": "The registry sends the artifact only a few times, and the rollout takes minutes instead of hours. There are more systems to run, a stale or corrupt cache entry must be caught by checking the content hash, and peer traffic must be limited so that it does not hurt the serving traffic on the same network cards.",
+      "concepts": [{ "slug": "cdn" }, { "slug": "caching" }, { "slug": "gossip-protocol" }]
+    },
+    {
+      "title": "Separate configuration and feature flags from deploys",
+      "problem": "Changing a setting or turning a feature off should not need a new build and a full rollout, because in an incident every minute counts.",
+      "fix": "A configuration and flag service holds versioned settings and feature flags, and hosts receive changes by a subscription or a short poll and cache them locally. New code ships with its feature switched off, and the flag is turned on for 1%, then 10%, then everyone, independently of any deploy. Flags can be switched off in seconds as a kill switch. Changes to configuration are versioned, reviewed, rolled out in stages and gated like code, since a bad setting can take a service down as easily as a bad build. Secrets are fetched from a secret store and are not in flags or in the artifact.",
+      "tradeoff": "Releasing a feature becomes a separate and safer step from deploying code, and a bad feature is undone in seconds. Flags that are never cleaned up pile up as hidden branches in the code, every combination of flags is a different system to test, and hosts need a safe default for when the flag service is unavailable.",
+      "concepts": [{ "slug": "pub-sub" }, { "slug": "secrets-management" }, { "slug": "caching" }]
+    },
+    {
+      "title": "Control who can deploy, when, and in what order",
+      "problem": "Two deploys of the same service at once leave it on an unknown mix of versions, a change at 3 am on Friday is hard to support, and a service that depends on another must not go out before it.",
+      "fix": "Every deploy takes a lock on its service, so only one rollout per service is active and a second request waits or is refused. A calendar blocks deploys during freezes, at peak traffic and when the error budget of the service is used up. Regions go one after another, with a small and low-traffic region first, so that one failure does not hit every region. Dependencies between services are declared, and the controller deploys in an order that keeps old and new versions compatible. Every action is recorded with who did it, which version and when, and the controller can be paused by anyone on call.",
+      "tradeoff": "Collisions and risky timings are prevented, and every change has an owner and a history. Locks can be held by a rollout that hangs, so they need a time limit and a way to be broken, and strict rules slow urgent fixes unless there is a reviewed emergency path.",
+      "concepts": [{ "slug": "leader-election" }, { "slug": "consensus" }, { "slug": "idempotency" }]
+    }
+  ],
+  "failures": [
+    {
+      "scenario": "A release passes the canary but fails later in the rollout",
+      "impact": "The bug appears only under a load or data pattern that the canary's small share of traffic never produced, so a large part of the fleet is on a bad version.",
+      "answer": "Every wave has its own gate, so the failure is caught by the next gate with a larger share of traffic. The controller stops, and rolls back all the hosts that changed, by running the previous version that is still on disk. The post-incident fix is to make the canary resemble the fleet, with more traffic or a longer bake, and to add a metric for the failure.",
+      "concepts": [{ "slug": "metrics" }, { "slug": "alerting" }, { "slug": "health-checks" }]
+    },
+    {
+      "scenario": "The deploy controller or the artifact registry goes down in the middle of a rollout",
+      "impact": "The rollout stops with the fleet half updated, and an engineer cannot start a rollback to the previous version.",
+      "answer": "The plan and its progress are in a replicated store, so a standby controller continues from the last recorded step, and repeating a step is safe because each step sets a desired version. Hosts already have the artifact on disk and the agents can switch back to the previous version from a local command, without the controller or the registry. A running service does not depend on the deploy system, which affects only changes.",
+      "concepts": [{ "slug": "leader-election" }, { "slug": "idempotency" }, { "slug": "consensus" }]
+    },
+    {
+      "scenario": "A bad configuration change is pushed to every host at once",
+      "impact": "A wrong value in a flag or a setting reaches the whole fleet in seconds, and the service goes down without any deploy.",
+      "answer": "Configuration goes through the same staged rollout and health gates as code, with a canary first and automatic revert of the version. Hosts keep the last good configuration, and when a new one does not validate, they refuse it and alert. A kill switch for each major feature and a one-click revert to the previous config version limit the damage.",
+      "concepts": [{ "slug": "circuit-breaker" }, { "slug": "alerting" }, { "slug": "pub-sub" }]
+    },
+    {
+      "scenario": "The new version needs a database change",
+      "impact": "During a rolling deploy the old and the new code run at the same time. If the schema changes in one step, one of the two versions breaks.",
+      "answer": "Changes are made in compatible steps: first add the new column or table so that both versions work, then deploy the code that uses it, and only after the old code is gone remove what is no longer used. A rollback to the previous code then still works, because the schema has not removed anything it needs.",
+      "concepts": [{ "slug": "acid-vs-base" }, { "slug": "api-versioning" }, { "slug": "database-replication" }]
+    }
+  ],
+  "alternatives": [
+    {
+      "title": "How to switch to the new version",
+      "options": [
+        { "name": "Rolling in place", "pro": "Needs no spare capacity, and it is simple and cheap", "con": "Two versions serve traffic at once, and a rollback is another rolling wave" },
+        { "name": "Blue/green", "pro": "A full new fleet is tested before traffic moves, and rollback is switching traffic back at once", "con": "Needs double capacity for a while and does not limit how many users see a bug unless traffic is moved gradually" },
+        { "name": "Canary then waves", "pro": "Limits the damage of a bad release to a small share of real users", "con": "Takes longer, and needs good comparison metrics and traffic that is representative" }
+      ],
+      "pick": "Canary then rolling waves for most services. Blue/green for the few that cannot run two versions at once, or where an instant switch back is worth the extra capacity."
+    },
+    {
+      "title": "How artifacts reach the hosts",
+      "options": [
+        { "name": "Every host pulls from the registry", "pro": "Nothing else to run", "con": "The registry's link and the registry itself become the limit and a single point of failure" },
+        { "name": "Tiered caches per region", "pro": "Origin traffic is one copy per region, and a cache is easy to operate", "con": "A cache tier must be sized for the whole fleet pulling at once" },
+        { "name": "Peer-to-peer swarm", "pro": "Capacity grows with the number of hosts, and the largest fleets finish in seconds", "con": "More complex, and traffic between hosts needs to be limited" }
+      ],
+      "pick": "Tiered caches first. Add peer-to-peer when the fleet and the artifact are large enough that a cache tier is the slowest part of the rollout."
+    },
+    {
+      "title": "Who triggers the next wave",
+      "options": [
+        { "name": "A person approves each step", "pro": "Judgement for unusual cases", "con": "Slow, and people miss a bad signal at 3 am" },
+        { "name": "Automatic gates with a person on call to pause", "pro": "Consistent and fast, and a human can still intervene", "con": "Needs trustworthy signals and tuning of thresholds" }
+      ],
+      "pick": "Automatic gates for ordinary releases. A person approves only for the riskiest changes, and can always pause."
+    },
+    {
+      "title": "Push or pull for the controller",
+      "options": [
+        { "name": "Controller pushes commands to hosts", "pro": "Immediate and easy to follow", "con": "Needs a connection to each host, and unreachable hosts are a special case" },
+        { "name": "Hosts pull their desired version", "pro": "Works through failures and new hosts, and the state is simply a record that the hosts converge to", "con": "Progress is seen with a delay of one poll" }
+      ],
+      "pick": "Pull a desired version, with a small push to wake the agents, so that new and recovered hosts also reach the right version without a special path."
+    }
+  ],
+  "roles": [
+    { "id": "client", "label": "Engineers", "description": "People who merge a change and start, pause or undo a deploy." },
+    { "id": "edge", "label": "Deploy controller", "description": "Owns the rollout plan and moves the fleet from wave to wave." },
+    { "id": "async", "label": "Distribution", "description": "Regional caches and peers that carry the artifact to hosts." },
+    { "id": "compute", "label": "Build, hosts and gate", "description": "The pipeline, the hosts that run the service, and the health gate." },
+    { "id": "data", "label": "State", "description": "The artifact registry, the config and flag service, and the deploy lock." }
+  ]
+}

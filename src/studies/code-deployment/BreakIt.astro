@@ -1,0 +1,117 @@
+---
+import PlaygroundShell from '../../components/PlaygroundShell.astro';
+---
+<PlaygroundShell title="Roll out a release with a hidden bug" hint="A new version goes to 1,000 hosts. It has a bug that makes some requests fail, and the bug only shows up some minutes after a host starts running it. Choose the canary, the batch size, the bake time and the rollback threshold, and see how many users meet the bug.">
+  <ol class="how">
+    <li>At the <b>default</b> settings (1% canary, 25% batches, 2 minutes of bake, rollback at 3% errors) the bug has not appeared yet when the gates look, so the release reaches <b>every host in 7:30</b> and a person notices it 20 minutes later: about <b>99,700 of 100,000 users</b> saw errors.</li>
+    <li>Raise the <b>bake time to 5 minutes</b>. The canary now runs long enough for the bug to show, the gate trips at <b>5:30</b>, and only about <b>1,000 users</b> are hurt. A bake time of 10 minutes cuts it to about <b>630</b>.</li>
+    <li>Or keep the 2-minute bake and lower the <b>threshold to 1%</b>: the gate sees the first signs of the bug at <b>2:00</b> and about <b>135 users</b> are hurt. Now set the bug to <b>0%</b> and the threshold to <b>0.25%</b>: a good release is <b>rolled back for nothing</b>, because normal error noise crosses a threshold that tight.</li>
+  </ol>
+  <div class="pg cdb" data-cdb>
+    <div class="pg-row">
+      <label>Canary hosts <select class="pg-in" data-c>
+        <option value="0">none</option><option value="1" selected>1% (10 hosts)</option><option value="5">5% (50 hosts)</option><option value="10">10% (100 hosts)</option>
+      </select></label>
+      <label>Batch size after the canary <select class="pg-in" data-b>
+        <option value="1">1% of hosts</option><option value="5">5%</option><option value="10">10%</option><option value="25" selected>25%</option><option value="50">50%</option>
+      </select></label>
+      <label>Canary bake time (minutes) <input type="range" min="0" max="15" step="1" value="2" data-bake /> <b data-bakeval></b></label>
+      <label>Roll back when errors exceed (%) <input type="range" min="0.25" max="10" step="0.25" value="3" data-thr /> <b data-thrval></b></label>
+      <label>Bug fails this share of requests (%) <input type="range" min="0" max="20" step="1" value="5" data-bug /> <b data-bugval></b></label>
+      <label>Bug shows up after <select class="pg-in" data-ramp>
+        <option value="0">immediately</option><option value="5">5 minutes</option><option value="10" selected>10 minutes</option>
+      </select></label>
+    </div>
+    <div class="pg-grid">
+      <div class="pg-box" data-b1><h3>Users who saw errors</h3><span class="pg-mono" data-o1></span><span class="pg-note" data-n1></span></div>
+      <div class="pg-box" data-b2><h3>Time to detect</h3><span class="pg-mono" data-o2></span><span class="pg-note" data-n2></span></div>
+      <div class="pg-box" data-b3><h3>Time to full rollout</h3><span class="pg-mono" data-o3></span><span class="pg-note" data-n3></span></div>
+      <div class="pg-box" data-b4><h3>Most hosts on the new version</h3><span class="pg-mono" data-o4></span><span class="pg-note" data-n4></span></div>
+    </div>
+    <svg viewBox="0 0 300 84" role="img" data-svg aria-label="Share of hosts running the new version over time" style="width:100%;max-height:140px">
+      <line x1="10" y1="74" x2="296" y2="74" stroke="var(--muted)" stroke-width="0.6"></line>
+      <line x1="10" y1="14" x2="296" y2="14" stroke="var(--muted)" stroke-width="0.4" stroke-dasharray="2 3"></line>
+      <polyline data-line fill="none" stroke-width="1.6" points=""></polyline>
+      <text x="12" y="11" font-size="6" fill="var(--muted)">100% of hosts</text>
+      <text x="296" y="82" font-size="6" text-anchor="end" fill="var(--muted)" data-end></text>
+      <text x="12" y="82" font-size="6" fill="var(--muted)">start</text>
+    </svg>
+    <p class="pg-out" data-verdict aria-live="polite"></p>
+    <p class="pg-note">Model: 1,000 hosts and 100,000 users, each sending a request every 10 seconds, spread randomly over the hosts. Time moves in 30-second steps. A batch takes one step to install, and the next batch waits two more steps for the health gate (the canary waits for the bake time instead). The bug fails the chosen share of requests on a host, growing linearly from nothing to that share over the time you pick. Normal traffic fails 0.2% of the time. The gate looks at the last minute of requests on the new hosts, needs at least 400 requests, and rolls back everything within 1 minute of tripping. If nothing trips, a person notices 20 minutes after the rollout ends. "Users who saw errors" counts users who received at least one failure caused by the bug.</p>
+  </div>
+</PlaygroundShell>
+<script>
+  document.querySelectorAll<HTMLElement>('[data-cdb]').forEach((root) => {
+    const q = <T extends HTMLElement>(s: string) => root.querySelector<T>(s)!;
+    const N = 1000; const USERS = 100000; const REQ = 3; const BASE = 0.002; const GATE = 2; const MINREQ = 400; const HUMAN = 40; const TICK = 30; const PER = (USERS / N) * REQ;
+    let seed = 4242; const rnd = () => ((seed = (seed * 1664525 + 1013904223) % 4294967296) / 4294967296);
+    const Z = Array.from({ length: 3000 }, () => (rnd() + rnd() + rnd() + rnd() - 2) / Math.sqrt(4 / 12)); // roughly normal sampling noise, fixed in advance
+    type Res = { users: number; detect: number | null; manual: boolean; full: number | null; done: number | null; peak: number; expo: number[]; rb: number; lastServe: number };
+    function rollout(canaryPct: number, batchPct: number, bakeMin: number, thr: number, bug: number, rampMin: number): Res {
+      const bakeT = Math.round(bakeMin * 2); const ramp = Math.round(rampMin * 2);
+      const c = canaryPct > 0 ? Math.max(1, Math.round((N * canaryPct) / 100)) : 0;
+      const B = Math.max(1, Math.round((N * batchPct) / 100));
+      const sizes: number[] = []; let left = N;
+      if (c > 0) { sizes.push(c); left -= c; }
+      while (left > 0) { const s = Math.min(B, left); sizes.push(s); left -= s; }
+      const starts: number[] = []; let ts = 0;
+      sizes.forEach((_, i) => { starts.push(ts); ts += 1 + (i === 0 && c > 0 ? Math.max(GATE, bakeT) : GATE); });
+      const lastServe = starts[starts.length - 1] + 1; const monitorEnd = lastServe + GATE;
+      const rateOf = (i: number, t: number) => { const age = t - (starts[i] + 1) + 1; return (bug / 100) * (ramp > 0 ? Math.min(1, age / ramp) : 1); };
+      const hist: { req: number; err: number }[] = []; const expo: number[] = [];
+      let rb = -1; let manual = false; let lam = 0; let peak = 0;
+      for (let t = 1; t < 2500; t++) {
+        let f = 1;
+        if (rb >= 0) { const k = t - rb; if (k >= 3) break; f = k === 1 ? 1 : 0.5; }
+        const lim = rb < 0 ? t : rb + 1; // hosts that were already installing when the rollback began still come up
+        let s = 0; let weighted = 0; let expected = 0;
+        sizes.forEach((sz, i) => { if (starts[i] + 1 <= lim) { s += sz; const r = rateOf(i, t); weighted += sz * r; expected += sz * (BASE + r); } });
+        expo.push((s * f) / N); peak = Math.max(peak, (s * f) / N);
+        lam += (REQ * weighted * f) / N;
+        if (rb < 0) {
+          const req = s * PER; const p = expected / s; const err = expected * PER + Z[t] * Math.sqrt(req * p * (1 - p));
+          hist.push({ req, err });
+          const w = hist.slice(-2); const wr = w.reduce((a, h) => a + h.req, 0); const we = w.reduce((a, h) => a + h.err, 0);
+          if (t <= monitorEnd && wr >= MINREQ && we / wr > thr / 100) rb = t;
+          else if (t === monitorEnd + HUMAN && bug > 0) { rb = t; manual = true; }
+        }
+      }
+      return { users: USERS * (1 - Math.exp(-lam)), detect: rb >= 0 ? rb * TICK : null, manual, full: rb < 0 || rb >= lastServe ? lastServe * TICK : null, done: rb >= 0 ? (rb + 2) * TICK : null, peak, expo, rb, lastServe };
+    }
+    const mmss = (s: number) => `${Math.floor(s / 60)}:${String(s % 60).padStart(2, '0')}`;
+    const fmt = (n: number) => Math.round(n).toLocaleString('en-US');
+    const line = q<SVGPolylineElement>('[data-line]'); const endLabel = q('[data-end]');
+    function draw() {
+      const c = Number(q<HTMLSelectElement>('[data-c]').value); const b = Number(q<HTMLSelectElement>('[data-b]').value);
+      const bake = Number(q<HTMLInputElement>('[data-bake]').value); const thr = Number(q<HTMLInputElement>('[data-thr]').value);
+      const bug = Number(q<HTMLInputElement>('[data-bug]').value); const ramp = Number(q<HTMLSelectElement>('[data-ramp]').value);
+      q('[data-bakeval]').textContent = String(bake); q('[data-thrval]').textContent = String(thr); q('[data-bugval]').textContent = String(bug);
+      const r = rollout(c, b, bake, thr, bug, ramp);
+      const falseAlarm = bug === 0 && r.detect !== null;
+      const late = r.detect !== null && !r.manual && r.peak >= 0.5 && !falseAlarm;
+      q('[data-o1]').textContent = fmt(r.users); q('[data-n1]').textContent = bug === 0 ? 'the release has no bug' : `${(r.users / 1000).toFixed(1)}% of all 100,000 users`;
+      q('[data-o2]').textContent = r.detect === null ? 'not needed' : mmss(r.detect);
+      q('[data-n2]').textContent = r.detect === null ? 'no alarm, and nothing was wrong' : r.manual ? 'noticed by a person: the gate never tripped' : falseAlarm ? 'a false alarm' : `the gate tripped; rollback finished at ${mmss(r.done as number)}`;
+      q('[data-o3]').textContent = r.full === null ? 'never' : mmss(r.full);
+      q('[data-n3]').textContent = r.full === null ? 'stopped and rolled back before the last batch' : r.detect === null ? 'every host is on the new version' : 'every host reached the new version before the rollback';
+      q('[data-o4]').textContent = `${Math.round(r.peak * 100)}%`; q('[data-n4]').textContent = `${fmt(r.peak * N)} of ${fmt(N)} hosts`;
+      const sad = r.manual || late || falseAlarm;
+      q<HTMLElement>('[data-b1]').style.setProperty('--c', r.users > 2000 ? 'var(--bad)' : 'var(--good)');
+      q<HTMLElement>('[data-b2]').style.setProperty('--c', r.manual || falseAlarm ? 'var(--bad)' : 'var(--good)');
+      q<HTMLElement>('[data-b3]').style.setProperty('--c', 'var(--accent)');
+      q<HTMLElement>('[data-b4]').style.setProperty('--c', r.peak >= 0.25 ? 'var(--bad)' : 'var(--good)');
+      const n = r.expo.length; const total = Math.max(n, 20);
+      line.setAttribute('points', r.expo.map((e, i) => `${(10 + (286 * (i + 1)) / total).toFixed(1)},${(74 - 60 * e).toFixed(1)}`).join(' '));
+      line.style.setProperty('stroke', sad ? 'var(--bad)' : 'var(--good)');
+      endLabel.textContent = mmss(total * TICK);
+      const out = q('[data-verdict]'); out.classList.toggle('bad', sad);
+      out.textContent = falseAlarm ? `The release was fine, but a threshold of ${thr}% sits inside normal noise (0.2% of requests fail anyway, and small samples wobble), so the gate rolled it back at ${mmss(r.detect as number)}. Too tight a gate blocks every release.`
+        : r.detect === null ? (bug === 0 ? `A good release went out to every host in ${mmss(r.full as number)} and nothing tripped. That is what the gates are meant to allow.` : 'The bug is so mild that it stays under the gate and nobody sees it in this window.')
+        : r.manual ? `Nothing tripped the gate: the bug fails at most ${bug}% of requests, ${bug <= thr ? 'which is under' : 'but it had not grown past'} the ${thr}% threshold while the gates were looking. The release reached every host at ${mmss(r.full as number)} and a person noticed 20 minutes later, after ${fmt(r.users)} users saw errors. Lengthen the bake or tighten the threshold.`
+        : late ? `The gate worked, but late: by ${mmss(r.detect as number)} the new version was on ${Math.round(r.peak * 100)}% of the hosts and ${fmt(r.users)} users had seen errors. A smaller first batch or a longer bake would have caught it while it was still on a few hosts.`
+        : `Caught at ${mmss(r.detect as number)} while only ${Math.round(r.peak * 100)}% of the hosts ran the new version. Rollback finished at ${mmss(r.done as number)} and about ${fmt(r.users)} users saw errors, instead of the whole fleet.`;
+    }
+    root.addEventListener('input', draw); root.addEventListener('change', draw);
+    draw();
+  });
+</script>

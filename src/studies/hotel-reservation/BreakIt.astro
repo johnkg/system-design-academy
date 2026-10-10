@@ -1,0 +1,85 @@
+---
+import PlaygroundShell from '../../components/PlaygroundShell.astro';
+---
+<PlaygroundShell title="The last rooms of a weekend" hint="120 guests want stays of 1 to 3 nights in a 7-night week. The hotel has 20 rooms of one type. Compare three ways of selling them, with the same guests in the same order.">
+  <ol class="how">
+    <li>With <b>concurrency 30</b>, <b>read then write</b> sells <b>18 room-nights that do not exist</b>, because every request in a group read the same free count. Set the concurrency to <b>1</b>: it sells exactly as the safe version does, which is why the bug hides in tests.</li>
+    <li>The <b>conditional update</b> never goes past 20 rooms on any night, however high you set the concurrency. Some guests are rejected, and with <b>10% cancellations</b> some rooms end up empty.</li>
+    <li>Add a <b>10% overbooking buffer</b> with 10% cancellations: it fills more nights with only <b>2 walked room-nights</b>. Raise the buffer to <b>20%</b> and guests are turned away at the desk (<b>12</b>). Go back to a 10% buffer and raise the real cancellations to <b>25%</b>: nobody walks, and rooms still stay empty.</li>
+  </ol>
+  <div class="pg hrb" data-hrb>
+    <div class="pg-row">
+      <label>Requests handled at the same instant <input type="range" min="1" max="120" value="30" data-c /> <b data-cval></b></label>
+      <label>Overbooking buffer (% of rooms) <input type="range" min="0" max="30" step="5" value="10" data-b /> <b data-bval></b></label>
+      <label>Bookings that are cancelled or no-show (%) <input type="range" min="0" max="30" step="5" value="10" data-x /> <b data-xval></b></label>
+    </div>
+    <div class="pg-grid">
+      <div class="pg-box" data-b1><h3>Read free count, then write</h3><span class="pg-mono" data-o1></span><span class="pg-note" data-n1></span></div>
+      <div class="pg-box" data-b2><h3>Conditional update on each night</h3><span class="pg-mono" data-o2></span><span class="pg-note" data-n2></span></div>
+      <div class="pg-box" data-b3><h3>Conditional update with overbooking</h3><span class="pg-mono" data-o3></span><span class="pg-note" data-n3></span></div>
+    </div>
+    <p class="pg-out" data-verdict aria-live="polite"></p>
+    <p class="pg-note">Model: 20 rooms, 7 nights, so 140 room-nights. The 120 guests arrive in a fixed order, each wanting 1 to 3 consecutive nights. A stay is accepted only if every one of its nights is free, and a rejected guest leaves. In the first design, each group of simultaneous requests reads the counts as they were before the group started. In the other two the check and the update are one step on each row. The buffer raises the limit to 20 rooms plus the buffer rounded up. Later, the chosen share of accepted bookings is cancelled, and a night walks one guest for every arriving guest above 20. Rooms freed by cancellations are not resold.</p>
+  </div>
+</PlaygroundShell>
+<script>
+  document.querySelectorAll<HTMLElement>('[data-hrb]').forEach((root) => {
+    const q = <T extends HTMLElement>(s: string) => root.querySelector<T>(s)!;
+    const CAP = 20; const NIGHTS = 7; const GUESTS = 120;
+    let seed = 77; const rnd = () => ((seed = (seed * 1664525 + 1013904223) % 4294967296) / 4294967296);
+    const reqs = Array.from({ length: GUESTS }, () => { const len = 1 + Math.floor(rnd() * 3); const from = Math.floor(rnd() * (NIGHTS - len + 1)); return { from, len, u: rnd() }; });
+    type Req = { from: number; len: number; u: number };
+    const nights = (r: Req) => Array.from({ length: r.len }, (_, i) => r.from + i);
+    // Counts how many accepted guests arrive on each night, given the cancellation share (a guest cancels if their draw is below it).
+    const arrivals = (acc: Req[], rate: number) => { const a = new Array(NIGHTS).fill(0); acc.forEach((r) => { if (r.u >= rate) nights(r).forEach((n) => a[n]++); }); return a; };
+    const walks = (a: number[]) => a.reduce((s, x) => s + Math.max(0, x - CAP), 0);
+    const filled = (a: number[]) => a.reduce((s, x) => s + Math.min(x, CAP), 0);
+    function simulate(c: number, buf: number, canc: number) {
+      const rate = canc / 100; const limit = CAP + Math.ceil((CAP * buf) / 100);
+      // 1. Read then write: a group reads one snapshot of the counts.
+      const booked = new Array(NIGHTS).fill(0); const acc1: Req[] = [];
+      for (let i = 0; i < GUESTS; i += c) {
+        const snap = booked.slice();
+        for (const r of reqs.slice(i, i + c)) if (nights(r).every((n) => snap[n] < CAP)) { acc1.push(r); nights(r).forEach((n) => booked[n]++); }
+      }
+      const a1 = arrivals(acc1, rate);
+      // 2 and 3. Conditional update per night, all nights or none.
+      const run = (lim: number) => {
+        const b = new Array(NIGHTS).fill(0); const acc: Req[] = [];
+        for (const r of reqs) if (nights(r).every((n) => b[n] < lim)) { acc.push(r); nights(r).forEach((n) => b[n]++); }
+        return { b, acc, a: arrivals(acc, rate) };
+      };
+      const s2 = run(CAP); const s3 = run(limit);
+      return {
+        limit,
+        r1: { over: booked.reduce((s, x) => s + Math.max(0, x - CAP), 0), accepted: acc1.length, walk: walks(a1), booked },
+        r2: { accepted: s2.acc.length, rejected: GUESTS - s2.acc.length, fill: filled(s2.a), walk: 0, booked: s2.b },
+        r3: { accepted: s3.acc.length, rejected: GUESTS - s3.acc.length, fill: filled(s3.a), walk: walks(s3.a), booked: s3.b },
+      };
+    }
+    function draw() {
+      const c = Number(q<HTMLInputElement>('[data-c]').value); const buf = Number(q<HTMLInputElement>('[data-b]').value); const canc = Number(q<HTMLInputElement>('[data-x]').value);
+      q('[data-cval]').textContent = String(c); q('[data-bval]').textContent = String(buf); q('[data-xval]').textContent = String(canc);
+      const r = simulate(c, buf, canc); const total = CAP * NIGHTS;
+      const pct = (n: number) => `${Math.round((n / total) * 100)}%`;
+      q('[data-o1]').textContent = r.r1.over > 0 ? `${r.r1.over} room-nights sold that do not exist` : 'no room sold twice';
+      q('[data-n1]').textContent = `${r.r1.accepted} guests accepted; nights used ${r.r1.booked.join(' ')}; ${r.r1.walk} room-nights with no room at arrival`;
+      q('[data-o2]').textContent = `${r.r2.fill} of ${total} room-nights filled (${pct(r.r2.fill)})`;
+      q('[data-n2]').textContent = `${r.r2.accepted} accepted, ${r.r2.rejected} rejected; nights booked ${r.r2.booked.join(' ')}; nobody walked`;
+      q('[data-o3]').textContent = `${r.r3.fill} of ${total} room-nights filled (${pct(r.r3.fill)}), ${r.r3.walk} walked`;
+      q('[data-n3]').textContent = `limit ${r.limit} rooms per night; ${r.r3.accepted} accepted, ${r.r3.rejected} rejected; nights booked ${r.r3.booked.join(' ')}`;
+      q<HTMLElement>('[data-b1]').style.setProperty('--c', r.r1.over > 0 ? 'var(--bad)' : 'var(--good)');
+      q<HTMLElement>('[data-b2]').style.setProperty('--c', 'var(--good)');
+      q<HTMLElement>('[data-b3]').style.setProperty('--c', r.r3.walk > 0 ? 'var(--bad)' : 'var(--good)');
+      const out = q('[data-verdict]'); out.classList.toggle('bad', r.r1.over > 0 || r.r3.walk > 0);
+      let msg = r.r1.over > 0 ? `Read-then-write sold ${r.r1.over} room-nights beyond the 20 rooms, because ${c} requests read the same free count. The conditional update accepted ${r.r2.accepted} guests and never passed 20 on any night.`
+        : c > 1 ? 'With this concurrency no two requests happened to compete for a full night, so the unsafe design looks correct. Raise the concurrency to see it fail.'
+        : 'One request at a time makes the unsafe design look correct, so a test on a laptop will not find it.';
+      if (r.r3.walk > r.r2.walk) msg += ` Overbooking by ${buf}% filled ${r.r3.fill - r.r2.fill} more room-nights than the strict limit, but ${r.r3.walk} arrivals found no room, because only ${canc}% of bookings were cancelled.`;
+      else if (buf > 0) msg += ` Overbooking by ${buf}% filled ${r.r3.fill - r.r2.fill} more room-nights and nobody was turned away, because cancellations of ${canc}% covered the extra bookings.`;
+      out.textContent = msg;
+    }
+    root.addEventListener('input', draw);
+    draw();
+  });
+</script>

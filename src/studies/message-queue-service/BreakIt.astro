@@ -1,0 +1,101 @@
+---
+import PlaygroundShell from '../../components/PlaygroundShell.astro';
+---
+<PlaygroundShell title="Kill the leader while writing" hint="A producer writes 200 messages to one partition. After message 125 the leader's machine is destroyed. Choose how the write is acknowledged and how many copies exist, then see what was promised and what survived.">
+  <ol class="how">
+    <li>The default is <b>acks = 1</b> on 3 replicas. The leader said "done" as soon as it had written the message, but the followers copy only every 8 messages, so <b>5 acknowledged messages are gone</b> and the log holds <b>7 duplicates</b> from lost acknowledgements that were retried.</li>
+    <li>Set <b>acks = all</b>: the leader waits for the in-sync followers, so <b>nothing acknowledged is lost</b>. The price is a slower acknowledgement (about 5.6 ms instead of 2 ms). Switch to <b>acks = 0</b> for the fastest and the worst: 7 messages are gone and the producer never knew.</li>
+    <li>Tick <b>idempotent producer</b> to remove the duplicates. Then tick <b>a follower is slow</b> with <b>2 replicas</b> and acks = all: the in-sync set shrinks to the leader alone, so acks = all protects nothing. Set <b>min.insync.replicas = 2</b> and the writes are refused instead, which is safe but unavailable.</li>
+    <li>In the consumer box, <b>commit before processing</b> loses the rest of the batch when the consumer crashes, and <b>commit after processing</b> repeats the part that was done.</li>
+  </ol>
+  <div class="pg mqb" data-mqb>
+    <div class="pg-row">
+      <label>Producer acks <select class="pg-in" data-acks><option value="0">0: do not wait</option><option value="1" selected>1: the leader wrote it</option><option value="2">all: every in-sync replica has it</option></select></label>
+      <label>Replicas of the partition <select class="pg-in" data-r><option value="1">1</option><option value="2">2</option><option value="3" selected>3</option></select></label>
+      <label>Followers copy every <input type="range" min="1" max="20" value="8" data-lag /> <b data-lagval></b> messages</label>
+      <label>min.insync.replicas <select class="pg-in" data-min><option value="1" selected>1</option><option value="2">2</option></select></label>
+    </div>
+    <div class="pg-row">
+      <label class="mqb-check"><input type="checkbox" data-slow /> One follower is slow and has left the in-sync set</label>
+      <label class="mqb-check"><input type="checkbox" data-idem /> Idempotent producer (sequence numbers)</label>
+    </div>
+    <div class="pg-row">
+      <label>Consumer commits the offset <select class="pg-in" data-commit><option value="before">before processing</option><option value="after" selected>after processing</option></select></label>
+      <label>Consumer crashes after processing <input type="range" min="0" max="10" value="6" data-k /> <b data-kval></b> of 10 messages</label>
+    </div>
+    <div class="pg-grid">
+      <div class="pg-box" data-b1><h3>Acknowledged but lost</h3><span class="pg-mono" data-o1></span><span class="pg-note" data-n1></span></div>
+      <div class="pg-box" data-b2><h3>Duplicates in the log</h3><span class="pg-mono" data-o2></span><span class="pg-note" data-n2></span></div>
+      <div class="pg-box" data-b3><h3>Typical acknowledgement time</h3><span class="pg-mono" data-o3></span><span class="pg-note" data-n3></span></div>
+      <div class="pg-box" data-b4><h3>Writes refused</h3><span class="pg-mono" data-o4></span><span class="pg-note" data-n4></span></div>
+      <div class="pg-box" data-b5><h3>Consumer after its crash</h3><span class="pg-mono" data-o5></span><span class="pg-note" data-n5></span></div>
+    </div>
+    <p class="pg-out" data-verdict aria-live="polite"></p>
+    <p class="pg-note">Model: the producer sends messages 0 to 199 in order. The leader's machine is destroyed just before message 125, and a follower in the in-sync set takes over. With acks = 0 and acks = 1 the followers copy the leader's log every N messages, and with acks = all the leader waits for them on every message. Every 25th acknowledgement is lost on the network, so the producer retries that message. After the crash a producer using acks = 0 sends 2 more messages to the dead leader before it learns about the new one. A refused write is reported to the producer. Times are typical same-datacenter medians: 0.3 ms to hand off, 2 ms for a leader write, plus 3 ms for the slowest follower fetch and 0.6 ms for each further follower.</p>
+  </div>
+</PlaygroundShell>
+<style is:global>
+  .playground .mqb-check { display: inline-flex; align-items: center; gap: 6px; }
+</style>
+<script>
+  document.querySelectorAll<HTMLElement>('[data-mqb]').forEach((root) => {
+    const q = <T extends HTMLElement>(s: string) => root.querySelector<T>(s)!;
+    const N = 200; const CRASH = 125; const RETRY_EVERY = 25; const BATCH = 10;
+    type Cfg = { acks: number; r: number; lag: number; slow: boolean; minIsr: number; idem: boolean };
+    function simulate(c: Cfg) {
+      let leaderLog: number[] = []; let copy: number[] = [];
+      let isr = c.r - (c.slow && c.r >= 2 ? 1 : 0); // replicas in sync, the leader included
+      const isr0 = isr; let crashed = false; let offline = false; let stale = 0;
+      const acked: number[] = []; let rejected = 0;
+      for (let i = 0; i < N; i++) {
+        if (i === CRASH) { crashed = true; if (isr < 2) offline = true; else { leaderLog = copy.slice(); isr--; } stale = 2; }
+        if (offline) { if (c.acks === 0) acked.push(i); else rejected++; continue; }
+        if (crashed && c.acks === 0 && stale > 0) { stale--; acked.push(i); continue; }
+        if (c.acks === 2 && isr < c.minIsr) { rejected++; continue; }
+        leaderLog.push(i);
+        if (i % RETRY_EVERY === RETRY_EVERY - 1 && c.acks !== 0 && !c.idem) leaderLog.push(i); // the acknowledgement was lost, so the retry writes it again
+        if (isr >= 2 && (c.acks === 2 || (i + 1) % c.lag === 0)) copy = leaderLog.slice();
+        acked.push(i);
+      }
+      const kept = offline ? [] : leaderLog; const has = new Set(kept);
+      const lost = acked.filter((id) => !has.has(id));
+      const followers = Math.max(0, isr0 - 1);
+      const ms = c.acks === 0 ? 0.3 : c.acks === 1 || followers === 0 ? 2 : 5 + 0.6 * (followers - 1);
+      return { acked: acked.length, lost, dups: kept.length - has.size, rejected, offline, kept: kept.length, ms, followers, isr0 };
+    }
+    function consumer(kept: number, commit: string, k: number) {
+      const b = Math.min(BATCH, kept); const done = Math.min(k, b);
+      return commit === 'before' ? { missing: b - done, repeated: 0, b, done } : { missing: 0, repeated: done, b, done };
+    }
+    function draw() {
+      const c: Cfg = { acks: Number(q<HTMLSelectElement>('[data-acks]').value), r: Number(q<HTMLSelectElement>('[data-r]').value), lag: Number(q<HTMLInputElement>('[data-lag]').value), slow: q<HTMLInputElement>('[data-slow]').checked, minIsr: Number(q<HTMLSelectElement>('[data-min]').value), idem: q<HTMLInputElement>('[data-idem]').checked };
+      const commit = q<HTMLSelectElement>('[data-commit]').value; const k = Number(q<HTMLInputElement>('[data-k]').value);
+      q('[data-lagval]').textContent = String(c.lag); q('[data-kval]').textContent = String(k);
+      const s = simulate(c); const cs = consumer(s.kept, commit, k);
+      const lostN = s.lost.length;
+      q('[data-o1]').textContent = `${lostN} of ${s.acked} acknowledged`;
+      q('[data-n1]').textContent = lostN === 0 ? 'every acknowledged message is in the new leader\'s log' : s.offline ? 'no in-sync replica could take over, so the log is gone' : `ids ${s.lost[0]} to ${s.lost[lostN - 1]}: written by the old leader, never copied`;
+      q('[data-o2]').textContent = `${s.dups} duplicates`;
+      q('[data-n2]').textContent = s.dups > 0 ? 'a retry after a lost acknowledgement was written a second time' : c.idem ? 'the broker dropped each retry by its sequence number' : 'no retry reached the surviving log';
+      q('[data-o3]').textContent = `${s.ms.toFixed(1)} ms`;
+      q('[data-n3]').textContent = c.acks === 0 ? 'the producer does not wait for any answer' : c.acks === 1 || s.followers === 0 ? 'one round trip to the leader and its disk write' : `leader write plus waiting for ${s.followers} in-sync follower${s.followers > 1 ? 's' : ''}`;
+      q('[data-o4]').textContent = `${s.rejected} refused`;
+      q('[data-n4]').textContent = s.rejected > 0 ? 'the producer got an error (not enough in-sync replicas, or no leader) and knows to retry later' : 'every write was accepted';
+      q('[data-o5]').textContent = `${cs.missing} missing, ${cs.repeated} repeated`;
+      q('[data-n5]').textContent = commit === 'before' ? `the offset moved past a batch of ${cs.b} before ${cs.done} were processed, so the rest is never delivered` : `${cs.done} of ${cs.b} were processed but not committed, so they are delivered again`;
+      const colour = (id: string, bad: boolean) => q<HTMLElement>(id).style.setProperty('--c', bad ? 'var(--bad)' : 'var(--good)');
+      colour('[data-b1]', lostN > 0); colour('[data-b2]', s.dups > 0); colour('[data-b3]', false); colour('[data-b4]', s.rejected > 0); colour('[data-b5]', cs.missing > 0 || cs.repeated > 0);
+      q<HTMLElement>('[data-b3]').style.setProperty('--c', 'var(--accent)');
+      const out = q('[data-verdict]'); const bad = lostN > 0 || s.dups > 0; out.classList.toggle('bad', bad);
+      const parts: string[] = [];
+      if (lostN > 0) parts.push(s.offline ? `The only in-sync replica was the leader, so when it died there was nobody to take over, and all ${lostN} messages the producer thought were safe were lost. With a single in-sync replica even acks = all protects nothing.` : c.acks === 0 ? `With acks = 0 the producer was told nothing, and ${lostN} messages were lost: the ones the old leader never copied, and 2 sent to it after it died.` : `${lostN} messages were acknowledged and then lost: the leader answered after its own write, and the followers had not copied them yet. The new leader never had them.`);
+      else if (s.rejected > 0) parts.push(`Nothing acknowledged was lost, but ${s.rejected} writes were refused. With fewer in-sync replicas than min.insync.replicas the partition stops accepting writes rather than risk them: safe, and unavailable.`);
+      else parts.push(`Nothing acknowledged was lost: every message the producer was told about is in the new leader's log.`);
+      if (s.dups > 0) parts.push(`The log also holds ${s.dups} duplicates from retries, which an idempotent producer would drop.`);
+      parts.push(`An acknowledgement takes about ${s.ms.toFixed(1)} ms.`);
+      out.textContent = parts.join(' ');
+    }
+    root.addEventListener('input', draw); root.addEventListener('change', draw);
+    draw();
+  });
+</script>
