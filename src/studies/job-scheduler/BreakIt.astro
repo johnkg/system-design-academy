@@ -1,0 +1,68 @@
+---
+import PlaygroundShell from '../../components/PlaygroundShell.astro';
+---
+<PlaygroundShell title="When workers crash" hint="300 jobs each send one invoice. Workers crash at random, before or after doing the work. Compare three delivery designs, all with the same jobs and the same crashes.">
+  <ol class="how">
+    <li>At <b>15% crashes</b>, <b>delete on receive</b> loses jobs, because a crash before the work means nobody ever tries again.</li>
+    <li><b>Lease and retry</b> loses nothing, but some invoices go out <b>twice</b>: the worker crashed after sending and before acknowledging. The same happens when the <b>lease is shorter than the job</b> takes, even with no crashes.</li>
+    <li><b>Lease, retry and idempotent work</b> sends every invoice once. At very high crash rates a few jobs run out of attempts and land in the <b>dead-letter queue</b>, where a person can see them.</li>
+  </ol>
+  <div class="pg jsb" data-jsb>
+    <div class="pg-row">
+      <label>Chance that a run crashes (%) <input type="range" min="0" max="50" step="1" value="15" data-c /> <b data-cval></b></label>
+      <label>Lease length (seconds) <input type="range" min="5" max="60" step="5" value="60" data-l /> <b data-lval></b></label>
+    </div>
+    <div class="pg-grid">
+      <div class="pg-box" data-b1><h3>Delete on receive (at most once)</h3><span class="pg-mono" data-o1></span><span class="pg-note" data-n1></span></div>
+      <div class="pg-box" data-b2><h3>Lease and retry (at least once)</h3><span class="pg-mono" data-o2></span><span class="pg-note" data-n2></span></div>
+      <div class="pg-box" data-b3><h3>Lease, retry, idempotent work</h3><span class="pg-mono" data-o3></span><span class="pg-note" data-n3></span></div>
+    </div>
+    <p class="pg-out" data-verdict aria-live="polite"></p>
+    <p class="pg-note">Model: each run takes between 10 and 40 seconds. A crash happens before the work with half the chance, otherwise after the work and before the ack. Each job gets at most 5 attempts. If a run takes longer than the lease, the queue hands the job to a second worker while the first is still running, and both do the work. The idempotent design records each run, so repeated work has no effect.</p>
+  </div>
+</PlaygroundShell>
+<script>
+  document.querySelectorAll<HTMLElement>('[data-jsb]').forEach((root) => {
+    const q = <T extends HTMLElement>(s: string) => root.querySelector<T>(s)!;
+    const N = 300; const MAX = 5;
+    let seed = 8; const rnd = () => ((seed = (seed * 1664525 + 1013904223) % 4294967296) / 4294967296);
+    const jobs = Array.from({ length: N }, () => ({ dur: 10 + rnd() * 30, crash: Array.from({ length: MAX }, () => rnd()), when: Array.from({ length: MAX }, () => rnd()) }));
+    type R = { once: number; lost: number; twice: number; dead: number };
+    function run(mode: 'at-most' | 'at-least' | 'idem', c: number, lease: number): R {
+      let once = 0; let lost = 0; let twice = 0; let dead = 0;
+      for (const j of jobs) {
+        let effects = 0; let finished = false;
+        const tries = mode === 'at-most' ? 1 : MAX;
+        for (let a = 0; a < tries; a++) {
+          const crashed = j.crash[a] < c;
+          if (crashed) { if (j.when[a] >= 0.5) effects++; continue; } // crash after the work: the work happened, the ack did not
+          effects++; finished = true;
+          if (mode !== 'at-most' && j.dur > lease) effects++; // the lease ran out while the job was still running, so a second worker did it too
+          break;
+        }
+        const done = mode === 'idem' ? Math.min(effects, 1) : effects;
+        if (!finished && mode !== 'at-most') dead++; // every attempt crashed: the job is set aside for a person
+        else if (done === 0) lost++;
+        else if (done === 1) once++;
+        else twice++;
+      }
+      return { once, lost, twice, dead };
+    }
+    function draw() {
+      const c = Number(q<HTMLInputElement>('[data-c]').value) / 100; const lease = Number(q<HTMLInputElement>('[data-l]').value);
+      q('[data-cval]').textContent = String(Math.round(c * 100)); q('[data-lval]').textContent = String(lease);
+      const r = [run('at-most', c, lease), run('at-least', c, lease), run('idem', c, lease)];
+      r.forEach((x, i) => {
+        const k = i + 1;
+        q(`[data-o${k}]`).textContent = `${x.once} invoices sent once`;
+        q(`[data-n${k}]`).textContent = `${x.lost} lost · ${x.twice} sent more than once · ${x.dead} in the dead-letter queue`;
+        q<HTMLElement>(`[data-b${k}]`).style.setProperty('--c', x.lost + x.twice > 0 ? 'var(--bad)' : x.dead > 0 ? 'var(--accent)' : 'var(--good)');
+      });
+      const out = q('[data-verdict]'); const bad = r[0].lost > 0 || r[1].twice > 0; out.classList.toggle('bad', bad);
+      out.textContent = !bad ? 'With no crashes and a lease that is long enough, all three look the same. The differences only show when something goes wrong.'
+        : `Delete-on-receive lost ${r[0].lost} invoices. Lease-and-retry lost none but sent ${r[1].twice} twice. Adding idempotent work gave ${r[2].twice} duplicates${r[2].dead ? ` and left ${r[2].dead} for a person in the dead-letter queue` : ''}.`;
+    }
+    root.addEventListener('input', draw);
+    draw();
+  });
+</script>

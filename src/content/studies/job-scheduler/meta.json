@@ -1,0 +1,177 @@
+{
+  "name": "Design a Distributed Job Scheduler",
+  "difficulty": "intermediate",
+  "intent": "Run millions of jobs, once or on a schedule, at the right time and on a fleet of workers that may crash at any moment, without losing jobs and without doing them twice.",
+  "codeTitle": "a job queue with leases and a dead-letter queue",
+  "finalIntro": "One scheduled job from the schedule to completion, with a worker that dies in the middle.",
+  "prompt": "Design a service where teams register jobs: send this invoice email at 9 a.m. tomorrow, rebuild the report every night, retry this payment in ten minutes. The service runs each job on time on a pool of workers, retries failures, and shows what happened.",
+  "functional": [
+    "Create jobs that run once at a given time, after a delay, or repeatedly on a schedule",
+    "Run each job at its scheduled time, with a delay of seconds at the worst",
+    "Retry failed jobs, with a limit, and set aside the ones that keep failing",
+    "Show the status and history of each job, and let users cancel or pause it",
+    "Support priorities and keep one team's load from starving the others"
+  ],
+  "nonFunctional": [
+    "Never lose a job that was accepted, even if machines crash",
+    "Run each job at least once, and make doing it twice harmless",
+    "Start jobs close to their scheduled time, even when thousands are due at the same minute",
+    "Scale to millions of jobs a day and tens of thousands of workers",
+    "Tolerate worker, scheduler and database failures without a person stepping in"
+  ],
+  "firstAttempt": {
+    "text": "One server with cron. A jobs table holds each job's command and next run time. Every minute a script looks for jobs whose time has come and runs them one after another, in the same process, then sets the next run time.",
+    "limits": [
+      "If that server dies, no job runs until someone notices",
+      "One slow job holds up every job behind it",
+      "Starting a second server for safety makes both run every job, so everything happens twice",
+      "A job that crashes the script is lost, and nothing retries it",
+      "Scanning the whole table every minute gets slower as the table grows"
+    ]
+  },
+  "nodes": [
+    { "id": "users", "label": "Teams and services", "kind": "client", "x": 12, "y": 50 },
+    { "id": "single", "label": "Server running cron", "kind": "compute", "x": 50, "y": 50, "at": 0, "until": 1 },
+    { "id": "api", "label": "Job API", "kind": "edge", "x": 37, "y": 50, "at": 1 },
+    { "id": "jobsdb", "label": "Jobs database", "kind": "data", "x": 87, "y": 50, "at": 1 },
+    { "id": "scheduler", "label": "Scheduler", "kind": "compute", "x": 62, "y": 50, "at": 1, "until": 4 },
+    { "id": "shards", "label": "Schedulers with leases on job ranges", "kind": "compute", "x": 62, "y": 50, "at": 4 },
+    { "id": "queue", "label": "Ready queue", "kind": "async", "x": 62, "y": 16, "at": 1, "until": 6 },
+    { "id": "tq", "label": "Queues per tenant and priority", "kind": "async", "x": 62, "y": 16, "at": 6 },
+    { "id": "workers", "label": "Workers", "kind": "compute", "x": 87, "y": 16, "at": 1 },
+    { "id": "runlog", "label": "Run records", "kind": "data", "x": 87, "y": 84, "at": 3 },
+    { "id": "dlq", "label": "Dead-letter queue", "kind": "async", "x": 62, "y": 84, "at": 5 },
+    { "id": "autoscaler", "label": "Autoscaler", "kind": "compute", "x": 37, "y": 16, "at": 6 }
+  ],
+  "edges": [
+    { "from": "users", "to": "single", "at": 0, "until": 1 },
+    { "from": "users", "to": "api", "at": 1 },
+    { "from": "api", "to": "jobsdb", "at": 1 },
+    { "from": "scheduler", "to": "jobsdb", "at": 1, "until": 4 },
+    { "from": "shards", "to": "jobsdb", "at": 4 },
+    { "from": "scheduler", "to": "queue", "at": 1, "until": 4 },
+    { "from": "shards", "to": "queue", "at": 4, "until": 6 },
+    { "from": "shards", "to": "tq", "at": 6 },
+    { "from": "queue", "to": "workers", "at": 1, "until": 6 },
+    { "from": "tq", "to": "workers", "at": 6 },
+    { "from": "workers", "to": "runlog", "at": 3 },
+    { "from": "queue", "to": "dlq", "at": 5, "until": 6 },
+    { "from": "tq", "to": "dlq", "at": 6 },
+    { "from": "autoscaler", "to": "tq", "at": 6 },
+    { "from": "autoscaler", "to": "workers", "at": 6 }
+  ],
+  "steps": [
+    {
+      "title": "Separate scheduling from running, with a queue between them",
+      "problem": "A single process that both decides what is due and runs it can only go as fast as its slowest job, and fails as one.",
+      "fix": "Jobs are stored in a database with an index on their next run time. A scheduler repeatedly asks for the jobs that are due, a few seconds ahead of time, and puts each one on a ready queue. A pool of workers takes jobs from the queue and runs them. The scheduler never runs anything itself, so it stays fast, and workers scale by number.",
+      "tradeoff": "Slow jobs no longer block anything, and the number of workers can follow the load. There is now a queue to keep healthy, and a job is delayed by the poll interval plus queue wait, so the scheduler looks a little ahead.",
+      "concepts": [{ "slug": "message-queues" }, { "slug": "database-indexing" }, { "slug": "sql-vs-nosql" }]
+    },
+    {
+      "title": "Lease each job to a worker, so a crash brings it back",
+      "problem": "A worker can die in the middle of a job, and if the queue has already forgotten the job it is lost for good.",
+      "fix": "When a worker receives a job, the queue does not delete it. It hides the job for a lease period and waits for an acknowledgement. The worker acknowledges after it finishes. If the worker dies, no ack arrives, the lease runs out and the job reappears for another worker. Long jobs renew their lease with a heartbeat so that they are not handed out again while still running.",
+      "tradeoff": "A crash can no longer lose a job. The job may be run again after a worker dies at the wrong moment, so a job can run more than once, which the next step handles. The lease must be long enough for a normal run, or a healthy job gets duplicated.",
+      "concepts": [{ "slug": "message-queues" }, { "slug": "retries-and-backoff" }, { "slug": "health-checks" }]
+    },
+    {
+      "title": "Make every job safe to run twice",
+      "problem": "With leases the guarantee is 'at least once', so the same job can start twice and an invoice could be sent twice.",
+      "fix": "Every run is identified by the job id and the scheduled time. Before doing the real work a worker records the run in a table with a unique key on that identifier, or passes the identifier as an idempotency key to the system it calls. A second attempt for the same run finds the record and does nothing. For jobs that must update several things together, the effect and the run record are written in one transaction.",
+      "tradeoff": "Duplicate deliveries become harmless, which is much cheaper than trying to guarantee exactly-once delivery. Authors of jobs must design them to be repeatable, and the run records need a retention policy.",
+      "concepts": [{ "slug": "idempotency" }, { "slug": "acid-vs-base" }, { "slug": "transactional-outbox" }]
+    },
+    {
+      "title": "Run several schedulers without letting them collide",
+      "problem": "A single scheduler is a single point of failure, but two schedulers that both scan the table will queue every job twice.",
+      "fix": "Split the jobs into ranges, for example by a hash of the job id. Each range is owned by one scheduler at a time through a lease kept in a coordination service, and the scheduler renews it regularly. If a scheduler dies, its lease expires and another takes the range. Moving a job to the queue is a conditional update that marks it as queued, so a repeat is rejected.",
+      "tradeoff": "Scheduling is spread across machines and survives failures, and no job is queued twice by two machines. A failover costs a few seconds of delay for the affected range, and the coordination service becomes a dependency of the scheduler.",
+      "concepts": [{ "slug": "leader-election" }, { "slug": "consensus" }, { "slug": "consistent-hashing" }]
+    },
+    {
+      "title": "Retry with backoff, and set poison jobs aside",
+      "problem": "Some jobs fail because of a temporary problem and should be retried, and others fail every time and will block a worker or loop for ever.",
+      "fix": "A failed job is retried after a growing delay with some randomness, such as 10 seconds, then 1 minute, then 10 minutes, up to a maximum number of attempts. A job with a timeout is stopped and counted as failed. After the last attempt it is moved to a dead-letter queue, which raises an alert and keeps the job and its error for a person to look at, fix and replay. A circuit breaker pauses a job type whose target is clearly down.",
+      "tradeoff": "Temporary failures heal themselves, permanent ones are visible and cannot jam the system. Retries add load during an outage, which the backoff and the breaker contain, and the dead-letter queue needs someone who looks at it.",
+      "concepts": [{ "slug": "retries-and-backoff" }, { "slug": "circuit-breaker" }, { "slug": "alerting" }]
+    },
+    {
+      "title": "Keep tenants fair and scale the workers with the queue",
+      "problem": "One team that schedules a million jobs at midnight can fill the queue and make everyone else's jobs late.",
+      "fix": "Each tenant and priority gets its own queue, and workers take from them by weighted round-robin so no tenant can take everything. Per-tenant rate limits and concurrency limits protect both the workers and the systems the jobs call. An autoscaler watches how long jobs wait in the queues and adds or removes workers.",
+      "tradeoff": "A burst from one team slows that team's jobs and no one else's, and capacity follows the load. More queues to run, limits that need to be set sensibly, and some scaling lag during very sharp bursts.",
+      "concepts": [{ "slug": "rate-limiting" }, { "slug": "bulkhead" }, { "slug": "horizontal-vs-vertical-scaling" }]
+    }
+  ],
+  "failures": [
+    {
+      "scenario": "A worker dies in the middle of a job",
+      "impact": "The job was received but never finished, and no acknowledgement will arrive.",
+      "answer": "The lease expires and the job becomes visible again. Another worker runs it, and because every run is recorded under the job id and scheduled time, a part of the work that was already done is not repeated.",
+      "concepts": [{ "slug": "message-queues" }, { "slug": "idempotency" }, { "slug": "retries-and-backoff" }]
+    },
+    {
+      "scenario": "A scheduler instance dies",
+      "impact": "The jobs in its range stop being queued, and their times pass.",
+      "answer": "Its lease on the range expires after a few seconds and another instance takes over. The new owner finds jobs that are overdue and queues them straight away, and the conditional 'mark as queued' step prevents any job from being queued twice.",
+      "concepts": [{ "slug": "leader-election" }, { "slug": "consensus" }, { "slug": "health-checks" }]
+    },
+    {
+      "scenario": "Half a million jobs are all scheduled for midnight exactly",
+      "impact": "The queue floods, workers are overwhelmed, and downstream systems are hit at once.",
+      "answer": "Jobs can carry a jitter window so that they start spread over a short period. Per-tenant limits and the autoscaler absorb the rest, the queue holds the backlog, and workers drain it at the pace the downstream systems can take.",
+      "concepts": [{ "slug": "backpressure" }, { "slug": "rate-limiting" }, { "slug": "message-queues" }]
+    },
+    {
+      "scenario": "A bug makes one job type fail every time",
+      "impact": "Retries pile up and the failing jobs use workers that others need.",
+      "answer": "After the attempt limit each failed job goes to the dead-letter queue and an alert names the job type. A circuit breaker for that type stops further attempts, and once the bug is fixed the jobs are replayed from the dead-letter queue.",
+      "concepts": [{ "slug": "circuit-breaker" }, { "slug": "alerting" }, { "slug": "bulkhead" }]
+    }
+  ],
+  "alternatives": [
+    {
+      "title": "Delivery guarantee",
+      "options": [
+        { "name": "At most once", "pro": "Never repeats a job", "con": "A crash at the wrong time loses the job" },
+        { "name": "At least once, with idempotent jobs", "pro": "Nothing is lost, and repeats are harmless", "con": "Job authors must make the work repeatable" },
+        { "name": "Exactly once", "pro": "What everyone would like", "con": "Not achievable across machines in general, only by making repeats harmless, which is the previous option" }
+      ],
+      "pick": "At least once, with idempotent jobs and run records."
+    },
+    {
+      "title": "How the scheduler finds due jobs",
+      "options": [
+        { "name": "Poll the database for due jobs", "pro": "Simple, and the database is the source of truth", "con": "Polling load, and a delay of up to the poll interval" },
+        { "name": "A timing wheel or sorted set in memory", "pro": "Very precise and fast", "con": "Must be rebuilt from the database after a crash" },
+        { "name": "Delayed messages in the queue itself", "pro": "No separate scheduler at all", "con": "Limited delay range, and less insight into pending jobs" }
+      ],
+      "pick": "Poll the database a few seconds ahead, with an in-memory structure for the near future if precision matters."
+    },
+    {
+      "title": "How workers get jobs",
+      "options": [
+        { "name": "The queue pushes jobs to workers", "pro": "Low latency", "con": "Needs to know each worker's capacity" },
+        { "name": "Workers pull from the queue", "pro": "Workers take only what they can handle, and scale easily", "con": "Idle polling, which long-polling reduces" }
+      ],
+      "pick": "Pull, so a busy worker simply takes less."
+    },
+    {
+      "title": "What to do with a job that keeps failing",
+      "options": [
+        { "name": "Retry for ever", "pro": "Nothing is ever given up", "con": "A permanent failure uses workers for ever" },
+        { "name": "Give up and drop it", "pro": "Simple", "con": "Silent loss" },
+        { "name": "Retry with a limit, then dead-letter it", "pro": "Temporary failures heal, and permanent ones are kept visible", "con": "Someone must look at the dead-letter queue" }
+      ],
+      "pick": "Bounded retries with backoff, then a dead-letter queue with an alert."
+    }
+  ],
+  "roles": [
+    { "id": "client", "label": "Job owners", "description": "Teams and services that register jobs." },
+    { "id": "edge", "label": "API", "description": "The service that accepts and manages jobs." },
+    { "id": "async", "label": "Queues", "description": "The ready queues and the dead-letter queue." },
+    { "id": "compute", "label": "Workers", "description": "Schedulers, workers and the autoscaler." },
+    { "id": "data", "label": "State", "description": "The jobs database and run records." }
+  ]
+}
