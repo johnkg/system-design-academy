@@ -1,0 +1,169 @@
+{
+  "name": "Design a Web Crawler",
+  "difficulty": "advanced",
+  "intent": "Download a billion pages a month from millions of websites, without hammering any one of them, without fetching the same page twice, and without getting lost in the web's endless traps.",
+  "codeTitle": "a polite crawl frontier with clean URLs",
+  "finalIntro": "One crawl cycle: pick a URL, fetch it politely, extract its links and queue only the new ones.",
+  "prompt": "Design the crawler behind a search engine. Starting from a list of seed pages, it follows links to discover pages, downloads their content, and keeps the copies fresh, so that the search index can be built from them.",
+  "functional": [
+    "Start from seed URLs and follow links to find new pages",
+    "Download each page and store its content for the indexer",
+    "Respect each site's robots.txt rules",
+    "Never fetch the same page twice in one pass, even under different spellings of its address",
+    "Come back to pages again, sooner for pages that change often"
+  ],
+  "nonFunctional": [
+    "Crawl about a billion pages a month, which is hundreds of pages per second all the time",
+    "Be polite: never overload any single website, and slow down when a site struggles",
+    "Be robust: broken HTML, huge files, slow servers, redirects and pages that never end",
+    "Avoid wasting effort on duplicate or worthless content",
+    "Be easy to scale out by adding machines, and to stop and resume without losing progress"
+  ],
+  "firstAttempt": {
+    "text": "One program with a loop. Take a URL from a list, download the page, save it to disk, find the links in it and append them to the end of the list. Repeat. It is a good way to crawl a single small site.",
+    "limits": [
+      "It fetches one page at a time and spends nearly all its time waiting for the network",
+      "Pages link back to each other, so the loop goes round in circles and downloads pages again and again",
+      "A big site that fills the list sends hundreds of requests in a row to the same server",
+      "A page whose links lead to endless new addresses, like a calendar, keeps the crawler busy for ever",
+      "The list lives in memory, so a crash loses the whole crawl"
+    ]
+  },
+  "nodes": [
+    { "id": "web", "label": "The web", "kind": "client", "x": 12, "y": 50 },
+    { "id": "single", "label": "Crawler loop", "kind": "compute", "x": 50, "y": 50, "at": 0, "until": 1 },
+    { "id": "fetchers", "label": "Fetcher workers", "kind": "compute", "x": 37, "y": 50, "at": 1 },
+    { "id": "parsers", "label": "Parser workers", "kind": "compute", "x": 62, "y": 50, "at": 1 },
+    { "id": "store", "label": "Page store", "kind": "data", "x": 87, "y": 50, "at": 1 },
+    { "id": "queue", "label": "URL queue", "kind": "async", "x": 62, "y": 16, "at": 1, "until": 2 },
+    { "id": "frontier", "label": "Per-site queues", "kind": "async", "x": 62, "y": 16, "at": 2 },
+    { "id": "seen", "label": "Seen URLs", "kind": "data", "x": 87, "y": 16, "at": 3 },
+    { "id": "dns", "label": "DNS and robots cache", "kind": "edge", "x": 37, "y": 16, "at": 4 },
+    { "id": "limits", "label": "Trap guards", "kind": "edge", "x": 37, "y": 84, "at": 5 },
+    { "id": "scheduler", "label": "Recrawl scheduler", "kind": "compute", "x": 62, "y": 84, "at": 6 },
+    { "id": "meta", "label": "Crawl metadata", "kind": "data", "x": 87, "y": 84, "at": 6 }
+  ],
+  "edges": [
+    { "from": "web", "to": "single", "at": 0, "until": 1 },
+    { "from": "web", "to": "fetchers", "at": 1 },
+    { "from": "fetchers", "to": "parsers", "at": 1 },
+    { "from": "parsers", "to": "store", "at": 1 },
+    { "from": "parsers", "to": "queue", "at": 1, "until": 2 },
+    { "from": "queue", "to": "fetchers", "at": 1, "until": 2 },
+    { "from": "parsers", "to": "frontier", "at": 2 },
+    { "from": "frontier", "to": "fetchers", "at": 2 },
+    { "from": "seen", "to": "frontier", "at": 3 },
+    { "from": "parsers", "to": "seen", "at": 3 },
+    { "from": "dns", "to": "fetchers", "at": 4 },
+    { "from": "limits", "to": "fetchers", "at": 5 },
+    { "from": "scheduler", "to": "frontier", "at": 6 },
+    { "from": "scheduler", "to": "meta", "at": 6 }
+  ],
+  "steps": [
+    {
+      "title": "Split fetching and parsing into parallel workers",
+      "problem": "A single loop waits on the network for almost the whole time, so it manages a few pages per second at most.",
+      "fix": "Run many fetcher workers at once, each holding many connections open, since the time is spent waiting and not computing. Fetchers write the raw page to a store and hand it to parser workers through a queue. Parsers extract the text and the links and put the new URLs into a shared queue that the fetchers read from. Fetching, parsing and storing can then be scaled separately.",
+      "tradeoff": "Throughput rises with the number of workers, and a slow parse never stops a fetch. Now there is a queue to manage, and the workers must be able to fail and restart without losing the pages they were handling.",
+      "concepts": [{ "slug": "message-queues" }, { "slug": "horizontal-vs-vertical-scaling" }, { "slug": "backpressure" }]
+    },
+    {
+      "title": "Give every website its own queue and a polite pace",
+      "problem": "With one shared queue, workers all pick URLs from the same big site at once and flood it, or they sit waiting for it while other sites could be fetched.",
+      "fix": "Replace the single queue with a frontier made of one queue per website. Each site queue has a minimum gap between requests, taken from robots.txt or a default, and a worker is only handed a URL from a site that has rested long enough. Priorities decide which queues are served first, so important or fast-changing sites come around sooner.",
+      "tradeoff": "No site is hit harder than its rules allow, and workers always find some site that is ready, so none sit idle. Crawling a very large site takes a long time by design, so there is also a cap on how many pages one site may take in each pass.",
+      "concepts": [{ "slug": "rate-limiting" }, { "slug": "message-queues" }, { "slug": "backpressure" }]
+    },
+    {
+      "title": "Clean up URLs and remember what has been seen",
+      "problem": "The same page appears under many spellings, and pages link to each other in circles, so the crawler fetches the same content again and again.",
+      "fix": "Every URL is normalised first: lower-case host, no default port, no fragment after the #, tidy trailing slashes, and tracking parameters dropped. Then it is looked up in a seen-set, spread across machines by a hash of the URL. A Bloom filter in memory answers 'definitely new' for most URLs without touching storage. The page content is also fingerprinted, so the same text found at two addresses is stored once.",
+      "tradeoff": "No page is fetched twice in one pass, and the loops end. A Bloom filter sometimes says 'seen' for a URL that is new, so a small share of pages is skipped, and normalisation rules that are too aggressive will merge pages that really differ.",
+      "concepts": [{ "slug": "consistent-hashing" }, { "slug": "database-indexing" }, { "slug": "sql-vs-nosql" }]
+    },
+    {
+      "title": "Cache DNS answers and robots.txt",
+      "problem": "Every fetch needs the site's address, and most sites publish a robots.txt that must be checked first. Doing both from scratch for every URL doubles or triples the work.",
+      "fix": "Keep a local DNS cache, because the crawler asks for the same few million names over and over and public resolvers are slow and rate-limited. Cache each site's robots.txt for a day or so and refresh it when it is due. Fetchers reuse open connections to a site and ask for several pages on one connection.",
+      "tradeoff": "Each fetch is often one request and not three, and the crawl no longer depends on a shared resolver. Cached rules can be out of date for a while, so the refresh interval stays short, and a failing robots.txt fetch should mean 'wait', not 'everything allowed'.",
+      "concepts": [{ "slug": "dns" }, { "slug": "caching" }, { "slug": "http-versions" }, { "slug": "tcp-vs-udp" }]
+    },
+    {
+      "title": "Guard against traps, slow servers and bad pages",
+      "problem": "The web has pages that generate endless new URLs, servers that answer very slowly or never, and files of any size. One of them can tie up workers for hours.",
+      "fix": "Put limits everywhere: a maximum URL length and depth, a maximum number of pages and a time budget for each site, a timeout and size cap on every download, and only the content types the indexer wants. Each site has a circuit breaker, so a site that keeps failing is rested and retried later with growing delays. A worker that gets stuck cannot starve the others because each site is limited to a few workers.",
+      "tradeoff": "The crawler stays productive however nasty the web gets. Limits can hide real content on huge sites, so they are tuned per site and reviewed from the statistics of what was dropped.",
+      "concepts": [{ "slug": "retries-and-backoff" }, { "slug": "circuit-breaker" }, { "slug": "bulkhead" }]
+    },
+    {
+      "title": "Shard by site and recrawl by how often pages change",
+      "problem": "One frontier cannot hold billions of URLs, and crawling everything at the same rate wastes effort on pages that never change while news pages go stale.",
+      "fix": "Shard the frontier and the seen-set by a hash of the site name, so that each site's queue, politeness timer and robots.txt live on one machine. A metadata store records for every URL when it was last fetched and whether the content changed. The scheduler estimates how often each page changes, and puts pages back on the frontier sooner when they change often and later when they never do.",
+      "tradeoff": "Each machine owns whole sites, which makes politeness easy to enforce, and the freshest pages get the most attention. Machines can end up with uneven amounts of work if some owns huge sites, and adding machines means moving sites, which consistent hashing keeps small.",
+      "concepts": [{ "slug": "database-sharding" }, { "slug": "consistent-hashing" }, { "slug": "sql-vs-nosql" }]
+    }
+  ],
+  "failures": [
+    {
+      "scenario": "A website starts answering slowly or with errors",
+      "impact": "Workers wait on it, requests pile up, and pushing harder makes the site worse.",
+      "answer": "The site's queue is paused by its circuit breaker, its crawl gap is increased, and the URLs are retried later with exponential delays. Because each site has a worker limit, the other sites carry on at full speed meanwhile.",
+      "concepts": [{ "slug": "circuit-breaker" }, { "slug": "bulkhead" }, { "slug": "retries-and-backoff" }]
+    },
+    {
+      "scenario": "A crawler machine dies with part of the frontier in memory",
+      "impact": "The URLs it held, and the record of what it had seen, are gone.",
+      "answer": "The frontier and the seen-set are persisted, and each shard has a replica that takes over. Workers acknowledge a URL only after the page is stored, so work that was in flight is fetched again, which is harmless because pages are stored under a key made from the URL.",
+      "concepts": [{ "slug": "database-replication" }, { "slug": "idempotency" }, { "slug": "message-queues" }]
+    },
+    {
+      "scenario": "The crawler enters an infinite space, such as a calendar with a link to the next month for ever",
+      "impact": "Millions of useless, near-identical URLs fill the frontier and use up the crawl budget.",
+      "answer": "The per-site page cap, the depth and URL-length limits, and the content fingerprint stop it. Statistics showing a site that yields many pages but almost no new content are an alert, and the pattern can be added to that site's exclusion rules.",
+      "concepts": [{ "slug": "rate-limiting" }, { "slug": "alerting" }, { "slug": "metrics" }]
+    }
+  ],
+  "alternatives": [
+    {
+      "title": "How to remember which URLs were seen",
+      "options": [
+        { "name": "A hash set in memory", "pro": "Exact and very fast", "con": "Does not fit in one machine for billions of URLs" },
+        { "name": "A sharded database of URL fingerprints", "pro": "Exact, durable and scalable", "con": "A lookup for every new link adds latency and load" },
+        { "name": "A Bloom filter in front of the database", "pro": "Rejects most known URLs in memory and spares the database", "con": "Never forgets, and a few new URLs are wrongly seen as old" }
+      ],
+      "pick": "A Bloom filter in front of a sharded store. The occasional skipped page is a cheap price for the savings."
+    },
+    {
+      "title": "How to walk the web",
+      "options": [
+        { "name": "Breadth-first", "pro": "Reaches important, well-linked pages early", "con": "The frontier grows very large" },
+        { "name": "Depth-first", "pro": "Small frontier", "con": "Gets lost deep inside one site, and traps are fatal" },
+        { "name": "Priority-based", "pro": "Spends effort on pages that matter most or change most", "con": "Needs a way to score pages, and the scores must be kept up to date" }
+      ],
+      "pick": "Breadth-first as the base, ordered by a priority that rises with page importance and change rate."
+    },
+    {
+      "title": "How to be polite",
+      "options": [
+        { "name": "A global rate limit", "pro": "Simple to set up", "con": "Does nothing to protect any single site from a burst" },
+        { "name": "One queue and one timer per site", "pro": "Each site sees a steady, small load", "con": "More structure, and a big site takes a long time" }
+      ],
+      "pick": "A queue and a timer per site, with the crawl gap taken from robots.txt when the site asks for one."
+    },
+    {
+      "title": "How to decide when to come back",
+      "options": [
+        { "name": "A fixed interval for everything", "pro": "Trivial", "con": "Wastes effort on static pages and leaves fast-changing pages stale" },
+        { "name": "An interval from each page's observed change rate", "pro": "Effort goes where changes happen", "con": "Needs history for every URL, and new pages have none yet" }
+      ],
+      "pick": "A change-rate estimate per page, with a sensible default for pages seen for the first time."
+    }
+  ],
+  "roles": [
+    { "id": "client", "label": "The web", "description": "The sites being crawled." },
+    { "id": "edge", "label": "Fetch helpers", "description": "DNS and robots caches and trap guards." },
+    { "id": "async", "label": "Frontier", "description": "The queues of URLs waiting to be fetched." },
+    { "id": "compute", "label": "Workers", "description": "Fetchers, parsers and the scheduler." },
+    { "id": "data", "label": "State", "description": "The page store, the seen URLs and crawl history." }
+  ]
+}

@@ -1,0 +1,95 @@
+---
+import PlaygroundShell from '../../components/PlaygroundShell.astro';
+---
+<PlaygroundShell title="Polite crawling" hint="About 1,700 URLs on 50 websites, where a few big sites own most of them. Compare three ways of handing URLs to workers.">
+  <ol class="how">
+    <li>With <b>2 seconds</b> between requests and <b>20 workers</b>: the plain queue finishes fastest but sends bursts of many requests per second to the biggest site.</li>
+    <li>The <b>plain queue with a polite wait</b> obeys the gap but leaves workers <b>idle</b>, because each one is stuck holding a URL of a site that is resting.</li>
+    <li><b>One queue per site</b> obeys the gap and keeps workers busy by giving them URLs from any site that is ready. It finishes sooner than the polite shared queue. The finish time is also bounded by the biggest site: its queue times the gap.</li>
+  </ol>
+  <div class="pg wcb" data-wcb>
+    <div class="pg-row">
+      <label>Seconds between requests to one site <input type="range" min="0" max="5" step="0.5" value="2" data-gap /> <b data-gapval></b></label>
+      <label>Workers <select class="pg-in" data-w>
+        <option value="5">5</option>
+        <option value="20" selected>20</option>
+        <option value="50">50</option>
+      </select></label>
+    </div>
+    <div class="pg-grid">
+      <div class="pg-box" data-b1><h3>One shared queue, no waiting</h3><span class="pg-mono" data-o1></span><span class="pg-note" data-n1></span></div>
+      <div class="pg-box" data-b2><h3>One shared queue, polite wait</h3><span class="pg-mono" data-o2></span><span class="pg-note" data-n2></span></div>
+      <div class="pg-box" data-b3><h3>One queue per site</h3><span class="pg-mono" data-o3></span><span class="pg-note" data-n3></span></div>
+    </div>
+    <p class="pg-out" data-verdict aria-live="polite"></p>
+    <p class="pg-note">Model: one second per download, time moves in whole seconds. Site sizes follow a skewed pattern, and no site contributes more than 100 URLs to a pass, as real crawlers cap it. "Peak load" is the most requests any one site received in a single second. A polite crawl keeps that at 1 or less when the gap is 1 second or more.</p>
+  </div>
+</PlaygroundShell>
+<script>
+  document.querySelectorAll<HTMLElement>('[data-wcb]').forEach((root) => {
+    const q = <T extends HTMLElement>(s: string) => root.querySelector<T>(s)!;
+    const H = 50; const CAP = 100; // no site gets more than 100 pages in one pass
+    let seed = 3; const rnd = () => ((seed = (seed * 1664525 + 1013904223) % 4294967296) / 4294967296);
+    const weights = Array.from({ length: H }, (_, i) => 1 / (i + 1) ** 0.8); const total = weights.reduce((a, b) => a + b, 0);
+    const found: number[] = []; // the site of each URL, in the order they were discovered
+    for (let i = 0; i < 2000; i++) { let r = rnd() * total; let h = 0; while (r > weights[h] && h < H - 1) { r -= weights[h]; h++; } found.push(h); }
+    const perHost = new Array(H).fill(0);
+    const urls = found.filter((h) => perHost[h]++ < CAP);
+    const N = urls.length;
+    const biggest = Math.max(...perHost.map((c) => Math.min(c, CAP)));
+    type R = { time: number; peak: number; idle: number };
+    function plain(W: number): R { // no politeness at all
+      let peak = 0; let t = 0;
+      for (let i = 0; i < N; i += W) { const c = new Map<number, number>(); urls.slice(i, i + W).forEach((h) => c.set(h, (c.get(h) ?? 0) + 1)); peak = Math.max(peak, ...c.values()); t++; }
+      return { time: t, peak, idle: 0 };
+    }
+    function waiting(W: number, gap: number): R { // shared queue; a worker holding a URL of a resting site just waits
+      const last = new Array(H).fill(-Infinity); const holding: (number | null)[] = new Array(W).fill(null);
+      let next = 0; let done = 0; let t = 0; let idle = 0; let peak = 0;
+      while (done < N) {
+        const c = new Map<number, number>();
+        for (let w = 0; w < W; w++) {
+          if (holding[w] === null && next < N) holding[w] = urls[next++];
+          const h = holding[w]; if (h === null) continue;
+          if (t - last[h] >= gap) { last[h] = t; holding[w] = null; done++; c.set(h, (c.get(h) ?? 0) + 1); } else idle++;
+        }
+        if (c.size) peak = Math.max(peak, ...c.values());
+        t++; if (t > 200000) break;
+      }
+      return { time: t, peak, idle: idle / (t * W) };
+    }
+    function perSite(W: number, gap: number): R { // one queue per site; any worker takes a URL from any site that is ready
+      const left = new Array(H).fill(0); urls.forEach((h) => left[h]++);
+      const last = new Array(H).fill(-Infinity); let done = 0; let t = 0; let idle = 0; let peak = 0; let turn = 0;
+      while (done < N) {
+        let used = 0;
+        for (let k = 0; k < H && used < W; k++) {
+          const h = (turn + k) % H;
+          if (left[h] > 0 && t - last[h] >= gap) { last[h] = t; left[h]--; done++; used++; }
+        }
+        turn = (turn + 1) % H; idle += W - used; peak = Math.max(peak, used ? 1 : 0); t++; if (t > 200000) break;
+      }
+      return { time: t, peak, idle: idle / (t * W) };
+    }
+    function draw() {
+      const gap = Number(q<HTMLInputElement>('[data-gap]').value); const W = Number(q<HTMLSelectElement>('[data-w]').value);
+      q('[data-gapval]').textContent = gap.toFixed(1);
+      const a = plain(W); const b = waiting(W, gap); const c = perSite(W, gap);
+      const f = (r: R) => `${r.time.toLocaleString('en-US')} s to finish`;
+      const note = (r: R) => `peak load on one site: ${r.peak} request${r.peak === 1 ? '' : 's'} per second · idle workers ${Math.round(r.idle * 100)}%`;
+      q('[data-o1]').textContent = f(a); q('[data-n1]').textContent = note(a);
+      q('[data-o2]').textContent = f(b); q('[data-n2]').textContent = note(b);
+      q('[data-o3]').textContent = f(c); q('[data-n3]').textContent = note(c);
+      const polite = gap >= 1;
+      q<HTMLElement>('[data-b1]').style.setProperty('--c', polite && a.peak > 1 ? 'var(--bad)' : 'var(--good)');
+      q<HTMLElement>('[data-b2]').style.setProperty('--c', b.idle > 0.5 ? 'var(--bad)' : 'var(--good)');
+      q<HTMLElement>('[data-b3]').style.setProperty('--c', 'var(--good)');
+      const out = q('[data-verdict]'); const bad = polite && a.peak > 1;
+      out.classList.toggle('bad', bad);
+      out.textContent = gap === 0 ? 'With no gap at all, all three finish as fast as the workers allow. Real crawlers never run like this.'
+        : `The plain queue sent up to ${a.peak} requests per second to one site. Per-site queues kept it at ${c.peak}, with ${Math.round(c.idle * 100)}% of workers idle, against ${Math.round(b.idle * 100)}% when workers wait. The biggest site has ${biggest} URLs queued, so it alone needs ${Math.ceil(biggest * gap)} s, which is the least any polite crawl can take.`;
+    }
+    root.addEventListener('input', draw); root.addEventListener('change', draw);
+    draw();
+  });
+</script>
