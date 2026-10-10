@@ -1,4 +1,4 @@
-// Verifies every code sample: JavaScript runs under Node, C# runs with `dotnet run <file>.cs`.
+// Verifies every code sample: JavaScript runs under Node, Python under python3, C# with `dotnet run <file>.cs`.
 import { readdirSync, existsSync, statSync } from 'node:fs';
 import { join } from 'node:path';
 import { spawnSync } from 'node:child_process';
@@ -9,6 +9,7 @@ if (!hasDotnet) console.warn('! dotnet not found: C# samples will be skipped');
 
 const runners = {
   '.js': (f) => spawnSync('node', [f], { encoding: 'utf8' }),
+  '.py': (f) => spawnSync('python3', ['-I', f], { encoding: 'utf8' }),
   '.cs': (f) => (hasDotnet ? spawnSync('dotnet', ['run', f], { encoding: 'utf8', env: { ...process.env, DOTNET_NOLOGO: '1', DOTNET_CLI_TELEMETRY_OPTOUT: '1' } }) : null),
 };
 

@@ -8,7 +8,7 @@ Visual, interactive lessons on system design concepts and design patterns: diagr
 npm install
 npm run dev            # http://localhost:4321
 npm run build          # static site in dist/
-npm run check:samples  # runs JS samples with Node, C# samples with `dotnet run`
+npm run check:samples  # runs JS samples with Node, Python samples with `python3`, C# samples with `dotnet run`
 ```
 
 If `npm install` fails with a cache permission error, add `--cache .tmp/npm-cache`.
@@ -71,6 +71,6 @@ How it was checked: axe-core was run on every page in both themes, including aft
 
 ## Adding a case study
 1. Create `src/content/studies/<slug>/meta.json` (validated by `src/content.config.ts`; `codeTitle` and `finalIntro` set the heading and intro for the code and final-flow sections): requirements, first attempt, `nodes` and `edges` for the growing diagram (each has `at`, and optionally `until`, as a step number), `steps`, `failures` and `alternatives`. Concept and pattern slugs are checked at build time.
-2. Optional: `visuals/final.json` (a step player flow), `code/javascript.js` and `code/csharp.cs` (run by `npm run check:samples`).
+2. Optional: `visuals/final.json` (a step player flow), `code/javascript.js`, `code/python.py` and `code/csharp.cs` (run by `npm run check:samples`).
 3. Optional: `src/studies/<slug>/Estimator.astro` (back-of-the-envelope numbers) and `BreakIt.astro` (a load simulation). Both are picked up by name.
 4. Concept pages list the studies that use them automatically.
