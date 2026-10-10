@@ -1,0 +1,173 @@
+{
+  "name": "Design a Stock Exchange",
+  "difficulty": "advanced",
+  "intent": "Match buyers and sellers fairly and in strict order, in microseconds, with a record so complete that the whole day can be replayed and give exactly the same trades.",
+  "codeTitle": "an order book with price-time priority",
+  "finalIntro": "One buy order from a trader to a trade, and out to everyone watching the market.",
+  "prompt": "Design the core of a stock exchange. Traders send buy and sell orders for thousands of symbols. The exchange matches them, tells both sides about the trade, and tells the whole market what the current prices are, fairly, fast, and without ever losing or reordering an order.",
+  "functional": [
+    "Accept limit orders (a price limit) and market orders, and cancellations",
+    "Match each order against the other side of the book by price priority, then by time of arrival",
+    "Confirm trades to both traders, and publish trade and price information to everyone",
+    "Run risk checks before an order enters the book",
+    "Keep a complete, ordered audit trail of everything that happened"
+  ],
+  "nonFunctional": [
+    "Match an order in tens of microseconds, with very little variation between orders",
+    "Strict fairness: the same orders in the same order always give the same trades, and no one gets a faster path in",
+    "Never lose or reorder an acknowledged order, even if the machine running the match fails",
+    "Throughput of hundreds of thousands of orders per second for the busiest symbols",
+    "Recover from a machine failure in well under a second, with no trade lost or repeated",
+    "Everyone who watches the market sees the same updates in the same order"
+  ],
+  "firstAttempt": {
+    "text": "A web application and a SQL database. An orders table holds the open orders. When an order arrives, a transaction looks up the best matching orders on the other side, updates them and inserts the trades, and commits. Many application servers run in parallel.",
+    "limits": [
+      "A database transaction takes milliseconds, which is a thousand times too slow for a market",
+      "Several servers matching the same symbol at once fight over the same rows, and the outcome depends on who wins the race, so it is neither fair nor repeatable",
+      "Locking makes latency jump unpredictably, so some traders are consistently slower than others",
+      "Prices have to be polled from the database, so traders see different prices at different moments",
+      "One database is one point of failure for the whole market"
+    ]
+  },
+  "nodes": [
+    { "id": "traders", "label": "Traders and brokers", "kind": "client", "x": 12, "y": 50 },
+    { "id": "single", "label": "Web app + SQL database", "kind": "compute", "x": 50, "y": 50, "at": 0, "until": 1 },
+    { "id": "gateway", "label": "Order gateway", "kind": "edge", "x": 37, "y": 50, "at": 1 },
+    { "id": "engine", "label": "Matching engine (one thread, in memory)", "kind": "compute", "x": 62, "y": 50, "at": 1, "until": 4 },
+    { "id": "engines", "label": "Matching engines, one per group of symbols", "kind": "compute", "x": 62, "y": 50, "at": 4 },
+    { "id": "trades", "label": "Trade database", "kind": "data", "x": 87, "y": 50, "at": 1 },
+    { "id": "sequencer", "label": "Sequencer and journal", "kind": "async", "x": 62, "y": 16, "at": 2 },
+    { "id": "standby", "label": "Hot standby engines", "kind": "compute", "x": 87, "y": 16, "at": 3 },
+    { "id": "risk", "label": "Risk checks", "kind": "compute", "x": 37, "y": 16, "at": 5 },
+    { "id": "feed", "label": "Market data feed", "kind": "async", "x": 62, "y": 84, "at": 6 },
+    { "id": "watchers", "label": "Market data subscribers", "kind": "client", "x": 87, "y": 84, "at": 6 }
+  ],
+  "edges": [
+    { "from": "traders", "to": "single", "at": 0, "until": 1 },
+    { "from": "traders", "to": "gateway", "at": 1 },
+    { "from": "gateway", "to": "engine", "at": 1, "until": 2 },
+    { "from": "gateway", "to": "sequencer", "at": 2 },
+    { "from": "sequencer", "to": "engine", "at": 2, "until": 4 },
+    { "from": "sequencer", "to": "engines", "at": 4 },
+    { "from": "engine", "to": "trades", "at": 1, "until": 4 },
+    { "from": "engines", "to": "trades", "at": 4 },
+    { "from": "sequencer", "to": "standby", "at": 3 },
+    { "from": "risk", "to": "gateway", "at": 5 },
+    { "from": "engines", "to": "feed", "at": 6 },
+    { "from": "feed", "to": "watchers", "at": 6 }
+  ],
+  "steps": [
+    {
+      "title": "Match in a single thread, with the order book in memory",
+      "problem": "Database transactions and locks are far too slow, and concurrent matching makes the outcome depend on timing luck.",
+      "fix": "A matching engine keeps the order book of each symbol in memory: buy orders sorted from the highest price down, sell orders from the lowest price up, with each price level holding its orders in arrival order. A single thread takes one order at a time and matches it against the best opposite orders, so there are no locks and no races. Trades are written to a database afterwards, off the critical path.",
+      "tradeoff": "Each match takes microseconds, and the result depends only on the order of arrival, which is what fairness means. Throughput is limited to what one core can do, so the work is divided by symbol, and the state in memory must be protected against loss.",
+      "concepts": [{ "slug": "database-indexing" }, { "slug": "consistency-models" }, { "slug": "horizontal-vs-vertical-scaling" }]
+    },
+    {
+      "title": "Number every order in a sequencer, and journal it first",
+      "problem": "The engine's memory is lost in a crash, and orders arriving over several connections have no single agreed order.",
+      "fix": "All orders pass through a sequencer, which stamps each with the next sequence number and writes it to an append-only journal before anything else happens. The engine reads the journal in sequence order. The engine is a deterministic state machine: the same orders in the same order always produce exactly the same book and trades. So the journal, and nothing else, defines what happened, and any past moment can be reproduced by replaying it.",
+      "tradeoff": "There is one agreed order of events and a complete audit trail, and recovery is replay. The sequencer is on the critical path, so it must be extremely fast and itself replicated, and the engine may use nothing random and nothing that depends on the clock.",
+      "concepts": [{ "slug": "event-sourcing" }, { "slug": "message-queues" }, { "slug": "logical-clocks" }]
+    },
+    {
+      "title": "Run hot standbys that read the same journal",
+      "problem": "If the engine's machine fails, the market stops, and rebuilding the book by replaying the whole day takes too long.",
+      "fix": "Standby engines run on other machines, in other racks, and consume the same journal in the same order. Because the engine is deterministic they always hold the identical book, a moment behind the primary. If the primary stops responding, a standby takes over from the last sequence number it processed. Orders are acknowledged only after they have been safely journaled on more than one machine.",
+      "tradeoff": "A failover takes a fraction of a second and loses nothing, because the standby has the same state. Writing to multiple machines before acknowledging adds a little latency to each order, and takeover must avoid two engines both thinking they are the primary.",
+      "concepts": [{ "slug": "database-replication" }, { "slug": "consensus" }, { "slug": "leader-election" }]
+    },
+    {
+      "title": "Split the symbols across engines",
+      "problem": "One engine thread cannot handle every symbol, but orders for different symbols never interact.",
+      "fix": "Assign each symbol, or a group of quiet symbols, to one engine, with its own sequencer, journal and standbys. Gateways route an order to the engine that owns its symbol. Very busy symbols get an engine of their own. Cross-symbol operations are rare and handled outside the matching path.",
+      "tradeoff": "Capacity grows by adding engines, and a problem with one symbol cannot affect the others. A single hot symbol is still limited by one engine, so it must be fast, and moving a symbol between engines needs a controlled hand-over.",
+      "concepts": [{ "slug": "database-sharding" }, { "slug": "consistent-hashing" }, { "slug": "load-balancing" }]
+    },
+    {
+      "title": "Check every order before it enters the book",
+      "problem": "A mistyped price or a runaway program can send orders that could do serious damage within seconds, and the matching engine has no time for slow checks.",
+      "fix": "A gateway authenticates each connection and runs pre-trade risk checks in memory before the order reaches the sequencer: the account's limits, the size and price of the order against the last price (to catch a mistyped 'fat finger'), and the rate of orders per second. Rejected orders never enter the journal. Each broker has its own gateway capacity, so a flood from one cannot slow the others.",
+      "tradeoff": "Dangerous orders stop at the door and the engine only sees valid ones. Checks add a few microseconds and must be kept simple, and limits need tuning so that they catch mistakes without rejecting real trading.",
+      "concepts": [{ "slug": "rate-limiting" }, { "slug": "authentication-and-authorization" }, { "slug": "bulkhead" }]
+    },
+    {
+      "title": "Publish market data in order, to everyone at the same time",
+      "problem": "Thousands of firms need the same price changes at the same moment, and any unfairness in who hears first is a serious problem.",
+      "fix": "The engine emits an ordered stream of events: orders added, cancelled and traded, each with a sequence number. A feed publishes this stream to all subscribers at once, usually with multicast over a fast network, so everyone receives each update at the same time. Subscribers who miss a message notice the gap in sequence numbers and ask a recovery service for it, and new subscribers start from a snapshot of the book and then apply the updates that follow.",
+      "tradeoff": "Everyone sees the same updates in the same order at nearly the same time, and the engine does not slow down for slow readers. Multicast is unreliable, so gap detection and a recovery path are essential, and the feed and the engine are kept on separate machines.",
+      "concepts": [{ "slug": "pub-sub" }, { "slug": "tcp-vs-udp" }, { "slug": "backpressure" }]
+    }
+  ],
+  "failures": [
+    {
+      "scenario": "The primary matching engine's machine crashes in the middle of the trading day",
+      "impact": "The book in its memory is gone and no orders are being matched.",
+      "answer": "A hot standby, which has been applying the same journal, becomes the primary from the last sequence number and carries on within a fraction of a second. Orders that were journaled are never lost, and orders that were not acknowledged are resent by the traders' systems.",
+      "concepts": [{ "slug": "leader-election" }, { "slug": "database-replication" }, { "slug": "event-sourcing" }]
+    },
+    {
+      "scenario": "A trader's system sends the same order twice after a timeout",
+      "impact": "Without protection, a trader buys twice as much as they meant to.",
+      "answer": "Every order carries a client order id, which is unique for that trader. The gateway or the engine rejects an id it has already seen, so the repeat is ignored and the trader is told about the original order.",
+      "concepts": [{ "slug": "idempotency" }, { "slug": "retries-and-backoff" }, { "slug": "authentication-and-authorization" }]
+    },
+    {
+      "scenario": "A firm's program goes wrong and sends a million orders in a second",
+      "impact": "The flood could fill the sequencer and delay everyone's orders.",
+      "answer": "The gateway rate-limits that firm's connection and stops the flow when it passes its limit, and an automatic kill switch cancels the firm's open orders. Because each firm has its own gateway capacity, the others do not notice.",
+      "concepts": [{ "slug": "rate-limiting" }, { "slug": "bulkhead" }, { "slug": "circuit-breaker" }]
+    },
+    {
+      "scenario": "A subscriber misses part of the market data stream",
+      "impact": "Their picture of the order book is wrong, and they might trade on wrong prices.",
+      "answer": "Every message has a sequence number, so they notice the gap at once. They stop trusting their book, request the missing messages from the recovery service, or reload a snapshot and then apply newer updates.",
+      "concepts": [{ "slug": "logical-clocks" }, { "slug": "tcp-vs-udp" }, { "slug": "retries-and-backoff" }]
+    }
+  ],
+  "alternatives": [
+    {
+      "title": "How matching is done",
+      "options": [
+        { "name": "A database transaction per order", "pro": "Easy to write and durable", "con": "Milliseconds per order, and a lock fight between servers" },
+        { "name": "A single-threaded in-memory engine", "pro": "Microseconds, deterministic and fair", "con": "One core per symbol group, and state to protect" },
+        { "name": "Several threads sharing one book with locks", "pro": "Appears to use more cores", "con": "Locks add delays and make the outcome depend on timing" }
+      ],
+      "pick": "A single-threaded in-memory engine per symbol group, with a journal for durability."
+    },
+    {
+      "title": "How to share a price level between orders",
+      "options": [
+        { "name": "Price-time priority (first in, first out)", "pro": "Simple, and rewards those who commit to a price first", "con": "A fast firm can always jump ahead by being first" },
+        { "name": "Pro-rata", "pro": "Spreads a trade across everyone at the best price in proportion to their size", "con": "Rewards large orders, and invites inflating order sizes" }
+      ],
+      "pick": "Price-time priority is the common rule for shares. Pro-rata is more common in some interest-rate markets."
+    },
+    {
+      "title": "How market data is delivered",
+      "options": [
+        { "name": "Each subscriber polls a database", "pro": "Trivial to build", "con": "Different people see different prices at different times" },
+        { "name": "TCP stream per subscriber", "pro": "Reliable and simple", "con": "A slow subscriber holds back its own stream, and the engine sends once per subscriber, so someone is always first or last" },
+        { "name": "Multicast with sequence numbers and recovery", "pro": "One send reaches everyone together", "con": "Subscribers must handle gaps" }
+      ],
+      "pick": "Multicast with sequence numbers, snapshots and a recovery service."
+    },
+    {
+      "title": "How the machine failure is survived",
+      "options": [
+        { "name": "Restore from a backup and replay", "pro": "Cheap", "con": "Minutes of downtime during which there is no market" },
+        { "name": "Hot standbys on the same journal", "pro": "Failover within a fraction of a second, losing nothing", "con": "Twice the machines, and the takeover logic has to be exactly right" }
+      ],
+      "pick": "Hot standbys fed from the replicated journal."
+    }
+  ],
+  "roles": [
+    { "id": "client", "label": "Market participants", "description": "Traders, brokers and data subscribers." },
+    { "id": "edge", "label": "Gateways", "description": "The order gateway that authenticates and checks orders." },
+    { "id": "async", "label": "Ordered streams", "description": "The sequencer, journal and market data feed." },
+    { "id": "compute", "label": "Engines", "description": "Matching engines, standbys and risk checks." },
+    { "id": "data", "label": "State", "description": "The trade database." }
+  ]
+}

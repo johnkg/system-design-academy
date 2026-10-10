@@ -1,0 +1,91 @@
+---
+import PlaygroundShell from '../../components/PlaygroundShell.astro';
+---
+<PlaygroundShell title="Trade against the book" hint="This is a real order book. Send an order and see exactly who it trades with. Orders are matched by price first, then by who was there first.">
+  <ol class="how">
+    <li>Press <b>Send order</b> with the default <b>buy 120 at 10.05</b>. It takes all 100 of A's shares, then 20 of B's. A was in the queue first, so A trades first.</li>
+    <li>Now <b>buy 200 at 10.10</b>: it finishes B's remaining 30 at 10.05 and then takes C's shares at 10.10, at <b>each resting order's price</b>. Whatever is left rests in the book.</li>
+    <li>Switch the rule to <b>pro-rata</b> and press <b>Reset book</b>, then buy 120 at 10.05: A and B share the trade in proportion to their size instead of by arrival. Different exchanges choose differently, and it changes how traders behave.</li>
+  </ol>
+  <div class="pg seb" data-seb>
+    <div class="pg-row">
+      <label>Side <select class="pg-in" data-side><option value="buy" selected>buy</option><option value="sell">sell</option></select></label>
+      <label>Limit price <input class="pg-in" type="number" min="9" max="11" step="0.01" value="10.05" data-price /></label>
+      <label>Quantity <input class="pg-in" type="number" min="1" max="1000" step="1" value="120" data-qty /></label>
+      <label>Matching rule <select class="pg-in" data-rule><option value="fifo" selected>price, then time</option><option value="prorata">price, then pro-rata</option></select></label>
+    </div>
+    <div class="pg-row">
+      <button type="button" class="btn pg-primary" data-send>Send order</button>
+      <button type="button" class="btn" data-reset>Reset book</button>
+    </div>
+    <div class="pg-grid">
+      <div class="pg-box"><h3>Sell orders waiting (best first)</h3><ul class="book" data-asks></ul></div>
+      <div class="pg-box"><h3>Buy orders waiting (best first)</h3><ul class="book" data-bids></ul></div>
+    </div>
+    <div class="pg-box" data-tbox><h3>What the last order did</h3><span class="pg-mono" data-trades></span></div>
+    <p class="pg-out" data-verdict aria-live="polite"></p>
+    <p class="pg-note">Rules of this model: a buy trades with sells at or below its limit, and a sell with buys at or above it. Each trade happens at the price of the order that was already waiting. A new order that is not completely filled waits in the book at its own price, behind any order already at that price. Orders in the same queue are shown in arrival order, with their names.</p>
+  </div>
+</PlaygroundShell>
+<style>
+  .book { list-style: none; margin: 0; padding: 0; font-family: var(--mono, ui-monospace, monospace); font-size: .9rem; }
+  .book li { padding: 2px 0; }
+  .book li[hidden] { display: none; }
+</style>
+<script>
+  document.querySelectorAll<HTMLElement>('[data-seb]').forEach((root) => {
+    const q = <T extends HTMLElement>(s: string) => root.querySelector<T>(s)!;
+    type Resting = { id: string; qty: number }; type Level = { price: number; orders: Resting[] };
+    type Book = { bids: Level[]; asks: Level[] };
+    const start = (): Book => ({
+      asks: [{ price: 1005, orders: [{ id: 'A', qty: 100 }, { id: 'B', qty: 50 }] }, { price: 1010, orders: [{ id: 'C', qty: 80 }] }],
+      bids: [{ price: 1000, orders: [{ id: 'X', qty: 60 }] }, { price: 995, orders: [{ id: 'Y', qty: 40 }] }],
+    });
+    let book = start(); let next = 1;
+    const ROWS = 8;
+    const make = (sel: string) => { const ul = q(sel); ul.replaceChildren(...Array.from({ length: ROWS }, () => { const li = document.createElement('li'); li.hidden = true; return li; })); return Array.from(ul.children) as HTMLElement[]; };
+    const askRows = make('[data-asks]'); const bidRows = make('[data-bids]');
+    const money = (c: number) => (c / 100).toFixed(2);
+    function render() {
+      const fill = (rows: HTMLElement[], levels: Level[]) => rows.forEach((li, i) => {
+        const l = levels[i]; li.hidden = !l;
+        if (l) li.textContent = `${money(l.price)}  ${l.orders.map((o) => `${o.id} ${o.qty}`).join(', ')}`;
+      });
+      fill(askRows, book.asks); fill(bidRows, book.bids);
+    }
+    function match(side: string, price: number, qty: number, rule: string) {
+      const id = `N${next++}`; const trades: string[] = []; let left = qty;
+      const opposite = side === 'buy' ? book.asks : book.bids; const crosses = (p: number) => (side === 'buy' ? p <= price : p >= price);
+      while (left > 0 && opposite.length && crosses(opposite[0].price)) {
+        const level = opposite[0]; const total = level.orders.reduce((s, o) => s + o.qty, 0); const take = Math.min(left, total);
+        if (rule === 'fifo') {
+          let want = take; while (want > 0) { const o = level.orders[0]; const f = Math.min(want, o.qty); trades.push(`${f} with ${o.id} at ${money(level.price)}`); o.qty -= f; want -= f; if (o.qty === 0) level.orders.shift(); }
+        } else {
+          const alloc = level.orders.map((o) => Math.floor((take * o.qty) / total)); let rest = take - alloc.reduce((a, b) => a + b, 0);
+          for (let i = 0; rest > 0; i = (i + 1) % level.orders.length) { if (alloc[i] < level.orders[i].qty) { alloc[i]++; rest--; } } // leftover shares go to the oldest orders first
+          level.orders.forEach((o, i) => { if (alloc[i] > 0) trades.push(`${alloc[i]} with ${o.id} at ${money(level.price)}`); o.qty -= alloc[i]; });
+          level.orders = level.orders.filter((o) => o.qty > 0);
+        }
+        left -= take; if (level.orders.length === 0) opposite.shift();
+      }
+      if (left > 0) {
+        const own = side === 'buy' ? book.bids : book.asks; const better = (a: number, b: number) => (side === 'buy' ? a > b : a < b);
+        let i = 0; while (i < own.length && better(own[i].price, price)) i++;
+        if (i < own.length && own[i].price === price) own[i].orders.push({ id, qty: left }); else own.splice(i, 0, { price, orders: [{ id, qty: left }] });
+      }
+      return { id, trades, left };
+    }
+    function send() {
+      const side = q<HTMLSelectElement>('[data-side]').value; const price = Math.round(Number(q<HTMLInputElement>('[data-price]').value) * 100); const qty = Math.floor(Number(q<HTMLInputElement>('[data-qty]').value));
+      if (!(price > 0) || !(qty > 0)) { q('[data-verdict]').textContent = 'Enter a price and a quantity above zero.'; return; }
+      const r = match(side, price, qty, q<HTMLSelectElement>('[data-rule]').value); render();
+      q('[data-trades]').textContent = r.trades.length ? r.trades.map((t) => `${side === 'buy' ? 'bought' : 'sold'} ${t}`).join('\n') : 'no trades: nothing at an acceptable price';
+      q<HTMLElement>('[data-tbox]').style.setProperty('--c', r.trades.length ? 'var(--good)' : 'var(--accent)');
+      const out = q('[data-verdict]'); out.classList.remove('bad');
+      out.textContent = `Order ${r.id} (${side} ${qty} at ${money(price)}): ${r.trades.length} trade${r.trades.length === 1 ? '' : 's'}${r.left > 0 ? `, and ${r.left} shares now wait in the book at ${money(price)}` : ', completely filled'}.`;
+    }
+    q('[data-send]').addEventListener('click', send);
+    q('[data-reset]').addEventListener('click', () => { book = start(); next = 1; render(); q('[data-trades]').textContent = ''; q('[data-verdict]').textContent = 'The book is back to its starting state.'; });
+    render();
+  });
+</script>
