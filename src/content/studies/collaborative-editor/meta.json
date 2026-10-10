@@ -1,0 +1,172 @@
+{
+  "name": "Design a Collaborative Document Editor",
+  "difficulty": "advanced",
+  "intent": "Let many people type in the same document at once, see each other's changes almost instantly, and always end up with exactly the same text, even after losing the connection.",
+  "codeTitle": "operational transformation of two simultaneous edits",
+  "finalIntro": "Two people editing the same sentence at the same moment.",
+  "prompt": "Design a real-time editor like Google Docs. Up to a hundred people can open one document and type in it at the same time. Everyone sees the others' edits and cursors within a fraction of a second, no one's typing is lost, and everyone's copy is identical at the end.",
+  "functional": [
+    "Edit the text of a document, with each keystroke appearing immediately for the person typing",
+    "See other people's edits and cursors live",
+    "Keep every copy of the document identical once all the edits have arrived",
+    "Work offline for a while, and merge when the connection returns",
+    "Undo your own changes, and browse and restore earlier versions"
+  ],
+  "nonFunctional": [
+    "Local typing feels instant: the editor never waits for the server to show a character",
+    "Other people's edits show up within about 100 to 300 ms",
+    "Convergence: all copies end up identical, with no lost or garbled edits",
+    "Durable: a saved edit survives server crashes",
+    "Scale to millions of open documents, each with a small number of active editors"
+  ],
+  "firstAttempt": {
+    "text": "The editor holds the document in the browser. Every few seconds, or on Save, it sends the whole text to the server, which overwrites the stored copy. To see others' changes, the page asks the server for the latest copy at intervals and replaces what is on screen.",
+    "limits": [
+      "Two people editing at once overwrite each other: the last save wins and the other person's work vanishes",
+      "Replacing the text on screen moves the cursor and loses what you just typed",
+      "Changes show up only after the next save and the next poll, which takes seconds",
+      "Sending the entire document for a single keystroke is slow for big documents",
+      "A save that fails, or a lost connection, loses everything typed since the last one"
+    ]
+  },
+  "nodes": [
+    { "id": "editors", "label": "Editors in browsers", "kind": "client", "x": 12, "y": 50 },
+    { "id": "single", "label": "Server saving whole documents", "kind": "compute", "x": 50, "y": 50, "at": 0, "until": 1 },
+    { "id": "gateway", "label": "WebSocket gateway", "kind": "edge", "x": 37, "y": 50, "at": 1 },
+    { "id": "docserver", "label": "Document server", "kind": "compute", "x": 62, "y": 50, "at": 1 },
+    { "id": "store", "label": "Document store", "kind": "data", "x": 87, "y": 50, "at": 1, "until": 4 },
+    { "id": "ot", "label": "Transform engine", "kind": "compute", "x": 37, "y": 84, "at": 2 },
+    { "id": "router", "label": "Router by document", "kind": "edge", "x": 37, "y": 16, "at": 3 },
+    { "id": "log", "label": "Operation log", "kind": "data", "x": 62, "y": 84, "at": 4 },
+    { "id": "snapshots", "label": "Snapshots", "kind": "data", "x": 87, "y": 84, "at": 4 },
+    { "id": "presence", "label": "Presence channel", "kind": "async", "x": 62, "y": 16, "at": 5 },
+    { "id": "local", "label": "Local copy + pending edits", "kind": "client", "x": 12, "y": 84, "at": 6 }
+  ],
+  "edges": [
+    { "from": "editors", "to": "single", "at": 0, "until": 1 },
+    { "from": "editors", "to": "gateway", "at": 1 },
+    { "from": "gateway", "to": "docserver", "at": 1, "until": 3 },
+    { "from": "docserver", "to": "store", "at": 1, "until": 4 },
+    { "from": "docserver", "to": "ot", "at": 2 },
+    { "from": "gateway", "to": "router", "at": 3 },
+    { "from": "router", "to": "docserver", "at": 3 },
+    { "from": "docserver", "to": "log", "at": 4 },
+    { "from": "log", "to": "snapshots", "at": 4 },
+    { "from": "docserver", "to": "presence", "at": 5 },
+    { "from": "presence", "to": "gateway", "at": 5 },
+    { "from": "local", "to": "gateway", "at": 6 }
+  ],
+  "steps": [
+    {
+      "title": "Send small edits over a live connection",
+      "problem": "Saving whole documents is slow and clumsy, and polling shows other people's changes seconds late.",
+      "fix": "Each editor keeps a WebSocket open to a gateway. A keystroke becomes a tiny operation such as 'insert H at position 4', which is sent at once to the document server. The server forwards each operation to everyone else with the document open. The editor shows your own typing immediately, without waiting for the server.",
+      "tradeoff": "Edits move in a few milliseconds and cost a few bytes each, and nothing is replaced under the cursor. Because everyone applies the edits locally, two edits that cross on the way can now disagree about the text, which the next step fixes.",
+      "concepts": [{ "slug": "real-time-communication" }, { "slug": "latency-and-round-trips" }, { "slug": "load-balancing" }]
+    },
+    {
+      "title": "Transform concurrent edits so every copy converges",
+      "problem": "Alice inserts at the start while Bob deletes the last letter. If each applies the other's operation as written, Bob's 'delete position 2' hits the wrong letter on Alice's screen and the copies end up different.",
+      "fix": "With operational transformation, the server gives every operation a place in one order. Before an operation is applied to text that has already changed, it is rewritten against the operations it did not know about: 'delete position 2' becomes 'delete position 3' after an insertion earlier in the text. Rules for each pair of operation types, plus a tie-break on ties, guarantee that every copy reaches the same result. CRDTs reach the same goal by giving every character a unique, ordered identity instead.",
+      "tradeoff": "No edit is lost and all copies converge, while each person still types without waiting. Transformation rules are famously hard to get right for rich text, and a CRDT avoids a central ordering at the price of carrying extra data with every character.",
+      "concepts": [{ "slug": "logical-clocks" }, { "slug": "consistency-models" }, { "slug": "idempotency" }]
+    },
+    {
+      "title": "Give each document one owner server",
+      "problem": "Transformation needs one agreed order of operations per document, and editors of the same document sitting on different servers would not have one.",
+      "fix": "Route everything for one document to the same document server, chosen by a hash of the document id with consistent hashing, through a router in front of the gateways. That server is the single sequencer for the document: it numbers the operations, transforms them and broadcasts them, holding the live state in memory. Different documents live on different servers, so the system scales by adding servers.",
+      "tradeoff": "Ordering is trivial and fast because it happens in one place, and the load is spread by document. A single very popular document is limited by one server, and if the owner fails another server must take over cleanly.",
+      "concepts": [{ "slug": "consistent-hashing" }, { "slug": "database-sharding" }, { "slug": "leader-election" }]
+    },
+    {
+      "title": "Store the operation log, with snapshots",
+      "problem": "An in-memory document is lost in a crash, and rewriting the whole document on every keystroke would be far too slow.",
+      "fix": "Every operation is appended to a durable log before it is acknowledged. Every few hundred operations, or after a pause in typing, the server writes a snapshot of the text. Opening a document loads the latest snapshot and replays the few operations after it. The log doubles as the version history, since any earlier state is a snapshot plus a prefix of the log.",
+      "tradeoff": "Nothing acknowledged is ever lost, a crashed server's replacement rebuilds the document in moments, and history comes for free. The log grows without end, so old operations are compacted into snapshots, and replay must be fast.",
+      "concepts": [{ "slug": "event-sourcing" }, { "slug": "database-replication" }, { "slug": "caching" }]
+    },
+    {
+      "title": "Share cursors and presence without storing them",
+      "problem": "People want to see who is here and where they are typing, but cursor positions change many times a second and are worthless a moment later.",
+      "fix": "Presence information, such as cursor positions, selections and names, travels on a separate lightweight channel. It is never written to the log. It is throttled to a few updates per second per person and sent only to the others in the same document, and it expires when someone disconnects. Cursor positions are also transformed by incoming edits so they stay on the right letter.",
+      "tradeoff": "The live feel of seeing others costs little, and the durable log stays clean. Presence can be briefly out of date or lost, which is fine because the next update replaces it.",
+      "concepts": [{ "slug": "pub-sub" }, { "slug": "rate-limiting" }, { "slug": "backpressure" }]
+    },
+    {
+      "title": "Keep editing offline and when the connection drops",
+      "problem": "Connections break on trains and in lifts, and a person must not lose work or be locked out of typing.",
+      "fix": "The editor keeps a local copy and a queue of operations that the server has not acknowledged yet. Typing continues offline. When the connection returns the client sends the queue along with the server version it was based on, and the server transforms those operations against everything that happened in between, then sends back what the client missed. Operations carry ids, so one that was already received and acknowledged is not applied twice after a retry.",
+      "tradeoff": "People can work through outages and the merge is automatic. A long offline period can produce a surprising merge, so very large divergences are shown to the user, and the queue must be kept safe on the device until acknowledged.",
+      "concepts": [{ "slug": "idempotency" }, { "slug": "retries-and-backoff" }, { "slug": "consistency-models" }]
+    }
+  ],
+  "failures": [
+    {
+      "scenario": "The document server for a busy document crashes",
+      "impact": "Its in-memory state and its open connections are lost, and editors cannot send changes.",
+      "answer": "The router assigns the document to another server, which loads the latest snapshot and replays the log. Editors reconnect and resend any unacknowledged operations with their ids, which the new server transforms and applies exactly once. People notice a pause of a second or two.",
+      "concepts": [{ "slug": "event-sourcing" }, { "slug": "retries-and-backoff" }, { "slug": "idempotency" }]
+    },
+    {
+      "scenario": "Two people edit the same word at the same instant",
+      "impact": "Both operations were made against the same earlier text and refer to positions that overlap.",
+      "answer": "The server picks an order for the two operations and transforms the second against the first. Ties are broken by a fixed rule, such as the user id, so every copy decides the same way. Both people's edits survive and both see the same result.",
+      "concepts": [{ "slug": "logical-clocks" }, { "slug": "consistency-models" }, { "slug": "consensus" }]
+    },
+    {
+      "scenario": "A client reconnects and resends operations the server has already received",
+      "impact": "Applying them again would type the text twice.",
+      "answer": "Each operation has a unique id made of the client and a counter, and the server records the highest counter it has seen from each client. A repeated operation is acknowledged again but not applied again.",
+      "concepts": [{ "slug": "idempotency" }, { "slug": "retries-and-backoff" }, { "slug": "message-queues" }]
+    },
+    {
+      "scenario": "A hundred people open one document and all type",
+      "impact": "Each keystroke is broadcast to ninety-nine other people, and the document server is overloaded.",
+      "answer": "The server batches operations into small time slices, throttles presence updates, and above a certain number of editors switches extra viewers to read-only. Only a small number of editors need the full live path.",
+      "concepts": [{ "slug": "backpressure" }, { "slug": "rate-limiting" }, { "slug": "pub-sub" }]
+    }
+  ],
+  "alternatives": [
+    {
+      "title": "How to merge simultaneous edits",
+      "options": [
+        { "name": "Last write wins on the whole document", "pro": "Trivial", "con": "Throws away other people's work" },
+        { "name": "Operational transformation with a central server", "pro": "Compact, proven for text, and edits stay small", "con": "The transformation rules are hard to get right, and it needs a central sequencer" },
+        { "name": "CRDTs (every character has a unique identity)", "pro": "No central ordering, and peers can merge directly, even offline", "con": "More metadata per character, and the document can grow with its history" }
+      ],
+      "pick": "Operational transformation with a server per document when a server is in the loop anyway. A CRDT when peer-to-peer or long offline editing matters most."
+    },
+    {
+      "title": "How to route editors",
+      "options": [
+        { "name": "Any server for any editor", "pro": "Simple load balancing", "con": "No single order of operations for a document" },
+        { "name": "All editors of a document on one server", "pro": "A single, simple ordering, and fast broadcasts", "con": "A hot document is limited by one machine, and a failover needs care" }
+      ],
+      "pick": "One owner server per document, chosen by consistent hashing."
+    },
+    {
+      "title": "What to store",
+      "options": [
+        { "name": "Only the latest text", "pro": "Small and simple", "con": "No history, no undo for past sessions, and a crash can lose the last edits" },
+        { "name": "Only the log of operations", "pro": "Complete history", "con": "Opening a long document means replaying everything" },
+        { "name": "A log with periodic snapshots", "pro": "Durable, with fast opening, and full history", "con": "Two things to keep in step" }
+      ],
+      "pick": "A log with snapshots every few hundred operations."
+    },
+    {
+      "title": "How undo should work",
+      "options": [
+        { "name": "Revert to the previous document state", "pro": "Easy to build", "con": "Would also undo other people's edits" },
+        { "name": "Undo your own last operation, transformed past later edits", "pro": "Only your own changes are undone, as people expect", "con": "More complex, since the inverse must be transformed against everything since" }
+      ],
+      "pick": "Undo only your own operations, by transforming their inverses."
+    }
+  ],
+  "roles": [
+    { "id": "client", "label": "Editors", "description": "Browsers, with a local copy and a queue of unacknowledged edits." },
+    { "id": "edge", "label": "Entry points", "description": "The WebSocket gateway and the document router." },
+    { "id": "async", "label": "Presence", "description": "Cursors and who is online." },
+    { "id": "compute", "label": "Servers", "description": "The document server and its transform engine." },
+    { "id": "data", "label": "State", "description": "The operation log, snapshots and the document store." }
+  ]
+}
