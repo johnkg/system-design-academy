@@ -1,0 +1,171 @@
+{
+  "name": "Design a Real-Time Leaderboard",
+  "difficulty": "intermediate",
+  "intent": "Rank a hundred million players by score, show the top of the table and each player's own position within a second, while scores change thousands of times per second.",
+  "codeTitle": "a sharded leaderboard with top-k and rank",
+  "finalIntro": "One player finishing a game and seeing where they stand.",
+  "prompt": "Design the leaderboard for a mobile game with 100 million players. After each match the player's score changes. Players want to see the top 100, their own rank and the players just above and below them, and separate daily and weekly boards.",
+  "functional": [
+    "Update a player's score when a match finishes",
+    "Show the top 100 players",
+    "Show any player's exact rank, and the players around them",
+    "Keep daily, weekly and all-time boards, and reset them on schedule",
+    "Show a friends-only board"
+  ],
+  "nonFunctional": [
+    "A score update is visible on the board within about a second",
+    "Reading the top list or a rank takes under 100 ms",
+    "Handle tens of thousands of score updates per second at the peak",
+    "The top of the table is always exact, and a rank far down the table may be approximate",
+    "Never lose a score, and rebuild the board after a crash",
+    "Resist cheaters who submit fake scores"
+  ],
+  "firstAttempt": {
+    "text": "One SQL table: player id and score, with an index on the score. An update changes the player's row. The top 100 is a query ordered by score with a limit of 100, and a player's rank is the number of rows with a higher score, plus one.",
+    "limits": [
+      "Counting every row with a higher score touches millions of index entries for each rank request",
+      "Each update rewrites an index entry, and thousands of updates per second contend for the same pages",
+      "Every player reloading their rank at once hammers the database",
+      "There is one database for everything, so a daily reset or a heavy query slows scoring too",
+      "The table is on one machine, with a size and a throughput limit"
+    ]
+  },
+  "nodes": [
+    { "id": "players", "label": "Players' phones", "kind": "client", "x": 12, "y": 50 },
+    { "id": "single", "label": "SQL table with a score index", "kind": "compute", "x": 50, "y": 50, "at": 0, "until": 1 },
+    { "id": "api", "label": "Score API", "kind": "edge", "x": 37, "y": 50, "at": 1 },
+    { "id": "zset", "label": "In-memory sorted set", "kind": "data", "x": 62, "y": 50, "at": 1, "until": 3 },
+    { "id": "shards", "label": "Sorted-set shards", "kind": "data", "x": 62, "y": 50, "at": 3 },
+    { "id": "queue", "label": "Score update queue", "kind": "async", "x": 62, "y": 84, "at": 2 },
+    { "id": "db", "label": "Scores database", "kind": "data", "x": 87, "y": 50, "at": 2 },
+    { "id": "periods", "label": "Daily and weekly boards", "kind": "data", "x": 87, "y": 84, "at": 4 },
+    { "id": "push", "label": "Push gateway", "kind": "edge", "x": 12, "y": 16, "at": 5 },
+    { "id": "guard", "label": "Score validation", "kind": "compute", "x": 37, "y": 16, "at": 6 }
+  ],
+  "edges": [
+    { "from": "players", "to": "single", "at": 0, "until": 1 },
+    { "from": "players", "to": "api", "at": 1 },
+    { "from": "api", "to": "zset", "at": 1, "until": 3 },
+    { "from": "api", "to": "queue", "at": 2 },
+    { "from": "queue", "to": "db", "at": 2 },
+    { "from": "db", "to": "zset", "at": 2, "until": 3 },
+    { "from": "api", "to": "shards", "at": 3 },
+    { "from": "db", "to": "shards", "at": 3 },
+    { "from": "shards", "to": "periods", "at": 4 },
+    { "from": "shards", "to": "push", "at": 5 },
+    { "from": "push", "to": "players", "at": 5 },
+    { "from": "guard", "to": "api", "at": 6 }
+  ],
+  "steps": [
+    {
+      "title": "Keep the board in a sorted set in memory",
+      "problem": "Asking a general database to count millions of rows for every rank is far too slow for something that is looked at after every match.",
+      "fix": "Keep the board in a data structure made for ranking, such as a Redis sorted set, which combines a hash table from player to score with a skip list ordered by score. Updating a player, reading the top 100, finding a player's rank and listing the neighbours are each logarithmic in the number of players, so they take microseconds even with tens of millions of entries. The API reads and writes this structure directly.",
+      "tradeoff": "Every operation the leaderboard needs becomes fast and cheap, and the work per request is tiny. It lives in memory, so it must be made durable and rebuilt after a crash, and one machine's memory limits its size.",
+      "concepts": [{ "slug": "database-indexing" }, { "slug": "caching" }, { "slug": "sql-vs-nosql" }]
+    },
+    {
+      "title": "Make scores durable in a database and rebuild from it",
+      "problem": "An in-memory structure is lost when the machine restarts, and the score must never be lost.",
+      "fix": "Each score update also goes onto a queue, and writers apply it to a scores database, which is the source of truth. The sorted set is a copy that can be rebuilt by reading the table. Replicas of the in-memory store keep a recent copy, and a snapshot is saved regularly, so after a crash a replica takes over within seconds and any gap is filled from the database.",
+      "tradeoff": "Nothing is lost, and the fast path stays free of disk writes. The durable copy trails by a moment, so the very last updates can be replayed from the queue after a failure, and the rebuild of a very large board takes time.",
+      "concepts": [{ "slug": "message-queues" }, { "slug": "database-replication" }, { "slug": "event-sourcing" }]
+    },
+    {
+      "title": "Shard the board, and merge the answers",
+      "problem": "A hundred million entries and tens of thousands of updates per second are more than one machine's memory and CPU can handle.",
+      "fix": "Split the players across shards by a hash of the player id, so each shard holds a sorted set of its own players. An update goes to one shard. The top 100 is found by asking every shard for its own top 100 and merging the lists, because any player in the global top 100 must be in the top 100 of their own shard. A player's exact rank is the sum, over all shards, of the number of players with a better score, and each shard answers that count quickly.",
+      "tradeoff": "Memory and write load spread over many machines, and the top list stays exact. A top-100 query now touches every shard and a rank query does too, so it must be parallel and its results cached for a second or two. Asking each shard for fewer than 100 would sometimes give a wrong answer.",
+      "concepts": [{ "slug": "database-sharding" }, { "slug": "consistent-hashing" }, { "slug": "load-balancing" }]
+    },
+    {
+      "title": "Create separate boards for each time window",
+      "problem": "Players want daily and weekly leaderboards that start from zero, and resetting a table of 100 million rows in place would be a huge operation.",
+      "fix": "Each time window gets its own sorted sets, named by period, such as 'daily:2026-10-10' and 'weekly:2026-W41'. A score update adds to every board that is currently open. Starting a new period is just starting to use a new, empty key, and old boards are set to expire after a few days or are archived. Seasonal resets work the same way.",
+      "tradeoff": "Resets cost nothing, and old boards disappear by themselves. Each update writes to a few boards, so write volume is a small multiple, and rewards at the end of a period need a job that snapshots the final top list before it expires.",
+      "concepts": [{ "slug": "caching" }, { "slug": "pub-sub" }, { "slug": "database-sharding" }]
+    },
+    {
+      "title": "Push changes and build friends boards on demand",
+      "problem": "Players keep refreshing to see if they moved, and a board of only my friends cannot be a single shared structure.",
+      "fix": "Players watching a board keep a connection to a push gateway, and the shards publish changes to the top positions and to a watched player's neighbours. Updates are batched, a second at a time, so that thousands of changes make one message. A friends board is computed when it is read: fetch each friend's score from their shard and sort the few dozen or hundred results in the request.",
+      "tradeoff": "The screen updates by itself, and friends boards need no storage of their own. Pushing every change to every watcher would be enormous, so only the top and the nearby neighbours are pushed, and a friends board costs one request per friend unless it is cached.",
+      "concepts": [{ "slug": "real-time-communication" }, { "slug": "pub-sub" }, { "slug": "backpressure" }]
+    },
+    {
+      "title": "Accept scores only from trusted servers, and check them",
+      "problem": "If the phone can send its own score, a cheater can send a million points, and the top of the board becomes worthless.",
+      "fix": "Scores are computed by the game server, which runs the match, and are sent to the score API with a server credential. Players never submit a score themselves. The API validates every update against plausible limits for one match, rate-limits per player, and flags suspicious jumps for review. Confirmed cheaters are removed from every board by a normal delete operation, and the same score update is applied only once if it is received twice.",
+      "tradeoff": "The board can be trusted, and bad entries can be removed after the fact. Validation rules need maintaining, they will sometimes flag legitimate great players, and anti-cheat is a never-ending contest.",
+      "concepts": [{ "slug": "rate-limiting" }, { "slug": "authentication-and-authorization" }, { "slug": "alerting" }]
+    }
+  ],
+  "failures": [
+    {
+      "scenario": "A shard's memory store crashes",
+      "impact": "The players on that shard disappear from the board, so the top list and ranks are wrong.",
+      "answer": "A replica takes over within seconds with a near-current copy. Any updates since its last sync are replayed from the queue, and if no replica is usable the shard is rebuilt from the scores table. Until then reads can be marked as approximate rather than wrong.",
+      "concepts": [{ "slug": "database-replication" }, { "slug": "health-checks" }, { "slug": "message-queues" }]
+    },
+    {
+      "scenario": "A score update is delivered twice",
+      "impact": "If updates add to a score, the player gets double points.",
+      "answer": "Each update carries a unique id, such as the match id, and the writer records the ids it has applied. A repeat is recognised and ignored. Where scores are 'best score' rather than 'total', setting the same value twice is harmless anyway.",
+      "concepts": [{ "slug": "idempotency" }, { "slug": "message-queues" }, { "slug": "retries-and-backoff" }]
+    },
+    {
+      "scenario": "A big tournament ends and millions of players check their rank at once",
+      "impact": "Rank queries need every shard, and the burst could overload them all.",
+      "answer": "Top-list and rank results are cached for a second, and the push gateway sends the changes to watchers so they do not need to ask. Beyond the top few thousand ranks the API can return an approximate rank from a cheaper sample.",
+      "concepts": [{ "slug": "caching" }, { "slug": "backpressure" }, { "slug": "rate-limiting" }]
+    },
+    {
+      "scenario": "A cheater reaches first place with a fake score",
+      "impact": "The top of the board is no longer trusted, and honest players lose motivation.",
+      "answer": "Checks on each update flagged it, since the score jumped beyond the maximum possible for one match. A review removes the player from all boards and bans the account, and the score is recomputed from the match log so that others move up.",
+      "concepts": [{ "slug": "alerting" }, { "slug": "event-sourcing" }, { "slug": "authentication-and-authorization" }]
+    }
+  ],
+  "alternatives": [
+    {
+      "title": "Where the ranking lives",
+      "options": [
+        { "name": "SQL with an index on the score", "pro": "One system, familiar, and fine for thousands of players", "con": "Counting rows for each rank is too slow beyond about a million players" },
+        { "name": "In-memory sorted sets", "pro": "Logarithmic update, rank and top-k, and tiny latency", "con": "Needs a durable source of truth and enough memory" },
+        { "name": "Periodic batch ranking", "pro": "Very cheap, since a job sorts everything every few minutes", "con": "Not real-time, so players do not see their moves" }
+      ],
+      "pick": "In-memory sorted sets over a durable database."
+    },
+    {
+      "title": "How to shard",
+      "options": [
+        { "name": "By a hash of the player", "pro": "Even load, and a simple update path", "con": "Every top-k and rank query visits every shard" },
+        { "name": "By score range", "pro": "A rank is a count in one shard plus the sizes of the shards above", "con": "Players move between shards as their score changes, and the busy ranges become hot spots" }
+      ],
+      "pick": "Hash by player at first. Score ranges help when the number of shards grows large and rank queries dominate."
+    },
+    {
+      "title": "How exact ranks must be",
+      "options": [
+        { "name": "Exact for everyone", "pro": "Simple to explain", "con": "Costs a count across all shards for every request" },
+        { "name": "Exact at the top, approximate below", "pro": "Cheap for the long tail, and nobody minds being rank 4,213,880 or 4,213,992", "con": "Two code paths" }
+      ],
+      "pick": "Exact for the top few thousand, and approximate (from sampling or bucket counts) for the rest."
+    },
+    {
+      "title": "How to deal with ties",
+      "options": [
+        { "name": "Leave ties unordered", "pro": "Nothing to do", "con": "Ranks jump unpredictably and two requests can disagree" },
+        { "name": "Break ties by who reached the score first", "pro": "Stable, fair and explainable", "con": "Needs the time of the score stored with it" }
+      ],
+      "pick": "Break ties by the earlier time, stored as part of the sort key."
+    }
+  ],
+  "roles": [
+    { "id": "client", "label": "Players", "description": "Phones that show the board." },
+    { "id": "edge", "label": "Entry points", "description": "The score API and the push gateway." },
+    { "id": "async", "label": "Update queue", "description": "Score updates on their way to the database." },
+    { "id": "compute", "label": "Checks", "description": "Validation and anti-cheat." },
+    { "id": "data", "label": "State", "description": "Sorted sets, the scores database and period boards." }
+  ]
+}
