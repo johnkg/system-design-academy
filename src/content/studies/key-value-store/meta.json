@@ -1,0 +1,160 @@
+{
+  "name": "Design a Key-Value Store",
+  "difficulty": "advanced",
+  "intent": "Build a database that stores values by key across many machines, stays available when machines fail, and lets you choose how fresh your reads must be.",
+  "codeTitle": "replicas, write quorums and read quorums",
+  "finalIntro": "One write and one read through the cluster while a node is down.",
+  "prompt": "Design a distributed key-value store like Dynamo or Cassandra. Applications put a value under a key and get it back later. There is far more data and traffic than one machine can handle, machines will fail, and the store must keep answering anyway.",
+  "functional": [
+    "put(key, value) stores a small value, up to about 10 KB",
+    "get(key) returns the latest value written for the key",
+    "Add and remove machines without stopping the store",
+    "Let each application choose between faster and fresher reads"
+  ],
+  "nonFunctional": [
+    "Single-digit milliseconds for reads and writes at the 99th percentile",
+    "Always writable: a machine or a network link failing must not stop writes",
+    "Scale out by adding machines, with little data moving when machines join or leave",
+    "Durable: an acknowledged write survives a machine crash",
+    "Eventually consistent by default, with the option to ask for stronger guarantees"
+  ],
+  "firstAttempt": {
+    "text": "One server with a big hash map in memory. Every put changes the map and appends a line to a log file on disk, so the map can be rebuilt after a restart. Every get is a map lookup. For a few gigabytes it is fast and perfectly good.",
+    "limits": [
+      "The data must fit on one machine, in memory or on its disk",
+      "The one machine handles every request, so its CPU and network are the ceiling",
+      "If the machine dies, the store is down until it restarts and replays a long log",
+      "If its disk is lost, the data is lost",
+      "Adding a bigger machine is the only way to grow, and that has a limit"
+    ]
+  },
+  "nodes": [
+    { "id": "app", "label": "Applications", "kind": "client", "x": 12, "y": 50 },
+    { "id": "single", "label": "Server with a hash map", "kind": "compute", "x": 50, "y": 50, "at": 0, "until": 1 },
+    { "id": "coord", "label": "Any node as coordinator", "kind": "edge", "x": 37, "y": 50, "at": 1 },
+    { "id": "ring", "label": "Nodes on a hash ring", "kind": "compute", "x": 62, "y": 50, "at": 1 },
+    { "id": "replicas", "label": "N copies of each key", "kind": "data", "x": 87, "y": 50, "at": 2 },
+    { "id": "versions", "label": "Versions per value", "kind": "compute", "x": 37, "y": 84, "at": 4 },
+    { "id": "gossip", "label": "Gossip membership", "kind": "async", "x": 62, "y": 16, "at": 5 },
+    { "id": "repair", "label": "Hints and repair", "kind": "compute", "x": 87, "y": 16, "at": 5 },
+    { "id": "engine", "label": "Log + sorted files", "kind": "data", "x": 62, "y": 84, "at": 6 }
+  ],
+  "edges": [
+    { "from": "app", "to": "single", "at": 0, "until": 1 },
+    { "from": "app", "to": "coord", "at": 1 },
+    { "from": "coord", "to": "ring", "at": 1 },
+    { "from": "ring", "to": "replicas", "at": 2 },
+    { "from": "coord", "to": "versions", "at": 4 },
+    { "from": "gossip", "to": "ring", "at": 5 },
+    { "from": "repair", "to": "replicas", "at": 5 },
+    { "from": "gossip", "to": "repair", "at": 5 },
+    { "from": "ring", "to": "engine", "at": 6 }
+  ],
+  "steps": [
+    {
+      "title": "Spread keys over the machines with consistent hashing",
+      "problem": "Data and traffic have to be split across machines, and a simple rule like hash modulo the number of machines moves almost every key when a machine is added or removed.",
+      "fix": "Place the machines on a ring of hash values, each at many points (virtual nodes), and store a key on the first machine found going clockwise from the key's hash. Any machine can receive a request and act as its coordinator: it hashes the key, finds the owner and forwards the request. Adding a machine takes over a slice of keys from its neighbours and nothing else moves.",
+      "tradeoff": "Load spreads evenly, because each machine owns many small slices, and growing the cluster moves about one machine's share of the data. Every node must know the ring, and the number of virtual nodes per machine is a tuning choice.",
+      "concepts": [{ "slug": "consistent-hashing" }, { "slug": "database-sharding" }, { "slug": "horizontal-vs-vertical-scaling" }]
+    },
+    {
+      "title": "Keep N copies of every key",
+      "problem": "With each key on a single machine, one failure makes that machine's keys unreachable, and a lost disk loses them for good.",
+      "fix": "Store each key on N machines, normally 3: the owner and the next machines clockwise on the ring, called the preference list. The coordinator sends each write to all N and each read to some of them. Machines in the list are chosen in different racks or zones so that one failure cannot take out all copies.",
+      "tradeoff": "A key survives the loss of N-1 machines and reads can be served by any copy. Every write costs N times the storage and network, and the copies can disagree for a short time.",
+      "concepts": [{ "slug": "database-replication" }, { "slug": "quorums" }, { "slug": "horizontal-vs-vertical-scaling" }]
+    },
+    {
+      "title": "Let each request choose its quorum: N, W and R",
+      "problem": "Waiting for all N copies on every write is slow and fails whenever one machine is down, while answering after one copy can return old data.",
+      "fix": "A write is acknowledged when W copies have stored it, and a read returns the newest answer among R copies. If W + R is greater than N, every read set overlaps the latest write set, so a read always sees the newest acknowledged value. With N = 3, W = 2 and R = 2 the store tolerates one failed machine for both reads and writes. Lower W or R for speed and availability, raise them for freshness.",
+      "tradeoff": "One setting trades off latency, availability and freshness per application, and no machine is special. W + R greater than N gives consistent reads of acknowledged writes, but not full linearizability, and operations that wait for more replicas are slower in the tail.",
+      "concepts": [{ "slug": "quorums" }, { "slug": "cap-theorem" }, { "slug": "consistency-models" }]
+    },
+    {
+      "title": "Detect conflicting versions and repair stale copies",
+      "problem": "Two clients can write the same key at the same time through different coordinators, and a copy that missed a write holds old data.",
+      "fix": "Each value carries version information, such as a vector clock or a timestamp. A read that finds different versions picks the newest one, or returns all concurrent versions for the application to merge, and writes the winner back to the replicas that had old data (read repair). Last-write-wins by timestamp is simple but can drop a concurrent update, so it suits values that can safely be overwritten.",
+      "tradeoff": "Conflicts are noticed and resolved rather than silently lost, and hot keys heal themselves as they are read. Vector clocks add size to every value and merging is the application's job, while timestamps rely on clocks that are never perfectly in step.",
+      "concepts": [{ "slug": "logical-clocks" }, { "slug": "consistency-models" }, { "slug": "idempotency" }]
+    },
+    {
+      "title": "Survive failures: gossip, hinted handoff and anti-entropy",
+      "problem": "Machines fail, links break and nodes disagree about who is alive, and copies on a node that was down stay out of date until something fixes them.",
+      "fix": "Nodes exchange membership and health information by gossip, so every node learns of a failure within seconds without a central coordinator. When a replica is down, the coordinator writes to another node with a hint saying who the data was meant for, and that node hands it over when the replica returns (a sloppy quorum with hinted handoff). In the background, replicas compare Merkle trees, hash trees of their key ranges, to find the keys that differ and copy only those.",
+      "tradeoff": "Writes keep succeeding through failures and recovery needs no operator. A sloppy quorum weakens the overlap guarantee for a while, and background repair uses network and disk, so it is rate-limited.",
+      "concepts": [{ "slug": "gossip-protocol" }, { "slug": "health-checks" }, { "slug": "retries-and-backoff" }]
+    },
+    {
+      "title": "Store data on each node with a log and sorted files",
+      "problem": "A hash map in memory is lost on a crash, and random writes to a disk are slow.",
+      "fix": "Each node first appends every write to a commit log on disk, which is fast because it is sequential, and then applies it to a sorted in-memory table. When the table is full it is written out as an immutable sorted file, and a background compaction merges files and drops overwritten values. A read looks in the memory table first and then in the files, using a Bloom filter for each file to skip the ones that cannot hold the key. This design is called a log-structured merge tree.",
+      "tradeoff": "Writes are very fast and always sequential, and nothing acknowledged is lost on a crash. Reads may touch several files, and compaction uses disk and CPU in the background, so it needs tuning for read-heavy or write-heavy loads.",
+      "concepts": [{ "slug": "database-indexing" }, { "slug": "caching" }, { "slug": "sql-vs-nosql" }]
+    }
+  ],
+  "failures": [
+    {
+      "scenario": "One node in a key's preference list is down",
+      "impact": "A write that needs all N copies would fail, and reads from that node would time out.",
+      "answer": "With N = 3, W = 2 and R = 2 the write is acknowledged by the other two copies and the read is answered by them. The coordinator keeps a hint for the missing node, so it catches up when it returns, and anti-entropy finds anything the hint missed.",
+      "concepts": [{ "slug": "quorums" }, { "slug": "gossip-protocol" }, { "slug": "retries-and-backoff" }]
+    },
+    {
+      "scenario": "A network partition splits the cluster into two groups",
+      "impact": "Each side can see only some replicas, and both may accept writes to the same key.",
+      "answer": "The side with enough replicas for the chosen W and R keeps serving. If the application chose a low W and R it keeps writing on both sides and conflicting versions are reconciled after the partition heals. If it demanded a strict quorum, the smaller side refuses to answer. This is the CAP trade-off, chosen per request.",
+      "concepts": [{ "slug": "cap-theorem" }, { "slug": "quorums" }, { "slug": "logical-clocks" }]
+    },
+    {
+      "scenario": "A node is replaced by a new empty one",
+      "impact": "The new node owns slices of the ring but holds none of their data.",
+      "answer": "The new node streams the data for its ranges from the other replicas, which can be done while the cluster is serving, and takes reads only when it is caught up. Because only its own slices move, the rest of the cluster is unaffected.",
+      "concepts": [{ "slug": "consistent-hashing" }, { "slug": "database-replication" }, { "slug": "backpressure" }]
+    }
+  ],
+  "alternatives": [
+    {
+      "title": "Consistency level",
+      "options": [
+        { "name": "W = 1, R = 1", "pro": "Fastest and available as long as any one replica is up", "con": "Reads can return old data" },
+        { "name": "W = 2, R = 2 with N = 3", "pro": "Reads see the latest acknowledged write, and one node may fail", "con": "Slower, and two failures stop it" },
+        { "name": "W = N, R = 1", "pro": "Very fast reads that are always fresh", "con": "A single failed node blocks all writes" }
+      ],
+      "pick": "N = 3, W = 2, R = 2 as the default, with W = 1 for data such as counters or caches where an old value is acceptable."
+    },
+    {
+      "title": "How to resolve concurrent writes",
+      "options": [
+        { "name": "Last write wins by timestamp", "pro": "Simple and needs nothing from the application", "con": "A concurrent update can be silently lost, and clocks can be wrong" },
+        { "name": "Vector clocks and application merge", "pro": "Nothing is lost, and the application knows its data best", "con": "More complex to build, and values grow with the number of writers" },
+        { "name": "Conflict-free data types (CRDTs)", "pro": "Merging happens automatically and always converges", "con": "Only works for data shaped like counters, sets and registers" }
+      ],
+      "pick": "Last write wins for simple overwrites, and CRDTs or application merges where losing an update would matter."
+    },
+    {
+      "title": "Where the cluster's membership lives",
+      "options": [
+        { "name": "A central coordinator service", "pro": "One source of truth, and easy to reason about", "con": "A new dependency that must itself be highly available" },
+        { "name": "Gossip between the nodes", "pro": "No single point of failure, and it scales to thousands of nodes", "con": "Nodes disagree for a few seconds after a change" }
+      ],
+      "pick": "Gossip for liveness, with a small, consensus-backed service only for changes that must be agreed, such as the schema."
+    },
+    {
+      "title": "Storage engine",
+      "options": [
+        { "name": "B-tree pages updated in place", "pro": "Fast, predictable reads", "con": "Random writes that wear the disk, and lower write throughput" },
+        { "name": "Log-structured merge tree", "pro": "Very high write throughput from sequential writes", "con": "Read amplification and background compaction" }
+      ],
+      "pick": "A log-structured merge tree for write-heavy key-value traffic, which is the common case for this kind of store."
+    }
+  ],
+  "roles": [
+    { "id": "client", "label": "Applications", "description": "The programs that call put and get." },
+    { "id": "edge", "label": "Coordinator", "description": "Whichever node receives a request." },
+    { "id": "async", "label": "Membership", "description": "Gossip between nodes." },
+    { "id": "compute", "label": "Nodes", "description": "Storage nodes and the logic that versions and repairs data." },
+    { "id": "data", "label": "Storage", "description": "Replicas and the files on each node." }
+  ]
+}
