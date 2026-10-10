@@ -1,0 +1,79 @@
+---
+import PlaygroundShell from '../../components/PlaygroundShell.astro';
+---
+<PlaygroundShell title="Race for 100 seats" hint="600 fans try to buy 100 seats. Some of the buyers abandon their purchase. Compare four ways of handling the seats, all with the same fans.">
+  <ol class="how">
+    <li>With <b>20 requests at the same instant</b>, <b>check then update</b> sells seats <b>that do not exist</b>, because many requests see the same free seat.</li>
+    <li>Set the instant to <b>1</b>: the same code looks correct. Races only show up under concurrency, which is why they are found in production.</li>
+    <li>Raise the <b>abandon rate</b>: holds without expiry <b>lock seats for ever</b>, so some seats are never sold. Holds with expiry give them back and sell out.</li>
+  </ol>
+  <div class="pg tbb" data-tbb>
+    <div class="pg-row">
+      <label>Requests handled at the same instant <input type="range" min="1" max="100" value="20" data-c /> <b data-cval></b></label>
+      <label>Fans who abandon after taking a seat (%) <input type="range" min="0" max="60" step="5" value="30" data-ab /> <b data-abval></b></label>
+    </div>
+    <div class="pg-grid">
+      <div class="pg-box" data-b1><h3>Check, then update</h3><span class="pg-mono" data-o1></span><span class="pg-note" data-n1></span></div>
+      <div class="pg-box" data-b2><h3>Atomic update, sold on click</h3><span class="pg-mono" data-o2></span><span class="pg-note" data-n2></span></div>
+      <div class="pg-box" data-b3><h3>Atomic hold, never expires</h3><span class="pg-mono" data-o3></span><span class="pg-note" data-n3></span></div>
+      <div class="pg-box" data-b4><h3>Atomic hold with expiry</h3><span class="pg-mono" data-o4></span><span class="pg-note" data-n4></span></div>
+    </div>
+    <p class="pg-out" data-verdict aria-live="polite"></p>
+    <p class="pg-note">Model: time moves in steps. In each step the first N waiting fans (the slider) send a request. A fan who gets a hold pays 5 steps later, unless they abandon. An expiring hold is released 8 steps after it was taken. A fan who finds nothing free waits and tries again if a seat could still be released, and leaves otherwise. "Sold on click" means the purchase is final at the click, as in the simplest design.</p>
+  </div>
+</PlaygroundShell>
+<script>
+  document.querySelectorAll<HTMLElement>('[data-tbb]').forEach((root) => {
+    const q = <T extends HTMLElement>(s: string) => root.querySelector<T>(s)!;
+    const SEATS = 100; const BUYERS = 600; const PAY = 5; const HOLD = 8;
+    let seed = 21; const rnd = () => ((seed = (seed * 1664525 + 1013904223) % 4294967296) / 4294967296);
+    const draws = Array.from({ length: BUYERS }, () => rnd());
+    type R = { paid: number; over: number; stuck: number; steps: number };
+    function race(c: number, ab: number): R[] {
+      const out: R[] = [];
+      // 1. Check then update: all requests in one step read the same free count before any of them writes.
+      { let rem = SEATS; let sold = 0; let waiting = BUYERS; let t = 0;
+        while (waiting > 0 && rem > 0) { const a = Math.min(c, waiting); const r = rem; waiting -= a; sold += a; rem = r - a; t++; }
+        out.push({ paid: sold, over: Math.max(0, sold - SEATS), stuck: 0, steps: t }); }
+      // 2. Atomic update, sold on click.
+      { let rem = SEATS; let waiting = BUYERS; let t = 0;
+        while (waiting > 0 && rem > 0) { const a = Math.min(c, waiting); const s = Math.min(a, rem); rem -= s; waiting -= a; t++; }
+        out.push({ paid: SEATS - rem, over: 0, stuck: 0, steps: t }); }
+      // 3 and 4. Atomic hold that is confirmed by a payment, without and with expiry.
+      for (const expire of [false, true]) {
+        let queue = Array.from({ length: BUYERS }, (_, i) => i); let holds: { t: number; pays: boolean }[] = []; let sold = 0; let t = 0; let last = 0;
+        while (t < 400 && (queue.length > 0 || holds.some((h) => h.pays))) {
+          holds = holds.filter((h) => { if (h.pays && t >= h.t + PAY) { sold++; last = t; return false; } if (expire && !h.pays && t >= h.t + HOLD) return false; return true; });
+          const tryNow = queue.slice(0, c); const rest = queue.slice(c); const again: number[] = [];
+          for (const id of tryNow) {
+            const free = SEATS - sold - holds.length;
+            if (free > 0) holds.push({ t, pays: draws[id] >= ab });
+            else if (expire && holds.some((h) => !h.pays)) again.push(id); // a seat will be released, so keep trying
+          }
+          queue = [...rest, ...again]; t++;
+          if (queue.length === 0 && !holds.some((h) => h.pays)) break;
+        }
+        out.push({ paid: sold, over: 0, stuck: expire ? 0 : holds.filter((h) => !h.pays).length, steps: last });
+      }
+      return out;
+    }
+    function draw() {
+      const c = Number(q<HTMLInputElement>('[data-c]').value); const ab = Number(q<HTMLInputElement>('[data-ab]').value) / 100;
+      q('[data-cval]').textContent = String(c); q('[data-abval]').textContent = String(Math.round(ab * 100));
+      const r = race(c, ab);
+      r.forEach((x, i) => {
+        const k = i + 1;
+        q(`[data-o${k}]`).textContent = x.over > 0 ? `${x.paid} sold: ${x.over} too many` : `${x.paid} of ${SEATS} seats sold`;
+        q(`[data-n${k}]`).textContent = x.stuck > 0 ? `${x.stuck} seats stuck in abandoned holds` : x.over > 0 ? 'the same seats were sold to more than one fan' : `finished after ${x.steps} steps`;
+        const bad = x.over > 0 || x.stuck > 0 || x.paid < SEATS;
+        q<HTMLElement>(`[data-b${k}]`).style.setProperty('--c', bad ? 'var(--bad)' : 'var(--good)');
+      });
+      const out = q('[data-verdict]'); const bad = r[0].over > 0 || r[2].stuck > 0; out.classList.toggle('bad', bad);
+      out.textContent = r[0].over > 0 ? `Check-then-update sold ${r[0].over} seats that did not exist. With one request at a time it would be correct, which is why races go unnoticed in testing.`
+        : r[2].stuck > 0 ? `Holds that never expire left ${r[2].stuck} seats locked by fans who walked away. Holds with expiry returned them and sold ${r[3].paid} seats.`
+        : 'With these settings every approach sells the seats once. Raise the concurrency or the abandon rate to see them fail.';
+    }
+    root.addEventListener('input', draw);
+    draw();
+  });
+</script>

@@ -1,0 +1,179 @@
+{
+  "name": "Design a Ticket Booking System",
+  "difficulty": "advanced",
+  "intent": "Sell a limited number of seats to a crowd that is far larger than the venue, so that every seat is sold exactly once and the system survives the first minute of a big on-sale.",
+  "codeTitle": "claiming a seat atomically with a hold that expires",
+  "finalIntro": "One fan buying a seat during a very busy on-sale.",
+  "prompt": "Design a service like Ticketmaster. People browse events, choose seats on a map, pay, and get tickets. A popular concert has 50,000 seats and a million people trying to buy them in the first minutes.",
+  "functional": [
+    "Browse and search events, and see which seats are still available",
+    "Select seats and hold them for a few minutes while the fan pays",
+    "Pay, and receive a ticket that can be checked at the door",
+    "Release held seats automatically if the fan does not pay in time",
+    "Handle cancellations and refunds"
+  ],
+  "nonFunctional": [
+    "Never sell the same seat twice",
+    "Survive huge, sudden spikes at the start of a sale, with far more fans than seats",
+    "Stay fair: no one should win just by hammering the server, and bots should lose",
+    "Keep browsing fast even when buying is overloaded",
+    "Seat maps may be a few seconds stale, but a purchase must be exact",
+    "Never charge for a seat that is not given, and never give a seat that was not paid for"
+  ],
+  "firstAttempt": {
+    "text": "One web server and one database. A seats table has a status column. When a fan clicks a seat, the server reads the status and, if it is 'available', writes 'sold' and takes payment. Browsing and buying use the same server and the same table.",
+    "limits": [
+      "Two fans clicking the same seat at the same moment can both read 'available' and both buy it",
+      "There is no hold, so a seat can be taken between choosing it and paying for it",
+      "Everyone watching the seat map reloads it constantly, which loads the same database that sells the seats",
+      "A million people arriving in one minute overwhelm one server and one database",
+      "Nothing stops scripts from sending thousands of requests per second"
+    ]
+  },
+  "nodes": [
+    { "id": "fans", "label": "Fans' browsers", "kind": "client", "x": 12, "y": 50 },
+    { "id": "single", "label": "Server + database", "kind": "compute", "x": 50, "y": 50, "at": 0, "until": 1 },
+    { "id": "guard", "label": "Bot protection", "kind": "edge", "x": 12, "y": 16, "at": 6 },
+    { "id": "cdn", "label": "CDN and page cache", "kind": "edge", "x": 37, "y": 16, "at": 2 },
+    { "id": "cache", "label": "Seat map cache", "kind": "data", "x": 62, "y": 16, "at": 2 },
+    { "id": "waiting", "label": "Waiting room", "kind": "async", "x": 37, "y": 50, "at": 3 },
+    { "id": "api", "label": "Booking service", "kind": "compute", "x": 62, "y": 50, "at": 1 },
+    { "id": "db", "label": "Seat database", "kind": "data", "x": 87, "y": 50, "at": 1, "until": 5 },
+    { "id": "partitions", "label": "Database per event", "kind": "data", "x": 87, "y": 50, "at": 5 },
+    { "id": "payments", "label": "Payment service", "kind": "compute", "x": 87, "y": 84, "at": 4 },
+    { "id": "expirer", "label": "Hold expiry job", "kind": "compute", "x": 62, "y": 84, "at": 4 },
+    { "id": "tickets", "label": "Ticket issuer", "kind": "compute", "x": 37, "y": 84, "at": 6 }
+  ],
+  "edges": [
+    { "from": "fans", "to": "single", "at": 0, "until": 1 },
+    { "from": "fans", "to": "api", "at": 1, "until": 3 },
+    { "from": "api", "to": "db", "at": 1, "until": 5 },
+    { "from": "api", "to": "partitions", "at": 5 },
+    { "from": "fans", "to": "cdn", "at": 2 },
+    { "from": "cdn", "to": "cache", "at": 2 },
+    { "from": "cache", "to": "db", "at": 2, "until": 5 },
+    { "from": "cache", "to": "partitions", "at": 5 },
+    { "from": "fans", "to": "waiting", "at": 3 },
+    { "from": "waiting", "to": "api", "at": 3 },
+    { "from": "api", "to": "payments", "at": 4 },
+    { "from": "expirer", "to": "api", "at": 4 },
+    { "from": "guard", "to": "waiting", "at": 6 },
+    { "from": "api", "to": "tickets", "at": 6 }
+  ],
+  "steps": [
+    {
+      "title": "Claim seats atomically and hold them with an expiry",
+      "problem": "Read-then-write lets two buyers both see a free seat and both take it, and without a hold a seat can be lost between choosing it and paying.",
+      "fix": "A booking service claims a seat with one conditional update that checks and changes it in the same step: set the holder and an expiry time only if the seat is free or its hold has run out. The database guarantees only one of two simultaneous claims succeeds, and the loser is told at once. A hold lasts a few minutes, and only the holder can confirm it with a payment before it expires.",
+      "tradeoff": "A seat can never be given to two people, and fans get a fair window to pay. Holds take seats off the market while fans hesitate or abandon, and a hold's length is a balance between fans who need time and seats that sit empty.",
+      "concepts": [{ "slug": "acid-vs-base" }, { "slug": "consistency-models" }, { "slug": "idempotency" }]
+    },
+    {
+      "title": "Serve browsing from caches, keep buying exact",
+      "problem": "Every fan watching the seat map refreshes it again and again, and these reads are by far the most requests and compete with the purchases.",
+      "fix": "Event pages, images and prices are cached on a CDN. The seat map is served from a cache that is refreshed every second or two from the database, and the page shows 'available' only as a hint. When a fan clicks, the booking service asks the database, which is the single source of truth, so a stale 'available' simply turns into 'sorry, just taken' without ever causing a double sale.",
+      "tradeoff": "Reads, which are 99% of the traffic, never touch the booking database, and the site stays up. Fans may click seats that are already gone, so the seat map is updated by pushing changes and the interface handles a lost race gracefully.",
+      "concepts": [{ "slug": "caching" }, { "slug": "cdn" }, { "slug": "cqrs" }]
+    },
+    {
+      "title": "Put a waiting room in front of the booking service",
+      "problem": "A million fans arriving at once is far more than the booking service can process, and letting them all in makes it slow for everyone.",
+      "fix": "A virtual waiting room sits in front of the sale. Fans who arrive before the on-sale are given a random place in the queue, not a first-come one, so being early or fast on the network does not matter. After the sale opens the queue lets people through at a fixed rate that the booking service can handle, with each admitted fan holding a signed token for a limited time. Everyone else sees their position and waits.",
+      "tradeoff": "The booking service sees a steady, safe load however big the crowd is, and the experience is fair and orderly. Fans wait, which is annoying but better than errors, and the waiting room itself must be built to carry a huge crowd cheaply, mostly with static pages and signed tokens.",
+      "concepts": [{ "slug": "rate-limiting" }, { "slug": "backpressure" }, { "slug": "message-queues" }]
+    },
+    {
+      "title": "Run purchase as a series of steps that can be undone",
+      "problem": "Payment is slow and can fail, so the seat must stay held during it, and a payment that succeeds when the hold has already expired must not leave the fan charged without a seat.",
+      "fix": "The purchase is a small workflow: hold the seat, create a payment, confirm the payment with the provider, then turn the hold into a sale. Each step is idempotent and carries the order's id. If payment fails or the hold expires, the workflow releases the seat. If the money arrives after the hold expired and the seat was sold to someone else, it is refunded automatically. A background job releases expired holds and puts those seats back on sale.",
+      "tradeoff": "Seats and money are never left in an inconsistent state, even through crashes, and failed purchases return their seats to the pool. There are more states to design and test, and the refund path must be reliable.",
+      "concepts": [{ "slug": "saga" }, { "slug": "idempotency" }, { "slug": "transactional-outbox" }]
+    },
+    {
+      "title": "Give every event its own partition",
+      "problem": "One very popular event can overload a shared database and slow down ticket sales for every other event.",
+      "fix": "Partition the data by event, so that all the seats, holds and orders of one event live together and one event's sale runs on its own database or shard. Large on-sales can be given dedicated capacity ahead of time, and a hot event cannot take resources from the rest of the catalogue. All the checks that matter happen inside one partition, so they stay simple transactions.",
+      "tradeoff": "A flood for one event stays contained and every claim remains a single-partition transaction. A single enormous event is still limited by one partition, so its seats may need to be split by section, and partitions need to be created and sized before a sale.",
+      "concepts": [{ "slug": "database-sharding" }, { "slug": "bulkhead" }, { "slug": "load-balancing" }]
+    },
+    {
+      "title": "Keep bots out and issue tickets that cannot be forged",
+      "problem": "Scripts and scalpers can grab seats faster than people and resell them, and a screenshot of a ticket must not be enough to get in.",
+      "fix": "Bot protection sits in front of the waiting room: it limits requests per account, address and device, checks signals that tell scripts from people, and asks suspicious clients to solve a challenge. Each fan is limited to a small number of tickets per event. Tickets carry a signed, rotating code that the entry scanner can verify offline and that stops working once it has been used or transferred.",
+      "tradeoff": "More of the seats go to real fans, and tickets are hard to copy. Bot protection costs some honest users extra effort, and any defence is a race against attackers, so it is tuned and monitored continuously.",
+      "concepts": [{ "slug": "rate-limiting" }, { "slug": "authentication-and-authorization" }, { "slug": "encryption" }]
+    }
+  ],
+  "failures": [
+    {
+      "scenario": "Two fans click the same seat in the same millisecond",
+      "impact": "Both read it as free, and without protection both would be told they have it.",
+      "answer": "The claim is a single conditional update in the database, so exactly one succeeds. The other is told at once that the seat was just taken and sees the map update, and both are told the truth.",
+      "concepts": [{ "slug": "acid-vs-base" }, { "slug": "consistency-models" }, { "slug": "idempotency" }]
+    },
+    {
+      "scenario": "A fan pays, but the booking service crashes before it turns the hold into a sale",
+      "impact": "The fan has been charged and has no ticket, and the hold is about to expire.",
+      "answer": "The payment confirmation is recorded in an outbox in the same step as the sale. A recovery job finds payments confirmed for holds that are still not sold and completes them. If the hold has already expired and the seat is gone, the payment is refunded automatically.",
+      "concepts": [{ "slug": "transactional-outbox" }, { "slug": "saga" }, { "slug": "retries-and-backoff" }]
+    },
+    {
+      "scenario": "The booking database for a hot event becomes slow",
+      "impact": "Claims take longer, holds pile up and fans see errors.",
+      "answer": "The waiting room reduces the admission rate when the service's latency rises, so the load falls instead of snowballing. The partition is isolated, so other events are unaffected, and browsing carries on from caches.",
+      "concepts": [{ "slug": "backpressure" }, { "slug": "bulkhead" }, { "slug": "slos-and-error-budgets" }]
+    },
+    {
+      "scenario": "The waiting room itself is hit by millions of requests",
+      "impact": "If it needs the same servers as the booking service, it fails and the sale fails with it.",
+      "answer": "It is built separately from the booking service. Its pages are static and cacheable, positions are assigned from signed tokens that need no database lookup, and it is served from the CDN, so a crowd of millions costs very little.",
+      "concepts": [{ "slug": "cdn" }, { "slug": "caching" }, { "slug": "rate-limiting" }]
+    }
+  ],
+  "alternatives": [
+    {
+      "title": "How to stop two buyers taking one seat",
+      "options": [
+        { "name": "Check, then update", "pro": "Easy to write", "con": "Unsafe: two buyers can both pass the check" },
+        { "name": "Row lock or conditional update", "pro": "Correct and simple, and the database does the hard part", "con": "Contention when many fans want the same seat" },
+        { "name": "Optimistic version check", "pro": "No lock is held, so it scales when conflicts are rare", "con": "The losing buyer must retry or be told no" },
+        { "name": "A distributed lock service", "pro": "Works across systems", "con": "Another system that can fail, and unnecessary when the seats are in one database" }
+      ],
+      "pick": "A conditional update in the database that owns the seats. It is correct, and it needs nothing more."
+    },
+    {
+      "title": "How long to hold a seat",
+      "options": [
+        { "name": "No hold: pay first", "pro": "No seats are ever locked", "con": "Fans pay and then learn the seat was taken, and refunds follow" },
+        { "name": "Short hold (2 to 5 minutes)", "pro": "Seats return to the pool quickly", "con": "Slow payers lose their seat" },
+        { "name": "Long hold (15 minutes or more)", "pro": "Generous for fans", "con": "Abandoned holds make seats look sold out when they are not" }
+      ],
+      "pick": "A hold of about 5 to 10 minutes, with a visible countdown and an extension for a payment already in progress."
+    },
+    {
+      "title": "How to order a crowd",
+      "options": [
+        { "name": "First come, first served", "pro": "Simple to explain", "con": "Rewards fast connections and bots, and a stampede crushes the servers" },
+        { "name": "Random lottery of everyone who arrives in a window", "pro": "Fair, and removes the race", "con": "Needs a clear queue window, and fans cannot plan exactly when they will get in" },
+        { "name": "Pre-registration and a verified lottery", "pro": "Best against scalpers", "con": "More work for fans and organisers" }
+      ],
+      "pick": "A random queue for everyone who arrives before the sale opens, plus per-person limits."
+    },
+    {
+      "title": "How fresh the seat map must be",
+      "options": [
+        { "name": "Always read from the booking database", "pro": "Always exact", "con": "Browsing traffic overwhelms the database" },
+        { "name": "A cache refreshed every second or two", "pro": "Cheap, and nearly right", "con": "Shows a seat as free for a moment after it is taken" },
+        { "name": "Push every change to every viewer", "pro": "Feels live", "con": "Fan-out of every change to a huge crowd, so it is usually batched" }
+      ],
+      "pick": "A short-lived cache, with pushed updates for the section the fan is looking at."
+    }
+  ],
+  "roles": [
+    { "id": "client", "label": "Fans", "description": "People trying to buy seats." },
+    { "id": "edge", "label": "Front door", "description": "Bot protection and the CDN." },
+    { "id": "async", "label": "Waiting room", "description": "The queue that admits fans at a safe rate." },
+    { "id": "compute", "label": "Services", "description": "Booking, payment, expiry and ticket issue." },
+    { "id": "data", "label": "State", "description": "Seats, holds and the seat map cache." }
+  ]
+}
