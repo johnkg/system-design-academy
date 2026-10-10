@@ -1,0 +1,87 @@
+---
+import PlaygroundShell from '../components/PlaygroundShell.astro';
+---
+<PlaygroundShell title="Simulate it" hint="Checkout calls a payment API. A failing call takes 2 seconds to time out. Break the API and watch the circuit breaker react.">
+  <ol class="how">
+    <li>Set the API to <b>Failing</b>. After 3 failures the breaker <b>opens</b> and calls fail instantly. The number of callers waiting stays small.</li>
+    <li>Switch the API back to <b>Healthy</b>. When the cool-down ends the breaker goes <b>half-open</b>, sends one probe, and <b>closes</b> again.</li>
+    <li>Untick <b>Use circuit breaker</b> and break the API again: every call waits the full 2 seconds, so waiting callers pile up and the failing API keeps receiving all the traffic.</li>
+  </ol>
+  <div class="pg cb" data-cb>
+    <div class="pg-row">
+      <label>Payment API <select class="pg-in" data-api><option value="up" selected>Healthy</option><option value="down">Failing (times out)</option></select></label>
+      <label>Requests per second <input type="range" min="1" max="10" value="4" data-rate /> <b data-rateval>4</b></label>
+      <label>Cool-down (s) <input type="range" min="2" max="10" value="5" data-cool /> <b data-coolval>5</b></label>
+      <label class="cb-check"><input type="checkbox" checked data-use /> Use circuit breaker</label>
+    </div>
+    <div class="pg-row"><button class="btn" type="button" data-reset>Reset</button></div>
+    <div class="pg-grid">
+      <div class="pg-box" data-statebox><h3>Breaker</h3><span class="pg-mono" data-state>CLOSED</span><span class="pg-note" data-statenote></span></div>
+      <div class="pg-box" style="--c: var(--role-3)"><h3>Callers waiting</h3><span class="pg-mono" data-waiting>0</span><span class="pg-note">requests stuck on a slow call</span></div>
+    </div>
+    <p class="pg-mono" data-stats></p>
+  </div>
+</PlaygroundShell>
+<script>
+  interface Pending { end: number; ok: boolean; probe: boolean }
+  const FAIL_MS = 2000; const OK_MS = 150; const THRESHOLD = 3;
+  document.querySelectorAll<HTMLElement>('[data-cb]').forEach((root) => {
+    const q = <T extends HTMLElement>(s: string) => root.querySelector<T>(s)!;
+    const val = (s: string) => Number(q<HTMLInputElement>(s).value);
+    let state: 'closed' | 'open' | 'half-open' = 'closed'; let failures = 0; let openedAt = 0; let probing = false;
+    let pending: Pending[] = []; let reached = 0; let fast = 0; let succeeded = 0; let failed = 0;
+    let tickTimer: number | undefined; let sendTimer: number | undefined; let onScreen = true;
+    const colour = { closed: 'var(--role-2)', open: 'var(--bad)', 'half-open': 'var(--role-3)' };
+
+    function send() {
+      const now = performance.now(); const use = q<HTMLInputElement>('[data-use]').checked;
+      if (use) {
+        if (state === 'open' && now - openedAt >= val('[data-cool]') * 1000) state = 'half-open';
+        if (state === 'open' || (state === 'half-open' && probing)) { fast++; return; }
+      }
+      const probe = use && state === 'half-open'; if (probe) probing = true;
+      const ok = q<HTMLSelectElement>('[data-api]').value === 'up';
+      reached++; pending.push({ end: now + (ok ? OK_MS : FAIL_MS), ok, probe });
+    }
+    function settle() {
+      const now = performance.now(); const use = q<HTMLInputElement>('[data-use]').checked;
+      pending = pending.filter((p) => {
+        if (now < p.end) return true;
+        if (p.probe) probing = false;
+        if (p.ok) { succeeded++; if (use) { state = 'closed'; failures = 0; } }
+        else { failed++; if (use) { failures++; if (p.probe || failures >= THRESHOLD) { state = 'open'; openedAt = now; } } }
+        return false;
+      });
+      if (use && state === 'open' && now - openedAt >= val('[data-cool]') * 1000) state = 'half-open';
+    }
+    function draw() {
+      const now = performance.now(); const use = q<HTMLInputElement>('[data-use]').checked;
+      q('[data-rateval]').textContent = String(val('[data-rate]')); q('[data-coolval]').textContent = String(val('[data-cool]'));
+      const label = use ? state.toUpperCase() : 'NO BREAKER';
+      q('[data-state]').textContent = label;
+      q<HTMLElement>('[data-statebox]').style.setProperty('--c', use ? colour[state] : 'var(--border)');
+      q('[data-statenote]').textContent = !use ? 'every call goes to the API' : state === 'closed' ? `consecutive failures: ${failures} of ${THRESHOLD}` : state === 'open' ? `calls fail fast, probe in ${Math.max(0, (val('[data-cool]') - (now - openedAt) / 1000)).toFixed(1)} s` : probing ? 'one probe in flight, others fail fast' : 'next call is the probe';
+      q('[data-waiting]').textContent = String(pending.length);
+      q('[data-stats]').textContent = `reached the API: ${reached} · failed fast by the breaker: ${fast} · succeeded: ${succeeded} · failed after timeout: ${failed}`;
+    }
+    function tick() { settle(); draw(); }
+    function reset() { state = 'closed'; failures = 0; probing = false; pending = []; reached = fast = succeeded = failed = 0; draw(); }
+    function clock() {
+      window.clearInterval(tickTimer); window.clearInterval(sendTimer); tickTimer = sendTimer = undefined;
+      if (!onScreen || document.hidden) return;
+      tickTimer = window.setInterval(tick, 100);
+      sendTimer = window.setInterval(send, 1000 / val('[data-rate]'));
+    }
+    q('[data-reset]').addEventListener('click', reset);
+    q('[data-rate]').addEventListener('input', () => { clock(); draw(); });
+    q('[data-cool]').addEventListener('input', draw);
+    q('[data-use]').addEventListener('change', () => { state = 'closed'; failures = 0; probing = false; draw(); });
+    q('[data-api]').addEventListener('change', draw);
+    new IntersectionObserver(([en]) => { onScreen = en.isIntersecting; clock(); }).observe(root);
+    document.addEventListener('visibilitychange', clock);
+    reset(); clock();
+  });
+</script>
+<style is:global>
+  .playground .cb-check { display: inline-flex; align-items: center; gap: 6px; }
+</style>

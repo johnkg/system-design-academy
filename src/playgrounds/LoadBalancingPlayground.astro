@@ -1,0 +1,125 @@
+---
+import PlaygroundShell from '../components/PlaygroundShell.astro';
+---
+<PlaygroundShell title="Simulate it" hint="Three servers, one of them slow. Pick an algorithm, send traffic, and take servers down.">
+  <ol class="how">
+    <li>Turn on <b>Steady traffic</b> with <b>Round robin</b>. The slow server (Server 3) falls behind and its queue grows.</li>
+    <li>Switch to <b>Least connections</b>. Watch the load shift away from the slow server.</li>
+    <li><b>Take down</b> a server. Traffic flows around it and its waiting requests are re-routed.</li>
+  </ol>
+  <div class="pg lbs" data-lb>
+    <div class="pg-row" role="group" aria-label="Algorithm" data-algos></div>
+    <div class="pg-row">
+      <button class="btn pg-primary" type="button" data-send>Send 1 request</button>
+      <button class="btn pg-primary" type="button" data-burst>Send burst of 20</button>
+      <label><input type="checkbox" data-auto /> Steady traffic (4 requests/second)</label>
+      <button class="btn" type="button" data-reset>Reset</button>
+    </div>
+    <div class="pg-grid" data-servers></div>
+    <p class="pg-mono" data-totals></p>
+    <p class="pg-note">Servers handle one request at a time: Server 1 and 2 take 0.4 s each, Server 3 takes 1.0 s. The bars show requests waiting plus in progress.</p>
+  </div>
+</PlaygroundShell>
+<script>
+  interface Req { t: number }
+  interface Srv { name: string; work: number; healthy: boolean; queue: Req[]; busy: Req | null; until: number; served: number; latency: number }
+  type Algo = 'roundrobin' | 'random' | 'least';
+  const load = (s: Srv) => s.queue.length + (s.busy ? 1 : 0);
+
+  // Same idea as the code samples: a balancer that picks among healthy servers.
+  class Balancer {
+    private next = 0;
+    pick(servers: Srv[], algo: Algo): Srv | null {
+      const up = servers.filter((s) => s.healthy);
+      if (!up.length) return null;
+      if (algo === 'random') return up[Math.floor(Math.random() * up.length)];
+      if (algo === 'least') return up.reduce((a, b) => (load(b) < load(a) ? b : a));
+      return up[this.next++ % up.length];
+    }
+  }
+
+  document.querySelectorAll<HTMLElement>('[data-lb]').forEach((root) => {
+    const q = <T extends HTMLElement>(s: string) => root.querySelector<T>(s)!;
+    const algos: { id: Algo; label: string }[] = [{ id: 'roundrobin', label: 'Round robin' }, { id: 'random', label: 'Random' }, { id: 'least', label: 'Least connections' }];
+    let algo: Algo = 'roundrobin';
+    let servers: Srv[] = []; let balancer = new Balancer(); let failed = 0; let dropped = 0; let sent = 0;
+    let autoTimer: number | undefined; let tickTimer: number | undefined;
+
+    const fresh = () => [['Server 1', 400], ['Server 2', 400], ['Server 3', 1000]].map(([name, work]) => ({ name: name as string, work: work as number, healthy: true, queue: [], busy: null, until: 0, served: 0, latency: 0 }));
+    function reset() { servers = fresh(); balancer = new Balancer(); failed = 0; dropped = 0; sent = 0; build(); draw(); }
+
+    function dispatch() {
+      sent++;
+      const s = balancer.pick(servers, algo);
+      if (!s) { dropped++; return; }
+      s.queue.push({ t: performance.now() });
+    }
+    function tick() {
+      const now = performance.now();
+      servers.forEach((s) => {
+        if (s.busy && now >= s.until) { s.served++; s.latency += now - s.busy.t; s.busy = null; }
+        if (!s.busy && s.healthy && s.queue.length) { s.busy = s.queue.shift()!; s.until = now + s.work; }
+      });
+      draw();
+    }
+    // Cards are built once per reset and only updated afterwards, so buttons keep focus and clicks land.
+    const cards: { box: HTMLElement; title: HTMLElement; fill: HTMLElement; meter: HTMLElement; flight: HTMLElement; stats: HTMLElement; btn: HTMLButtonElement }[] = [];
+    function build() {
+      const grid = q('[data-servers]'); grid.innerHTML = ''; cards.length = 0;
+      servers.forEach((s) => {
+        const box = document.createElement('div'); box.className = 'pg-box';
+        box.innerHTML = '<h3></h3><div class="lb-meter" role="img"><div class="lb-fill"></div></div><span class="pg-mono" data-flight></span><span class="pg-mono" data-stats></span>';
+        const btn = document.createElement('button'); btn.type = 'button'; btn.className = 'btn';
+        btn.addEventListener('click', () => {
+          s.healthy = !s.healthy;
+          if (!s.healthy) { if (s.busy) { failed++; s.busy = null; } s.queue.splice(0).forEach((r) => { const t = balancer.pick(servers, algo); if (t) t.queue.push(r); else dropped++; }); }
+          draw();
+        });
+        box.appendChild(btn); grid.appendChild(box);
+        cards.push({ box, title: box.querySelector('h3')!, fill: box.querySelector('.lb-fill')!, meter: box.querySelector('.lb-meter')!, flight: box.querySelector('[data-flight]')!, stats: box.querySelector('[data-stats]')!, btn });
+      });
+    }
+    function draw() {
+      servers.forEach((s, i) => {
+        const c = cards[i]; const l = load(s);
+        c.box.classList.toggle('off', !s.healthy);
+        c.box.style.setProperty('--c', s.healthy ? (l > 8 ? 'var(--bad)' : 'var(--role-3)') : 'var(--border)');
+        c.title.textContent = s.healthy ? s.name : `${s.name} (down)`;
+        c.fill.style.width = `${Math.min(100, (l / 12) * 100)}%`;
+        c.meter.setAttribute('aria-label', `${l} requests waiting or in progress`);
+        c.flight.textContent = `in flight: ${l}`;
+        c.stats.textContent = `served: ${s.served}${s.served ? ` · avg ${Math.round(s.latency / s.served)} ms` : ''}`;
+        c.btn.textContent = s.healthy ? 'Take down' : 'Bring up';
+      });
+      const done = servers.reduce((a, s) => a + s.served, 0); const lat = servers.reduce((a, s) => a + s.latency, 0);
+      q('[data-totals]').textContent = `sent ${sent} · served ${done}${done ? ` · average latency ${Math.round(lat / done)} ms` : ''} · failed mid-request ${failed} · rejected (no server) ${dropped}`;
+    }
+    function chips() {
+      const w = q('[data-algos]'); w.innerHTML = '';
+      algos.forEach((a) => { const b = document.createElement('button'); b.type = 'button'; b.className = 'btn'; b.textContent = a.label; b.setAttribute('aria-pressed', String(a.id === algo)); b.addEventListener('click', () => { algo = a.id; chips(); }); w.appendChild(b); });
+    }
+
+    q('[data-send]').addEventListener('click', () => { dispatch(); draw(); });
+    q('[data-burst]').addEventListener('click', () => { for (let i = 0; i < 20; i++) dispatch(); draw(); });
+    q('[data-reset]').addEventListener('click', reset);
+    q<HTMLInputElement>('[data-auto]').addEventListener('change', (e) => {
+      window.clearInterval(autoTimer);
+      if ((e.target as HTMLInputElement).checked) autoTimer = window.setInterval(dispatch, 250);
+    });
+
+    // Only run the clock while the simulation is on screen and the tab is visible.
+    let onScreen = true; // assume visible until the observer says otherwise
+    const syncClock = () => {
+      window.clearInterval(tickTimer); tickTimer = undefined;
+      if (onScreen && !document.hidden) tickTimer = window.setInterval(tick, 100);
+    };
+    new IntersectionObserver(([en]) => { onScreen = en.isIntersecting; syncClock(); }).observe(root);
+    document.addEventListener('visibilitychange', syncClock);
+    syncClock();
+    chips(); reset();
+  });
+</script>
+<style is:global>
+  .playground .lb-meter { height: 14px; border-radius: 99px; background: var(--surface-2); overflow: hidden; }
+  .playground .lb-fill { height: 100%; background: var(--accent); border-radius: 99px; transition: width .15s linear; }
+</style>

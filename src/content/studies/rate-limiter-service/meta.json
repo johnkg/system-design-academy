@@ -1,0 +1,359 @@
+{
+  "name": "Design a Rate Limiter Service",
+  "difficulty": "intermediate",
+  "intent": "Build the shared service that decides, for every request in a fleet of API gateways, whether a client is still within its limit, and keep it fast and available while doing so.",
+  "codeTitle": "comparing the algorithms",
+  "finalIntro": "One API request through everything built above, including a denial and an outage.",
+  "prompt": "Design a rate limiter used by an API platform. Each API key has a limit such as 100 requests per minute. Dozens of gateway servers receive traffic for the same key, and each request must be allowed or rejected within a few milliseconds.",
+  "functional": [
+    "Allow or reject each request based on the caller's API key and plan",
+    "Support different limits per plan and per endpoint, changeable without a deploy",
+    "Tell rejected clients how long to wait (429 with Retry-After) and tell others how much is left",
+    "Optional: limits by IP, by user, or by a combination"
+  ],
+  "nonFunctional": [
+    "Very low latency: the check adds only a few milliseconds to every request",
+    "The limit must hold across all gateways, not per gateway",
+    "Highly available: if the limiter breaks, the API must not break with it",
+    "Accurate enough: small overshoot is fine, doubling the limit is not",
+    "Scales to millions of keys and hundreds of thousands of checks per second"
+  ],
+  "firstAttempt": {
+    "text": "Every gateway keeps an in-memory counter per API key and resets it every minute. A request increments the counter and is rejected once it passes the limit. It needs no other system, adds almost no latency, and is a fine start with one gateway.",
+    "limits": [
+      "A load balancer spreads one client's requests over N gateways, so the real limit becomes N times higher",
+      "Counters vanish when a gateway restarts, and every new gateway starts at zero",
+      "A fixed minute window lets a client send double the limit around the boundary",
+      "Memory grows with the number of keys and never shrinks",
+      "Limits are hard-coded, so changing a plan means redeploying"
+    ]
+  },
+  "nodes": [
+    {
+      "id": "client",
+      "label": "Client",
+      "kind": "client",
+      "x": 12,
+      "y": 50
+    },
+    {
+      "id": "gw",
+      "label": "API gateways",
+      "kind": "edge",
+      "x": 37,
+      "y": 50
+    },
+    {
+      "id": "api",
+      "label": "API servers",
+      "kind": "compute",
+      "x": 87,
+      "y": 16
+    },
+    {
+      "id": "local",
+      "label": "Local counters",
+      "kind": "data",
+      "x": 62,
+      "y": 16,
+      "at": 0,
+      "until": 1
+    },
+    {
+      "id": "store",
+      "label": "Shared counter store",
+      "kind": "data",
+      "x": 62,
+      "y": 50,
+      "at": 1,
+      "until": 4
+    },
+    {
+      "id": "rules",
+      "label": "Rules service",
+      "kind": "compute",
+      "x": 37,
+      "y": 84,
+      "at": 3
+    },
+    {
+      "id": "shards",
+      "label": "Counter shards",
+      "kind": "data",
+      "x": 62,
+      "y": 50,
+      "at": 4
+    },
+    {
+      "id": "replicas",
+      "label": "Replicas",
+      "kind": "data",
+      "x": 87,
+      "y": 84,
+      "at": 5
+    },
+    {
+      "id": "fallback",
+      "label": "Local fallback limit",
+      "kind": "async",
+      "x": 37,
+      "y": 16,
+      "at": 5
+    }
+  ],
+  "edges": [
+    {
+      "from": "client",
+      "to": "gw"
+    },
+    {
+      "from": "gw",
+      "to": "api"
+    },
+    {
+      "from": "gw",
+      "to": "local",
+      "at": 0,
+      "until": 1
+    },
+    {
+      "from": "gw",
+      "to": "store",
+      "at": 1,
+      "until": 4
+    },
+    {
+      "from": "rules",
+      "to": "gw",
+      "at": 3
+    },
+    {
+      "from": "gw",
+      "to": "shards",
+      "at": 4
+    },
+    {
+      "from": "shards",
+      "to": "replicas",
+      "at": 5
+    },
+    {
+      "from": "gw",
+      "to": "fallback",
+      "at": 5
+    }
+  ],
+  "steps": [
+    {
+      "title": "Keep the counters in one shared store",
+      "problem": "Each gateway counts only the requests it sees, so a client spread over several gateways gets several times its limit.",
+      "fix": "Move the counters to a fast shared store such as Redis. Every gateway asks the same place, so one key has one count however many gateways handle it.",
+      "tradeoff": "The limit now holds across the fleet. Every request pays a network round trip (about a millisecond), and the store becomes a dependency of every API call.",
+      "concepts": [
+        {
+          "slug": "rate-limiting"
+        },
+        {
+          "slug": "load-balancing"
+        }
+      ]
+    },
+    {
+      "title": "Make check-and-update one atomic step",
+      "problem": "If a gateway reads the count, decides, then writes it back, two gateways can read the same value at the same moment and both allow the request.",
+      "fix": "Do the whole check and update inside the store in one operation, for example a small Lua script in Redis or an atomic increment. Nothing can run between the read and the write. Also use the store's clock for windows, so gateways with skewed clocks agree.",
+      "tradeoff": "No lost updates and no overshoot from races. In exchange the logic lives in the store, which must be able to run it quickly and which you must test carefully.",
+      "concepts": [
+        {
+          "slug": "consistency-models"
+        }
+      ]
+    },
+    {
+      "title": "Load the rules from a rules service and cache them",
+      "problem": "Limits are hard-coded, and asking a service for the rule on every request would double the latency.",
+      "fix": "A rules service holds each plan's limits. Every gateway keeps a local copy of the rules and refreshes it every few seconds. The hot path reads from memory.",
+      "tradeoff": "Plan changes apply without a deploy and add no latency. A change takes a few seconds to reach every gateway, so a lowered limit is briefly not yet enforced.",
+      "concepts": [
+        {
+          "slug": "caching"
+        }
+      ]
+    },
+    {
+      "title": "Shard the counters by key",
+      "problem": "One store node can only do so many operations per second, and every request is one operation.",
+      "fix": "Spread keys over several store nodes using consistent hashing on the API key. A key's counter always lives on the same shard, so checks stay exact, and adding a node moves only a small share of keys.",
+      "tradeoff": "Throughput and memory scale out. Keys are not evenly busy, so one hot key can overload its shard, and a shard failure affects only the keys on it.",
+      "concepts": [
+        {
+          "slug": "database-sharding"
+        },
+        {
+          "slug": "consistent-hashing"
+        }
+      ]
+    },
+    {
+      "title": "Add replicas and decide what happens when the store is down",
+      "problem": "If a shard is unreachable, every gateway either rejects everyone (the API goes down) or allows everyone (the limit disappears).",
+      "fix": "Give each shard a replica that can take over. Wrap store calls in a short timeout and a circuit breaker. If the store is still unreachable, fail open, but fall back to a conservative limit counted locally in each gateway instead of allowing everything.",
+      "tradeoff": "The API stays up when the limiter fails, and abuse is still bounded. During an outage limits are approximate, and a replica may be a moment behind, so a few extra requests can slip through.",
+      "concepts": [
+        {
+          "slug": "database-replication"
+        },
+        {
+          "slug": "circuit-breaker"
+        }
+      ]
+    },
+    {
+      "title": "Tell clients exactly how to behave",
+      "problem": "A client that is rejected and simply retries at once makes the overload worse and wastes the limiter's capacity.",
+      "fix": "Return 429 with a Retry-After header, and send the remaining quota on every response (for example X-RateLimit-Remaining). Well-behaved clients wait, back off with jitter and stay within the limit.",
+      "tradeoff": "Cheap to add and it shifts effort to well-behaved clients. Badly behaved ones ignore it, so the limiter still has to stay cheap under a flood of rejected requests.",
+      "concepts": [
+        {
+          "slug": "retries-and-backoff"
+        },
+        {
+          "slug": "backpressure"
+        }
+      ]
+    }
+  ],
+  "failures": [
+    {
+      "scenario": "The counter store becomes unreachable",
+      "impact": "Gateways cannot check limits. Failing closed would take the whole API down, and failing open removes all protection.",
+      "answer": "The circuit breaker trips after a few timeouts so requests stop waiting on the store. Gateways switch to the local fallback limit and fail open within that cap. Alert on the breaker opening, and the replica is promoted.",
+      "concepts": [
+        {
+          "slug": "circuit-breaker"
+        },
+        {
+          "slug": "database-replication"
+        }
+      ]
+    },
+    {
+      "scenario": "One abusive key sends a million requests per second",
+      "impact": "All of that key's checks land on one shard. Even rejected requests cost a store call, so the shard can saturate and slow every other key on it.",
+      "answer": "Once a key is over its limit, gateways remember that locally until the retry time and reject without asking the store. Add a coarse per-IP limit at the edge, and isolate heavy keys so one cannot starve the rest.",
+      "concepts": [
+        {
+          "slug": "caching"
+        },
+        {
+          "slug": "bulkhead"
+        },
+        {
+          "slug": "rate-limiting"
+        }
+      ]
+    },
+    {
+      "scenario": "A bad rule is rolled out: one plan is set to 1 request per minute",
+      "impact": "Thousands of legitimate customers are suddenly rejected everywhere, within seconds, because the rule is cached by every gateway.",
+      "answer": "Validate rules before publishing, roll them out gradually, and keep the previous version so a rollback is one step. Gateways keep serving the last good rules if the rules service is down or returns nonsense.",
+      "concepts": [
+        {
+          "slug": "caching"
+        }
+      ]
+    }
+  ],
+  "alternatives": [
+    {
+      "title": "Which counting algorithm",
+      "options": [
+        {
+          "name": "Fixed window counter",
+          "pro": "One counter per key and window, trivial and cheap",
+          "con": "Allows up to double the limit around a window boundary"
+        },
+        {
+          "name": "Sliding window log",
+          "pro": "Exact: counts the requests in the last N seconds",
+          "con": "Stores a timestamp for every request, which costs memory"
+        },
+        {
+          "name": "Sliding window counter",
+          "pro": "Two counters and a weighted sum approximate a true sliding window",
+          "con": "An estimate, not exact"
+        },
+        {
+          "name": "Token bucket",
+          "pro": "Two numbers per key, permits controlled bursts, smooth refill",
+          "con": "Burst size and refill rate are two settings to explain to customers"
+        }
+      ],
+      "pick": "A token bucket for most APIs: tiny state and bursts are usually what you want. Use a sliding window when the rule is literally 'no more than N in any 60 seconds'."
+    },
+    {
+      "title": "When the limiter is unavailable",
+      "options": [
+        {
+          "name": "Fail open",
+          "pro": "The API stays up",
+          "con": "No protection while the limiter is down"
+        },
+        {
+          "name": "Fail closed",
+          "pro": "Always enforces the limit",
+          "con": "A limiter outage becomes a total outage"
+        },
+        {
+          "name": "Fail open to a local cap",
+          "pro": "API stays up and abuse is still bounded",
+          "con": "More code, and limits are approximate meanwhile"
+        }
+      ],
+      "pick": "Fail open to a local cap for public APIs. Fail closed only where an unchecked request is more dangerous than an outage, such as login attempts."
+    },
+    {
+      "title": "Exact or approximate counting",
+      "options": [
+        {
+          "name": "Ask the shared store on every request",
+          "pro": "Exact limits",
+          "con": "A network call per request and a hot dependency"
+        },
+        {
+          "name": "Count locally and sync every fraction of a second",
+          "pro": "No call on the hot path, much less store load",
+          "con": "Overshoot by up to the traffic of one sync interval across all gateways"
+        }
+      ],
+      "pick": "Start exact. Move to local counting with periodic sync only if the store becomes the cost or latency problem, and accept the small overshoot."
+    }
+  ],
+  "roles": [
+    {
+      "id": "client",
+      "label": "Client",
+      "description": "An API consumer with a key."
+    },
+    {
+      "id": "edge",
+      "label": "Gateway",
+      "description": "Receives requests and enforces the limit."
+    },
+    {
+      "id": "compute",
+      "label": "Service",
+      "description": "The API behind the gateways, and the rules service."
+    },
+    {
+      "id": "data",
+      "label": "Counter state",
+      "description": "Where counts and token buckets live."
+    },
+    {
+      "id": "async",
+      "label": "Fallback",
+      "description": "Degraded-mode behaviour when the store is down."
+    }
+  ]
+}

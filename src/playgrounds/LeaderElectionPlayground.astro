@@ -1,0 +1,85 @@
+---
+import PlaygroundShell from '../components/PlaygroundShell.astro';
+---
+<PlaygroundShell title="Simulate it" hint="A five-node cluster. Break things, then advance time one tick at a time. A candidate needs 3 votes, a majority of all five. Election timeouts are fixed per node, so the result is repeatable.">
+  <ol class="how">
+    <li>Press <b>Crash the leader</b> and advance a few ticks: followers time out, one becomes a <b>candidate</b>, wins 3 votes and leads in a <b>higher term</b>. Press <b>Recover all nodes</b> and the old leader joins as a follower.</li>
+    <li>Press <b>Isolate the leader</b> (a network partition) and advance. The majority side elects a new leader, so briefly <b>two nodes believe they lead</b>. The isolated one cannot reach a majority, so it cannot commit anything.</li>
+    <li>Press <b>Heal the network</b> and advance once: the old leader sees the higher term and steps down. Try crashing 3 nodes: with no majority nobody can win.</li>
+  </ol>
+  <div class="pg le" data-le>
+    <div class="pg-row">
+      <button class="btn pg-primary" type="button" data-tick>Advance 1 tick</button>
+      <button class="btn" type="button" data-tick5>Advance 5 ticks</button>
+      <button class="btn" type="button" data-crash>Crash the leader</button>
+      <button class="btn" type="button" data-isolate>Isolate the leader</button>
+      <button class="btn" type="button" data-heal>Heal the network</button>
+      <button class="btn" type="button" data-recover>Recover all nodes</button>
+      <button class="btn" type="button" data-crashf>Crash a follower</button>
+      <button class="btn" type="button" data-reset>Reset</button>
+    </div>
+    <div class="pg-grid" data-nodes></div>
+    <p class="pg-out" data-verdict aria-live="polite"></p>
+    <ol class="pg-log" data-log aria-label="What happened"></ol>
+  </div>
+</PlaygroundShell>
+<script>
+  interface Node { up: boolean; group: number; role: 'leader' | 'follower' | 'candidate'; term: number; votedFor: number | null; heard: number }
+  const TIMEOUTS = [4, 6, 5, 7, 8]; const N = 5; const MAJ = 3;
+  document.querySelectorAll<HTMLElement>('[data-le]').forEach((root) => {
+    const q = <T extends HTMLElement>(s: string) => root.querySelector<T>(s)!;
+    let nodes: Node[] = []; let tick = 0; let log: string[] = [];
+    const LOG = 8; const rows: HTMLElement[] = [];
+    for (let i = 0; i < LOG; i++) { const li = document.createElement('li'); li.hidden = true; q('[data-log]').appendChild(li); rows.push(li); }
+    const cards = TIMEOUTS.map((_, i) => { const b = document.createElement('div'); b.className = 'pg-box'; b.innerHTML = '<h3></h3><span class="pg-mono"></span><span class="pg-note"></span>'; b.querySelector('h3')!.textContent = `Node ${i + 1}`; q('[data-nodes]').appendChild(b); return { b, a: b.querySelector<HTMLElement>('.pg-mono')!, n: b.querySelector<HTMLElement>('.pg-note')! }; });
+    const say = (t: string) => { log.push(`tick ${tick}: ${t}`); if (log.length > LOG) log.shift(); };
+    function reset() { nodes = TIMEOUTS.map((_, i) => ({ up: true, group: 0, role: i === 0 ? 'leader' : 'follower', term: 1, votedFor: i === 0 ? 0 : 0, heard: 0 })); tick = 0; log = []; say('Node 1 is the leader of term 1'); draw(); }
+    const reach = (i: number) => nodes.filter((n, j) => n.up && n.group === nodes[i].group && j !== i);
+    function step() {
+      tick++;
+      nodes.forEach((n, i) => {
+        if (!n.up || n.role !== 'leader') return;
+        let steppedDown = false;
+        reach(i).forEach((m) => {
+          if (steppedDown) return;
+          if (m.term > n.term) { n.term = m.term; n.role = 'follower'; steppedDown = true; say(`Node ${i + 1} sees term ${m.term} and steps down`); return; }
+          m.heard = 0; if (m.term < n.term) { m.term = n.term; m.votedFor = null; }
+          if (m.role !== 'follower') { m.role = 'follower'; }
+        });
+      });
+      nodes.forEach((n, i) => {
+        if (!n.up || n.role === 'leader') return;
+        n.heard++;
+        if (n.heard < TIMEOUTS[i]) return;
+        n.role = 'candidate'; n.term++; n.votedFor = i; n.heard = 0; let votes = 1;
+        say(`Node ${i + 1} times out and becomes a candidate for term ${n.term}`);
+        reach(i).forEach((m) => { if (m.term < n.term) { m.term = n.term; m.votedFor = i; m.heard = 0; if (m.role !== 'follower') m.role = 'follower'; votes++; } });
+        if (votes >= MAJ) { n.role = 'leader'; say(`Node ${i + 1} got ${votes} of ${N} votes and is the leader of term ${n.term}`); } else say(`Node ${i + 1} got only ${votes} of ${N} votes: no majority, it will try again later`);
+      });
+      draw();
+    }
+    function draw() {
+      nodes.forEach((n, i) => {
+        const c = cards[i]; const leaderReach = n.role === 'leader' ? 1 + reach(i).length : 0;
+        c.a.textContent = !n.up ? 'DOWN' : `${n.role}, term ${n.term}`;
+        c.n.textContent = !n.up ? 'crashed' : n.role === 'leader' ? (leaderReach >= MAJ ? `reaches ${leaderReach} of ${N}: can commit writes` : `reaches only ${leaderReach} of ${N}: cannot commit writes`) : n.group ? 'on the isolated side' : `time since heartbeat: ${n.heard}`;
+        c.b.style.setProperty('--c', !n.up ? 'var(--border)' : n.role === 'leader' ? 'var(--role-2)' : n.role === 'candidate' ? 'var(--role-3)' : 'var(--role-1)'); c.b.classList.toggle('off', !n.up);
+      });
+      const leaders = nodes.map((n, i) => ({ n, i })).filter((x) => x.n.up && x.n.role === 'leader');
+      const out = q('[data-verdict]'); const live = leaders.filter((x) => 1 + reach(x.i).length >= MAJ);
+      const bad = leaders.length !== 1 || live.length !== 1;
+      out.classList.toggle('bad', bad);
+      out.textContent = leaders.length === 0 ? 'No leader right now: writes wait until an election succeeds.' : leaders.length > 1 ? `${leaders.length} nodes believe they are leader, but only ${live.length ? `node ${live[0].i + 1}` : 'none'} can reach a majority, so only it can commit writes.` : live.length === 0 ? 'The only leader cannot reach a majority: it cannot commit writes.' : `Node ${leaders[0].i + 1} is the one leader, term ${leaders[0].n.term}.`;
+      rows.forEach((li, i) => { li.hidden = log[i] === undefined; if (log[i] !== undefined) li.textContent = log[i]; });
+    }
+    q('[data-tick]').addEventListener('click', step);
+    q('[data-tick5]').addEventListener('click', () => { for (let i = 0; i < 5; i++) step(); });
+    q('[data-crash]').addEventListener('click', () => { const i = nodes.findIndex((n) => n.up && n.role === 'leader'); if (i >= 0) { nodes[i].up = false; say(`Node ${i + 1} (leader) crashes`); draw(); } });
+    q('[data-crashf]').addEventListener('click', () => { const i = nodes.findIndex((n) => n.up && n.role !== 'leader'); if (i >= 0) { nodes[i].up = false; say(`Node ${i + 1} crashes`); draw(); } });
+    q('[data-isolate]').addEventListener('click', () => { const i = nodes.findIndex((n) => n.up && n.role === 'leader'); if (i >= 0) { nodes[i].group = 1; say(`Node ${i + 1} is cut off from the others`); draw(); } });
+    q('[data-heal]').addEventListener('click', () => { nodes.forEach((n) => (n.group = 0)); say('The network is healed'); draw(); });
+    q('[data-recover]').addEventListener('click', () => { nodes.forEach((n, i) => { if (!n.up) { n.up = true; n.role = 'follower'; n.heard = 0; say(`Node ${i + 1} restarts as a follower`); } }); draw(); });
+    q('[data-reset]').addEventListener('click', reset);
+    reset();
+  });
+</script>

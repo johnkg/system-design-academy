@@ -1,0 +1,175 @@
+{
+  "name": "Design a Chat System",
+  "difficulty": "advanced",
+  "intent": "Deliver messages between people in real time, in the right order and exactly once, to phones that come and go, and to groups of every size.",
+  "codeTitle": "ordering and de-duplicating messages",
+  "finalIntro": "One message from Alice to Bob, including delivery, a receipt, and what happens when Bob is offline.",
+  "prompt": "Design a chat service like WhatsApp or Slack. People send one-to-one and group messages, see them arrive instantly, read their history on any device, and see when messages are delivered and read.",
+  "functional": [
+    "Send and receive one-to-one and group messages in real time",
+    "Keep history, and show it on every device the person uses",
+    "Show sent, delivered and read receipts",
+    "Show whether a contact is online or when they were last seen",
+    "Notify people who are offline with a push notification"
+  ],
+  "nonFunctional": [
+    "Low latency: a message reaches an online recipient in well under a second",
+    "Never lose a message once it is acknowledged, and never show it twice",
+    "Messages in a conversation appear in the same order for everyone",
+    "Handle millions of simultaneous connections that stay open for hours",
+    "Stay available when servers fail, and recover without losing messages",
+    "Groups range from 3 people to thousands"
+  ],
+  "firstAttempt": {
+    "text": "One web server and one database. To send, the client posts the message to an HTTP API, which stores it with a timestamp. To receive, every client asks the server 'anything new?' every couple of seconds. It is easy to build and fine for a demo.",
+    "limits": [
+      "Almost every poll returns nothing, but every poll costs a request, so cost grows with users, not with messages",
+      "Messages arrive up to one polling interval late, which feels broken for a conversation",
+      "Ordering by device timestamp breaks when phone clocks disagree",
+      "A retry after a lost response stores the message twice",
+      "Offline users get nothing, and there is no notion of a user reachable on several devices"
+    ]
+  },
+  "nodes": [
+    { "id": "clients", "label": "Phones and browsers", "kind": "client", "x": 12, "y": 50 },
+    { "id": "single", "label": "Web server + database", "kind": "compute", "x": 50, "y": 50, "at": 0, "until": 1 },
+    { "id": "chat", "label": "Chat servers", "kind": "edge", "x": 37, "y": 50, "at": 1 },
+    { "id": "store", "label": "Message store", "kind": "data", "x": 87, "y": 50, "at": 1, "until": 6 },
+    { "id": "shards", "label": "Message store shards", "kind": "data", "x": 87, "y": 50, "at": 6 },
+    { "id": "registry", "label": "Who is on which server", "kind": "data", "x": 37, "y": 16, "at": 3 },
+    { "id": "bus", "label": "Pub/sub bus", "kind": "async", "x": 62, "y": 34, "at": 3 },
+    { "id": "inbox", "label": "Offline inbox", "kind": "async", "x": 62, "y": 84, "at": 4 },
+    { "id": "push", "label": "Push provider", "kind": "external", "x": 87, "y": 84, "at": 4 },
+    { "id": "fanout", "label": "Group fan-out", "kind": "compute", "x": 62, "y": 14, "at": 5 },
+    { "id": "presence", "label": "Presence", "kind": "data", "x": 12, "y": 84, "at": 7 }
+  ],
+  "edges": [
+    { "from": "clients", "to": "single", "at": 0, "until": 1 },
+    { "from": "clients", "to": "chat", "at": 1 },
+    { "from": "chat", "to": "store", "at": 1, "until": 6 },
+    { "from": "chat", "to": "shards", "at": 6 },
+    { "from": "chat", "to": "registry", "at": 3 },
+    { "from": "chat", "to": "bus", "at": 3 },
+    { "from": "chat", "to": "inbox", "at": 4 },
+    { "from": "inbox", "to": "push", "at": 4 },
+    { "from": "chat", "to": "fanout", "at": 5 },
+    { "from": "fanout", "to": "bus", "at": 5 },
+    { "from": "chat", "to": "presence", "at": 7 }
+  ],
+  "steps": [
+    {
+      "title": "Keep connections open instead of polling",
+      "problem": "Polling wastes almost all of its requests and still delivers messages late.",
+      "fix": "Each client opens one long-lived WebSocket connection to a chat server. The server pushes a message the instant it arrives, and clients send over the same connection. A load balancer spreads new connections over many chat servers, and a reconnecting client lands on any healthy one.",
+      "tradeoff": "Messages arrive immediately and idle users cost almost nothing. Servers now hold state (open connections), so capacity is counted in connections, and a server restart disconnects thousands of people at once.",
+      "concepts": [{ "slug": "load-balancing" }, { "slug": "horizontal-vs-vertical-scaling" }]
+    },
+    {
+      "title": "Number messages on the server and de-duplicate",
+      "problem": "Device clocks disagree, so timestamps give inconsistent order, and a retry after a lost acknowledgement stores a message twice.",
+      "fix": "The server assigns each message the next sequence number within its conversation when it stores it, and that number defines the order for everyone. The client gives each message a unique id, and the server ignores an id it has already stored. The acknowledgement is sent only after the message is safely stored.",
+      "tradeoff": "One agreed order and no duplicates, and clients can ask 'give me everything after number 57'. A conversation's messages must go through a single writer to be numbered, which limits how that conversation can be spread.",
+      "concepts": [{ "slug": "idempotency" }, { "slug": "consistency-models" }]
+    },
+    {
+      "title": "Route messages between chat servers",
+      "problem": "Alice and Bob are connected to different chat servers, and Alice's server does not know where Bob is.",
+      "fix": "A registry (a fast in-memory store) records which server each user's connection is on, with a short expiry that heartbeats keep alive. After storing a message, the sender's server looks up the recipient's server and publishes the message to it through a pub/sub bus. That server pushes it down the recipient's connection.",
+      "tradeoff": "Any server can reach any user. The registry is hot, frequently changing data that can be briefly wrong, so delivery must tolerate a miss by falling back to the stored message.",
+      "concepts": [{ "slug": "pub-sub" }, { "slug": "caching" }]
+    },
+    {
+      "title": "Deliver to offline users with an inbox and push notifications",
+      "problem": "Recipients are often offline, and a phone with no connection cannot be pushed to over a WebSocket.",
+      "fix": "If the registry says the recipient is offline, the message is already in the store, so the server also queues a notification in the recipient's offline inbox and a worker sends a push notification through the phone vendor's service. When the app opens, it syncs everything after its last sequence number.",
+      "tradeoff": "No message is lost while a phone is off, and the notification is only a nudge, since the store is the source of truth. Push providers are slow and unreliable, and notifications for a message already read must not still be sent.",
+      "concepts": [{ "slug": "message-queues" }, { "slug": "transactional-outbox" }]
+    },
+    {
+      "title": "Fan out group messages with workers",
+      "problem": "A message to a group of 500 means 500 deliveries, and doing them inside the sender's request is slow and spiky.",
+      "fix": "The message is stored once for the group. A fan-out worker then looks up the members and publishes one delivery per member in batches. For very large groups, members who are online get a push, and the rest pull the group's log when they open it.",
+      "tradeoff": "The sender gets a fast acknowledgement and delivery load is smoothed out. Delivery to members now finishes at slightly different times, and big groups need limits to protect the system.",
+      "concepts": [{ "slug": "pub-sub" }, { "slug": "backpressure" }, { "slug": "message-queues" }]
+    },
+    {
+      "title": "Shard the message store by conversation",
+      "problem": "Billions of messages per day outgrow one database, and every read and write goes through it.",
+      "fix": "Partition messages by conversation id, so one conversation always lives on one shard and its sequence numbers stay simple. Use a store designed for this access pattern (append, read the latest, read a range), such as a wide-column database, and use consistent hashing to place conversations.",
+      "tradeoff": "Storage and write capacity scale out, and reading recent history stays a single-shard lookup. Searching across all of a user's conversations needs a separate index, and very hot conversations can overload one shard.",
+      "concepts": [{ "slug": "database-sharding" }, { "slug": "consistent-hashing" }, { "slug": "sql-vs-nosql" }]
+    },
+    {
+      "title": "Track presence with heartbeats, and only for people who care",
+      "problem": "Online and last-seen status changes constantly, and telling every contact each time would swamp the system.",
+      "fix": "Connected clients send a heartbeat every few seconds that refreshes a key with a short expiry. If it lapses, the user counts as offline and 'last seen' is recorded. Presence is sent only to contacts who currently have that chat open, not to everyone who has the user in their list.",
+      "tradeoff": "Cheap and self-healing: a crashed phone goes offline by itself after the expiry. Status is approximate by a few seconds, which is acceptable for presence but not for messages.",
+      "concepts": [{ "slug": "caching" }, { "slug": "pub-sub" }, { "slug": "rate-limiting" }]
+    }
+  ],
+  "failures": [
+    {
+      "scenario": "A chat server crashes and 100,000 users are disconnected",
+      "impact": "Every one of those clients tries to reconnect at once, which can overload the remaining servers (a thundering herd).",
+      "answer": "Clients reconnect with exponential backoff and jitter through the load balancer. On reconnect each asks the server for everything after its last sequence number, and nothing is lost because a message is stored before it is acknowledged.",
+      "concepts": [{ "slug": "retries-and-backoff" }, { "slug": "load-balancing" }, { "slug": "idempotency" }]
+    },
+    {
+      "scenario": "The push notification provider is down",
+      "impact": "Offline users get no notification, though their messages are safe in the store.",
+      "answer": "A circuit breaker stops calls to the provider, notifications wait in the inbox queue and are retried later, and messages show up when users next open the app. Switching to a backup provider is also possible.",
+      "concepts": [{ "slug": "circuit-breaker" }, { "slug": "message-queues" }]
+    },
+    {
+      "scenario": "A group with 10,000 members gets a burst of messages",
+      "impact": "Each message turns into 10,000 deliveries, and a busy group could flood the bus and the connection servers.",
+      "answer": "Fan-out is queued and processed at a controlled rate, very large groups switch to members pulling the log, and per-user and per-group rate limits keep one conversation from starving the rest.",
+      "concepts": [{ "slug": "backpressure" }, { "slug": "rate-limiting" }, { "slug": "bulkhead" }]
+    }
+  ],
+  "alternatives": [
+    {
+      "title": "How the client gets messages",
+      "options": [
+        { "name": "Short polling", "pro": "Simplest, works everywhere", "con": "Late messages and mostly empty requests" },
+        { "name": "Long polling", "pro": "Near-real-time over plain HTTP, easy through proxies", "con": "A request cycle per message and awkward at scale" },
+        { "name": "WebSocket", "pro": "Two-way, low latency, little overhead per message", "con": "Stateful servers and harder load balancing" },
+        { "name": "Server-sent events", "pro": "Simple one-way push over HTTP", "con": "Client to server still needs separate requests" }
+      ],
+      "pick": "WebSockets for a chat product. Fall back to long polling where connections are blocked."
+    },
+    {
+      "title": "How to order messages",
+      "options": [
+        { "name": "Device timestamps", "pro": "No server coordination", "con": "Clock skew and edits scramble the order" },
+        { "name": "A global increasing id", "pro": "Total order across everything", "con": "A single bottleneck, or complex distributed id generation, for an order nobody needs" },
+        { "name": "A sequence number per conversation", "pro": "Everyone in a conversation sees the same order, and it scales by conversation", "con": "No order across different conversations, which is fine" }
+      ],
+      "pick": "A per-conversation sequence assigned by the server when it stores the message."
+    },
+    {
+      "title": "Group fan-out",
+      "options": [
+        { "name": "Fan-out on write", "pro": "Reading is a quick lookup of your own inbox", "con": "A message to a huge group means a huge burst of writes" },
+        { "name": "Fan-out on read", "pro": "One write per message, whatever the group size", "con": "Each member must read the group's log, which costs more on open" }
+      ],
+      "pick": "A hybrid: fan-out on write for ordinary groups, and read-based for very large ones."
+    },
+    {
+      "title": "Encryption",
+      "options": [
+        { "name": "Encryption in transit and at rest", "pro": "Server can search, moderate and back up messages", "con": "The operator and anyone who breaches the servers can read them" },
+        { "name": "End-to-end encryption", "pro": "Only the participants can read messages", "con": "No server-side search, harder multi-device sync and group key management" }
+      ],
+      "pick": "Always encrypt in transit and at rest. Choose end-to-end if privacy is the product, and accept the loss of server-side features."
+    }
+  ],
+  "roles": [
+    { "id": "client", "label": "Client", "description": "A phone or browser with an open connection." },
+    { "id": "edge", "label": "Connection layer", "description": "Chat servers holding the open connections." },
+    { "id": "async", "label": "Messaging", "description": "The bus and offline inbox that move messages between servers." },
+    { "id": "compute", "label": "Workers", "description": "Servers that do the work for a request." },
+    { "id": "data", "label": "State", "description": "Message store, routing registry and presence." },
+    { "id": "external", "label": "Provider", "description": "The phone vendors' push notification services." }
+  ]
+}

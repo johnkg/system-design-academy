@@ -1,0 +1,79 @@
+---
+import PlaygroundShell from '../components/PlaygroundShell.astro';
+---
+<PlaygroundShell title="Simulate it" hint="Send requests through a gateway pipeline. Switch stages on and off and see what reaches the services.">
+  <ol class="how">
+    <li>Send <b>GET /orders</b>: it passes authentication, the rate limit and routing, and reaches the order service.</li>
+    <li>Send <b>Request with a bad token</b>: the gateway stops it at the first stage, and no service is touched. Untick <b>Check tokens</b> and it gets all the way through.</li>
+    <li>Press <b>15 quick requests</b>: the rate limit (10 per 10 seconds) rejects the rest. Press <b>Make payments slow</b>, then <b>POST /pay</b> a few times: a circuit breaker opens, so callers get a fast error and other routes still work.</li>
+  </ol>
+  <div class="pg gw" data-gw>
+    <div class="pg-row">
+      <label class="gw-check"><input type="checkbox" checked data-auth /> Check tokens</label>
+      <label class="gw-check"><input type="checkbox" checked data-limit /> Rate limit (10 per 10 s)</label>
+      <label class="gw-check"><input type="checkbox" checked data-cache /> Cache GET responses (5 s)</label>
+      <label class="gw-check"><input type="checkbox" checked data-breaker /> Circuit breaker on payments</label>
+    </div>
+    <div class="pg-row">
+      <button class="btn pg-primary" type="button" data-send="orders">GET /orders</button>
+      <button class="btn" type="button" data-send="users">GET /users/7</button>
+      <button class="btn" type="button" data-send="pay">POST /pay</button>
+      <button class="btn" type="button" data-send="bad">Request with a bad token</button>
+      <button class="btn" type="button" data-burst>15 quick requests</button>
+      <button class="btn" type="button" data-slow aria-pressed="false">Make payments slow</button>
+      <button class="btn" type="button" data-reset>Reset</button>
+    </div>
+    <div class="pg-grid" data-stages></div>
+    <p class="pg-out" data-res aria-live="polite">No request yet.</p>
+    <p class="pg-mono" data-stats></p>
+  </div>
+</PlaygroundShell>
+<script>
+  const stageNames = ['Authenticate', 'Rate limit', 'Cache', 'Route and call'];
+  document.querySelectorAll<HTMLElement>('[data-gw]').forEach((root) => {
+    const q = <T extends HTMLElement>(s: string) => root.querySelector<T>(s)!;
+    const on = (s: string) => q<HTMLInputElement>(s).checked;
+    let tokens = 10; let last = performance.now(); let slow = false; let payFails = 0; let breakerUntil = 0;
+    const cache = new Map<string, number>(); const c = { total: 0, reached: 0, cached: 0, auth: 0, limited: 0, shed: 0 };
+    const boxes = stageNames.map((n) => { const b = document.createElement('div'); b.className = 'pg-box off'; b.innerHTML = '<h3></h3><span class="pg-mono"></span>'; b.querySelector('h3')!.textContent = n; q('[data-stages]').appendChild(b); return { b, s: b.querySelector<HTMLElement>('span')! }; });
+    function show(i: number, text: string, state: 'pass' | 'block' | 'skip') {
+      const { b, s } = boxes[i]; s.textContent = text; b.classList.toggle('off', state === 'skip'); b.style.setProperty('--c', state === 'block' ? 'var(--bad)' : state === 'pass' ? 'var(--role-2)' : 'var(--border)');
+    }
+    function send(kind: string, quiet = false): string {
+      const now = performance.now(); c.total++;
+      boxes.forEach((_, i) => show(i, 'not reached', 'skip'));
+      let res = '';
+      const done = (text: string) => { res = text; if (!quiet) { q('[data-res]').textContent = text; q('[data-res]').classList.toggle('bad', !text.startsWith('200')); } draw(); return text; };
+      if (on('[data-auth]')) { if (kind === 'bad') { c.auth++; show(0, 'token rejected', 'block'); return done('401 Unauthorized: stopped at the gateway, no service was touched.'); } show(0, 'token valid', 'pass'); } else show(0, 'skipped (not checked)', 'skip');
+      if (on('[data-limit]')) {
+        tokens = Math.min(10, tokens + ((now - last) / 10000) * 10); last = now;
+        if (tokens < 1) { c.limited++; show(1, 'over the limit', 'block'); return done('429 Too Many Requests: stopped at the gateway.'); }
+        tokens -= 1; show(1, `allowed (${tokens.toFixed(1)} left)`, 'pass');
+      } else show(1, 'skipped', 'skip');
+      const key = kind;
+      if (on('[data-cache]') && kind !== 'pay' && kind !== 'bad') {
+        if ((cache.get(key) ?? 0) > now) { c.cached++; show(2, 'cache hit', 'pass'); return done(`200 OK: ${kind} served from the gateway cache, no service was touched.`); }
+        show(2, 'miss', 'pass');
+      } else show(2, kind === 'pay' ? 'not cacheable (POST)' : 'skipped', 'skip');
+      if (kind === 'pay') {
+        if (on('[data-breaker]') && now < breakerUntil) { c.shed++; show(3, 'breaker open', 'block'); return done('503 Service Unavailable: the breaker failed fast, payments were not called.'); }
+        c.reached++;
+        if (slow) { payFails++; if (on('[data-breaker]') && payFails >= 3) breakerUntil = now + 8000; show(3, 'payments timed out', 'block'); return done('504 Gateway Timeout: the payment service did not answer.'); }
+        payFails = 0; show(3, 'payment service', 'pass'); return done('200 OK: handled by the payment service.');
+      }
+      c.reached++; show(3, kind === 'users' ? 'user service' : kind === 'orders' ? 'order service' : 'a service', 'pass');
+      if (on('[data-cache]')) cache.set(key, now + 5000);
+      return done(`200 OK: handled by the ${kind === 'users' ? 'user' : kind === 'orders' ? 'order' : 'backend'} service.`);
+    }
+    function draw() { q('[data-stats]').textContent = `requests: ${c.total} · reached a service: ${c.reached} · served from cache: ${c.cached} · rejected for the token: ${c.auth} · rate limited: ${c.limited} · failed fast by the breaker: ${c.shed}`; }
+    function reset() { tokens = 10; last = performance.now(); slow = false; payFails = 0; breakerUntil = 0; cache.clear(); Object.keys(c).forEach((k) => ((c as Record<string, number>)[k] = 0)); const b = q('[data-slow]'); b.setAttribute('aria-pressed', 'false'); b.textContent = 'Make payments slow'; boxes.forEach((_, i) => show(i, 'not reached', 'skip')); q('[data-res]').textContent = 'No request yet.'; q('[data-res]').classList.remove('bad'); draw(); }
+    root.querySelectorAll<HTMLElement>('[data-send]').forEach((b) => b.addEventListener('click', () => send(b.dataset.send!)));
+    q('[data-burst]').addEventListener('click', () => { let last = ''; for (let i = 0; i < 15; i++) last = send('users', true); q('[data-res]').textContent = `Last of 15: ${last}`; q('[data-res]').classList.toggle('bad', !last.startsWith('200')); });
+    q('[data-slow]').addEventListener('click', (e) => { slow = !slow; const b = e.currentTarget as HTMLElement; b.setAttribute('aria-pressed', String(slow)); b.textContent = slow ? 'Make payments healthy' : 'Make payments slow'; });
+    q('[data-reset]').addEventListener('click', reset);
+    reset();
+  });
+</script>
+<style is:global>
+  .playground .gw-check { display: inline-flex; align-items: center; gap: 6px; }
+</style>

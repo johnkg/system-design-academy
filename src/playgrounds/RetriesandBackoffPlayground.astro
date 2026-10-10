@@ -1,0 +1,90 @@
+---
+import PlaygroundShell from '../components/PlaygroundShell.astro';
+---
+<PlaygroundShell title="Simulate it" hint="100 clients hit a service that is down for a while, then can handle only a few requests every 100 ms. Each chart shows how many requests arrive over 12 seconds, for four retry strategies.">
+  <ol class="how">
+    <li>Compare the four charts. <b>Retry immediately</b> burns all 8 attempts during the outage and most clients give up. <b>Fixed delay</b> keeps arriving as one big wave.</li>
+    <li><b>Exponential backoff</b> spaces the waves out, but they stay synchronized: every wave is still taller than the service can take. <b>With jitter</b> the requests spread out and nearly everyone gets through.</li>
+    <li>Lengthen the <b>outage</b> or lower the <b>capacity</b> and see which strategies still manage. Press <b>Re-roll jitter</b> to try different random delays.</li>
+  </ol>
+  <div class="pg rb" data-rb>
+    <div class="pg-row">
+      <label>Outage length (s) <input type="range" min="1" max="5" step="0.5" value="2" data-outage /> <b data-outageval>2</b></label>
+      <label>Capacity per 100 ms <input type="range" min="5" max="30" value="15" data-cap /> <b data-capval>15</b></label>
+      <button class="btn" type="button" data-reroll>Re-roll jitter</button>
+    </div>
+    <div data-rows></div>
+    <p class="pg-note">The first bar is every client arriving at once and is cut off to keep the retries readable. Red bars are moments when more requests arrived than the service can handle. The dashed line is its capacity. Each client gives up after 8 attempts.</p>
+  </div>
+</PlaygroundShell>
+<script>
+  const BUCKETS = 120; const CLIENTS = 100; const MAX_ATTEMPTS = 8; const HORIZON = 800;
+  type Strategy = { id: string; label: string; delay: (failures: number, rnd: () => number) => number };
+  const strategies: Strategy[] = [
+    { id: 'none', label: 'Retry immediately', delay: () => 1 },
+    { id: 'fixed', label: 'Fixed delay (500 ms)', delay: () => 5 },
+    { id: 'exp', label: 'Exponential backoff', delay: (f) => Math.max(1, Math.min(50, 2 ** (f - 1))) },
+    { id: 'jitter', label: 'Exponential backoff with jitter', delay: (f, rnd) => Math.max(1, Math.round(rnd() * Math.min(50, 2 ** (f - 1)))) },
+  ];
+  function prng(seed: number) { let s = seed >>> 0; return () => { s = (s + 0x6d2b79f5) >>> 0; let t = s; t = Math.imul(t ^ (t >>> 15), t | 1); t ^= t + Math.imul(t ^ (t >>> 7), t | 61); return ((t ^ (t >>> 14)) >>> 0) / 4294967296; }; }
+
+  document.querySelectorAll<HTMLElement>('[data-rb]').forEach((root) => {
+    const q = <T extends HTMLElement>(s: string) => root.querySelector<T>(s)!;
+    const val = (s: string) => Number(q<HTMLInputElement>(s).value);
+    let seed = 1;
+    const rows = strategies.map((st) => {
+      const wrap = document.createElement('div'); wrap.className = 'rb-row';
+      wrap.innerHTML = '<h3></h3><div class="rb-chart" role="img"><div class="rb-cap"></div></div><p class="pg-mono"></p>';
+      wrap.querySelector('h3')!.textContent = st.label;
+      const chart = wrap.querySelector<HTMLElement>('.rb-chart')!;
+      const bars: HTMLElement[] = [];
+      for (let i = 0; i < BUCKETS; i++) { const b = document.createElement('i'); chart.appendChild(b); bars.push(b); }
+      q('[data-rows]').appendChild(wrap);
+      return { st, chart, bars, cap: wrap.querySelector<HTMLElement>('.rb-cap')!, text: wrap.querySelector<HTMLElement>('p')! };
+    });
+
+    function simulate(st: Strategy, outage: number, cap: number, rnd: () => number) {
+      const load = new Array<number>(HORIZON).fill(0);
+      const arrivals: number[][] = Array.from({ length: HORIZON }, () => []);
+      const failures = new Array<number>(CLIENTS).fill(0);
+      for (let c = 0; c < CLIENTS; c++) arrivals[0].push(c);
+      let ok = 0; let gaveUp = 0; let sent = 0; let doneAt = 0;
+      for (let b = 0; b < HORIZON; b++) {
+        const list = arrivals[b]; load[b] = list.length; sent += list.length;
+        list.sort(() => rnd() - 0.5);
+        list.forEach((c, i) => {
+          if (b >= outage * 10 && i < cap) { ok++; doneAt = b; return; }
+          failures[c]++;
+          if (failures[c] >= MAX_ATTEMPTS) { gaveUp++; return; }
+          const next = b + st.delay(failures[c], rnd);
+          if (next < HORIZON) arrivals[next].push(c); else gaveUp++;
+        });
+      }
+      return { load, ok, gaveUp, sent, doneAt, peak: Math.max(...load.slice(1)) };
+    }
+    function draw() {
+      const outage = val('[data-outage]'); const cap = val('[data-cap]');
+      q('[data-outageval]').textContent = String(outage); q('[data-capval]').textContent = String(cap);
+      const results = rows.map((r, i) => simulate(r.st, outage, cap, prng(seed * 7919 + i)));
+      const scale = Math.max(30, ...results.map((r) => r.peak));
+      rows.forEach((r, i) => {
+        const res = results[i];
+        r.bars.forEach((b, k) => { const n = res.load[k]; b.style.height = `${Math.min(100, (n / scale) * 100)}%`; b.classList.toggle('over', n > cap); });
+        r.cap.style.bottom = `${(cap / scale) * 100}%`;
+        r.text.textContent = `requests sent: ${res.sent} · biggest retry wave: ${res.peak} per 100 ms · succeeded: ${res.ok} · gave up: ${res.gaveUp}${res.ok ? ` · last success at ${(res.doneAt / 10).toFixed(1)} s` : ''}`;
+        r.chart.setAttribute('aria-label', `${r.st.label}: biggest retry wave ${res.peak} requests per 100 ms, ${res.ok} of ${CLIENTS} clients succeeded, ${res.gaveUp} gave up`);
+      });
+    }
+    q('[data-reroll]').addEventListener('click', () => { seed++; draw(); });
+    q('[data-outage]').addEventListener('input', draw); q('[data-cap]').addEventListener('input', draw);
+    draw();
+  });
+</script>
+<style is:global>
+  .playground .rb-row { margin-bottom: 14px; }
+  .playground .rb-row h3 { margin: 0 0 4px; font-size: 1rem; }
+  .playground .rb-chart { position: relative; height: 70px; display: flex; align-items: flex-end; gap: 1px; background: var(--surface-2); border-radius: 6px; padding: 2px; }
+  .playground .rb-chart i { flex: 1 1 0; min-width: 0; background: var(--accent); min-height: 0; }
+  .playground .rb-chart i.over { background: var(--bad); }
+  .playground .rb-cap { position: absolute; left: 0; right: 0; border-top: 2px dashed var(--muted); pointer-events: none; }
+</style>

@@ -1,0 +1,83 @@
+---
+import PlaygroundShell from '../components/PlaygroundShell.astro';
+---
+<PlaygroundShell title="Simulate it" hint="Producers add messages, workers take about 0.7 s to handle one. Tune the workers and the failure rate and watch the backlog.">
+  <ol class="how">
+    <li>With <b>2 workers</b> and about <b>4 messages/s</b>, the queue grows: workers cannot keep up. Add a worker and it drains.</li>
+    <li>Press <b>Burst of 30</b> to simulate a traffic spike. The queue absorbs it and workers catch up.</li>
+    <li>Press <b>Send a poison message</b>: it fails every time, is retried 3 times, and then lands in the <b>dead-letter queue</b>. Raising the <b>failure rate</b> makes ordinary messages retry too.</li>
+  </ol>
+  <div class="pg mq" data-mq>
+    <div class="pg-row">
+      <label>Messages per second <input type="range" min="0" max="12" value="4" data-rate /> <b data-rateval>4</b></label>
+      <label>Workers <input type="range" min="1" max="5" value="2" data-workers /> <b data-workerval>2</b></label>
+      <label>Failure rate <input type="range" min="0" max="50" step="5" value="0" data-fail /> <b data-failval>0%</b></label>
+    </div>
+    <div class="pg-row">
+      <button class="btn pg-primary" type="button" data-burst>Burst of 30 messages</button>
+      <button class="btn" type="button" data-poison>Send a poison message</button>
+      <button class="btn" type="button" data-pause aria-pressed="false">Pause workers</button>
+      <button class="btn" type="button" data-reset>Reset</button>
+    </div>
+    <div class="mq-queue" role="img" aria-label="Queue depth" data-depthbar><div class="mq-fill" data-depthfill></div></div>
+    <p class="pg-mono" data-stats></p>
+    <div class="pg-grid" data-workercards></div>
+  </div>
+</PlaygroundShell>
+<script>
+  interface Msg { id: number; attempts: number; at: number; poison?: boolean }
+  interface Worker { msg: Msg | null; until: number }
+  const WORK_MS = 700; const MAX_ATTEMPTS = 3; const MAX_WORKERS = 5;
+  document.querySelectorAll<HTMLElement>('[data-mq]').forEach((root) => {
+    const q = <T extends HTMLElement>(s: string) => root.querySelector<T>(s)!;
+    let ready: Msg[] = []; let workers: Worker[] = []; let nextId = 1;
+    let processed = 0; let dead = 0; let retries = 0; let waitSum = 0; let paused = false;
+    let produceTimer: number | undefined; let tickTimer: number | undefined; let onScreen = true;
+    const val = (s: string) => Number(q<HTMLInputElement>(s).value);
+    const cards: { box: HTMLElement; title: HTMLElement; body: HTMLElement }[] = [];
+
+    function reset() { ready = []; workers = Array.from({ length: MAX_WORKERS }, () => ({ msg: null, until: 0 })); nextId = 1; processed = 0; dead = 0; retries = 0; waitSum = 0; draw(); }
+    function publish(n = 1, poison = false) { for (let i = 0; i < n; i++) ready.push({ id: nextId++, attempts: 0, at: performance.now(), poison }); }
+    function tick() {
+      const now = performance.now(); const active = val('[data-workers]');
+      workers.forEach((w, i) => {
+        if (i >= active && !w.msg) return;
+        if (w.msg && now >= w.until) {
+          const m = w.msg; w.msg = null;
+          if (m.poison || Math.random() * 100 < val('[data-fail]')) { if (m.attempts >= MAX_ATTEMPTS) dead++; else { retries++; ready.push(m); } }
+          else { processed++; waitSum += now - m.at; }
+        }
+        if (!w.msg && i < active && !paused && ready.length) { const m = ready.shift()!; m.attempts++; w.msg = m; w.until = now + WORK_MS; }
+      });
+      draw();
+    }
+    function draw() {
+      const active = val('[data-workers]');
+      q('[data-rateval]').textContent = String(val('[data-rate]')); q('[data-workerval]').textContent = String(active); q('[data-failval]').textContent = `${val('[data-fail]')}%`;
+      q('[data-depthfill]').style.width = `${Math.min(100, (ready.length / 40) * 100)}%`;
+      q('[data-depthfill]').style.background = ready.length > 20 ? 'var(--bad)' : 'var(--accent)';
+      q('[data-depthbar]').setAttribute('aria-label', `Queue depth ${ready.length}`);
+      q('[data-stats]').textContent = `waiting in queue: ${ready.length} · processed: ${processed}${processed ? ` (average wait ${Math.round(waitSum / processed)} ms)` : ''} · retries: ${retries} · dead-lettered: ${dead} · capacity ≈ ${(active / (WORK_MS / 1000)).toFixed(1)} msg/s`;
+      workers.forEach((w, i) => { const c = cards[i]; c.box.hidden = i >= active; c.box.classList.toggle('off', !w.msg); c.body.textContent = w.msg ? `handling message #${w.msg.id}${w.msg.poison ? ' (poison)' : ''} (attempt ${w.msg.attempts})` : paused ? 'paused' : 'idle'; });
+    }
+    function clock() {
+      window.clearInterval(tickTimer); window.clearInterval(produceTimer); tickTimer = produceTimer = undefined;
+      if (!onScreen || document.hidden) return;
+      tickTimer = window.setInterval(tick, 100);
+      const rate = val('[data-rate]'); if (rate > 0) produceTimer = window.setInterval(() => publish(1), 1000 / rate);
+    }
+    for (let i = 0; i < MAX_WORKERS; i++) { const box = document.createElement('div'); box.className = 'pg-box'; box.style.setProperty('--c', 'var(--role-3)'); box.innerHTML = '<h3></h3><span class="pg-mono"></span>'; box.querySelector('h3')!.textContent = `Worker ${i + 1}`; q('[data-workercards]').appendChild(box); cards.push({ box, title: box.querySelector('h3')!, body: box.querySelector('span')! }); }
+    q('[data-burst]').addEventListener('click', () => { publish(30); draw(); });
+    q('[data-poison]').addEventListener('click', () => { ready.unshift({ id: nextId++, attempts: 0, at: performance.now(), poison: true }); draw(); });
+    q('[data-pause]').addEventListener('click', (e) => { paused = !paused; const b = e.currentTarget as HTMLElement; b.setAttribute('aria-pressed', String(paused)); b.textContent = paused ? 'Resume workers' : 'Pause workers'; draw(); });
+    q('[data-reset]').addEventListener('click', reset);
+    q('[data-rate]').addEventListener('input', () => { clock(); draw(); }); q('[data-workers]').addEventListener('input', draw); q('[data-fail]').addEventListener('input', draw);
+    new IntersectionObserver(([en]) => { onScreen = en.isIntersecting; clock(); }).observe(root);
+    document.addEventListener('visibilitychange', clock);
+    reset(); clock();
+  });
+</script>
+<style is:global>
+  .playground .mq-queue { height: 20px; border-radius: 99px; background: var(--surface-2); overflow: hidden; }
+  .playground .mq-fill { height: 100%; width: 0; border-radius: 99px; transition: width .12s linear, background .2s; }
+</style>

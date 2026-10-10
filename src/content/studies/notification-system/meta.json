@@ -1,0 +1,435 @@
+{
+  "name": "Design a Notification System",
+  "difficulty": "intermediate",
+  "intent": "Deliver push, SMS and email notifications to millions of people reliably, once each, even when providers are slow, flaky or rate-limited.",
+  "codeTitle": "retries and idempotent sending",
+  "finalIntro": "One notification through everything built above, including a failed attempt and a retry.",
+  "prompt": "Design a notification system. Other services (orders, social, security) trigger notifications such as 'your order shipped' or a login code, and marketing sometimes sends one message to millions of users. Messages go out as push, SMS and email through third-party providers.",
+  "functional": [
+    "Send notifications over push, SMS and email",
+    "Respect each user's preferences, opt-outs and quiet hours",
+    "Support templates and personalisation",
+    "Support urgent messages (login codes) and bulk campaigns",
+    "Track whether a notification was delivered"
+  ],
+  "nonFunctional": [
+    "Never lose a notification once it was accepted",
+    "Never send the same notification twice",
+    "Urgent messages arrive in seconds, even during a marketing blast",
+    "Survive slow or failing providers without slowing the services that trigger notifications",
+    "Handle bursts of millions of messages, and do not exceed provider rate limits",
+    "Do not spam users: cap how many they receive"
+  ],
+  "firstAttempt": {
+    "text": "Each service calls the email, SMS and push providers directly from its own request handler. When an order ships, the order service calls the email API and waits for the answer. It is quick to build, and it works for a handful of notifications.",
+    "limits": [
+      "A slow provider makes the order service slow, and a provider outage fails the order",
+      "A retry after a timeout can send the same message twice, because the first call may have succeeded",
+      "Every team re-implements providers, templates and opt-outs, and gets them subtly different",
+      "A marketing blast of millions of calls overwhelms the providers and anything sharing the same code",
+      "An urgent login code waits behind everything else"
+    ]
+  },
+  "nodes": [
+    {
+      "id": "src",
+      "label": "Other services",
+      "kind": "client",
+      "x": 12,
+      "y": 50
+    },
+    {
+      "id": "providers",
+      "label": "Email, SMS, push providers",
+      "kind": "external",
+      "x": 87,
+      "y": 16
+    },
+    {
+      "id": "outbox",
+      "label": "Outbox",
+      "kind": "data",
+      "x": 12,
+      "y": 84,
+      "at": 2
+    },
+    {
+      "id": "api",
+      "label": "Notification API",
+      "kind": "edge",
+      "x": 37,
+      "y": 50,
+      "at": 1
+    },
+    {
+      "id": "prefs",
+      "label": "Preferences",
+      "kind": "data",
+      "x": 37,
+      "y": 16,
+      "at": 3
+    },
+    {
+      "id": "limiter",
+      "label": "Per-user caps",
+      "kind": "edge",
+      "x": 37,
+      "y": 84,
+      "at": 7
+    },
+    {
+      "id": "queue",
+      "label": "Queue",
+      "kind": "async",
+      "x": 62,
+      "y": 50,
+      "at": 1,
+      "until": 4
+    },
+    {
+      "id": "qhigh",
+      "label": "Urgent queue",
+      "kind": "async",
+      "x": 62,
+      "y": 28,
+      "at": 4
+    },
+    {
+      "id": "qbulk",
+      "label": "Bulk queue",
+      "kind": "async",
+      "x": 62,
+      "y": 64,
+      "at": 4
+    },
+    {
+      "id": "dlq",
+      "label": "Dead letters",
+      "kind": "async",
+      "x": 62,
+      "y": 88,
+      "at": 5
+    },
+    {
+      "id": "workers",
+      "label": "Sender workers",
+      "kind": "compute",
+      "x": 87,
+      "y": 50,
+      "at": 1
+    },
+    {
+      "id": "sentlog",
+      "label": "Sent log",
+      "kind": "data",
+      "x": 87,
+      "y": 84,
+      "at": 6
+    }
+  ],
+  "edges": [
+    {
+      "from": "src",
+      "to": "providers",
+      "at": 0,
+      "until": 1
+    },
+    {
+      "from": "src",
+      "to": "api",
+      "at": 1
+    },
+    {
+      "from": "src",
+      "to": "outbox",
+      "at": 2
+    },
+    {
+      "from": "outbox",
+      "to": "api",
+      "at": 2
+    },
+    {
+      "from": "api",
+      "to": "prefs",
+      "at": 3
+    },
+    {
+      "from": "api",
+      "to": "limiter",
+      "at": 7
+    },
+    {
+      "from": "api",
+      "to": "queue",
+      "at": 1,
+      "until": 4
+    },
+    {
+      "from": "queue",
+      "to": "workers",
+      "at": 1,
+      "until": 4
+    },
+    {
+      "from": "api",
+      "to": "qhigh",
+      "at": 4
+    },
+    {
+      "from": "api",
+      "to": "qbulk",
+      "at": 4
+    },
+    {
+      "from": "qhigh",
+      "to": "workers",
+      "at": 4
+    },
+    {
+      "from": "qbulk",
+      "to": "workers",
+      "at": 4
+    },
+    {
+      "from": "workers",
+      "to": "providers",
+      "at": 1
+    },
+    {
+      "from": "workers",
+      "to": "dlq",
+      "at": 5
+    },
+    {
+      "from": "workers",
+      "to": "sentlog",
+      "at": 6
+    }
+  ],
+  "steps": [
+    {
+      "title": "Put a queue between the services and the providers",
+      "problem": "Services wait for slow providers, and a provider outage fails the request that triggered the notification.",
+      "fix": "Services send a small request to a notification API, which stores it on a queue and answers at once. Separate sender workers take messages from the queue and call the providers at their own pace.",
+      "tradeoff": "Triggering services stay fast and unaffected by provider trouble, and bursts are absorbed. Delivery is now asynchronous and at least once, so duplicates must be handled later.",
+      "concepts": [
+        {
+          "slug": "message-queues"
+        }
+      ]
+    },
+    {
+      "title": "Hand events over with an outbox",
+      "problem": "If the order service saves the order and then crashes before calling the notification API, the customer is never told. Sending the notification first is no better: it could announce an order that then fails to save.",
+      "fix": "The service writes the notification request into an outbox table in the same database transaction as the order. A relay reads the outbox and sends the request to the notification API, retrying until it is accepted.",
+      "tradeoff": "A change and its notification succeed or fail together. The relay can send a request twice, which the later idempotency step absorbs.",
+      "concepts": [
+        {
+          "slug": "transactional-outbox"
+        }
+      ]
+    },
+    {
+      "title": "Check preferences before sending",
+      "problem": "Users opt out of channels, set quiet hours and expect messages in their language. Without a single place for this, every team handles it differently.",
+      "fix": "The API looks up the user's preferences (channel choice, opt-outs, quiet hours, locale) and fills the template before enqueueing. The lookup is read-heavy and rarely changes, so it is cached.",
+      "tradeoff": "One consistent policy, and cheap lookups. A preference change takes a short time to apply everywhere, so an opt-out should also be checked at send time for the most sensitive channels.",
+      "concepts": [
+        {
+          "slug": "caching"
+        },
+        {
+          "slug": "sql-vs-nosql"
+        }
+      ]
+    },
+    {
+      "title": "Separate queues for urgent and bulk messages",
+      "problem": "A campaign of ten million messages fills the queue, and a login code sent a second later waits behind all of them.",
+      "fix": "Use an urgent queue and a bulk queue, each with its own worker capacity. Login codes and security alerts never share a line with marketing. Bulk sends are throttled to the providers' limits.",
+      "tradeoff": "Urgent messages stay fast during any blast. Capacity is split, so spare bulk workers cannot always help the urgent queue, and each queue needs its own monitoring.",
+      "concepts": [
+        {
+          "slug": "bulkhead"
+        },
+        {
+          "slug": "backpressure"
+        },
+        {
+          "slug": "message-queues"
+        }
+      ]
+    },
+    {
+      "title": "Retry with backoff, trip a breaker, and keep a dead-letter queue",
+      "problem": "Providers return errors, time out and rate-limit. Dropping a message on the first failure loses it, and retrying instantly hammers a provider that is already struggling.",
+      "fix": "Workers retry failures with exponential backoff and jitter, up to a limit. A circuit breaker per provider stops calls while it is down, and can route to a backup provider. Messages that keep failing go to a dead-letter queue for inspection.",
+      "tradeoff": "Temporary failures are invisible to users and a bad message cannot block the line. Latency grows during incidents, and the dead-letter queue needs someone to look at it.",
+      "concepts": [
+        {
+          "slug": "retries-and-backoff"
+        },
+        {
+          "slug": "circuit-breaker"
+        }
+      ]
+    },
+    {
+      "title": "Make sending idempotent",
+      "problem": "A worker can send a message and then crash before acknowledging it, or the provider can deliver but the answer is lost. The queue redelivers, and the user gets the message twice.",
+      "fix": "Give every notification a unique id. Workers record it in a sent log, and pass it to the provider as an idempotency key where supported, so a repeat is recognised and ignored.",
+      "tradeoff": "Users get each message once, even though delivery inside the system is at least once. It costs a lookup per send and storage for the log, which is expired after a few days.",
+      "concepts": [
+        {
+          "slug": "idempotency"
+        }
+      ]
+    },
+    {
+      "title": "Cap how much each user receives",
+      "problem": "Several services can notify the same user within minutes, and too many messages make people turn notifications off or mark them as spam.",
+      "fix": "A per-user rate limit counts notifications by user and channel, for example at most three marketing messages a day. Over-limit messages are dropped or merged into a digest, and urgent categories are exempt.",
+      "tradeoff": "Protects users and the sender's reputation. Someone has to decide the limits and which categories are exempt, and a dropped message is a product decision, not just a technical one.",
+      "concepts": [
+        {
+          "slug": "rate-limiting"
+        }
+      ]
+    }
+  ],
+  "failures": [
+    {
+      "scenario": "The email provider is down for an hour",
+      "impact": "Every email send fails. Without protection, workers would spend the hour retrying and slowing everything.",
+      "answer": "The circuit breaker opens after a few failures, so workers stop calling it. Email messages wait safely on the queue (or flow to a backup provider), and nothing is lost. Alert on queue age, not only on errors.",
+      "concepts": [
+        {
+          "slug": "circuit-breaker"
+        },
+        {
+          "slug": "message-queues"
+        },
+        {
+          "slug": "retries-and-backoff"
+        }
+      ]
+    },
+    {
+      "scenario": "A worker crashes right after the provider accepted a message",
+      "impact": "The message was never acknowledged, so the queue gives it to another worker, and the user would get it twice.",
+      "answer": "The second worker finds the notification id in the sent log, or the provider sees the same idempotency key, and skips the send. The user gets one message.",
+      "concepts": [
+        {
+          "slug": "idempotency"
+        },
+        {
+          "slug": "message-queues"
+        }
+      ]
+    },
+    {
+      "scenario": "Marketing sends to ten million users at once",
+      "impact": "The bulk queue holds millions of messages and the providers start rejecting calls for exceeding their limits.",
+      "answer": "The bulk queue is isolated from the urgent one, so login codes are unaffected. Bulk workers are throttled to the providers' rate limits, and the campaign is expanded to recipients in batches instead of all at once.",
+      "concepts": [
+        {
+          "slug": "bulkhead"
+        },
+        {
+          "slug": "backpressure"
+        },
+        {
+          "slug": "rate-limiting"
+        }
+      ]
+    }
+  ],
+  "alternatives": [
+    {
+      "title": "What delivery guarantee to promise",
+      "options": [
+        {
+          "name": "At most once",
+          "pro": "Never a duplicate",
+          "con": "A crash or failure loses the message"
+        },
+        {
+          "name": "At least once",
+          "pro": "Nothing is lost",
+          "con": "Duplicates happen unless handled"
+        },
+        {
+          "name": "At least once plus idempotent sending",
+          "pro": "Nothing lost, and duplicates are ignored, which behaves like exactly once for the user",
+          "con": "A sent log and idempotency keys to maintain"
+        }
+      ],
+      "pick": "At least once with idempotent sending. True exactly-once delivery across a network and a third-party provider is not something you can promise, but its effect can be achieved."
+    },
+    {
+      "title": "How to expand a campaign to millions of recipients",
+      "options": [
+        {
+          "name": "Create every message up front",
+          "pro": "Simple, and progress is easy to count",
+          "con": "A huge burst of writes and a very long queue before anything sends"
+        },
+        {
+          "name": "Expand in batches as workers go",
+          "pro": "Steady load, and a campaign can be paused or cancelled midway",
+          "con": "Needs a cursor to track progress and care that a retry does not resend a batch"
+        }
+      ],
+      "pick": "Batches: a campaign job reads recipients a few thousand at a time and enqueues them, keeping the queue short and the campaign controllable."
+    },
+    {
+      "title": "One provider or several",
+      "options": [
+        {
+          "name": "A single provider per channel",
+          "pro": "Simplest, and one contract to manage",
+          "con": "Their outage is your outage"
+        },
+        {
+          "name": "A primary and a backup provider",
+          "pro": "The breaker can switch over during an outage",
+          "con": "Two integrations, two sets of delivery quirks, and extra cost"
+        }
+      ],
+      "pick": "A backup provider for SMS and email login codes, where a missed message locks users out. A single provider is fine for low-stakes channels."
+    }
+  ],
+  "roles": [
+    {
+      "id": "client",
+      "label": "Triggering service",
+      "description": "A service that wants a notification sent."
+    },
+    {
+      "id": "edge",
+      "label": "Intake",
+      "description": "Accepts requests and applies policy before queueing."
+    },
+    {
+      "id": "async",
+      "label": "Queues",
+      "description": "Hold messages until a worker is ready."
+    },
+    {
+      "id": "compute",
+      "label": "Workers",
+      "description": "Send messages to providers."
+    },
+    {
+      "id": "data",
+      "label": "State",
+      "description": "Outbox, preferences and the sent log."
+    },
+    {
+      "id": "external",
+      "label": "Provider",
+      "description": "Third-party delivery services."
+    }
+  ]
+}

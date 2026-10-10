@@ -1,0 +1,93 @@
+---
+import PlaygroundShell from '../components/PlaygroundShell.astro';
+---
+<PlaygroundShell title="Simulate it" hint="Write to the primary, read from replicas, and crash the primary to see what failover costs.">
+  <ol class="how">
+    <li>With <b>Async</b> and a high lag, press <b>Write</b>, then immediately read from a <b>replica</b>. You get a stale value.</li>
+    <li>Switch to <b>Sync</b>. Writes now wait for the replicas, so reads are never stale, but each write is slower.</li>
+    <li>In Async, press <b>Write</b> then straight away <b>Crash primary</b>. Writes that had not been copied are lost.</li>
+  </ol>
+  <div class="pg" data-repl>
+    <div class="pg-row">
+      <span role="group" aria-label="Replication mode" class="pg-row">
+        <button class="btn" type="button" data-mode="async" aria-pressed="true">Async</button>
+        <button class="btn" type="button" data-mode="sync" aria-pressed="false">Sync</button>
+      </span>
+      <label>Replication lag <input type="range" min="200" max="3000" step="100" value="1500" data-lag /> <b data-lagval>1.5 s</b></label>
+    </div>
+    <div class="pg-grid" data-nodes></div>
+    <div class="pg-row">
+      <button class="btn pg-primary" type="button" data-write>Write (price + 1)</button>
+      <span class="pg-row" role="group" aria-label="Read from" data-reads></span>
+      <button class="btn" type="button" data-crash>Crash primary</button>
+      <button class="btn" type="button" data-reset>Reset</button>
+    </div>
+    <output class="pg-out" data-out aria-live="polite">Price is 10 on every node.</output>
+  </div>
+</PlaygroundShell>
+<script>
+  interface Node { name: string; role: 'primary' | 'replica'; up: boolean; price: number; version: number }
+  document.querySelectorAll<HTMLElement>('[data-repl]').forEach((root) => {
+    const q = <T extends HTMLElement>(s: string) => root.querySelector<T>(s)!;
+    let nodes: Node[] = []; let sync = false; let acked = 0; let version = 1; let busy = false;
+    let timers: number[] = [];
+    const cards: { box: HTMLElement; title: HTMLElement; body: HTMLElement }[] = [];
+    const lag = () => Number(q<HTMLInputElement>('[data-lag]').value);
+    const primary = () => nodes.find((n) => n.role === 'primary' && n.up);
+    const say = (t: string, bad = false) => { const o = q('[data-out]'); o.textContent = t; o.classList.toggle('bad', bad); };
+
+    function fresh(): Node[] { return [{ name: 'Primary', role: 'primary', up: true, price: 10, version: 1 }, { name: 'Replica 1', role: 'replica', up: true, price: 10, version: 1 }, { name: 'Replica 2', role: 'replica', up: true, price: 10, version: 1 }]; }
+    function reset() { timers.forEach(clearTimeout); timers = []; nodes = fresh(); acked = 1; version = 1; busy = false; draw(); say('Price is 10 on every node.'); }
+
+    function draw() {
+      const top = primary()?.version ?? version;
+      nodes.forEach((n, i) => {
+        const c = cards[i]; c.box.classList.toggle('off', !n.up);
+        c.box.style.setProperty('--c', !n.up ? 'var(--border)' : n.version < top ? 'var(--role-4)' : 'var(--role-3)');
+        c.title.textContent = `${n.role === 'primary' ? 'PRIMARY' : 'Replica'}: ${n.name}${n.up ? '' : ' (down)'}`;
+        c.body.textContent = n.up ? `price ${n.price} · version ${n.version}${n.version < top ? ` · behind by ${top - n.version}` : ''}` : 'unavailable';
+      });
+      q('[data-write]').setAttribute('aria-disabled', String(!primary() || busy));
+      q('[data-crash]').setAttribute('aria-disabled', String(!primary()));
+    }
+    function write() {
+      const p = primary(); if (!p || busy) return;
+      version++; p.price++; p.version = version; const v = version, price = p.price;
+      const followers = nodes.filter((n) => n.role === 'replica' && n.up);
+      const delays = followers.map((_, i) => lag() * (i + 1)); // the second replica is slower
+      followers.forEach((f, i) => { timers.push(window.setTimeout(() => { if (f.version < v) { f.price = price; f.version = v; } draw(); }, delays[i])); });
+      if (sync) {
+        busy = true; say(`Sync write: waiting for replicas to confirm... (about ${Math.max(...delays)} ms)`);
+        timers.push(window.setTimeout(() => { acked = v; busy = false; draw(); say(`Write acknowledged after ${Math.max(...delays)} ms, once every replica had it. Reads are never stale.`); }, Math.max(...delays)));
+      } else { acked = v; say(`Write acknowledged after about 5 ms. Replicas will catch up in ${(delays[0] / 1000).toFixed(1)} s and ${(delays[1] / 1000).toFixed(1)} s.`); }
+      draw();
+    }
+    function read(i: number) {
+      const n = nodes[i]; if (!n.up) { say(`${n.name} is down.`, true); return; }
+      const latest = Math.max(...nodes.filter((x) => x.up).map((x) => x.price));
+      const stale = n.price < latest;
+      say(`Read from ${n.name}: price ${n.price}${stale ? ` (STALE: the primary has ${latest})` : ' (current)'}`, stale);
+    }
+    function crash() {
+      const p = primary(); if (!p) return;
+      // Changes the primary had not yet sent die with it, so cancel anything still in flight.
+      p.up = false; timers.forEach(clearTimeout); timers = []; busy = false;
+      draw(); say('Primary crashed. Failing over in 1 second...', true);
+      window.setTimeout(() => {
+        const best = nodes.filter((n) => n.up).sort((a, b) => b.version - a.version)[0];
+        if (!best) return;
+        best.role = 'primary'; version = best.version;
+        const lost = acked - best.version;
+        busy = false; draw();
+        say(lost > 0 ? `${best.name} was promoted. It was missing ${lost} write(s) the old primary had acknowledged: LOST.` : `${best.name} was promoted with every acknowledged write. Nothing lost.`, lost > 0);
+      }, 1000);
+    }
+    nodes = fresh();
+    nodes.forEach(() => { const box = document.createElement('div'); box.className = 'pg-box'; box.innerHTML = '<h3></h3><span class="pg-mono"></span>'; q('[data-nodes]').appendChild(box); cards.push({ box, title: box.querySelector('h3')!, body: box.querySelector('span')! }); });
+    nodes.forEach((n, i) => { const b = document.createElement('button'); b.type = 'button'; b.className = 'btn'; b.textContent = `Read ${n.name}`; b.addEventListener('click', () => read(i)); q('[data-reads]').appendChild(b); });
+    q('[data-write]').addEventListener('click', write); q('[data-crash]').addEventListener('click', crash); q('[data-reset]').addEventListener('click', reset);
+    q('[data-lag]').addEventListener('input', () => { q('[data-lagval]').textContent = `${(lag() / 1000).toFixed(1)} s`; });
+    root.querySelectorAll<HTMLButtonElement>('[data-mode]').forEach((b) => b.addEventListener('click', () => { sync = b.dataset.mode === 'sync'; root.querySelectorAll('[data-mode]').forEach((o) => o.setAttribute('aria-pressed', String(o === b))); reset(); }));
+    reset();
+  });
+</script>

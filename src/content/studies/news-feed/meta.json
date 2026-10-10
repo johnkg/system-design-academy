@@ -1,0 +1,169 @@
+{
+  "name": "Design a News Feed",
+  "difficulty": "advanced",
+  "intent": "Show every person a fresh, ranked list of posts from the accounts they follow, in a fraction of a second, even when one account has millions of followers.",
+  "codeTitle": "a feed that mixes pushed and pulled posts",
+  "finalIntro": "One post from Priya reaching a follower's feed, then that follower opening the app and scrolling.",
+  "prompt": "Design the home feed of a social network like Instagram or X. People publish posts, follow other accounts, and open the app to see a feed of recent posts from the accounts they follow, newest or most relevant first, with endless scrolling.",
+  "functional": [
+    "Publish a post with text and images",
+    "Follow and unfollow accounts",
+    "Open a home feed made of posts from followed accounts",
+    "Scroll to load older posts without gaps or repeats",
+    "Show likes and comment counts on each post"
+  ],
+  "nonFunctional": [
+    "Opening the feed is fast: the first page appears in well under a second",
+    "Reads far outnumber writes, so reading must be cheap",
+    "A new post shows up in followers' feeds within seconds, not necessarily instantly",
+    "Accounts range from 10 followers to tens of millions",
+    "Stay available when servers fail, and never lose a published post",
+    "Cost per user stays flat as the network grows"
+  ],
+  "firstAttempt": {
+    "text": "One web server and one relational database. To show a feed, the server looks up everyone the user follows, fetches their recent posts with a join, sorts by time and returns the top 20. It is correct and simple, and fine for a few thousand users.",
+    "limits": [
+      "Every feed open runs a heavy query that touches as many accounts as the user follows, and feeds are opened far more often than posts are written",
+      "Response time grows with the number of followed accounts and the size of the posts table",
+      "All traffic hits one database, so a busy hour slows everything down",
+      "Loading page two with an offset skips or repeats posts when new ones arrive",
+      "Nothing is shared between users: a post read by a million followers is looked up a million times"
+    ]
+  },
+  "nodes": [
+    { "id": "clients", "label": "Phones and browsers", "kind": "client", "x": 12, "y": 50 },
+    { "id": "single", "label": "Web server + database", "kind": "compute", "x": 50, "y": 50, "at": 0, "until": 1 },
+    { "id": "api", "label": "Feed API", "kind": "edge", "x": 37, "y": 50, "at": 1 },
+    { "id": "posts", "label": "Posts store", "kind": "data", "x": 62, "y": 84, "at": 1, "until": 6 },
+    { "id": "pshards", "label": "Posts shards", "kind": "data", "x": 62, "y": 84, "at": 6 },
+    { "id": "feeds", "label": "Feed lists", "kind": "data", "x": 87, "y": 50, "at": 1 },
+    { "id": "fanout", "label": "Fan-out workers", "kind": "compute", "x": 62, "y": 16, "at": 1 },
+    { "id": "graph", "label": "Follower graph", "kind": "data", "x": 87, "y": 16, "at": 1 },
+    { "id": "queue", "label": "Fan-out queue", "kind": "async", "x": 37, "y": 16, "at": 2 },
+    { "id": "celeb", "label": "Celebrity posts", "kind": "data", "x": 87, "y": 84, "at": 3 },
+    { "id": "pcache", "label": "Post cache", "kind": "data", "x": 12, "y": 84, "at": 4 },
+    { "id": "ranking", "label": "Ranking", "kind": "compute", "x": 12, "y": 16, "at": 5 }
+  ],
+  "edges": [
+    { "from": "clients", "to": "single", "at": 0, "until": 1 },
+    { "from": "clients", "to": "api", "at": 1 },
+    { "from": "api", "to": "posts", "at": 1, "until": 4 },
+    { "from": "api", "to": "feeds", "at": 1 },
+    { "from": "api", "to": "fanout", "at": 1, "until": 2 },
+    { "from": "fanout", "to": "feeds", "at": 1 },
+    { "from": "fanout", "to": "graph", "at": 1 },
+    { "from": "api", "to": "queue", "at": 2 },
+    { "from": "queue", "to": "fanout", "at": 2 },
+    { "from": "api", "to": "celeb", "at": 3 },
+    { "from": "api", "to": "pcache", "at": 4 },
+    { "from": "pcache", "to": "posts", "at": 4, "until": 6 },
+    { "from": "pcache", "to": "pshards", "at": 6 },
+    { "from": "api", "to": "ranking", "at": 5 }
+  ],
+  "steps": [
+    {
+      "title": "Build each feed ahead of time (fan-out on write)",
+      "problem": "Building a feed when it is opened is slow, and feeds are opened far more often than posts are written.",
+      "fix": "When someone publishes, store the post once, then workers look up the author's followers and add the post id to each follower's precomputed feed list, held in a fast in-memory store. Opening the feed is then one cheap read of a list.",
+      "tradeoff": "Reads become fast and flat in cost, whatever the user follows. Each post now causes one write per follower, so work moves from read time to write time, and feed lists cost memory for every active user.",
+      "concepts": [{ "slug": "caching" }, { "slug": "pub-sub" }]
+    },
+    {
+      "title": "Do the fan-out in the background through a queue",
+      "problem": "Writing to thousands of feed lists inside the publish request makes posting slow and lets a burst of posts overload the feed store.",
+      "fix": "The API saves the post, puts a small job on a queue and acknowledges right away. Fan-out workers consume jobs at their own pace, and more workers can be added when the queue grows.",
+      "tradeoff": "Publishing stays fast and spikes are absorbed by the queue. Followers see the post a few seconds later, so the feed is eventually consistent, and workers must handle a job being delivered twice.",
+      "concepts": [{ "slug": "message-queues" }, { "slug": "backpressure" }, { "slug": "idempotency" }]
+    },
+    {
+      "title": "Handle accounts with millions of followers differently",
+      "problem": "One post from an account with 20 million followers means 20 million list writes, which takes minutes and swamps the workers.",
+      "fix": "Skip fan-out for accounts above a follower threshold. Their posts stay in their own list. When a user opens the feed, the API merges the precomputed list with the latest posts of the few popular accounts that user follows, removing duplicates.",
+      "tradeoff": "Posting from huge accounts becomes cheap and fast to reach everyone. Reading costs a little more, since each feed open also pulls from a handful of popular accounts, and two code paths must be kept consistent.",
+      "concepts": [{ "slug": "caching" }, { "slug": "rate-limiting" }]
+    },
+    {
+      "title": "Store ids in the feed and look up post details from a cache",
+      "problem": "Copying the full post into every follower's list wastes memory, and likes and edits would be out of date in millions of copies.",
+      "fix": "Feed lists hold only post ids. To show a page, the API fetches those posts' details, with counts, from a post cache that sits in front of the posts store. A popular post is read from memory once, then shared by everyone.",
+      "tradeoff": "Lists stay small and a post exists in exactly one place, so edits and deletes take effect everywhere. Each page costs one extra batched lookup, and a miss falls through to the posts store.",
+      "concepts": [{ "slug": "caching" }, { "slug": "pagination" }]
+    },
+    {
+      "title": "Rank the candidates instead of sorting by time",
+      "problem": "Newest first buries what people care about under noise from accounts they hardly look at.",
+      "fix": "The API takes a few hundred candidate ids from the feed list and the popular accounts, and a ranking service scores them by recency, closeness to the author, and likely engagement. The top page is returned. Scroll position is tracked with a cursor that identifies the last post shown, not an offset.",
+      "tradeoff": "Feeds feel relevant and keep people engaged. Ranking adds time to every read, so it must be fast and degrade to chronological order when it is slow, and results are harder to explain and test.",
+      "concepts": [{ "slug": "pagination" }, { "slug": "circuit-breaker" }]
+    },
+    {
+      "title": "Shard the posts and feed stores by user",
+      "problem": "Billions of posts and hundreds of millions of feed lists no longer fit on one machine.",
+      "fix": "Partition the posts by author id and the feed lists by the owner's user id, and place them on machines with consistent hashing. Each feed read then touches one shard, and each post lookup is a key lookup on a known shard, with replicas for reads and failover.",
+      "tradeoff": "Storage and throughput scale by adding machines, and a feed open is a handful of single-shard reads. Queries across authors are no longer possible in the database, and one very popular post can still make a shard hot.",
+      "concepts": [{ "slug": "database-sharding" }, { "slug": "consistent-hashing" }, { "slug": "database-replication" }]
+    }
+  ],
+  "failures": [
+    {
+      "scenario": "A big event makes everyone post at once and the fan-out queue grows",
+      "impact": "Followers see new posts minutes late, though nothing is lost.",
+      "answer": "The queue holds the backlog and workers scale out to drain it. Active users' lists are filled first, inactive users are skipped and rebuilt on their next open, and the API keeps accepting posts because it only has to save them and enqueue a job.",
+      "concepts": [{ "slug": "message-queues" }, { "slug": "backpressure" }, { "slug": "horizontal-vs-vertical-scaling" }]
+    },
+    {
+      "scenario": "A feed cache node dies and its users' lists disappear",
+      "impact": "Those users open the app and get an empty or very stale feed.",
+      "answer": "Feed lists are a copy, not the source of truth. On a missing list the API rebuilds it by reading the follower graph and recent posts, and refills the cache. Replicas keep most lists available, and rebuilds are rate limited so a node loss does not overload the posts store.",
+      "concepts": [{ "slug": "caching" }, { "slug": "database-replication" }, { "slug": "rate-limiting" }]
+    },
+    {
+      "scenario": "A celebrity posts and millions open the app within a minute",
+      "impact": "One post and one popular account's list are requested millions of times, which can overload a single cache node.",
+      "answer": "Hot items are replicated across several cache nodes and cached in the API servers' memory for a few seconds. Images are served from a CDN near each user, and the ranking and API layers are isolated so a spike on one path cannot starve the others.",
+      "concepts": [{ "slug": "caching" }, { "slug": "cdn" }, { "slug": "bulkhead" }]
+    }
+  ],
+  "alternatives": [
+    {
+      "title": "When the feed is built",
+      "options": [
+        { "name": "Fan-out on read (pull)", "pro": "Posting is one write, and storage is minimal", "con": "Every feed open gathers posts from every followed account, which is slow and heavy" },
+        { "name": "Fan-out on write (push)", "pro": "Opening the feed is one fast read", "con": "Huge accounts cause enormous bursts of writes, and inactive users still get lists" },
+        { "name": "Hybrid", "pro": "Push for ordinary accounts, pull for very popular ones, so both costs stay bounded", "con": "Two paths to build, test and keep consistent" }
+      ],
+      "pick": "Hybrid, with a follower threshold. Reads dominate, so pay at write time for most accounts."
+    },
+    {
+      "title": "How the feed is ordered",
+      "options": [
+        { "name": "Newest first", "pro": "Predictable, cheap and easy to explain", "con": "Noisy, and people who follow many accounts miss what matters to them" },
+        { "name": "Ranked by relevance", "pro": "Higher engagement and a better first screen", "con": "Extra latency, a model to maintain, and results that differ per user and per refresh" }
+      ],
+      "pick": "Rank a bounded set of candidates, and fall back to newest first when ranking is slow or down."
+    },
+    {
+      "title": "How to page through the feed",
+      "options": [
+        { "name": "Offset and limit", "pro": "Trivial to implement and allows jumping to a page", "con": "New posts shift the pages, so items repeat or vanish, and deep offsets are slow" },
+        { "name": "Cursor (the last item seen)", "pro": "Stable while new posts arrive and fast at any depth", "con": "No jumping to an arbitrary page" }
+      ],
+      "pick": "A cursor, because a feed only moves forward and keeps changing."
+    },
+    {
+      "title": "Where the feed lists live",
+      "options": [
+        { "name": "In-memory store", "pro": "Very fast reads and simple list operations", "con": "Memory is expensive, and a node loss needs a rebuild" },
+        { "name": "Database table or wide-column store", "pro": "Durable and cheaper per entry", "con": "Slower reads that need caching on top" }
+      ],
+      "pick": "Memory for the recent few hundred ids per active user, with older history read from the durable store."
+    }
+  ],
+  "roles": [
+    { "id": "client", "label": "Client", "description": "A phone or browser opening the feed." },
+    { "id": "edge", "label": "Feed API", "description": "The entry point that serves and merges feeds." },
+    { "id": "async", "label": "Messaging", "description": "The queue that carries fan-out jobs." },
+    { "id": "compute", "label": "Workers", "description": "Servers that fan out posts and rank candidates." },
+    { "id": "data", "label": "State", "description": "Posts, feed lists, the follower graph and caches." }
+  ]
+}

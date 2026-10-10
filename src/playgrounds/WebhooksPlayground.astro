@@ -1,0 +1,81 @@
+---
+import PlaygroundShell from '../components/PlaygroundShell.astro';
+---
+<PlaygroundShell title="Try it" hint="A payment provider sends events to a shop. Take the shop's endpoint down, lose replies, and let an attacker post fake events. Time moves only when you press the button.">
+  <ol class="how">
+    <li>Set the endpoint to <b>Down</b>, press <b>Send payment.succeeded</b>, then <b>Advance 5 minutes</b> a few times. Bring it <b>Up</b> and keep advancing until the retry time shown under <b>Provider's events</b>: the retry delivers the event. The wait grows each time (1, 5, 30, 120 minutes).</li>
+    <li>Tick <b>Reply to the provider gets lost</b> and send an event with <b>Dedupe by event id</b> off: the shop processes it, the provider thinks it failed and retries, and the order is <b>paid twice</b>. Turn dedupe on and it is paid once.</li>
+    <li>Press <b>Attacker posts a fake event</b> with <b>Verify the signature</b> off: a fake order gets marked paid. Turn it on and the fake is rejected.</li>
+  </ol>
+  <div class="pg wh" data-wh>
+    <div class="pg-row">
+      <label>Shop endpoint <select class="pg-in" data-endpoint><option value="up" selected>Up</option><option value="down">Down</option></select></label>
+      <label class="wh-check"><input type="checkbox" checked data-verify /> Verify the signature</label>
+      <label class="wh-check"><input type="checkbox" data-dedupe /> Dedupe by event id</label>
+      <label class="wh-check"><input type="checkbox" data-lost /> Reply to the provider gets lost</label>
+    </div>
+    <div class="pg-row">
+      <button class="btn pg-primary" type="button" data-send>Send payment.succeeded</button>
+      <button class="btn" type="button" data-fake>Attacker posts a fake event</button>
+      <button class="btn" type="button" data-advance>Advance 5 minutes</button>
+      <button class="btn" type="button" data-reset>Reset</button>
+    </div>
+    <div class="pg-grid">
+      <div class="pg-box" style="--c: var(--role-3)"><h3>Clock</h3><span class="pg-mono" data-clock></span></div>
+      <div class="pg-box" data-ledgerbox><h3>Orders marked paid</h3><span class="pg-mono" data-ledger></span><span class="pg-note" data-verdict></span></div>
+      <div class="pg-box" style="--c: var(--role-1)"><h3>Provider's events</h3><span class="pg-mono" data-events></span></div>
+    </div>
+    <ol class="pg-log" data-log aria-label="What happened"></ol>
+  </div>
+</PlaygroundShell>
+<script>
+  const SCHEDULE = [1, 5, 30, 120]; // minutes to wait before retry 1, 2, 3, 4
+  interface Ev { id: string; order: string; attempts: number; nextAt: number; state: 'pending' | 'delivered' | 'gave up' }
+  document.querySelectorAll<HTMLElement>('[data-wh]').forEach((root) => {
+    const q = <T extends HTMLElement>(s: string) => root.querySelector<T>(s)!;
+    const on = (s: string) => q<HTMLInputElement>(s).checked;
+    let clock = 0; let n = 0; let events: Ev[] = []; let handled = new Set<string>(); let ledger: Record<string, number> = {}; let fakes = 0; let log: string[] = [];
+    const LOG = 10; const rows: HTMLElement[] = [];
+    for (let i = 0; i < LOG; i++) { const li = document.createElement('li'); li.hidden = true; q('[data-log]').appendChild(li); rows.push(li); }
+    const say = (t: string) => { log.push(`t+${clock} min: ${t}`); if (log.length > LOG) log.shift(); };
+
+    function process(id: string, order: string, forged: boolean): string {
+      if (forged && on('[data-verify]')) { say('endpoint: signature does not match, replied 400 (fake rejected)'); return '400'; }
+      if (on('[data-dedupe]') && handled.has(id)) { say(`endpoint: ${id} was already handled, replied 200 and did nothing`); return '200'; }
+      handled.add(id); ledger[order] = (ledger[order] ?? 0) + 1; if (forged) fakes++;
+      say(`endpoint: ${forged ? 'accepted a FAKE event for' : 'marked paid:'} ${order}${ledger[order] > 1 ? ' (paid again!)' : ''}`);
+      return '200';
+    }
+    function deliver(ev: Ev) {
+      ev.attempts++;
+      if (q<HTMLSelectElement>('[data-endpoint]').value === 'down') { say(`provider: ${ev.id} got no answer (attempt ${ev.attempts})`); fail(ev); return; }
+      process(ev.id, ev.order, false);
+      if (on('[data-lost]')) { say(`provider: never received the reply for ${ev.id}, treats it as failed`); fail(ev); return; }
+      ev.state = 'delivered'; say(`provider: ${ev.id} delivered`);
+    }
+    function fail(ev: Ev) {
+      if (ev.attempts > SCHEDULE.length) { ev.state = 'gave up'; say(`provider: gave up on ${ev.id}`); return; }
+      ev.nextAt = clock + SCHEDULE[ev.attempts - 1]; say(`provider: will retry ${ev.id} at t+${ev.nextAt} min`);
+    }
+    function draw() {
+      q('[data-clock]').textContent = `t + ${clock} min`;
+      const entries = Object.entries(ledger);
+      q('[data-ledger]').textContent = entries.length ? entries.map(([o, c]) => `${o} x${c}`).join(', ') : 'none';
+      const bad = entries.some(([, c]) => c > 1) || fakes > 0;
+      q<HTMLElement>('[data-ledgerbox]').style.setProperty('--c', bad ? 'var(--bad)' : 'var(--role-2)');
+      q<HTMLElement>('[data-verdict]').style.color = bad ? 'var(--bad-text)' : '';
+      q('[data-verdict]').textContent = fakes > 0 ? 'A fake event was accepted' : entries.some(([, c]) => c > 1) ? 'An order was processed twice' : entries.length ? 'Each order paid once' : '';
+      q('[data-events]').textContent = events.length ? events.map((e) => `${e.id}: ${e.state}${e.state === 'pending' && e.attempts ? `, retry at t+${e.nextAt}` : ''}`).join(' | ') : 'none sent';
+      rows.forEach((li, i) => { li.hidden = log[i] === undefined; if (log[i] !== undefined) li.textContent = log[i]; });
+    }
+    q('[data-send]').addEventListener('click', () => { n++; const ev: Ev = { id: `evt_${n}`, order: `order-${n}`, attempts: 0, nextAt: 0, state: 'pending' }; events.push(ev); say(`provider: sends ${ev.id} (payment.succeeded for ${ev.order})`); deliver(ev); draw(); });
+    q('[data-fake]').addEventListener('click', () => { say('attacker: posts a fake payment.succeeded for order-99 with no valid signature'); process('evt_fake', 'order-99', true); draw(); });
+    q('[data-advance]').addEventListener('click', () => { for (let m = 0; m < 5; m++) { clock++; events.filter((e) => e.state === 'pending' && e.nextAt === clock).forEach(deliver); } draw(); });
+    q('[data-reset]').addEventListener('click', () => { clock = 0; n = 0; events = []; handled = new Set(); ledger = {}; fakes = 0; log = []; draw(); });
+    root.addEventListener('change', (e) => { if ((e.target as HTMLElement).matches('select, input')) { /* settings apply to the next delivery */ } });
+    draw();
+  });
+</script>
+<style is:global>
+  .playground .wh-check { display: inline-flex; align-items: center; gap: 6px; }
+</style>

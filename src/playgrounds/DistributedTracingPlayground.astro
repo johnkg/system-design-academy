@@ -1,0 +1,66 @@
+---
+import PlaygroundShell from '../components/PlaygroundShell.astro';
+---
+<PlaygroundShell title="Read the waterfall" hint="One checkout request as a trace. Make one hop slow, change how the order service makes its calls, and read the waterfall.">
+  <ol class="how">
+    <li>With <b>No slow hop</b> the request takes about 200 ms. Pick <b>payment database</b>: its bar grows, and so do the bars of everything above it that is waiting for it.</li>
+    <li>Note that the <b>gateway</b> and <b>orders</b> bars become long too, but their own work is small. The highlighted row shows the span with the most <b>self time</b>, which is the real culprit.</li>
+    <li>Switch the order service to <b>in parallel</b>: the inventory and payment bars overlap, and the total drops. Sequential calls that could run together are easy to spot in a waterfall.</li>
+  </ol>
+  <div class="pg tr" data-tr>
+    <div class="pg-row">
+      <label>Slow hop <select class="pg-in" data-slow><option value="">No slow hop</option><option value="payment">Payment service (own work)</option><option value="paydb" selected>Payment database</option><option value="invdb">Inventory database</option></select></label>
+      <label>Order service calls inventory and payment <select class="pg-in" data-mode><option value="seq" selected>one after another</option><option value="par">in parallel</option></select></label>
+    </div>
+    <div class="tr-axis pg-mono"><span>0 ms</span><span data-total></span></div>
+    <div class="tr-rows" role="img" aria-label="Trace waterfall" data-rows></div>
+    <p class="pg-out" data-verdict aria-live="polite"></p>
+  </div>
+</PlaygroundShell>
+<script>
+  interface Node { id: string; label: string; depth: number; pre: number; post: number; children: string[] }
+  const nodes: Record<string, Node> = {
+    gateway: { id: 'gateway', label: 'gateway', depth: 0, pre: 10, post: 10, children: ['orders'] },
+    orders: { id: 'orders', label: 'orders', depth: 1, pre: 20, post: 30, children: ['inventory', 'payment'] },
+    inventory: { id: 'inventory', label: 'inventory', depth: 2, pre: 15, post: 0, children: ['invdb'] },
+    invdb: { id: 'invdb', label: 'inventory db query', depth: 3, pre: 25, post: 0, children: [] },
+    payment: { id: 'payment', label: 'payment', depth: 2, pre: 40, post: 0, children: ['paydb'] },
+    paydb: { id: 'paydb', label: 'payment db query', depth: 3, pre: 60, post: 0, children: [] },
+  };
+  const order = ['gateway', 'orders', 'inventory', 'invdb', 'payment', 'paydb'];
+  document.querySelectorAll<HTMLElement>('[data-tr]').forEach((root) => {
+    const q = <T extends HTMLElement>(s: string) => root.querySelector<T>(s)!;
+    const rows = order.map((id) => { const row = document.createElement('div'); row.className = 'tr-row'; row.innerHTML = '<span class="tr-name"></span><div class="tr-track"><i></i></div><span class="pg-mono tr-ms"></span>'; const n = nodes[id]; const name = row.querySelector<HTMLElement>('.tr-name')!; name.textContent = n.label; name.style.paddingLeft = `${n.depth * 10}px`; q('[data-rows]').appendChild(row); return { id, row, bar: row.querySelector<HTMLElement>('i')!, ms: row.querySelector<HTMLElement>('.tr-ms')! }; });
+    function draw() {
+      const slow = q<HTMLSelectElement>('[data-slow]').value; const parallel = q<HTMLSelectElement>('[data-mode]').value === 'par';
+      const span: Record<string, { start: number; end: number; self: number }> = {};
+      const own = (id: string) => nodes[id].pre + nodes[id].post + (id === slow ? 1500 : 0);
+      function run(id: string, start: number): number {
+        const n = nodes[id]; let t = start + n.pre + (id === slow ? 1500 : 0); const kids = n.children; let childTotal = 0;
+        if (id === 'orders' && parallel) { const ends = kids.map((k) => run(k, t)); t = Math.max(...ends); } else { for (const k of kids) { t = run(k, t); } }
+        t += n.post; span[id] = { start, end: t, self: own(id) }; childTotal += 0; return t;
+      }
+      const total = run('gateway', 0);
+      q('[data-total]').textContent = `${total} ms`;
+      const busiest = order.reduce((a, b) => (span[b].self > span[a].self ? b : a));
+      rows.forEach((r) => { const s = span[r.id]; r.bar.style.left = `${(s.start / total) * 100}%`; r.bar.style.width = `${Math.max(0.8, ((s.end - s.start) / total) * 100)}%`; r.ms.textContent = `${s.end - s.start} ms`; r.row.classList.toggle('hot', r.id === busiest && span[busiest].self > 100); });
+      q('[data-rows]').setAttribute('aria-label', `Trace waterfall, total ${total} ms: ${order.map((id) => `${nodes[id].label} ${span[id].end - span[id].start} ms`).join(', ')}`);
+      const out = q('[data-verdict]'); const culprit = span[busiest].self > 100;
+      out.classList.toggle('bad', culprit); out.textContent = culprit ? `Total ${total} ms. The most self time is in "${nodes[busiest].label}" (${span[busiest].self} ms): that is where to look.` : `Total ${total} ms. Nothing stands out.`;
+    }
+    root.addEventListener('change', draw);
+    draw();
+  });
+</script>
+<style is:global>
+  .playground .tr-axis { display: flex; justify-content: space-between; margin-left: 150px; font-size: .78rem; color: var(--muted); }
+  .playground .tr-rows { display: grid; gap: 4px; }
+  .playground .tr-row { display: grid; grid-template-columns: 150px 1fr 64px; gap: 8px; align-items: center; font-size: .85rem; }
+  .playground .tr-name { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .playground .tr-track { position: relative; height: 18px; background: var(--surface-2); border-radius: 4px; }
+  .playground .tr-track i { position: absolute; top: 2px; bottom: 2px; background: var(--accent); border-radius: 3px; transition: left .15s, width .15s; }
+  .playground .tr-row.hot .tr-track i { background: var(--bad); }
+  .playground .tr-row.hot .tr-name { font-weight: 700; }
+  .playground .tr-ms { text-align: right; font-size: .78rem; }
+  @media (max-width: 560px) { .playground .tr-row { grid-template-columns: 96px 1fr 52px; } .playground .tr-axis { margin-left: 96px; } }
+</style>
