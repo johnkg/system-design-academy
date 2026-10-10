@@ -1,0 +1,178 @@
+{
+  "name": "Design a Metrics and Monitoring System",
+  "difficulty": "advanced",
+  "intent": "Collect millions of measurements per second from thousands of servers, keep them cheaply for years, draw graphs in a blink, and wake someone up only when something is really wrong.",
+  "codeTitle": "rollups and an alert that has to last",
+  "finalIntro": "One measurement from a server to a graph, and a problem from first sign to a page on someone's phone.",
+  "prompt": "Design a monitoring system like Prometheus or Datadog. Services report numbers such as CPU use, request counts and latency. Engineers look at dashboards, query the history, and get alerted when something breaks.",
+  "functional": [
+    "Collect metrics from thousands of servers and services, with labels such as host, region and endpoint",
+    "Store them as time series and answer queries, such as 'the 99th percentile latency per region over the last 6 hours'",
+    "Draw dashboards that refresh every few seconds",
+    "Evaluate alert rules and notify the right on-call person",
+    "Keep recent data in full detail and older data in summary, for months or years"
+  ],
+  "nonFunctional": [
+    "Ingest millions of data points per second, a write-heavy load that never stops",
+    "Show fresh data: a few seconds from measurement to dashboard",
+    "Alert within a minute of a real problem, and not at all for noise",
+    "Be more reliable than the systems it watches, since it is needed most when they fail",
+    "Keep storage cost under control as data piles up for years",
+    "Protect itself from a sender that creates too many different series"
+  ],
+  "firstAttempt": {
+    "text": "One SQL database with a table metrics(name, labels, timestamp, value). Every service inserts a row for each measurement. Dashboards run SQL queries with a GROUP BY over the table, and a cron script runs a few queries every minute and sends an email when a number is too high.",
+    "limits": [
+      "A row per data point, with its name and labels repeated every time, makes the table enormous",
+      "Millions of inserts per second are far beyond what one database takes",
+      "A dashboard query over days of data scans millions of rows and gets slower every day",
+      "Old data is never removed or summarised, so cost grows without limit",
+      "If the database or the cron script dies, nobody is alerted that nothing is being watched"
+    ]
+  },
+  "nodes": [
+    { "id": "services", "label": "Services and servers", "kind": "client", "x": 12, "y": 50 },
+    { "id": "single", "label": "SQL database + cron", "kind": "compute", "x": 50, "y": 50, "at": 0, "until": 1 },
+    { "id": "agents", "label": "Collector agents", "kind": "edge", "x": 37, "y": 50, "at": 1 },
+    { "id": "queue", "label": "Ingest queue", "kind": "async", "x": 62, "y": 50, "at": 1 },
+    { "id": "sql", "label": "SQL database", "kind": "data", "x": 87, "y": 50, "at": 1, "until": 2 },
+    { "id": "tsdb", "label": "Time-series database", "kind": "data", "x": 87, "y": 50, "at": 2 },
+    { "id": "rollup", "label": "Rollup jobs", "kind": "compute", "x": 62, "y": 84, "at": 3 },
+    { "id": "cold", "label": "Long-term store", "kind": "data", "x": 87, "y": 84, "at": 3 },
+    { "id": "dash", "label": "Dashboards", "kind": "client", "x": 12, "y": 16, "at": 4 },
+    { "id": "query", "label": "Query service + cache", "kind": "compute", "x": 62, "y": 16, "at": 4 },
+    { "id": "rules", "label": "Alert rule evaluator", "kind": "compute", "x": 87, "y": 16, "at": 5 },
+    { "id": "alertmgr", "label": "Alert manager", "kind": "edge", "x": 37, "y": 16, "at": 5 },
+    { "id": "oncall", "label": "On-call phone", "kind": "client", "x": 12, "y": 84, "at": 5 },
+    { "id": "watchdog", "label": "Independent watchdog", "kind": "compute", "x": 37, "y": 84, "at": 6 }
+  ],
+  "edges": [
+    { "from": "services", "to": "single", "at": 0, "until": 1 },
+    { "from": "services", "to": "agents", "at": 1 },
+    { "from": "agents", "to": "queue", "at": 1 },
+    { "from": "queue", "to": "sql", "at": 1, "until": 2 },
+    { "from": "queue", "to": "tsdb", "at": 2 },
+    { "from": "tsdb", "to": "rollup", "at": 3 },
+    { "from": "rollup", "to": "cold", "at": 3 },
+    { "from": "dash", "to": "query", "at": 4 },
+    { "from": "query", "to": "tsdb", "at": 4 },
+    { "from": "query", "to": "cold", "at": 4 },
+    { "from": "rules", "to": "query", "at": 5 },
+    { "from": "rules", "to": "alertmgr", "at": 5 },
+    { "from": "alertmgr", "to": "oncall", "at": 5 },
+    { "from": "watchdog", "to": "alertmgr", "at": 6 }
+  ],
+  "steps": [
+    {
+      "title": "Collect through agents and an ingest queue",
+      "problem": "Thousands of services writing straight to a database overload it in bursts, and a database that is slow or down makes the services lose data or wait.",
+      "fix": "A small collector agent runs on every host. It gathers the host's and the applications' metrics, batches them and sends them on, either by being scraped on a schedule or by pushing. Batches go into an ingest queue, and writer processes take from the queue at their own pace and store the data. Services only talk to their local agent.",
+      "tradeoff": "Bursts are absorbed by the queue, and a slow database never slows the services. Data is a few seconds behind, and if the queue backs up, the system must choose between delaying and dropping samples, and says which.",
+      "concepts": [{ "slug": "message-queues" }, { "slug": "backpressure" }, { "slug": "pub-sub" }]
+    },
+    {
+      "title": "Store the data in a database built for time series",
+      "problem": "A general SQL table is poor at this: it stores the full name and labels with every point, it indexes everything, and a single database cannot take the write rate.",
+      "fix": "Use a time-series database. Each unique name-and-labels combination is a series, stored as a long run of timestamps and values. Timestamps are almost evenly spaced and neighbouring values are similar, so they compress to a byte or two per point by storing only differences. Data is written in time-ordered blocks and series are spread across nodes by a hash of the series, so a query for one series reads one place.",
+      "tradeoff": "Writes are append-only and fast, storage is ten times or more smaller, and a recent time range is quick to read. The database is specialised: it is poor at general queries and updates, and too many different series bring it down.",
+      "concepts": [{ "slug": "database-indexing" }, { "slug": "sql-vs-nosql" }, { "slug": "database-sharding" }]
+    },
+    {
+      "title": "Downsample old data and enforce retention",
+      "problem": "Keeping every 10-second sample for years costs a fortune, and nobody needs second-by-second detail from last spring.",
+      "fix": "Rollup jobs summarise old data into coarser points: for example 1-minute averages, maxima and counts for 3 months, then 1-hour ones for 2 years. Full-resolution samples are kept for around two weeks and then deleted. Each rollup keeps several summaries, because averaging alone hides spikes. The long-term data sits on cheaper storage.",
+      "tradeoff": "Storage drops by a factor of 6 to 360 as data ages, and long-range graphs read far fewer points. A rollup cannot be turned back into raw data, so what you keep in a summary decides which questions you can answer later.",
+      "concepts": [{ "slug": "metrics" }, { "slug": "caching" }, { "slug": "database-sharding" }]
+    },
+    {
+      "title": "Serve queries through a cache and protect the database from them",
+      "problem": "Dashboards refresh every few seconds on many screens, and one careless query over a month of data can slow the whole database.",
+      "fix": "A query service sits between users and the database. It splits long time ranges into pieces and caches the finished pieces, so a refresh only computes the newest few seconds. Expensive, often-used queries are precomputed by recording rules and stored as new series. The service limits how much any one query may read and how long it may run, and a limit on series per metric protects the database from an explosion of label values.",
+      "tradeoff": "Dashboards stay fast however many people watch them, and one bad query cannot take the system down. A cache can show data that is a few seconds old, and limits sometimes reject a legitimate but huge query.",
+      "concepts": [{ "slug": "caching" }, { "slug": "rate-limiting" }, { "slug": "cqrs" }]
+    },
+    {
+      "title": "Evaluate alert rules and route notifications",
+      "problem": "Alerting on every threshold crossing floods people with noise, so they learn to ignore it, while a missed real problem is a disaster.",
+      "fix": "A rule evaluator runs every rule on a schedule, using the query service. A rule has a condition and a 'for' duration, so the condition must hold for several minutes before the alert fires. Firing alerts go to an alert manager, which groups related alerts into one message, drops duplicates, honours silences during maintenance, and routes by team and severity to chat, email or a pager. Alerts are tied to symptoms users feel, such as error rate or latency against an objective.",
+      "tradeoff": "People are woken for real, lasting problems, and one outage is one page rather than three hundred. A duration delays detection by its length, and every threshold is a judgment between missing a problem and crying wolf.",
+      "concepts": [{ "slug": "alerting" }, { "slug": "slos-and-error-budgets" }, { "slug": "health-checks" }]
+    },
+    {
+      "title": "Make the monitoring system more reliable than what it monitors",
+      "problem": "When the monitoring system fails silently, an outage can go unnoticed, and it often fails at the same time as the systems around it.",
+      "fix": "Run the collectors, queue, database and rule evaluators redundantly, with copies of the data in a second zone or region, so that no one failure loses data or alerts. Add a watchdog: an alert that always fires, expected by an independent system outside the main one, so that silence from the monitor is itself an alarm. Keep the monitoring system's own network and dependencies separate from the production systems it watches.",
+      "tradeoff": "A failure of the monitor is noticed within minutes and by something outside the monitor. The cost is duplicated infrastructure and a second, simpler system to maintain.",
+      "concepts": [{ "slug": "database-replication" }, { "slug": "bulkhead" }, { "slug": "health-checks" }]
+    }
+  ],
+  "failures": [
+    {
+      "scenario": "A deploy adds a label with a million different values, such as a user id",
+      "impact": "The number of series explodes, the database runs out of memory, and every dashboard and alert slows down.",
+      "answer": "The writers enforce a limit on series per metric and per tenant and drop the excess, with a counter and an alert that names the offender. The query service rejects queries that would read too many series, and the label is removed at the source.",
+      "concepts": [{ "slug": "rate-limiting" }, { "slug": "bulkhead" }, { "slug": "alerting" }]
+    },
+    {
+      "scenario": "The time-series database is down for ten minutes",
+      "impact": "Samples keep arriving, and there is nowhere to put them.",
+      "answer": "The ingest queue keeps the samples, and writers catch up when the database returns, so dashboards show a gap in freshness but no gap in data. Alert evaluation switches to a replica, and the watchdog still reports on whether alerts are flowing.",
+      "concepts": [{ "slug": "message-queues" }, { "slug": "database-replication" }, { "slug": "backpressure" }]
+    },
+    {
+      "scenario": "A whole data centre loses power, including the monitoring system running in it",
+      "impact": "The tool that would report the outage is itself down.",
+      "answer": "A second copy of the monitoring system in another region keeps receiving data and evaluating rules, and the independent watchdog notices that the first one has gone quiet and pages someone. The outage is reported by a system that is not in the affected data centre.",
+      "concepts": [{ "slug": "health-checks" }, { "slug": "database-replication" }, { "slug": "alerting" }]
+    },
+    {
+      "scenario": "A noisy alert wakes the on-call engineer every night for a harmless blip",
+      "impact": "The team starts to ignore pages, and a real problem will be missed.",
+      "answer": "The rule is changed to need the condition for longer and to alert on the symptom users see rather than a cause. Every page is reviewed, and an alert that does not need a human action becomes a ticket or a dashboard, not a page.",
+      "concepts": [{ "slug": "alerting" }, { "slug": "slos-and-error-budgets" }, { "slug": "metrics" }]
+    }
+  ],
+  "alternatives": [
+    {
+      "title": "How metrics reach the system",
+      "options": [
+        { "name": "Pull: the system scrapes each service", "pro": "Easy to see which targets are down, and services need no knowledge of the monitor", "con": "Needs discovery of targets, and short-lived jobs may finish before they are scraped" },
+        { "name": "Push: services send their metrics", "pro": "Works for short-lived jobs and across firewalls", "con": "A silent service looks the same as a healthy one that sends nothing" },
+        { "name": "Local agent that collects and forwards", "pro": "Buffers during outages and adds host labels", "con": "Another process to deploy and update on every host" }
+      ],
+      "pick": "Pull for long-running services so that missing targets are noticed, and push through a gateway for short batch jobs."
+    },
+    {
+      "title": "How to build the storage",
+      "options": [
+        { "name": "A general SQL database", "pro": "Familiar and flexible", "con": "Poor compression and write rates, and slow range queries at scale" },
+        { "name": "A purpose-built time-series database", "pro": "Compact, fast writes, and range queries designed for the job", "con": "Specialised, with limits on series count and on joins" },
+        { "name": "A hosted service", "pro": "No operations at all", "con": "Cost grows with volume, and data leaves your control" }
+      ],
+      "pick": "A time-series database, hosted or self-run. A SQL table is fine for a handful of services and not beyond."
+    },
+    {
+      "title": "What to alert on",
+      "options": [
+        { "name": "Causes such as CPU, memory and disk", "pro": "Easy to measure and often an early warning", "con": "Many of them are harmless, and they page people for things users never notice" },
+        { "name": "Symptoms such as errors and latency seen by users", "pro": "Every page means someone is hurting", "con": "Tells you something is wrong, not what, so you need dashboards to find the cause" }
+      ],
+      "pick": "Page on symptoms, tied to objectives. Show causes on dashboards, and alert on them only when they predict an outage, such as a disk filling."
+    },
+    {
+      "title": "How long to keep data and at what detail",
+      "options": [
+        { "name": "Everything at full detail", "pro": "Nothing is ever lost", "con": "Cost grows without limit" },
+        { "name": "Raw for two weeks, then rollups", "pro": "Cheap, and enough for most questions", "con": "Old spikes are only visible in the summaries you chose to keep" }
+      ],
+      "pick": "Raw data for about two weeks, minute rollups for months and hourly rollups for years, each storing the average, maximum and count."
+    }
+  ],
+  "roles": [
+    { "id": "client", "label": "People and apps", "description": "The services being watched, the dashboards and the on-call phone." },
+    { "id": "edge", "label": "Entry points", "description": "Collectors and the alert manager." },
+    { "id": "async", "label": "Ingest", "description": "The queue between collectors and storage." },
+    { "id": "compute", "label": "Services", "description": "Rollups, queries, rule evaluation and the watchdog." },
+    { "id": "data", "label": "State", "description": "The time-series database and the long-term store." }
+  ]
+}
