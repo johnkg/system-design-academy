@@ -1,0 +1,495 @@
+{
+  "name": "Design a Database Proxy and Connection Pooler",
+  "difficulty": "intermediate",
+  "intent": "Let hundreds of application instances share a few dozen database connections, queue the excess politely, send reads to replicas, and ride out a failover without dropping requests.",
+  "codeTitle": "a transaction-mode pooler with a bounded wait queue",
+  "finalIntro": "One write and one read going through the pooler, and then a failover.",
+  "prompt": "Design a proxy that sits between 300 application instances and a PostgreSQL primary with 2 read replicas, like PgBouncer, ProxySQL or RDS Proxy. Each instance wants a pool of 20 connections, the database allows 500, and the team keeps adding instances. The proxy must keep the database healthy under bursts, behave well when the primary fails over, and never become the thing that takes the site down.",
+  "functional": [
+    "Accept thousands of client connections and run their queries over a small set of server connections",
+    "Offer pooling modes (session, transaction, statement) with clear rules about what each one breaks",
+    "Queue requests when every server connection is busy, and fail them cleanly after a timeout",
+    "Route writes to the primary and reads to replicas that are fresh enough",
+    "Reconnect after a primary switch and retry statements that are safe to retry",
+    "Limit connections and queue share per user, tenant or database"
+  ],
+  "nonFunctional": [
+    "Added latency under 1 ms when a server connection is free",
+    "Support at least 10,000 client connections per proxy with a few MB of memory in total",
+    "The database never sees more active connections than it can run well, which is a few dozen",
+    "A primary failover costs seconds of errors at most, not minutes",
+    "Reads are never staler than a configured lag, and a client always sees its own writes",
+    "The proxy itself is redundant, so losing one copy loses no more than its in-flight requests"
+  ],
+  "firstAttempt": {
+    "text": "Every application instance keeps its own pool of 20 connections straight to the database. With 300 instances that is 6,000 connections wanted, and the database has max_connections set to 500. When traffic grows the team raises max_connections and adds instances.",
+    "limits": [
+      "A connection is expensive: a TCP and TLS handshake, authentication, and in PostgreSQL a whole operating system process that uses several MB of memory, so thousands of them waste memory that could be cache",
+      "Instances times pool size passes max_connections as soon as the fleet grows, and new instances get 'too many clients' errors at start-up",
+      "Most connections are idle most of the time, but they still cost memory and slow shared work such as taking snapshots",
+      "In a burst every connection becomes active at once, and a database with 16 cores running 400 queries at once spends its time switching between them, so throughput falls as load rises",
+      "A deploy or an autoscaling event opens thousands of new connections in a few seconds, which can knock over the database that was healthy a moment ago",
+      "Nothing sends reads to replicas, and every application has to handle a failover on its own"
+    ]
+  },
+  "nodes": [
+    {
+      "id": "apps",
+      "label": "App instances",
+      "kind": "client",
+      "x": 37,
+      "y": 88
+    },
+    {
+      "id": "primary",
+      "label": "Primary database",
+      "kind": "data",
+      "x": 37,
+      "y": 37
+    },
+    {
+      "id": "pooler",
+      "label": "Pooler",
+      "kind": "edge",
+      "x": 37,
+      "y": 63,
+      "at": 1
+    },
+    {
+      "id": "queue",
+      "label": "Wait queue",
+      "kind": "async",
+      "x": 62,
+      "y": 63,
+      "at": 3
+    },
+    {
+      "id": "router",
+      "label": "Read/write router",
+      "kind": "compute",
+      "x": 12,
+      "y": 63,
+      "at": 4
+    },
+    {
+      "id": "replicas",
+      "label": "Replicas",
+      "kind": "data",
+      "x": 12,
+      "y": 37,
+      "at": 4
+    },
+    {
+      "id": "health",
+      "label": "Health checker",
+      "kind": "compute",
+      "x": 62,
+      "y": 37,
+      "at": 5
+    },
+    {
+      "id": "limits",
+      "label": "Tenant limits",
+      "kind": "compute",
+      "x": 62,
+      "y": 88,
+      "at": 6
+    },
+    {
+      "id": "pooler2",
+      "label": "Second pooler",
+      "kind": "edge",
+      "x": 12,
+      "y": 88,
+      "at": 6
+    }
+  ],
+  "edges": [
+    {
+      "from": "apps",
+      "to": "primary",
+      "at": 0,
+      "until": 1
+    },
+    {
+      "from": "apps",
+      "to": "pooler",
+      "at": 1
+    },
+    {
+      "from": "pooler",
+      "to": "primary",
+      "at": 1,
+      "until": 4
+    },
+    {
+      "from": "pooler",
+      "to": "queue",
+      "at": 3
+    },
+    {
+      "from": "pooler",
+      "to": "router",
+      "at": 4
+    },
+    {
+      "from": "router",
+      "to": "primary",
+      "at": 4
+    },
+    {
+      "from": "router",
+      "to": "replicas",
+      "at": 4
+    },
+    {
+      "from": "primary",
+      "to": "replicas",
+      "at": 4
+    },
+    {
+      "from": "health",
+      "to": "primary",
+      "at": 5
+    },
+    {
+      "from": "health",
+      "to": "pooler",
+      "at": 5
+    },
+    {
+      "from": "limits",
+      "to": "pooler",
+      "at": 6
+    },
+    {
+      "from": "apps",
+      "to": "pooler2",
+      "at": 6
+    },
+    {
+      "from": "pooler2",
+      "to": "router",
+      "at": 6
+    }
+  ],
+  "steps": [
+    {
+      "title": "Put a pooler between the apps and the database",
+      "problem": "Each database connection is a heavy thing: a handshake, TLS, authentication and, in PostgreSQL, a separate process with its own memory. 300 instances with 20 connections each ask for 6,000 of them, and the database only allows 500.",
+      "fix": "Run a pooler that speaks the database protocol. The apps open as many cheap client connections to it as they like, because a pooler like PgBouncer keeps only a few KB for each one. The pooler holds a small set of long-lived server connections, already authenticated and with TLS set up, and lends one to a client only while it needs it. The app changes nothing except the address and port in its connection string.",
+      "tradeoff": "Thousands of client connections now share a few dozen server connections, and new instances cost the database nothing. There is one more hop, which adds a fraction of a millisecond, and one more component to run and watch.",
+      "concepts": [
+        {
+          "slug": "proxies"
+        },
+        {
+          "slug": "latency-and-round-trips"
+        },
+        {
+          "slug": "tls-and-https"
+        },
+        {
+          "slug": "horizontal-vs-vertical-scaling"
+        }
+      ]
+    },
+    {
+      "title": "Choose the pooling mode, knowing what it breaks",
+      "problem": "When can the pooler take a server connection back from a client? Take it too late and nothing is saved, take it too early and the client's session state vanishes under it.",
+      "fix": "Session mode lends a server connection for the whole life of the client connection, which keeps every feature but saves nothing for apps that stay connected. Transaction mode lends it from BEGIN to COMMIT and takes it back, so a few dozen connections can serve thousands of clients; this is the mode that fixes the connection count. Statement mode lends it for a single statement and forbids multi-statement transactions. In transaction mode anything that lives in the session breaks: SET without LOCAL, temporary tables, session advisory locks, LISTEN and NOTIFY, WITH HOLD cursors and, in older versions, server-side prepared statements. ProxySQL and RDS Proxy 'pin' a client to a server connection when they see such state, which keeps it correct and removes the saving.",
+      "tradeoff": "Transaction mode multiplies capacity by 100 or more, but the app must keep its state inside transactions: use SET LOCAL, transaction-level advisory locks and a direct connection for LISTEN. The bugs from getting this wrong are intermittent, because they depend on which server connection a transaction happens to get.",
+      "concepts": [
+        {
+          "slug": "mvcc-and-isolation-levels"
+        },
+        {
+          "slug": "acid-vs-base"
+        },
+        {
+          "slug": "pub-sub"
+        },
+        {
+          "slug": "proxies"
+        }
+      ]
+    },
+    {
+      "title": "Keep the pool small and queue the rest",
+      "problem": "More connections do not mean more speed. A database with 16 cores and a few disks does its best work with a few dozen active queries, and beyond that every extra one only adds context switches and lock contention.",
+      "fix": "Size the server pool from the hardware, starting near cores times 2 plus the number of disks, such as 36 for 16 cores and 4 disks, then measure. Little's law shows how busy it will be: 6,000 queries a second that last 4 ms keep 24 connections busy on average. When all server connections are in use, requests wait in a first-in first-out queue in the pooler. Each wait has a limit, such as a few hundred ms or a second, and a client that waits longer gets a clear error instead of hanging for ever. The pooler exports the queue length and the wait time as the main signals of saturation.",
+      "tradeoff": "The database stays at its sweet spot and the excess becomes a short wait, which is better for everyone than a slow database for everyone. A pool that is too small, or one slow query that holds a connection, turns into long waits and timeouts, so the queue wait time needs an alert.",
+      "concepts": [
+        {
+          "slug": "backpressure"
+        },
+        {
+          "slug": "bulkhead"
+        },
+        {
+          "slug": "rate-limiting"
+        },
+        {
+          "slug": "metrics"
+        },
+        {
+          "slug": "retries-and-backoff"
+        }
+      ]
+    },
+    {
+      "title": "Route reads to replicas that are fresh enough",
+      "problem": "The primary does all the work, while the replicas sit nearly idle, and an application that sends reads there itself must deal with lag and failover on its own.",
+      "fix": "A router behind the pooler sends each statement to the primary or to a replica. Statements outside a transaction that start with SELECT go to a replica, and everything else goes to the primary; ProxySQL does this with query rules, and applications can also ask for a replica with a separate port or user. The router knows each replica's replication lag from heartbeat rows or the replay position, and skips a replica that is over the limit, say 500 ms. A client that has just written is kept on the primary for a short time, or until a replica has replayed the position of its write, so it always reads its own writes.",
+      "tradeoff": "The primary is relieved of most of the read traffic, and replicas can be added or removed behind the proxy. Parsing SQL to find reads is imperfect: a SELECT that calls a function with side effects goes to the wrong place unless the app marks it. Reads can still be a little stale, which is the price of replication.",
+      "concepts": [
+        {
+          "slug": "database-replication"
+        },
+        {
+          "slug": "consistency-models"
+        },
+        {
+          "slug": "load-balancing"
+        },
+        {
+          "slug": "health-checks"
+        }
+      ]
+    },
+    {
+      "title": "Survive a primary failover",
+      "problem": "When the primary fails and a replica is promoted, every server connection in the pool points at a dead machine, and every client has a query in flight that may or may not have been committed.",
+      "fix": "A health checker probes the primary with a cheap query every second and takes it out after a few misses. The pooler closes its old server connections, finds the new primary through DNS, a cluster manager or the cloud API, and reconnects. Client connections stay open, which is why a pooler makes failover so much gentler than connecting directly. Statements that are safe to run twice, such as a SELECT that had not returned yet or a write with an idempotency key, are retried with backoff on the new primary. A transaction that was open when the connection broke is not replayed: the client gets an error, because the proxy cannot know whether the COMMIT arrived.",
+      "tradeoff": "A failover costs a few seconds of errors and slow requests, not a restart of the whole fleet. Retrying hides short outages but could repeat a write if it is not idempotent, and a proxy that guesses wrongly about a promotion could briefly send writes to the old primary, so the cluster manager must fence it.",
+      "concepts": [
+        {
+          "slug": "health-checks"
+        },
+        {
+          "slug": "retries-and-backoff"
+        },
+        {
+          "slug": "idempotency"
+        },
+        {
+          "slug": "multi-region-failover"
+        },
+        {
+          "slug": "leader-election"
+        }
+      ]
+    },
+    {
+      "title": "Limit tenants, and do not make the proxy a single point of failure",
+      "problem": "One noisy service can take every server connection and starve the others, and a single pooler that fails brings down everything behind it.",
+      "fix": "Pools are kept per database and user, each with its own size and its own queue limit, so a batch job with a pool of 5 can never take connections from the web tier. Per-tenant caps on client connections, queued requests and statement time (statement_timeout) keep one tenant's problem inside that tenant. For availability, run at least two poolers, put them behind a load balancer or give apps a list of addresses, keep them stateless, and use a modest pool in each so the sum stays within max_connections. A pooler restart should only cost its in-flight requests; some poolers support a graceful restart that hands over their sockets.",
+      "tradeoff": "Noisy neighbours are contained and losing one pooler is a small event. The total number of server connections is now the sum over all poolers and all pools, which has to be planned, and a fleet of poolers is yet another thing to configure, deploy and upgrade.",
+      "concepts": [
+        {
+          "slug": "rate-limiting"
+        },
+        {
+          "slug": "bulkhead"
+        },
+        {
+          "slug": "load-balancing"
+        },
+        {
+          "slug": "health-checks"
+        },
+        {
+          "slug": "metrics"
+        }
+      ]
+    }
+  ],
+  "failures": [
+    {
+      "scenario": "The primary fails and a replica is promoted",
+      "impact": "All server connections break and every in-flight transaction has an unknown result.",
+      "answer": "The health checker takes the primary out after a few failed probes. The pooler drops the old server connections, learns the new address and reconnects, while client connections stay open. Idempotent statements are retried with backoff, and open transactions return an error so that the application retries them as a whole. The old primary is fenced so that it cannot accept writes if it comes back.",
+      "concepts": [
+        {
+          "slug": "health-checks"
+        },
+        {
+          "slug": "retries-and-backoff"
+        },
+        {
+          "slug": "idempotency"
+        },
+        {
+          "slug": "leader-election"
+        }
+      ]
+    },
+    {
+      "scenario": "A pooler instance crashes",
+      "impact": "Every client connected to it loses its connection, and if it was the only pooler, nothing can reach the database.",
+      "answer": "Two or more poolers run behind a load balancer, and a failed one is removed by its health check. Clients reconnect to another with backoff, with jitter so they do not return at the same instant. Each pooler has a modest pool, so the survivors do not need more server connections than the database allows.",
+      "concepts": [
+        {
+          "slug": "load-balancing"
+        },
+        {
+          "slug": "health-checks"
+        },
+        {
+          "slug": "retries-and-backoff"
+        }
+      ]
+    },
+    {
+      "scenario": "A slow query or an idle transaction holds server connections",
+      "impact": "Server connections stay busy, the queue grows, and healthy requests start to time out.",
+      "answer": "Set a statement timeout and an idle-in-transaction timeout so that the database or the pooler ends sessions that sit forever. Keep a separate small pool for reports and batch jobs. Alert on queue wait time and on the oldest transaction, which finds the culprit before users do.",
+      "concepts": [
+        {
+          "slug": "bulkhead"
+        },
+        {
+          "slug": "metrics"
+        },
+        {
+          "slug": "backpressure"
+        }
+      ]
+    },
+    {
+      "scenario": "One tenant floods the proxy with queries",
+      "impact": "Its requests fill the queue and every other tenant waits behind them.",
+      "answer": "Each tenant has its own pool and queue limit, so excess requests from the noisy tenant are rejected quickly while the others are served. Rate limits and a maximum number of client connections per user add a second line of defence.",
+      "concepts": [
+        {
+          "slug": "rate-limiting"
+        },
+        {
+          "slug": "bulkhead"
+        },
+        {
+          "slug": "backpressure"
+        }
+      ]
+    },
+    {
+      "scenario": "A replica falls far behind",
+      "impact": "Reads from it show old data, so a user may not see a change they have just made.",
+      "answer": "The router measures lag and stops sending reads to any replica over the limit, falling back to the other replicas or to the primary. Clients that have just written are served from the primary anyway, so they see their own changes.",
+      "concepts": [
+        {
+          "slug": "database-replication"
+        },
+        {
+          "slug": "consistency-models"
+        },
+        {
+          "slug": "health-checks"
+        }
+      ]
+    }
+  ],
+  "alternatives": [
+    {
+      "title": "Where the pooling happens",
+      "options": [
+        {
+          "name": "A pool inside each app (HikariCP, SQLAlchemy)",
+          "pro": "No extra hop and no extra system",
+          "con": "Total connections are instances times pool size, and a deploy opens them all at once"
+        },
+        {
+          "name": "A central pooler (PgBouncer, ProxySQL)",
+          "pro": "One small set of server connections for the whole fleet",
+          "con": "A new component that must be redundant and monitored"
+        },
+        {
+          "name": "A managed proxy (RDS Proxy)",
+          "pro": "Nobody runs it, and it keeps client connections open during a failover",
+          "con": "Cost, and it pins connections when it sees session state, which removes the saving"
+        }
+      ],
+      "pick": "App pools kept small, in front of a pair of central poolers in transaction mode, or a managed proxy where the cloud provides one."
+    },
+    {
+      "title": "Pooling mode",
+      "options": [
+        {
+          "name": "Session",
+          "pro": "Nothing breaks",
+          "con": "Saves little unless clients disconnect often"
+        },
+        {
+          "name": "Transaction",
+          "pro": "Large multiplexing, and the usual choice for web apps",
+          "con": "Session state, session locks, LISTEN and temporary tables stop working"
+        },
+        {
+          "name": "Statement",
+          "pro": "The highest reuse of connections",
+          "con": "No multi-statement transactions at all"
+        }
+      ],
+      "pick": "Transaction mode, with a direct or session-mode route for the few jobs that need session features."
+    },
+    {
+      "title": "How reads reach replicas",
+      "options": [
+        {
+          "name": "The proxy parses SQL and routes",
+          "pro": "No application change",
+          "con": "It can guess wrong, and read-your-writes needs extra rules"
+        },
+        {
+          "name": "The application picks a connection string",
+          "pro": "Explicit and predictable, since the code decides what may be stale",
+          "con": "Every service must make the choice"
+        }
+      ],
+      "pick": "Explicit read-only endpoints for code that accepts staleness, with proxy rules as a convenience."
+    },
+    {
+      "title": "Retries after a failover",
+      "options": [
+        {
+          "name": "Surface every error",
+          "pro": "Simple and never repeats a write",
+          "con": "Every service must write retry code"
+        },
+        {
+          "name": "Retry idempotent statements in the proxy",
+          "pro": "Short outages are hidden",
+          "con": "A non-idempotent statement retried by mistake runs twice"
+        }
+      ],
+      "pick": "Retry only statements known to be safe, and return an error for anything inside an open transaction."
+    }
+  ],
+  "roles": [
+    {
+      "id": "client",
+      "label": "Applications",
+      "description": "App instances with their own small pools of client connections."
+    },
+    {
+      "id": "edge",
+      "label": "Poolers",
+      "description": "The proxy processes that clients connect to."
+    },
+    {
+      "id": "async",
+      "label": "Wait queue",
+      "description": "Requests waiting for a free server connection."
+    },
+    {
+      "id": "compute",
+      "label": "Routing and checks",
+      "description": "The read/write router, health checks and per-tenant limits."
+    },
+    {
+      "id": "data",
+      "label": "Databases",
+      "description": "The primary and its replicas."
+    }
+  ]
+}

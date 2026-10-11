@@ -1,0 +1,234 @@
+{
+  "actors": [
+    {
+      "id": "orders",
+      "label": "Order service",
+      "role": "client",
+      "x": 14,
+      "y": 16
+    },
+    {
+      "id": "front",
+      "label": "Workflow service",
+      "role": "edge",
+      "x": 50,
+      "y": 16
+    },
+    {
+      "id": "history",
+      "label": "History shard 17",
+      "role": "data",
+      "x": 86,
+      "y": 16
+    },
+    {
+      "id": "queue",
+      "label": "Task queues",
+      "role": "async",
+      "x": 14,
+      "y": 50
+    },
+    {
+      "id": "worker",
+      "label": "Workflow worker",
+      "role": "compute",
+      "x": 50,
+      "y": 50
+    },
+    {
+      "id": "actw",
+      "label": "Activity worker",
+      "role": "compute",
+      "x": 50,
+      "y": 84
+    },
+    {
+      "id": "pay",
+      "label": "Payment and stock APIs",
+      "role": "data",
+      "x": 86,
+      "y": 84
+    }
+  ],
+  "frames": [
+    {
+      "narration": "The order service starts workflow o-7731. The workflow service hashes the id to history shard 17 and appends the first event, 'workflow started', with the order as input. That one append is the moment the order becomes durable: from here a crash anywhere cannot lose it.",
+      "messages": [
+        {
+          "from": "orders",
+          "to": "front",
+          "label": "start o-7731"
+        },
+        {
+          "from": "front",
+          "to": "history",
+          "label": "append: started"
+        }
+      ],
+      "states": {
+        "history": "1 event"
+      }
+    },
+    {
+      "narration": "The shard also writes a 'decide next' task onto the workflow task queue. A workflow worker is already waiting on that queue with a long poll, so it receives the task at once instead of checking every few seconds.",
+      "messages": [
+        {
+          "from": "history",
+          "to": "queue",
+          "label": "decision task"
+        },
+        {
+          "from": "queue",
+          "to": "worker",
+          "label": "long poll returns"
+        }
+      ]
+    },
+    {
+      "narration": "The worker runs the order code from the top. The first line asks for the activity reserve_stock, which has no result in the history yet, so the code stops there and the worker returns one command: schedule it. The shard appends it, and the history has 2 events.",
+      "messages": [
+        {
+          "from": "worker",
+          "to": "history",
+          "label": "schedule reserve_stock"
+        }
+      ],
+      "states": {
+        "worker": "code paused at line 1",
+        "history": "2 events"
+      }
+    },
+    {
+      "narration": "An activity worker picks the task from the activity queue and calls the stock service with the key o-7731:reserve. The result is appended as 'activity completed', so the history has 3 events. The workflow worker will resume the code from there.",
+      "messages": [
+        {
+          "from": "queue",
+          "to": "actw",
+          "label": "reserve_stock"
+        },
+        {
+          "from": "actw",
+          "to": "pay",
+          "label": "reserve, key o-7731:reserve"
+        },
+        {
+          "from": "actw",
+          "to": "history",
+          "label": "completed"
+        }
+      ],
+      "states": {
+        "history": "3 events"
+      }
+    },
+    {
+      "narration": "Next is charge_card. The activity worker calls the payment API with the key o-7731:charge, and the card is charged. Then the activity worker crashes before it can report the result, so the history still ends at 'charge scheduled' and has 4 events.",
+      "messages": [
+        {
+          "from": "actw",
+          "to": "pay",
+          "label": "charge, key o-7731:charge"
+        }
+      ],
+      "states": {
+        "pay": "charged once",
+        "actw": "crashed",
+        "history": "4 events"
+      },
+      "highlight": [
+        "actw"
+      ]
+    },
+    {
+      "narration": "The task has a start-to-close timeout of 30 seconds and a heartbeat that stopped arriving, so the shard notices and puts the activity back on the queue as attempt 2 after a short backoff. Another activity worker repeats the call with the same key, and the payment API answers with the original result instead of charging again.",
+      "messages": [
+        {
+          "from": "history",
+          "to": "queue",
+          "label": "timeout, attempt 2"
+        },
+        {
+          "from": "queue",
+          "to": "actw",
+          "label": "charge_card"
+        },
+        {
+          "from": "actw",
+          "to": "pay",
+          "label": "charge, same key"
+        },
+        {
+          "from": "pay",
+          "to": "actw",
+          "label": "already charged, same result"
+        }
+      ],
+      "states": {
+        "pay": "still one charge"
+      }
+    },
+    {
+      "narration": "The result is appended, so the history has 5 events. Now the workflow worker that held the order in its cache dies too. A different worker takes the next decision task and replays the 5 events through the same code. Each activity call returns its recorded result, without calling anything, and the state is exactly as it was.",
+      "messages": [
+        {
+          "from": "actw",
+          "to": "history",
+          "label": "completed"
+        },
+        {
+          "from": "history",
+          "to": "worker",
+          "label": "5 events to replay"
+        }
+      ],
+      "states": {
+        "history": "5 events",
+        "worker": "state rebuilt by replay"
+      },
+      "highlight": [
+        "worker"
+      ]
+    },
+    {
+      "narration": "The code goes on to pack and ship, 4 more events, so the history has 9. It then waits for a 'delivered' signal or a 3-day timer, whichever comes first. The timer is an event (10), not a sleeping thread, so no worker is held for three days. Two days later the carrier's webhook arrives as a signal and is appended as event 11, which wakes the workflow.",
+      "messages": [
+        {
+          "from": "worker",
+          "to": "history",
+          "label": "start 3-day timer"
+        },
+        {
+          "from": "orders",
+          "to": "front",
+          "label": "signal: delivered"
+        },
+        {
+          "from": "front",
+          "to": "history",
+          "label": "append: signal"
+        }
+      ],
+      "states": {
+        "history": "11 events"
+      }
+    },
+    {
+      "narration": "The worker replays 11 events, sees the signal, cancels the timer (event 12), runs the last activity, the email (events 13 and 14), and returns 'workflow completed' (event 15). The history ends at 15 events: 2 for each of the 5 activities, plus start, finish, the timer's start and cancel, and the signal. It stays readable for the retention period and is then archived.",
+      "messages": [
+        {
+          "from": "history",
+          "to": "worker",
+          "label": "11 events to replay"
+        },
+        {
+          "from": "worker",
+          "to": "history",
+          "label": "complete workflow"
+        }
+      ],
+      "states": {
+        "history": "15 events, closed"
+      }
+    }
+  ]
+}

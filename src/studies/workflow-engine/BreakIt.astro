@@ -1,0 +1,100 @@
+---
+import PlaygroundShell from '../../components/PlaygroundShell.astro';
+---
+<PlaygroundShell title="Crash an order workflow" hint="200 orders each run 5 steps: reserve stock, charge the card, pack, ship, notify. Activities sometimes fail, and a worker may crash. Choose how the process is executed, how it retries and whether the steps are idempotent.">
+  <ol class="how">
+    <li>The defaults are <b>event-sourced replay</b>, <b>3 attempts</b>, <b>no idempotency</b>, a <b>20% failure rate</b> and crashes on: <b>191 of 200</b> orders finish and <b>9</b> are stuck, but <b>166</b> steps ran twice, and <b>32</b> of them were card charges. Replay rebuilt every workflow, yet it cannot tell whether a step that lost its reply had run.</li>
+    <li>Tick <b>idempotent steps</b>: the duplicates fall to <b>0</b>, with the same completed and stuck orders. The key made the repeated call harmless.</li>
+    <li>Switch to <b>one script</b> and untick idempotent: after a crash the script starts again from the top, so <b>268</b> steps run twice and the mean recovery is <b>900 s</b> against <b>10 s</b>. A persisted state machine behaves like replay here (166 twice, 60 s), because it also re-runs the one step in flight.</li>
+    <li>Set the attempts to <b>1</b> and most orders get stuck (<b>138</b> of 200 with event-sourced replay), and set them to <b>5</b> and none do. Retries repair failures, but they are also what repeats steps when the reply is lost.</li>
+  </ol>
+  <div class="pg wfb" data-wfb>
+    <div class="pg-row">
+      <label>Execution style <select class="pg-in" data-style>
+        <option value="script">One script in one process</option>
+        <option value="machine">Persisted state machine, no replay</option>
+        <option value="events" selected>Event-sourced history with replay</option>
+      </select></label>
+      <label>Attempts per activity <input type="range" min="1" max="5" value="3" data-att /> <b data-attval></b></label>
+      <label>Chance an attempt fails (%) <input type="range" min="0" max="40" step="5" value="20" data-fail /> <b data-failval></b></label>
+      <label><input type="checkbox" data-idem /> Idempotent steps (repeat has no new effect)</label>
+      <label><input type="checkbox" data-crash checked /> A worker crashes after some steps (3% of steps)</label>
+    </div>
+    <div class="pg-grid">
+      <div class="pg-box" data-b1><h3>Orders completed</h3><span class="pg-mono" data-o1></span><span class="pg-note" data-n1></span></div>
+      <div class="pg-box" data-b2><h3>Steps executed twice</h3><span class="pg-mono" data-o2></span><span class="pg-note" data-n2></span></div>
+      <div class="pg-box" data-b3><h3>Orders stuck</h3><span class="pg-mono" data-o3></span><span class="pg-note" data-n3></span></div>
+      <div class="pg-box" data-b4><h3>Recovery after a crash</h3><span class="pg-mono" data-o4></span><span class="pg-note" data-n4></span></div>
+      <div class="pg-box" data-b5><h3>History length per order</h3><span class="pg-mono" data-o5></span><span class="pg-note" data-n5></span></div>
+    </div>
+    <p class="pg-out" data-verdict aria-live="polite"></p>
+    <p class="pg-note">Model: each attempt fails before doing anything with probability half of the failure rate, and with the other half the effect happens but the reply is lost, so the retry repeats it. A step is recorded when it succeeds, and with crashes on the worker dies right after 3% of the successful steps and before recording them. A script restarts the order from step 1 after an operator notices (900 s), a state machine resumes after a sweeper finds the stale row (60 s), and event-sourced replay resumes after the 10 s task timeout plus a replay of a few events. A step run twice means an extra side effect on one order and one step. Orders whose attempts are used up wait for a human and count as stuck.</p>
+  </div>
+</PlaygroundShell>
+<script>
+  document.querySelectorAll<HTMLElement>('[data-wfb]').forEach((root) => {
+    const q = <T extends HTMLElement>(s: string) => root.querySelector<T>(s)!;
+    const ORDERS = 200; const STEPS = 5; const DRAWS = 600; const CRASH = 0.03;
+    let seed = 11; const rnd = () => ((seed = (seed * 1664525 + 1013904223) % 4294967296) / 4294967296);
+    const draws = Array.from({ length: ORDERS }, () => Array.from({ length: DRAWS }, rnd));
+    const RECOVER: Record<string, number> = { script: 900, machine: 60, events: 10 };
+    const NAMES: Record<string, string> = { script: 'one script', machine: 'a persisted state machine', events: 'event-sourced replay' };
+    function sim(style: string, maxAttempts: number, idem: boolean, crashOn: boolean, failPct: number) {
+      const f = failPct / 100;
+      let completed = 0; let stuck = 0; let twice = 0; let doubleCharges = 0; let crashes = 0; let recSum = 0; let longest = 0;
+      for (let o = 0; o < ORDERS; o++) {
+        const d = draws[o]; let k = 0; const eff = new Array(STEPS).fill(0); let pos = 0; let recorded = 0; let dead = false; let guard = 0;
+        while (pos < STEPS && !dead) {
+          let done = false;
+          for (let a = 1; a <= maxAttempts && !done; a++) {
+            const r = d[k++ % DRAWS];
+            if (r < f / 2) continue; // failed before doing anything
+            if (!(idem && eff[pos] > 0)) eff[pos]++; // the side effect happens
+            if (r < f) continue; // the reply was lost, so this looks like a failure
+            done = true;
+          }
+          if (!done) { dead = true; break; }
+          const cr = d[k++ % DRAWS];
+          if (crashOn && guard < 20 && cr < CRASH) {
+            guard++; crashes++;
+            recSum += RECOVER[style] + (style === 'events' ? (2 * pos + 1) * 0.002 : 0);
+            if (style === 'script') { pos = 0; recorded = 0; } // nothing was saved, so start again from the top
+            continue; // otherwise the step is not recorded and runs again
+          }
+          pos++; recorded = Math.max(recorded, pos);
+        }
+        if (dead) stuck++; else completed++;
+        eff.forEach((n, i) => { twice += Math.max(0, n - 1); if (i === 1) doubleCharges += Math.max(0, n - 1); });
+        longest = Math.max(longest, recorded);
+      }
+      const hist = style === 'events' ? 2 + 2 * longest : style === 'machine' ? 1 : 0;
+      return { completed, stuck, twice, doubleCharges, crashes, rec: crashes ? recSum / crashes : null, hist };
+    }
+    function draw() {
+      const style = q<HTMLSelectElement>('[data-style]').value; const att = Number(q<HTMLInputElement>('[data-att]').value); const fail = Number(q<HTMLInputElement>('[data-fail]').value);
+      const idem = q<HTMLInputElement>('[data-idem]').checked; const crash = q<HTMLInputElement>('[data-crash]').checked;
+      q('[data-attval]').textContent = String(att); q('[data-failval]').textContent = String(fail);
+      const r = sim(style, att, idem, crash, fail);
+      q('[data-o1]').textContent = `${r.completed} of ${ORDERS}`; q('[data-n1]').textContent = r.completed === ORDERS ? 'every order finished' : 'orders that reached the last step';
+      q('[data-o2]').textContent = String(r.twice); q('[data-n2]').textContent = `${r.doubleCharges} of them were double charges`;
+      q('[data-o3]').textContent = `${r.stuck} of ${ORDERS}`; q('[data-n3]').textContent = r.stuck === 0 ? 'no order ran out of attempts' : `all ${att} attempt${att === 1 ? '' : 's'} failed on some step`;
+      q('[data-o4]').textContent = r.rec === null ? 'no crash' : `${r.rec.toFixed(1)} s`; q('[data-n4]').textContent = r.rec === null ? 'crashes are off or none happened' : `mean over ${r.crashes} crashes`;
+      q('[data-o5]').textContent = style === 'script' ? 'none' : style === 'machine' ? '1 row' : `${r.hist} events`;
+      q('[data-n5]').textContent = style === 'script' ? 'nothing is saved to look at or replay' : style === 'machine' ? 'overwritten at each step, so no audit trail' : 'every step appended, so it can be audited and replayed';
+      q<HTMLElement>('[data-b1]').style.setProperty('--c', r.stuck === 0 ? 'var(--good)' : 'var(--accent)');
+      q<HTMLElement>('[data-b2]').style.setProperty('--c', r.twice === 0 ? 'var(--good)' : 'var(--bad)');
+      q<HTMLElement>('[data-b3]').style.setProperty('--c', r.stuck === 0 ? 'var(--good)' : 'var(--bad)');
+      q<HTMLElement>('[data-b4]').style.setProperty('--c', r.rec === null || r.rec < 30 ? 'var(--good)' : 'var(--bad)');
+      q<HTMLElement>('[data-b5]').style.setProperty('--c', 'var(--accent)');
+      const out = q('[data-verdict]'); const bad = r.twice > 0 || r.stuck > 0; out.classList.toggle('bad', bad);
+      const parts: string[] = [];
+      if (r.twice > 0) parts.push(`${r.twice} steps ran twice (${r.doubleCharges} double charges) with ${NAMES[style]}${style === 'script' && crash ? ', and a crash sends the script back to step 1' : ', because a retry or a re-run cannot tell a step that never ran from one whose reply was lost'}. Making the steps idempotent removes every one of them.`);
+      else parts.push(`No step ran twice: with idempotent steps, or with no lost replies and no crashes, a repeated call has no extra effect.`);
+      if (r.stuck > 0) parts.push(`${r.stuck} orders are stuck after ${att} attempt${att === 1 ? '' : 's'}; more attempts or a lower failure rate would finish them.`);
+      else parts.push('Every order finished.');
+      out.textContent = parts.join(' ');
+    }
+    root.addEventListener('input', draw); root.addEventListener('change', draw);
+    draw();
+  });
+</script>

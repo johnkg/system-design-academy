@@ -1,0 +1,545 @@
+{
+  "name": "Design a Content Delivery Network",
+  "difficulty": "advanced",
+  "intent": "Serve images, video and web pages to users on every continent from a cache close to them, so the origin sees a small fraction of the traffic and a page loads in tens of milliseconds, not hundreds.",
+  "codeTitle": "a two-level cache with LRU, TTL and request coalescing",
+  "finalIntro": "One image request through the network, a cache hit for the next user, and a purge when the image changes.",
+  "prompt": "Design a CDN for a company whose customers are websites and video services. Users are spread over every continent, a customer's files live on that customer's origin servers in one region, and the CDN must deliver them fast, keep the origin load small, let a customer remove or replace a file everywhere within seconds, and stay up when a data center or an origin fails.",
+  "functional": [
+    "Send each user to a nearby point of presence (PoP)",
+    "Serve cached copies of files, and fetch from the customer's origin on a miss",
+    "Honour cache rules: how long to keep a file, and which request details make two requests different",
+    "Deliver large files and video in parts, with range requests",
+    "Let a customer purge one file, a group of files or everything",
+    "Terminate HTTPS at the edge for each customer's domain",
+    "Pass through requests that cannot be cached, such as personalised API calls"
+  ],
+  "nonFunctional": [
+    "A cache hit is answered in under 50 ms for most users, and most requests are hits",
+    "The origin sees a small fraction of the traffic, and a popular file is fetched from it once, not once per user",
+    "A purge reaches every PoP within a few seconds",
+    "Tens of Tbps of peak traffic in total, spread over hundreds of PoPs",
+    "A failed PoP, shield or origin must not take the site down",
+    "A hostile request must not poison the cache or make the CDN fetch from the wrong place",
+    "Cost per delivered gigabyte stays low, because delivery is the whole business"
+  ],
+  "firstAttempt": {
+    "text": "Every user connects straight to the customer's origin servers, which sit in one data center. A far-away user waits for several long round trips, and each copy of a file is sent again from the origin for every user.",
+    "limits": [
+      "A user on another continent pays 150 ms or more for every round trip, and a page needs several of them",
+      "The origin sends the same popular file again for every viewer, so its bandwidth bill and load grow with the audience",
+      "A traffic spike, such as a launch or a viral video, goes straight to the origin and knocks it over",
+      "The origin is a single place and a single point of failure",
+      "Every user connection, including the slow ones, ties up origin servers"
+    ]
+  },
+  "nodes": [
+    {
+      "id": "users",
+      "label": "Users",
+      "kind": "client",
+      "x": 37,
+      "y": 88
+    },
+    {
+      "id": "origin",
+      "label": "Origin servers",
+      "kind": "data",
+      "x": 62,
+      "y": 88
+    },
+    {
+      "id": "router",
+      "label": "Anycast or geo DNS",
+      "kind": "edge",
+      "x": 12,
+      "y": 88,
+      "at": 1
+    },
+    {
+      "id": "pop",
+      "label": "Edge PoPs",
+      "kind": "edge",
+      "x": 37,
+      "y": 63,
+      "at": 1
+    },
+    {
+      "id": "shield",
+      "label": "Regional shield",
+      "kind": "edge",
+      "x": 62,
+      "y": 63,
+      "at": 2
+    },
+    {
+      "id": "rules",
+      "label": "Cache rules",
+      "kind": "compute",
+      "x": 12,
+      "y": 63,
+      "at": 3
+    },
+    {
+      "id": "disk",
+      "label": "Edge RAM and disk",
+      "kind": "data",
+      "x": 37,
+      "y": 37,
+      "at": 4
+    },
+    {
+      "id": "purge",
+      "label": "Purge API",
+      "kind": "edge",
+      "x": 62,
+      "y": 12,
+      "at": 5
+    },
+    {
+      "id": "bus",
+      "label": "Purge fan-out",
+      "kind": "async",
+      "x": 62,
+      "y": 37,
+      "at": 5
+    },
+    {
+      "id": "certs",
+      "label": "Certificate manager",
+      "kind": "compute",
+      "x": 12,
+      "y": 37,
+      "at": 6
+    },
+    {
+      "id": "backup",
+      "label": "Backup origin",
+      "kind": "data",
+      "x": 87,
+      "y": 88,
+      "at": 6
+    }
+  ],
+  "edges": [
+    {
+      "from": "users",
+      "to": "origin",
+      "at": 0,
+      "until": 1
+    },
+    {
+      "from": "users",
+      "to": "router",
+      "at": 1
+    },
+    {
+      "from": "router",
+      "to": "pop",
+      "at": 1
+    },
+    {
+      "from": "users",
+      "to": "pop",
+      "at": 1
+    },
+    {
+      "from": "pop",
+      "to": "origin",
+      "at": 1,
+      "until": 2
+    },
+    {
+      "from": "pop",
+      "to": "shield",
+      "at": 2
+    },
+    {
+      "from": "shield",
+      "to": "origin",
+      "at": 2
+    },
+    {
+      "from": "rules",
+      "to": "pop",
+      "at": 3
+    },
+    {
+      "from": "pop",
+      "to": "disk",
+      "at": 4
+    },
+    {
+      "from": "purge",
+      "to": "bus",
+      "at": 5
+    },
+    {
+      "from": "bus",
+      "to": "pop",
+      "at": 5
+    },
+    {
+      "from": "bus",
+      "to": "shield",
+      "at": 5
+    },
+    {
+      "from": "certs",
+      "to": "pop",
+      "at": 6
+    },
+    {
+      "from": "shield",
+      "to": "backup",
+      "at": 6
+    }
+  ],
+  "steps": [
+    {
+      "title": "Put caches near users and route each user to one",
+      "problem": "Distance is the cost. A round trip from Singapore to a data center in Virginia takes about 200 ms, and loading one page needs a DNS lookup, a TCP and TLS handshake and then the request itself.",
+      "fix": "Run points of presence (PoPs), each a rack of cache servers, in hundreds of cities, and keep copies of popular files there. A user must be sent to a nearby one. Two ways work. With DNS-based routing, the CDN's authoritative DNS answers with the address of a PoP chosen by the resolver's location and the current load, which lets the CDN steer by load and cost but is only as accurate as the resolver's location (a user on a public resolver may be mapped to the wrong city) and the answer is cached for its TTL. With anycast, every PoP announces the same IP address through BGP, and the internet's routing sends each packet to the closest announcer; it needs no DNS decisions and fails over by itself when a PoP stops announcing, but 'closest' means fewest network hops, not the lowest latency, and a route change in the middle of a TCP connection can send the rest of it to a different PoP. Many CDNs combine them: DNS picks a region, and anycast picks a PoP within it.",
+      "tradeoff": "Hits are answered in about 10 to 30 ms, and the origin is touched only on a miss. Each PoP now holds only the files its own users ask for, so a file that is wanted rarely is a miss in most PoPs, and the miss still travels to the far-away origin.",
+      "concepts": [
+        {
+          "slug": "cdn"
+        },
+        {
+          "slug": "dns"
+        },
+        {
+          "slug": "latency-and-round-trips"
+        },
+        {
+          "slug": "load-balancing"
+        },
+        {
+          "slug": "tcp-vs-udp"
+        }
+      ]
+    },
+    {
+      "title": "Add a regional shield so the origin sees each file once",
+      "problem": "With 300 PoPs and no tier above them, a file that is new or has just expired is a miss in every PoP that is asked for it, so the origin may receive hundreds of requests for the same file. When many users ask at the same moment, each of those misses also fetches separately.",
+      "fix": "Arrange the caches in tiers: edge PoPs, then a small number of regional shields (mid-tier caches), then the origin. A PoP that misses asks its regional shield, and only the shield goes to the origin. Hundreds of PoPs become a handful of origin fetchers per file, and the shield's cache is large because it serves the PoPs rather than users. On each miss the cache also coalesces requests: while a fetch for a key is in flight, the other requests for the same key wait for it instead of starting their own, so a thundering herd for one new object becomes one fetch. The shield keeps a pool of warm, persistent connections to the origin, which also speeds up requests that cannot be cached: the user's TLS handshake is short because the PoP is close, and the long distance is crossed over an already-open connection with a large TCP window.",
+      "tradeoff": "In the code sample for this study, adding a shield cut origin requests by about 85 percent, and coalescing took off another tenth. A miss now has an extra hop and the shield is another system to run and scale. A shield fetch is also a single point on the path, so each region needs more than one.",
+      "concepts": [
+        {
+          "slug": "caching"
+        },
+        {
+          "slug": "proxies"
+        },
+        {
+          "slug": "backpressure"
+        },
+        {
+          "slug": "http-versions"
+        },
+        {
+          "slug": "latency-and-round-trips"
+        }
+      ]
+    },
+    {
+      "title": "Decide what a request is, and how long a copy is good",
+      "problem": "Two requests for the same URL are not always the same request. One user wants a WebP image and another a JPEG, one is logged in and one is not, and a copy that was right an hour ago may be wrong now. Cache the wrong thing and one user sees another's page.",
+      "fix": "A cache key is built from the request details that change the answer: normally the host, the path and a normalised query string, plus any request headers the response names in its Vary header (for example Vary: Accept-Encoding, so gzip and Brotli copies are stored separately). Anything that does not change the answer, such as tracking parameters, is removed from the key, so it does not split the cache into copies. The origin's Cache-Control header sets freshness: max-age is the TTL, s-maxage is the TTL for shared caches, and private or no-store keeps a response out of the CDN completely. When a copy expires the cache does not simply throw it away: it asks the origin conditionally with If-None-Match and the stored ETag, and an unchanged file comes back as a 304 Not Modified with no body. With stale-while-revalidate the cache keeps serving the old copy while it refreshes in the background, and with stale-if-error it serves the old copy when the origin is failing.",
+      "tradeoff": "A long TTL gives a high hit ratio and a small origin bill, and a short one gives fresh content and more origin traffic. Customers set the rules, and rules written wrongly are the most common source of trouble: a key that is too narrow serves the wrong content, and a key that includes a cookie makes every user a miss.",
+      "concepts": [
+        {
+          "slug": "caching"
+        },
+        {
+          "slug": "cdn"
+        },
+        {
+          "slug": "http-versions"
+        },
+        {
+          "slug": "api-gateway"
+        }
+      ]
+    },
+    {
+      "title": "Store large files in pieces and evict by value",
+      "problem": "A 4 GB game download or an hour of video cannot be fetched whole before the first byte is sent, and a cache that holds a few huge files has no room for the thousands of small ones that make up most requests.",
+      "fix": "Treat a large object as a series of chunks of a fixed size, such as 2 MB. The edge answers a range request (Range: bytes=...) from the chunks it already has and fetches only the missing ones from the shield, starting to send the response as the first chunk arrives. Video is already cut into segments of a few seconds, each a small file with its own URL, which suits a CDN well. The edge keeps a small hot set in RAM and the rest on SSD. When space runs out it evicts by value: least recently used (LRU) removes what has gone longest unused; least frequently used (LFU) keeps what is requested often, and admission policies in front of it stop a one-time scan from pushing out the hot set; size-aware rules weigh the benefit of a hit against the space a file takes, because one 4 GB file costs as much room as 40,000 small images.",
+      "tradeoff": "Large files start playing quickly and a failed download resumes from the part that was lost. Cache metadata and the logic for range handling grow, and a partial file in the cache must never be served as if it were complete. Eviction is a bet: a policy that suits video can hurt a site of small images.",
+      "concepts": [
+        {
+          "slug": "caching"
+        },
+        {
+          "slug": "cdn"
+        },
+        {
+          "slug": "tcp-vs-udp"
+        },
+        {
+          "slug": "http-versions"
+        }
+      ]
+    },
+    {
+      "title": "Purge: tell every cache a file has changed",
+      "problem": "A customer fixes a wrong price or removes a file that must not be shown, and thousands of caches in hundreds of cities still hold the old copy for the rest of its TTL.",
+      "fix": "The customer calls a purge API with a URL, a tag or a prefix. The request is checked, written down, and published to a fan-out system that reaches every PoP and shield, either as messages on a persistent channel with each cache holding a connection to its nearest hub, or as a stream each cache follows. Each cache marks the matching copies as expired, so the next request revalidates or fetches them. Purging by surrogate key (a tag the origin put on the response, such as product-1042) removes a whole group of files with one call, which is far easier than listing URLs. The purge message carries an ID, and a cache that was disconnected asks for the purges it missed when it reconnects. Soft purge marks a copy stale rather than deleting it, so it can still be served while the fresh copy is fetched. Versioned file names, such as app.4f9c1.js, avoid the need to purge at all: a new version is a new URL.",
+      "tradeoff": "A purge reaches most PoPs in one or two seconds, and versioned URLs make it unnecessary for static assets. But a purge is not free: a hard purge of a popular file sends every PoP back to the origin at once, and a PoP that missed the message holds a stale copy until the TTL expires, so the TTL must stay as the safety net.",
+      "concepts": [
+        {
+          "slug": "pub-sub"
+        },
+        {
+          "slug": "message-queues"
+        },
+        {
+          "slug": "caching"
+        },
+        {
+          "slug": "gossip-protocol"
+        },
+        {
+          "slug": "backpressure"
+        }
+      ]
+    },
+    {
+      "title": "Terminate TLS at the edge, survive failures and resist attack",
+      "problem": "Users reach the CDN over HTTPS for the customer's own domain, so the edge must hold a certificate for it. Origins fail and attackers send requests designed to harm the cache or the origin.",
+      "fix": "The edge terminates TLS: the handshake is with the PoP, which is close, so it costs one short round trip rather than a long one. A certificate manager gets and renews a certificate for each customer domain, for example through ACME, and distributes it to PoPs, with the private keys kept in a hardware or encrypted store and loaded into memory on demand. The connection from the edge to the origin is also encrypted, and the edge checks the origin's certificate. An origin that stops responding is marked down by health checks and the shield switches to a backup origin, and with stale-if-error it keeps serving the old copy meanwhile. For attacks, the cache key uses only what the customer allows, unkeyed headers such as X-Forwarded-Host are not reflected into cacheable responses, error responses are not cached for long, and request smuggling is blocked by strict parsing. A rate limiter and a web application firewall at the edge absorb floods before they reach the shield, and since the CDN has far more bandwidth than any one origin, it absorbs volumetric DDoS traffic.",
+      "tradeoff": "Users get fast and encrypted connections, and the origin can survive failures and attacks by hiding behind the CDN. The CDN now holds customers' private keys and sees their traffic in the clear, which makes it a high-value target, and cache poisoning bugs affect every user of a poisoned key at once.",
+      "concepts": [
+        {
+          "slug": "tls-and-https"
+        },
+        {
+          "slug": "secrets-management"
+        },
+        {
+          "slug": "health-checks"
+        },
+        {
+          "slug": "multi-region-failover"
+        },
+        {
+          "slug": "rate-limiting"
+        },
+        {
+          "slug": "injection-and-xss"
+        }
+      ]
+    }
+  ],
+  "failures": [
+    {
+      "scenario": "The origin goes down",
+      "impact": "Every miss and every expiry fails, and with a short TTL the site goes dark within minutes.",
+      "answer": "Hits keep working. Health checks mark the origin down and the shield tries the backup origin. With stale-if-error the caches serve the expired copy for hours instead of an error, and the shield uses a circuit breaker so it does not hammer a sick origin with retries. A longer TTL on static files gives more time.",
+      "concepts": [
+        {
+          "slug": "circuit-breaker"
+        },
+        {
+          "slug": "health-checks"
+        },
+        {
+          "slug": "multi-region-failover"
+        },
+        {
+          "slug": "retries-and-backoff"
+        }
+      ]
+    },
+    {
+      "scenario": "A popular file expires and a million users ask for it in the same second",
+      "impact": "Every PoP misses at once, and without protection each request opens its own fetch to the origin: a thundering herd.",
+      "answer": "Each cache coalesces requests for the same key, so a PoP sends one fetch and the shield sends one. With stale-while-revalidate the file is refreshed a little before it is needed, and the TTL gets a small random jitter so that copies in different PoPs do not all expire together.",
+      "concepts": [
+        {
+          "slug": "caching"
+        },
+        {
+          "slug": "backpressure"
+        },
+        {
+          "slug": "rate-limiting"
+        },
+        {
+          "slug": "retries-and-backoff"
+        }
+      ]
+    },
+    {
+      "scenario": "A PoP fails or is cut off from the network",
+      "impact": "Users sent to it get errors, and its cache is cold when it comes back.",
+      "answer": "With anycast, a PoP that stops announcing its route is dropped by the network within seconds, and its traffic flows to the next closest. With DNS routing, health checks remove it from the answers, and users recover as their cached answers expire. The nearby PoPs absorb the load from capacity set aside for this, and the recovering PoP warms up from the shield, not from the origin.",
+      "concepts": [
+        {
+          "slug": "dns"
+        },
+        {
+          "slug": "health-checks"
+        },
+        {
+          "slug": "load-balancing"
+        },
+        {
+          "slug": "bulkhead"
+        }
+      ]
+    },
+    {
+      "scenario": "An attacker poisons the cache",
+      "impact": "A request with a malicious header makes the origin return a bad response, which the CDN stores under the normal key and serves to all users.",
+      "answer": "The key includes everything that changes the response, headers that the origin reflects but the key ignores are stripped before the request is forwarded, error responses and redirects are not cached for long, and only the methods and status codes that are meant to be cached are stored. A purge removes the bad copy, and responses with a user's cookie or authorization header are not shared.",
+      "concepts": [
+        {
+          "slug": "injection-and-xss"
+        },
+        {
+          "slug": "caching"
+        },
+        {
+          "slug": "authentication-and-authorization"
+        },
+        {
+          "slug": "alerting"
+        }
+      ]
+    },
+    {
+      "scenario": "A customer purges everything during peak hours",
+      "impact": "The next requests are all misses, so the origin receives the full traffic of the site at once.",
+      "answer": "Purges apply as soft purges where possible, so stale copies keep serving while refreshes trickle in. The shield absorbs and coalesces the refills, and the CDN can limit how fast it refills from a customer's origin. A customer who purges everything is asked to prefer versioned file names and to purge by tag.",
+      "concepts": [
+        {
+          "slug": "backpressure"
+        },
+        {
+          "slug": "rate-limiting"
+        },
+        {
+          "slug": "caching"
+        },
+        {
+          "slug": "autoscaling"
+        }
+      ]
+    }
+  ],
+  "alternatives": [
+    {
+      "title": "How to route users to a PoP",
+      "options": [
+        {
+          "name": "DNS-based geo routing",
+          "pro": "Can pick by load, cost and health, and the CDN controls each answer",
+          "con": "Depends on the resolver's location, and clients keep an answer until its TTL ends"
+        },
+        {
+          "name": "Anycast",
+          "pro": "One address everywhere, quick failover and good spread of DDoS traffic",
+          "con": "Closest by network path is not always the fastest, and routes can change in the middle of a connection"
+        },
+        {
+          "name": "Both: DNS picks a region, anycast picks a PoP",
+          "pro": "Control where it matters, and fast recovery",
+          "con": "More moving parts to operate"
+        }
+      ],
+      "pick": "Anycast for the entry point, with DNS steering when a region needs to be drained or load balanced."
+    },
+    {
+      "title": "How many cache tiers",
+      "options": [
+        {
+          "name": "Edge only",
+          "pro": "Simple, and a miss costs one hop to the origin",
+          "con": "Origin load grows with the number of PoPs, and the long tail is always a miss"
+        },
+        {
+          "name": "Edge plus a regional shield",
+          "pro": "The origin sees each file about once per region",
+          "con": "An extra hop on a miss and another tier to run"
+        },
+        {
+          "name": "Edge, regional shield and a global tier",
+          "pro": "The origin sees each file about once",
+          "con": "Misses get slower, and more places can hold stale copies"
+        }
+      ],
+      "pick": "Edge plus a regional shield. A third tier is worth it only for very large catalogs with a long tail."
+    },
+    {
+      "title": "How to invalidate content",
+      "options": [
+        {
+          "name": "Wait for the TTL",
+          "pro": "Free, and cannot overload the origin",
+          "con": "Stale content for as long as the TTL"
+        },
+        {
+          "name": "Purge by URL, tag or prefix",
+          "pro": "Fresh in seconds",
+          "con": "A burst of origin requests after it, and a cache may miss the message"
+        },
+        {
+          "name": "Versioned URLs",
+          "pro": "Never needs a purge and allows a very long TTL",
+          "con": "Works for assets, not for pages whose address must stay the same"
+        }
+      ],
+      "pick": "Versioned URLs with a one-year TTL for assets, and short TTLs with tag-based purge for pages."
+    },
+    {
+      "title": "Which eviction policy",
+      "options": [
+        {
+          "name": "LRU",
+          "pro": "Simple, and follows recent demand",
+          "con": "One scan over many rarely used files pushes the hot set out"
+        },
+        {
+          "name": "LFU with admission control",
+          "pro": "Keeps what is popular over time, and ignores one-hit wonders",
+          "con": "Slow to notice that popularity has changed"
+        },
+        {
+          "name": "Size-aware (such as GDSF)",
+          "pro": "Fits more small, popular files by not letting large ones take the room",
+          "con": "More tuning, and large files are more often a miss"
+        }
+      ],
+      "pick": "A size-aware policy with admission control, so a file is stored the second time it is asked for."
+    }
+  ],
+  "roles": [
+    {
+      "id": "client",
+      "label": "Users",
+      "description": "Browsers and apps that request files."
+    },
+    {
+      "id": "edge",
+      "label": "Edge and routing",
+      "description": "DNS or anycast routing, PoPs, shields and the purge API."
+    },
+    {
+      "id": "async",
+      "label": "Purge fan-out",
+      "description": "Delivers purge messages to every cache."
+    },
+    {
+      "id": "compute",
+      "label": "Control plane",
+      "description": "Customer cache rules and certificate management."
+    },
+    {
+      "id": "data",
+      "label": "Storage",
+      "description": "Origin servers, backup origin, and the RAM and disk of each cache."
+    }
+  ]
+}

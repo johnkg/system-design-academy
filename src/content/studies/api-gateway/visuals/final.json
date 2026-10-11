@@ -1,0 +1,53 @@
+{
+  "actors": [
+    { "id": "control", "label": "Control plane", "role": "async", "x": 14, "y": 16 },
+    { "id": "redis", "label": "Shared counters", "role": "data", "x": 50, "y": 16 },
+    { "id": "logs", "label": "Log and trace queue", "role": "async", "x": 86, "y": 16 },
+    { "id": "client", "label": "Partner app (consumer acme)", "role": "client", "x": 14, "y": 50 },
+    { "id": "gateway", "label": "Gateway instance 4 of 9", "role": "edge", "x": 50, "y": 50 },
+    { "id": "podA", "label": "orders v1, pod A", "role": "compute", "x": 86, "y": 50 },
+    { "id": "podB", "label": "orders v1, pod B", "role": "compute", "x": 86, "y": 84 }
+  ],
+  "frames": [
+    {
+      "narration": "Earlier, the control plane pushed route table version 118, which sends 95 percent of /orders traffic to v1 and 5 percent to a canary. The gateway built the new table beside the old one, swapped it in, and acknowledged. Requests already in flight finished on the old table, and no connection was dropped.",
+      "messages": [{ "from": "control", "to": "gateway", "label": "route table v118" }, { "from": "gateway", "to": "control", "label": "ack v118" }],
+      "states": { "gateway": "v118 live" }
+    },
+    {
+      "narration": "The partner app sends GET /v1/orders/42 with a signed token. It reuses an open HTTP/2 connection, so there is no new TCP or TLS handshake. The gateway terminates TLS and decrypts the request.",
+      "messages": [{ "from": "client", "to": "gateway", "label": "GET /v1/orders/42 + token" }],
+      "states": { "gateway": "TLS terminated" }
+    },
+    {
+      "narration": "The route table matches host api.example.com and the prefix /v1/orders to the orders-v1 cluster, in about 0.01 ms. The authentication plugin checks the token signature against the cached public key and the expiry, in about 0.08 ms, with no call to the identity provider. The consumer is acme.",
+      "states": { "gateway": "route found, acme authenticated" },
+      "highlight": ["gateway"]
+    },
+    {
+      "narration": "The rate limit plugin counts acme's request in memory, in about 0.01 ms. Every 100 ms the instance sends its count to the shared store and gets the total back. The latest total is 412 of acme's 1,000 per second, so the request is allowed.",
+      "messages": [{ "from": "gateway", "to": "redis", "label": "acme +37 in 100 ms" }, { "from": "redis", "to": "gateway", "label": "acme total 412 of 1,000" }],
+      "states": { "redis": "acme 412 / 1,000 per s" }
+    },
+    {
+      "narration": "The cache lookup takes about 0.02 ms and misses, so the request goes upstream. Pod A has 3 outstanding requests and pod B has 5, so the least-outstanding rule picks pod A. The gateway sends the request on a pooled connection, with a trace id added.",
+      "messages": [{ "from": "gateway", "to": "podA", "label": "GET /orders/42, trace t-7f" }],
+      "states": { "gateway": "cache miss, pod A chosen" }
+    },
+    {
+      "narration": "Pod A answers 503 after 6 ms. A GET is idempotent, so a retry is safe. Over the last 10 seconds the gateway has made 4 retries for each 100 requests, which is under the 10 percent retry budget, so a retry is allowed. The gateway also counts one error against pod A for outlier detection.",
+      "messages": [{ "from": "podA", "to": "gateway", "label": "503" }],
+      "states": { "podA": "1 error counted", "gateway": "retries 4% of requests, budget 10%" }
+    },
+    {
+      "narration": "The retry goes to a different instance, pod B, with a per-try timeout of 200 ms. Pod B answers in 38 ms.",
+      "messages": [{ "from": "gateway", "to": "podB", "label": "retry GET /orders/42" }, { "from": "podB", "to": "gateway", "label": "200 OK" }]
+    },
+    {
+      "narration": "The response plugin removes an internal header, and the answer goes back to the caller over the same connection. The access log record and the trace span are put on a queue and sent in batches by a background thread. The gateway itself added about 0.30 ms: 0.01 routing, 0.08 token check, 0.01 rate limit, 0.02 cache lookup, 0.15 proxy hop, 0.02 response changes and 0.01 queueing the log. The 6 ms spent on the failed try is not gateway overhead.",
+      "messages": [{ "from": "gateway", "to": "client", "label": "200 OK" }, { "from": "gateway", "to": "logs", "label": "log + span (batched)" }],
+      "states": { "client": "got the order", "logs": "record queued" },
+      "highlight": ["client"]
+    }
+  ]
+}

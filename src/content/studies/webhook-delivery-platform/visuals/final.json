@@ -1,0 +1,205 @@
+{
+  "actors": [
+    {
+      "id": "billing",
+      "label": "Billing service",
+      "role": "client",
+      "x": 14,
+      "y": 16
+    },
+    {
+      "id": "log",
+      "label": "Event log",
+      "role": "async",
+      "x": 50,
+      "y": 16
+    },
+    {
+      "id": "fan",
+      "label": "Fan-out worker",
+      "role": "compute",
+      "x": 86,
+      "y": 16
+    },
+    {
+      "id": "dlog",
+      "label": "Delivery log",
+      "role": "data",
+      "x": 14,
+      "y": 50
+    },
+    {
+      "id": "worker",
+      "label": "Delivery worker",
+      "role": "compute",
+      "x": 50,
+      "y": 50
+    },
+    {
+      "id": "queue",
+      "label": "Queue for endpoint A",
+      "role": "async",
+      "x": 86,
+      "y": 50
+    },
+    {
+      "id": "egress",
+      "label": "Egress proxy",
+      "role": "edge",
+      "x": 50,
+      "y": 84
+    },
+    {
+      "id": "customer",
+      "label": "Customer endpoint A",
+      "role": "client",
+      "x": 86,
+      "y": 84
+    }
+  ],
+  "frames": [
+    {
+      "narration": "An invoice is paid. Billing writes the event evt_5001, of type invoice.paid, to the event log in the same transaction as the payment. Once the log has stored it safely, the event can no longer be lost, and billing carries on without waiting for any customer.",
+      "messages": [
+        {
+          "from": "billing",
+          "to": "log",
+          "label": "evt_5001 invoice.paid"
+        }
+      ],
+      "states": {
+        "log": "evt_5001 stored"
+      }
+    },
+    {
+      "narration": "A fan-out worker reads the event and looks up the subscriptions of this customer for invoice.paid. It finds 2 endpoints, A and B, and writes one delivery job for each into that endpoint's own queue. A platform-wide event with thousands of subscribers does the same in parallel chunks.",
+      "messages": [
+        {
+          "from": "log",
+          "to": "fan",
+          "label": "evt_5001"
+        },
+        {
+          "from": "fan",
+          "to": "queue",
+          "label": "job: evt_5001 to A"
+        }
+      ],
+      "states": {
+        "fan": "2 jobs written",
+        "queue": "1 job waiting"
+      }
+    },
+    {
+      "narration": "A delivery worker takes the job. Endpoint A has 0 requests in flight and a limit of 3, and its breaker is closed, so the call may go ahead. The worker signs the body: a timestamp plus an HMAC-SHA256 of the timestamp and the body. It adds the event id evt_5001 as a header.",
+      "messages": [
+        {
+          "from": "queue",
+          "to": "worker",
+          "label": "job for A"
+        }
+      ],
+      "states": {
+        "worker": "signed, attempt 1"
+      },
+      "highlight": [
+        "worker"
+      ]
+    },
+    {
+      "narration": "The request leaves through the egress proxy. The proxy resolves the name, checks that the address is public, and connects to exactly that address over https. A private or metadata address would be refused here.",
+      "messages": [
+        {
+          "from": "worker",
+          "to": "egress",
+          "label": "POST to A"
+        },
+        {
+          "from": "egress",
+          "to": "customer",
+          "label": "signed request"
+        }
+      ],
+      "states": {
+        "egress": "address is public"
+      }
+    },
+    {
+      "narration": "The customer's server is restarting and answers 503 after 120 ms. The worker writes attempt 1 to the delivery log and counts one failure for the breaker, which would open at 5 in a row. It schedules a retry for 3 seconds later, a random delay between 0 and 5 seconds.",
+      "messages": [
+        {
+          "from": "customer",
+          "to": "worker",
+          "label": "503"
+        },
+        {
+          "from": "worker",
+          "to": "dlog",
+          "label": "attempt 1: 503, 120 ms"
+        }
+      ],
+      "states": {
+        "dlog": "1 attempt logged",
+        "worker": "retry in 3 s"
+      }
+    },
+    {
+      "narration": "Three seconds later the job is back at the head of the queue. The worker sends it again with the same event id, a new timestamp and a new signature. This time the customer verifies the signature, stores evt_5001, and answers 200 in 90 ms.",
+      "messages": [
+        {
+          "from": "queue",
+          "to": "worker",
+          "label": "retry, attempt 2"
+        },
+        {
+          "from": "worker",
+          "to": "egress",
+          "label": "POST, same event id"
+        },
+        {
+          "from": "egress",
+          "to": "customer",
+          "label": "signed request"
+        },
+        {
+          "from": "customer",
+          "to": "worker",
+          "label": "200"
+        }
+      ],
+      "states": {
+        "customer": "evt_5001 stored",
+        "worker": "delivered"
+      }
+    },
+    {
+      "narration": "Attempt 2 is written to the delivery log, and the job is finished. If the first attempt had been processed and only the answer lost, this second request would carry the same event id, and the customer would recognise it and ignore it.",
+      "messages": [
+        {
+          "from": "worker",
+          "to": "dlog",
+          "label": "attempt 2: 200, 90 ms"
+        }
+      ],
+      "states": {
+        "dlog": "2 attempts, delivered"
+      },
+      "highlight": [
+        "dlog"
+      ]
+    },
+    {
+      "narration": "Next day the customer finds a bug in their handler and presses replay for evt_5001 in the dashboard. The platform reads the event from the log, queues a new job for endpoint A with the same id, and the cycle runs again.",
+      "messages": [
+        {
+          "from": "dlog",
+          "to": "queue",
+          "label": "replay evt_5001"
+        }
+      ],
+      "states": {
+        "queue": "1 job waiting"
+      }
+    }
+  ]
+}

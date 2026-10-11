@@ -1,0 +1,191 @@
+---
+import PlaygroundShell from '../../components/PlaygroundShell.astro';
+---
+<PlaygroundShell title="Break the gateway" hint="One stream of requests goes through the plugin chain. Change what each plugin does, the number of gateway instances and the speed of the upstream service, and watch the delay, the load on the backends, the accuracy of the quota and a retry storm.">
+  <ol class="how">
+    <li>The default setting is the naive design. <b>Auth by calling the identity service</b> adds about <b>4 ms</b> to every request and puts <b>20,000 calls a second</b> on that service. Switch to <b>local JWT verification</b> and the added delay falls to about <b>0.3 ms</b>, with no load on the identity service.</li>
+    <li>With <b>local counters, whole limit on each instance</b>, the abusive consumer (3,000 requests a second against a limit of 1,000) gets <b>all 3,000</b> through on 8 instances. A <b>central counter</b> admits exactly 1,000 but adds a Redis call to every request. <b>Local counters with a 100 ms sync</b> admit about 1,200 (20% over) with about 7,300 Redis commands a second instead of 20,000. <b>Even split</b> is accurate for the abuser but wrongly rejects 12 of the 900 requests of a well-behaved consumer.</li>
+    <li>Slow the upstream down <b>3 times</b> with <b>3 retries and no budget</b>: the upstream sees up to <b>3.8 times</b> its normal load and only <b>17%</b> of requests succeed, against 35% with no retries at all, and it needs another 2.4 s to recover. Choose <b>retries with a 10% budget</b> and the load peaks at 1.2 times, with 34% succeeding. Turn the <b>cache</b> on with a 2 times slowdown and the upstream sees 40% of the traffic, so 100% of requests succeed.</li>
+  </ol>
+  <div class="pg agb" data-agb>
+    <div class="pg-row">
+      <label>Authentication <select class="pg-in" data-auth>
+        <option value="remote" selected>call the identity service for every request</option>
+        <option value="jwt">verify the JWT locally</option>
+      </select></label>
+      <label>Rate limit <select class="pg-in" data-limit>
+        <option value="central">central counter on every request</option>
+        <option value="local" selected>local counters, whole limit on each instance</option>
+        <option value="split">local counters, limit split evenly</option>
+        <option value="sync">local counters, sync every 100 ms</option>
+      </select></label>
+      <label>Response cache <select class="pg-in" data-cache>
+        <option value="off" selected>off</option>
+        <option value="on">on (60% of requests hit it)</option>
+      </select></label>
+    </div>
+    <div class="pg-row">
+      <label>Gateway instances <input type="range" min="1" max="32" value="8" data-n /> <b data-nval></b></label>
+      <label>Traffic (requests per second) <input type="range" min="5000" max="40000" step="5000" value="20000" data-traffic /> <b data-tval></b></label>
+      <label>Upstream slowdown <input type="range" min="1" max="10" value="3" data-k /> <b data-kval></b></label>
+      <label>Retries <select class="pg-in" data-retry>
+        <option value="none">none</option>
+        <option value="retry" selected>up to 3, no budget</option>
+        <option value="budget">up to 3, within a 10% budget</option>
+      </select></label>
+    </div>
+    <div class="pg-grid">
+      <div class="pg-box" data-b1><h3>Added latency per request</h3><span class="pg-mono" data-o1></span><span class="pg-note" data-n1></span></div>
+      <div class="pg-box" data-b2><h3>Load on the backends</h3><span class="pg-mono" data-o2></span><span class="pg-note" data-n2></span></div>
+      <div class="pg-box" data-b3><h3>Rate-limit accuracy</h3><span class="pg-mono" data-o3></span><span class="pg-note" data-n3></span></div>
+      <div class="pg-box" data-b4><h3>While the upstream is slow</h3><span class="pg-mono" data-o4></span><span class="pg-note" data-n4></span></div>
+    </div>
+    <svg viewBox="0 0 300 90" role="img" data-svg aria-label="Attempts reaching the upstream and successful requests over 10 seconds, relative to normal load" style="width:100%;max-height:170px">
+      <rect data-win x="67.8" y="8" width="144.4" height="66" fill="var(--accent-soft)" opacity="0.5"></rect>
+      <line x1="10" y1="74" x2="296" y2="74" stroke="var(--muted)" stroke-width="0.6"></line>
+      <line data-one x1="10" y1="60" x2="296" y2="60" stroke="var(--muted)" stroke-width="0.4" stroke-dasharray="2 3"></line>
+      <polyline data-load fill="none" stroke="var(--bad)" stroke-width="1.6" points=""></polyline>
+      <polyline data-ok fill="none" stroke="var(--accent)" stroke-width="1.6" points=""></polyline>
+      <text x="12" y="11" font-size="6" fill="var(--muted)" data-top></text>
+      <text x="12" y="58" font-size="6" fill="var(--muted)">normal load</text>
+      <text x="69" y="86" font-size="6" fill="var(--muted)">slowdown from 2 s to 7 s</text>
+      <text x="296" y="86" font-size="6" text-anchor="end" fill="var(--muted)">10 s</text>
+      <line x1="170" y1="9" x2="182" y2="9" stroke="var(--bad)" stroke-width="1.6"></line>
+      <text x="185" y="11" font-size="6" fill="var(--text)">attempts sent to the upstream</text>
+      <line x1="170" y1="18" x2="182" y2="18" stroke="var(--accent)" stroke-width="1.6"></line>
+      <text x="185" y="20" font-size="6" fill="var(--text)">successful requests</text>
+    </svg>
+    <p class="pg-out" data-verdict aria-live="polite"></p>
+    <p class="pg-note">Model and assumptions: a gateway instance handles 6,000 requests per second with the chain on, and queueing delay grows sharply above about 80% busy. Proxying and routing cost 0.16 ms, response changes and logging 0.03 ms, a local JWT check 0.08 ms, a cache lookup 0.02 ms, a local counter 0.01 ms. The identity service answers in 0.5 ms behind a 1.5 ms round trip and handles 25,000 calls per second with no caching of its answers. A Redis call costs 0.4 ms plus queueing and Redis handles 100,000 operations per second. A synced limiter sends one batch of changed counters per instance every 100 ms for 100 active consumers. Quota test: one abusive consumer sends 3,000 requests in one second against a limit of 1,000, a well-behaved one sends 900, and the load balancer picks a random instance for each request. The upstream is sized for 1.2 times the normal request rate (2,400 units of work per 100 ms at 20,000 requests a second), a request costs as many units as the slowdown factor, and refusing an attempt costs 0.2 units. A request that is rejected can be tried again 100 ms later, up to 3 times. Each attempt also fails by chance 2% of the time, which is what retries are good for. Retry budget: retries up to 10% of the new requests, with a burst allowance of two intervals. Requests failed by the gateway or the identity service are not subtracted from the upstream load. The slowdown lasts from 2 s to 7 s.</p>
+  </div>
+</PlaygroundShell>
+<script>
+  document.querySelectorAll<HTMLElement>('[data-agb]').forEach((root) => {
+    const q = <T extends HTMLElement | SVGElement>(s: string) => root.querySelector<T>(s)!;
+    const GW_CAP = 6000, AUTH_CAP = 25000, REDIS_CAP = 100000, CONSUMERS = 100, LIMIT = 1000;
+    const fmt = (n: number) => Math.round(n).toLocaleString('en-US');
+    const ms = (n: number) => (n < 10 ? n.toFixed(2) : n < 100 ? n.toFixed(1) : String(Math.round(n)));
+    const lcg = (s: number) => () => (s = (s * 1664525 + 1013904223) % 4294967296) / 4294967296;
+
+    // Rate limiting: one second in 100 ticks. The abusive consumer sends 30 requests a tick, the well-behaved one 9, each to a random instance.
+    function limiter(mode: string, n: number) {
+      const rnd = lcg(77); const mk = () => new Array(n).fill(0);
+      const loc: Record<string, number[]> = { a: mk(), l: mk() }; const snap: Record<string, number[]> = { a: mk(), l: mk() };
+      const glob: Record<string, number> = { a: 0, l: 0 }; const adm: Record<string, number> = { a: 0, l: 0 };
+      const split = Math.floor(LIMIT / n);
+      for (let t = 0; t < 100; t++) {
+        if (mode === 'sync' && t % 10 === 0) for (const k of ['a', 'l']) { for (let i = 0; i < n; i++) { glob[k] += loc[k][i]; loc[k][i] = 0; } snap[k].fill(glob[k]); }
+        for (const [k, per] of [['a', 30], ['l', 9]] as [string, number][]) for (let j = 0; j < per; j++) {
+          const i = Math.floor(rnd() * n); let ok: boolean;
+          if (mode === 'central') { ok = glob[k] < LIMIT; if (ok) glob[k]++; }
+          else { ok = mode === 'local' ? loc[k][i] < LIMIT : mode === 'split' ? loc[k][i] < split : snap[k][i] + loc[k][i] < LIMIT; if (ok) loc[k][i]++; }
+          if (ok) adm[k]++;
+        }
+      }
+      return { abuser: adm.a, rejectedGood: 900 - adm.l };
+    }
+
+    // Retry storm: 100 intervals of 100 ms. The upstream has 0.12 units of work per request per second of traffic (2,400 at 20,000 a second), a request costs `slow` units, and refusing an attempt costs 0.2.
+    function storm(policy: string, slow: number, traffic: number, hit: number) {
+      const A = (traffic * (1 - hit)) / 10; const B = traffic * 0.12; const REJ = 0.2; const LV = 4;
+      let att: number[] = new Array(LV).fill(0); let tokens = 0; let okSum = 0; let newSum = 0; let peak = 1; let recover = -1;
+      const load: number[] = []; const good: number[] = [];
+      for (let t = 0; t < 100; t++) {
+        const f = t >= 20 && t < 70 ? slow : 1;
+        att[0] = A; const X = att.reduce((a, b) => a + b, 0);
+        const served = Math.max(0, Math.min(X, (B - REJ * X) / (f - REJ))); const p = X === 0 ? 1 : served / X; const succ = p * 0.98;
+        tokens = Math.min(tokens + 0.1 * A, 0.2 * A);
+        const next: number[] = new Array(LV).fill(0);
+        if (policy !== 'none') {
+          const fail = att.map((a) => a * (1 - succ)); const eligible = fail.slice(0, LV - 1).reduce((a, b) => a + b, 0);
+          const r = policy === 'budget' ? (eligible > 0 ? Math.min(1, tokens / eligible) : 0) : 1;
+          for (let l = 0; l < LV - 1; l++) next[l + 1] = fail[l] * r;
+          if (policy === 'budget') tokens -= eligible * r;
+        }
+        const ok = X * succ; load.push(X / A); good.push(ok / A);
+        if (t >= 20 && t < 70) { okSum += ok; newSum += A; peak = Math.max(peak, X / A); }
+        if (t >= 70 && recover < 0 && ok / A > 0.95 && X / A < 1.1) recover = t - 70;
+        att = next;
+      }
+      return { success: okSum / newSum, peak, recover, load, good };
+    }
+
+    function model(c: { auth: string; limit: string; cache: boolean; n: number; traffic: number; k: number; retry: string }) {
+      const rhoG = c.traffic / (c.n * GW_CAP); const queue = rhoG >= 1 ? 20 : Math.min(20, 1 + Math.pow(rhoG, 4) / (1 - rhoG));
+      const gwFail = rhoG >= 1 ? 1 - 1 / rhoG : 0;
+      const cpu = (0.16 + 0.03 + (c.auth === 'jwt' ? 0.08 : 0) + (c.cache ? 0.02 : 0) + (c.limit === 'central' ? 0 : 0.01)) * queue;
+      const rhoA = c.auth === 'remote' ? c.traffic / AUTH_CAP : 0;
+      const authFail = rhoA >= 1 ? 1 - 1 / rhoA : 0;
+      const authMs = c.auth === 'jwt' ? 0 : rhoA >= 1 ? 100 : Math.min(100, 1.5 + 0.5 / (1 - rhoA));
+      const distinct = (r: number) => CONSUMERS * (1 - Math.exp(-r / CONSUMERS));
+      const redisOps = c.limit === 'central' ? c.traffic : c.limit === 'sync' ? c.n * 10 * distinct(c.traffic / c.n / 10) : 0;
+      const rhoR = redisOps / REDIS_CAP;
+      const limMs = c.limit === 'central' ? 0.4 + 0.1 / (1 - Math.min(rhoR, 0.99)) : 0;
+      const total = cpu + authMs + limMs;
+      const lq = limiter(c.limit, c.n); const st = storm(c.retry, c.k, c.traffic, c.cache ? 0.6 : 0);
+      const rhoLose = c.n > 1 ? c.traffic / ((c.n - 1) * GW_CAP) : Infinity;
+      return { rhoG, gwFail, cpu, rhoA, authFail, authMs, redisOps, rhoR, limMs, total, lq, st, rhoLose };
+    }
+
+    const byId = (s: string) => q<HTMLSelectElement>(s).value;
+    const num = (s: string) => Number(q<HTMLInputElement>(s).value);
+    const lineOf = (v: number[], max: number) => v.map((y, i) => `${(10 + (i * 286) / 99).toFixed(1)},${(74 - (Math.min(y, max) / max) * 64).toFixed(1)}`).join(' ');
+    let frame = 0;
+    function draw() {
+      const c = { auth: byId('[data-auth]'), limit: byId('[data-limit]'), cache: byId('[data-cache]') === 'on', n: num('[data-n]'), traffic: num('[data-traffic]'), k: num('[data-k]'), retry: byId('[data-retry]') };
+      q('[data-nval]').textContent = String(c.n); q('[data-tval]').textContent = fmt(c.traffic); q('[data-kval]').textContent = `${c.k}x`;
+      const m = model(c);
+      const set = (id: string, color: string) => q<HTMLElement>(id).style.setProperty('--c', color);
+      const budget = 1;
+
+      // 1: delay
+      q('[data-o1]').textContent = `${ms(m.total)} ms`;
+      q('[data-n1]').textContent = `proxy and plugins ${ms(m.cpu)} ms, auth ${ms(m.authMs)} ms, rate limit call ${ms(m.limMs)} ms` + (m.authFail > 0 || m.gwFail > 0 ? `; ${Math.round(100 * (1 - (1 - m.authFail) * (1 - m.gwFail)))}% of requests fail` : '');
+      set('[data-b1]', m.total <= budget && m.gwFail === 0 ? 'var(--good)' : 'var(--bad)');
+
+      // 2: backend load
+      const parts = [
+        c.auth === 'remote' ? `identity service ${fmt(c.traffic)}/s (${Math.round(m.rhoA * 100)}% of capacity)` : 'identity service 0/s',
+        `Redis ${fmt(m.redisOps)}/s (${Math.round(m.rhoR * 100)}%)`,
+      ];
+      q('[data-o2]').textContent = parts.join('; ');
+      q('[data-n2]').textContent = `each gateway instance ${Math.round(m.rhoG * 100)}% busy; ` + (c.n === 1 ? 'with one instance, its failure is a total outage' : `if one instance dies the other ${c.n - 1} run at ${Math.round(m.rhoLose * 100)}%`);
+      set('[data-b2]', m.rhoA >= 0.9 || m.rhoG >= 0.8 || m.rhoLose >= 1 ? 'var(--bad)' : 'var(--good)');
+
+      // 3: quota accuracy
+      const over = Math.round(((m.lq.abuser - LIMIT) / LIMIT) * 100);
+      q('[data-o3]').textContent = `abuser: ${fmt(m.lq.abuser)} of 3,000 admitted, limit ${fmt(LIMIT)}`;
+      q('[data-n3]').textContent = `${over > 0 ? `${over}% over the limit` : over < 0 ? `${-over}% under the limit` : 'exactly at the limit'}; ${m.lq.rejectedGood} of 900 requests from a well-behaved consumer wrongly rejected`;
+      set('[data-b3]', over > 25 || m.lq.rejectedGood > 0 ? 'var(--bad)' : over > 5 ? 'var(--accent)' : 'var(--good)');
+
+      // 4: slow upstream
+      const s = m.st;
+      q('[data-o4]').textContent = c.k === 1 ? 'no slowdown' : `${(s.success * 100).toFixed(0)}% of requests succeed, upstream load up to ${s.peak.toFixed(1)}x`;
+      q('[data-n4]').textContent = c.k === 1 ? `normal operation: ${(s.success * 100).toFixed(0)}% succeed because 2% of attempts fail by chance` : s.recover <= 1 ? 'back to normal as soon as the slowdown ends' : `after the slowdown ends it needs ${(s.recover / 10).toFixed(1)} s more to recover`;
+      set('[data-b4]', c.k === 1 || (s.success > 0.9) ? 'var(--good)' : s.success > 0.5 ? 'var(--accent)' : 'var(--bad)');
+
+      const top = 4.2;
+      q('[data-load]').setAttribute('points', lineOf(s.load, top)); q('[data-ok]').setAttribute('points', lineOf(s.good, top));
+      q('[data-top]').textContent = `${top.toFixed(1)}x normal`;
+      q<SVGElement>('[data-one]').setAttribute('y1', String(74 - (1 / top) * 64)); q<SVGElement>('[data-one]').setAttribute('y2', String(74 - (1 / top) * 64));
+      q('[data-svg]').setAttribute('aria-label', `Over 10 seconds the upstream receives up to ${s.peak.toFixed(1)} times its normal load, and ${(s.success * 100).toFixed(0)}% of requests succeed during the slowdown`);
+
+      // verdict
+      const issues: string[] = [];
+      if (m.gwFail > 0) issues.push(`The gateway is overloaded: ${fmt(c.traffic)} requests a second on ${c.n} instance${c.n > 1 ? 's' : ''} is ${Math.round(m.rhoG * 100)}% of their capacity, so ${Math.round(m.gwFail * 100)}% of requests fail.`);
+      else if (c.n === 1) issues.push('One gateway instance is a single point of failure: if it stops, every request fails.');
+      else if (m.rhoLose >= 1) issues.push(`Losing one instance would overload the remaining ${c.n - 1} (${Math.round(m.rhoLose * 100)}% of capacity), and the failure would spread.`);
+      if (m.authFail > 0) issues.push(`The identity service is overloaded at ${Math.round(m.rhoA * 100)}% of its capacity, so ${Math.round(m.authFail * 100)}% of requests fail at authentication. Verify tokens locally.`);
+      else if (c.auth === 'remote') issues.push(`Calling the identity service for every request adds ${ms(m.authMs)} ms and puts ${fmt(c.traffic)} calls a second on it, which is ${Math.round(m.rhoA * 100)}% of its capacity.`);
+      if (over > 25) issues.push(`The quota is ${over}% over the limit: ${m.lq.abuser > 2000 ? 'with the whole limit on each instance, the real limit is the limit times the number of instances' : 'instances act on stale totals for up to one sync interval'}.`);
+      if (m.lq.rejectedGood > 0) issues.push(`An even split wrongly rejected ${m.lq.rejectedGood} requests of a consumer who stayed under the limit, because traffic is never perfectly even.`);
+      if (c.k > 1 && c.retry === 'retry' && s.peak > 2) issues.push(`Retry storm: the slow upstream receives up to ${s.peak.toFixed(1)} times its normal load and ${(s.success * 100).toFixed(0)}% of requests succeed${s.recover > 1 ? `, and it takes ${(s.recover / 10).toFixed(1)} s more to recover once it is fast again` : ''}.`);
+      else if (c.k > 1 && s.success < 0.5) issues.push(`The slow upstream cannot keep up, and ${(100 - s.success * 100).toFixed(0)}% of requests fail. The ${c.retry === 'budget' ? 'retry budget keeps the load at most ' + s.peak.toFixed(1) + ' times normal' : 'failures are not made worse by retries'}, but the gateway cannot create capacity. Turn the cache on, or shed load.`);
+      const out = q('[data-verdict]'); const bad = issues.length > 0; out.classList.toggle('bad', bad);
+      out.textContent = bad ? issues.join(' ') : `Healthy: ${ms(m.total)} ms added per request, the quota is within ${Math.abs(over)}% of the limit, and the upstream copes${c.k > 1 ? ` with a ${c.k}x slowdown (${(s.success * 100).toFixed(0)}% succeed, peak ${s.peak.toFixed(1)}x load)` : ''}.`;
+    }
+    function schedule() { if (!frame) frame = requestAnimationFrame(() => { frame = 0; draw(); }); }
+    root.addEventListener('input', schedule); root.addEventListener('change', schedule);
+    draw();
+  });
+</script>

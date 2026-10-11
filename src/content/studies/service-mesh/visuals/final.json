@@ -1,0 +1,54 @@
+{
+  "actors": [
+    { "id": "ca", "label": "Control plane + CA", "role": "compute", "x": 14, "y": 16 },
+    { "id": "svcA", "label": "Service A (checkout)", "role": "client", "x": 14, "y": 50 },
+    { "id": "proxyA", "label": "Sidecar of A", "role": "edge", "x": 50, "y": 50 },
+    { "id": "proxyB", "label": "Sidecar of B", "role": "edge", "x": 86, "y": 50 },
+    { "id": "svcB", "label": "Service B pods (payments)", "role": "client", "x": 86, "y": 16 },
+    { "id": "collector", "label": "Telemetry collector", "role": "async", "x": 50, "y": 84 },
+    { "id": "store", "label": "Metrics and traces", "role": "data", "x": 86, "y": 84 }
+  ],
+  "frames": [
+    {
+      "narration": "Before any call, the control plane has pushed each proxy its configuration over xDS: the list of B's 10 pods, the route with a 250 ms timeout and a retry budget of 20%, and the policy that only checkout may call payments. The CA has signed each proxy a certificate for its identity that is valid for 24 hours.",
+      "messages": [{ "from": "ca", "to": "proxyA", "label": "xDS: routes, 10 endpoints, cert for spiffe://shop/checkout" }, { "from": "ca", "to": "proxyB", "label": "xDS: policy, cert for spiffe://shop/payments" }],
+      "states": { "ca": "config v412 pushed" }
+    },
+    {
+      "narration": "Service A calls http://payments/charge in plain HTTP, as always. The redirect rules in its pod send the connection to its own sidecar, so the application never knows the mesh is there.",
+      "messages": [{ "from": "svcA", "to": "proxyA", "label": "POST /charge (plain HTTP)" }],
+      "states": { "proxyA": "intercepted" }
+    },
+    {
+      "narration": "The proxy picks a pod for this request. Two pods are drawn at random and the one with fewer requests in flight wins, which is pod b-7. It opens a mutual TLS connection, and each side checks the other's certificate. Sidecar B reads the caller's identity from it.",
+      "messages": [{ "from": "proxyA", "to": "proxyB", "label": "mTLS to pod b-7, try 1" }],
+      "states": { "proxyB": "caller = checkout" }
+    },
+    {
+      "narration": "The authorization policy allows checkout to POST to /charge, so sidecar B passes the request to the application. Pod b-7 is having trouble and answers 503 after 3 ms. Sidecar B reports that to sidecar A, which counts it against the pod.",
+      "messages": [{ "from": "proxyB", "to": "svcB", "label": "POST /charge (allowed)" }, { "from": "svcB", "to": "proxyB", "label": "503" }, { "from": "proxyB", "to": "proxyA", "label": "503" }],
+      "states": { "proxyB": "policy: allow", "proxyA": "b-7: 1 error" }
+    },
+    {
+      "narration": "The route allows a retry, and the budget has room, since fewer than 20% of the requests on this route are retries right now. After a 25 ms backoff the proxy picks another pod, b-3, and tries again. The app was not involved. If pod b-7 failed 5 times in a row, the proxy would stop sending it traffic for 30 seconds.",
+      "messages": [{ "from": "proxyA", "to": "proxyB", "label": "retry 1 of 3 to pod b-3 (budget ok)" }, { "from": "proxyB", "to": "svcB", "label": "POST /charge" }],
+      "states": { "proxyA": "retries: 4% of requests" }
+    },
+    {
+      "narration": "Pod b-3 answers 200 after 9 ms. The response goes back through the two proxies to the application. The caller saw one successful call that took about 40 ms in all, including the failed try and the backoff, and the first try's 503 is only visible in the mesh's metrics.",
+      "messages": [{ "from": "svcB", "to": "proxyB", "label": "200" }, { "from": "proxyB", "to": "proxyA", "label": "200" }, { "from": "proxyA", "to": "svcA", "label": "200 OK" }],
+      "states": { "svcA": "charged" }
+    },
+    {
+      "narration": "Both proxies now report what they saw: a request counted with its latency and status, an access log line that records 1 retry, and a span in the trace that carries the trace id which A passed on in a header. Nobody had to write any of this in the applications.",
+      "messages": [{ "from": "proxyA", "to": "collector", "label": "200, 40 ms, 1 retry, trace 9f3c" }, { "from": "proxyB", "to": "collector", "label": "span: checkout to payments" }, { "from": "collector", "to": "store", "label": "metrics and sampled traces" }],
+      "states": { "collector": "traced" }
+    },
+    {
+      "narration": "Now the control plane crashes. The proxies are not affected: they keep the endpoints, routes, policy and certificates they already have, so the next call in the company goes through as before. Only changes, such as a new pod, wait until it is back.",
+      "messages": [{ "from": "svcA", "to": "proxyA", "label": "POST /charge" }, { "from": "proxyA", "to": "proxyB", "label": "mTLS, last known config" }],
+      "states": { "ca": "down", "proxyA": "config v412 kept" },
+      "highlight": ["ca"]
+    }
+  ]
+}

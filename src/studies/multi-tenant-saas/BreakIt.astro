@@ -1,0 +1,149 @@
+---
+import PlaygroundShell from '../../components/PlaygroundShell.astro';
+---
+<PlaygroundShell title="One big tenant bursts, and a query forgets its filter" hint="400 tenants share a few database shards. Tenant 0 is the big one and sends a burst for 20 seconds. Choose how the tenants are isolated, how many share a shard, and whether a bug forgets the tenant filter.">
+  <ol class="how">
+    <li>Start with <b>shared everything, 100 tenants per shard, a 12 times burst</b>. The 99 small tenants on the big tenant's shard see a peak latency of <b>7.1 s</b>, and one shard failure would hit <b>100 tenants</b>. A call that forgets the filter returns up to <b>67,682 rows</b> of other tenants, including the big tenant's 40,000, because row-level security is off.</li>
+    <li>Switch to <b>per-tenant quota and fair queue</b>: small tenants stay at about <b>27 ms</b>. The big tenant is capped at 200 requests per second, so <b>76%</b> of its requests get a 429. The blast radius is still <b>100 tenants</b>, and the leak is unchanged. Limits fix latency, not isolation.</li>
+    <li>Switch to a <b>dedicated shard</b> for the big tenant: small tenants are fine (<b>23 ms</b>), the blast radius of the big tenant's shard is <b>1</b> and it costs <b>$25</b> per tenant instead of $20. The big tenant now slows itself down (<b>4.4 s</b>). Then set row-level security to <b>on</b> and the leak goes to <b>0</b>, but not if the app connects as the table owner.</li>
+  </ol>
+  <div class="pg mtb" data-mtb>
+    <div class="pg-row">
+      <label>Isolation model <select class="pg-in" data-model>
+        <option value="shared" selected>Shared everything</option>
+        <option value="quota">Per-tenant quota and fair queue</option>
+        <option value="dedicated">Dedicated shard for the big tenant</option>
+      </select></label>
+      <label>Tenants per shard <select class="pg-in" data-tps>
+        <option value="25">25</option><option value="50">50</option><option value="100" selected>100</option><option value="200">200</option><option value="400">400</option>
+      </select></label>
+      <label>Burst of the big tenant (times normal) <input type="range" min="1" max="20" value="12" data-burst /> <b data-burstval></b></label>
+      <label><input type="checkbox" data-bug checked /> A bug forgets the tenant filter</label>
+      <label>Row-level security <select class="pg-in" data-rls>
+        <option value="off" selected>Off</option>
+        <option value="on">On, app uses a restricted role</option>
+        <option value="owner">On, but the app connects as the table owner</option>
+      </select></label>
+    </div>
+    <div class="pg-grid">
+      <div class="pg-box" data-b1><h3>Small tenants: peak latency</h3><span class="pg-mono" data-o1></span><span class="pg-note" data-n1></span></div>
+      <div class="pg-box" data-b2><h3>The big tenant</h3><span class="pg-mono" data-o2></span><span class="pg-note" data-n2></span></div>
+      <div class="pg-box" data-b3><h3>Cost per tenant per month</h3><span class="pg-mono" data-o3></span><span class="pg-note" data-n3></span></div>
+      <div class="pg-box" data-b4><h3>Blast radius of a bad query or outage on the big tenant's shard</h3><span class="pg-mono" data-o4></span><span class="pg-note" data-n4></span></div>
+      <div class="pg-box" data-b5><h3>Rows leaked by one call without the filter</h3><span class="pg-mono" data-o5></span><span class="pg-note" data-n5></span></div>
+    </div>
+    <div class="pg-box"><h3>Latency of a small tenant over 60 seconds (burst from second 20 to 40)</h3>
+      <div class="mtb-bars" data-bars aria-hidden="true"></div>
+      <span class="pg-note" data-bartxt></span>
+    </div>
+    <p class="pg-out" data-verdict aria-live="polite"></p>
+    <p class="pg-note">Model: 400 tenants, tenant 0 is big. One shard serves 1,500 requests per second and costs $2,000 a month. The big tenant normally sends 150 per second and the 399 small ones send 1 to 3 each. Tenants are spread evenly over shards. Latency is 20 ms divided by one minus the load (capped at 95%), plus the time to drain a backlog; a backlog over 10 s of work is dropped as failures. The quota is 200 requests per second for the big tenant, with fair sharing of what is left. The big tenant owns 40,000 rows and each small tenant 50 to 450. A tenant is slowed if its shard peaks above 1 s. The leak is the worst case: a call by a tenant on the shard with the most rows returns every row on its shard that is not its own.</p>
+  </div>
+</PlaygroundShell>
+<style is:global>
+  .playground .mtb-bars { display: flex; align-items: end; gap: 1px; height: 64px; }
+  .playground .mtb-bars span { flex: 1; min-width: 0; background: var(--accent); border-radius: 2px 2px 0 0; }
+  .playground .mtb-bars span.slow { background: var(--bad); }
+</style>
+<script>
+  document.querySelectorAll<HTMLElement>('[data-mtb]').forEach((root) => {
+    const q = <T extends HTMLElement>(s: string) => root.querySelector<T>(s)!;
+    const TENANTS = 400; const C = 1500; const BIG_RATE = 150; const QUOTA = 200; const TICKS = 60; const B0 = 20; const B1 = 40; const COST = 2000; const CAP = 10; const BIG_ROWS = 40000;
+    let seed = 11; const rnd = (n: number) => { seed = (seed * 1664525 + 1013904223) % 4294967296; return Math.floor(seed / 65536) % n; };
+    const rate: number[] = [BIG_RATE]; const rows: number[] = [BIG_ROWS];
+    for (let i = 1; i < TENANTS; i++) { rate.push(1 + rnd(3)); rows.push(50 + rnd(401)); }
+    const lat = (a: number, c: number) => 20 / (1 - Math.min(0.95, a / c));
+    // CORE-START
+    function simulate(model: string, tps: number, burst: number, bug: boolean, rls: string) {
+      const dedicated = model === 'dedicated';
+      const pool = dedicated ? TENANTS - 1 : TENANTS;
+      const nShards = Math.ceil(pool / tps);
+      const shardOf = (i: number) => (dedicated ? (i === 0 ? -1 : (i - 1) % nShards) : i % nShards);
+      const members: number[][] = Array.from({ length: nShards }, () => []);
+      for (let i = 0; i < TENANTS; i++) { const s = shardOf(i); if (s >= 0) members[s].push(i); }
+      const bigShard = dedicated ? -1 : 0;
+      const peak: number[] = new Array(nShards).fill(0); const failedSmall: number[] = new Array(nShards).fill(0);
+      const series: number[] = [];
+      let bigPeak = 0; let bigFailed = 0; let bigRejected = 0; let bigTotal = 0;
+      for (let s = 0; s < nShards; s++) {
+        let backlog = 0; const hasBig = s === bigShard;
+        const smallRate = members[s].reduce((n, i) => n + (i === 0 ? 0 : rate[i]), 0);
+        for (let t = 0; t < TICKS; t++) {
+          const bigNow = hasBig ? (t >= B0 && t < B1 ? BIG_RATE * burst : BIG_RATE) : 0;
+          let ms: number;
+          if (model === 'quota' && hasBig) {
+            const adm = Math.min(bigNow, QUOTA); const served = Math.min(adm, Math.max(0, C - smallRate));
+            ms = lat(smallRate + served, C); bigTotal += bigNow; bigRejected += bigNow - adm; bigFailed += adm - served; bigPeak = Math.max(bigPeak, ms);
+          } else {
+            const arrivals = smallRate + bigNow; const avail = backlog + arrivals; const served = Math.min(C, avail);
+            let next = avail - served; let dropped = 0; if (next > CAP * C) { dropped = next - CAP * C; next = CAP * C; }
+            backlog = next; ms = lat(arrivals, C) + (1000 * backlog) / C;
+            failedSmall[s] += arrivals > 0 ? (dropped * smallRate) / arrivals : 0;
+            if (hasBig) { bigTotal += bigNow; bigFailed += (dropped * bigNow) / arrivals; bigPeak = Math.max(bigPeak, ms); }
+          }
+          peak[s] = Math.max(peak[s], ms);
+          if (s === 0) series.push(ms);
+        }
+      }
+      if (dedicated) { // the big tenant alone on its own shard
+        let backlog = 0;
+        for (let t = 0; t < TICKS; t++) {
+          const a = t >= B0 && t < B1 ? BIG_RATE * burst : BIG_RATE; const avail = backlog + a; const served = Math.min(C, avail);
+          let next = avail - served; let dropped = 0; if (next > CAP * C) { dropped = next - CAP * C; next = CAP * C; }
+          backlog = next; bigTotal += a; bigFailed += dropped; bigPeak = Math.max(bigPeak, lat(a, C) + (1000 * backlog) / C);
+        }
+      }
+      let slowed = 0; let worst = 0; let failed = 0;
+      for (let s = 0; s < nShards; s++) { slowed += peak[s] > 1000 ? members[s].filter((i) => i !== 0).length : 0; worst = Math.max(worst, peak[s]); failed += failedSmall[s]; }
+      const totalShards = nShards + (dedicated ? 1 : 0);
+      let leakWorst = 0; let exposed = 0;
+      if (bug && rls !== 'on') {
+        for (let s = 0; s < nShards; s++) {
+          const total = members[s].reduce((n, i) => n + rows[i], 0);
+          for (const i of members[s]) { const l = total - rows[i]; if (l > leakWorst) { leakWorst = l; exposed = members[s].length - 1; } }
+        }
+      }
+      return { totalShards, slowed, worst, failed: Math.round(failed), bigPeak, bigFailed: Math.round(bigFailed), bigRejected: Math.round(bigRejected), bigTotal, cost: (totalShards * COST) / TENANTS, blast: dedicated ? 1 : members[0].length, leakWorst, exposed, series };
+    }
+    // CORE-END
+    const bars: HTMLElement[] = Array.from({ length: TICKS }, () => { const s = document.createElement('span'); q('[data-bars]').append(s); return s; });
+    const fmtMs = (ms: number) => (ms >= 1000 ? `${(ms / 1000).toFixed(1)} s` : `${Math.round(ms)} ms`);
+    const fmt = (n: number) => Math.round(n).toLocaleString('en-US');
+    const paint = (id: string, bad: boolean) => q<HTMLElement>(id).style.setProperty('--c', bad ? 'var(--bad)' : 'var(--good)');
+    function draw() {
+      const model = q<HTMLSelectElement>('[data-model]').value; const tps = Number(q<HTMLSelectElement>('[data-tps]').value);
+      const burst = Number(q<HTMLInputElement>('[data-burst]').value); const bug = q<HTMLInputElement>('[data-bug]').checked; const rls = q<HTMLSelectElement>('[data-rls]').value;
+      q('[data-burstval]').textContent = String(burst);
+      const r = simulate(model, tps, burst, bug, rls);
+      q('[data-o1]').textContent = fmtMs(r.worst);
+      q('[data-n1]').textContent = r.slowed > 0 ? `${r.slowed} of 399 small tenants were slowed above 1 s; ${fmt(r.failed)} of their requests timed out` : 'no small tenant went above 1 s';
+      paint('[data-b1]', r.slowed > 0);
+      const bigPct = r.bigTotal > 0 ? Math.round((100 * r.bigRejected) / r.bigTotal) : 0;
+      q('[data-o2]').textContent = model === 'quota' ? `${bigPct}% rejected (429)` : `peak ${fmtMs(r.bigPeak)}`;
+      q('[data-n2]').textContent = model === 'quota' ? 'it is capped at its quota, and the rest of its burst is turned away' : model === 'dedicated' ? `${fmt(r.bigFailed)} requests failed; it now slows only itself` : `${fmt(r.bigFailed)} requests failed; it hurts everyone on its shard too`;
+      paint('[data-b2]', model === 'quota' ? bigPct > 0 : r.bigPeak > 1000);
+      q('[data-o3]').textContent = `$${r.cost.toFixed(2)}`;
+      q('[data-n3]').textContent = `${r.totalShards} shards at $2,000 a month for 400 tenants`;
+      q<HTMLElement>('[data-b3]').style.setProperty('--c', 'var(--accent)');
+      q('[data-o4]').textContent = `${r.blast} ${r.blast === 1 ? 'tenant' : 'tenants'}`;
+      q('[data-n4]').textContent = r.blast === 1 ? 'only the big tenant is on that shard' : `${Math.round((100 * r.blast) / TENANTS)}% of all tenants share its fate`;
+      paint('[data-b4]', r.blast > 1);
+      q('[data-o5]').textContent = bug ? `${fmt(r.leakWorst)} rows` : 'no bug';
+      q('[data-n5]').textContent = !bug ? 'every query filters by tenant' : r.leakWorst === 0 ? 'the policy hides other tenants\' rows even though the query forgot' : `the rows of ${r.exposed} other tenants are exposed${model === 'dedicated' ? ', but not the big tenant\'s' : ''}`;
+      paint('[data-b5]', r.leakWorst > 0);
+      r.series.forEach((ms, i) => { bars[i].style.height = `${Math.max(3, Math.min(100, (100 * Math.log10(ms / 10)) / 3))}%`; bars[i].classList.toggle('slow', ms > 1000); });
+      q('[data-bartxt]').textContent = model === 'dedicated' ? 'a small tenant on a shared shard: flat, the burst is on another shard' : `a small tenant on the big tenant's shard: ${r.worst > 1000 ? 'rises when the burst starts and drains afterwards' : 'flat'}`;
+      const out = q('[data-verdict]');
+      const leak = r.leakWorst > 0; const slow = r.slowed > 0; out.classList.toggle('bad', leak || slow);
+      const parts: string[] = [];
+      if (slow) parts.push(`The burst filled the shared shard: ${r.slowed} small tenants waited up to ${fmtMs(r.worst)}. A per-tenant quota with a fair queue, or a dedicated shard, would keep them at tens of milliseconds.`);
+      else if (model === 'quota') parts.push('The quota and fair queue kept small tenants fast, but the shard still hosts ' + r.blast + ' tenants, so a bad query or an outage would still hit all of them.');
+      else if (model === 'dedicated') parts.push('The big tenant sits alone, so its burst and its failures stay with it. The price is one more shard, and the big tenant now feels its own bursts.');
+      else parts.push('At this burst the shard keeps up.');
+      if (bug) parts.push(leak ? (rls === 'owner' ? 'Row-level security is on but the app connects as the table owner, which bypasses the policy, so the forgotten filter still leaks.' : `With no row-level security the forgotten filter leaks ${fmt(r.leakWorst)} rows.`) : 'Row-level security stopped the leak: the database added the tenant condition itself.');
+      out.textContent = parts.join(' ');
+    }
+    root.addEventListener('input', draw); root.addEventListener('change', draw);
+    draw();
+  });
+</script>

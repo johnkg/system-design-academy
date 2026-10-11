@@ -1,0 +1,111 @@
+---
+import PlaygroundShell from '../../components/PlaygroundShell.astro';
+---
+<PlaygroundShell title="A burst of requests from many app instances" hint="Each app instance keeps 10 connections and sends 60 requests in one second. Choose how they reach the database, then change the pool, the fleet and the query time.">
+  <ol class="how">
+    <li>At the start, with <b>direct connections</b> and 30 instances, the apps want 300 connections and the database allows 200. <b>10 instances get no connection at all</b>, and the 200 that did connect all run queries at once, so the database <b>thrashes</b> and throughput falls to about 440 requests a second.</li>
+    <li>Switch to <b>transaction pooling</b> with a pool of 24: the database sees <b>24 connections</b>, every request is served, and throughput is about <b>1,150 a second</b>. The cost is a wait in the pooler queue and the <b>session-state warning</b> below.</li>
+    <li>Raise the pool to <b>200</b> and the database thrashes again (about 230 a second), and lower it to <b>4</b> and it starves. A pool near cores times 2 plus disks is the sweet spot. <b>Session pooling</b> pins a server connection to each client connection, so with connections kept open it saves nothing.</li>
+  </ol>
+  <div class="pg cpb" data-cpb>
+    <div class="pg-row">
+      <label>How the apps connect <select class="pg-in" data-mode>
+        <option value="direct" selected>direct to the database</option>
+        <option value="session">pooler, session pooling</option>
+        <option value="transaction">pooler, transaction pooling</option>
+      </select></label>
+      <label>App instances <input type="range" min="5" max="150" step="5" value="30" data-a /> <b data-aval></b></label>
+      <label>Server pool size (pooler modes) <input type="range" min="2" max="200" value="24" data-s /> <b data-sval></b></label>
+      <label>Average query time (ms) <input type="range" min="1" max="40" value="20" data-q /> <b data-qval></b></label>
+      <label><input type="checkbox" data-state checked /> The app relies on session state (SET, advisory locks, prepared statements)</label>
+    </div>
+    <div class="pg-grid">
+      <div class="pg-box" data-b1><h3>Connections open at the database</h3><span class="pg-mono" data-o1></span><span class="pg-note" data-n1></span></div>
+      <div class="pg-box" data-b2><h3>Throughput</h3><span class="pg-mono" data-o2></span><span class="pg-note" data-n2></span></div>
+      <div class="pg-box" data-b3><h3>Latency of served requests</h3><span class="pg-mono" data-o3></span><span class="pg-note" data-n3></span></div>
+      <div class="pg-box" data-b4><h3>Wait for a free connection</h3><span class="pg-mono" data-o4></span><span class="pg-note" data-n4></span></div>
+      <div class="pg-box" data-b5><h3>Errors</h3><span class="pg-mono" data-o5></span><span class="pg-note" data-n5></span></div>
+    </div>
+    <p class="pg-out" data-verdict aria-live="polite"></p>
+    <p class="pg-out" data-warn aria-live="polite"></p>
+    <p class="pg-note">Model, with made-up but plausible constants: the database has 16 cores and runs up to 24 queries at full speed (some wait for disk), then loses speed as more run at once (half speed at about 112 active queries, 15% at 200), and max_connections is 200. Each instance holds 10 connections, kept open, and sends 60 requests at random moments in one second, each taking 0.5 to 1.5 times the average query time. A request waits at most 1 second for a connection. 15% of requests rely on session state. Direct and session pooling give a server connection to the first connections that ask, up to the limit, and the rest fail. The result is the same on every run.</p>
+  </div>
+</PlaygroundShell>
+<script>
+  document.querySelectorAll<HTMLElement>('[data-cpb]').forEach((root) => {
+    const q = <T extends HTMLElement>(s: string) => root.querySelector<T>(s)!;
+    const MAXC = 200; const CPI = 10; const RPI = 60; const WAIT = 1000; const KNEE = 24; const THR = 48; const T = 6000;
+    const mix = (a: number, b: number) => { let h = (Math.imul(a + 1, 2654435761) ^ Math.imul(b + 7, 2246822519)) >>> 0; h ^= h >>> 15; h = Math.imul(h, 2246822519) >>> 0; h ^= h >>> 13; h = Math.imul(h, 3266489917) >>> 0; h ^= h >>> 16; return (h >>> 0) / 4294967296; };
+    // Work done per millisecond by the database when k queries are active: full speed up to KNEE, then a loss of speed as k passes THR.
+    const rate = (k: number) => (k === 0 ? 0 : Math.min(k, KNEE) / (1 + Math.pow(Math.max(0, k - THR) / 64, 2)));
+    const pct = (a: number[], p: number) => { if (!a.length) return 0; const s = a.slice().sort((x, y) => x - y); return s[Math.min(s.length - 1, Math.floor(s.length * p))]; };
+    function sim(mode: string, A: number, S: number, qms: number) {
+      let slots: number[]; let open = 0;
+      if (mode === 'transaction') slots = [S];
+      else { let left = mode === 'direct' ? MAXC : S; slots = []; for (let i = 0; i < A; i++) { const s = Math.min(CPI, left); slots.push(s); left -= s; } open = Math.min(mode === 'direct' ? MAXC : S, A * CPI); }
+      const G = slots.length; const queues: any[][] = Array.from({ length: G }, () => []); const head = new Array(G).fill(0); const busy = new Array(G).fill(0);
+      const arr: any[][] = Array.from({ length: 1000 }, () => []);
+      for (let i = 0; i < A; i++) for (let j = 0; j < RPI; j++) {
+        const t = Math.floor(mix(i, j * 4) * 1000);
+        arr[t].push({ g: mode === 'transaction' ? 0 : i, c: i * CPI + Math.floor(mix(i, j * 4 + 1) * CPI), w: qms * (0.5 + mix(i, j * 4 + 2)), st: mix(i, j * 4 + 3) < 0.15, t0: t, sid: 0 });
+      }
+      let active: any[] = []; let served = 0; let errNoConn = 0; let errWait = 0; let peak = 0; let wrong = 0; let flagged = 0; let nextId = 0; let lastActive = 0;
+      const freeIds: number[] = []; const last = new Map<number, number>(); const lat: number[] = []; const waits: number[] = [];
+      for (let t = 0; t < T; t++) {
+        const k = active.length;
+        if (k) {
+          const p = rate(k) / k;
+          for (const r of active) r.w -= p;
+          active = active.filter((r) => { if (r.w <= 0) { busy[r.g]--; if (mode === 'transaction') freeIds.push(r.sid); lat.push(t + 1 - r.t0); served++; lastActive = t + 1; return false; } return true; });
+        }
+        if (t < 1000) for (const r of arr[t]) { if (slots[r.g] === 0) { errNoConn++; continue; } queues[r.g].push(r); }
+        for (let g = 0; g < G; g++) {
+          const qu = queues[g];
+          while (head[g] < qu.length && t - qu[head[g]].t0 >= WAIT) { head[g]++; errWait++; }
+          while (head[g] < qu.length && busy[g] < slots[g]) {
+            const r = qu[head[g]++]; busy[g]++; waits.push(t - r.t0);
+            if (mode === 'transaction') {
+              freeIds.sort((a, b) => a - b); r.sid = freeIds.length ? (freeIds.shift() as number) : nextId++;
+              if (r.st) { flagged++; if (last.has(r.c) && last.get(r.c) !== r.sid) wrong++; }
+              last.set(r.c, r.sid);
+            } else r.sid = r.c;
+            active.push(r);
+          }
+        }
+        if (active.length > peak) peak = active.length;
+      }
+      if (mode === 'transaction') open = nextId;
+      return { total: A * RPI, served, errNoConn, errWait, peak, open, p50: pct(lat, 0.5), p95: pct(lat, 0.95), w95: pct(waits, 0.95), wrong, flagged, tput: Math.round(served / (Math.max(lastActive, 1000) / 1000)), cut: slots.filter((s) => s === 0).length };
+    }
+    const fmt = (n: number) => Math.round(n).toLocaleString('en-US');
+    function draw() {
+      const mode = q<HTMLSelectElement>('[data-mode]').value; const A = Number(q<HTMLInputElement>('[data-a]').value); const S = Number(q<HTMLInputElement>('[data-s]').value); const qms = Number(q<HTMLInputElement>('[data-q]').value);
+      const useState = q<HTMLInputElement>('[data-state]').checked;
+      q('[data-aval]').textContent = String(A); q('[data-sval]').textContent = mode === 'direct' ? `${S} (not used)` : String(S); q('[data-qval]').textContent = String(qms);
+      q<HTMLInputElement>('[data-s]').disabled = mode === 'direct';
+      const r = sim(mode, A, S, qms); const errors = r.errNoConn + r.errWait; const thrash = r.peak > THR;
+      const set = (k: number, o: string, n: string, bad: boolean) => { q(`[data-o${k}]`).textContent = o; q(`[data-n${k}]`).textContent = n; q<HTMLElement>(`[data-b${k}]`).style.setProperty('--c', bad ? 'var(--bad)' : 'var(--good)'); };
+      const wanted = A * CPI;
+      set(1, `${fmt(r.open)} (limit ${MAXC})`, mode === 'direct' ? `${fmt(wanted)} wanted by ${A} instances, about ${fmt(r.open * 10)} MB of memory` : `${fmt(wanted)} client connections share them, about ${fmt(r.open * 10)} MB of memory`, mode === 'direct' && wanted > MAXC);
+      set(2, `${fmt(r.tput)} requests/s`, `${fmt(r.served)} of ${fmt(r.total)} served, at most ${fmt(r.peak)} queries running at once${thrash ? ' (the database is thrashing)' : ''}`, thrash || r.served < r.total * 0.9);
+      set(3, `${fmt(r.p50)} ms median, ${fmt(r.p95)} ms 95th`, `a single query takes about ${qms} ms`, r.p95 > 500);
+      set(4, `${fmt(r.w95)} ms (95th percentile)`, mode === 'direct' ? 'waiting for a connection inside each app' : 'waiting in the pooler queue, 1000 ms at most', r.w95 >= 500);
+      set(5, `${fmt(errors)} of ${fmt(r.total)}`, errors === 0 ? 'none' : `${fmt(r.errNoConn)} got no connection, ${fmt(r.errWait)} waited too long`, errors > 0);
+      const out = q('[data-verdict]'); const parts: string[] = [];
+      if (mode === 'direct' && r.errNoConn > 0) parts.push(`The apps want ${fmt(wanted)} connections but max_connections is ${MAXC}, so ${r.cut} of ${A} instances got none and ${fmt(r.errNoConn)} requests failed with too many clients.`);
+      if (mode === 'session' && r.errNoConn > 0) parts.push(`Session pooling gives a server connection to a client connection for as long as it stays open. The apps keep theirs open, so the ${fmt(r.open)} server connections stay with the first ${fmt(r.open)} client connections and ${fmt(r.errNoConn)} requests from the rest never get one.`);
+      if (thrash) parts.push(`Up to ${fmt(r.peak)} queries ran at once on 16 cores, so the database spent its time switching and throughput fell to ${fmt(r.tput)} a second. A smaller number of active connections would finish sooner.`);
+      if (r.errWait > 0 && !thrash) parts.push(`${fmt(r.errWait)} requests waited a full second for a server connection and failed, because the pool (${mode === 'direct' ? 'each app' : S}) cannot run this much work in time.`);
+      else if (r.errWait > 0 && thrash) parts.push(`${fmt(r.errWait)} requests waited a full second and failed.`);
+      const bad = parts.length > 0; out.classList.toggle('bad', bad);
+      out.textContent = bad ? parts.join(' ') : `All ${fmt(r.total)} requests were served with at most ${fmt(r.peak)} queries running at once. The database holds ${fmt(r.open)} connections, and 95% of requests waited ${fmt(r.w95)} ms or less for one.`;
+      const warn = q('[data-warn]'); const show = mode === 'transaction' && useState && r.flagged > 0;
+      warn.classList.toggle('bad', show); warn.hidden = !show;
+      warn.textContent = show ? `Broken feature: ${fmt(r.wrong)} of ${fmt(r.flagged)} requests that rely on session state ran on a different server connection from the one that held their state. A SET, a session advisory lock, a temporary table, a LISTEN or a prepared statement made earlier is gone, and the failure is intermittent. Use SET LOCAL, transaction-level locks and a direct connection for LISTEN, or use session pooling for those clients.` : '';
+    }
+    let queued = false;
+    const schedule = () => { if (queued) return; queued = true; requestAnimationFrame(() => { queued = false; draw(); }); };
+    root.addEventListener('input', schedule); root.addEventListener('change', schedule);
+    draw();
+  });
+</script>

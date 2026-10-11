@@ -1,0 +1,559 @@
+{
+  "name": "Design a Distributed Tracing System",
+  "difficulty": "advanced",
+  "intent": "Follow one request across hundreds of services, record it as a tree of timed spans, keep the traces that matter at a tiny share of the cost, and find the one bad request in seconds.",
+  "prompt": "Design a distributed tracing backend like Jaeger, Zipkin or Dapper for a company with 300 services handling 100 million requests a day. Each request touches about 6 services and produces about 20 spans. Engineers want to open a trace by its id, search for slow or failing requests by service, operation, duration and tags, see which services depend on which, and jump between traces, logs and metrics. The tracing must never slow the services down, and the bill must stay a small fraction of the cost of the services themselves.",
+  "codeTitle": "trace context and a tail sampler",
+  "finalIntro": "One failed checkout, from the first span to an engineer opening it.",
+  "functional": [
+    "Create spans in every service and pass the trace context along on HTTP calls, messages and background jobs",
+    "Collect spans from all services and store them by trace id",
+    "Open a trace by id and show its spans as a tree with timings",
+    "Search traces by service, operation, minimum duration, error status and tags",
+    "Show a service dependency graph with call counts and error rates",
+    "Link a trace to its logs and to the metric data points (exemplars) it produced"
+  ],
+  "nonFunctional": [
+    "Instrumentation adds under about 1% CPU and never blocks or fails a request, even if the tracing backend is down",
+    "Ingest about 24,000 spans per second on average and several times that at the peak",
+    "A trace is searchable within about 30 seconds of the request finishing",
+    "Open a trace by id in under a second and run an attribute search in a few seconds",
+    "Keep all slow and failed traces plus a sample of normal ones, at a few percent of the full storage cost",
+    "Keep recent traces fast to search and older ones cheap, for a retention of weeks",
+    "Handle spans that arrive late, out of order or never, without breaking the view"
+  ],
+  "firstAttempt": {
+    "text": "Every service writes one row per span into a central SQL table as soon as the span ends, keyed by trace id and span id, with an index on trace id. To see a trace, select all rows with that trace id and draw them as a tree. Spans from different services are tied together by passing a trace id in a custom header.",
+    "limits": [
+      "Each span becomes a synchronous database write on the request path, so a slow database slows every service, and an outage there breaks checkout",
+      "At 24,000 spans per second and about 1 TB a day, a single SQL table and its indexes cannot keep up",
+      "Storing every span of every request costs more than anything else, and almost all of it is routine traffic nobody will ever open",
+      "A custom header means every team invents its own format, and the trace breaks at each service or queue that does not copy it",
+      "There is no way to keep just the failures: the choice to store a request is made before anyone knows how it will end",
+      "Searching by tags or duration on a table that large means scanning it"
+    ]
+  },
+  "nodes": [
+    {
+      "id": "apps",
+      "label": "Services",
+      "kind": "client",
+      "x": 87,
+      "y": 12,
+      "at": 0,
+      "until": 1
+    },
+    {
+      "id": "sdk",
+      "label": "Services + SDK",
+      "kind": "client",
+      "x": 87,
+      "y": 12,
+      "at": 1
+    },
+    {
+      "id": "sql",
+      "label": "SQL span table",
+      "kind": "data",
+      "x": 62,
+      "y": 37,
+      "at": 0,
+      "until": 2
+    },
+    {
+      "id": "agent",
+      "label": "Local agent",
+      "kind": "edge",
+      "x": 62,
+      "y": 12,
+      "at": 2
+    },
+    {
+      "id": "collectors",
+      "label": "Collectors",
+      "kind": "edge",
+      "x": 37,
+      "y": 12,
+      "at": 2
+    },
+    {
+      "id": "store",
+      "label": "Trace store",
+      "kind": "data",
+      "x": 12,
+      "y": 63,
+      "at": 2
+    },
+    {
+      "id": "queue",
+      "label": "Span queue",
+      "kind": "async",
+      "x": 12,
+      "y": 12,
+      "at": 3
+    },
+    {
+      "id": "sampler",
+      "label": "Tail sampler",
+      "kind": "compute",
+      "x": 12,
+      "y": 37,
+      "at": 3
+    },
+    {
+      "id": "index",
+      "label": "Search index",
+      "kind": "data",
+      "x": 37,
+      "y": 63,
+      "at": 4
+    },
+    {
+      "id": "cold",
+      "label": "Cold storage",
+      "kind": "data",
+      "x": 12,
+      "y": 88,
+      "at": 4
+    },
+    {
+      "id": "query",
+      "label": "Query UI",
+      "kind": "edge",
+      "x": 62,
+      "y": 63,
+      "at": 5
+    },
+    {
+      "id": "deps",
+      "label": "Dependency job",
+      "kind": "compute",
+      "x": 37,
+      "y": 37,
+      "at": 5
+    },
+    {
+      "id": "logs",
+      "label": "Logs",
+      "kind": "data",
+      "x": 87,
+      "y": 88,
+      "at": 6
+    },
+    {
+      "id": "metrics",
+      "label": "Metrics",
+      "kind": "data",
+      "x": 62,
+      "y": 88,
+      "at": 6
+    }
+  ],
+  "edges": [
+    {
+      "from": "apps",
+      "to": "sql",
+      "at": 0,
+      "until": 1
+    },
+    {
+      "from": "sdk",
+      "to": "sql",
+      "at": 1,
+      "until": 2
+    },
+    {
+      "from": "sdk",
+      "to": "agent",
+      "at": 2
+    },
+    {
+      "from": "agent",
+      "to": "collectors",
+      "at": 2
+    },
+    {
+      "from": "collectors",
+      "to": "store",
+      "at": 2,
+      "until": 3
+    },
+    {
+      "from": "collectors",
+      "to": "queue",
+      "at": 3
+    },
+    {
+      "from": "queue",
+      "to": "sampler",
+      "at": 3
+    },
+    {
+      "from": "sampler",
+      "to": "store",
+      "at": 3
+    },
+    {
+      "from": "store",
+      "to": "index",
+      "at": 4
+    },
+    {
+      "from": "store",
+      "to": "cold",
+      "at": 4
+    },
+    {
+      "from": "query",
+      "to": "index",
+      "at": 5
+    },
+    {
+      "from": "collectors",
+      "to": "deps",
+      "at": 5
+    },
+    {
+      "from": "deps",
+      "to": "index",
+      "at": 5
+    },
+    {
+      "from": "logs",
+      "to": "query",
+      "at": 6
+    },
+    {
+      "from": "metrics",
+      "to": "query",
+      "at": 6
+    }
+  ],
+  "steps": [
+    {
+      "title": "Create spans and carry the trace context in headers",
+      "problem": "A request that crosses six services leaves six unrelated pieces of evidence, and nothing says which belong together or which call caused which.",
+      "fix": "A tracing library inside every service starts a span for each unit of work: a trace id shared by the whole request, its own span id, a parent span id, a name, start and end times and attributes such as the service, operation, status and HTTP route. The context travels in the standard W3C traceparent header, version-traceid-parentspanid-flags, for example 00-4bf92f35...-00f067aa...-01, and the HTTP, gRPC and message clients and servers read and write it automatically. For a queue or a background job the same header is stored in the message's metadata, so the consumer continues the trace. Inside a process the context is held in a context object that follows async calls.",
+      "tradeoff": "Every hop joins one trace in a format all languages and vendors understand. One service or queue that drops the header splits a trace into two, so coverage depends on instrumenting every client and every message hop, and the library must be cheap enough to leave on everywhere.",
+      "concepts": [
+        {
+          "slug": "distributed-tracing"
+        },
+        {
+          "slug": "api-gateway"
+        },
+        {
+          "slug": "message-queues"
+        },
+        {
+          "slug": "logical-clocks"
+        }
+      ]
+    },
+    {
+      "title": "Buffer spans locally and export them asynchronously",
+      "problem": "Sending each span to a database from the request path ties every service's latency and availability to the tracing system.",
+      "fix": "Ending a span only appends it to a bounded in-memory queue, which takes microseconds. A background thread exports it in batches, for example up to 512 spans or every 2 seconds, to a local agent on the same host, which forwards to the collectors with compression and retries. If the queue is full because the backend is slow, new spans are dropped and counted, rather than blocking the request or growing memory without limit. The agent holds a little more, with its own limit.",
+      "tradeoff": "Tracing adds well under 1% CPU and cannot take the application down. The price is that spans can be lost under overload, and a crash loses the last unsent batch, so traces are best effort and the drop counters are themselves a metric to watch.",
+      "concepts": [
+        {
+          "slug": "backpressure"
+        },
+        {
+          "slug": "retries-and-backoff"
+        },
+        {
+          "slug": "bulkhead"
+        },
+        {
+          "slug": "circuit-breaker"
+        }
+      ]
+    },
+    {
+      "title": "Receive spans in collectors, and sample to control the cost",
+      "problem": "Storing about 1 TB a day of spans is far too much, and most of it is routine requests that nobody will open.",
+      "fix": "Stateless collectors receive spans over OTLP, add metadata and write them to a queue partitioned by a hash of the trace id, so every span of one trace reaches the same tail sampler. Sampling comes in two stages. Head sampling decides at the start of the request, from the trace id, whether to record it, and writes that decision into the traceparent flags so all services agree. It is cheap, but blind: it cannot know the request will fail. Tail sampling keeps every span of a trace in memory for a wait, such as 10 to 30 seconds, then decides with the whole picture: keep all traces with an error or a slow root span, and a small share, such as 1 to 2%, of the rest. Per-service rates can adapt so that a busy service does not use the whole budget.",
+      "tradeoff": "Storage falls from about 1 TB to roughly 25 GB a day while every failure is kept. The tail sampler needs memory for all traces in flight, the whole trace on one machine, and a wait long enough for late spans. If the head sampler drops 90% of traces first, the tail sampler can never get them back.",
+      "concepts": [
+        {
+          "slug": "consistent-hashing"
+        },
+        {
+          "slug": "message-queues"
+        },
+        {
+          "slug": "load-balancing"
+        },
+        {
+          "slug": "backpressure"
+        },
+        {
+          "slug": "slos-and-error-budgets"
+        }
+      ]
+    },
+    {
+      "title": "Store spans by trace id, assemble late spans, and tier by age",
+      "problem": "Spans of one trace arrive from different machines in any order, some late and some never, and the store must serve both an exact lookup and an attribute search.",
+      "fix": "The main store is a wide-column or log-structured database that writes spans with the trace id as the partition key, so all spans of a trace sit together and opening one is a single read. A separate search index maps service, operation, duration buckets, status and selected tags to trace ids. A trace is assembled at read time: gather the spans, link each to its parent by id, and show a span whose parent has not arrived as a root with a gap marked missing rather than hiding it. Clocks differ between hosts, so a child that appears to start before its parent is shifted, not dropped. Recent days stay on fast storage with the index, while older traces move to cheap object storage that supports lookup by id only, and then expire.",
+      "tradeoff": "Opening a trace is fast and searches stay affordable, because only ids and selected tags are indexed. Unindexed tags cannot be searched, high-cardinality tags such as user ids make the index explode, and the cold tier answers only questions that start from a trace id.",
+      "concepts": [
+        {
+          "slug": "database-sharding"
+        },
+        {
+          "slug": "lsm-trees-vs-b-trees"
+        },
+        {
+          "slug": "database-indexing"
+        },
+        {
+          "slug": "logical-clocks"
+        },
+        {
+          "slug": "caching"
+        }
+      ]
+    },
+    {
+      "title": "Offer lookup by id, search by attributes, and a dependency graph",
+      "problem": "Engineers arrive with very different questions: one trace id from a support ticket, or the vague 'checkout got slow around two o'clock'. A service owner also wants to know who calls them.",
+      "fix": "The query service handles two paths. Lookup by trace id reads the one partition and works across hot and cold storage. Search asks the index for matching trace ids, for example service payments, status error, duration above 1 s, in the last hour, ordered by time and limited to a page, then fetches those traces. A streaming job reads spans at the collectors before sampling, so the counts are complete, pairs each client span with the server span below it, and counts calls and errors for every pair of services per minute. This becomes the dependency graph, an input for finding the blast radius of an outage.",
+      "tradeoff": "Trace-id lookup is a fast and exact key read, while searches are bounded by what the index holds and the time range. The graph is accurate because it counts every span, not the sample, and the extra pipeline must keep up with the full span rate.",
+      "concepts": [
+        {
+          "slug": "database-indexing"
+        },
+        {
+          "slug": "pagination"
+        },
+        {
+          "slug": "distributed-tracing"
+        },
+        {
+          "slug": "cqrs"
+        }
+      ]
+    },
+    {
+      "title": "Link traces with logs and metrics",
+      "problem": "A trace shows where the time went, but an engineer also needs the log lines from that request, and a dashboard spike needs a trace to explain it.",
+      "fix": "The logging library writes the current trace id and span id into every structured log line, so a trace view can show a link to the logs of that span, and a log search can jump to the trace. Metrics histograms record an exemplar: the trace id of a sample request in a bucket, such as a request that took 3 s. The dashboard shows that point on the latency graph, and a click opens the trace. Span data is also turned into rate, error and duration metrics per service and operation, so alerts fire on the metrics and point to traces.",
+      "tradeoff": "The three kinds of signals become one navigable story, and alerts lead to evidence in a click. Each exemplar must point to a trace that was kept, which tail sampling by latency and error helps ensure, and the identifiers have to be written consistently by every library.",
+      "concepts": [
+        {
+          "slug": "structured-logging"
+        },
+        {
+          "slug": "metrics"
+        },
+        {
+          "slug": "alerting"
+        },
+        {
+          "slug": "slos-and-error-budgets"
+        },
+        {
+          "slug": "distributed-tracing"
+        }
+      ]
+    }
+  ],
+  "failures": [
+    {
+      "scenario": "The collectors or the trace store are down for an hour",
+      "impact": "If services waited for the backend, they would slow down or fail, and spans would pile up in memory.",
+      "answer": "The SDK queues are bounded and the export runs on a background thread, so requests never wait. Once the queue is full, new spans are dropped and counted. The agents retry with exponential backoff and jitter, and the queue between collectors and samplers absorbs a backlog of minutes. After recovery there is a gap in traces for the outage, and the drop counters show how large it was.",
+      "concepts": [
+        {
+          "slug": "backpressure"
+        },
+        {
+          "slug": "retries-and-backoff"
+        },
+        {
+          "slug": "circuit-breaker"
+        },
+        {
+          "slug": "message-queues"
+        }
+      ]
+    },
+    {
+      "scenario": "A tail sampler instance runs out of memory",
+      "impact": "Traces in flight on that instance are lost, and a sampler in a restart loop keeps nothing.",
+      "answer": "Memory is bounded by a limit on buffered traces, and when it is reached the oldest traces are decided early on the spans they already have, so errors seen so far are still kept. Autoscaling adds sampler instances, and the partitioning by trace id moves the load without splitting a trace. An alert fires on the number of buffered traces and the early decisions, since a shrinking effective wait lowers completeness.",
+      "concepts": [
+        {
+          "slug": "autoscaling"
+        },
+        {
+          "slug": "consistent-hashing"
+        },
+        {
+          "slug": "health-checks"
+        },
+        {
+          "slug": "alerting"
+        }
+      ]
+    },
+    {
+      "scenario": "A service forgets to pass the trace header on calls to a queue",
+      "impact": "The trace breaks in two: the consumer starts a new trace, and the work before and after the queue cannot be seen as one request.",
+      "answer": "Message clients are instrumented so the context travels in message headers. When the header is missing, the consumer starts a new trace with a link to nothing, and a coverage check, using spans with no parent from a service that is expected to have one, shows which service is the culprit. A span link can join a batch consumer to the many producer traces it handles.",
+      "concepts": [
+        {
+          "slug": "message-queues"
+        },
+        {
+          "slug": "distributed-tracing"
+        },
+        {
+          "slug": "api-gateway"
+        }
+      ]
+    },
+    {
+      "scenario": "Spans arrive out of order, or after the sampler has decided",
+      "impact": "A child span arrives before its parent, or the error span of an async worker arrives after the trace was already dropped, so the failure is invisible.",
+      "answer": "The sampler keeps a trace open for a wait that covers the normal export delay, and the store builds the tree on read, so arrival order does not matter. For stragglers, a decision cache remembers keep and drop for a few minutes, so a late span of a kept trace is stored too. The few traces that are beyond the wait, such as a job that runs for minutes, show up as incomplete, and the incomplete rate is monitored.",
+      "concepts": [
+        {
+          "slug": "logical-clocks"
+        },
+        {
+          "slug": "caching"
+        },
+        {
+          "slug": "alerting"
+        }
+      ]
+    },
+    {
+      "scenario": "A new tag with millions of distinct values is added to the index",
+      "impact": "The search index grows without bound, writes slow down and searches get worse for everyone.",
+      "answer": "Only an allowlist of low-cardinality tags is indexed, such as service, operation, status code and region, with per-tenant limits on distinct values. High-cardinality values such as user ids stay on the span and are found through the trace id, a log line or an exemplar, not by searching.",
+      "concepts": [
+        {
+          "slug": "database-indexing"
+        },
+        {
+          "slug": "database-sharding"
+        },
+        {
+          "slug": "metrics"
+        }
+      ]
+    }
+  ],
+  "alternatives": [
+    {
+      "title": "When to decide whether to keep a trace",
+      "options": [
+        {
+          "name": "Head sampling in the app",
+          "pro": "Cheapest, as unsampled requests create no spans to send, and the decision is consistent across services",
+          "con": "Blind to the outcome, so at 1% it keeps 1% of the errors too"
+        },
+        {
+          "name": "Tail sampling in collectors",
+          "pro": "Keeps every error and slow trace, because it decides with the whole trace",
+          "con": "Needs every span sent, memory for traces in flight, and all spans of a trace on one machine"
+        },
+        {
+          "name": "Keep everything for a short time",
+          "pro": "Simple, with no sampling decisions to get wrong",
+          "con": "About 1 TB a day at this scale, so retention would be hours"
+        }
+      ],
+      "pick": "A light head sample for the very busiest services, then tail sampling that keeps all errors and slow traces plus a 1 to 2% baseline."
+    },
+    {
+      "title": "Where spans are stored",
+      "options": [
+        {
+          "name": "A wide-column or log-structured store keyed by trace id",
+          "pro": "Very high write rate, and a trace is one partition read",
+          "con": "Searches need a separate index"
+        },
+        {
+          "name": "A search engine such as Elasticsearch",
+          "pro": "Flexible search over any field",
+          "con": "Expensive at this volume, and indexing every span is heavy"
+        },
+        {
+          "name": "Object storage with columnar files",
+          "pro": "Cheapest, and good for scans over days",
+          "con": "Slow for single-trace lookups unless an id index sits beside it"
+        }
+      ],
+      "pick": "A key-value store for hot traces with a limited index, plus object storage for older traces."
+    },
+    {
+      "title": "How to set the tail sampling wait",
+      "options": [
+        {
+          "name": "A short wait, a few seconds",
+          "pro": "Small memory and fast availability",
+          "con": "Misses slow roots and async spans, so traces are incomplete and some errors are dropped"
+        },
+        {
+          "name": "A long wait, a minute or more",
+          "pro": "Nearly every trace is complete",
+          "con": "Memory grows in proportion, and traces appear later"
+        }
+      ],
+      "pick": "Around 10 to 30 seconds, matched to the slowest normal request, with a decision cache for stragglers."
+    },
+    {
+      "title": "How to instrument",
+      "options": [
+        {
+          "name": "Manual instrumentation in code",
+          "pro": "Spans named for business operations",
+          "con": "Needs work in every service and is easy to forget"
+        },
+        {
+          "name": "Auto-instrumentation of frameworks and clients",
+          "pro": "Broad coverage with almost no code",
+          "con": "Generic names, and extra spans that cost money"
+        },
+        {
+          "name": "A service mesh or eBPF",
+          "pro": "No code changes, even for old services",
+          "con": "Sees only network calls, and cannot link them to work inside a process"
+        }
+      ],
+      "pick": "Auto-instrumentation everywhere, with manual spans for the few operations that matter."
+    }
+  ],
+  "roles": [
+    {
+      "id": "client",
+      "label": "Services",
+      "description": "Applications with the tracing library that create spans and pass the context on."
+    },
+    {
+      "id": "edge",
+      "label": "Agents, collectors and queries",
+      "description": "Receive, forward and serve spans and traces."
+    },
+    {
+      "id": "async",
+      "label": "Span queue",
+      "description": "Holds spans between the collectors and the tail samplers."
+    },
+    {
+      "id": "compute",
+      "label": "Samplers and jobs",
+      "description": "Tail sampling decisions and the dependency graph."
+    },
+    {
+      "id": "data",
+      "label": "Stores",
+      "description": "The trace store, search index, cold storage, logs and metrics."
+    }
+  ]
+}

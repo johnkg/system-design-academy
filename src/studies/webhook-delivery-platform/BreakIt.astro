@@ -1,0 +1,137 @@
+---
+import PlaygroundShell from '../../components/PlaygroundShell.astro';
+---
+<PlaygroundShell title="One burst, ten customer endpoints" hint="Four healthy endpoints, two slow, two flaky and two that are down all receive the same burst of 600 events. Choose how the sender is built and see who pays for the bad endpoints.">
+  <ol class="how">
+    <li>The default is <b>one shared pool, exponential backoff with jitter, no circuit breaker</b>. The four healthy endpoints answer in 1 second, yet only <b>55 of their 240 events arrive within 10 seconds</b> (median 27 s), because the workers are busy waiting on the down endpoints. <b>4,200 of 5,753</b> worker-seconds are spent on dead endpoints.</li>
+    <li>Choose <b>per-endpoint queues, 3 at a time</b>: all <b>240 of 240</b> healthy events arrive within 10 s (median 1 s). Dead endpoints can now hold only 6 workers, but they are still retried, so 3,570 worker-seconds are still wasted. Turn the <b>circuit breaker on</b> and that falls to <b>230</b>, with the events of the dead endpoints parked instead of dropped.</li>
+    <li>Set the retry policy to <b>none</b> and <b>246</b> events are dropped. With exponential backoff and the breaker only <b>1</b> is. The <b>duplicates</b> come from slow endpoints that finish work after the timeout: the receiver saw the event, the sender did not, so it sends again. Raise the timeout to 10 s and duplicates go to 0, but every attempt on a dead endpoint now holds a worker twice as long.</li>
+  </ol>
+  <div class="pg whb" data-whb>
+    <div class="pg-row">
+      <label>Workers <select class="pg-in" data-pool>
+        <option value="shared" selected>one shared pool, first come first served</option>
+        <option value="per">per-endpoint queues, at most 3 in flight each</option>
+      </select></label>
+      <label>Retry policy <select class="pg-in" data-retry>
+        <option value="none">none: a failure is final</option>
+        <option value="fixed">fixed: every 5 s</option>
+        <option value="exp" selected>exponential with full jitter</option>
+      </select></label>
+      <label>Request timeout <select class="pg-in" data-to>
+        <option value="2">2 s</option><option value="5" selected>5 s</option><option value="10">10 s</option>
+      </select></label>
+      <label><input type="checkbox" data-cb /> Circuit breaker per endpoint</label>
+    </div>
+    <div class="pg-grid">
+      <div class="pg-box" data-b1><h3>Healthy endpoints: events within 10 s</h3><span class="pg-mono" data-o1></span><span class="pg-note" data-n1></span></div>
+      <div class="pg-box" data-b2><h3>Delivered after a retry</h3><span class="pg-mono" data-o2></span><span class="pg-note" data-n2></span></div>
+      <div class="pg-box" data-b3><h3>Dropped</h3><span class="pg-mono" data-o3></span><span class="pg-note" data-n3></span></div>
+      <div class="pg-box" data-b4><h3>Duplicates seen by receivers</h3><span class="pg-mono" data-o4></span><span class="pg-note" data-n4></span></div>
+      <div class="pg-box" data-b5><h3>Worker time wasted on dead endpoints</h3><span class="pg-mono" data-o5></span><span class="pg-note" data-n5></span></div>
+    </div>
+    <div class="whb-bar" role="img" aria-label="Where the worker time went" data-bar></div>
+    <ul class="whb-legend" data-legend></ul>
+    <div class="whb-tbl" role="region" tabindex="0" aria-label="Result for each endpoint">
+      <table><thead><tr><th scope="col">Endpoint</th><th scope="col">Delivered</th><th scope="col">Dropped</th><th scope="col">Waiting</th><th scope="col">Median delay</th><th scope="col">Worker time</th></tr></thead><tbody data-rows></tbody></table>
+    </div>
+    <p class="pg-out" data-verdict aria-live="polite"></p>
+    <p class="pg-note">Model: one step is one second, and the run covers the first 10 minutes. 600 events are published over 30 seconds, 2 per second for each of 10 endpoints, and there are 20 workers. A healthy endpoint answers in 1 s. A slow endpoint takes 3 to 7 s, and it has already processed the event when the sender gives up on a timeout. A flaky endpoint fails 40% of requests at random, and the second flaky endpoint returns an error for the first 3 minutes and then recovers. A down endpoint never answers, so every attempt holds a worker for the full timeout. Every event gets at most 7 attempts. Fixed retries wait 5 s. Exponential retries wait a random time between 0 and min(160 s, 5 s times 2 to the power of the retries so far), with the numbers scaled down from the minutes and hours a real sender uses. The breaker opens after 5 failures in a row, waits 30 s, then lets one probe through. Events held back by an open breaker are "waiting", not dropped. The randomness is seeded, so every setting sees the same luck.</p>
+  </div>
+</PlaygroundShell>
+<style is:global>
+  .playground .whb-bar { display: flex; height: 18px; border-radius: 9px; overflow: hidden; border: 1px solid var(--border); background: var(--surface-2); }
+  .playground .whb-bar span { display: block; height: 100%; }
+  .playground .whb-legend { list-style: none; margin: 0; padding: 0; display: flex; flex-wrap: wrap; gap: 4px 16px; font-size: .85rem; }
+  .playground .whb-legend i { display: inline-block; width: .8em; height: .8em; border-radius: 3px; margin-right: .4em; }
+  .playground .whb-tbl { overflow-x: auto; }
+  .playground .whb-tbl table { border-collapse: collapse; width: 100%; font-size: .85rem; }
+  .playground .whb-tbl th, .playground .whb-tbl td { text-align: right; padding: 4px 8px; border-bottom: 1px solid var(--border); white-space: nowrap; }
+  .playground .whb-tbl th:first-child, .playground .whb-tbl td:first-child { text-align: left; }
+</style>
+<script>
+  document.querySelectorAll<HTMLElement>('[data-whb]').forEach((root) => {
+    const q = <T extends HTMLElement>(s: string) => root.querySelector<T>(s)!;
+    const WORKERS = 20; const CAP = 3; const MAXTRY = 7; const BURST = 30; const PER_SEC = 2; const HORIZON = 600; const COOL = 30; const TRIP = 5; const OUTAGE = 180;
+    const EPS = [
+      { name: 'ok-1', kind: 'healthy' }, { name: 'ok-2', kind: 'healthy' }, { name: 'ok-3', kind: 'healthy' }, { name: 'ok-4', kind: 'healthy' },
+      { name: 'slow-1', kind: 'slow' }, { name: 'slow-2', kind: 'slow' },
+      { name: 'flaky-1', kind: 'flaky' }, { name: 'flaky-2', kind: 'flaky' },
+      { name: 'down-1', kind: 'down' }, { name: 'down-2', kind: 'down' },
+    ];
+    // A deterministic number in [0,1) for (event, attempt, purpose), so every option sees the same luck.
+    const luck = (a: number, b: number, c: number) => { let h = Math.imul(a * 7919 + b * 104729 + c * 1299709 + 12345, 2654435761) >>> 0; h ^= h >>> 15; h = Math.imul(h, 2246822519) >>> 0; h ^= h >>> 13; h = Math.imul(h, 3266489917) >>> 0; h ^= h >>> 16; return (h >>> 0) / 4294967296; };
+    function simulate(pool: string, retry: string, breaker: boolean, timeout: number) {
+      const jobs: any[] = [];
+      for (let s = 0; s < BURST; s++) for (let k = 0; k < PER_SEC; k++) EPS.forEach((_, ep) => jobs.push({ id: jobs.length, ep, pub: s, ready: s, tries: 0, state: 'wait', receipts: 0, done: 0 }));
+      const st = EPS.map(() => ({ inflight: 0, fails: 0, open: false, openAt: 0, probe: false }));
+      const ws = EPS.map(() => 0); let running: any[] = []; let open = jobs.slice();
+      for (let t = 0; t <= HORIZON; t++) {
+        running = running.filter((r) => {
+          if (r.end > t) return true;
+          const j = r.job; const s = st[j.ep]; s.inflight--; if (r.probe) s.probe = false;
+          if (r.ok) { j.state = 'ok'; j.done = t; s.fails = 0; s.open = false; } else {
+            s.fails++; if (breaker && (s.open || s.fails >= TRIP)) { s.open = true; s.openAt = t; }
+            if (retry !== 'none' && j.tries < MAXTRY) { const n = j.tries; j.ready = t + (retry === 'fixed' ? 5 : 1 + Math.floor(luck(j.id, n, 9) * Math.min(160, 5 * 2 ** (n - 1)))); j.state = 'wait'; } else j.state = 'dropped';
+          }
+          return false;
+        });
+        open = open.filter((j) => j.state === 'wait' || j.state === 'run');
+        const can = (j: any) => { if (j.state !== 'wait' || j.ready > t) return false; const s = st[j.ep]; if (pool === 'per' && s.inflight >= CAP) return false; if (breaker && s.open && (t - s.openAt < COOL || s.probe)) return false; return true; };
+        while (running.length < WORKERS) {
+          const cand = open.filter(can); if (!cand.length) break;
+          const older = (a: any, b: any) => b.ready < a.ready || (b.ready === a.ready && b.id < a.id);
+          const j = pool === 'shared' ? cand.reduce((a, b) => (older(a, b) ? b : a)) : cand.reduce((a, b) => { const ia = st[a.ep].inflight; const ib = st[b.ep].inflight; return ib < ia || (ib === ia && older(a, b)) ? b : a; });
+          const s = st[j.ep]; const e = EPS[j.ep]; j.tries++;
+          let hold = 1; let ok = true; let receipt = true;
+          if (e.kind === 'flaky') { ok = j.ep === 6 ? luck(j.id, j.tries, 1) >= 0.4 : t >= OUTAGE; }
+          else if (e.kind === 'slow') { const L = 3 + Math.floor(luck(j.id, j.tries, 2) * 5); if (L > timeout) { hold = timeout; ok = false; } else hold = L; }
+          else if (e.kind === 'down') { hold = timeout; ok = false; receipt = false; }
+          if (receipt && (ok || e.kind === 'slow')) j.receipts++;
+          const probe = breaker && s.open; if (probe) s.probe = true;
+          j.state = 'run'; s.inflight++; ws[j.ep] += hold;
+          running.push({ job: j, end: t + hold, ok, probe });
+        }
+        if (t > BURST && !running.length && !open.length) break;
+      }
+      const med = (a: number[]) => { const s = a.slice().sort((x, y) => x - y); return s.length ? s[s.length >> 1] : 0; };
+      const rows = EPS.map((e, ep) => { const js = jobs.filter((j) => j.ep === ep); const done = js.filter((j) => j.state === 'ok'); return { name: e.name, kind: e.kind, total: js.length, ok: done.length, dropped: js.filter((j) => j.state === 'dropped').length, pending: js.filter((j) => j.state === 'wait' || j.state === 'run').length, med: med(done.map((j) => j.done - j.pub)), ws: ws[ep] }; });
+      const hj = jobs.filter((j) => EPS[j.ep].kind === 'healthy'); const hd = hj.filter((j) => j.state === 'ok').map((j) => j.done - j.pub);
+      const sum = (f: (r: any) => number) => rows.reduce((a, r) => a + f(r), 0);
+      return {
+        rows, healthyTotal: hj.length, healthyFast: hd.filter((d) => d <= 10).length, healthyMed: med(hd), healthyMax: hd.length ? Math.max(...hd) : 0,
+        delivered: sum((r) => r.ok), afterRetry: jobs.filter((j) => j.state === 'ok' && j.tries > 1).length, dropped: sum((r) => r.dropped), pending: sum((r) => r.pending),
+        dups: jobs.reduce((a, j) => a + Math.max(0, j.receipts - 1), 0), wasted: sum((r) => (r.kind === 'down' ? r.ws : 0)), workTotal: sum((r) => r.ws), total: jobs.length,
+      };
+    }
+
+    const fmt = (n: number) => Math.round(n).toLocaleString('en-US');
+    const KINDS = [['healthy', 'var(--good)'], ['slow', 'var(--role-4)'], ['flaky', 'var(--role-5)'], ['down', 'var(--bad)']];
+    const bar = q('[data-bar]'); const segs = KINDS.map(([, c]) => { const sp = document.createElement('span'); sp.style.background = c; bar.append(sp); return sp; });
+    const legend = q('[data-legend]'); const legendTxt = KINDS.map(([k, c]) => { const li = document.createElement('li'); const i = document.createElement('i'); i.style.background = c; const t = document.createElement('span'); li.append(i, t); legend.append(li); return { k, t }; });
+    const body = q('[data-rows]'); const cells = EPS.map(() => { const tr = document.createElement('tr'); const tds = Array.from({ length: 6 }, () => document.createElement('td')); tr.append(...tds); body.append(tr); return tds; });
+    const cache = new Map<string, ReturnType<typeof simulate>>();
+    function draw() {
+      const pool = q<HTMLSelectElement>('[data-pool]').value; const retry = q<HTMLSelectElement>('[data-retry]').value; const to = Number(q<HTMLSelectElement>('[data-to]').value); const cb = q<HTMLInputElement>('[data-cb]').checked;
+      const key = `${pool}|${retry}|${to}|${cb}`; let r = cache.get(key); if (!r) { r = simulate(pool, retry, cb, to); cache.set(key, r); }
+      const share = r.wasted / r.workTotal; const hol = r.healthyFast < r.healthyTotal * 0.95;
+      q('[data-o1]').textContent = `${r.healthyFast} of ${r.healthyTotal}`; q('[data-n1]').textContent = `median ${r.healthyMed} s, slowest ${r.healthyMax} s`;
+      q('[data-o2]').textContent = fmt(r.afterRetry); q('[data-n2]').textContent = `of ${fmt(r.delivered)} delivered in all`;
+      q('[data-o3]').textContent = fmt(r.dropped); q('[data-n3]').textContent = r.pending ? `plus ${fmt(r.pending)} still waiting or retrying at 10 minutes` : 'nothing is left waiting';
+      q('[data-o4]').textContent = fmt(r.dups); q('[data-n4]').textContent = r.dups ? 'extra copies that receivers must dedupe by event id' : 'no attempt timed out after the receiver had the event';
+      q('[data-o5]').textContent = `${fmt(r.wasted)} worker-seconds`; q('[data-n5]').textContent = `${Math.round(share * 100)}% of the ${fmt(r.workTotal)} used in all`;
+      const col = (id: string, v: string) => q<HTMLElement>(id).style.setProperty('--c', v);
+      col('[data-b1]', hol ? 'var(--bad)' : 'var(--good)'); col('[data-b2]', 'var(--accent)'); col('[data-b3]', r.dropped >= 10 ? 'var(--bad)' : 'var(--good)'); col('[data-b4]', r.dups ? 'var(--role-4)' : 'var(--good)'); col('[data-b5]', share > 0.5 ? 'var(--bad)' : 'var(--good)');
+      KINDS.forEach(([k], i) => { const w = r!.rows.filter((x) => x.kind === k).reduce((a, x) => a + x.ws, 0); segs[i].style.width = `${(w / r!.workTotal) * 100}%`; legendTxt[i].t.textContent = `${k} endpoints ${fmt(w)} s`; });
+      r.rows.forEach((x, i) => { const v = [x.name, `${x.ok} of ${x.total}`, String(x.dropped), String(x.pending), x.ok ? `${x.med} s` : '-', `${fmt(x.ws)} s`]; v.forEach((t, j) => (cells[i][j].textContent = t)); });
+      const out = q('[data-verdict]');
+      const bad = hol || share > 0.5 || r.dropped >= 10; out.classList.toggle('bad', bad);
+      const a = hol ? `Head-of-line blocking: the healthy endpoints answer in 1 s, but only ${r.healthyFast} of ${r.healthyTotal} events arrive within 10 s, because every worker is tied up waiting for slow and dead endpoints.` : `The healthy endpoints are isolated from the bad ones: ${r.healthyFast} of ${r.healthyTotal} events arrive within 10 s.`;
+      const b = share > 0.5 ? ` Dead endpoints burn ${Math.round(share * 100)}% of all worker time, on attempts that cannot succeed.` : ` Dead endpoints cost only ${Math.round(share * 100)}% of the worker time.`;
+      const c = r.dropped >= 10 ? ` ${fmt(r.dropped)} events are dropped for good.` : r.dropped ? ` Only ${r.dropped} event is dropped.` : ' No event is lost.';
+      out.textContent = a + b + c + (r.pending ? ` ${fmt(r.pending)} wait for endpoints that are paused or still being retried.` : '');
+    }
+    root.addEventListener('input', draw); root.addEventListener('change', draw);
+    draw();
+  });
+</script>

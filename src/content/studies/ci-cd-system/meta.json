@@ -1,0 +1,583 @@
+{
+  "name": "Design a CI System",
+  "difficulty": "advanced",
+  "intent": "Build and test every push for thousands of repositories on a pool of throwaway runners, in minutes, safely, with fair queues and a bill that follows the load.",
+  "codeTitle": "a pipeline DAG, cache keys, test shards and fair-share scheduling",
+  "finalIntro": "One push to a pull request, from the webhook to a green check.",
+  "prompt": "Design a continuous integration service like GitHub Actions or Buildkite for a company with 10,000 repositories. A push or a pull request triggers a pipeline defined in the repository. The pipeline runs builds and tests, reports the result on the pull request, and must handle pull requests from forks without leaking secrets. Deploying the result to hosts is a separate system.",
+  "functional": [
+    "Start a pipeline when a push or pull request event arrives from the code host",
+    "Read the pipeline definition from the commit: stages, steps and a graph of jobs that depend on each other",
+    "Run each job on a clean runner that matches its labels, such as operating system and size",
+    "Cache dependencies and pass build artifacts between jobs",
+    "Split tests across parallel jobs, and retry or quarantine flaky tests",
+    "Stream logs live, store artifacts and logs, and report status on the pull request",
+    "Keep secrets away from untrusted code such as pull requests from forks"
+  ],
+  "nonFunctional": [
+    "Median wait before a job starts is under 30 seconds, and the 95th percentile under 3 minutes, even during bursts",
+    "Handle about 25,000 builds and 150,000 jobs a day, with 4 times that rate in the busiest hour",
+    "One team's burst of builds must not starve other teams",
+    "Untrusted code cannot read secrets, reach internal networks or poison caches used by trusted builds",
+    "A crashed runner or a lost webhook never loses a build: the job is run again or the build is found by reconciliation",
+    "A failed build means the code is broken, so false failures from flaky tests must be rare and visible",
+    "Cost follows load: idle runners are removed, and each team can see what it spends"
+  ],
+  "firstAttempt": {
+    "text": "One build server with a few permanent build machines. It polls each repository every minute and runs the steps from a configuration stored in the server's own settings, in a workspace that the machine keeps between builds. The secrets are environment variables available to every job. The log is a file on the machine, and the result is shown on the server's own page.",
+    "limits": [
+      "Polling thousands of repositories adds a delay to every build and a constant load on the code host",
+      "Jobs share a workspace with leftovers from earlier jobs, so a build can pass or fail because of what ran before it",
+      "Fixed machines are too few in the morning rush and idle at night, and one large team can fill all of them",
+      "Any pull request can print the secrets, since its code runs on the same machine as the secrets",
+      "Every build downloads all its dependencies again, and tests run in one long sequence",
+      "The configuration is not in the repository, so it cannot be reviewed or changed with the code"
+    ]
+  },
+  "nodes": [
+    {
+      "id": "dev",
+      "label": "Developers",
+      "kind": "client",
+      "x": 62,
+      "y": 12
+    },
+    {
+      "id": "single",
+      "label": "One build server",
+      "kind": "compute",
+      "x": 87,
+      "y": 37,
+      "at": 0,
+      "until": 1
+    },
+    {
+      "id": "hook",
+      "label": "Webhook receiver",
+      "kind": "edge",
+      "x": 37,
+      "y": 12,
+      "at": 1
+    },
+    {
+      "id": "plan",
+      "label": "Pipeline planner",
+      "kind": "compute",
+      "x": 37,
+      "y": 37,
+      "at": 1
+    },
+    {
+      "id": "queue",
+      "label": "Job queues",
+      "kind": "async",
+      "x": 12,
+      "y": 37,
+      "at": 2
+    },
+    {
+      "id": "sched",
+      "label": "Scheduler",
+      "kind": "compute",
+      "x": 12,
+      "y": 63,
+      "at": 2
+    },
+    {
+      "id": "pool",
+      "label": "Ephemeral runners",
+      "kind": "compute",
+      "x": 37,
+      "y": 88,
+      "at": 2
+    },
+    {
+      "id": "scaler",
+      "label": "Autoscaler",
+      "kind": "compute",
+      "x": 12,
+      "y": 88,
+      "at": 2
+    },
+    {
+      "id": "secrets",
+      "label": "Secrets broker",
+      "kind": "data",
+      "x": 62,
+      "y": 88,
+      "at": 3
+    },
+    {
+      "id": "store",
+      "label": "Cache and artifacts",
+      "kind": "data",
+      "x": 62,
+      "y": 63,
+      "at": 4
+    },
+    {
+      "id": "history",
+      "label": "Test history",
+      "kind": "data",
+      "x": 37,
+      "y": 63,
+      "at": 5
+    },
+    {
+      "id": "logs",
+      "label": "Log stream",
+      "kind": "data",
+      "x": 87,
+      "y": 63,
+      "at": 6
+    },
+    {
+      "id": "status",
+      "label": "Status reporter",
+      "kind": "edge",
+      "x": 62,
+      "y": 37,
+      "at": 6
+    }
+  ],
+  "edges": [
+    {
+      "from": "dev",
+      "to": "single",
+      "at": 0,
+      "until": 1
+    },
+    {
+      "from": "dev",
+      "to": "hook",
+      "at": 1
+    },
+    {
+      "from": "hook",
+      "to": "plan",
+      "at": 1
+    },
+    {
+      "from": "plan",
+      "to": "queue",
+      "at": 2
+    },
+    {
+      "from": "queue",
+      "to": "sched",
+      "at": 2
+    },
+    {
+      "from": "sched",
+      "to": "pool",
+      "at": 2
+    },
+    {
+      "from": "sched",
+      "to": "scaler",
+      "at": 2
+    },
+    {
+      "from": "scaler",
+      "to": "pool",
+      "at": 2
+    },
+    {
+      "from": "pool",
+      "to": "secrets",
+      "at": 3
+    },
+    {
+      "from": "pool",
+      "to": "store",
+      "at": 4
+    },
+    {
+      "from": "history",
+      "to": "plan",
+      "at": 5
+    },
+    {
+      "from": "pool",
+      "to": "history",
+      "at": 5
+    },
+    {
+      "from": "pool",
+      "to": "logs",
+      "at": 6
+    },
+    {
+      "from": "logs",
+      "to": "status",
+      "at": 6
+    },
+    {
+      "from": "plan",
+      "to": "status",
+      "at": 6
+    },
+    {
+      "from": "status",
+      "to": "dev",
+      "at": 6
+    }
+  ],
+  "steps": [
+    {
+      "title": "Turn every push into a graph of jobs",
+      "problem": "Polling repositories is slow and wasteful, and a configuration kept inside the server cannot change together with the code it builds.",
+      "fix": "The code host sends a webhook for each push and pull request. The receiver checks the HMAC signature, records the delivery id so a redelivery is ignored, answers with a success code in milliseconds and hands the event on. The planner reads the pipeline file from that exact commit and expands it into a graph of jobs, where each job lists the jobs it needs. Jobs with no unmet needs are ready and can run at the same time, and matrix entries such as three operating systems times two language versions become six jobs. The planner stores the state of every job and starts a job when all the jobs it needs have succeeded.",
+      "tradeoff": "Builds start within a second of the push, and the pipeline is reviewed and versioned like code, so an old commit builds the way it did then. The planner must validate the file, reject cycles and cap matrix sizes, and webhooks can be lost, so a background job also compares the code host's recent events with the builds it knows.",
+      "concepts": [
+        {
+          "slug": "webhooks"
+        },
+        {
+          "slug": "idempotency"
+        },
+        {
+          "slug": "message-queues"
+        },
+        {
+          "slug": "infrastructure-as-code"
+        }
+      ]
+    },
+    {
+      "title": "Queue jobs by label and run them on ephemeral runners",
+      "problem": "A fixed set of shared machines gives jobs dirty workspaces, is too small in a burst and wasted at night, and lets a single team take everything.",
+      "fix": "Ready jobs go into queues keyed by their labels, such as linux-4cpu or macos, and by team. Runners are fresh virtual machines or containers that start, pull one job from the scheduler, run it, upload the results and are destroyed, so no job sees another job's leftovers. A runner holds a lease on its job and renews it with a heartbeat. If it disappears the lease expires and the job goes back in the queue. The autoscaler watches queue depth against the number of runners and boots more, since a virtual machine takes a minute or more to start, and removes runners that have been idle for a few minutes. When a runner is free, the scheduler does not take the oldest job. It takes the oldest job of the team with the fewest running jobs, with weights, quotas and a higher priority for the default branch.",
+      "tradeoff": "Jobs get a clean, identical environment, capacity follows demand and one team's burst cannot starve the others. Every job pays for its start-up, and a pool that is too lean makes people wait while one that is too generous costs money. A warm pool of ready runners hides the boot time, and the right size is a decision you tune against the wait-time target.",
+      "concepts": [
+        {
+          "slug": "message-queues"
+        },
+        {
+          "slug": "autoscaling"
+        },
+        {
+          "slug": "containers-and-orchestration"
+        },
+        {
+          "slug": "backpressure"
+        },
+        {
+          "slug": "bulkhead"
+        }
+      ]
+    },
+    {
+      "title": "Run untrusted code in a sandbox and keep secrets out of it",
+      "problem": "A pull request from a fork runs code written by a stranger on your machines, and it can print secrets, scan the internal network or leave a trap for later builds.",
+      "fix": "Every job runs in a one-shot sandbox, a micro virtual machine or a container with a strong kernel boundary, with no access to the internal network and with outgoing traffic limited to an allow list. Secrets are not environment variables on the runner. A secrets broker hands a job short-lived credentials only if the job is trusted: a push to a protected branch, or a pull request from the same repository. A pull request from a fork gets a read-only token and no secrets, and a maintainer must approve any job that needs more. Credentials are scoped to the repository and branch, expire when the job ends, and are masked in the logs.",
+      "tradeoff": "A malicious pull request can use some compute, but can read nothing valuable. Contributors from forks cannot run tests that need real credentials until a maintainer approves, and the strongest sandboxes start slower and cost more than plain containers.",
+      "concepts": [
+        {
+          "slug": "secrets-management"
+        },
+        {
+          "slug": "authentication-and-authorization"
+        },
+        {
+          "slug": "containers-and-orchestration"
+        },
+        {
+          "slug": "bulkhead"
+        },
+        {
+          "slug": "encryption"
+        }
+      ]
+    },
+    {
+      "title": "Cache dependencies and share artifacts by content",
+      "problem": "Each fresh runner starts empty, so downloading and compiling the same dependencies for every job wastes minutes and money.",
+      "fix": "A cache entry is stored under a key made from a hash of the files that decide its content, for example the operating system, the compiler version and the hash of the lockfile. If the lockfile is unchanged, the key is the same and the runner restores the entry in seconds. On a miss it can fall back to the newest entry with a matching prefix and then saves a new entry for the next job. Artifacts that pass from one job to the next, such as the compiled output, are uploaded to object storage under a hash of their content and fetched by the jobs that need them, and expire after a retention period. Builds from forks may read the shared cache but cannot write to it.",
+      "tradeoff": "Jobs start sooner, and equal content is stored once. A key that misses something gives a stale result, so keys must include everything that matters. Storage grows and needs eviction by age and size, and a wrongly shared cache is a way to attack the trusted builds, which is why writes are restricted by trust.",
+      "concepts": [
+        {
+          "slug": "caching"
+        },
+        {
+          "slug": "idempotency"
+        },
+        {
+          "slug": "cdn"
+        },
+        {
+          "slug": "encryption"
+        }
+      ]
+    },
+    {
+      "title": "Split tests into shards and handle flaky tests",
+      "problem": "One 12-minute test run slows every change, and a test that fails by chance teaches people to ignore red builds.",
+      "fix": "The planner keeps the time of each test from earlier runs in the test history. To shard, it sorts the tests by time and gives the slowest remaining test to the least loaded shard, so each shard takes about the same time and the build waits for the slowest one. Each shard is its own job, so they run on separate runners at once. When a test fails, only that test is run again, up to two times. A test that fails and then passes on the same commit is recorded as flaky. Its flakiness score rises with each such event, and above a threshold the test is quarantined: it still runs and is reported, but it no longer blocks the merge, and its owner gets a ticket.",
+      "tradeoff": "Build time drops from the total test time to the time of the slowest shard, and trust in a red result is protected. Each shard repeats setup and a cache restore, so more shards means more cost and diminishing returns. Retries use extra runner time and can hide real intermittent bugs, so every pass on retry must be recorded and shown.",
+      "concepts": [
+        {
+          "slug": "retries-and-backoff"
+        },
+        {
+          "slug": "metrics"
+        },
+        {
+          "slug": "alerting"
+        },
+        {
+          "slug": "slos-and-error-budgets"
+        }
+      ]
+    },
+    {
+      "title": "Stream logs, report status and keep the cost in check",
+      "problem": "People wait for feedback in the pull request, and nobody knows why the runner bill doubled.",
+      "fix": "A runner sends its log in numbered chunks about every second to the log service, which appends them to object storage and pushes them live to browsers, with secrets masked. The status reporter writes a check on the pull request for each job and a summary for the build, keyed by commit and check name so an update replaces the old one, and it batches updates to stay within the code host's API limits. To control cost, a new push to a pull request cancels the older build, path filters skip jobs whose files did not change, every job has a time limit, idle runners are removed, interruptible spot machines are used where a job can be rerun, and spending is reported for each team.",
+      "tradeoff": "Developers see progress in seconds and teams can see what they spend. Live streaming and many small status updates are real load on the system. Spot machines are cheaper but are taken away without warning, so jobs must be safe to repeat, and cancelling old builds saves money but loses results someone may have wanted.",
+      "concepts": [
+        {
+          "slug": "structured-logging"
+        },
+        {
+          "slug": "real-time-communication"
+        },
+        {
+          "slug": "rate-limiting"
+        },
+        {
+          "slug": "idempotency"
+        },
+        {
+          "slug": "metrics"
+        }
+      ]
+    }
+  ],
+  "failures": [
+    {
+      "scenario": "A webhook is lost, or delivered twice",
+      "impact": "A lost event means a commit with no build and a pull request waiting for ever. A duplicate would run the same build twice.",
+      "answer": "The receiver records each delivery id and the planner keys a build by repository and commit, so a repeat finds the existing build. A reconciler compares the code host's recent events and open pull requests with known builds and starts the missing ones. A manual re-run is always available.",
+      "concepts": [
+        {
+          "slug": "webhooks"
+        },
+        {
+          "slug": "idempotency"
+        },
+        {
+          "slug": "retries-and-backoff"
+        }
+      ]
+    },
+    {
+      "scenario": "A runner disappears in the middle of a job",
+      "impact": "The job never reports a result, so the build hangs, or a spot machine is reclaimed after 20 minutes of work.",
+      "answer": "The runner's lease expires without a heartbeat and the scheduler puts the job back in the queue, up to a small number of attempts. The result is marked an infrastructure failure, not a test failure, so it is not blamed on the code. Jobs must be safe to run again, with results written under the job's own id.",
+      "concepts": [
+        {
+          "slug": "health-checks"
+        },
+        {
+          "slug": "message-queues"
+        },
+        {
+          "slug": "retries-and-backoff"
+        },
+        {
+          "slug": "idempotency"
+        }
+      ]
+    },
+    {
+      "scenario": "One team merges 100 pull requests in 12 minutes",
+      "impact": "With one first-come queue every other team waits behind them, and the pool of runners is exhausted.",
+      "answer": "The scheduler takes the next job from the team with the fewest running jobs, so the other teams still start within seconds while the burst waits its turn. The autoscaler adds runners up to a cap, a per-team concurrency quota stops one team from spending the whole budget, and an alert fires when the wait of the 95th percentile exceeds the target.",
+      "concepts": [
+        {
+          "slug": "backpressure"
+        },
+        {
+          "slug": "bulkhead"
+        },
+        {
+          "slug": "autoscaling"
+        },
+        {
+          "slug": "rate-limiting"
+        },
+        {
+          "slug": "alerting"
+        }
+      ]
+    },
+    {
+      "scenario": "A fork pull request tries to steal secrets or poison the cache",
+      "impact": "If it works, the attacker holds production credentials, or later trusted builds run code planted in a shared cache.",
+      "answer": "The job runs in a sandbox with no internal network, and the broker refuses to issue secrets to a fork, so there is nothing to read. The fork's token is read-only and its cache writes go to an area that trusted builds never read. A change to the pipeline file in the pull request is run only after a maintainer approves it.",
+      "concepts": [
+        {
+          "slug": "secrets-management"
+        },
+        {
+          "slug": "authentication-and-authorization"
+        },
+        {
+          "slug": "bulkhead"
+        },
+        {
+          "slug": "caching"
+        }
+      ]
+    },
+    {
+      "scenario": "The cloud cannot supply new machines",
+      "impact": "The queue grows, people wait for an hour and the autoscaler can do nothing.",
+      "answer": "The autoscaler tries other instance types and zones, and falls back to on-demand machines when spot capacity is gone. A warm pool covers short gaps. The queue-wait target raises an alert, and jobs on the default branch have priority over pull request builds while capacity is short.",
+      "concepts": [
+        {
+          "slug": "autoscaling"
+        },
+        {
+          "slug": "slos-and-error-budgets"
+        },
+        {
+          "slug": "alerting"
+        },
+        {
+          "slug": "multi-region-failover"
+        }
+      ]
+    }
+  ],
+  "alternatives": [
+    {
+      "title": "Where jobs run",
+      "options": [
+        {
+          "name": "Long-lived machines",
+          "pro": "No start-up delay and warm disks",
+          "con": "Leftovers between jobs, drift, and untrusted code on a shared machine"
+        },
+        {
+          "name": "A fresh virtual machine per job",
+          "pro": "Clean and strongly isolated",
+          "con": "A minute or more to start, unless a warm pool hides it"
+        },
+        {
+          "name": "Containers on a shared cluster",
+          "pro": "Start in seconds and pack many jobs per machine",
+          "con": "A weaker boundary, so risky for fork pull requests without extra sandboxing"
+        }
+      ],
+      "pick": "A fresh micro virtual machine or sandboxed container per job, with a warm pool to hide the start-up."
+    },
+    {
+      "title": "How a runner gets work",
+      "options": [
+        {
+          "name": "The scheduler pushes the job to a runner",
+          "pro": "Placement can be very precise",
+          "con": "The scheduler must reach every runner and track which are alive"
+        },
+        {
+          "name": "Runners pull jobs from a queue",
+          "pro": "Works behind firewalls, scales by adding runners, and a dead runner just stops asking",
+          "con": "Needs leases and heartbeats to recover jobs, and polling adds a little delay"
+        }
+      ],
+      "pick": "Runners pull a job with a lease, so a dead runner loses it automatically."
+    },
+    {
+      "title": "How to split tests",
+      "options": [
+        {
+          "name": "By file name or hash",
+          "pro": "Needs no history",
+          "con": "Shards can differ by a factor of two, and the slowest decides"
+        },
+        {
+          "name": "By recorded timing",
+          "pro": "Even shards, so the build is as short as possible",
+          "con": "Needs a test history, and new or changed tests are guesses"
+        },
+        {
+          "name": "Dynamic: shards take tests from a shared queue",
+          "pro": "Balances itself even with wrong timings",
+          "con": "More coordination, and test order differs between runs"
+        }
+      ],
+      "pick": "Timing-based shards, with the history updated after each run."
+    },
+    {
+      "title": "How to treat a flaky test",
+      "options": [
+        {
+          "name": "Fail the build",
+          "pro": "Nothing is hidden",
+          "con": "People stop trusting red and re-run by hand, which costs more than the retry"
+        },
+        {
+          "name": "Retry silently",
+          "pro": "Fewer false failures",
+          "con": "Hides flakiness and real intermittent bugs, and wastes runner time"
+        },
+        {
+          "name": "Retry, record and quarantine",
+          "pro": "Keeps builds green and trusted, and pushes the problem to the owner",
+          "con": "Needs the history, the thresholds and the follow-up discipline"
+        }
+      ],
+      "pick": "Retry only the failed test, record every flip, and quarantine a test that crosses the threshold."
+    },
+    {
+      "title": "How to share runners between teams",
+      "options": [
+        {
+          "name": "First come, first served",
+          "pro": "Simple and predictable",
+          "con": "A burst from one team makes everyone wait"
+        },
+        {
+          "name": "Fixed quotas per team",
+          "pro": "Strong isolation and predictable cost",
+          "con": "Idle quota is wasted while others queue"
+        },
+        {
+          "name": "Fair share with weights",
+          "pro": "Uses all the capacity and still protects small teams",
+          "con": "Harder to explain, and the big team's own wait grows in a burst"
+        }
+      ],
+      "pick": "Fair share with weights, plus a cap per team and priority for the default branch."
+    }
+  ],
+  "roles": [
+    {
+      "id": "client",
+      "label": "Developers",
+      "description": "People who push code, open pull requests and read the results."
+    },
+    {
+      "id": "edge",
+      "label": "Entry points",
+      "description": "The webhook receiver and the status reporter that talk to the code host."
+    },
+    {
+      "id": "async",
+      "label": "Job queues",
+      "description": "Ready jobs waiting for a runner, one queue per label and team."
+    },
+    {
+      "id": "compute",
+      "label": "Planner and runners",
+      "description": "The pipeline planner, scheduler, autoscaler and the throwaway runners."
+    },
+    {
+      "id": "data",
+      "label": "State",
+      "description": "Secrets, caches, artifacts, logs and test history."
+    }
+  ]
+}

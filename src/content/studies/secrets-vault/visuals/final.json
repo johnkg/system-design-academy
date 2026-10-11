@@ -1,0 +1,205 @@
+{
+  "actors": [
+    {
+      "id": "app",
+      "label": "Billing workload",
+      "role": "client",
+      "x": 14,
+      "y": 16
+    },
+    {
+      "id": "api",
+      "label": "Vault API",
+      "role": "edge",
+      "x": 50,
+      "y": 16
+    },
+    {
+      "id": "auth",
+      "label": "Identity and policy",
+      "role": "compute",
+      "x": 86,
+      "y": 16
+    },
+    {
+      "id": "audit",
+      "label": "Audit log",
+      "role": "async",
+      "x": 14,
+      "y": 50
+    },
+    {
+      "id": "engine",
+      "label": "Lease engine",
+      "role": "compute",
+      "x": 50,
+      "y": 50
+    },
+    {
+      "id": "raft",
+      "label": "Raft cluster",
+      "role": "data",
+      "x": 86,
+      "y": 50
+    },
+    {
+      "id": "db",
+      "label": "Billing database",
+      "role": "data",
+      "x": 14,
+      "y": 84
+    },
+    {
+      "id": "hsm",
+      "label": "HSM",
+      "role": "data",
+      "x": 50,
+      "y": 84
+    }
+  ],
+  "frames": [
+    {
+      "narration": "A billing pod starts. It has no stored password, only an identity from the platform: a service account token. It sends the token to the vault to log in.",
+      "messages": [
+        {
+          "from": "app",
+          "to": "api",
+          "label": "login with service account token"
+        }
+      ]
+    },
+    {
+      "narration": "The vault checks the token with the platform and finds that it belongs to billing in production. It returns a vault token that lives 15 minutes and carries the 'billing' policy.",
+      "messages": [
+        {
+          "from": "api",
+          "to": "auth",
+          "label": "verify identity"
+        },
+        {
+          "from": "auth",
+          "to": "app",
+          "label": "token, 15 min, policy billing"
+        }
+      ],
+      "states": {
+        "auth": "billing / prod"
+      }
+    },
+    {
+      "narration": "The pod asks for database credentials. The policy allows reads of database/creds/billing and nothing else. The vault writes the audit entry before it answers, and would refuse the request if it could not.",
+      "messages": [
+        {
+          "from": "app",
+          "to": "api",
+          "label": "read database/creds/billing"
+        },
+        {
+          "from": "api",
+          "to": "audit",
+          "label": "who, path, time, allowed"
+        }
+      ],
+      "states": {
+        "audit": "entry written"
+      }
+    },
+    {
+      "narration": "The lease engine connects to the database with its privileged account and creates a role with a random name and password, limited to the billing tables.",
+      "messages": [
+        {
+          "from": "api",
+          "to": "engine",
+          "label": "create credentials"
+        },
+        {
+          "from": "engine",
+          "to": "db",
+          "label": "CREATE ROLE v-billing-8f3a"
+        }
+      ],
+      "states": {
+        "db": "role v-billing-8f3a"
+      }
+    },
+    {
+      "narration": "The lease record is written to the Raft log. The leader sends it to the other four nodes and continues once 3 of the 5 have it, so it survives the loss of any two nodes. The lease record is encrypted with a data key that the HSM-held master key protects.",
+      "messages": [
+        {
+          "from": "engine",
+          "to": "raft",
+          "label": "lease l-512, 1 hour"
+        },
+        {
+          "from": "raft",
+          "to": "hsm",
+          "label": "wrap with master key"
+        }
+      ],
+      "states": {
+        "raft": "committed on 3 of 5"
+      }
+    },
+    {
+      "narration": "The pod receives the username and password with the lease id and a one hour time to live. It connects to the database. No other pod has the same password, and the audit log says which pod has this one.",
+      "messages": [
+        {
+          "from": "api",
+          "to": "app",
+          "label": "v-billing-8f3a, lease l-512, 1 h"
+        },
+        {
+          "from": "app",
+          "to": "db",
+          "label": "connect"
+        }
+      ],
+      "states": {
+        "app": "holds lease l-512"
+      },
+      "highlight": [
+        "app"
+      ]
+    },
+    {
+      "narration": "At about 40 minutes, two thirds of the lease, the agent in the pod renews it in the background. It does not ask for a new credential, and the application never notices.",
+      "messages": [
+        {
+          "from": "app",
+          "to": "api",
+          "label": "renew l-512"
+        },
+        {
+          "from": "api",
+          "to": "engine",
+          "label": "extend to 1 hour"
+        }
+      ],
+      "states": {
+        "engine": "expires in 1 h"
+      }
+    },
+    {
+      "narration": "Later the pod is deleted. Nobody renews the lease, so it expires. The engine drops the role, and the password stops working even if someone copied it. An operator could have revoked the same lease early, in one call.",
+      "messages": [
+        {
+          "from": "engine",
+          "to": "db",
+          "label": "DROP ROLE v-billing-8f3a"
+        },
+        {
+          "from": "engine",
+          "to": "audit",
+          "label": "lease l-512 revoked"
+        }
+      ],
+      "states": {
+        "db": "role dropped",
+        "audit": "revocation recorded"
+      },
+      "highlight": [
+        "db"
+      ]
+    }
+  ]
+}

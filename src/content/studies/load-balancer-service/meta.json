@@ -1,0 +1,532 @@
+{
+  "name": "Design a Cloud Load Balancer",
+  "difficulty": "advanced",
+  "intent": "Spread millions of connections over a fleet of backends, keep each connection on the same backend even as balancers and backends come and go, and make the balancer itself something that never fails.",
+  "codeTitle": "a Maglev lookup table with connection tracking",
+  "finalIntro": "One connection from the first packet to the moment a backend leaves the pool.",
+  "prompt": "Design a managed load balancer for a cloud provider, like AWS NLB and ALB or Google's Maglev. Customers get one stable address, attach thousands of backends in several zones, and expect traffic to be spread evenly, unhealthy backends to be skipped, deployments to cause no dropped connections, and the balancer itself to survive the loss of any machine.",
+  "functional": [
+    "Give each customer a stable virtual address (a VIP) and forward connections to the backends registered behind it",
+    "Offer a layer 4 mode (TCP and UDP, by address and port) and a layer 7 mode (HTTP, routing by host and path, with TLS termination)",
+    "Check backend health and stop sending traffic to backends that fail",
+    "Drain a backend gracefully before it is removed or replaced",
+    "Support several balancing algorithms and per-backend weights",
+    "Let backends see the real client address"
+  ],
+  "nonFunctional": [
+    "Handle tens of millions of packets per second and hundreds of Gbps for the busiest customers",
+    "Add under a millisecond of latency at layer 4, and a few milliseconds at layer 7",
+    "A connection must keep going to the same backend for its whole life, even when balancers or backends are added or removed",
+    "No single balancer machine is a point of failure, and a failed machine is replaced without breaking most connections",
+    "Spread load evenly, with the busiest backend within a few percent of the average",
+    "A customer's traffic spike or a bad backend must not take down other customers"
+  ],
+  "firstAttempt": {
+    "text": "One DNS name with an address record for every server, so that clients pick one of them (round-robin DNS). Each server has a public address and does its own TLS. Clients cache the addresses for the length of the record's time to live.",
+    "limits": [
+      "DNS knows nothing about load, so a client that cached one address keeps using it, and a few heavy clients can overload one server",
+      "A dead server keeps receiving traffic until every client's cached record expires, which can be minutes",
+      "Taking a server out for a deployment drops its live connections, because nothing drains them",
+      "Every server is exposed to the internet and does its own TLS",
+      "There is no way to weight a larger server, add a health rule, or route by path"
+    ]
+  },
+  "nodes": [
+    {
+      "id": "clients",
+      "label": "Clients",
+      "kind": "client",
+      "x": 37,
+      "y": 88
+    },
+    {
+      "id": "dns",
+      "label": "Round-robin DNS",
+      "kind": "edge",
+      "x": 12,
+      "y": 88,
+      "at": 0,
+      "until": 1
+    },
+    {
+      "id": "backends",
+      "label": "Backends, zone A",
+      "kind": "compute",
+      "x": 87,
+      "y": 63
+    },
+    {
+      "id": "single",
+      "label": "One balancer",
+      "kind": "edge",
+      "x": 62,
+      "y": 63,
+      "at": 1,
+      "until": 3
+    },
+    {
+      "id": "registry",
+      "label": "Backend registry",
+      "kind": "data",
+      "x": 62,
+      "y": 12,
+      "at": 2
+    },
+    {
+      "id": "feed",
+      "label": "Health and config feed",
+      "kind": "async",
+      "x": 62,
+      "y": 37,
+      "at": 2
+    },
+    {
+      "id": "health",
+      "label": "Health checkers",
+      "kind": "compute",
+      "x": 87,
+      "y": 37,
+      "at": 2
+    },
+    {
+      "id": "router",
+      "label": "Router (ECMP)",
+      "kind": "edge",
+      "x": 37,
+      "y": 63,
+      "at": 3
+    },
+    {
+      "id": "lbtier",
+      "label": "Balancer nodes",
+      "kind": "edge",
+      "x": 62,
+      "y": 63,
+      "at": 3
+    },
+    {
+      "id": "flows",
+      "label": "Flow table",
+      "kind": "data",
+      "x": 37,
+      "y": 37,
+      "at": 4
+    },
+    {
+      "id": "tls",
+      "label": "TLS proxies (L7)",
+      "kind": "edge",
+      "x": 87,
+      "y": 88,
+      "at": 5
+    },
+    {
+      "id": "backendsb",
+      "label": "Backends, zone B",
+      "kind": "compute",
+      "x": 62,
+      "y": 88,
+      "at": 6
+    }
+  ],
+  "edges": [
+    {
+      "from": "clients",
+      "to": "dns",
+      "at": 0,
+      "until": 1
+    },
+    {
+      "from": "clients",
+      "to": "backends",
+      "at": 0,
+      "until": 1
+    },
+    {
+      "from": "clients",
+      "to": "single",
+      "at": 1,
+      "until": 3
+    },
+    {
+      "from": "single",
+      "to": "backends",
+      "at": 1,
+      "until": 3
+    },
+    {
+      "from": "registry",
+      "to": "feed",
+      "at": 2
+    },
+    {
+      "from": "health",
+      "to": "backends",
+      "at": 2
+    },
+    {
+      "from": "health",
+      "to": "feed",
+      "at": 2
+    },
+    {
+      "from": "feed",
+      "to": "single",
+      "at": 2,
+      "until": 3
+    },
+    {
+      "from": "feed",
+      "to": "lbtier",
+      "at": 3
+    },
+    {
+      "from": "clients",
+      "to": "router",
+      "at": 3
+    },
+    {
+      "from": "router",
+      "to": "lbtier",
+      "at": 3
+    },
+    {
+      "from": "lbtier",
+      "to": "backends",
+      "at": 3
+    },
+    {
+      "from": "lbtier",
+      "to": "flows",
+      "at": 4
+    },
+    {
+      "from": "lbtier",
+      "to": "tls",
+      "at": 5
+    },
+    {
+      "from": "tls",
+      "to": "backends",
+      "at": 5
+    },
+    {
+      "from": "tls",
+      "to": "backendsb",
+      "at": 6
+    },
+    {
+      "from": "lbtier",
+      "to": "backendsb",
+      "at": 6
+    }
+  ],
+  "steps": [
+    {
+      "title": "Put a balancer in front, at layer 4 or layer 7",
+      "problem": "Clients should see one address, and a piece of software should decide which backend gets each new connection, using more than DNS luck.",
+      "fix": "Run a balancer on the customer's virtual address. A layer 4 balancer looks only at the IP and TCP or UDP headers: it picks a backend when the first packet of a connection (the SYN) arrives and then forwards every packet of that connection to the same backend, without reading the payload, so it is very fast. A layer 7 balancer terminates the client's connection, reads the HTTP request and opens or reuses a separate connection to a backend, so it can route by host and path, retry, and add headers. The algorithm is a plug-in: round robin and random need no state, least connections and power of two choices (pick two backends at random, take the one with fewer connections) adapt to slow backends, and weights let a big machine take more.",
+      "tradeoff": "One address, even spreading and the choice of a smarter algorithm. A layer 4 balancer is cheap and keeps almost no per-request state, but cannot see requests. A layer 7 balancer is far more flexible and costs a few times more CPU per request. A single balancer is still one machine, and the balancer's own address is a single point of failure.",
+      "concepts": [
+        {
+          "slug": "load-balancing"
+        },
+        {
+          "slug": "proxies"
+        },
+        {
+          "slug": "tcp-vs-udp"
+        },
+        {
+          "slug": "horizontal-vs-vertical-scaling"
+        }
+      ]
+    },
+    {
+      "title": "Check health and drain before removing",
+      "problem": "A backend that has crashed or hangs will fail every connection sent to it, and a backend that is removed for a deployment kills the connections it holds.",
+      "fix": "Health checkers probe every backend at an interval, for example a TCP connect or an HTTP request every few seconds, and mark a backend unhealthy after several failures in a row and healthy again after several successes, so that one lost probe does not flap it. Results go on a feed that balancers subscribe to, and the backend list comes from a registry. To remove a backend, the control plane puts it in a draining state: it gets no new connections, existing ones are left to finish until a timeout, and only then is it deregistered. Passive checks also count real failures and resets, which detect trouble between probes.",
+      "tradeoff": "Bad backends are skipped within seconds and deployments drop no live connections. Probes from every balancer to every backend add up to a lot of traffic, so the probing is done by dedicated checkers whose results are shared. Slow detection loses requests, and a hair-trigger detection causes flapping. A draining timeout is a compromise between waiting for long connections and finishing the deployment.",
+      "concepts": [
+        {
+          "slug": "health-checks"
+        },
+        {
+          "slug": "blue-green-and-rolling-deployments"
+        },
+        {
+          "slug": "pub-sub"
+        },
+        {
+          "slug": "retries-and-backoff"
+        }
+      ]
+    },
+    {
+      "title": "Reach a tier of balancers by anycast and ECMP",
+      "problem": "One balancer machine is a limit on traffic and a point of failure, and the virtual address must keep working while machines come and go.",
+      "fix": "Run many identical balancer nodes. Every node announces the same virtual address to the network's routers over BGP, which is anycast within the data center. A router sees several equal-cost paths to that address and uses ECMP (equal-cost multipath): it hashes the 5-tuple of each packet (source and destination address, ports and protocol) and picks one path, so all packets of one connection reach the same node, and different connections spread across nodes. A node that fails stops announcing the address (its BGP session drops) and the routers stop using it. Capacity is added by adding nodes, and a customer's address is not tied to any machine.",
+      "tradeoff": "Capacity grows by adding nodes, and the loss of a machine is routine, not an outage. When the set of paths changes, routers rehash connections to different nodes, so a node that receives a packet of a connection it has never seen must still know where to send it. The next step solves that.",
+      "concepts": [
+        {
+          "slug": "load-balancing"
+        },
+        {
+          "slug": "dns"
+        },
+        {
+          "slug": "multi-region-failover"
+        },
+        {
+          "slug": "latency-and-round-trips"
+        }
+      ]
+    },
+    {
+      "title": "Hash the connection consistently, and track it",
+      "problem": "If a node is added, or a backend leaves, a plain hash modulo the number of backends changes the answer for most connections, and every one of those breaks. Different balancer nodes must also agree without talking to each other.",
+      "fix": "Each node builds the same Maglev lookup table, a large array (65,537 slots or more) whose slots each name a backend. The backends take turns filling the table, each one following its own pseudo-random order of slots derived from its name, so every backend gets a nearly equal share and nodes that have the same backend list build the same table. A flow goes to the backend at slot hash(5-tuple) mod table size, so any node answers the same. When a backend is removed, only the slots it held change (plus a small percentage of others), instead of nearly all. Each node also keeps a connection-tracking table: the first packet of a flow picks a backend from the table and the choice is remembered, so later changes of the backend list do not move a flow that is already running.",
+      "tradeoff": "Existing connections survive deployments and scaling, and even a node that has lost its tracking table sends most flows to the right backend. The lookup is a single memory read per packet. Table building takes a moment, a few percent of flows can still move on a change, the tracking table uses memory per connection (about 100 bytes), and a stateless hash cannot do least-connections, so that algorithm has to remember the choice it made.",
+      "concepts": [
+        {
+          "slug": "consistent-hashing"
+        },
+        {
+          "slug": "load-balancing"
+        },
+        {
+          "slug": "caching"
+        },
+        {
+          "slug": "database-sharding"
+        }
+      ]
+    },
+    {
+      "title": "Terminate TLS and keep the client's address",
+      "problem": "Layer 7 features need the request in plain text, and once a proxy sits in the path the backend sees the proxy's address instead of the client's.",
+      "fix": "A layer 7 fleet of proxies sits behind the layer 4 tier and terminates TLS, using certificates held in a secret store and loaded into memory, with session resumption to avoid repeating full handshakes. It speaks HTTP/2 to clients and reuses a pool of connections to backends. To keep the client's address, the proxy adds an X-Forwarded-For header for HTTP, or sends the PROXY protocol header, a line at the start of the TCP connection that carries the original source address. For a pure layer 4 service there is another option, direct server return (DSR): the balancer rewrites only the destination of incoming packets, and the backend answers the client directly with the virtual address as its source, so the large response never passes through the balancer and the client address is intact.",
+      "tradeoff": "TLS and HTTP are handled in one place and certificates are not spread over every backend. DSR makes the balancer carry only the small request direction, which matters when responses are 10 to 100 times larger. But DSR needs every backend configured with the virtual address and a reply path that does not pass the balancer, and cannot do layer 7 features. A proxy that terminates TLS holds private keys and is a more valuable target.",
+      "concepts": [
+        {
+          "slug": "tls-and-https"
+        },
+        {
+          "slug": "proxies"
+        },
+        {
+          "slug": "http-versions"
+        },
+        {
+          "slug": "secrets-management"
+        }
+      ]
+    },
+    {
+      "title": "Balance across zones, and protect backends from overload",
+      "problem": "A zone can fail, new backends start cold, and a surge can push the healthy backends over their limit.",
+      "fix": "Balancers in every zone know the backends in all zones. Cross-zone balancing sends each zone's traffic to every backend, spreading uneven load and giving survivors the share of a failed zone, at the price of cross-zone data transfer and some latency. Turning it off keeps traffic local and cheaper, but an unevenly sized zone then gets unevenly loaded. A newly added backend gets slow start: its weight ramps up over 30 to 60 seconds, since its caches, connection pools and JIT-compiled code are cold, and a least-connections balancer would otherwise send it a flood because it has zero connections. Overload protection limits each backend's concurrent connections or requests, sheds the excess with a fast error, and ejects backends that return many errors for a while. Each customer's resources are also isolated, for example by giving each customer a small random subset of balancer nodes (shuffle sharding), so that one customer's attack harms few others.",
+      "tradeoff": "A zone loss becomes a non-event, a new backend cannot melt itself, and overload turns into a few quick rejections instead of a collapse in which every request is slow. The cost is more configuration, cross-zone traffic charges, and the need to keep spare capacity: with three zones, the two survivors must each take half again their normal load, so about 33% headroom.",
+      "concepts": [
+        {
+          "slug": "autoscaling"
+        },
+        {
+          "slug": "bulkhead"
+        },
+        {
+          "slug": "circuit-breaker"
+        },
+        {
+          "slug": "backpressure"
+        },
+        {
+          "slug": "multi-region-failover"
+        }
+      ]
+    }
+  ],
+  "failures": [
+    {
+      "scenario": "A balancer node dies in the middle of the day",
+      "impact": "Its share of connections would be cut off, and the routers will rehash the others across the remaining nodes.",
+      "answer": "The node's BGP session drops and routers remove it from ECMP within seconds (BFD can detect it in under a second). The connections that lived on it are rehashed to other nodes, which have no tracking entries for them, but the Maglev table gives the same backend as before for nearly all flows, so most connections carry on. A few percent are reset, and clients retry. The node is replaced automatically.",
+      "concepts": [
+        {
+          "slug": "consistent-hashing"
+        },
+        {
+          "slug": "health-checks"
+        },
+        {
+          "slug": "retries-and-backoff"
+        }
+      ]
+    },
+    {
+      "scenario": "A backend is slow but still passes its health check",
+      "impact": "Round robin keeps sending it a full share, requests queue on it, and the customer's tail latency climbs.",
+      "answer": "Use an algorithm that sees load: least connections or power of two choices send fewer new connections to a backend whose connections are piling up. Passive outlier detection ejects a backend whose error rate or latency is far above its peers, for a time that grows when it repeats. Deep health checks that run a real request also help. Retries go to a different backend, with a budget to avoid a storm.",
+      "concepts": [
+        {
+          "slug": "load-balancing"
+        },
+        {
+          "slug": "circuit-breaker"
+        },
+        {
+          "slug": "retries-and-backoff"
+        },
+        {
+          "slug": "metrics"
+        }
+      ]
+    },
+    {
+      "scenario": "A zone goes dark and its traffic moves to the others",
+      "impact": "The surviving zones suddenly take 50% more traffic, and may collapse if they were running full.",
+      "answer": "Health checks and zone-level signals mark the zone's backends out within seconds, and cross-zone balancing spreads the load over the others. Capacity is planned for this: with three zones, each runs under about two thirds of its limit. Autoscaling adds backends, slow start protects the new ones, and the connection limit sheds the excess while it catches up.",
+      "concepts": [
+        {
+          "slug": "multi-region-failover"
+        },
+        {
+          "slug": "autoscaling"
+        },
+        {
+          "slug": "backpressure"
+        },
+        {
+          "slug": "slos-and-error-budgets"
+        }
+      ]
+    },
+    {
+      "scenario": "A flood of SYN packets or a very large customer burst arrives",
+      "impact": "The balancer tier is saturated, and other customers' connections slow down or fail.",
+      "answer": "SYN cookies avoid keeping state for connections that never finish the handshake, and traffic scrubbing or rate limits drop attack traffic at the edge. Shuffle sharding gives each customer a small subset of nodes, so a victim's overload hurts only the few customers sharing the same nodes. Connection and rate limits per customer cap the work any one customer can create.",
+      "concepts": [
+        {
+          "slug": "rate-limiting"
+        },
+        {
+          "slug": "bulkhead"
+        },
+        {
+          "slug": "backpressure"
+        },
+        {
+          "slug": "alerting"
+        }
+      ]
+    }
+  ],
+  "alternatives": [
+    {
+      "title": "Layer 4 or layer 7",
+      "options": [
+        {
+          "name": "Layer 4 (by address and port)",
+          "pro": "Very fast, millions of connections per node, protocol-agnostic and low latency",
+          "con": "Cannot route by path or host, or retry a request, and sees one connection as one unit even if it carries many requests"
+        },
+        {
+          "name": "Layer 7 (HTTP-aware)",
+          "pro": "Routes by host and path, terminates TLS, retries, balances each request and not each connection",
+          "con": "More CPU, more latency, and more state"
+        }
+      ],
+      "pick": "A layer 4 tier in front for scale and fast failover, with a layer 7 fleet behind it for the customers who need HTTP features."
+    },
+    {
+      "title": "How the replies get back",
+      "options": [
+        {
+          "name": "Full proxy (traffic both ways)",
+          "pro": "Works with any backend network, and the balancer can inspect and change responses",
+          "con": "The balancer carries all response bytes, which are usually the bulk"
+        },
+        {
+          "name": "Direct server return",
+          "pro": "Only requests go through the balancer, and the client address is kept",
+          "con": "Backends must be on the same network and configured with the virtual address, and layer 7 features are not available"
+        }
+      ],
+      "pick": "DSR for high-volume layer 4 services, a full proxy for layer 7."
+    },
+    {
+      "title": "Which algorithm picks the backend",
+      "options": [
+        {
+          "name": "Round robin or random",
+          "pro": "Stateless and trivially cheap, and fine when requests are uniform",
+          "con": "Ignores load, so long requests or unequal backends cause imbalance"
+        },
+        {
+          "name": "Least connections",
+          "pro": "Adapts to slow backends and long requests",
+          "con": "Needs an accurate count, and floods a new empty backend"
+        },
+        {
+          "name": "Power of two choices",
+          "pro": "Almost as good as least connections, and needs only two random lookups",
+          "con": "Each node sees only its own counts, and the choice is random"
+        },
+        {
+          "name": "Hash of the connection or a key",
+          "pro": "Affinity: the same client or key reaches the same backend, with no state",
+          "con": "Cannot adapt to load"
+        }
+      ],
+      "pick": "Power of two choices with weights and slow start for requests, and a Maglev hash for layer 4 flows."
+    },
+    {
+      "title": "Where connection state lives",
+      "options": [
+        {
+          "name": "Per-node tracking table only",
+          "pro": "Fast and simple, and exact for flows that stay on the node",
+          "con": "Lost when the flow moves to another node"
+        },
+        {
+          "name": "Consistent hash only (no state)",
+          "pro": "Any node answers alike, and no memory per flow",
+          "con": "Flows move when the backend list changes"
+        },
+        {
+          "name": "Hash plus tracking",
+          "pro": "Flows survive both a node change and a backend change",
+          "con": "More moving parts, and the tracking state must be sized and expired"
+        }
+      ],
+      "pick": "Consistent hash plus a per-node tracking table: the table makes rare changes safe, and the hash covers a lost node."
+    }
+  ],
+  "roles": [
+    {
+      "id": "client",
+      "label": "Clients",
+      "description": "Browsers, apps and other services that connect to the virtual address."
+    },
+    {
+      "id": "edge",
+      "label": "Entry and balancing",
+      "description": "The routers, the balancer nodes and the TLS proxies."
+    },
+    {
+      "id": "async",
+      "label": "Health feed",
+      "description": "The stream that carries health results and configuration to the balancers."
+    },
+    {
+      "id": "compute",
+      "label": "Backends and checks",
+      "description": "The servers that do the work and the checkers that probe them."
+    },
+    {
+      "id": "data",
+      "label": "Tables",
+      "description": "The backend registry and the connection-tracking table."
+    }
+  ]
+}

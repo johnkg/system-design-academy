@@ -1,0 +1,130 @@
+---
+import PlaygroundShell from '../../components/PlaygroundShell.astro';
+---
+<PlaygroundShell title="Hit ratio, shield and purge" hint="A seeded stream of 300 requests per second for a catalog of 2,000 files (a few are very popular) from users in three regions. The origin is in the US and can serve 100 requests per second. Change the design and watch the origin, the latency and the cost of a purge.">
+  <ol class="how">
+    <li>Start with the <b>defaults</b>: 24 PoPs, <b>edge only</b>, a 5 minute TTL. About <b>77%</b> of requests hit the edge and the origin handles about <b>69 requests per second</b>, which is fine. But a <b>purge</b> of the 50 hottest files sends it to a peak of <b>218 requests per second</b>, over its capacity for several seconds.</li>
+    <li>Choose <b>edge + regional shield</b>: the edge hit ratio stays the same, but the shield answers most of the edge's misses and the origin falls to about <b>19 requests per second</b>. Also switch on <b>request coalescing</b> and the purge peak drops to about <b>80 requests per second</b>, under the capacity.</li>
+    <li>With <b>edge only</b>, go from <b>3 PoPs to 24</b>: the median latency falls (the US median from about 127 to 37 ms), but each PoP sees fewer requests, so the hit ratio falls from 83% to 77% and the origin load rises from 50 to 69 requests per second. A shield removes that penalty.</li>
+    <li>Set the <b>TTL to 30 seconds</b>: freshness is excellent but the origin gets about <b>150 requests per second</b> and is overloaded all the time. At <b>1 hour</b> with a shield and coalescing the origin sees about 1 request per second, but a changed file stays stale until you purge it.</li>
+  </ol>
+  <div class="pg cdnb" data-cdnb>
+    <div class="pg-row">
+      <label>PoPs worldwide <select class="pg-in" data-pops><option value="3">3</option><option value="6">6</option><option value="12">12</option><option value="24" selected>24</option></select></label>
+      <label>Cache hierarchy <select class="pg-in" data-shield><option value="0" selected>Edge only</option><option value="1">Edge + regional shield</option></select></label>
+      <label>TTL <select class="pg-in" data-ttl><option value="30">30 seconds</option><option value="60">1 minute</option><option value="300" selected>5 minutes</option><option value="3600">1 hour</option></select></label>
+      <label>Cache size per PoP <select class="pg-in" data-cap><option value="100">100 files</option><option value="300">300 files</option><option value="1000" selected>1,000 files</option></select></label>
+      <label>Request coalescing <select class="pg-in" data-co><option value="0" selected>Off</option><option value="1">On</option></select></label>
+    </div>
+    <div class="pg-grid">
+      <div class="pg-box" data-b1><h3>Edge hit ratio</h3><span class="pg-mono" data-o1></span><span class="pg-note" data-n1></span></div>
+      <div class="pg-box" data-b2><h3>Origin requests per second</h3><span class="pg-mono" data-o2></span><span class="pg-note" data-n2></span></div>
+      <div class="pg-box" data-b3><h3>Latency by region</h3><span class="pg-mono" data-o3a></span><span class="pg-mono" data-o3b></span><span class="pg-mono" data-o3c></span><span class="pg-note" data-n3></span></div>
+      <div class="pg-box" data-b4><h3>Purge the 50 hottest files now</h3><span class="pg-mono" data-o4></span><span class="pg-note" data-n4></span></div>
+      <div class="pg-box" data-b5><h3>Wait for the TTL instead</h3><span class="pg-mono" data-o5></span><span class="pg-note" data-n5></span></div>
+    </div>
+    <p class="pg-out" data-verdict aria-live="polite"></p>
+    <p class="pg-note">Model: 300 requests per second for 700 seconds, 40% from the US, 35% from Europe and 25% from Asia, for 2,000 files whose popularity follows a Zipf curve (exponent 0.95). The origin is in the US (round trips of 40, 100 and 180 ms from the three regions) and takes 400 ms to produce a file. The PoPs are split evenly between the three regions, and each caches by LRU. A regional shield caches four times as many files as a PoP. A fetch costs two round trips plus the time above, a user's round trip to the nearest PoP is 55, 35, 22 or 14 ms (for 1, 2, 4 or 8 PoPs per region; 0.9 times that in Europe and 1.3 times in Asia), a response takes two such round trips plus 5 ms, and 5% of users are on a slow connection. Results are measured from second 250 to second 450. At second 450 the 50 most popular files change: the first run waits for the TTL, the second purges them from every cache (the purge itself takes no time, and an in-flight fetch may still bring back an old copy). Extra origin egress assumes 200 KB per file. With a shield, the edge may copy an old file that the shield still holds, so staleness can reach twice the TTL. Latency is the median and 95th percentile of the time to deliver a file.</p>
+  </div>
+</PlaygroundShell>
+<script>
+  // ==core==
+  const DUR = 700; const WARM = 250; const PURGE = 450; const HOT = 50; const RATE = 300; const CATALOG = 2000; const ORIGIN_CAP = 100;
+  const REG = [0.4, 0.35, 0.25]; const ORTT = [0.04, 0.1, 0.18]; const SRTT = [0.012, 0.015, 0.02]; const RF = [1.0, 0.9, 1.3];
+  const BASE: Record<number, number> = { 1: 0.055, 2: 0.035, 4: 0.022, 8: 0.014 }; const PROC = 0.4; const SHIELD_X = 4;
+  let seed = 7; const rnd = () => ((seed = (Math.imul(seed, 1664525) + 1013904223) >>> 0) / 4294967296);
+  // The request stream is built once: a Zipf-popular catalog, three regions, and a random choice of PoP and user distance for each request.
+  const cum: number[] = []; { let s = 0; for (let i = 1; i <= CATALOG; i++) { s += 1 / Math.pow(i, 0.95); cum.push(s); } for (let i = 0; i < CATALOG; i++) cum[i] /= s; }
+  const pickKey = (u: number) => { let lo = 0; let hi = CATALOG - 1; while (lo < hi) { const m = (lo + hi) >> 1; if (cum[m] < u) lo = m + 1; else hi = m; } return lo; };
+  const T: number[] = []; const K: number[] = []; const R: number[] = []; const P: number[] = []; const J: number[] = [];
+  for (let t = 0; t < DUR;) {
+    t += -Math.log(1 - rnd()) / RATE; if (t >= DUR) break;
+    T.push(t); K.push(pickKey(rnd())); const u = rnd(); R.push(u < REG[0] ? 0 : u < REG[0] + REG[1] ? 1 : 2); P.push(rnd()); J.push((0.6 + 0.8 * rnd()) * (rnd() < 0.05 ? 2.5 : 1));
+  }
+  const N = T.length;
+  const pct = (a: number[], q: number) => { if (!a.length) return 0; const s = Float64Array.from(a).sort(); return s[Math.min(s.length - 1, Math.floor(q * s.length))]; };
+  type Entry = { ver: number; ready: number; exp: number };
+  function run(o: { pops: number; shield: boolean; ttl: number; cap: number; coalesce: boolean }, purge: boolean) {
+    const { shield, ttl, cap, coalesce } = o; const k = o.pops / 3;
+    const edges: Map<number, Entry>[][] = [[], [], []]; for (let r = 0; r < 3; r++) for (let i = 0; i < k; i++) edges[r].push(new Map());
+    const shields: Map<number, Entry>[] = [new Map(), new Map(), new Map()];
+    const originSec = new Float64Array(DUR + 2); const st = { req: 0, hit: 0, join: 0, sReq: 0, origin: 0, stale: 0, maxStale: 0 };
+    const lat: number[][] = [[], [], []]; const est = { hit: 0, join: 0 }; const sst = { hit: 0, join: 0 };
+    const origin = (t: number, key: number) => { originSec[Math.floor(t)]++; if (t >= WARM && t < PURGE) st.origin++; return { lat: PROC, ver: key < HOT && t >= PURGE ? 1 : 0 }; };
+    // One cache tier: a fresh entry is a hit; an entry whose fetch is still in flight is joined when coalescing is on; anything else is fetched from the tier above.
+    const look = (m: Map<number, Entry>, limit: number, key: number, t: number, fetch: () => { lat: number; ver: number }, stat: { hit: number; join: number } | null) => {
+      const e = m.get(key);
+      if (e && e.exp > t) {
+        if (e.ready <= t) { m.delete(key); m.set(key, e); if (stat) stat.hit++; return { lat: 0, ver: e.ver }; } // refresh its place in the LRU order
+        if (coalesce) { if (stat) stat.join++; return { lat: e.ready - t, ver: e.ver }; }
+      }
+      const r = fetch(); m.delete(key); m.set(key, { ver: r.ver, ready: t + r.lat, exp: t + r.lat + ttl });
+      while (m.size > limit) m.delete(m.keys().next().value as number); // evict the least recently used
+      return r;
+    };
+    let purged = false;
+    for (let i = 0; i < N; i++) {
+      const t = T[i]; const key = K[i]; const r = R[i];
+      if (purge && !purged && t >= PURGE) { purged = true; for (let x = 0; x < HOT; x++) { for (const g of edges) for (const m of g) m.delete(x); for (const m of shields) m.delete(x); } }
+      const meas = t >= WARM && t < PURGE;
+      const res = look(edges[r][Math.floor(P[i] * k)], cap, key, t, () => {
+        if (shield) { const sr = look(shields[r], cap * SHIELD_X, key, t, () => { const x = origin(t, key); return { lat: 2 * ORTT[r] + x.lat, ver: x.ver }; }, meas ? sst : null); return { lat: 2 * SRTT[r] + sr.lat, ver: sr.ver }; }
+        const x = origin(t, key); return { lat: 2 * ORTT[r] + x.lat, ver: x.ver };
+      }, meas ? est : null);
+      if (meas) { st.req++; lat[r].push(2 * BASE[k] * RF[r] * J[i] + 0.005 + res.lat); }
+      if (key < HOT && t >= PURGE && res.ver === 0) { st.stale++; st.maxStale = Math.max(st.maxStale, t - PURGE); }
+    }
+    st.hit = est.hit; st.join = est.join; st.sReq = sst.hit + sst.join;
+    let peakAfter = 0; let over = 0; let after20 = 0; for (let s = PURGE; s < PURGE + 20; s++) { after20 += originSec[s]; peakAfter = Math.max(peakAfter, originSec[s]); if (originSec[s] > ORIGIN_CAP) over++; }
+    let afterTotal = 0; for (let s = PURGE; s < DUR; s++) afterTotal += originSec[s];
+    let sover = 0; let peakSteady = 0; for (let s = WARM; s < PURGE; s++) { peakSteady = Math.max(peakSteady, originSec[s]); if (originSec[s] > ORIGIN_CAP) sover++; }
+    return { st, lat: lat.map((a) => ({ med: pct(a, 0.5), p95: pct(a, 0.95) })), originRps: st.origin / (PURGE - WARM), sover, peakSteady, peakAfter, over, after20, afterTotal };
+  }
+  // Both runs are identical until the update at PURGE: one waits for the TTL, the other purges the changed objects from every cache.
+  function simulate(o: { pops: number; shield: boolean; ttl: number; cap: number; coalesce: boolean }) { return { w: run(o, false), p: run(o, true) }; }
+  // ==end==
+
+  document.querySelectorAll<HTMLElement>('[data-cdnb]').forEach((root) => {
+    const q = <T extends HTMLElement>(s: string) => root.querySelector<T>(s)!;
+    const sel = (s: string) => q<HTMLSelectElement>(s).value;
+    const cache = new Map<string, ReturnType<typeof simulate>>();
+    const REGION_NAMES = ['US', 'Europe', 'Asia'];
+    const ms = (s: number) => `${Math.round(s * 1000)} ms`;
+    const num = (n: number) => Math.round(n).toLocaleString('en-US');
+    function draw() {
+      const o = { pops: Number(sel('[data-pops]')), shield: sel('[data-shield]') === '1', ttl: Number(sel('[data-ttl]')), cap: Number(sel('[data-cap]')), coalesce: sel('[data-co]') === '1' };
+      const key = JSON.stringify(o);
+      let res = cache.get(key); if (!res) { res = simulate(o); cache.set(key, res); }
+      const { w, p } = res;
+      const hitPct = (w.st.hit / w.st.req) * 100; const shieldPct = (w.st.sReq / w.st.req) * 100; const originPct = (w.st.origin / w.st.req) * 100; const joinPct = (w.st.join / w.st.req) * 100;
+      const reqPerS = w.st.req / (PURGE - WARM);
+      q('[data-o1]').textContent = `${hitPct.toFixed(1)}%`;
+      q('[data-n1]').textContent = `${o.shield ? `the shield answered another ${shieldPct.toFixed(1)}%; ` : ''}${originPct.toFixed(1)}% of requests reached the origin${o.coalesce ? `; ${joinPct.toFixed(1)}% joined a fetch already in flight` : ''}`;
+      const overloaded = w.originRps > ORIGIN_CAP || w.sover > 10;
+      q('[data-o2]').textContent = `${w.originRps.toFixed(0)} per second`;
+      q('[data-n2]').textContent = `without a CDN: ${reqPerS.toFixed(0)}; the origin can serve ${ORIGIN_CAP}; busiest second: ${w.peakSteady}${w.sover > 0 ? `; over capacity in ${w.sover} of ${PURGE - WARM} seconds` : ''}`;
+      ['a', 'b', 'c'].forEach((k, i) => (q(`[data-o3${k}]`).textContent = `${REGION_NAMES[i]}: median ${ms(w.lat[i].med)}, p95 ${ms(w.lat[i].p95)}`));
+      q('[data-n3]').textContent = 'The median is a nearby hit when the hit ratio is high. The p95 is the slowest 5%, which is a miss that travels to the origin.';
+      const extra = Math.max(0, p.after20 - w.after20);
+      q('[data-o4]').textContent = `+${num(extra)} origin requests in 20 s`;
+      q('[data-n4]').textContent = `peak ${p.peakAfter} per second, over capacity in ${p.over} of 20 seconds; about ${num(extra * 0.2)} MB more origin egress; ${num(p.st.stale)} stale responses`;
+      const longest = w.st.maxStale >= DUR - PURGE - 2;
+      q('[data-o5]').textContent = `${num(w.st.stale)} stale responses`;
+      q('[data-n5]').textContent = `${longest ? `still stale when the run ended, ${DUR - PURGE} s after the update` : `the last one ${w.st.maxStale.toFixed(0)} s after the update`}; the origin's busiest second in the next 20 s is ${w.peakAfter}`;
+      q<HTMLElement>('[data-b1]').style.setProperty('--c', 'var(--accent)');
+      q<HTMLElement>('[data-b2]').style.setProperty('--c', overloaded ? 'var(--bad)' : 'var(--good)');
+      q<HTMLElement>('[data-b3]').style.setProperty('--c', 'var(--accent)');
+      q<HTMLElement>('[data-b4]').style.setProperty('--c', p.over > 0 ? 'var(--bad)' : 'var(--good)');
+      q<HTMLElement>('[data-b5]').style.setProperty('--c', w.st.maxStale > 60 ? 'var(--bad)' : 'var(--good)');
+      const out = q('[data-verdict]'); const bad = overloaded || p.over > 0; out.classList.toggle('bad', bad);
+      const hint = !o.shield ? 'A regional shield would absorb most of it.' : !o.coalesce ? 'Request coalescing would cut the burst.' : 'Purging fewer files at once, or soft purges, would spread it.';
+      out.textContent = overloaded ? `The origin is overloaded even without a purge: it goes over its capacity of ${ORIGIN_CAP} requests per second in ${w.sover} of ${PURGE - WARM} seconds (average ${w.originRps.toFixed(0)}), because only ${hitPct.toFixed(0)}% of requests hit the edge. Try a longer TTL, a bigger cache or a regional shield.`
+        : p.over > 0 ? `Normal load is fine (${w.originRps.toFixed(0)} per second), but a purge of the 50 hottest files sends the origin to ${p.peakAfter} per second, over its ${ORIGIN_CAP}, for ${p.over} of the next 20 seconds. ${hint} Waiting for the TTL instead causes no burst but serves ${num(w.st.stale)} stale responses.`
+        : `The origin stays under its capacity of ${ORIGIN_CAP} per second, even during a purge (peak ${p.peakAfter}). Purging costs ${num(extra)} extra origin requests in 20 seconds and leaves ${num(p.st.stale)} stale responses; waiting for the TTL serves ${num(w.st.stale)} stale responses${longest ? ' and the old file is still being served at the end of the run' : ''}.`;
+    }
+    let queued = false;
+    const schedule = () => { if (queued) return; queued = true; requestAnimationFrame(() => { queued = false; draw(); }); };
+    root.addEventListener('input', schedule); root.addEventListener('change', schedule);
+    draw();
+  });
+</script>

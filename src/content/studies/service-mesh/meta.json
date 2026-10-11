@@ -1,0 +1,533 @@
+{
+  "name": "Design a Service Mesh",
+  "difficulty": "advanced",
+  "intent": "Give hundreds of microservices secure, observable and resilient calls to each other by moving that work out of the application code and into proxies that a control plane configures.",
+  "codeTitle": "a client-side proxy with least-request balancing, ejection and a retry budget",
+  "finalIntro": "One call from service A to service B through the mesh.",
+  "prompt": "Design a service mesh for a company with 400 microservices, written in four languages and running on Kubernetes. Every call between services should be encrypted and authenticated, balanced across healthy pods, retried safely, limited, measured and traceable, and the platform team should be able to change the rules without asking 400 teams to redeploy.",
+  "functional": [
+    "Encrypt every service-to-service call and prove which service is calling",
+    "Allow or deny calls by policy, for example only the checkout service may call payments",
+    "Balance calls across the pods of the target service, and stop sending to bad pods",
+    "Apply timeouts, retries and circuit breaking to calls, without changing application code",
+    "Shift a share of the traffic to a new version of a service for a canary release",
+    "Limit the request rate to a service, per caller if needed",
+    "Record metrics, access logs and trace headers for every call"
+  ],
+  "nonFunctional": [
+    "Add no more than about 1 to 2 ms of median latency per hop, and a small share of CPU and memory per pod",
+    "A configuration change reaches every affected proxy within seconds",
+    "The mesh must never be a single point of failure: if the control plane is down, calls keep working with the last configuration",
+    "Certificates are short-lived (hours), rotate by themselves and never need an engineer",
+    "Work for any language and for services that nobody wants to touch",
+    "A mistake in a mesh-wide setting must not be able to take every service down at once"
+  ],
+  "firstAttempt": {
+    "text": "Each team uses a client library in its own language for calls to other services. The library handles timeouts and retries with its own defaults, TLS is optional and set up by hand with certificates that last a year, load balancing is a DNS name behind a cluster IP, and each team writes its own metrics and logs.",
+    "limits": [
+      "Four languages mean four implementations of retries, timeouts and balancing, each with different bugs and defaults",
+      "Changing a rule, such as a timeout, needs a code change and a deploy of every service that makes the call",
+      "Year-long certificates are copied around by hand, and an expired one takes a service down in the middle of the night",
+      "Retries at every layer multiply, since no one sees the whole chain, and one slow service can start a retry storm",
+      "A cluster IP balances connections, not requests, so one long-lived connection sends all its traffic to one pod",
+      "Metrics and traces are missing wherever a team forgot, so an incident has gaps in exactly the wrong place"
+    ]
+  },
+  "nodes": [
+    {
+      "id": "svcA",
+      "label": "Service A",
+      "kind": "client",
+      "x": 37,
+      "y": 88
+    },
+    {
+      "id": "svcB",
+      "label": "Service B pods",
+      "kind": "client",
+      "x": 12,
+      "y": 37
+    },
+    {
+      "id": "proxyA",
+      "label": "Sidecar of A",
+      "kind": "edge",
+      "x": 37,
+      "y": 63,
+      "at": 1
+    },
+    {
+      "id": "proxyB",
+      "label": "Sidecar of B",
+      "kind": "edge",
+      "x": 37,
+      "y": 37,
+      "at": 1
+    },
+    {
+      "id": "istiod",
+      "label": "Control plane",
+      "kind": "compute",
+      "x": 62,
+      "y": 37,
+      "at": 2
+    },
+    {
+      "id": "registry",
+      "label": "Service registry",
+      "kind": "data",
+      "x": 62,
+      "y": 12,
+      "at": 2
+    },
+    {
+      "id": "ca",
+      "label": "Certificate authority",
+      "kind": "data",
+      "x": 87,
+      "y": 37,
+      "at": 3
+    },
+    {
+      "id": "rls",
+      "label": "Rate limit service",
+      "kind": "edge",
+      "x": 37,
+      "y": 12,
+      "at": 4
+    },
+    {
+      "id": "svcB2",
+      "label": "B v2 canary",
+      "kind": "client",
+      "x": 62,
+      "y": 63,
+      "at": 5
+    },
+    {
+      "id": "collector",
+      "label": "Telemetry collector",
+      "kind": "async",
+      "x": 12,
+      "y": 63,
+      "at": 6
+    },
+    {
+      "id": "store",
+      "label": "Metrics and traces",
+      "kind": "data",
+      "x": 12,
+      "y": 88,
+      "at": 6
+    }
+  ],
+  "edges": [
+    {
+      "from": "svcA",
+      "to": "svcB",
+      "at": 0,
+      "until": 1
+    },
+    {
+      "from": "svcA",
+      "to": "proxyA",
+      "at": 1
+    },
+    {
+      "from": "proxyA",
+      "to": "proxyB",
+      "at": 1
+    },
+    {
+      "from": "proxyB",
+      "to": "svcB",
+      "at": 1
+    },
+    {
+      "from": "registry",
+      "to": "istiod",
+      "at": 2
+    },
+    {
+      "from": "istiod",
+      "to": "proxyA",
+      "at": 2
+    },
+    {
+      "from": "istiod",
+      "to": "proxyB",
+      "at": 2
+    },
+    {
+      "from": "ca",
+      "to": "istiod",
+      "at": 3
+    },
+    {
+      "from": "proxyB",
+      "to": "rls",
+      "at": 4
+    },
+    {
+      "from": "proxyA",
+      "to": "svcB2",
+      "at": 5
+    },
+    {
+      "from": "proxyA",
+      "to": "collector",
+      "at": 6
+    },
+    {
+      "from": "proxyB",
+      "to": "collector",
+      "at": 6
+    },
+    {
+      "from": "collector",
+      "to": "store",
+      "at": 6
+    }
+  ],
+  "steps": [
+    {
+      "title": "Put a proxy next to every service and send all traffic through it",
+      "problem": "Retries, timeouts, encryption and balancing are re-implemented in every language and every team, and cannot be changed without redeploying the application.",
+      "fix": "Run a small L7 proxy, such as Envoy, in every pod as a sidecar container. Rules in the pod's network namespace redirect all traffic in and out of the application through it, so the application still calls http://payments and does not know the proxy exists. The proxy of the caller picks the target and applies the policies, and the proxy of the callee receives the call and applies its own. The mesh features are now the same for every language, and they are changed by changing proxy configuration, not application code.",
+      "tradeoff": "One implementation serves every service, and it can be updated without touching the applications. Each call now crosses two extra processes, which costs about 0.5 ms each at the median and some memory and CPU in every pod, and the proxy has to start before the application and be upgraded with it.",
+      "concepts": [
+        {
+          "slug": "proxies"
+        },
+        {
+          "slug": "load-balancing"
+        },
+        {
+          "slug": "latency-and-round-trips"
+        },
+        {
+          "slug": "containers-and-orchestration"
+        }
+      ]
+    },
+    {
+      "title": "Let a control plane push the configuration to every proxy",
+      "problem": "Hundreds of proxies need to know where every service's pods are right now, and the rules for each, and nobody can edit them by hand.",
+      "fix": "A control plane, such as Istiod, watches the Kubernetes API and the mesh rules that the platform team writes as declarative objects. It turns them into proxy configuration (routes, clusters, endpoints, listeners) and streams it to each proxy over xDS, a gRPC protocol where the proxy subscribes and the server sends only what changed. A new pod is in every interested proxy's list within seconds. The proxies keep running with their last configuration if the control plane disappears.",
+      "tradeoff": "One place to describe the rules for the whole fleet, with fast and incremental updates. The control plane is now a powerful component: a bad rule goes everywhere, and its memory and CPU grow with the number of proxies and endpoints, so each proxy should be told only about the services it really calls.",
+      "concepts": [
+        {
+          "slug": "infrastructure-as-code"
+        },
+        {
+          "slug": "gossip-protocol"
+        },
+        {
+          "slug": "health-checks"
+        },
+        {
+          "slug": "containers-and-orchestration"
+        }
+      ]
+    },
+    {
+      "title": "Give every workload an identity and encrypt all calls with short-lived certificates",
+      "problem": "Without identity, any pod in the network can call any service, and anyone who can read the network can read the traffic.",
+      "fix": "Each pod's proxy proves who it is to the control plane with the pod's Kubernetes service account token, and the mesh certificate authority signs a short-lived X.509 certificate that names the workload, for example spiffe://shop/ns/payments/sa/payments. The proxies use these certificates to set up mutual TLS: both sides prove who they are and the traffic is encrypted. Certificates last hours and are renewed halfway through, by the proxy, without a restart. Because the callee's proxy now knows who is calling, an authorization policy can say that only the checkout identity may POST to /charge on payments, and everything else is denied.",
+      "tradeoff": "Encryption and authentication come for free for every service, and a stolen certificate is useless within hours. The certificate authority and its root key become critical secrets, handshakes add CPU and a little latency (kept low by reusing connections), and every pod needs a valid certificate to take part in the mesh.",
+      "concepts": [
+        {
+          "slug": "tls-and-https"
+        },
+        {
+          "slug": "encryption"
+        },
+        {
+          "slug": "authentication-and-authorization"
+        },
+        {
+          "slug": "secrets-management"
+        }
+      ]
+    },
+    {
+      "title": "Make calls resilient: balance, time out, retry within a budget, eject bad pods, limit the rate",
+      "problem": "Calls fail and slow down all the time, and the naive reaction, retrying everywhere, turns a small problem into an outage.",
+      "fix": "The caller's proxy balances every request, not every connection, usually with least-request (or power of two choices) and a preference for pods in the same zone. Each route has a timeout and a retry policy: retry only safe failures, with a short backoff, and only while retries are below a budget such as 20% of the live requests, so that a failing service gets at most a little extra load. Outlier detection ejects a pod after a few consecutive errors for a while, and connection and request limits act as a circuit breaker. A rate limit service holds the counters for global limits, for example per caller.",
+      "tradeoff": "Failures are hidden and contained in a uniform way, and the budget bounds the amplification. Retries still need idempotent operations, a timeout and retry policy per route has to be chosen with care, and a limit that is too tight rejects good traffic. Without a budget and a sensible timeout at each layer a mesh makes a retry storm worse, not better.",
+      "concepts": [
+        {
+          "slug": "retries-and-backoff"
+        },
+        {
+          "slug": "circuit-breaker"
+        },
+        {
+          "slug": "bulkhead"
+        },
+        {
+          "slug": "rate-limiting"
+        },
+        {
+          "slug": "idempotency"
+        },
+        {
+          "slug": "backpressure"
+        }
+      ]
+    },
+    {
+      "title": "Shift traffic by weight for canary releases",
+      "problem": "A new version of a service should see real traffic gradually, and be rolled back in seconds if it is wrong, without a deploy.",
+      "fix": "The new version runs as separate pods with a version label. A route rule sends a weight of the traffic to each version, for example 95/5 and then 80/20 and 50/50, and it can also match on a header so that testers always reach the new one. Because the rule is part of the configuration that the control plane pushes, a change takes effect in seconds in every caller's proxy, and the metrics of the mesh show the error rate and latency of each version side by side. An automatic controller can promote the canary, or roll it back if its error rate is worse.",
+      "tradeoff": "Releases become gradual, measurable and reversible, independently of deploying the code. The percentages are per caller proxy and per request, so a user may see both versions, and the old and new version must be compatible with each other and with the same database.",
+      "concepts": [
+        {
+          "slug": "canary-deployments"
+        },
+        {
+          "slug": "blue-green-and-rolling-deployments"
+        },
+        {
+          "slug": "feature-flags"
+        },
+        {
+          "slug": "slos-and-error-budgets"
+        }
+      ]
+    },
+    {
+      "title": "Record metrics, logs and trace headers for every call",
+      "problem": "Finding why a request was slow or failed in a chain of 12 services needs the same data from every service, which hand-written instrumentation never provides.",
+      "fix": "Every proxy sees every request and response, so it emits the golden signals itself: request count, error rate and a latency histogram, labelled with the source and destination service and the response code. It writes an access log line with the identities, the route, the status, the time spent and the number of retries, and it starts or continues a trace by creating spans and forwarding the trace headers (W3C traceparent or B3). The application only has to copy the incoming trace headers onto its outgoing calls. A collector aggregates the data, with sampling for logs and traces and full counts for metrics.",
+      "tradeoff": "Uniform data for the whole fleet from day one, with a service graph for free, and no gaps where a team forgot. The volume is large at 100% (metrics have many label combinations and logs are huge), traces are broken wherever an application drops the headers, and the proxies spend CPU on it.",
+      "concepts": [
+        {
+          "slug": "metrics"
+        },
+        {
+          "slug": "distributed-tracing"
+        },
+        {
+          "slug": "structured-logging"
+        },
+        {
+          "slug": "alerting"
+        },
+        {
+          "slug": "slos-and-error-budgets"
+        }
+      ]
+    }
+  ],
+  "failures": [
+    {
+      "scenario": "The control plane goes down",
+      "impact": "No new endpoints, routes or certificates can be pushed, so changes stop, but if the proxies stopped working too, every call in the company would stop.",
+      "answer": "The proxies are the data plane and keep running with the last configuration they received, including the endpoint lists and the certificates they hold, so existing calls continue. Pods that are replaced during the outage are not seen until it is back, and certificates that expire during it would break, which is why they live for hours and are renewed at half their life, and why the control plane runs several replicas across zones with alerts on its health.",
+      "concepts": [
+        {
+          "slug": "health-checks"
+        },
+        {
+          "slug": "multi-region-failover"
+        },
+        {
+          "slug": "alerting"
+        },
+        {
+          "slug": "containers-and-orchestration"
+        }
+      ]
+    },
+    {
+      "scenario": "A bad configuration is pushed to every proxy",
+      "impact": "A wrong route, a timeout of 1 ms or a policy that denies everything is applied to the whole fleet in seconds, which is the same speed that makes the mesh useful.",
+      "answer": "The control plane validates the rule before it is pushed, and the proxy rejects configuration it cannot load and keeps the previous one. Mesh-wide changes are rolled out like code: reviewed in version control, applied first to a test namespace, then a few services, then the rest, with the error rate watched and a one-step rollback. The most dangerous defaults, such as retries and timeouts, are set per route with limits, not as one global value.",
+      "concepts": [
+        {
+          "slug": "canary-deployments"
+        },
+        {
+          "slug": "infrastructure-as-code"
+        },
+        {
+          "slug": "feature-flags"
+        },
+        {
+          "slug": "blue-green-and-rolling-deployments"
+        }
+      ]
+    },
+    {
+      "scenario": "A slow service starts a retry storm",
+      "impact": "In a chain of 4 services each of the 3 hops makes up to 4 tries (3 retries), so 1 user request can become 4 x 4 x 4 = 64 requests to the service at the bottom, which is already struggling and now gets far more load than before.",
+      "answer": "Retries are limited by a budget (a share of the live traffic) and use backoff with jitter, circuit breaking and outlier ejection stop sending to a failing service, and the timeouts get smaller, not larger, deeper in the chain. Retrying is done at one layer where possible, and only for idempotent requests. Load is shed with a clear error that is not retried instead of queueing without limit.",
+      "concepts": [
+        {
+          "slug": "retries-and-backoff"
+        },
+        {
+          "slug": "circuit-breaker"
+        },
+        {
+          "slug": "backpressure"
+        },
+        {
+          "slug": "bulkhead"
+        },
+        {
+          "slug": "rate-limiting"
+        }
+      ]
+    },
+    {
+      "scenario": "Certificates expire or the certificate authority is unavailable",
+      "impact": "Proxies reject each other's handshakes, so calls fail with TLS errors across many services at the same time.",
+      "answer": "Certificates are renewed when half their life is over, so a failure of the authority has hours to be fixed before anything expires, and renewal is retried with backoff and alerts. The root key is kept offline or in a hardware module, with an intermediate that is rotated. Clocks are synchronised, a metric of the time left on certificates is alerted on, and the authority runs redundantly.",
+      "concepts": [
+        {
+          "slug": "tls-and-https"
+        },
+        {
+          "slug": "secrets-management"
+        },
+        {
+          "slug": "alerting"
+        },
+        {
+          "slug": "health-checks"
+        }
+      ]
+    },
+    {
+      "scenario": "The application starts before its sidecar is ready, or the sidecar dies",
+      "impact": "The first calls from a new pod fail because outbound traffic is redirected to a proxy that is not listening, and a pod that is shutting down loses its last calls.",
+      "answer": "The pod is not started until the proxy is ready: the proxy container is started first and the application waits for its readiness check. On shutdown the application drains first and the proxy exits last. Resource requests and limits are set for the proxy, and health checks restart it if it hangs.",
+      "concepts": [
+        {
+          "slug": "containers-and-orchestration"
+        },
+        {
+          "slug": "health-checks"
+        },
+        {
+          "slug": "autoscaling"
+        }
+      ]
+    }
+  ],
+  "alternatives": [
+    {
+      "title": "Where the proxy runs",
+      "options": [
+        {
+          "name": "A sidecar in every pod",
+          "pro": "Strong isolation per workload, full L7 features and the most mature model",
+          "con": "Memory and CPU in every pod, an extra process to start and upgrade, and about 1 ms per hop"
+        },
+        {
+          "name": "One proxy per node (ambient mesh)",
+          "pro": "Much less memory and no restart of the application to join or upgrade, with L4 mTLS from a shared node proxy and L7 features only where a waypoint is deployed",
+          "con": "A shared proxy is a bigger blast radius per node, and L7 policy needs an extra hop through a waypoint"
+        },
+        {
+          "name": "A library in the application (Finagle, gRPC)",
+          "pro": "No extra hop at all, and the lowest latency",
+          "con": "One implementation per language, upgrades need a redeploy of every service, and services nobody can change are left out"
+        }
+      ],
+      "pick": "Sidecars for fine-grained L7 control and the most proven path; ambient to cut cost where mostly mTLS and simple routing are needed; a library only for a few languages and a team that owns every service."
+    },
+    {
+      "title": "How the traffic is balanced",
+      "options": [
+        {
+          "name": "Round robin",
+          "pro": "Simple and fair when requests cost the same",
+          "con": "Ignores slow pods, so a slow pod keeps getting its full share"
+        },
+        {
+          "name": "Least request (or power of two choices)",
+          "pro": "Sends less to busy pods, which adapts to slowness with no extra signals",
+          "con": "Needs a per-proxy count of requests in flight, which each proxy sees only for its own traffic"
+        },
+        {
+          "name": "Consistent hash on a header",
+          "pro": "The same key always reaches the same pod, which helps caches",
+          "con": "Uneven load when a key is hot"
+        }
+      ],
+      "pick": "Least request with zone preference as the default, and hashing only for services that cache by key."
+    },
+    {
+      "title": "How to identify a caller",
+      "options": [
+        {
+          "name": "mTLS with workload certificates (SPIFFE)",
+          "pro": "The identity is proved by the connection itself and the application never handles credentials",
+          "con": "Needs a certificate authority and rotation, and identity is of the workload, not of the end user"
+        },
+        {
+          "name": "Signed tokens (JWT) in a header",
+          "pro": "Can carry the end user and claims, and passes through proxies and queues",
+          "con": "The application or proxy must validate and refresh them, and a stolen token works anywhere until it expires"
+        },
+        {
+          "name": "Network rules by IP address",
+          "pro": "No cryptography in the path",
+          "con": "Pod addresses change constantly and an address is not an identity"
+        }
+      ],
+      "pick": "mTLS for service identity, and JWT on top for the end user."
+    },
+    {
+      "title": "Whether to adopt a mesh at all",
+      "options": [
+        {
+          "name": "A full mesh",
+          "pro": "Uniform security, resilience and telemetry for hundreds of services in many languages",
+          "con": "A large system to run, to learn and to debug, with a cost per pod"
+        },
+        {
+          "name": "An API gateway and shared libraries",
+          "pro": "Much simpler, and enough for a few dozen services in one or two languages",
+          "con": "Only the edge is covered, and each service still has to do the rest"
+        },
+        {
+          "name": "Only mTLS and policy at the node or network level",
+          "pro": "Gets the security benefits with little overhead",
+          "con": "No per-request retries, routing or L7 metrics"
+        }
+      ],
+      "pick": "A mesh from about 50 to 100 services, or earlier when the rules must be uniform across languages; before that, a gateway and one good library."
+    }
+  ],
+  "roles": [
+    {
+      "id": "client",
+      "label": "Application services",
+      "description": "The microservices that make and receive the calls, and know nothing about the mesh."
+    },
+    {
+      "id": "edge",
+      "label": "Proxies",
+      "description": "The sidecar proxies and the rate limit service on the path of every call."
+    },
+    {
+      "id": "async",
+      "label": "Telemetry",
+      "description": "The collector that receives metrics, logs and spans from every proxy."
+    },
+    {
+      "id": "compute",
+      "label": "Control plane",
+      "description": "Computes the configuration and pushes it to the proxies over xDS."
+    },
+    {
+      "id": "data",
+      "label": "Registry, certificates and stores",
+      "description": "The service registry, the certificate authority and the metrics and trace store."
+    }
+  ]
+}

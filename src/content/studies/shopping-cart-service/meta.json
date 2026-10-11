@@ -1,0 +1,518 @@
+{
+  "name": "Design a Highly Available Shopping Cart",
+  "difficulty": "advanced",
+  "intent": "A cart that always accepts an add, even during failures and network partitions, and merges the copies that diverge without losing an item, until checkout, where the numbers must be exact.",
+  "codeTitle": "merging two diverged carts without losing an item",
+  "finalIntro": "A shopper edits one cart on two devices during a partition, and the copies are merged and checked out.",
+  "prompt": "Design the shopping cart for a large online store. A cart must always accept 'add to cart', even when servers fail or the network splits, because a failed add is a lost sale. A shopper uses a phone and a laptop, and may be a guest who logs in later. Copies of the cart may be changed in different places at the same time, and no change may be silently lost. At checkout, stock and price must be exact.",
+  "functional": [
+    "Add an item, remove an item and change a quantity",
+    "Show the same cart on every device of a shopper",
+    "Keep a guest's cart and merge it into their account when they log in",
+    "Expire carts that have not been used for a while",
+    "Move the cart to checkout, with current prices and stock"
+  ],
+  "nonFunctional": [
+    "Writes are accepted at all times, even during a node failure or a partition (availability over consistency)",
+    "A cart read or write takes under 50 ms at the 99th percentile",
+    "No item added by a shopper is ever silently lost",
+    "A removed item should stay removed, and quantities should add up",
+    "Copies converge on their own after a failure, with no manual repair",
+    "Checkout is strongly consistent for stock, price and payment"
+  ],
+  "firstAttempt": {
+    "text": "One SQL table with a row per cart item, in one primary database with a replica for backup. Every add, remove and quantity change is a transaction on the primary. The last change written is the one that stays.",
+    "limits": [
+      "If the primary is down or unreachable, nobody can add to a cart, so a failure becomes lost sales",
+      "A failover promotes a replica that may be missing the last changes, and those adds are lost",
+      "A shopper on a bad connection retries, and the primary may apply the same add twice",
+      "Two devices changing the same row at the same time overwrite each other, and the last write wins whatever its clock says",
+      "One database is a size and throughput limit for the busiest sale of the year"
+    ]
+  },
+  "nodes": [
+    {
+      "id": "devices",
+      "label": "Phone and laptop",
+      "kind": "client",
+      "x": 37,
+      "y": 63
+    },
+    {
+      "id": "single",
+      "label": "SQL cart table",
+      "kind": "data",
+      "x": 12,
+      "y": 63,
+      "at": 0,
+      "until": 1
+    },
+    {
+      "id": "api",
+      "label": "Cart API",
+      "kind": "edge",
+      "x": 62,
+      "y": 63,
+      "at": 1
+    },
+    {
+      "id": "ring",
+      "label": "Cart replicas",
+      "kind": "data",
+      "x": 62,
+      "y": 37,
+      "at": 1
+    },
+    {
+      "id": "reconcile",
+      "label": "Union merge",
+      "kind": "compute",
+      "x": 87,
+      "y": 37,
+      "at": 2,
+      "until": 3
+    },
+    {
+      "id": "crdt",
+      "label": "Set merge (CRDT)",
+      "kind": "compute",
+      "x": 37,
+      "y": 37,
+      "at": 3
+    },
+    {
+      "id": "repair",
+      "label": "Repair and hints",
+      "kind": "async",
+      "x": 87,
+      "y": 37,
+      "at": 4
+    },
+    {
+      "id": "login",
+      "label": "Login merge",
+      "kind": "compute",
+      "x": 62,
+      "y": 88,
+      "at": 5
+    },
+    {
+      "id": "ttl",
+      "label": "Cart expiry",
+      "kind": "async",
+      "x": 62,
+      "y": 12,
+      "at": 5
+    },
+    {
+      "id": "checkout",
+      "label": "Checkout",
+      "kind": "compute",
+      "x": 87,
+      "y": 63,
+      "at": 6
+    },
+    {
+      "id": "inventory",
+      "label": "Stock and prices",
+      "kind": "data",
+      "x": 87,
+      "y": 88,
+      "at": 6
+    }
+  ],
+  "edges": [
+    {
+      "from": "devices",
+      "to": "single",
+      "at": 0,
+      "until": 1
+    },
+    {
+      "from": "devices",
+      "to": "api",
+      "at": 1
+    },
+    {
+      "from": "api",
+      "to": "ring",
+      "at": 1
+    },
+    {
+      "from": "api",
+      "to": "reconcile",
+      "at": 2,
+      "until": 3
+    },
+    {
+      "from": "reconcile",
+      "to": "ring",
+      "at": 2,
+      "until": 3
+    },
+    {
+      "from": "api",
+      "to": "crdt",
+      "at": 3
+    },
+    {
+      "from": "crdt",
+      "to": "ring",
+      "at": 3
+    },
+    {
+      "from": "repair",
+      "to": "ring",
+      "at": 4
+    },
+    {
+      "from": "devices",
+      "to": "login",
+      "at": 5
+    },
+    {
+      "from": "login",
+      "to": "api",
+      "at": 5
+    },
+    {
+      "from": "ttl",
+      "to": "ring",
+      "at": 5
+    },
+    {
+      "from": "api",
+      "to": "checkout",
+      "at": 6
+    },
+    {
+      "from": "checkout",
+      "to": "inventory",
+      "at": 6
+    }
+  ],
+  "steps": [
+    {
+      "title": "Keep copies on several nodes, and accept writes with a sloppy quorum",
+      "problem": "A single primary makes the cart unavailable whenever it is unreachable, and a failover can drop the last writes.",
+      "fix": "Store each cart under its id in a leaderless ring of nodes, in the style of Amazon's Dynamo. Consistent hashing places each cart on N = 3 consecutive nodes. Any node can coordinate a request. A write succeeds after W = 2 nodes acknowledge it, and a read asks R = 2, so a read usually meets the latest write when all is well. If one of the three home nodes is down, the write goes to the next healthy node on the ring with a hint saying whose data it is (a sloppy quorum), and that node passes it on when the home node returns (hinted handoff).",
+      "tradeoff": "The cart accepts adds through a node failure and even a partition. The price is that copies can differ, a read may see a stale cart, and a sloppy quorum does not guarantee that a read meets the latest write. The system now has to detect and merge divergent versions.",
+      "concepts": [
+        {
+          "slug": "cap-theorem"
+        },
+        {
+          "slug": "quorums"
+        },
+        {
+          "slug": "consistent-hashing"
+        },
+        {
+          "slug": "database-replication"
+        },
+        {
+          "slug": "acid-vs-base"
+        }
+      ]
+    },
+    {
+      "title": "Detect concurrent versions with vector clocks",
+      "problem": "Two devices change the cart on different sides of a partition. A timestamp cannot tell whether one change came after the other, or whether they were made without knowing about each other, and a wrong guess drops an item.",
+      "fix": "Each stored version carries a vector clock: a counter for each node that has coordinated a write to it. A client sends back the clock it read with its update, and the coordinator increments its own counter. When one clock is at least as large in every position, that version is simply newer and the older one is dropped. When neither dominates, the versions are concurrent and both are kept as siblings. A read returns all siblings, the cart service merges them (in the original design, by taking the union of the items) and writes the result back with a clock that covers them all. Entries are trimmed once a clock has about ten of them.",
+      "tradeoff": "No concurrent write is silently overwritten, which is the failure of last-write-wins with timestamps (a device with a fast clock wins and the other device's items vanish). A union cannot express a removal, so an item deleted on one side comes back, and the quantity rule (largest, or sum) is a guess. Clocks grow with the number of coordinators, and trimming can make an ordered pair look concurrent.",
+      "concepts": [
+        {
+          "slug": "logical-clocks"
+        },
+        {
+          "slug": "consistency-models"
+        },
+        {
+          "slug": "quorums"
+        },
+        {
+          "slug": "database-replication"
+        }
+      ]
+    },
+    {
+      "title": "Merge with a data type made for it: an add-wins set and counters",
+      "problem": "Hand-written reconciliation has to guess about removals and quantities, and each guess loses something: deleted items return, or increases vanish.",
+      "fix": "Store the cart as a conflict-free replicated data type. Every add gets a unique tag (replica id and counter) and carries its own quantity. A remove puts a tombstone on exactly the tags it has seen. An item is in the cart if any of its tags is not removed, so a concurrent add beats a remove (add-wins) and a removed item stays removed. Taking one fewer is counted separately for each tag, as the negative half of a counter. Merging is a union of tags and tombstones and the larger value of each counter, which gives the same result in any order and when repeated. The siblings from step 2 are merged by this function.",
+      "tradeoff": "Nothing added is lost, deletes stick, and quantities add up, without coordination. The bookkeeping grows with every add and remove, tombstones can only be dropped after every replica has seen them, and add-wins is a product choice. Rules such as a quantity limit can be broken by concurrent adds and have to be enforced later, at checkout.",
+      "concepts": [
+        {
+          "slug": "logical-clocks"
+        },
+        {
+          "slug": "consistency-models"
+        },
+        {
+          "slug": "acid-vs-base"
+        },
+        {
+          "slug": "idempotency"
+        },
+        {
+          "slug": "cap-theorem"
+        }
+      ]
+    },
+    {
+      "title": "Repair the copies in the background",
+      "problem": "A replica that was down or cut off holds an old cart, and a cart nobody reads would stay out of date for ever.",
+      "fix": "Three mechanisms bring the copies together. Read repair: when a read sees that the replicas differ, the merged cart is written back to the ones that are behind. Hinted handoff: a stand-in node keeps the writes meant for a down node and replays them when it returns, for a limited time. Anti-entropy: replicas compare Merkle trees (hash trees) over their key ranges, find the ranges whose hashes differ and exchange only those carts. Gossip tells nodes which peers are alive.",
+      "tradeoff": "Replicas converge without the shopper doing anything, even for carts that are not being read. It costs background traffic and the upkeep of the trees, hints are kept only for a few hours, and a node that comes back after a long outage causes a burst of repair that has to be rate-limited.",
+      "concepts": [
+        {
+          "slug": "gossip-protocol"
+        },
+        {
+          "slug": "database-replication"
+        },
+        {
+          "slug": "quorums"
+        },
+        {
+          "slug": "health-checks"
+        },
+        {
+          "slug": "retries-and-backoff"
+        }
+      ]
+    },
+    {
+      "title": "Merge the guest cart on login, and expire old carts",
+      "problem": "A guest fills a cart before logging in and may already have a cart on another device. Merging by hand would double quantities when a login request is retried, and carts that are abandoned pile up for ever.",
+      "fix": "A guest cart is stored under an anonymous id in a cookie. At login, the same set merge is applied between the guest cart and the account cart: tags and tombstones are united, so an add that arrives twice is the same tag and counts once. The guest cart is then tombstoned or deleted. Every cart has a time to live (for example 30 days for an account cart, 7 days for a guest cart) that is refreshed by each write. The storage layer removes expired carts, and tombstones are dropped after every replica has acknowledged them.",
+      "tradeoff": "The shopper sees one cart on all devices, and a retried login does no harm because the merge is idempotent. Prices in an old guest cart may be out of date, expiry will remove a cart that someone wanted (so send a reminder before it), and refreshing the time to live on every touch means a cart with a looping client never expires.",
+      "concepts": [
+        {
+          "slug": "authentication-and-authorization"
+        },
+        {
+          "slug": "idempotency"
+        },
+        {
+          "slug": "retries-and-backoff"
+        },
+        {
+          "slug": "database-replication"
+        }
+      ]
+    },
+    {
+      "title": "Move to checkout, where consistency matters",
+      "problem": "A cart is a wish list, so a wrong quantity is a small annoyance. A wrong stock count, price or payment is lost money or an oversold item.",
+      "fix": "At checkout the service reads the cart with a quorum, merges it, and takes a snapshot with an idempotency key. It then calls a strongly consistent system: a transactional database for stock and prices, where an atomic update reserves each item or fails. Price, stock, limits and promotions are checked again and the shopper is shown any change. Payment and the reservation form a saga, where a failure releases the reserved stock. If the cart store is unreachable, checkout waits or shows an error instead of guessing.",
+      "tradeoff": "The cart stays available and fast, and money and stock are never wrong. Checkout is less available than the cart, the price at checkout can differ from the price in the cart, and there are two kinds of storage and a conversion between them.",
+      "concepts": [
+        {
+          "slug": "two-phase-commit"
+        },
+        {
+          "slug": "saga"
+        },
+        {
+          "slug": "acid-vs-base"
+        },
+        {
+          "slug": "idempotency"
+        },
+        {
+          "slug": "consistency-models"
+        }
+      ]
+    }
+  ],
+  "failures": [
+    {
+      "scenario": "A network partition separates the replicas the phone uses from the ones the laptop uses",
+      "impact": "Both sides accept changes, so the cart exists in two diverging versions.",
+      "answer": "Sloppy quorums keep both sides writable, and the vector clocks mark the two versions as concurrent when the partition ends. The first read merges them with the set merge, and read repair writes the merged cart back. A shopper who looked at the cart in the middle of the partition saw only their own side's changes.",
+      "concepts": [
+        {
+          "slug": "cap-theorem"
+        },
+        {
+          "slug": "quorums"
+        },
+        {
+          "slug": "logical-clocks"
+        }
+      ]
+    },
+    {
+      "scenario": "A node that holds a replica is down for several hours",
+      "impact": "Its copy of every cart it holds is stale, and a hint buffer on the stand-in node could fill up or expire.",
+      "answer": "Writes meanwhile go to a stand-in with hints, and are replayed when the node returns. If hints were dropped, anti-entropy compares Merkle trees with the other replicas and copies only the ranges that differ. The repair is rate-limited so that it does not overload the recovering node.",
+      "concepts": [
+        {
+          "slug": "database-replication"
+        },
+        {
+          "slug": "gossip-protocol"
+        },
+        {
+          "slug": "health-checks"
+        }
+      ]
+    },
+    {
+      "scenario": "A shopper removes an item on the phone while the laptop still shows it",
+      "impact": "With a plain union of items the removed item returns after the merge.",
+      "answer": "A remove adds tombstones for the tags it saw, and the merge unites the tombstones, so the item stays removed. If the laptop added the same item again while the phone was removing it, that add has a tag the remove never saw, and it survives. That is the add-wins rule. Tombstones are compacted after every replica has seen them.",
+      "concepts": [
+        {
+          "slug": "logical-clocks"
+        },
+        {
+          "slug": "consistency-models"
+        },
+        {
+          "slug": "idempotency"
+        }
+      ]
+    },
+    {
+      "scenario": "A device has a clock that is a minute fast, and the system uses last write wins",
+      "impact": "That device's whole cart beats the other device's newer changes, and the items the other device added are lost.",
+      "answer": "Do not order concurrent cart changes by wall-clock time. Use vector clocks to find concurrency and the set merge to combine it. Timestamps are still fine for expiry, where a minute of error does not matter.",
+      "concepts": [
+        {
+          "slug": "logical-clocks"
+        },
+        {
+          "slug": "consistency-models"
+        },
+        {
+          "slug": "cap-theorem"
+        }
+      ]
+    },
+    {
+      "scenario": "An item sells out or its price changes between the add and the checkout",
+      "impact": "The cart shows a price or availability that is no longer true.",
+      "answer": "The cart is not the source of truth for either. Checkout reads the current price and reserves stock in the strongly consistent system, and tells the shopper about any difference before taking payment. A failed payment releases the reservation through the saga.",
+      "concepts": [
+        {
+          "slug": "saga"
+        },
+        {
+          "slug": "two-phase-commit"
+        },
+        {
+          "slug": "acid-vs-base"
+        }
+      ]
+    }
+  ],
+  "alternatives": [
+    {
+      "title": "How to resolve concurrent versions",
+      "options": [
+        {
+          "name": "Last write wins by timestamp",
+          "pro": "Trivial, and the store needs no extra metadata",
+          "con": "Silently drops one side's changes, and trusts device and server clocks"
+        },
+        {
+          "name": "Vector clocks and an application merge",
+          "pro": "Detects true concurrency and loses no write; the merge can be tuned",
+          "con": "Union cannot express removes, clocks grow, and every client has to run the merge"
+        },
+        {
+          "name": "A CRDT (add-wins set and counters)",
+          "pro": "Merges in any order with no coordination, removes stick and quantities add up",
+          "con": "Needs tombstone compaction, and some rules cannot be enforced without coordination"
+        }
+      ],
+      "pick": "A CRDT cart, kept in a store that also tracks vector clocks for concurrency."
+    },
+    {
+      "title": "Availability or consistency for the cart",
+      "options": [
+        {
+          "name": "Single leader, reject writes without it",
+          "pro": "Simple and always consistent",
+          "con": "The cart is down when the leader is unreachable"
+        },
+        {
+          "name": "Leaderless with sloppy quorums",
+          "pro": "Accepts writes through failures, with hinted handoff",
+          "con": "Reads can be stale and versions diverge"
+        }
+      ],
+      "pick": "Leaderless for the cart, where an unavailable cart costs sales. Strong consistency only at checkout."
+    },
+    {
+      "title": "Quorum settings (N = 3)",
+      "options": [
+        {
+          "name": "W = 1, R = 1",
+          "pro": "The fastest and most available",
+          "con": "A read often misses the latest write, and a single failed node can hold the only copy"
+        },
+        {
+          "name": "W = 2, R = 2",
+          "pro": "A read usually overlaps the latest write, and one node can fail",
+          "con": "Slower, and a partition can make a quorum unreachable unless it is sloppy"
+        },
+        {
+          "name": "W = 3, R = 1",
+          "pro": "Reads are fast and consistent",
+          "con": "A write fails when any replica is down"
+        }
+      ],
+      "pick": "W = 2 and R = 2 with a sloppy quorum, and read repair to hide most staleness."
+    },
+    {
+      "title": "What happens to a concurrent add and remove",
+      "options": [
+        {
+          "name": "Add wins",
+          "pro": "Keeps an item the shopper may want, and loses no sale",
+          "con": "An item the shopper deleted can occasionally stay"
+        },
+        {
+          "name": "Remove wins",
+          "pro": "A delete is always final",
+          "con": "An add can disappear, which is a lost sale"
+        },
+        {
+          "name": "Latest timestamp wins",
+          "pro": "A single simple rule",
+          "con": "Depends on clocks, and either side can lose"
+        }
+      ],
+      "pick": "Add wins. An extra item in a cart costs a click, and a missing item can cost the sale."
+    }
+  ],
+  "roles": [
+    {
+      "id": "client",
+      "label": "Devices",
+      "description": "The shopper's phone and laptop, which edit the cart."
+    },
+    {
+      "id": "edge",
+      "label": "Cart API",
+      "description": "The service that coordinates reads and writes of carts."
+    },
+    {
+      "id": "async",
+      "label": "Background repair",
+      "description": "Hinted handoff, anti-entropy and cart expiry."
+    },
+    {
+      "id": "compute",
+      "label": "Merging and checkout",
+      "description": "The merge function, the login merge and the checkout service."
+    },
+    {
+      "id": "data",
+      "label": "State",
+      "description": "The cart replicas, and the stock and price database."
+    }
+  ]
+}

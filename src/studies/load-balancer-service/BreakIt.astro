@@ -1,0 +1,162 @@
+---
+import PlaygroundShell from '../../components/PlaygroundShell.astro';
+---
+<PlaygroundShell title="Spread a stream of connections" hint="The same 4,000 seeded connections (most short, a few long) arrive at 5 backends. Pick the algorithm and the backend mix, then add or remove a backend halfway through.">
+  <ol class="how">
+    <li>The default, <b>random</b> choice over <b>mixed-size backends</b> that the balancer treats as equal: the small backends get as many connections as the big one, so the hottest backend runs at <b>1.82 times</b> the mean and the slowest 1% of connections wait <b>13.4 s</b> in a queue.</li>
+    <li>Tick <b>weights</b> and switch to <b>least connections</b>: the imbalance falls to <b>1.09</b> and the p99 wait to <b>12 ms</b>. Least connections without weights still manages <b>1.38</b>, because a backend that is falling behind has more open connections.</li>
+    <li>With <b>a backend added</b>, a modulo hash breaks <b>226 of 274</b> live connections (82%), a Maglev table only <b>43</b> (16%), and a connection-tracking table breaks none: it pins every live flow.</li>
+    <li>The new backend starts cold, at 20% speed. Without slow-start, random sends it a full share and its connections run <b>5.5 times</b> slower than they should in the first 8 s, and with slow-start only <b>2.0 times</b>. Round robin is worse (13.4 times). Least connections floods an empty backend too, but suffers less (2.3 times) because slow requests keep its connection count up.</li>
+  </ol>
+  <div class="pg lbb" data-lbb>
+    <div class="pg-row">
+      <label>Algorithm <select class="pg-in" data-algo>
+        <option value="random" selected>random</option>
+        <option value="rr">round robin</option>
+        <option value="lc">least connections</option>
+        <option value="p2c">power of two choices</option>
+      </select></label>
+      <label>Backends <select class="pg-in" data-mix>
+        <option value="mixed" selected>mixed sizes (1, 1, 2, 2, 4)</option>
+        <option value="same">all the same size (2 each)</option>
+      </select></label>
+      <label>Halfway through <select class="pg-in" data-event>
+        <option value="add" selected>add a cold backend</option>
+        <option value="remove">remove a backend</option>
+        <option value="none">nothing changes</option>
+      </select></label>
+      <label><input type="checkbox" data-weighted /> Balancer knows backend sizes (weights)</label>
+    </div>
+    <div class="pg-grid">
+      <div class="pg-box" data-b1><h3>Load imbalance (busiest / mean)</h3><span class="pg-mono" data-o1></span><span class="pg-note" data-n1></span>
+        <div class="lbb-bars" data-bars role="img" aria-label="Utilisation of each backend over the run, as a bar per backend"></div></div>
+      <div class="pg-box" data-b2><h3>Waiting in a queue (slowest 1%)</h3><span class="pg-mono" data-o2></span><span class="pg-note" data-n2></span></div>
+      <div class="pg-box" data-b3><h3>Live connections broken by the change</h3><span class="pg-mono" data-o3></span><span class="pg-note" data-n3></span></div>
+      <div class="pg-box" data-b4><h3>New backend, first 8 seconds</h3><span class="pg-mono" data-o4></span><span class="pg-note" data-n4></span></div>
+    </div>
+    <p class="pg-out" data-verdict aria-live="polite"></p>
+    <p class="pg-note">Model: each backend has 4 slots per size unit (a connection takes a slot for its duration, others queue), and the load is about 70% of the total slots before the change. Connection lengths are exponential: 90% have a mean of 100 ms and 10% a mean of 1,500 ms. The event happens at the middle of the run. A new backend runs at 20% speed and ramps to full speed over 8 s, and slow-start ramps its weight from 10% to 100% over the same time. A removed backend lets its live connections finish. Imbalance is each backend's busy time divided by its slot time, as busiest over mean, with the new backend measured from when it joined. The table box counts the connections open at the event whose backend changes, for a hash by modulo (index = hash mod number of backends) and for a 2,003-slot Maglev table with equal weights, and a tracking table pins live flows so only the removed backend's flows must move.</p>
+  </div>
+</PlaygroundShell>
+<style is:global>
+  .lbb-bars { display: grid; gap: 4px; margin-top: 8px; }
+  .lbb-row { display: grid; grid-template-columns: 5.5rem 1fr 3.5rem; gap: 8px; align-items: center; font-size: .85rem; }
+  .lbb-row[hidden] { display: none; }
+  .lbb-track { height: 10px; border-radius: 5px; background: var(--border); overflow: hidden; }
+  .lbb-fill { height: 100%; width: 0; background: var(--accent); }
+  .lbb-row span:last-child { text-align: right; white-space: nowrap; }
+  .lbb-row span:first-child { white-space: nowrap; }
+</style>
+<script>
+  document.querySelectorAll<HTMLElement>('[data-lbb]').forEach((root) => {
+    const q = <T extends HTMLElement>(s: string) => root.querySelector<T>(s)!;
+    const N = 4000; const RAMP = 8000; const M = 2003; const LAMBDA = 0.1167;
+    const mix32 = (x) => { let h = Math.imul(x ^ 0x9e3779b9, 2654435761) >>> 0; h ^= h >>> 15; h = Math.imul(h, 2246822519) >>> 0; h ^= h >>> 13; h = Math.imul(h, 3266489917) >>> 0; h ^= h >>> 16; return h >>> 0; };
+    // The same seeded stream of connections is used for every setting: Poisson arrivals, 90% short (mean 100 ms) and 10% long (mean 1,500 ms).
+    const LOAD = (() => {
+      let s = 7; const rnd = () => ((s = (Math.imul(s, 1664525) + 1013904223) >>> 0) / 4294967296);
+      const list = []; let t = 0;
+      for (let i = 0; i < N; i++) { t += -Math.log(1 - rnd()) / LAMBDA; const dur = (rnd() < 0.9 ? 100 : 1500) * -Math.log(1 - rnd()); list.push({ t, dur: Math.max(5, dur), h: mix32(i + 1) }); }
+      return list;
+    })();
+    const hashName = (name) => name.split('').reduce((a, c) => (Math.imul(a, 31) + c.charCodeAt(0)) | 0, 7);
+    // Maglev table: each backend claims slots in its own pseudo-random order, taking turns, until the table is full.
+    function maglev(names) {
+      const perm = names.map((nm) => { const h = mix32(hashName(nm)); return { off: h % M, skip: (mix32(h) % (M - 1)) + 1, next: 0 }; });
+      const table = new Array(M).fill(-1); let filled = 0;
+      while (filled < M) for (let i = 0; i < names.length && filled < M; i++) { const p = perm[i]; let c = (p.off + p.next * p.skip) % M; while (table[c] >= 0) { p.next++; c = (p.off + p.next * p.skip) % M; } table[c] = i; p.next++; filled++; }
+      return table;
+    }
+    const tableCache = {};
+    const tableFor = (names) => { const k = names.join(','); return tableCache[k] || (tableCache[k] = maglev(names)); };
+    function simulate(o) { // o: algo, mix, event, weighted, slowStart
+      const caps = o.mix === 'mixed' ? [1, 1, 2, 2, 4] : [2, 2, 2, 2, 2];
+      const T = LOAD[N - 1].t; const te = T / 2;
+      const mk = (name, cap, added) => ({ name, cap, slots: 4 * cap, free: new Array(4 * cap).fill(0), fin: [], work: 0, cur: 0, n: 0, added, first: 0, sd: 0, sdn: 0 });
+      const bs = caps.map((c, i) => mk('b' + i, c, false));
+      if (o.event === 'add') bs.push(mk('b5', 2, true));
+      let s = 99; const rnd = () => ((s = (Math.imul(s, 1664525) + 1013904223) >>> 0) / 4294967296);
+      const ramp = (t) => Math.min(1, Math.max(0, (t - te) / RAMP));
+      const wt = (b, t) => (o.weighted ? b.cap : 1) * (b.added && o.slowStart ? 0.1 + 0.9 * ramp(t) : 1);
+      const removed = (b, t) => o.event === 'remove' && b === bs[0] && t >= te;
+      const wait = []; const allc = []; let snap = null;
+      for (const c of LOAD) {
+        const t = c.t;
+        if (!snap && t >= te) snap = allc.filter((x) => x.fin > te).map((x) => x.h);
+        const el = bs.filter((b) => !(b.added && t < te) && !removed(b, t));
+        for (const b of el) b.fin = b.fin.filter((f) => f > t);
+        let b;
+        if (o.algo === 'random') { const ws = el.map((x) => wt(x, t)); let r = rnd() * ws.reduce((a, x) => a + x, 0); b = el[el.length - 1]; for (let i = 0; i < el.length; i++) { r -= ws[i]; if (r < 0) { b = el[i]; break; } } }
+        else if (o.algo === 'rr') { let tot = 0; for (const x of el) { const w = wt(x, t); x.cur += w; tot += w; } b = el[0]; for (const x of el) if (x.cur > b.cur) b = x; b.cur -= tot; }
+        else if (o.algo === 'lc') { b = el[0]; for (const x of el) if ((x.fin.length + 1) / wt(x, t) < (b.fin.length + 1) / wt(b, t)) b = x; }
+        else { const i = Math.floor(rnd() * el.length); let j = Math.floor(rnd() * (el.length - 1)); if (j >= i) j++; const x = el[i]; const y = el[j]; b = (x.fin.length + 1) / wt(x, t) <= (y.fin.length + 1) / wt(y, t) ? x : y; }
+        let k = 0; for (let i = 1; i < b.free.length; i++) if (b.free[i] < b.free[k]) k = i;
+        const start = Math.max(t, b.free[k]);
+        const speed = b.added ? 0.2 + 0.8 * ramp(start) : 1; // a new backend is cold: 20% speed, back to full over 8 seconds
+        const fin = start + c.dur / speed; b.free[k] = fin; b.fin.push(fin); b.work += c.dur; b.n++;
+        allc.push({ h: c.h, fin }); wait.push(start - t);
+        if (b.added && t < te + RAMP) { b.sd += (fin - t) / c.dur; b.sdn++; }
+      }
+      const u = bs.map((b) => b.work / (b.slots * ((o.event === 'remove' && b === bs[0] ? te : T) - (b.added ? te : 0))));
+      const mean = u.reduce((a, x) => a + x, 0) / u.length; const hot = u.indexOf(Math.max(...u));
+      const w99 = [...wait].sort((a, b) => a - b)[Math.floor(0.99 * (wait.length - 1))];
+      let modulo = 0; let mag = 0; let forced = 0;
+      const active = snap ? snap.length : 0;
+      if (o.event !== 'none' && snap) {
+        const old = caps.map((_, i) => 'b' + i); const nw = o.event === 'add' ? [...old, 'b5'] : old.slice(1);
+        const tA = tableFor(old); const tB = tableFor(nw);
+        for (const h of snap) { if (old[h % old.length] !== nw[h % nw.length]) modulo++; const m1 = old[tA[h % M]]; if (m1 !== nw[tB[h % M]]) mag++; if (o.event === 'remove' && m1 === 'b0') forced++; }
+      }
+      const nb = bs.find((x) => x.added);
+      return { names: bs.map((b) => b.name + ' (x' + b.cap + ')'), u, imbalance: Math.max(...u) / mean, hot, w99, active, modulo, mag, forced, slow: nb && nb.sdn ? nb.sd / nb.sdn : 0, slowN: nb ? nb.sdn : 0 };
+    }
+
+    const bars = Array.from({ length: 6 }, () => {
+      const row = document.createElement('div'); row.className = 'lbb-row';
+      const name = document.createElement('span'); const track = document.createElement('span'); track.className = 'lbb-track'; track.setAttribute('aria-hidden', 'true');
+      const fill = document.createElement('span'); fill.className = 'lbb-fill'; fill.style.display = 'block'; track.append(fill);
+      const num = document.createElement('span'); row.append(name, track, num); q('[data-bars]').append(row);
+      return { row, name, fill, num };
+    });
+    const fmtMs = (ms: number) => (ms >= 1000 ? `${(ms / 1000).toFixed(1)} s` : `${Math.round(ms)} ms`);
+    const pct = (a: number, b: number) => (b ? `${Math.round((100 * a) / b)}%` : '0%');
+    function draw() {
+      const algo = q<HTMLSelectElement>('[data-algo]').value; const mix = q<HTMLSelectElement>('[data-mix]').value; const event = q<HTMLSelectElement>('[data-event]').value; const weighted = q<HTMLInputElement>('[data-weighted]').checked;
+      const base = { algo, mix, event, weighted };
+      const a = simulate({ ...base, slowStart: false }); const b = event === 'add' ? simulate({ ...base, slowStart: true }) : a;
+      const maxU = Math.max(...a.u);
+      bars.forEach((r, i) => {
+        r.row.hidden = i >= a.u.length;
+        if (i < a.u.length) { r.name.textContent = a.names[i]; r.fill.style.width = `${Math.max(2, (100 * a.u[i]) / maxU)}%`; r.fill.style.background = i === a.hot ? 'var(--bad)' : 'var(--accent)'; r.num.textContent = `${Math.round(a.u[i] * 100)}%`; }
+      });
+      q('[data-o1]').textContent = `${a.imbalance.toFixed(2)}x`;
+      q('[data-n1]').textContent = `busiest: ${a.names[a.hot]} at ${Math.round(a.u[a.hot] * 100)}% busy`;
+      q('[data-o2]').textContent = fmtMs(a.w99);
+      q('[data-n2]').textContent = event === 'add' ? `with slow-start: ${fmtMs(b.w99)}` : 'a connection waits when every slot of its backend is taken';
+      if (event === 'none') {
+        q('[data-o3]').textContent = 'no change'; q('[data-n3]').textContent = 'choose to add or remove a backend to see which connections move';
+        q('[data-o4]').textContent = 'no new backend'; q('[data-n4]').textContent = 'choose to add a cold backend';
+      } else {
+        q('[data-o3]').textContent = `modulo ${a.modulo}, Maglev ${a.mag}, tracked ${event === 'remove' ? a.forced : 0}`;
+        q('[data-n3]').textContent = `of ${a.active} open connections: modulo ${pct(a.modulo, a.active)}, Maglev ${pct(a.mag, a.active)}` + (event === 'remove' ? `. ${a.forced} of them were on the removed backend, and finish there if it drains.` : '. A tracking table pins them all.');
+        if (event === 'add') { q('[data-o4]').textContent = `${a.slow.toFixed(1)}x slower, or ${b.slow.toFixed(1)}x with slow-start`; q('[data-n4]').textContent = `mean time to finish compared with a warm backend (1.0x); ${a.slowN} connections reached it, or ${b.slowN} with slow-start`; }
+        else { q('[data-o4]').textContent = 'no new backend'; q('[data-n4]').textContent = 'choose add a cold backend'; }
+      }
+      q<HTMLElement>('[data-b1]').style.setProperty('--c', a.imbalance < 1.2 ? 'var(--good)' : 'var(--bad)');
+      q<HTMLElement>('[data-b2]').style.setProperty('--c', a.w99 < 500 ? 'var(--good)' : 'var(--bad)');
+      q<HTMLElement>('[data-b3]').style.setProperty('--c', event === 'none' ? 'var(--accent)' : a.mag * 4 < a.modulo ? 'var(--good)' : 'var(--bad)');
+      q<HTMLElement>('[data-b4]').style.setProperty('--c', event !== 'add' ? 'var(--accent)' : b.slow < 2.2 ? 'var(--good)' : 'var(--bad)');
+      const parts: string[] = [];
+      parts.push(a.imbalance < 1.2 ? `Load is even (${a.imbalance.toFixed(2)}x).` : `Load is uneven (${a.imbalance.toFixed(2)}x): ${a.names[a.hot]} is the hot spot.`);
+      if (a.w99 >= 500) parts.push(`The slowest 1% wait ${fmtMs(a.w99)} for a slot.`);
+      if (!weighted && mix === 'mixed') parts.push('The balancer treats a size-1 and a size-4 backend as equal' + (algo === 'lc' || algo === 'p2c' ? ', and only the connection counts partly make up for it.' : ', and nothing makes up for it.'));
+      if (event !== 'none') parts.push(`On the change, a modulo hash breaks ${pct(a.modulo, a.active)} of live connections, a Maglev table ${pct(a.mag, a.active)}.`);
+      if (event === 'add') parts.push(b.slow < a.slow ? `Slow-start cuts the cold backend's slowdown from ${a.slow.toFixed(1)}x to ${b.slow.toFixed(1)}x.` : 'Slow-start makes no difference here.');
+      const out = q('[data-verdict]'); out.classList.toggle('bad', a.imbalance >= 1.2 || a.w99 >= 500); out.textContent = parts.join(' ');
+    }
+    let queued = false;
+    const schedule = () => { if (queued) return; queued = true; requestAnimationFrame(() => { queued = false; draw(); }); };
+    root.addEventListener('input', schedule); root.addEventListener('change', schedule);
+    draw();
+  });
+</script>

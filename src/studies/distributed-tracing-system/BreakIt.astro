@@ -1,0 +1,120 @@
+---
+import PlaygroundShell from '../../components/PlaygroundShell.astro';
+---
+<PlaygroundShell title="Find the one bad request" hint="20,000 simulated requests, scaled up to a day of 100 million traces. About 1 in 70 is slow or failed, and one of them is the checkout a customer is complaining about. Choose what to keep and see whether you can still find it.">
+  <ol class="how">
+    <li>Start with the default, <b>keep 10% at the start of the request</b>, no tail sampling: about <b>99 GB a day</b>, and only <b>28 of the 299</b> slow or failed traces survive. The customer's request was thrown away before anyone knew it was bad, so you <b>cannot find it</b>.</li>
+    <li>Switch to <b>100% head sampling with tail sampling on</b> and a 10 s wait: about <b>23 GB a day</b> (2% of the 100% cost), <b>298 of 299</b> bad traces kept and the customer's request found with all 24 spans. The price is a collector holding about <b>12,000 traces</b> in memory.</li>
+    <li>Cut the wait to <b>1 s</b>: the sampler decides before the slow root span and the late spans arrive. Only <b>58 of 299</b> bad traces are kept, nearly all of those <b>incomplete</b>, and the customer's request is lost. At <b>5 s</b> it is kept but without its error span, so you see slow and not why. At <b>60 s</b> nothing is incomplete, but the buffer is about <b>5.7 times larger</b>.</li>
+    <li>Now put <b>head sampling back to 10% with tail sampling on</b>: the sampler is cheap (about 1,500 traces in memory), yet it only sees the 10% that survived, so 90% of the bad traces are gone before it can look. Tail sampling needs the head to keep everything.</li>
+  </ol>
+  <div class="pg tcb" data-tcb>
+    <div class="pg-row">
+      <label>Head sampling (decided in the app) <select class="pg-in" data-head>
+        <option value="1">keep 100%</option>
+        <option value="0.1" selected>keep 10%</option>
+        <option value="0.01">keep 1%</option>
+      </select></label>
+      <label>Tail sampling in the collector <select class="pg-in" data-tail>
+        <option value="off" selected>off</option>
+        <option value="on">on: keep errors, slow traces and 1% of the rest</option>
+      </select></label>
+      <label>Buffer wait before deciding <select class="pg-in" data-wait>
+        <option value="1">1 s</option>
+        <option value="5">5 s</option>
+        <option value="10" selected>10 s</option>
+        <option value="30">30 s</option>
+        <option value="60">60 s</option>
+      </select></label>
+    </div>
+    <div class="pg-grid">
+      <div class="pg-box" data-b1><h3>Storage per day</h3><span class="pg-mono" data-o1></span><span class="pg-note" data-n1></span></div>
+      <div class="pg-box" data-b2><h3>Bad traces kept (errors and slow)</h3><span class="pg-mono" data-o2></span><span class="pg-note" data-n2></span></div>
+      <div class="pg-box" data-b3><h3>Incomplete traces kept</h3><span class="pg-mono" data-o3></span><span class="pg-note" data-n3></span></div>
+      <div class="pg-box" data-b4><h3>Tail sampler memory</h3><span class="pg-mono" data-o4></span><span class="pg-note" data-n4></span></div>
+      <div class="pg-box" data-b5><h3>The customer's failed checkout</h3><span class="pg-mono" data-o5></span><span class="pg-note" data-n5></span></div>
+    </div>
+    <p class="pg-out" data-verdict aria-live="polite"></p>
+    <p class="pg-note">Assumptions: 100 million traces a day (1,157 a second), 20 spans per trace on average and 500 bytes stored per span, so 100% is about 1 TB a day. A trace is bad if one span has an error or the root span took over 2 s. Spans reach the collector 0.1 to 1.5 s after they end, and 8% of traces have an async hop (a queue consumer) that ends up to 40 s after the start. The tail sampler decides once, at the first span plus the wait, from the spans it has seen; later spans of that trace are dropped. It keeps 1% of normal traces as a baseline. It needs a collector that gets every span of a trace, for example by routing on the trace id, and holds about 2 KB of memory per buffered span. The customer's request is a 6 s trace of 24 spans whose error comes from an async worker 9.5 s in, and it is not among the 10% or 1% that head sampling keeps.</p>
+  </div>
+</PlaygroundShell>
+<script>
+  document.querySelectorAll<HTMLElement>('[data-tcb]').forEach((root) => {
+    const q = <T extends HTMLElement>(s: string) => root.querySelector<T>(s)!;
+    const N = 20000; const WINDOW = 200; const PROD_TRACES = 100e6; const SPAN_BYTES = 500; const MEM_PER_SPAN = 2000; const SLOW = 2; const PLANT = 7777;
+    const mix = (x: number) => { let h = Math.imul(x ^ 0x9e3779b9, 2654435761) >>> 0; h ^= h >>> 15; h = Math.imul(h, 2246822519) >>> 0; h ^= h >>> 13; return h >>> 0; };
+    type Span = { end: number; arr: number; err: boolean; root: boolean };
+    type Trace = { id: number; error: boolean; slow: boolean; n: number; spans: Span[]; h: number; b: number; first: number };
+    let seed = 1234567; const rnd = () => ((seed = (seed * 1664525 + 1013904223) % 4294967296) / 4294967296);
+    const traces: Trace[] = [];
+    for (let id = 0; id < N; id++) {
+      const start = rnd() * WINDOW; const r = rnd();
+      const error = id === PLANT || r < 0.005; const slow = !error && r < 0.015;
+      const dur = id === PLANT ? 6 : slow ? 2.5 + rnd() * 9 : error ? 0.1 + rnd() * 3 : 0.05 + rnd() * rnd() * 0.9;
+      const n = id === PLANT ? 24 : 8 + Math.floor(rnd() * 25);
+      const hasAsync = id === PLANT || rnd() < 0.08; const errAt = Math.floor(rnd() * n);
+      const spans: Span[] = [];
+      for (let k = 0; k < n; k++) {
+        let end = k === 0 ? dur : dur * (0.15 + 0.85 * rnd()); let delay = 0.1 + rnd() * 1.4; let err = error && k === errAt;
+        if (hasAsync && k === n - 1) { end = id === PLANT ? 9 : 5 + rnd() * 35; delay = id === PLANT ? 0.5 : 0.1 + rnd() * 1.4; err = error && (id === PLANT || k === errAt || errAt === n - 1); }
+        if (id === PLANT) err = k === n - 1;
+        spans.push({ end, arr: start + end + delay, err, root: k === 0 });
+      }
+      traces.push({ id, error, slow, n, spans, h: mix(id) / 4294967296, b: mix(id + 99991) / 4294967296, first: Math.min(...spans.map((s) => s.arr)) });
+    }
+    const errTotal = traces.filter((t) => t.error).length; const slowTotal = traces.filter((t) => t.slow).length;
+    function run(head: number, tail: boolean, wait: number) {
+      let kept = 0; let keptSpans = 0; let errKept = 0; let slowKept = 0; let incomplete = 0; const ev: number[][] = [];
+      let plant = { kept: false, stored: 0, n: 0, hasErr: false };
+      for (const t of traces) {
+        if (!(t.h < head)) continue;
+        let stored = t.n; let keep = true; let hasErr = true;
+        if (tail) {
+          const dec = t.first + wait; ev.push([t.first, 1], [dec, -1]);
+          const seen = t.spans.filter((s) => s.arr <= dec); const root = seen.find((s) => s.root);
+          hasErr = seen.some((s) => s.err); keep = hasErr || (root !== undefined && root.end > SLOW) || t.b < 0.01; stored = seen.length;
+        }
+        if (!keep) continue;
+        kept++; keptSpans += stored; if (t.error) errKept++; if (t.slow) slowKept++; if (stored < t.n) incomplete++;
+        if (t.id === PLANT) plant = { kept: true, stored, n: t.n, hasErr };
+      }
+      let cur = 0; let peak = 0; ev.sort((a, b) => a[0] - b[0] || a[1] - b[1]); for (const e of ev) { cur += e[1]; peak = Math.max(peak, cur); }
+      const perDay = PROD_TRACES / N;
+      return { kept, errKept, slowKept, incomplete, bytes: keptSpans * perDay * SPAN_BYTES, prodPeak: peak * (PROD_TRACES / 86400) / (N / WINDOW), plant };
+    }
+    const sizeText = (b: number) => (b >= 1e12 ? `${(b / 1e12).toFixed(1)} TB` : b >= 1e10 ? `${Math.round(b / 1e9)} GB` : `${(b / 1e9).toFixed(1)} GB`);
+    const pct = (f: number) => (f > 0 && f < 0.01 ? '<1%' : `${Math.round(100 * f)}%`);
+    const count = (n: number) => Math.round(n).toLocaleString('en-US');
+    const full = run(1, false, 0).bytes;
+    let queued = false;
+    function draw() {
+      queued = false;
+      const head = Number(q<HTMLSelectElement>('[data-head]').value); const tail = q<HTMLSelectElement>('[data-tail]').value === 'on'; const wait = Number(q<HTMLSelectElement>('[data-wait]').value);
+      q<HTMLSelectElement>('[data-wait]').disabled = !tail;
+      const r = run(head, tail, wait); const bad = errTotal + slowTotal; const badKept = r.errKept + r.slowKept; const share = Math.round((100 * badKept) / bad);
+      q('[data-o1]').textContent = `${sizeText(r.bytes)} a day`; q('[data-n1]').textContent = `${pct(r.bytes / full)} of keeping everything (${sizeText(full)})`;
+      q('[data-o2]').textContent = `${badKept} of ${bad} (${share}%)`; q('[data-n2]').textContent = `${r.errKept} of ${errTotal} errors, ${r.slowKept} of ${slowTotal} slow`;
+      q('[data-o3]').textContent = r.kept ? `${r.incomplete} of ${r.kept}` : 'none kept'; q('[data-n3]').textContent = tail ? 'kept, but some spans arrived after the decision' : 'the decision is in the trace context, so every span is stored';
+      const memBytes = r.prodPeak * 20 * MEM_PER_SPAN;
+      q('[data-o4]').textContent = tail ? `${count(r.prodPeak)} traces (${memBytes >= 1e9 ? `${(memBytes / 1e9).toFixed(1)} GB` : `${Math.round(memBytes / 1e6)} MB`})` : '0';
+      q('[data-n4]').textContent = tail ? `at the busiest moment, across all collectors, waiting ${wait} s each` : 'no buffering: the app decided before sending anything';
+      const p = r.plant; const found = p.kept && p.hasErr && p.stored === p.n;
+      q('[data-o5]').textContent = !p.kept ? 'not stored' : found ? 'found, all 24 spans' : p.hasErr ? `kept, ${p.stored} of ${p.n} spans` : `kept, error span missing (${p.stored} of ${p.n})`;
+      q('[data-n5]').textContent = !p.kept ? (tail && head === 1 ? 'dropped by the sampler: it looked ordinary at decision time' : 'thrown away before anyone knew it was bad') : found ? 'search error=true or the trace id and open it' : 'you see that it was slow, not why';
+      const good = share >= 95;
+      q<HTMLElement>('[data-b1]').style.setProperty('--c', r.bytes > 5e11 ? 'var(--bad)' : 'var(--accent)');
+      q<HTMLElement>('[data-b2]').style.setProperty('--c', good ? 'var(--good)' : 'var(--bad)');
+      q<HTMLElement>('[data-b3]').style.setProperty('--c', r.incomplete > 0.1 * r.kept ? 'var(--bad)' : 'var(--accent)');
+      q<HTMLElement>('[data-b4]').style.setProperty('--c', 'var(--accent)');
+      q<HTMLElement>('[data-b5]').style.setProperty('--c', found ? 'var(--good)' : 'var(--bad)');
+      const out = q('[data-verdict]'); out.classList.toggle('bad', !found);
+      out.textContent = found
+        ? (tail ? `An engineer can find it. The sampler held the trace for ${wait} s, saw the error and kept all 24 spans, and the whole day costs ${sizeText(r.bytes)} and about ${count(r.prodPeak)} buffered traces.` : `An engineer can find it, but only because everything is kept: ${sizeText(r.bytes)} a day, with every normal request stored too.`)
+        : !p.kept ? (tail && head < 1 ? `Not findable. Head sampling dropped this request at ${Math.round(head * 100)}% before the tail sampler could see it, so tail sampling only rescued ${badKept} of ${bad} bad traces.` : tail ? `Not findable. With a ${wait} s wait the sampler decided before the root span or the late async error arrived, so the trace looked ordinary and was dropped.` : `Not findable. The request was chosen at random at the start, before it failed, so it was thrown away with ${100 - Math.round(head * 100)}% of everything else. Only ${share}% of bad traces survive.`)
+          : `Half found: the trace was kept because it was slow, but the sampler decided after ${wait} s, before the error span from the async worker arrived. You can see the slowness and not the cause.`;
+    }
+    const schedule = () => { if (!queued) { queued = true; requestAnimationFrame(draw); } };
+    root.addEventListener('input', schedule); root.addEventListener('change', schedule);
+    draw();
+  });
+</script>

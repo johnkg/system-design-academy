@@ -1,0 +1,90 @@
+---
+import PlaygroundShell from '../../components/PlaygroundShell.astro';
+---
+<PlaygroundShell title="A leaked credential" hint="A credential leaks at a random moment. Choose what kind of secret it was, how often it is rotated and how long it takes to notice, and see how long the attacker can use it and what the rotation costs you.">
+  <ol class="how">
+    <li>Start with the default, a <b>static shared password</b>, rotated every 90 days and noticed after a week: the attacker keeps access for up to <b>8 days</b>, and each rotation means changing <b>40 systems by hand</b>, which breaks something about <b>1 time in 3</b> (about 80% of years).</li>
+    <li>Choose a <b>dynamic credential</b> and rotate every <b>1 hour</b> (its lease). The attacker's window is capped at <b>1 hour</b> even if the leak is noticed after a week, no human changes anything, and the risk of an outage is low. With clients caching, the vault sees under <b>1 read per second</b> from the whole fleet, against <b>100,000</b> if every request asked it.</li>
+    <li>Now set the rotation to <b>5 minutes</b>. The window shrinks to 5 minutes, but any vault outage longer than the lease takes the workloads down with it, so the yearly outage risk climbs. Short leases need a highly available vault, and that is why the next best setting is usually hours, not seconds.</li>
+  </ol>
+  <div class="pg svb" data-svb>
+    <div class="pg-row">
+      <label>Secret type <select class="pg-in" data-type>
+        <option value="shared" selected>Static shared password (40 systems)</option>
+        <option value="key">Long-lived API key (6 services)</option>
+        <option value="dynamic">Dynamic credential with a lease</option>
+      </select></label>
+      <label>Rotation interval (the lease TTL for a dynamic credential) <select class="pg-in" data-rot>
+        <option value="5m">5 minutes</option><option value="1h">1 hour</option><option value="1d">1 day</option><option value="7d">7 days</option>
+        <option value="30d">30 days</option><option value="90d" selected>90 days</option><option value="365d">1 year</option><option value="never">never</option>
+      </select></label>
+      <label>Time until the leak is noticed <select class="pg-in" data-det>
+        <option value="1h">1 hour</option><option value="1d">1 day</option><option value="7d" selected>1 week</option><option value="30d">1 month</option><option value="180d">6 months</option>
+      </select></label>
+    </div>
+    <div class="pg-grid">
+      <div class="pg-box" data-b1><h3>Attacker can use the secret for</h3><span class="pg-mono" data-o1></span><span class="pg-note" data-n1></span></div>
+      <div class="pg-box" data-b2><h3>Systems changed to rotate</h3><span class="pg-mono" data-o2></span><span class="pg-note" data-n2></span></div>
+      <div class="pg-box" data-b3><h3>Chance that rotation causes an outage</h3><span class="pg-mono" data-o3></span><span class="pg-note" data-n3></span></div>
+      <div class="pg-box" data-b4><h3>Vault reads per second, no cache</h3><span class="pg-mono" data-o4></span><span class="pg-note" data-n4></span></div>
+      <div class="pg-box" data-b5><h3>Vault reads per second, clients cache</h3><span class="pg-mono" data-o5></span><span class="pg-note" data-n5></span></div>
+    </div>
+    <p class="pg-out" data-verdict aria-live="polite"></p>
+    <p class="pg-note">Assumptions: the leak happens at a uniformly random moment in the rotation cycle, and the secret stops working at the next rotation or when it is revoked, whichever is first. Revoking by hand takes 24 hours for the shared password (40 systems to coordinate), 4 hours for the API key and 5 minutes for a dynamic credential (one lease revoke). A manual change to one system goes wrong 1% of the time. Dynamic rotation is automatic and fails 1 time in 100,000, but a vault outage of 30 minutes outlasts a lease shorter than that. There are 4 such outages a year. The fleet is 2,000 workloads making 50 requests per second each, one secret per request. Cached clients re-read a static secret every 5 minutes and renew a lease at two thirds of its life.</p>
+  </div>
+</PlaygroundShell>
+<script>
+  document.querySelectorAll<HTMLElement>('[data-svb]').forEach((root) => {
+    const q = <T extends HTMLElement>(s: string) => root.querySelector<T>(s)!;
+    const ROT: Record<string, number> = { '5m': 5 / 60, '1h': 1, '1d': 24, '7d': 168, '30d': 720, '90d': 2160, '365d': 8760, never: Infinity };
+    const DET: Record<string, number> = { '1h': 1, '1d': 24, '7d': 168, '30d': 720, '180d': 4320 };
+    const WORKLOADS = 2000; const RPS = 50;
+    // hours of attacker access, systems changed by hand, chance one rotation breaks something
+    function model(type: string, rotH: number, detH: number) {
+      const respond = type === 'shared' ? 24 : type === 'key' ? 4 : 5 / 60; // hours to revoke after noticing
+      const systems = type === 'shared' ? 40 : type === 'key' ? 6 : 0;
+      const c = detH + respond; // the leak is noticed and revoked after c hours
+      const worst = Math.min(rotH, c);
+      const avg = c >= rotH ? rotH / 2 : c - (c * c) / (2 * rotH); // average of min(time to next rotation, c) for a uniform leak moment
+      const perYear = rotH === Infinity ? 0 : 8760 / rotH;
+      const pRot = type === 'dynamic' ? 1e-5 : 1 - Math.pow(0.99, systems);
+      let yearly = 1 - Math.pow(1 - pRot, perYear);
+      if (type === 'dynamic') { const ttlMin = rotH * 60; const perIncident = Math.min(1, Math.max(0, 1 - ttlMin / 30)); yearly = 1 - (1 - yearly) * Math.pow(1 - perIncident, 4); }
+      const readsNo = WORKLOADS * RPS;
+      const refreshSec = type === 'dynamic' ? (rotH === Infinity ? Infinity : rotH * 3600 * (2 / 3)) : 300;
+      const readsCache = refreshSec === Infinity ? 0 : WORKLOADS / refreshSec;
+      return { worst, avg, systems, pRot, perYear, yearly, readsNo, readsCache };
+    }
+    const dur = (h: number) => {
+      if (h === Infinity) return 'forever';
+      if (h < 1) { const mi = Math.round(h * 60); return `${mi} minute${mi === 1 ? '' : 's'}`; }
+      if (h < 48) { const hr = Math.round(h * 10) / 10; return `${hr} hour${hr === 1 ? '' : 's'}`; }
+      if (h < 24 * 90) return `${Math.round(h / 24)} days`;
+      return `${Math.round(h / 24 / 30)} months`;
+    };
+    const pct = (p: number) => (p === 0 ? '0%' : p < 0.001 ? '< 0.1%' : p > 0.995 ? '> 99%' : `${Math.round(p * 1000) / 10}%`);
+    const num = (n: number) => (n === 0 ? '0' : n < 0.01 ? '< 0.01' : n < 10 ? n.toFixed(2) : Math.round(n).toLocaleString('en-US'));
+    function draw() {
+      const type = q<HTMLSelectElement>('[data-type]').value; const rotH = ROT[q<HTMLSelectElement>('[data-rot]').value]; const detH = DET[q<HTMLSelectElement>('[data-det]').value];
+      const m = model(type, rotH, detH);
+      q('[data-o1]').textContent = `up to ${dur(m.worst)}`; q('[data-n1]').textContent = `on average ${dur(m.avg)}; it ends at the next rotation or when it is revoked`;
+      q('[data-o2]').textContent = m.systems === 0 ? '0 by hand' : `${m.systems} by hand`;
+      q('[data-n2]').textContent = m.systems === 0 ? `${WORKLOADS.toLocaleString('en-US')} workloads fetch a fresh credential on their own` : `${m.systems} places hold a copy that someone has to update`;
+      q('[data-o3]').textContent = `${pct(m.pRot)} per rotation`;
+      q('[data-n3]').textContent = m.perYear === 0 ? 'it is never rotated, so it never breaks, and it never ends either' : `${pct(m.yearly)} chance of at least one in a year (${num(m.perYear)} rotations a year)`;
+      q('[data-o4]').textContent = num(m.readsNo); q('[data-n4]').textContent = `${WORKLOADS.toLocaleString('en-US')} workloads x ${RPS} requests per second, one read each`;
+      q('[data-o5]').textContent = num(m.readsCache); q('[data-n5]').textContent = m.readsCache === 0 ? 'read once at start-up' : `${Math.round(m.readsNo / m.readsCache).toLocaleString('en-US')} times fewer, but cached reads are not audited one by one`;
+      q<HTMLElement>('[data-b1]').style.setProperty('--c', m.worst <= 24 ? 'var(--good)' : 'var(--bad)');
+      q<HTMLElement>('[data-b2]').style.setProperty('--c', m.systems === 0 ? 'var(--good)' : 'var(--bad)');
+      q<HTMLElement>('[data-b3]').style.setProperty('--c', m.yearly < 0.1 ? 'var(--good)' : 'var(--bad)');
+      q<HTMLElement>('[data-b4]').style.setProperty('--c', 'var(--bad)'); q<HTMLElement>('[data-b5]').style.setProperty('--c', 'var(--good)');
+      const out = q('[data-verdict]'); const bad = m.worst > 24 || m.yearly >= 0.1; out.classList.toggle('bad', bad);
+      out.textContent = m.worst > 24 && m.yearly >= 0.1 ? `Both bad: the attacker has up to ${dur(m.worst)}, and rotating is risky enough that people will put it off. That is how static secrets end up never being rotated.`
+        : m.worst > 24 ? `The attacker has up to ${dur(m.worst)}. Rotating more often only helps until it is shorter than the time to notice, so also shorten the detection delay or use a lease.`
+        : m.yearly >= 0.1 ? `The attacker is limited to ${dur(m.worst)}, but the yearly chance of a rotation outage is ${pct(m.yearly)}. ${type === 'dynamic' ? 'The lease is shorter than a vault outage, so workloads lose their database access when the vault is down.' : 'Rotating by hand this often breaks things.'}`
+        : `The attacker is limited to ${dur(m.worst)} and rotation is safe (${pct(m.yearly)} chance of an outage in a year). ${type === 'dynamic' ? 'Every workload holds a different credential, so one leak gives access to one workload.' : ''}`;
+    }
+    root.addEventListener('change', draw);
+    draw();
+  });
+</script>

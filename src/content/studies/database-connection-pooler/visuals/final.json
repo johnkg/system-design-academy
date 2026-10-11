@@ -1,0 +1,55 @@
+{
+  "actors": [
+    { "id": "app", "label": "App instance 117", "role": "client", "x": 14, "y": 16 },
+    { "id": "pooler", "label": "Pooler", "role": "edge", "x": 50, "y": 16 },
+    { "id": "queue", "label": "Wait queue", "role": "async", "x": 86, "y": 16 },
+    { "id": "router", "label": "Read/write router", "role": "compute", "x": 50, "y": 50 },
+    { "id": "primary", "label": "Primary", "role": "data", "x": 86, "y": 50 },
+    { "id": "health", "label": "Health checker", "role": "compute", "x": 14, "y": 84 },
+    { "id": "replica", "label": "Replica 2", "role": "data", "x": 50, "y": 84 }
+  ],
+  "frames": [
+    {
+      "narration": "The app sends a short transaction that updates an order. It has an ordinary connection to the pooler, one of 6,000 that the fleet holds. The pooler has 36 server connections, and at this moment all of them are busy.",
+      "messages": [{ "from": "app", "to": "pooler", "label": "BEGIN; UPDATE orders; COMMIT" }],
+      "states": { "pooler": "6,000 clients, 36 server conns busy" }
+    },
+    {
+      "narration": "The request waits in line. The limit for waiting is 1 second, and the pooler records how long each request waits so that saturation can be seen.",
+      "messages": [{ "from": "pooler", "to": "queue", "label": "wait for a server conn" }],
+      "states": { "queue": "waiting 3 ms (limit 1 s)" },
+      "highlight": ["queue"]
+    },
+    {
+      "narration": "After 3 ms another transaction finishes and server connection 7 is free. The first request in line gets it. The router sees a write inside a transaction, so it must go to the primary.",
+      "messages": [{ "from": "queue", "to": "pooler", "label": "conn 7 is free" }, { "from": "pooler", "to": "router", "label": "transaction on conn 7" }],
+      "states": { "router": "write: primary" }
+    },
+    {
+      "narration": "The primary runs the update and commits in 4 ms. The pooler takes conn 7 back at the COMMIT and answers the app. The app waited 3 ms in the queue and 4 ms for the query, 7 ms in total, and conn 7 is already lent to someone else.",
+      "messages": [{ "from": "router", "to": "primary", "label": "UPDATE + COMMIT (4 ms)" }, { "from": "primary", "to": "pooler", "label": "committed" }, { "from": "pooler", "to": "app", "label": "OK after 7 ms" }],
+      "states": { "app": "wrote 7 ms ago" }
+    },
+    {
+      "narration": "The app now reads the order it just wrote. Replica 2 is 80 ms behind, and this client wrote only a few milliseconds ago, so the replica might not have the row. The router sends the read to the primary and the client sees its own write.",
+      "messages": [{ "from": "app", "to": "router", "label": "SELECT the order" }, { "from": "router", "to": "primary", "label": "recent write: use primary" }],
+      "states": { "router": "replica 2 lag 80 ms" }
+    },
+    {
+      "narration": "A different request lists the product catalog, and its client has not written anything recently. Replica 2 is within the 500 ms limit, so the router sends the read there and the primary is spared.",
+      "messages": [{ "from": "app", "to": "router", "label": "SELECT products" }, { "from": "router", "to": "replica", "label": "lag 80 ms, ok" }, { "from": "replica", "to": "app", "label": "200 rows" }],
+      "states": { "replica": "served a read" }
+    },
+    {
+      "narration": "Later the primary crashes. The health checker misses 3 probes in a row, about 3 seconds, and tells the pooler. The pooler drops its 36 server connections to the old machine, the cluster promotes a replica, and the pooler reconnects to the new primary.",
+      "messages": [{ "from": "health", "to": "primary", "label": "probe: no answer (3 in a row)" }, { "from": "health", "to": "pooler", "label": "primary is down" }],
+      "states": { "primary": "down", "pooler": "reconnecting, clients stay open" },
+      "highlight": ["primary"]
+    },
+    {
+      "narration": "The 6,000 client connections never closed. A SELECT that was in flight is retried on the new primary. A transaction that was open at the moment of the crash gets an error, because the pooler cannot know whether the COMMIT arrived, so the app retries the whole transaction using its idempotency key.",
+      "messages": [{ "from": "pooler", "to": "router", "label": "retry the SELECT" }, { "from": "pooler", "to": "app", "label": "error for the open transaction" }],
+      "states": { "pooler": "36 conns on the new primary" }
+    }
+  ]
+}

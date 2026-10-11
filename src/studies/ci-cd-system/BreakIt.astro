@@ -1,0 +1,194 @@
+---
+import PlaygroundShell from '../../components/PlaygroundShell.astro';
+---
+<PlaygroundShell title="A day of commits on a runner pool" hint="Six teams push 1,130 commits over a 10-hour day, with bursts when the monorepo team merges 100 changes in 12 minutes. Pick the runner pool, the cache, the number of test shards, the queue order and a flaky test, and watch the queue, the cost and the trust in the results.">
+  <ol class="how">
+    <li>At the start (<b>100 fixed runners, FIFO</b>) the bursts fill the queue: the <b>p95 queue wait is about 15 minutes</b> and small teams wait nearly as long as the monorepo. Switch the queue to <b>fair share</b>: the small teams' p95 drops to <b>under 20 seconds</b>, and the monorepo, which caused the burst, waits longer.</li>
+    <li>Change the pool to <b>autoscaled</b>: the p95 wait falls to about <b>80 seconds</b> (the 90-second boot) and the bill drops from <b>$170 to $116</b>. <b>180 fixed runners</b> cope better (p95 wait about 5 minutes) but cost <b>$306</b> and sit idle 72% of the time, while with <b>60 fixed runners</b> the median job waits 16 minutes and the last result arrives after the day has ended.</li>
+    <li>Turn the <b>cache off</b> (with 100 fixed runners): every job downloads its dependencies again, the hit rate is 0%, and the median queue wait rises from 0 to about 4 minutes. Raise <b>shards to 8</b> with 100 fixed runners and the median build barely changes (14.8 to 14.5 minutes), while the extra jobs push the p95 queue wait from 15.4 to 18.6 minutes. With an autoscaled pool, shards help (p95 build 19.2 to 16.9 minutes) but cost more ($116 to $142).</li>
+    <li>Choose a <b>flaky test</b>. With no retry, 191 builds go red for no reason, only <b>24%</b> of red builds are real bugs and developers rerun 136 builds. With <b>auto-retry</b> the red builds are nearly all real (95%), but 170 builds went green only after a retry. <b>Retry plus quarantine</b> stops it after 3 detections.</li>
+  </ol>
+  <div class="pg cib" data-cib>
+    <div class="pg-row">
+      <label>Runner pool <select class="pg-in" data-pool>
+        <option value="fixed60">Fixed, 60 runners</option>
+        <option value="fixed100" selected>Fixed, 100 runners</option>
+        <option value="fixed180">Fixed, 180 runners</option>
+        <option value="auto">Autoscaled, 90 s boot</option>
+        <option value="warm">Autoscaled, warm pool, 15 s boot</option>
+      </select></label>
+      <label>Dependency cache <select class="pg-in" data-cache><option value="1" selected>On</option><option value="0">Off</option></select></label>
+      <label>Test shards per build <select class="pg-in" data-shards><option value="1">1</option><option value="2">2</option><option value="4" selected>4</option><option value="8">8</option></select></label>
+      <label>Queue order <select class="pg-in" data-fair><option value="0" selected>First come, first served</option><option value="1">Fair share between teams</option></select></label>
+      <label>Flaky test <select class="pg-in" data-flaky>
+        <option value="none" selected>None</option>
+        <option value="off">Fails 15% of runs, no retry</option>
+        <option value="retry">Fails 15% of runs, auto-retry twice</option>
+        <option value="quar">Auto-retry plus quarantine</option>
+      </select></label>
+    </div>
+    <div class="pg-grid">
+      <div class="pg-box" data-b1><h3>Queue wait for a job</h3><span class="pg-mono" data-o1></span><span class="pg-note" data-n1></span></div>
+      <div class="pg-box" data-b2><h3>Build time, commit to result</h3><span class="pg-mono" data-o2></span><span class="pg-note" data-n2></span></div>
+      <div class="pg-box" data-b3><h3>Runner cost</h3><span class="pg-mono" data-o3></span><span class="pg-note" data-n3></span></div>
+      <div class="pg-box" data-b4><h3>Cache hit rate</h3><span class="pg-mono" data-o4></span><span class="pg-note" data-n4></span></div>
+      <div class="pg-box" data-b5><h3>Trust in a red build</h3><span class="pg-mono" data-o5></span><span class="pg-note" data-n5></span></div>
+      <div class="pg-box" data-b6><h3>Work wasted</h3><span class="pg-mono" data-o6></span><span class="pg-note" data-n6></span></div>
+    </div>
+    <p class="pg-out" data-verdict aria-live="polite"></p>
+    <p class="pg-note">Model: 1,130 commits from 6 teams over 10 hours, seeded and identical for every setting. A build is a build job, then the test shards, then a package job, and each job needs a fresh runner (20 s setup). A cache hit costs 20 s to restore dependencies and a miss 150 s; 8% of commits change the dependencies and miss once. Total test work is 8 to 24 minutes per build, split into equal shards with up to 25% imbalance and 15 s of overhead per shard. A runner costs $0.17 per hour, and a fixed pool is paid for the whole window. The autoscaler checks every 30 s, boots one runner per waiting or running job up to 300, and removes runners idle for 5 minutes. The flaky test lives in one shard and fails 15% of runs; 5% of commits are really broken. A false red build is rerun by the developer 5 minutes later 70% of the time.</p>
+  </div>
+</PlaygroundShell>
+<script>
+  type Opts = { pool: string; cache: boolean; shards: number; fair: boolean; flaky: string };
+  // SIM-START
+const mulberry32 = (a: number) => (): number => { a |= 0; a = (a + 0x6d2b79f5) | 0; let t = Math.imul(a ^ (a >>> 15), 1 | a); t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t; return ((t ^ (t >>> 14)) >>> 0) / 4294967296; };
+const DAY = 36000; // 10 hours in seconds
+const TEAMS = [
+  { name: 'Monorepo', tests: 1440, build: 300 },
+  { name: 'Payments', tests: 720, build: 180 },
+  { name: 'Mobile', tests: 840, build: 180 },
+  { name: 'Web', tests: 600, build: 150 },
+  { name: 'Data', tests: 720, build: 180 },
+  { name: 'Infra', tests: 480, build: 120 },
+];
+const PRICE = 0.17 / 3600; // dollars per runner-second (a 4-vCPU VM at $0.17 per hour)
+function makeCommits() {
+  const rnd = mulberry32(7); const out: any[] = [];
+  const gauss = () => (rnd() + rnd() + rnd() + rnd() - 2) / 0.58;
+  const add = (t: number, team: number) => out.push({ t: Math.max(0, Math.min(DAY - 600, Math.floor(t))), team, deps: rnd() < 0.08, broken: rnd() < 0.05, seed: Math.floor(rnd() * 1e9), depth: 0 });
+  for (let i = 0; i < 60; i++) add(rnd() * DAY, 0);
+  for (const c of [6000, 19800, 31200]) for (let i = 0; i < 100; i++) add(c + rnd() * 720, 0);
+  for (let team = 1; team < TEAMS.length; team++) {
+    for (let i = 0; i < 130; i++) add(rnd() < 0.7 ? (rnd() < 0.5 ? 9000 : 25200) + gauss() * 3600 : rnd() * DAY, team);
+    for (const c of [rnd() * 30000 + 2000, rnd() * 30000 + 2000]) for (let i = 0; i < 12; i++) add(c + rnd() * 360, team);
+  }
+  return out.sort((a, b) => a.t - b.t || a.team - b.team);
+}
+const COMMITS = makeCommits();
+const POOLS: Record<string, any> = {
+  fixed60: { fixed: 60 }, fixed100: { fixed: 100 }, fixed180: { fixed: 180 },
+  auto: { min: 10, max: 300, start: 90, idle: 300 },
+  warm: { min: 40, max: 300, start: 15, idle: 300 },
+};
+class Heap { a: any[] = []; push(x: any) { const a = this.a; a.push(x); let i = a.length - 1; while (i > 0) { const p = (i - 1) >> 1; if (a[p][0] < x[0] || (a[p][0] === x[0] && a[p][1] < x[1])) break; a[i] = a[p]; i = p; } a[i] = x; }
+  pop(): any { const a = this.a; const top = a[0]; const x = a.pop(); if (a.length) { let i = 0; const n = a.length; for (;;) { let c = 2 * i + 1; if (c >= n) break; if (c + 1 < n && (a[c + 1][0] < a[c][0] || (a[c + 1][0] === a[c][0] && a[c + 1][1] < a[c][1]))) c++; if (x[0] < a[c][0] || (x[0] === a[c][0] && x[1] <= a[c][1])) break; a[i] = a[c]; i = c; } a[i] = x; } return top; }
+  get size() { return this.a.length; } }
+const pct = (arr: number[], p: number) => { if (!arr.length) return 0; const s = [...arr].sort((x, y) => x - y); return s[Math.floor(p * (s.length - 1))]; };
+const HIT = 20, MISS = 150, SETUP = 20, FLAKE = 0.15;
+
+function simulate(o: Opts) { // o: pool, cache(bool), shards, fair(bool), flaky: 'none'|'off'|'retry'|'quar'
+  const pool = POOLS[o.pool]; const S = o.shards; const retryOn = o.flaky === 'retry' || o.flaky === 'quar';
+  const flakyOn = o.flaky !== 'none';
+  const ev = new Heap(); let seq = 0; const push = (t: number, type: string, d?: any) => ev.push([t, seq++, type, d]);
+  const queues: any[][] = TEAMS.map(() => []); const heads = TEAMS.map(() => 0); let queued = 0;
+  const running = TEAMS.map(() => 0); let busy = 0;
+  const idle: any[] = []; let nBoot = 0; let alive = 0; let billed = 0; let busySec = 0;
+  const populated = new Set(TEAMS.map((_, i) => `${i}:0`)); const version = TEAMS.map(() => 0);
+  let lookups = 0, hits = 0;
+  const waits: number[] = [], waitsSmall: number[] = [], waitsBig: number[] = [], durs: number[] = [];
+  const stats: any = { builds: 0, pass: 0, redReal: 0, redFalse: 0, retried: 0, hidden: 0, reruns: 0, wasted: 0, detections: 0, quarAt: -1, last: 0, jobs: 0 };
+  let quarantined = false; let now = 0; let rid = 0; let finished = 0; let total = COMMITS.length;
+  const newRunner = (t: number): any => ({ id: rid++, born: t, since: t });
+  if (pool.fixed) { for (let i = 0; i < pool.fixed; i++) { const r = newRunner(0); idle.push(r); } alive = pool.fixed; }
+  else { for (let i = 0; i < pool.min; i++) idle.push(newRunner(0)); alive = pool.min; push(30, 'tick'); }
+  COMMITS.forEach((c) => push(c.t, 'arrive', c));
+  const enqueue = (job: any, t: number) => { job.enq = t; queues[job.b.team].push(job); queued++; };
+  const pick = (): number => { let best = -1;
+    for (let t = 0; t < TEAMS.length; t++) { if (heads[t] >= queues[t].length) continue; if (best < 0) { best = t; continue; }
+      if (o.fair) { if (running[t] < running[best] || (running[t] === running[best] && queues[t][heads[t]].enq < queues[best][heads[best]].enq)) best = t; }
+      else if (queues[t][heads[t]].enq < queues[best][heads[best]].enq) best = t; }
+    return best; };
+  const dispatch = (t: number) => { while (idle.length && queued > 0) { const q = pick(); const job = queues[q][heads[q]++]; queued--; const r = idle.pop();
+      const key = `${job.b.team}:${job.b.ver}`; let restore = 0;
+      if (job.kind !== 'pkg') { lookups++; const hit = o.cache && populated.has(key); if (hit) hits++; restore = hit ? HIT : MISS; }
+      job.dur = SETUP + restore + job.work; job.start = t; job.r = r; running[q]++; busy++; busySec += job.dur;
+      waits.push(t - job.enq); (q === 0 ? waitsBig : waitsSmall).push(t - job.enq); stats.jobs++;
+      push(t + job.dur, 'done', job); } };
+  const newBuild = (c: any, t: number) => { const rng = mulberry32(c.seed); const team = TEAMS[c.team];
+    const ver = (c.deps && c.depth === 0) ? ++version[c.team] : version[c.team];
+    const b = { c, team: c.team, t0: t, ver, d: [rng(), rng(), rng()], rr: rng(), imb: Array.from({ length: S }, () => (S > 1 ? rng() * 0.25 : 0)), left: S, failed: false, flakeFail: false, real: false, retried: false, busy: 0, rerun: c.depth > 0 };
+    enqueue({ b, kind: 'build', work: team.build, attempt: 0 }, t); };
+  const finishBuild = (b: any, t: number, ok: boolean) => { stats.builds++; finished++; stats.last = t; durs.push(t - b.t0);
+    if (ok) { stats.pass++; if (b.retried) stats.hidden++; } else if (b.real) stats.redReal++; else stats.redFalse++;
+    if (b.rerun) stats.wasted += b.busy;
+    if (!ok && !b.real && b.rr < 0.7) { stats.reruns++; total++; push(t + 300, 'arrive', { t: t + 300, team: b.team, deps: false, broken: false, seed: (b.c.seed * 7919 + 13) % 1000000007, depth: b.c.depth + 1 }); } };
+  for (;;) {
+    if (!ev.size) break; const [t, , type, d] = ev.pop(); now = t;
+    if (type === 'arrive') { newBuild(d, t); dispatch(t); }
+    else if (type === 'ready') { nBoot--; alive++; const r = newRunner(d.born); r.since = t; idle.push(r); dispatch(t); }
+    else if (type === 'tick') {
+      const demand = busy + queued; const have = alive + nBoot; const want = Math.min(pool.max, Math.max(pool.min, demand));
+      if (want > have) for (let i = 0; i < want - have; i++) { nBoot++; push(t + pool.start, 'ready', { born: t }); }
+      if (queued === 0) for (let i = idle.length - 1; i >= 0 && alive > pool.min; i--) if (t - idle[i].since >= pool.idle) { billed += t - idle[i].born; idle.splice(i, 1); alive--; }
+      if (t < DAY || finished < total) push(t + 30, 'tick');
+    }
+    else if (type === 'done') {
+      const job = d; const b = job.b; running[b.team]--; busy--; job.r.since = t; idle.push(job.r); b.busy += job.dur;
+      if (job.kind === 'build') { populated.add(`${b.team}:${b.ver}`); for (let s = 0; s < S; s++) { const imb = b.imb[s]; enqueue({ b, kind: 'test', shard: s, work: Math.floor(TEAMS[b.team].tests / S * (1 + imb)) + (S > 1 ? 15 : 0), attempt: 0 }, t); } }
+      else if (job.kind === 'test') {
+        const flakeHit = flakyOn && job.shard === 0 && !(o.flaky === 'quar' && quarantined) && b.d[job.attempt] < FLAKE;
+        const realHit = b.c.broken && job.shard === (b.c.seed % S);
+        const fail = flakeHit || realHit;
+        if (fail && retryOn && job.attempt < 2) { stats.retried++; stats.wasted += job.dur; b.retried = true; if (flakeHit && !realHit) job.pendingFlake = true; const nj = { b, kind: 'test', shard: job.shard, work: job.work, attempt: job.attempt + 1, fromFlake: flakeHit && !realHit || job.fromFlake }; enqueue(nj, t); }
+        else {
+          if (!fail && job.fromFlake && job.attempt > 0) { stats.detections++; if (o.flaky === 'quar' && stats.detections >= 3 && !quarantined) { quarantined = true; stats.quarAt = stats.builds; } }
+          if (fail) { b.failed = true; if (realHit) b.real = true; }
+          if (--b.left === 0) { if (b.failed) finishBuild(b, t, false); else enqueue({ b, kind: 'pkg', work: 60, attempt: 0 }, t); }
+        }
+      }
+      else { finishBuild(b, t, true); }
+      dispatch(t);
+    }
+  }
+  // billing
+  const T = Math.max(DAY, now);
+  if (pool.fixed) billed = pool.fixed * T; else for (const r of idle) billed += T - r.born;
+  return { T, waits, waitsSmall, waitsBig, durs, stats, lookups, hits, busySec, billed, idleList: idle, alive, pool };
+}
+  // SIM-END
+  document.querySelectorAll<HTMLElement>('[data-cib]').forEach((root) => {
+    const q = <T extends HTMLElement>(s: string) => root.querySelector<T>(s)!;
+    const sel = (s: string) => q<HTMLSelectElement>(s).value;
+    const num = (n: number) => Math.round(n).toLocaleString('en-US');
+    const secs = (n: number) => (n < 120 ? `${Math.round(n)} s` : `${(n / 60).toFixed(1)} min`);
+    const usd = (n: number) => `$${Math.round(n).toLocaleString('en-US')}`;
+    const color = (id: string, bad: boolean) => q<HTMLElement>(id).style.setProperty('--c', bad ? 'var(--bad)' : 'var(--good)');
+    function draw() {
+      const o: Opts = { pool: sel('[data-pool]'), cache: sel('[data-cache]') === '1', shards: Number(sel('[data-shards]')), fair: sel('[data-fair]') === '1', flaky: sel('[data-flaky]') };
+      const r = simulate(o); const s = r.stats;
+      const p50 = pct(r.waits, 0.5); const p95 = pct(r.waits, 0.95); const small = pct(r.waitsSmall, 0.95); const big = pct(r.waitsBig, 0.95);
+      const cost = r.billed * PRICE; const busy = r.busySec * PRICE; const idleCost = cost - busy; const idleShare = idleCost / cost;
+      const red = s.redReal + s.redFalse; const trust = red === 0 ? 1 : s.redReal / red;
+      q('[data-o1]').textContent = `median ${secs(p50)} · p95 ${secs(p95)}`;
+      q('[data-n1]').textContent = `p95 for the five small teams ${secs(small)}, for the monorepo ${secs(big)}`;
+      q('[data-o2]').textContent = `median ${secs(pct(r.durs, 0.5))} · p95 ${secs(pct(r.durs, 0.95))}`;
+      q('[data-n2]').textContent = `${num(s.builds)} builds, the last result at minute ${num(r.T / 60)}`;
+      q('[data-o3]').textContent = `${usd(cost)}`;
+      q('[data-n3]').textContent = `busy ${num(r.busySec / 60)} min (${usd(busy)}) plus idle ${num(r.billed / 60 - r.busySec / 60)} min (${usd(idleCost)}), ${Math.round(idleShare * 100)}% of paid time idle`;
+      q('[data-o4]').textContent = o.cache ? `${Math.round((100 * r.hits) / r.lookups)}%` : '0% (cache off)';
+      q('[data-n4]').textContent = o.cache ? `${num(r.hits)} of ${num(r.lookups)} dependency restores were hits` : `all ${num(r.lookups)} restores downloaded from scratch`;
+      q('[data-o5]').textContent = `${Math.round(trust * 100)}% real`;
+      q('[data-n5]').textContent = o.flaky === 'none' ? `${s.redReal} red builds, all real bugs` : `${s.redReal} real red, ${s.redFalse} false red, ${s.hidden} green only after a retry`;
+      q('[data-o6]').textContent = `${Math.round((100 * s.wasted) / r.busySec)}% of busy time`;
+      q('[data-n6]').textContent = `${num(s.retried)} job retries, ${num(s.reruns)} developer reruns` + (o.flaky === 'quar' && s.quarAt > 0 ? `, test quarantined after build ${s.quarAt}` : '');
+      color('[data-b1]', p95 > 300); color('[data-b2]', pct(r.durs, 0.95) > 1800); color('[data-b3]', idleShare > 0.5);
+      color('[data-b4]', !o.cache); color('[data-b5]', trust < 0.9); color('[data-b6]', s.wasted / r.busySec > 0.04);
+      const bad = p95 > 300 || trust < 0.9 || idleShare > 0.5;
+      const out = q('[data-verdict]'); out.classList.toggle('bad', bad);
+      const parts: string[] = [];
+      parts.push(p95 > 300 ? `Runners are scarce in the bursts: the p95 queue wait is ${secs(p95)}.` : `The pool keeps up: the p95 queue wait is ${secs(p95)}.`);
+      if (o.fair && small < p95) parts.push(`Fair share protects the small teams (p95 ${secs(small)}) while the monorepo that caused the burst waits ${secs(big)}.`);
+      else if (!o.fair && small > 120) parts.push(`First come, first served makes the small teams wait ${secs(small)} behind the monorepo bursts.`);
+      parts.push(`The bill is ${usd(cost)}, of which ${usd(idleCost)} is idle time.`);
+      if (o.flaky === 'off') parts.push(`The flaky test turned ${s.redFalse} good builds red, so only ${Math.round(trust * 100)}% of red builds are real and developers reran ${s.reruns}.`);
+      else if (o.flaky === 'retry') parts.push(`Auto-retry hides the flaky test (${Math.round(trust * 100)}% of red builds are real), but ${s.hidden} builds passed only after a retry and nobody is told.`);
+      else if (o.flaky === 'quar') parts.push(`The detector saw ${s.detections} fail-then-pass runs, quarantined the test and stopped the waste: ${s.redFalse} false red builds.`);
+      out.textContent = parts.join(' ');
+    }
+    let queued = false;
+    const schedule = () => { if (queued) return; queued = true; requestAnimationFrame(() => { queued = false; draw(); }); };
+    root.addEventListener('input', schedule); root.addEventListener('change', schedule);
+    draw();
+  });
+</script>
