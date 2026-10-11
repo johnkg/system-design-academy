@@ -1,0 +1,258 @@
+---
+import PlaygroundShell from '../components/PlaygroundShell.astro';
+---
+<PlaygroundShell title="Simulate it" hint="Split full_name into first_name and last_name on a 100 million row table that takes 2,000 writes per second. Pick a method, a batch size and a replica-lag limit, then press Run.">
+  <ol class="how">
+    <li>Choose <b>Naive in-place ALTER</b> and press <b>Finish</b>: the table is locked for about <b>11 minutes</b>, <b>Writes</b> turns red, roughly <b>1.3M writes</b> are blocked, and the replica ends <b>11 minutes behind</b> because it has to repeat the rewrite.</li>
+    <li>Choose <b>Expand / contract</b> with <b>10,000 rows</b> per batch and a <b>5 s</b> lag limit (the default) and press <b>Finish</b>: writes are never blocked (50 ms for the ADD COLUMN), nothing is inconsistent, replica lag peaks near <b>6 s</b>, and the backfill takes about <b>an hour</b>.</li>
+    <li>Set the lag limit to <b>Off</b>: it finishes in about <b>36 minutes</b>, but replica lag climbs past <b>20 minutes</b>. Set the batch to <b>1,000,000 rows</b> (keep the limit on): the worst single-write stall rises to <b>about 17 s</b> because each batch holds its row locks that long. Batch <b>1,000</b> never lags but takes close to <b>two hours</b>.</li>
+    <li>Tick <b>Deploy dual-write 10 minutes late</b> (with Expand / contract and the default throttle): the backfill passes rows while the app still writes only <b>full_name</b>, so about <b>100,000 rows</b> end up with a stale name split and the verdict says <b>do not switch reads</b>. The order of the steps matters, not just their existence.</li>
+    <li>Choose <b>Shadow table copy</b>: no long lock, only a <b>1.5 s</b> stall at the atomic rename, and no order mistake is possible because the change log wins over the copy. It costs two events per live write on the replica, and it needs the copy time of a full table.</li>
+  </ol>
+  <div class="pg osm" data-osm>
+    <div class="pg-row">
+      <label>Method
+        <select class="pg-in" data-method>
+          <option value="naive">Naive in-place ALTER (exclusive lock)</option>
+          <option value="expand" selected>Expand / contract with backfill</option>
+          <option value="shadow">Shadow table copy (gh-ost style)</option>
+        </select>
+      </label>
+      <label>Batch size
+        <select class="pg-in" data-batch>
+          <option value="1000">1,000 rows</option>
+          <option value="10000" selected>10,000 rows</option>
+          <option value="100000">100,000 rows</option>
+          <option value="1000000">1,000,000 rows</option>
+        </select>
+      </label>
+      <label>Pause when replica lag is over
+        <select class="pg-in" data-lag>
+          <option value="0">Off (no throttle)</option>
+          <option value="2">2 s</option>
+          <option value="5" selected>5 s</option>
+          <option value="10">10 s</option>
+          <option value="30">30 s</option>
+        </select>
+      </label>
+      <label class="osm-check"><input type="checkbox" data-late /> Deploy dual-write 10 minutes late</label>
+    </div>
+    <div class="pg-row">
+      <button class="btn pg-primary" type="button" data-run>Run</button>
+      <button class="btn" type="button" data-step>Step (+1 min)</button>
+      <button class="btn" type="button" data-finish>Finish</button>
+      <button class="btn" type="button" data-reset>Reset</button>
+    </div>
+    <div class="pg-out" data-phase aria-live="polite"></div>
+    <div class="osm-bar" role="progressbar" aria-label="Rows migrated" aria-valuemin="0" aria-valuemax="100" aria-valuenow="0" data-bar><div class="osm-fill" data-fill></div></div>
+    <div class="pg-grid">
+      <div class="pg-box" data-wbox><h3>Live writes</h3><span class="pg-mono" data-wstate>OK</span><span class="pg-note" data-wnote></span></div>
+      <div class="pg-box" style="--c: var(--role-1)"><h3>Writes blocked or stalled</h3><span class="pg-mono" data-blocked></span><span class="pg-note" data-blockednote></span></div>
+      <div class="pg-box" style="--c: var(--role-2)"><h3>Rows migrated</h3><span class="pg-mono" data-rows></span><span class="pg-note" data-rowsnote></span></div>
+      <div class="pg-box" data-ibox><h3>Stale or inconsistent rows</h3><span class="pg-mono" data-stale></span><span class="pg-note" data-stalenote></span></div>
+      <div class="pg-box" data-lbox><h3>Replica lag</h3><span class="pg-mono" data-lagnow></span><span class="pg-note" data-lagnote></span></div>
+      <div class="pg-box" style="--c: var(--role-4)"><h3>Duration</h3><span class="pg-mono" data-dur></span><span class="pg-note" data-durnote></span></div>
+    </div>
+    <svg class="osm-spark" viewBox="0 0 300 60" preserveAspectRatio="none" role="img" aria-label="Replica lag over time" data-spark>
+      <line class="osm-limit" x1="0" x2="300" y1="60" y2="60" data-limit />
+      <polyline class="osm-line" points="" data-line />
+    </svg>
+    <p class="pg-note">Replica lag over the run (dashed line: your limit). Constants: 100M rows, 2,000 live writes/s, replica applies 30,000 row events/s, a batch updates 60,000 rows/s plus 50 ms of commit overhead, a rewriting ALTER copies 150,000 rows/s.</p>
+    <p class="pg-out" data-verdict></p>
+  </div>
+</PlaygroundShell>
+<script>
+  type Method = 'naive' | 'expand' | 'shadow';
+  interface Params { method: Method; batch: number; maxLag: number; late: boolean }
+  interface Sim {
+    t: number; migrated: number; backlog: number; peakLag: number; blocked: number; blockedWrites: number;
+    delayed: number; stale: number; paused: number; pausedNow: boolean; done: boolean; dual: boolean;
+    phase: string; hist: number[]; lastSample: number; rng: () => number;
+  }
+
+  // ---- model (pure functions; no DOM) ----
+  const N = 100_000_000; // rows in users
+  const W = 2000; // live writes per second
+  const R = 30000; // row events per second a replica can apply
+  const COPY = 60000; // rows per second a batch UPDATE or INSERT..SELECT processes while it runs
+  const OVH = 0.05; // seconds of commit and round trip overhead per batch
+  const REWRITE = 150000; // rows per second for a table rewriting ALTER
+  const CUTOVER = 1.5; // seconds of write stall for the atomic rename
+  const GAP = 600; // seconds until a late dual-write deploy reaches every instance
+  const ADD_COL = 0.05; // seconds the metadata lock of ADD COLUMN is held
+  const SAMPLE = 10; // seconds between lag samples
+  const MAX_TICKS = 40000;
+
+  function mulberry32(a: number) {
+    return () => { a = (a + 0x6d2b79f5) | 0; let t = Math.imul(a ^ (a >>> 15), 1 | a); t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t; return ((t ^ (t >>> 14)) >>> 0) / 4294967296; };
+  }
+  function effRate(batch: number) { return batch / (batch / COPY + OVH); }
+  function newSim(p: Params): Sim {
+    const expand = p.method === 'expand';
+    return {
+      t: 0, migrated: 0, backlog: 0, peakLag: 0, blocked: expand ? ADD_COL : 0, blockedWrites: expand ? W * ADD_COL : 0,
+      delayed: 0, stale: 0, paused: 0, pausedNow: false, done: false, dual: p.method !== 'expand' || !p.late,
+      phase: 'ready', hist: [0], lastSample: 0, rng: mulberry32(7),
+    };
+  }
+  function stepSim(s: Sim, p: Params) {
+    if (s.done) return;
+    let dt = 1;
+    s.pausedNow = false;
+    if (p.method === 'naive') {
+      const rows = Math.min(REWRITE, N - s.migrated);
+      dt = rows / REWRITE;
+      s.migrated += rows; s.blocked += dt; s.blockedWrites += W * dt;
+      s.phase = 'ALTER TABLE is rewriting the table: exclusive lock held, every write waits or times out';
+      if (s.migrated >= N) { s.backlog += (N * R) / REWRITE; s.done = true; s.phase = 'done: lock released, but the replica now has to repeat the rewrite'; }
+    } else {
+      const lag0 = s.backlog / R;
+      const eff = effRate(p.batch);
+      s.dual = p.method === 'shadow' || !p.late || s.t >= GAP;
+      let rows = 0;
+      if (p.maxLag > 0 && lag0 > p.maxLag) {
+        s.pausedNow = true; s.paused++;
+        s.phase = `copy paused: replica lag ${lag0.toFixed(1)} s is over your ${p.maxLag} s limit`;
+      } else {
+        rows = Math.min(eff, N - s.migrated);
+        dt = rows / eff;
+        const duty = p.batch / COPY / (p.batch / COPY + OVH);
+        s.delayed += W * dt * duty * (p.batch / N);
+        s.phase = p.method === 'shadow'
+          ? 'copying chunks into the new table while the change log is applied to it'
+          : s.dual ? 'dual-write is live, backfilling in batches' : 'backfilling, but the app does NOT dual-write yet';
+      }
+      if (p.method === 'expand' && !s.dual) {
+        const writes = Math.round(W * dt);
+        for (let k = 0; k < writes; k++) if (s.rng() * N < s.migrated) s.stale++; // write behind the cursor: new columns not updated
+      }
+      const live = (p.method === 'shadow' ? 2 : 1) * W * dt; // shadow: every live write also hits the new table
+      s.backlog = Math.max(0, s.backlog + live + rows - R * dt);
+      s.migrated += rows;
+      if (s.migrated >= N) {
+        s.done = true;
+        if (p.method === 'shadow') { s.blocked += CUTOVER; s.blockedWrites += W * CUTOVER; s.t += CUTOVER; s.phase = 'done: atomic rename swapped the tables'; }
+        else s.phase = 'backfill done: verify, wait for replicas, then switch reads';
+      }
+    }
+    s.t += dt;
+    const lag = s.backlog / R;
+    if (lag > s.peakLag) s.peakLag = lag;
+    while (s.t >= (s.lastSample + 1) * SAMPLE) { s.lastSample++; s.hist.push(lag); }
+  }
+  function runToEnd(s: Sim, p: Params) { for (let i = 0; i < MAX_TICKS && !s.done; i++) stepSim(s, p); }
+  function drainSeconds(s: Sim) { return s.backlog / (R - W); } // after the migration, only live writes remain
+  function fmtDur(sec: number) {
+    if (sec < 1) return `${(sec * 1000).toFixed(0)} ms`;
+    if (sec < 60) return `${sec.toFixed(1)} s`;
+    const m = Math.floor(sec / 60); const r = Math.floor(sec % 60);
+    if (m < 60) return `${m} min ${String(r).padStart(2, '0')} s`;
+    return `${Math.floor(m / 60)} h ${String(m % 60).padStart(2, '0')} min`;
+  }
+  function fmtN(n: number) {
+    if (n >= 1e6) return `${(n / 1e6).toFixed(n >= 1e7 ? 1 : 2)}M`;
+    if (n >= 1e4) return `${(n / 1e3).toFixed(0)}k`;
+    return String(Math.round(n));
+  }
+  // ---- end model ----
+
+  document.querySelectorAll<HTMLElement>('[data-osm]').forEach((root) => {
+    const q = <T extends HTMLElement | SVGElement>(s: string) => root.querySelector<T>(s)!;
+    const reduce = window.matchMedia('(prefers-reduced-motion: reduce)').matches;
+    const TICKS_PER_FRAME = 25;
+    let params: Params; let sim: Sim;
+    let running = false; let timer: number | undefined; let onScreen = true; let raf = 0;
+
+    function readParams(): Params {
+      return {
+        method: q<HTMLSelectElement>('[data-method]').value as Method,
+        batch: Number(q<HTMLSelectElement>('[data-batch]').value),
+        maxLag: Number(q<HTMLSelectElement>('[data-lag]').value),
+        late: q<HTMLInputElement>('[data-late]').checked,
+      };
+    }
+    function enable() {
+      const m = q<HTMLSelectElement>('[data-method]').value;
+      q<HTMLSelectElement>('[data-batch]').disabled = m === 'naive';
+      q<HTMLSelectElement>('[data-lag]').disabled = m === 'naive';
+      q<HTMLInputElement>('[data-late]').disabled = m !== 'expand';
+    }
+    function sparkline() {
+      const h = sim.hist; const top = Math.max(10, sim.peakLag, params.maxLag * 1.2);
+      const stride = Math.max(1, Math.ceil(h.length / 300)); const pts: string[] = [];
+      for (let i = 0; i < h.length; i += stride) pts.push(`${((i / Math.max(1, h.length - 1)) * 300).toFixed(1)},${(58 - (h[i] / top) * 56).toFixed(1)}`);
+      q('[data-line]').setAttribute('points', pts.join(' '));
+      const y = params.maxLag > 0 ? 58 - (params.maxLag / top) * 56 : 60;
+      q('[data-limit]').setAttribute('y1', y.toFixed(1)); q('[data-limit]').setAttribute('y2', y.toFixed(1));
+      q('[data-limit]').style.display = params.maxLag > 0 ? '' : 'none';
+      q('[data-spark]').setAttribute('aria-label', `Replica lag over time, peak ${fmtDur(sim.peakLag)}`);
+    }
+    function draw() {
+      raf = 0;
+      const s = sim; const p = params; const lag = s.backlog / R; const pct = (s.migrated / N) * 100;
+      q('[data-phase]').textContent = s.phase;
+      q('[data-fill]').style.width = `${pct}%`; q('[data-bar]').setAttribute('aria-valuenow', pct.toFixed(0));
+      const naiveLocked = p.method === 'naive' && !s.done && s.t > 0;
+      const stalled = p.method === 'shadow' && s.done;
+      q('[data-wstate]').textContent = naiveLocked ? 'BLOCKED' : stalled ? 'STALLED 1.5 s, then OK' : 'OK';
+      q('[data-wbox]').style.setProperty('--c', naiveLocked ? 'var(--bad)' : 'var(--good)');
+      q('[data-wnote]').textContent = naiveLocked ? 'the exclusive lock holds every write; pools fill up' : p.method === 'naive' ? 'blocked for the whole rewrite, now released' : 'only the rows of one batch are ever locked';
+      q('[data-blocked]').textContent = `${fmtDur(s.blocked)} · ${fmtN(s.blockedWrites)} writes`;
+      const worst = p.method === 'naive' ? N / REWRITE : Math.max(p.batch / COPY, p.method === 'shadow' ? CUTOVER : ADD_COL);
+      q('[data-blockednote]').textContent = `worst single-write stall: ${fmtDur(worst)} · ${p.method === 'naive' ? 'writes time out' : `${fmtN(s.delayed)} writes waited on a batch's row locks`}`;
+      q('[data-rows]').textContent = `${fmtN(s.migrated)} of ${fmtN(N)} (${pct.toFixed(1)}%)`;
+      q('[data-rowsnote]').textContent = p.method === 'naive' ? 'rewritten under the lock' : p.method === 'shadow' ? 'copied into the new table' : 'backfilled into first_name and last_name';
+      q('[data-stale]').textContent = s.stale > 0 ? `${fmtN(s.stale)} rows wrong` : '0';
+      q('[data-ibox]').style.setProperty('--c', s.stale > 0 ? 'var(--bad)' : 'var(--role-5)');
+      q('[data-stalenote]').textContent = p.method === 'expand' ? (s.dual ? (s.stale > 0 ? 'written before dual-write, never repaired' : 'dual-write is live: backfill and live writes agree') : 'dual-write is not live, rows behind the cursor go stale') : p.method === 'shadow' ? 'the change log wins over the copy' : 'nothing can diverge under a table lock';
+      q('[data-lagnow]').textContent = `${fmtDur(lag)} (peak ${fmtDur(s.peakLag)})`;
+      q('[data-lbox]').style.setProperty('--c', s.peakLag > 60 ? 'var(--bad)' : s.pausedNow ? 'var(--role-3)' : 'var(--role-6)');
+      q('[data-lagnote]').textContent = p.method === 'naive' ? 'the replica replays the whole ALTER after the primary finishes' : p.maxLag > 0 ? `throttle paused the copy for ${fmtDur(s.paused)}` : 'no throttle: the copy runs flat out';
+      q('[data-dur]').textContent = fmtDur(s.t);
+      q('[data-durnote]').textContent = s.done ? 'migration finished' : 'simulated time elapsed';
+      const v = q('[data-verdict]');
+      v.classList.remove('bad');
+      if (!s.done) v.textContent = 'Press Run, Step or Finish.';
+      else if (s.stale > 0) { v.textContent = `Do not switch reads: ${fmtN(s.stale)} rows have a stale first_name/last_name. The backfill only fills NULLs, so nothing will repair them. Redeploy with dual-write first, then verify and re-backfill.`; v.classList.add('bad'); }
+      else if (p.method === 'naive') { v.textContent = `Writes were blocked for ${fmtDur(s.blocked)} (${fmtN(s.blockedWrites)} writes failed or timed out) and the replica needs about ${fmtDur(drainSeconds(s))} more to catch up.`; v.classList.add('bad'); }
+      else if (s.peakLag > 60) { v.textContent = `Data is correct, but replicas fell up to ${fmtDur(s.peakLag)} behind and need about ${fmtDur(drainSeconds(s))} more. Do not point replica reads at the new columns until they catch up. A lag limit prevents this.`; v.classList.add('bad'); }
+      else v.textContent = `Safe: no long lock, 0 inconsistent rows, peak replica lag ${fmtDur(s.peakLag)}. Verify, switch reads, stop writing the old column, then drop it.`;
+      sparkline();
+    }
+    function schedule() { if (!raf) raf = requestAnimationFrame(draw); }
+    function setRunning(on: boolean) { running = on && !sim.done; q('[data-run]').textContent = running ? 'Pause' : 'Run'; clock(); }
+    function frame() {
+      for (let i = 0; i < TICKS_PER_FRAME && !sim.done; i++) stepSim(sim, params);
+      if (sim.done) setRunning(false);
+      schedule();
+    }
+    function clock() {
+      window.clearInterval(timer); timer = undefined;
+      if (running && onScreen && !document.hidden) timer = window.setInterval(frame, 80);
+    }
+    function reset() { params = readParams(); sim = newSim(params); enable(); setRunning(false); draw(); }
+    function finish() { runToEnd(sim, params); setRunning(false); draw(); }
+
+    q('[data-run]').addEventListener('click', () => {
+      if (sim.done) reset();
+      if (reduce) { finish(); return; }
+      setRunning(!running);
+    });
+    q('[data-step]').addEventListener('click', () => { setRunning(false); for (let i = 0; i < 60 && !sim.done; i++) stepSim(sim, params); draw(); });
+    q('[data-finish]').addEventListener('click', () => { if (sim.done) reset(); finish(); });
+    q('[data-reset]').addEventListener('click', reset);
+    ['[data-method]', '[data-batch]', '[data-lag]', '[data-late]'].forEach((s) => q(s).addEventListener('change', reset));
+    new IntersectionObserver(([en]) => { onScreen = en.isIntersecting; clock(); }).observe(root);
+    document.addEventListener('visibilitychange', clock);
+    reset();
+  });
+</script>
+<style is:global>
+  .playground .osm-check { display: inline-flex; align-items: center; gap: 6px; }
+  .playground .osm-bar { height: 14px; border: 1px solid var(--border); border-radius: 7px; background: var(--surface-2); overflow: hidden; }
+  .playground .osm-fill { height: 100%; width: 0; background: var(--role-2); transition: width .1s linear; }
+  .playground .osm-spark { width: 100%; height: 64px; border: 1px solid var(--border); border-radius: 8px; background: var(--surface); }
+  .playground .osm-line { fill: none; stroke: var(--role-6); stroke-width: 2; vector-effect: non-scaling-stroke; }
+  .playground .osm-limit { stroke: var(--muted); stroke-width: 1; stroke-dasharray: 4 3; vector-effect: non-scaling-stroke; }
+  @media (prefers-reduced-motion: reduce) { .playground .osm-fill { transition: none; } }
+</style>

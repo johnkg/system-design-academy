@@ -1,0 +1,523 @@
+{
+  "name": "Design a Time-Series Database",
+  "difficulty": "advanced",
+  "intent": "Store billions of timestamped numbers from metrics, sensors and market feeds, append them at a very high rate, and answer range queries filtered by labels in milliseconds, while keeping memory and disk in check.",
+  "codeTitle": "Gorilla compression and a label index",
+  "finalIntro": "One point written to a series, then read back by a dashboard.",
+  "prompt": "Design the storage engine behind a metrics platform. Thousands of hosts and devices send points of the form (series, timestamp, value) every few seconds, where a series is a metric name plus labels such as host, region and endpoint. Dashboards ask for ranges of time filtered by labels, with aggregation, and recent data must be queryable within seconds. Old data should get cheaper as it ages.",
+  "functional": [
+    "Append points to a series identified by a metric name and a set of labels",
+    "Query a time range for all series matching label conditions, such as region=eu and host=~web.*",
+    "Aggregate results over time and across series, for example the average per region in 1-minute steps",
+    "Keep recent data at full resolution and older data as coarser rollups, then delete it after a retention period",
+    "Accept points that arrive late or out of order, within a limit",
+    "List label names and values for dashboards and autocomplete"
+  ],
+  "nonFunctional": [
+    "Ingest millions of points per second across the cluster, and keep up with bursts",
+    "A new point is queryable within a few seconds, and typical dashboard queries answer in under a second",
+    "Use about 1 to 2 bytes of disk per point after compression",
+    "Memory grows with the number of active series, not with the number of points, and must stay bounded",
+    "No acknowledged point is lost when one machine crashes",
+    "One badly behaved client cannot take the database down"
+  ],
+  "firstAttempt": {
+    "text": "One SQL table with the columns metric, labels, timestamp and value, and an index on (metric, labels, timestamp). Each point is an INSERT. A query selects the rows where the metric matches, the labels match and the timestamp is in range, then aggregates them. Old rows are removed by a nightly DELETE.",
+    "limits": [
+      "Every point costs a full row of about 100 bytes with its index entries, though the information in it is a few bits",
+      "The index is rewritten on every insert, so a million inserts per second turn into random disk writes",
+      "The label set is repeated in every row, and finding the rows for 'region=eu' means scanning the text of all of them",
+      "Deleting old data is a huge DELETE that fragments the table and competes with the writes",
+      "One machine holds everything, so there is no way to scale writes or survive its loss"
+    ]
+  },
+  "nodes": [
+    {
+      "id": "writers",
+      "label": "Agents and devices",
+      "kind": "client",
+      "x": 37,
+      "y": 12
+    },
+    {
+      "id": "single",
+      "label": "SQL table with an index",
+      "kind": "data",
+      "x": 37,
+      "y": 37,
+      "at": 0,
+      "until": 1
+    },
+    {
+      "id": "router",
+      "label": "Ingest router",
+      "kind": "edge",
+      "x": 37,
+      "y": 37,
+      "at": 1
+    },
+    {
+      "id": "head",
+      "label": "Head block in memory",
+      "kind": "data",
+      "x": 62,
+      "y": 37,
+      "at": 1
+    },
+    {
+      "id": "wal",
+      "label": "Write-ahead log",
+      "kind": "data",
+      "x": 12,
+      "y": 37,
+      "at": 1
+    },
+    {
+      "id": "encoder",
+      "label": "Gorilla encoder",
+      "kind": "compute",
+      "x": 62,
+      "y": 12,
+      "at": 2
+    },
+    {
+      "id": "blocks",
+      "label": "Immutable blocks",
+      "kind": "data",
+      "x": 62,
+      "y": 63,
+      "at": 3
+    },
+    {
+      "id": "index",
+      "label": "Inverted index",
+      "kind": "data",
+      "x": 87,
+      "y": 63,
+      "at": 3
+    },
+    {
+      "id": "compactor",
+      "label": "Compactor",
+      "kind": "async",
+      "x": 37,
+      "y": 63,
+      "at": 3
+    },
+    {
+      "id": "dashboards",
+      "label": "Dashboards",
+      "kind": "client",
+      "x": 87,
+      "y": 88,
+      "at": 3
+    },
+    {
+      "id": "query",
+      "label": "Query engine",
+      "kind": "compute",
+      "x": 62,
+      "y": 88,
+      "at": 3
+    },
+    {
+      "id": "rollups",
+      "label": "Rollups by age",
+      "kind": "data",
+      "x": 37,
+      "y": 88,
+      "at": 4
+    },
+    {
+      "id": "replica",
+      "label": "Replica shard",
+      "kind": "data",
+      "x": 12,
+      "y": 63,
+      "at": 5
+    },
+    {
+      "id": "guard",
+      "label": "Cardinality guard",
+      "kind": "compute",
+      "x": 12,
+      "y": 12,
+      "at": 6
+    }
+  ],
+  "edges": [
+    {
+      "from": "writers",
+      "to": "single",
+      "at": 0,
+      "until": 1
+    },
+    {
+      "from": "writers",
+      "to": "router",
+      "at": 1
+    },
+    {
+      "from": "router",
+      "to": "head",
+      "at": 1,
+      "until": 2
+    },
+    {
+      "from": "router",
+      "to": "wal",
+      "at": 1
+    },
+    {
+      "from": "router",
+      "to": "encoder",
+      "at": 2
+    },
+    {
+      "from": "encoder",
+      "to": "head",
+      "at": 2
+    },
+    {
+      "from": "head",
+      "to": "blocks",
+      "at": 3
+    },
+    {
+      "from": "blocks",
+      "to": "index",
+      "at": 3
+    },
+    {
+      "from": "blocks",
+      "to": "compactor",
+      "at": 3
+    },
+    {
+      "from": "dashboards",
+      "to": "query",
+      "at": 3
+    },
+    {
+      "from": "query",
+      "to": "index",
+      "at": 3
+    },
+    {
+      "from": "query",
+      "to": "blocks",
+      "at": 3
+    },
+    {
+      "from": "compactor",
+      "to": "rollups",
+      "at": 4
+    },
+    {
+      "from": "query",
+      "to": "rollups",
+      "at": 4
+    },
+    {
+      "from": "wal",
+      "to": "replica",
+      "at": 5
+    },
+    {
+      "from": "writers",
+      "to": "guard",
+      "at": 6
+    },
+    {
+      "from": "guard",
+      "to": "router",
+      "at": 6
+    }
+  ],
+  "steps": [
+    {
+      "title": "Append to an in-memory head block, with a write-ahead log",
+      "problem": "Writing each point into a B-tree index means random disk writes for every insert, which no disk can do millions of times per second.",
+      "fix": "Treat the data as an append-only stream. Each series has an open chunk in memory, in a head block that holds roughly the last two hours. A new point is appended to its series chunk, which costs a few memory writes, and the same point is appended to a sequential write-ahead log on disk first, so a crash can be repaired by replaying the log. The database looks the series up by the hash of its metric name and labels, and creates it on the first point.",
+      "tradeoff": "Writes become sequential and cheap, and recent data is served from memory. Everything in the head must be re-read from the log after a restart, which takes minutes for a big head, and the head's memory is a cost that grows with the number of active series.",
+      "concepts": [
+        {
+          "slug": "event-sourcing"
+        },
+        {
+          "slug": "database-indexing"
+        },
+        {
+          "slug": "caching"
+        }
+      ]
+    },
+    {
+      "title": "Compress with delta-of-delta timestamps and XOR floats",
+      "problem": "A point stored as an 8-byte time plus an 8-byte value is 16 bytes, so a million series scraped every 15 seconds would write over 90 GB a day.",
+      "fix": "Exploit the regularity of the data, as in Facebook's Gorilla. Timestamps arrive at a steady interval, so the delta between consecutive times is nearly constant and the delta of the deltas is usually zero, which is stored as a single bit. A value usually resembles the previous one, so it is XORed with it, and the long runs of leading and trailing zeros are dropped, with a single bit for 'same as before'. Samples are packed into chunks of about 120 points, which are decoded from the start.",
+      "tradeoff": "Real workloads fall from 16 bytes to about 1.4 to 2 bytes per point, and the head fits in memory. Chunks must be decoded sequentially, so random access inside a chunk is not possible, and noisy values with random decimals compress far worse than counters and steady gauges.",
+      "concepts": [
+        {
+          "slug": "latency-and-round-trips"
+        },
+        {
+          "slug": "metrics"
+        },
+        {
+          "slug": "database-indexing"
+        }
+      ]
+    },
+    {
+      "title": "Cut immutable blocks and add an inverted index",
+      "problem": "A head cannot grow for ever, and a query for 'region=eu' must not scan every series to find the matching ones.",
+      "fix": "Every two hours the head is written out as an immutable block: a directory with the compressed chunks, and an index. The index maps each series id to its labels and chunks, and for every label pair, such as region=eu, a sorted list of the series ids that have it (a postings list). A query intersects the postings lists of its matchers, like a search engine, and then reads only the chunks of the matching series that overlap the time range. A background compactor merges small blocks into larger ones, and the WAL segments of a flushed block are deleted.",
+      "tradeoff": "Queries touch only the blocks and series they need, and deleting a block is deleting a directory. Each block carries its own index, so too many small blocks multiply the lookups per query, and the compactor uses disk bandwidth and needs headroom.",
+      "concepts": [
+        {
+          "slug": "database-indexing"
+        },
+        {
+          "slug": "sql-vs-nosql"
+        },
+        {
+          "slug": "pagination"
+        }
+      ]
+    },
+    {
+      "title": "Downsample old data and expire it by tier",
+      "problem": "A dashboard that shows a year cannot read 2 billion raw points per series, and nobody needs 15-second resolution from last spring.",
+      "fix": "A background job rolls raw points into coarser tiers: for example min, max, sum and count per 5 minutes for data older than a week, and per hour for data older than a month. Each tier has its own retention, so raw data is deleted after a few days, 5-minute data after a few months and hourly data after years. The query engine picks the finest tier that covers the requested range and step. Because sum and count are stored, an average over any longer window is still exact.",
+      "tradeoff": "Long-range queries become thousands of times cheaper and storage is bounded. The detail is lost for good: a 10-second spike is visible in raw data but is only a maximum in the rollup, and percentiles cannot be rebuilt from rollups unless histograms were stored.",
+      "concepts": [
+        {
+          "slug": "caching"
+        },
+        {
+          "slug": "database-indexing"
+        },
+        {
+          "slug": "slos-and-error-budgets"
+        }
+      ]
+    },
+    {
+      "title": "Shard by series hash and replicate the log",
+      "problem": "One machine cannot hold the series, the head and the ingest rate of a whole company, and its loss would lose the recent data.",
+      "fix": "The router hashes the series identity (metric name and labels) and sends all points of that series to one shard, so a series chunk is always written by one machine and compressed with its own history. Each shard streams its log to replicas and acknowledges a write after a quorum has it. A query goes to every shard that may hold matching series, each shard aggregates its part locally, and the query engine merges the partial sums, counts and mins.",
+      "tradeoff": "Writes and memory scale with the number of shards, and a machine can fail without losing acknowledged points. Every query fans out to all shards, adding latency from the slowest, and moving series between shards when the cluster changes needs consistent hashing and care.",
+      "concepts": [
+        {
+          "slug": "database-sharding"
+        },
+        {
+          "slug": "consistent-hashing"
+        },
+        {
+          "slug": "quorums"
+        },
+        {
+          "slug": "database-replication"
+        }
+      ]
+    },
+    {
+      "title": "Limit cardinality and handle late data",
+      "problem": "Every unique combination of label values is a new series with its own memory, so one label with unbounded values, such as user_id, can exhaust the cluster. Points also arrive late, after their time slot has moved on.",
+      "fix": "A guard in front of the router counts active series per metric and per tenant, rejects or drops new series above a limit, can refuse labels that look like identifiers, and reports the top offenders by name. For out-of-order data, the head accepts points up to a tolerance window, for example 30 minutes behind the newest point, by keeping them in a small buffer and sorting them when the chunk is closed. Points older than the head are rejected, or sent through a slower backfill path that writes a separate block.",
+      "tradeoff": "The cluster survives a client's mistake and the memory stays predictable. Legitimate growth can be refused until limits are raised, dropped series are a hard failure for that client, and late data past the window is lost unless a backfill is run.",
+      "concepts": [
+        {
+          "slug": "rate-limiting"
+        },
+        {
+          "slug": "backpressure"
+        },
+        {
+          "slug": "bulkhead"
+        }
+      ]
+    }
+  ],
+  "failures": [
+    {
+      "scenario": "A shard crashes with two hours of data in its head block",
+      "impact": "The points in memory are gone, and its series cannot be written or queried.",
+      "answer": "Every acknowledged point is in the write-ahead log, and a quorum of replicas also has it. A replica takes over, replays the log tail since the last flushed block to rebuild the head, and writes continue. Queries can mark a result as partial until the shard is back.",
+      "concepts": [
+        {
+          "slug": "database-replication"
+        },
+        {
+          "slug": "health-checks"
+        },
+        {
+          "slug": "event-sourcing"
+        }
+      ]
+    },
+    {
+      "scenario": "A deploy adds a label with a unique value per request",
+      "impact": "Millions of new series appear within minutes, the head's memory and the index explode and the shard is killed by the operating system.",
+      "answer": "The cardinality guard sees the series count for that metric jump past its limit and starts rejecting new series, while old series keep working. It names the metric and the label responsible, the owning team removes the label, and the stale series disappear from memory once they stop receiving points.",
+      "concepts": [
+        {
+          "slug": "rate-limiting"
+        },
+        {
+          "slug": "bulkhead"
+        },
+        {
+          "slug": "backpressure"
+        }
+      ]
+    },
+    {
+      "scenario": "A device sends a day of buffered points after reconnecting",
+      "impact": "The timestamps are far older than the head's window, and writing them into the open chunks would break the time order that compression needs.",
+      "answer": "The points are rejected by the normal path with a clear error. A backfill endpoint accepts them, sorts them, writes a separate block for that day with its own index, and the query engine merges that block with the others. The device agent keeps its buffer to a sensible age.",
+      "concepts": [
+        {
+          "slug": "idempotency"
+        },
+        {
+          "slug": "message-queues"
+        },
+        {
+          "slug": "retries-and-backoff"
+        }
+      ]
+    },
+    {
+      "scenario": "Someone opens a dashboard of every series for the last year",
+      "impact": "The query fans out to every shard and block, decodes billions of points and starves everyone else's queries.",
+      "answer": "The query engine uses the hourly rollups for that range, limits the number of series and points one query may touch, and runs queries under time and memory budgets. Frequently used panels are cached for a short time, and a query that exceeds a limit returns an error asking for narrower filters.",
+      "concepts": [
+        {
+          "slug": "caching"
+        },
+        {
+          "slug": "rate-limiting"
+        },
+        {
+          "slug": "backpressure"
+        }
+      ]
+    }
+  ],
+  "alternatives": [
+    {
+      "title": "Where the points are stored",
+      "options": [
+        {
+          "name": "A relational table",
+          "pro": "Familiar tools and joins with other data",
+          "con": "About 100 bytes per point and random index writes, so it caps out at thousands of points per second"
+        },
+        {
+          "name": "A general LSM key-value store",
+          "pro": "Fast sequential writes and mature operations",
+          "con": "Keys repeat the series and time, compression is generic, and time-range deletes are expensive"
+        },
+        {
+          "name": "A purpose-built time-series engine",
+          "pro": "Specialised compression, time partitions and a label index",
+          "con": "A narrower tool that is poor at updates and general queries"
+        }
+      ],
+      "pick": "A purpose-built engine, or a time-series layer on top of a store that gives time partitions."
+    },
+    {
+      "title": "How to shard",
+      "options": [
+        {
+          "name": "By a hash of the series",
+          "pro": "Even load, and one machine sees the whole history of a series",
+          "con": "Every label query fans out to all shards"
+        },
+        {
+          "name": "By time range",
+          "pro": "Recent data is hot and old shards can be moved to cold storage",
+          "con": "All writes hit the newest shard, which becomes the bottleneck"
+        },
+        {
+          "name": "By metric name or tenant",
+          "pro": "Queries on one metric hit one shard, and tenants are isolated",
+          "con": "A large metric or tenant becomes a hot spot"
+        }
+      ],
+      "pick": "Hash by series for writes, with tenants kept on separate clusters or shard sets for isolation."
+    },
+    {
+      "title": "How to compute rollups",
+      "options": [
+        {
+          "name": "Aggregate while writing",
+          "pro": "Rollups are ready at once and raw data need not be stored",
+          "con": "Raw detail is lost forever, and late points are hard to include"
+        },
+        {
+          "name": "Background job on closed blocks",
+          "pro": "Raw data stays available, late data is handled when the block closes, and the job can be retried",
+          "con": "Rollups lag by a block, and the job needs its own capacity"
+        },
+        {
+          "name": "Compute at query time",
+          "pro": "No extra storage or jobs",
+          "con": "Cost is paid on every query, so long ranges are slow"
+        }
+      ],
+      "pick": "A background job on closed blocks, with query-time aggregation for short ranges."
+    },
+    {
+      "title": "How to treat out-of-order points",
+      "options": [
+        {
+          "name": "Reject them",
+          "pro": "Simple, and chunks stay perfectly ordered",
+          "con": "A clock hiccup or a retry loses data"
+        },
+        {
+          "name": "Accept within a window",
+          "pro": "Handles retries and small delays, with bounded memory",
+          "con": "A small sorting buffer, and a hard limit that still rejects older points"
+        },
+        {
+          "name": "Accept anything and rewrite blocks",
+          "pro": "Nothing is rejected",
+          "con": "Old blocks are no longer immutable, so caching, replication and compaction all get harder"
+        }
+      ],
+      "pick": "Accept within a window, and use a separate backfill path for older data."
+    }
+  ],
+  "roles": [
+    {
+      "id": "client",
+      "label": "Writers and readers",
+      "description": "Agents and devices that send points, and dashboards that query them."
+    },
+    {
+      "id": "edge",
+      "label": "Ingest router",
+      "description": "Hashes each series to its shard."
+    },
+    {
+      "id": "async",
+      "label": "Background jobs",
+      "description": "Compaction and downsampling of closed blocks."
+    },
+    {
+      "id": "compute",
+      "label": "Encoding and queries",
+      "description": "The compressor, the query engine and the cardinality guard."
+    },
+    {
+      "id": "data",
+      "label": "Stored state",
+      "description": "The head, the log, immutable blocks, the index and rollups."
+    }
+  ]
+}

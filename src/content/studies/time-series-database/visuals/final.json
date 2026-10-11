@@ -1,0 +1,55 @@
+{
+  "actors": [
+    { "id": "agent", "label": "Agent on web-17", "role": "client", "x": 12, "y": 16 },
+    { "id": "router", "label": "Ingest router", "role": "edge", "x": 50, "y": 16 },
+    { "id": "wal", "label": "Write-ahead log (shard 2)", "role": "data", "x": 86, "y": 16 },
+    { "id": "head", "label": "Head block (shard 2)", "role": "data", "x": 50, "y": 50 },
+    { "id": "replica", "label": "Replica of shard 2", "role": "data", "x": 86, "y": 50 },
+    { "id": "blocks", "label": "Blocks and index", "role": "data", "x": 14, "y": 50 },
+    { "id": "dash", "label": "Dashboard", "role": "client", "x": 14, "y": 84 },
+    { "id": "query", "label": "Query engine", "role": "compute", "x": 50, "y": 84 }
+  ],
+  "frames": [
+    {
+      "narration": "The agent on host web-17 sends a point for the series cpu_usage{host=web-17, region=eu}: 61.5 at 12:00:15. The router hashes the metric name and labels together and gets shard 2, so every point of this series will go to the same machine.",
+      "messages": [{ "from": "agent", "to": "router", "label": "cpu_usage{host=web-17,region=eu} 61.5 @12:00:15" }],
+      "states": { "router": "hash -> shard 2" }
+    },
+    {
+      "narration": "Shard 2 first appends the point to its write-ahead log, a sequential write, and then to the open chunk of the series in the head block. The series already exists, with id 4711, so the labels are not stored again.",
+      "messages": [{ "from": "router", "to": "wal", "label": "append" }, { "from": "router", "to": "head", "label": "series 4711: add point" }],
+      "states": { "head": "series 4711, chunk 31 of 120 points" }
+    },
+    {
+      "narration": "The point is compressed as it joins the chunk. The time is exactly 15 seconds after the previous one, as before, so the delta-of-delta is zero and takes 1 bit. The previous value was 61.25, and the XOR of the two differs in just 2 bits, so a new window of meaningful bits is written: 2 + 5 + 6 + 2 = 15 bits. With the 1 bit for the time that makes 16 bits, 2 bytes, where an uncompressed point takes 16 bytes. A value that repeats takes a single bit.",
+      "messages": [],
+      "states": { "head": "this point: 16 bits", "wal": "durable" },
+      "highlight": ["head"]
+    },
+    {
+      "narration": "The shard sends the log record to its replica and acknowledges the write once the replica has it. If the shard dies now, the replica holds the point.",
+      "messages": [{ "from": "wal", "to": "replica", "label": "log record" }, { "from": "replica", "to": "agent", "label": "ack (2 of 2 copies)" }],
+      "states": { "replica": "has the point" }
+    },
+    {
+      "narration": "Later the head is full: it holds two hours of points. It is written out as an immutable block together with its index, which lists, for each label pair such as region=eu, the sorted ids of the series that have it. The log segments for those two hours can now be deleted.",
+      "messages": [{ "from": "head", "to": "blocks", "label": "flush 10:00-12:00" }],
+      "states": { "blocks": "new block + index", "wal": "old segments deleted" }
+    },
+    {
+      "narration": "A dashboard asks for the average cpu_usage per region for the last 6 hours, filtered by region=eu. The query engine asks shard 2 for the series that have the name cpu_usage and region=eu.",
+      "messages": [{ "from": "dash", "to": "query", "label": "avg cpu_usage{region=eu}, last 6h" }, { "from": "query", "to": "blocks", "label": "postings: cpu_usage AND region=eu" }]
+    },
+    {
+      "narration": "Intersecting two sorted lists gives 1,240 series out of 2.1 million on the shard. Only the 2 blocks that overlap the last 6 hours beyond the head, plus the head itself, are opened, and only the chunks of those 1,240 series are decoded. The shard returns a partial sum and count, not the points.",
+      "messages": [{ "from": "blocks", "to": "query", "label": "1,240 series, partial sum + count" }, { "from": "head", "to": "query", "label": "latest points, partial sum + count" }],
+      "states": { "query": "merging all shards" }
+    },
+    {
+      "narration": "The query engine adds the sums and counts from every shard and divides, and the dashboard draws the line. A month later the compactor will roll these points into 5-minute min, max, sum and count, and the raw points will be deleted after their retention period.",
+      "messages": [{ "from": "query", "to": "dash", "label": "avg 58.9, 72 points" }],
+      "states": { "dash": "line drawn" },
+      "highlight": ["dash"]
+    }
+  ]
+}

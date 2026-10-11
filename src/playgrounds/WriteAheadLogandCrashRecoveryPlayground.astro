@@ -1,0 +1,300 @@
+---
+import PlaygroundShell from '../components/PlaygroundShell.astro';
+---
+<PlaygroundShell title="Simulate it" hint="Twenty bank transfers run against 6 data pages (12 accounts, $100 each, $1,200 in total). Cut the power at a chosen moment and see what recovery can and cannot rebuild.">
+  <ol class="how">
+    <li>Leave the defaults (<b>write-ahead logging</b>, <b>fsync on every commit</b>, crash <b>after commit, before pages are written</b>). Several committed transfers exist only in the log and the buffer pool, yet recovery <b>redoes</b> them: <b>0 lost</b>, total $1,200.</li>
+    <li>Change the log to <b>No log</b>. The same crash now loses <b>3 acknowledged transfers</b>: data pages are written lazily, so the disk is behind and nothing can replay the rest. Crash <b>Mid-transfer</b> as well and the total drifts away from $1,200.</li>
+    <li>Pick the crash <b>Mid-transfer</b>. With <b>write-ahead logging</b> recovery <b>undoes</b> the half-done transfer (1 compensation record). Switch to <b>Log, but pages may go first</b> and the stolen page leaks $ with no log record to undo it.</li>
+    <li>Pick <b>No fsync</b> with crash <b>power fails before fsync</b>: the app was told "committed" but the log tail was never on disk, so a transfer it confirmed is lost. Group commit keeps durability and still saves fsyncs.</li>
+    <li>Move <b>Checkpoint every</b> from 8 to 20 (never): <b>log records scanned</b> grows from 18 to 48 and recovery time from about 37 ms to 51 ms, but less log is written (50 KB instead of 90 KB) because full-page images follow every checkpoint. Crash <b>while a data page is written</b> and untick <b>Full-page writes</b> to get a corrupt page.</li>
+  </ol>
+  <div class="pg wal" data-wal>
+    <div class="pg-row">
+      <label>Log <select class="pg-in" data-log>
+        <option value="wal" selected>Write-ahead logging (log before pages)</option>
+        <option value="broken">Log, but pages may go first (rule broken)</option>
+        <option value="none">No log (pages only)</option>
+      </select></label>
+      <label>Commit <select class="pg-in" data-commit>
+        <option value="every" selected>fsync on every commit</option>
+        <option value="group">Group commit (shared fsync)</option>
+        <option value="async">No fsync (ack first, flush later)</option>
+      </select></label>
+      <label>Batch size <input type="range" min="2" max="8" value="4" data-batch /> <b data-batchval>4</b></label>
+    </div>
+    <div class="pg-row">
+      <label>Crash <select class="pg-in" data-crash>
+        <option value="mid">Mid-transfer: debit logged and its page stolen to disk</option>
+        <option value="precommit">Power fails before the commit fsync</option>
+        <option value="postcommit" selected>After commit, before pages are written</option>
+        <option value="checkpoint">In the middle of a checkpoint</option>
+        <option value="torn">While a data page is being written</option>
+      </select></label>
+      <label>during transfer # <input type="range" min="3" max="20" value="12" data-k /> <b data-kval>12</b></label>
+    </div>
+    <div class="pg-row">
+      <label>Checkpoint every <input type="range" min="2" max="20" value="8" data-ckpt /> <b data-ckptval>8</b> transfers</label>
+      <label class="wal-check"><input type="checkbox" checked data-fpw /> Full-page writes</label>
+      <button class="btn" type="button" data-seed>New workload</button>
+      <button class="btn" type="button" data-reset>Reset</button>
+    </div>
+    <p class="pg-out" data-verdict aria-live="polite"></p>
+    <div class="pg-grid" data-stats></div>
+    <div class="pg-row">
+      <label>Show data pages <select class="pg-in" data-view>
+        <option value="crash">on disk when the power failed</option>
+        <option value="redo">after redo</option>
+        <option value="final" selected>after recovery (redo and undo)</option>
+      </select></label>
+    </div>
+    <div class="pg-grid" data-pages></div>
+    <h3 class="wal-h">Last log records (LSN, transaction, record) and what recovery did with them</h3>
+    <ol class="pg-mono wal-log" data-logrows></ol>
+    <p class="pg-note" data-note></p>
+  </div>
+</PlaygroundShell>
+<script>
+  type LogMode = 'none' | 'broken' | 'wal';
+  type CommitMode = 'every' | 'group' | 'async';
+  type CrashAt = 'mid' | 'precommit' | 'postcommit' | 'checkpoint' | 'torn';
+  interface Cfg { wal: LogMode; commit: CommitMode; batch: number; ckpt: number; fpw: boolean; crash: CrashAt; k: number; seed: number }
+  interface Pg { bal: number[]; lsn: number; torn: boolean; g: Record<string, number> }
+  interface Rec { lsn: number; type: string; tx: number; page: number; slot: number; delta: number; key: string; fpi: Pg | null; ref: number; bytes: number }
+
+  const NP = 6; const NA = NP * 2; const START = 100; const N_TX = 20; const DIRTY_LIMIT = 3;
+  const PAGE_BYTES = 8192; const FSYNC_MS = 2;
+  const clone = (p: Pg): Pg => ({ bal: [p.bal[0], p.bal[1]], lsn: p.lsn, torn: p.torn, g: { ...p.g } });
+
+  function mulberry32(a: number) {
+    return () => { a |= 0; a = (a + 0x6d2b79f5) | 0; let t = Math.imul(a ^ (a >>> 15), 1 | a); t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t; return ((t ^ (t >>> 14)) >>> 0) / 4294967296; };
+  }
+  function workload(seed: number) {
+    const r = mulberry32(seed * 7919 + 13); const out: { from: number; to: number; amt: number }[] = [];
+    for (let t = 0; t < N_TX; t++) { const from = Math.floor(r() * NA); const to = (from + 1 + Math.floor(r() * (NA - 1))) % NA; out.push({ from, to, amt: 5 + Math.floor(r() * 46) }); }
+    return out;
+  }
+
+  function simulate(cfg: Cfg) {
+    const work = workload(cfg.seed); const wal = cfg.wal !== 'none';
+    const disk: Pg[] = Array.from({ length: NP }, () => ({ bal: [START, START], lsn: 0, torn: false, g: {} }));
+    const pool = new Map<number, Pg>(); const dirty = new Map<number, number>();
+    const log: Rec[] = []; let counter = 0; let durable = 0;
+    let fsyncs = 0; let logBytes = 0; let ckpts = 0; let pageWrites = 0; let asyncCount = 0;
+    const acked = new Set<number>(); let pending: number[] = []; const fpiDone = new Set<number>();
+
+    function append(type: string, tx: number, page = -1, slot = 0, delta = 0, key = '', fpi: Pg | null = null, ref = 0) {
+      counter++;
+      if (wal) {
+        const bytes = (type === 'update' || type === 'clr' || type === 'ckpt_end' ? 64 : 32) + (fpi ? PAGE_BYTES : 0);
+        log.push({ lsn: counter, type, tx, page, slot, delta, key, fpi, ref, bytes }); logBytes += bytes;
+      }
+      return counter;
+    }
+    function flush() {
+      if (wal && durable < counter) { durable = counter; fsyncs++; }
+      pending.forEach((t) => acked.add(t)); pending = []; asyncCount = 0;
+    }
+    function getPage(p: number) { if (!pool.has(p)) pool.set(p, clone(disk[p])); return pool.get(p)!; }
+    function update(tx: number, i: number, acct: number, delta: number) {
+      const page = Math.floor(acct / 2); const slot = acct % 2; const key = `${tx}.${i}`; const pg = getPage(page);
+      let fpi: Pg | null = null;
+      if (cfg.fpw && wal && !fpiDone.has(page)) { fpi = clone(pg); fpiDone.add(page); }
+      const lsn = append('update', tx, page, slot, delta, key, fpi);
+      pg.bal[slot] += delta; pg.lsn = lsn; pg.g[key] = slot;
+      if (!dirty.has(page)) dirty.set(page, lsn);
+    }
+    function writePage(page: number, torn = false) {
+      const pg = pool.get(page)!;
+      if (cfg.wal === 'wal') flush(); // write-ahead rule: the log up to this page's LSN reaches disk first
+      if (torn) {
+        const old = disk[page]; const g: Record<string, number> = {};
+        Object.keys(pg.g).forEach((k) => { if (pg.g[k] === 0) g[k] = 0; });
+        Object.keys(old.g).forEach((k) => { if (old.g[k] === 1) g[k] = 1; });
+        disk[page] = { bal: [pg.bal[0], old.bal[1]], lsn: old.lsn, torn: true, g };
+      } else disk[page] = clone(pg);
+      dirty.delete(page); pageWrites++;
+    }
+    const oldestDirty = () => [...dirty].sort((a, b) => a[1] - b[1]).map((e) => e[0]);
+    function bgwriter() { while (dirty.size > DIRTY_LIMIT) writePage(oldestDirty()[0]); }
+    function commitAppend(tx: number) {
+      append('commit', tx);
+      if (!wal || cfg.commit === 'async') acked.add(tx); else pending.push(tx);
+    }
+    function commitStep() {
+      if (!wal) return;
+      if (cfg.commit === 'every') flush();
+      else if (cfg.commit === 'group') { if (pending.length >= cfg.batch) flush(); }
+      else { asyncCount++; if (asyncCount >= cfg.batch) flush(); }
+    }
+    function checkpoint(partial: boolean) {
+      const begin = append('ckpt_begin', 0); if (wal) flush(); fpiDone.clear();
+      const list = oldestDirty(); const n = partial ? Math.ceil(list.length / 2) : list.length;
+      list.slice(0, n).forEach((p) => writePage(p));
+      if (!partial) { append('ckpt_end', 0, -1, 0, 0, '', null, begin); if (wal) flush(); ckpts++; }
+    }
+
+    const K = Math.min(cfg.k, N_TX);
+    for (let t = 1; t <= K; t++) {
+      const w = work[t - 1]; const last = t === K;
+      append('begin', t);
+      update(t, 0, w.from, -w.amt);
+      if (last && cfg.crash === 'mid') { writePage(Math.floor(w.from / 2)); break; }
+      update(t, 1, w.to, w.amt);
+      if (last && cfg.crash === 'precommit') { commitAppend(t); break; }
+      commitAppend(t); commitStep();
+      if (last) {
+        if (cfg.crash === 'postcommit') { if (pending.length) flush(); }
+        else if (cfg.crash === 'checkpoint') checkpoint(true);
+        else if (cfg.crash === 'torn') writePage(oldestDirty()[0], true);
+        break;
+      }
+      if (t % cfg.ckpt === 0) checkpoint(false); else bgwriter();
+    }
+    return { cfg, work, K, disk, log, durable, acked, fsyncs, logBytes, ckpts, pageWrites };
+  }
+
+  function recover(sim: ReturnType<typeof simulate>) {
+    const cfg = sim.cfg; const crashDisk = sim.disk.map(clone);
+    const pages = sim.disk.map(clone); const fate = new Map<number, string>(); const extra: { lsn: number; text: string; fate: string }[] = [];
+    const out = { crashDisk, redoDisk: pages.map(clone), finalDisk: pages, scanned: 0, redone: 0, skipped: 0, undone: 0, losers: [] as number[], pagesRead: 0, corrupt: 0, timeMs: 20, fate, extra, start: 1 };
+    if (cfg.wal === 'none') { out.corrupt = pages.filter((p) => p.torn).length; return out; }
+    const durLog = sim.log.filter((r) => r.lsn <= sim.durable);
+    let start = 1; durLog.forEach((r) => { if (r.type === 'ckpt_end') start = r.ref; }); out.start = start;
+    const scan = durLog.filter((r) => r.lsn >= start); out.scanned = scan.length;
+    const state = new Map<number, string>();
+    scan.forEach((r) => { if (r.type === 'update' || r.type === 'clr') { if (!state.has(r.tx)) state.set(r.tx, 'active'); } else if (r.type === 'commit') state.set(r.tx, 'committed'); });
+    out.losers = [...state].filter((e) => e[1] === 'active').map((e) => e[0]);
+    const touched = new Set<number>(); const bad = new Set<number>();
+    scan.forEach((r) => {
+      if (r.type !== 'update') return;
+      let pg = pages[r.page]; touched.add(r.page);
+      if (pg.torn && !bad.has(r.page)) { if (r.fpi) { pages[r.page] = clone(r.fpi); pg = pages[r.page]; fate.set(r.lsn, 'full-page image repairs the torn page, then redo'); } else bad.add(r.page); }
+      if (bad.has(r.page)) { fate.set(r.lsn, 'page fails its checksum: nothing to rebuild it from'); return; }
+      if (pg.lsn < r.lsn) { pg.bal[r.slot] += r.delta; pg.lsn = r.lsn; pg.g[r.key] = r.slot; out.redone++; if (!fate.has(r.lsn)) fate.set(r.lsn, 'redo: applied (page LSN was older)'); }
+      else { out.skipped++; fate.set(r.lsn, 'redo: skipped (page already has it)'); }
+    });
+    out.redoDisk = pages.map(clone);
+    let next = durLog.length ? durLog[durLog.length - 1].lsn : 0;
+    [...durLog].reverse().forEach((r) => {
+      if (r.type !== 'update' || !out.losers.includes(r.tx) || r.lsn < start || bad.has(r.page)) return;
+      next++; touched.add(r.page); const pg = pages[r.page];
+      pg.bal[r.slot] -= r.delta; pg.lsn = next; delete pg.g[r.key]; out.undone++;
+      fate.set(r.lsn, `undo: reverted by CLR ${next}`);
+      extra.push({ lsn: next, text: `${next} T${r.tx} CLR undo of ${r.lsn}`, fate: 'written during undo' });
+    });
+    out.pagesRead = touched.size; out.corrupt = pages.filter((p) => p.torn).length;
+    out.timeMs = 20 + out.scanned * 0.4 + out.pagesRead * 2 + out.undone;
+    return out;
+  }
+
+  function evaluate(cfg: Cfg) {
+    const sim = simulate(cfg); const rec = recover(sim); const fin = rec.finalDisk;
+    const present: Record<string, number> = {}; fin.forEach((p) => Object.keys(p.g).forEach((k) => { present[k] = 1; }));
+    const count = (t: number) => (present[`${t}.0`] ? 1 : 0) + (present[`${t}.1`] ? 1 : 0);
+    const lostTx: number[] = []; const leakedTx: number[] = [];
+    for (let t = 1; t <= sim.K; t++) {
+      if (sim.acked.has(t)) { if (count(t) < 2) lostTx.push(t); } else if (count(t) > 0) leakedTx.push(t);
+    }
+    const expected = new Array(NA).fill(START);
+    sim.acked.forEach((t) => { const w = sim.work[t - 1]; expected[w.from] -= w.amt; expected[w.to] += w.amt; });
+    const bal = (disk: Pg[]) => { const out: number[] = []; disk.forEach((p) => { out.push(p.bal[0], p.bal[1]); }); return out; };
+    const total = bal(fin).reduce((a, b) => a + b, 0);
+    const latency = !(cfg.wal !== 'none') || cfg.commit === 'async' ? 0.05 : cfg.commit === 'every' ? FSYNC_MS : FSYNC_MS + (cfg.batch - 1) / 2;
+    return { sim, rec, lostTx, leakedTx, expected, total, latency, bal };
+  }
+
+  // ---- DOM: built once, then updated ----
+  document.querySelectorAll<HTMLElement>('[data-wal]').forEach((root) => {
+    const q = <T extends HTMLElement>(s: string) => root.querySelector<T>(s)!;
+    const num = (s: string) => Number(q<HTMLInputElement>(s).value);
+    const STAT_LABELS = ['Total money', 'Acknowledged transfers lost', 'Uncommitted changes leaked', 'Corrupt pages', 'Redo: applied / skipped', 'Undo: changes reverted', 'Log records scanned', 'Recovery time (illustrative)', 'fsyncs · commit latency', 'Log written'];
+    const statEls = STAT_LABELS.map((label) => {
+      const box = document.createElement('div'); box.className = 'pg-box';
+      const h = document.createElement('h3'); h.textContent = label;
+      const v = document.createElement('span'); v.className = 'pg-mono';
+      const n = document.createElement('span'); n.className = 'pg-note';
+      box.append(h, v, n); q('[data-stats]').append(box); return { box, v, n };
+    });
+    const pageEls = Array.from({ length: NP }, (_, i) => {
+      const box = document.createElement('div'); box.className = 'pg-box';
+      const h = document.createElement('h3'); h.textContent = `Page ${i}`;
+      const v = document.createElement('span'); v.className = 'pg-mono';
+      const n = document.createElement('span'); n.className = 'pg-note';
+      box.append(h, v, n); q('[data-pages]').append(box); return { box, h, v, n };
+    });
+    const ROWS = 16;
+    const rowEls = Array.from({ length: ROWS }, () => {
+      const li = document.createElement('li'); const l = document.createElement('span'); const r = document.createElement('span');
+      l.className = 'wal-l'; r.className = 'wal-r'; li.append(l, r); q('[data-logrows]').append(li); return { li, l, r };
+    });
+
+    const setStat = (i: number, v: string, n: string, c: string) => { statEls[i].v.textContent = v; statEls[i].n.textContent = n; statEls[i].box.style.setProperty('--c', c); };
+    const cfgNow = (): Cfg => ({ wal: q<HTMLSelectElement>('[data-log]').value as LogMode, commit: q<HTMLSelectElement>('[data-commit]').value as CommitMode, batch: num('[data-batch]'), ckpt: num('[data-ckpt]'), fpw: q<HTMLInputElement>('[data-fpw]').checked, crash: q<HTMLSelectElement>('[data-crash]').value as CrashAt, k: num('[data-k]'), seed });
+    let seed = 1; let frame = 0;
+
+    function render() {
+      frame = 0; const cfg = cfgNow();
+      q('[data-batchval]').textContent = String(cfg.batch); q('[data-kval]').textContent = String(cfg.k);
+      q('[data-ckptval]').textContent = cfg.ckpt >= 20 ? '20 (never)' : String(cfg.ckpt);
+      q<HTMLInputElement>('[data-batch]').disabled = cfg.commit === 'every'; q<HTMLInputElement>('[data-fpw]').disabled = cfg.wal === 'none';
+      const e = evaluate(cfg); const { sim, rec } = e; const good = 'var(--good)'; const bad = 'var(--bad)'; const neutral = 'var(--role-1)';
+      const problems: string[] = [];
+      if (e.lostTx.length) problems.push(`${e.lostTx.length} acknowledged transfer${e.lostTx.length > 1 ? 's' : ''} lost (T${e.lostTx.join(', T')})`);
+      if (e.leakedTx.length) problems.push(`uncommitted change from T${e.leakedTx.join(', T')} survived`);
+      if (rec.corrupt) problems.push(`${rec.corrupt} corrupt page${rec.corrupt > 1 ? 's' : ''}`);
+      if (e.total !== NA * START) problems.push(`total is $${e.total}, not $${NA * START}`);
+      const verdict = q('[data-verdict]');
+      verdict.textContent = problems.length ? `Broken after recovery: ${problems.join('; ')}.` : `Recovered correctly: ${sim.acked.size} acknowledged transfer${sim.acked.size === 1 ? '' : 's'} present, nothing uncommitted survived, total $${e.total}.`;
+      verdict.classList.toggle('bad', problems.length > 0);
+
+      setStat(0, `$${e.total}`, `should be $${NA * START}`, e.total === NA * START ? good : bad);
+      setStat(1, String(e.lostTx.length), `of ${sim.acked.size} acknowledged`, e.lostTx.length ? bad : good);
+      setStat(2, String(e.leakedTx.length), 'half-done or unacknowledged work on disk', e.leakedTx.length ? bad : good);
+      setStat(3, String(rec.corrupt), 'pages failing their checksum', rec.corrupt ? bad : good);
+      setStat(4, cfg.wal === 'none' ? 'no log' : `${rec.redone} / ${rec.skipped}`, 'records replayed from the checkpoint / already on the page', neutral);
+      setStat(5, cfg.wal === 'none' ? 'no log' : String(rec.undone), rec.losers.length ? `in-flight T${rec.losers.join(', T')} rolled back with CLRs` : 'no transaction was in flight', neutral);
+      setStat(6, cfg.wal === 'none' ? 'no log' : String(rec.scanned), rec.start > 1 ? `from the checkpoint at LSN ${rec.start}` : 'from the start of the log: no checkpoint yet', neutral);
+      setStat(7, `${rec.timeMs.toFixed(1)} ms`, '20 ms start + 0.4 ms per record + 2 ms per page read', neutral);
+      setStat(8, `${sim.fsyncs} · ${e.latency.toFixed(2)} ms`, `${sim.fsyncs} fsyncs for ${sim.K} transfers; modelled commit wait`, neutral);
+      setStat(9, `${(sim.logBytes / 1024).toFixed(1)} KB`, `${sim.ckpts} checkpoint${sim.ckpts === 1 ? "" : "s"}, 8 KB per full-page image`, neutral);
+
+      const view = q<HTMLSelectElement>('[data-view]').value; const disk = view === 'crash' ? rec.crashDisk : view === 'redo' ? rec.redoDisk : rec.finalDisk;
+      const bal = e.bal(disk); const unrecovered = view !== 'final' && cfg.wal !== 'none';
+      pageEls.forEach((p, i) => {
+        const a = i * 2; const pg = disk[i]; const ok = bal[a] === e.expected[a] && bal[a + 1] === e.expected[a + 1] && !pg.torn;
+        p.h.textContent = `Page ${i} · LSN ${pg.lsn}${pg.torn ? ' · TORN' : ''}`;
+        p.v.textContent = `A${a} $${bal[a]} · A${a + 1} $${bal[a + 1]}`;
+        p.n.textContent = ok ? 'matches the acknowledged state' : `expected $${e.expected[a]} · $${e.expected[a + 1]}${unrecovered ? ' (not recovered yet)' : ''}`;
+        p.box.style.setProperty('--c', ok ? good : bad);
+      });
+
+      const all = sim.log.map((r) => ({ lsn: r.lsn, text: `${r.lsn} T${r.tx || '-'} ${r.type === 'update' ? `UPDATE page ${r.page} A${r.page * 2 + r.slot} ${r.delta > 0 ? '+' : ''}${r.delta}${r.fpi ? ' +8KB image' : ''}` : r.type.toUpperCase()}`, fate: r.lsn > sim.durable ? 'lost: never reached disk' : r.lsn < rec.start ? 'before checkpoint: not replayed' : rec.fate.get(r.lsn) ?? (r.type === 'commit' ? 'commit is durable' : '') }));
+      const rows = all.concat(rec.extra).slice(-ROWS);
+      rowEls.forEach((r, i) => {
+        const row = rows[i]; r.li.hidden = !row; if (!row) return;
+        r.l.textContent = row.text; r.r.textContent = cfg.wal === 'none' ? '' : row.fate; r.li.classList.toggle('wal-lost', row.fate.startsWith('lost') || row.fate.startsWith('page fails'));
+      });
+      q('[data-note]').textContent = cfg.wal === 'none' ? 'Without a log nothing is replayed: the disk is whatever the buffer pool happened to write.' : `Transfers run one after another, so at most one is in flight. The page LSN decides redo: a record is applied only if the page's LSN is older. ${rec.losers.length ? '' : 'No loser transaction, so undo has nothing to do.'}`;
+    }
+    const schedule = () => { if (!frame) frame = requestAnimationFrame(render); };
+    root.querySelectorAll('select, input[type=range], input[type=checkbox]').forEach((el) => el.addEventListener('input', schedule));
+    root.querySelectorAll('select, input[type=checkbox]').forEach((el) => el.addEventListener('change', schedule));
+    q('[data-seed]').addEventListener('click', () => { seed = seed % 9 + 1; schedule(); });
+    q('[data-reset]').addEventListener('click', () => {
+      q<HTMLSelectElement>('[data-log]').value = 'wal'; q<HTMLSelectElement>('[data-commit]').value = 'every'; q<HTMLInputElement>('[data-batch]').value = '4';
+      q<HTMLSelectElement>('[data-crash]').value = 'postcommit'; q<HTMLInputElement>('[data-k]').value = '12'; q<HTMLInputElement>('[data-ckpt]').value = '8';
+      q<HTMLInputElement>('[data-fpw]').checked = true; q<HTMLSelectElement>('[data-view]').value = 'final'; seed = 1; schedule();
+    });
+    render();
+  });
+</script>
+<style is:global>
+  .playground .wal-check { display: inline-flex; align-items: center; gap: 6px; }
+  .playground .wal-h { font-size: .95rem; margin: 14px 0 6px; }
+  .playground .wal-log { list-style: none; margin: 0; padding: 0; font-size: .82rem; }
+  .playground .wal-log li { display: flex; flex-wrap: wrap; justify-content: space-between; gap: 2px 12px; padding: 3px 0; border-bottom: 1px solid var(--border); }
+  .playground .wal-log li[hidden] { display: none; }
+  .playground .wal-r { color: var(--muted); }
+  .playground .wal-lost .wal-r { color: var(--bad); }
+</style>

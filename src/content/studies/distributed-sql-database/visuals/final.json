@@ -1,0 +1,55 @@
+{
+  "actors": [
+    { "id": "app", "label": "Application", "role": "client", "x": 14, "y": 16 },
+    { "id": "gw", "label": "SQL gateway (region A)", "role": "edge", "x": 50, "y": 16 },
+    { "id": "clk", "label": "Hybrid clock", "role": "compute", "x": 86, "y": 16 },
+    { "id": "r1", "label": "Range 7: alice (leaseholder in A)", "role": "data", "x": 14, "y": 50 },
+    { "id": "r2", "label": "Range 12: zed (leaseholder in C)", "role": "data", "x": 50, "y": 50 },
+    { "id": "fol", "label": "Range 7 follower in region B", "role": "data", "x": 86, "y": 50 },
+    { "id": "bg", "label": "Intent resolver", "role": "async", "x": 50, "y": 84 }
+  ],
+  "frames": [
+    {
+      "narration": "The application sends a transaction: take 30 from alice and give 30 to zed. The gateway turns the rows into keys. Using its cached range directory it finds that alice's key is in range 7, whose leaseholder is in region A, and zed's key is in range 12, whose leaseholder is in region C, 70 ms away.",
+      "messages": [{ "from": "app", "to": "gw", "label": "BEGIN; alice -30; zed +30; COMMIT" }],
+      "states": { "gw": "alice in range 7, zed in range 12" }
+    },
+    {
+      "narration": "The gateway's coordinator takes a read timestamp from its hybrid clock, 8,000 ms with counter 0. Every read in the transaction will see exactly the versions up to that timestamp.",
+      "messages": [{ "from": "gw", "to": "clk", "label": "timestamp?" }, { "from": "clk", "to": "gw", "label": "8000.0" }],
+      "states": { "clk": "ts 8000.0" }
+    },
+    {
+      "narration": "Both reads go out at once to the leaseholders, because a leaseholder can answer from its own state without a vote. Range 7 answers in about 1 ms and range 12 in about 71 ms (a 70 ms round trip plus 1 ms of work). The read phase takes the slower one, 71 ms.",
+      "messages": [{ "from": "gw", "to": "r1", "label": "read alice at 8000.0" }, { "from": "gw", "to": "r2", "label": "read zed at 8000.0" }, { "from": "r1", "to": "gw", "label": "100" }, { "from": "r2", "to": "gw", "label": "100" }],
+      "states": { "r1": "alice = 100", "r2": "zed = 100" }
+    },
+    {
+      "narration": "Now the writes, sent in parallel. Each range writes an intent, a provisional value tagged with the transaction, and replicates it through Raft. The record for the transaction is staged on range 7 in the same batch. Range 7 needs about 31 ms (30 ms to its nearest follower plus 1 ms of disk), and range 12 about 61 ms (60 ms plus 1 ms). Together with the 70 ms trip to range 12, the write phase takes about 131 ms.",
+      "messages": [{ "from": "gw", "to": "r1", "label": "intent alice = 70, record STAGING" }, { "from": "gw", "to": "r2", "label": "intent zed = 130" }],
+      "states": { "r1": "intent alice = 70", "r2": "intent zed = 130" },
+      "highlight": ["r1", "r2"]
+    },
+    {
+      "narration": "Both intents are durable on a majority of their replicas, so with parallel commits the transaction is already committed, with no second round. The gateway answers the application after about 202 ms in total: 71 ms of reads and 131 ms of writes.",
+      "messages": [{ "from": "r1", "to": "gw", "label": "durable" }, { "from": "r2", "to": "gw", "label": "durable" }, { "from": "gw", "to": "app", "label": "committed at 8000.0, 202 ms" }],
+      "states": { "gw": "implicitly committed" }
+    },
+    {
+      "narration": "After the answer has gone out, a background resolver marks the record committed and rewrites each intent as an ordinary version stamped 8000.0. If the gateway had crashed at this point, anyone meeting an intent would read the record, find that every intent was durable, and finish the job.",
+      "messages": [{ "from": "bg", "to": "r1", "label": "alice = 70 at 8000.0" }, { "from": "bg", "to": "r2", "label": "zed = 130 at 8000.0" }],
+      "states": { "r1": "alice = 70 at 8000.0", "r2": "zed = 130 at 8000.0", "bg": "intents resolved" }
+    },
+    {
+      "narration": "Two seconds later an app in region B wants to show alice's balance. A normal read would go to the leaseholder in region A, 30 ms away, and see 70. A follower read is allowed instead: region B holds a follower of range 7, and the leaseholder has promised that nothing more will be written below a closed timestamp that trails the present by about 4.8 s.",
+      "messages": [{ "from": "app", "to": "fol", "label": "read alice, 4.8 s stale is fine" }],
+      "states": { "fol": "closed timestamp = now - 4.8 s" },
+      "highlight": ["fol"]
+    },
+    {
+      "narration": "The local follower answers in about 2 ms with the version it holds at that time, which is the balance before the transfer: 100. The transfer was only 2 s old and the read is allowed to be 4.8 s old, so the answer is stale but consistent, a true snapshot from before the transfer. A read that must be current goes to the leaseholder and pays the round trip.",
+      "messages": [{ "from": "fol", "to": "app", "label": "alice = 100 (as of 4.8 s ago)" }],
+      "states": { "app": "alice = 100, stale" }
+    }
+  ]
+}

@@ -1,0 +1,172 @@
+---
+import PlaygroundShell from '../components/PlaygroundShell.astro';
+---
+<PlaygroundShell title="Simulate it" hint="A DELETE with no WHERE hits the orders table at 14:03. Choose how you back up, then restore and see what you get back, what you lose and how long it takes.">
+  <ol class="how">
+    <li>The default is <b>daily base backup, WAL archiving on, target 1 s before the delete</b>: all 1,233,732 orders come back, only <b>1 s</b> of work is lost, but the restore takes about <b>3 h 9 min</b> because 12 hours of log must be replayed.</li>
+    <li>Switch the base backup to <b>every 6 hours</b>. The 14:00 backup is only 3 minutes before the mistake, so replay shrinks to seconds and recovery drops to about <b>45 min</b>, almost all of it copying the data. Then raise <b>Data size</b> to 2 TB and the copy alone takes close to 3 h.</li>
+    <li>Untick <b>WAL archiving</b>: you can only restore the base backup. With daily backups that is <b>12 h of orders lost</b> (about 29,000 rows). Then set <b>What went wrong</b> to the lost server: archiving loses only the time since the last archived segment, and <b>Backups on the same server</b> loses everything.</li>
+    <li>Set the target to <b>after the delete</b> and the restore faithfully replays the DELETE: the table is empty again. Note the <b>replica</b> box: it showed 0 orders one second after the delete.</li>
+    <li>Untick <b>Verify by restoring</b> and press <b>Next day</b> once or twice. Some backups are unusable (30% here, to make the point), and you only find out during the restore: scenario 2 loses a full copy attempt and falls back to the previous day (RTO about 8 h 40 min), scenario 3 does it twice (about 14 h).</li>
+  </ol>
+  <div class="pg" data-pitr>
+    <div class="pg-row">
+      <label>What went wrong
+        <select class="pg-in" data-kind><option value="delete" selected>Bad DELETE (server fine)</option><option value="loss">Server and disk destroyed</option></select></label>
+      <label>Incident time <input type="range" min="0" max="1439" step="1" value="843" data-time aria-label="Incident time of day" /> <b data-timeval>14:03</b></label>
+    </div>
+    <div class="pg-row">
+      <label>Base backup
+        <select class="pg-in" data-sched><option value="daily" selected>Daily at 02:00</option><option value="6h">Every 6 h (02, 08, 14, 20)</option></select></label>
+      <label class="pitr-check"><input type="checkbox" checked data-wal /> WAL archiving</label>
+      <label>Archive at least every
+        <select class="pg-in" data-intv><option value="60">1 min</option><option value="300" selected>5 min</option><option value="900">15 min</option></select></label>
+      <label>Recovery target
+        <select class="pg-in" data-target><option value="before" selected>1 s before the delete</option><option value="early">10 min before the delete</option><option value="after">1 min after the delete</option><option value="latest">latest (when noticed)</option></select></label>
+    </div>
+    <div class="pg-row">
+      <label>Data size
+        <select class="pg-in" data-gb><option value="50">50 GB</option><option value="500" selected>500 GB</option><option value="2000">2 TB</option></select></label>
+      <label>WAL volume <input type="range" min="60" max="3000" step="60" value="600" data-walmb aria-label="Log generated per minute in megabytes" /> <b data-walmbval>600 MB/min</b></label>
+      <label class="pitr-check"><input type="checkbox" checked data-verify /> Verify by restoring</label>
+      <label>Backups kept
+        <select class="pg-in" data-where><option value="off" selected>In another region</option><option value="same">On the same server</option></select></label>
+      <button class="btn" type="button" data-seed>Next day</button>
+      <span class="pg-note" data-seedval></span>
+    </div>
+    <div class="pitr-tl" role="img" aria-label="Timeline of the day with base backups, replayed log range and incident" data-tl>
+      <div class="pitr-bar">
+        <div class="pitr-replay" data-replay></div>
+        <div class="pitr-mark pitr-b" data-b0></div><div class="pitr-mark pitr-b" data-b1></div><div class="pitr-mark pitr-b" data-b2></div><div class="pitr-mark pitr-b" data-b3></div>
+        <div class="pitr-mark pitr-t" data-tmark></div>
+        <div class="pitr-mark pitr-i" data-imark></div>
+      </div>
+      <div class="pitr-axis"><span>00</span><span>06</span><span>12</span><span>18</span><span>24</span></div>
+      <p class="pg-note" data-legend></p>
+    </div>
+    <div class="pg-grid">
+      <div class="pg-box" data-box="from" style="--c: var(--role-4)"><h3>Restored from</h3><span class="pg-mono" data-from></span><span class="pg-note" data-fromnote></span></div>
+      <div class="pg-box" data-box="rows" style="--c: var(--role-2)"><h3>Orders after restore</h3><span class="pg-mono" data-rows></span><span class="pg-note" data-rowsnote></span></div>
+      <div class="pg-box" data-box="rpo" style="--c: var(--role-3)"><h3>Work lost (RPO)</h3><span class="pg-mono" data-rpo></span><span class="pg-note" data-rponote></span></div>
+      <div class="pg-box" data-box="rto" style="--c: var(--role-1)"><h3>Time to recover (RTO)</h3><span class="pg-mono" data-rto></span><span class="pg-note" data-rtonote></span></div>
+      <div class="pg-box" data-box="rep" style="--c: var(--role-5)"><h3>A replica would show</h3><span class="pg-mono" data-rep></span><span class="pg-note" data-repnote></span></div>
+    </div>
+    <output class="pg-out" data-out aria-live="polite"></output>
+  </div>
+</PlaygroundShell>
+<script>
+  // ---- pure model (no DOM) ----
+  const DAY = 86400; const DETECT = 300; const LAG = 1; const COPY_MBPS = 200; const REPLAY_MBPS = 50;
+  const OVERHEAD = 120; const ORDERS_PER_MIN = 40; const BASE_ROWS = 1200000; const FAILOVER = 60; const FIRST = 7200;
+  const BAD_CHANCE = 0.3;
+  interface Params { kind: string; sched: string; wal: boolean; intv: number; target: string; gb: number; walmb: number; verify: boolean; where: string; min: number; seed: number }
+  function mulberry32(a: number) { return () => { a |= 0; a = (a + 0x6d2b79f5) | 0; let t = Math.imul(a ^ (a >>> 15), 1 | a); t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t; return ((t ^ (t >>> 14)) >>> 0) / 4294967296; }; }
+  const ordersAt = (t: number) => BASE_ROWS + Math.floor((ORDERS_PER_MIN * t) / 60);
+  const corrupt = (seed: number, t: number) => mulberry32(seed * 7919 + Math.floor(t / 3600) * 104729 + 17)() < BAD_CHANCE;
+  function simulate(p: Params) {
+    const I = p.min * 60 + 20;
+    const period = p.sched === 'daily' ? DAY : DAY / 4;
+    const copySec = (p.gb * 1024) / COPY_MBPS;
+    const r: any = { I, ok: true, reason: '', B: 0, Teff: 0, tried: [] as { t: number; bad: boolean }[], attempts: 0, replayed: false };
+    const pre = p.kind === 'delete' ? ordersAt(I - 1) : ordersAt(I);
+    r.pre = pre;
+    // replica: copies everything, mistakes included
+    if (p.kind === 'delete') { r.repRows = 0; r.repNote = 'the DELETE reached it ' + LAG + ' s after the primary; failing over restores nothing'; r.repRto = null; }
+    else { r.repRows = ordersAt(I - LAG); r.repNote = 'async lag ' + LAG + ' s: promote it and lose about ' + LAG + ' s'; r.repRto = FAILOVER; }
+    if (p.kind === 'loss' && p.where === 'same') { r.ok = false; r.reason = 'The backups lived on the destroyed server. Nothing to restore from.'; return r; }
+    // how far can we get
+    let T: number;
+    if (!p.wal) T = I; else if (p.kind === 'loss') T = Math.floor(I / p.intv) * p.intv;
+    else T = p.target === 'before' ? I - 1 : p.target === 'early' ? I - 600 : p.target === 'after' ? I + 60 : I + DETECT;
+    r.T = T;
+    // newest usable base backup at or before T (without WAL: at or before the incident)
+    const limit = p.wal ? T : I;
+    let k = Math.floor((limit - FIRST) / period); let found = false;
+    for (let n = 0; n < 5; n++, k--) {
+      const t = FIRST + k * period; const bad = !p.verify && corrupt(p.seed, t);
+      r.tried.push({ t, bad });
+      if (bad) { r.attempts++; continue; }
+      r.B = t; found = true; break;
+    }
+    if (!found) { r.ok = false; r.reason = 'None of the last 5 backups could be restored.'; return r; }
+    r.Teff = p.wal ? T : r.B;
+    const window = p.wal ? r.Teff - r.B : 0;
+    r.replayMB = (p.walmb * window) / 60; r.replaySec = r.replayMB / REPLAY_MBPS; r.copySec = copySec;
+    r.rto = r.attempts * copySec + copySec + r.replaySec + OVERHEAD;
+    r.replayed = p.kind === 'delete' && p.wal && r.Teff >= I;
+    if (!p.wal) r.rows = ordersAt(r.B);
+    else if (p.kind === 'delete') r.rows = r.Teff < I ? ordersAt(r.Teff) : Math.floor((ORDERS_PER_MIN * (r.Teff - I)) / 60);
+    else r.rows = ordersAt(r.Teff);
+    r.lostRows = Math.max(0, pre - r.rows);
+    r.lostSec = r.replayed ? null : I - r.Teff;
+    r.discarded = p.kind === 'delete' && !r.replayed ? Math.floor((ORDERS_PER_MIN * DETECT) / 60) : 0;
+    return r;
+  }
+  // ---- formatting ----
+  const n0 = (x: number) => Math.round(x).toLocaleString('en-US');
+  const hm = (t: number) => { const d = Math.floor(t / DAY); const s = ((t % DAY) + DAY) % DAY; return `${d === -1 ? 'yesterday ' : d < -1 ? `${-d} days ago ` : ''}${String(Math.floor(s / 3600)).padStart(2, '0')}:${String(Math.floor((s % 3600) / 60)).padStart(2, '0')}`; };
+  const hms = (t: number) => { const s = ((t % DAY) + DAY) % DAY; return `${hm(t)}:${String(Math.floor(s % 60)).padStart(2, '0')}`; };
+  const dur = (s: number) => { s = Math.round(s); if (s < 60) return `${s} s`; if (s < 3600) return `${Math.floor(s / 60)} min ${s % 60 ? (s % 60) + ' s' : ''}`.trim(); const h = Math.floor(s / 3600); const m = Math.round((s % 3600) / 60); return m === 60 ? `${h + 1} h` : `${h} h ${m} min`; };
+  // ---- DOM ----
+  document.querySelectorAll<HTMLElement>('[data-pitr]').forEach((root) => {
+    const q = <T extends HTMLElement>(s: string) => root.querySelector<T>(s)!;
+    const sel = (s: string) => q<HTMLSelectElement>(s).value;
+    const chk = (s: string) => q<HTMLInputElement>(s).checked;
+    const SEEDS = [1, 7, 6, 11, 12, 2, 3, 4, 5, 8, 9, 10]; let idx = 0; let seed = SEEDS[0]; let queued = false;
+    const params = (): Params => ({ kind: sel('[data-kind]'), sched: sel('[data-sched]'), wal: chk('[data-wal]'), intv: Number(sel('[data-intv]')), target: sel('[data-target]'), gb: Number(sel('[data-gb]')), walmb: Number(q<HTMLInputElement>('[data-walmb]').value), verify: chk('[data-verify]'), where: sel('[data-where]'), min: Number(q<HTMLInputElement>('[data-time]').value), seed });
+    const set = (s: string, t: string) => { q(s).textContent = t; };
+    const pct = (t: number) => `${Math.max(0, Math.min(100, (t / DAY) * 100))}%`;
+    function draw() {
+      queued = false;
+      const p = params(); const r = simulate(p);
+      set('[data-timeval]', hm(p.min * 60)); set('[data-walmbval]', `${n0(p.walmb)} MB/min`); set('[data-seedval]', `scenario ${idx + 1}`);
+      q<HTMLSelectElement>('[data-target]').disabled = !p.wal || p.kind === 'loss';
+      q<HTMLSelectElement>('[data-intv]').disabled = !p.wal;
+      q<HTMLSelectElement>('[data-where]').disabled = p.kind !== 'loss';
+      // timeline
+      const period = p.sched === 'daily' ? DAY : DAY / 4; const marks = Math.round(DAY / period);
+      for (let i = 0; i < 4; i++) {
+        const m = q(`[data-b${i}]`); const t = FIRST + i * period; m.style.display = i < marks ? '' : 'none';
+        m.style.left = pct(t); const used = r.ok !== false && r.B === t; const bad = r.tried.some((x: any) => x.t === t && x.bad);
+        m.style.background = bad ? 'var(--bad)' : used ? 'var(--accent)' : 'var(--muted)';
+      }
+      q('[data-imark]').style.left = pct(r.I);
+      const rp = q('[data-replay]'); const tm = q('[data-tmark]');
+      if (r.ok && p.wal) { const a = Math.max(0, r.B); const b = Math.max(a, Math.min(DAY, r.Teff)); rp.style.display = ''; rp.style.left = pct(a); rp.style.width = `${((b - a) / DAY) * 100}%`; tm.style.display = ''; tm.style.left = pct(r.Teff); }
+      else { rp.style.display = 'none'; tm.style.display = 'none'; }
+      set('[data-legend]', `Grey ticks: base backups. Red tick: the incident at ${hms(r.I)}.${r.ok && p.wal ? ` Band: log replayed from ${hm(r.B)} to ${hms(r.Teff)}.` : ''}${r.attempts ? ` Red backup ticks were corrupt and tried first.` : ''}`);
+      // replica
+      set('[data-rep]', `${n0(r.repRows)} orders`); set('[data-repnote]', r.repNote + (r.repRto != null ? `; failover about ${dur(r.repRto)}` : ''));
+      const out = q('[data-out]');
+      if (!r.ok) {
+        set('[data-from]', 'nothing'); set('[data-fromnote]', r.reason); set('[data-rows]', 'unknown'); set('[data-rowsnote]', 'no restore possible');
+        set('[data-rpo]', 'everything'); set('[data-rponote]', `all ${n0(r.pre)} orders, unless the replica survived`); set('[data-rto]', 'never'); set('[data-rtonote]', 'an untested or co-located backup is not a backup');
+        out.textContent = `${r.reason} ${p.kind === 'loss' ? 'Only the replica (' + n0(r.repRows) + ' orders) is left.' : ''}`.trim(); out.classList.add('bad'); return;
+      }
+      set('[data-from]', p.wal ? `${hm(r.B)} base + log to ${hms(r.Teff)}` : `${hm(r.B)} base only`);
+      set('[data-fromnote]', (r.attempts ? `${r.attempts} corrupt backup${r.attempts > 1 ? 's' : ''} found during restore; ` : p.verify ? 'verified by test restores; ' : '') + (p.wal ? `${n0(r.replayMB)} MB of log replayed` : 'no log archive: cannot go past the backup'));
+      set('[data-rows]', `${n0(r.rows)} orders`);
+      set('[data-rowsnote]', r.replayed ? 'the DELETE was replayed too' : `before the incident there were ${n0(r.pre)}`);
+      set('[data-rpo]', r.lostSec == null ? 'everything' : dur(r.lostSec)); set('[data-rponote]', r.replayed ? `${n0(r.lostRows)} rows still gone` : r.lostRows ? `${n0(r.lostRows)} orders to re-create` : 'about nothing to re-create');
+      set('[data-rto]', dur(r.rto)); set('[data-rtonote]', `copy ${dur(r.copySec)}${r.attempts ? ` x${r.attempts + 1}` : ''} + replay ${dur(r.replaySec || 0)} + checks ${dur(OVERHEAD)}`);
+      const bad = r.replayed || r.lostRows > 0 && r.lostSec != null && r.lostSec > 60;
+      out.classList.toggle('bad', !!bad);
+      out.textContent = r.replayed ? `Restored to ${hms(r.Teff)}: the DELETE is part of that history, so the table is ${r.rows ? 'nearly empty' : 'empty'} again. Pick a target before ${hms(r.I)}.`
+        : `Back after ${dur(r.rto)} with ${n0(r.rows)} orders; ${dur(r.lostSec as number)} of work lost.${p.kind === 'delete' ? ` Orders placed after the mistake and before it was noticed (about ${r.discarded}) are discarded unless exported first.` : ''}${!p.wal ? ' Without an archived log the restore point is the backup time.' : ''}`;
+    }
+    const schedule = () => { if (!queued) { queued = true; requestAnimationFrame(draw); } };
+    root.querySelectorAll('select, input').forEach((el) => { el.addEventListener('input', schedule); el.addEventListener('change', schedule); });
+    q('[data-seed]').addEventListener('click', () => { idx = (idx + 1) % SEEDS.length; seed = SEEDS[idx]; schedule(); });
+    draw();
+  });
+</script>
+<style is:global>
+  .playground .pitr-check { display: inline-flex; align-items: center; gap: 6px; }
+  .playground .pitr-tl { display: grid; gap: 4px; margin: 6px 0; }
+  .playground .pitr-bar { position: relative; height: 28px; border: 1px solid var(--border); border-radius: 8px; background: var(--surface-2); overflow: hidden; }
+  .playground .pitr-replay { position: absolute; top: 0; bottom: 0; background: color-mix(in srgb, var(--role-2) 35%, transparent); }
+  .playground .pitr-mark { position: absolute; top: 0; bottom: 0; width: 4px; margin-left: -2px; }
+  .playground .pitr-i { background: var(--bad); width: 6px; margin-left: -3px; }
+  .playground .pitr-t { background: var(--good); }
+  .playground .pitr-axis { display: flex; justify-content: space-between; font-size: .75rem; color: var(--muted); }
+</style>

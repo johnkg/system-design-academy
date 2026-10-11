@@ -1,0 +1,64 @@
+{
+  "name": "Online Schema Migrations",
+  "area": "databases",
+  "difficulty": "intermediate",
+  "intent": "Change a table's structure while the application keeps running, by splitting the change into small compatible steps instead of one big blocking ALTER.",
+  "scenario": "A users table with 100 million rows has one full_name column. The product needs first_name and last_name. Traffic is about 2,000 writes per second and must not stop, and read replicas must not fall minutes behind.",
+  "problem": "A schema change that rewrites or locks a large table blocks writes for as long as it runs: minutes to hours on 100 million rows. Writers queue behind the lock, connection pools fill, and the outage looks like the database died. Even without a table lock, one giant UPDATE holds row locks and one huge transaction, produces a replication event the replicas cannot apply for a long time, and cannot be rolled back cheaply. Meanwhile the application is deployed gradually, so old and new code run against the same table at the same time.",
+  "howItWorks": [
+    { "title": "Expand: add the new shape without breaking the old one", "text": "ADD COLUMN first_name and last_name as nullable with no default. In PostgreSQL this is a catalog change, in MySQL 8 it can be ALGORITHM=INSTANT. The lock is taken for milliseconds, but it still queues behind any long running transaction and blocks everyone behind it, so set lock_timeout (or retry) and run it at a quiet moment. Old code ignores the new columns and keeps working." },
+    { "title": "Dual-write before backfill", "text": "Deploy an app version that writes full_name and first_name/last_name together, in the same statement, while still reading full_name. This must be live everywhere before the backfill starts. Otherwise a row written after the backfill has passed it keeps a stale split, and nothing will ever repair it." },
+    { "title": "Backfill in small, throttled batches", "text": "A job walks the primary key in ranges of a few thousand rows: UPDATE users SET first_name = ..., last_name = ... WHERE id BETWEEN a AND b AND first_name IS NULL. Each batch is a short transaction (hundreds of milliseconds), so row locks are brief and the WAL or binlog is produced in small pieces. Between batches it sleeps while replica lag is above a threshold, so replicas and any lag-sensitive reads are not sacrificed. The WHERE first_name IS NULL guard means the job never overwrites a value the application just wrote." },
+    { "title": "Verify, switch reads, stop writing the old column", "text": "Count rows where the new columns are NULL or differ from the split of full_name, and wait until replicas have caught up. Then flip reads to the new columns behind a flag. Keep dual-writing for a while so you can flip back. When confident, deploy the version that no longer touches full_name." },
+    { "title": "Contract: drop the old column", "text": "DROP COLUMN full_name once no deployed code, job, report or replica consumer references it. In PostgreSQL this is metadata only; in MySQL it can rewrite the table, so use INSTANT where available or a shadow-table tool. Each step is its own deploy and can be reverted on its own." },
+    { "title": "Shadow-table tools for changes that must rewrite the table", "text": "gh-ost and pt-online-schema-change create an empty copy with the new schema, copy rows in chunks (INSERT IGNORE ... SELECT), and capture ongoing changes (gh-ost reads the binlog, pt-osc uses triggers) to replay on the copy. When the copy has caught up, a short atomic rename swaps the tables. They throttle on replica lag, but they cannot compute a column from other columns. Splitting full_name still needs a backfill, which is why the expand and contract pattern is the usual answer here." }
+  ],
+  "pros": [
+    "No long table lock: the only blocking moments are millisecond metadata changes and, for shadow tools, a rename of around a second",
+    "Every step is small, observable and reversible, and old and new app versions can run at the same time",
+    "Backfill speed is a dial: it can be slowed or paused when replicas lag or the primary is busy",
+    "Works for data transformations that no ALTER TABLE can express, such as splitting or merging columns"
+  ],
+  "cons": [
+    "Takes days or weeks of calendar time and several deploys instead of one command",
+    "Temporarily doubles the writes for the changed columns and uses extra storage and WAL or binlog volume",
+    "Dual-write code is extra code that must be written correctly and then removed",
+    "Shadow-table tools need disk space for a full copy, extra care with foreign keys and triggers, and do not fit every topology (some managed services restrict them)"
+  ],
+  "whenToUse": [
+    "Large or hot tables where an hour of blocked writes, or minutes of replica lag, is not acceptable",
+    "Changes that must keep the old and new application versions working during a rolling deploy",
+    "Data transformations (split, merge, re-encode, change type) rather than a plain metadata change"
+  ],
+  "whenNotToUse": [
+    "Small tables, or a service with a maintenance window, where a plain ALTER finishes in seconds and the ceremony costs more than the risk",
+    "Changes the database already does online and cheaply: PostgreSQL ADD COLUMN with a constant default, MySQL 8 INSTANT operations, CREATE INDEX CONCURRENTLY",
+    "Pre-launch tables with no traffic and no data worth preserving"
+  ],
+  "pitfalls": [
+    "Starting the backfill before dual-write is live everywhere: rows written behind the cursor keep a stale split silently",
+    "A backfill that reads a row, computes in the app, and writes it back unconditionally: it overwrites a concurrent update with stale data. Compute in SQL, in one statement, and guard with IS NULL or a version",
+    "ALTER TABLE ... ADD COLUMN ... NOT NULL DEFAULT on an old engine, or with a volatile default, rewrites the whole table under an exclusive lock. Adding NOT NULL later takes a full scan under lock unless you first add a validated CHECK constraint (PostgreSQL) and then set NOT NULL",
+    "CREATE INDEX without CONCURRENTLY (PostgreSQL) blocks all writes for the duration of the build; CONCURRENTLY is slower, cannot run inside a transaction, and leaves an INVALID index if it fails",
+    "Renaming a column or changing its type in one step breaks every running app instance that still uses the old name or type. Add a new column and migrate instead",
+    "Waiting for a metadata lock behind a long transaction: the ALTER queues, every later query queues behind the ALTER, and the whole table stalls. Always set lock_timeout and retry",
+    "Ignoring replica lag: finishing the backfill on the primary does not mean replicas have the data. Switching reads to the new columns while a replica is 20 minutes behind returns NULL names",
+    "One huge batch because it is faster: the batch holds locks for seconds, produces a single large replication event, and a failure rolls back all the work"
+  ],
+  "related": [
+    { "kind": "concept", "slug": "database-replication" },
+    { "kind": "concept", "slug": "database-indexing" },
+    { "kind": "concept", "slug": "blue-green-and-rolling-deployments" },
+    { "kind": "concept", "slug": "api-versioning" },
+    { "kind": "concept", "slug": "feature-flags" },
+    { "kind": "concept", "slug": "write-ahead-log" },
+    { "kind": "concept", "slug": "mvcc-and-isolation-levels" },
+    { "kind": "concept", "slug": "backups-and-point-in-time-recovery" }
+  ],
+  "roles": [
+    { "id": "app", "label": "Application", "description": "Old and new app versions, deployed gradually, that read and write the table throughout the migration." },
+    { "id": "table", "label": "Users table", "description": "The 100 million row table on the primary, which gains new columns and eventually loses the old one." },
+    { "id": "job", "label": "Backfill job", "description": "Copies data into the new columns in small batches and sleeps when replicas lag." },
+    { "id": "replica", "label": "Read replica", "description": "Applies the primary's changes in order and falls behind if the migration produces too many too fast." }
+  ]
+}

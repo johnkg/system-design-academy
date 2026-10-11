@@ -1,0 +1,63 @@
+{
+  "name": "Write-Ahead Log and Crash Recovery",
+  "area": "databases",
+  "difficulty": "intermediate",
+  "intent": "Make a change durable by appending it to a sequential log before touching the data pages, so a crash can always be repaired by replaying that log.",
+  "scenario": "A bank transfer moves $30 from Alice to Bob while the server loses power. Depending on the exact moment, the transfer was acknowledged and must survive, or was half done and must vanish, and the data pages on disk are out of date either way.",
+  "problem": "A database changes 8 KB pages in memory and writes them to disk later, in any order, because random page writes are slow. A transfer touches two pages; a crash can leave one written and one not, a committed change that never reached disk, or an uncommitted change that did. Writing every page at commit would be slow and still not atomic, and a page torn by a power cut can be half old and half new.",
+  "howItWorks": [
+    { "title": "Log first: append a record, then change the cached page", "text": "Every change becomes a log record with an increasing log sequence number (LSN): transaction, page, and what changed. It is appended to the log buffer before the cached page is modified, and the page remembers the LSN of its last change (the page LSN). The log is written sequentially, which is much cheaper than scattered page writes." },
+    { "title": "Commit means the commit record is fsynced", "text": "A transaction is committed when its commit record is durable, not when its pages are on disk. The commit flushes the log up to that LSN and waits for fsync, typically 0.1 to 2 ms on SSD, more on network disks. Group commit lets many transactions wait for one shared fsync, so throughput scales while each commit still pays about one flush latency." },
+    { "title": "Pages are written lazily: steal and no-force", "text": "The buffer pool may write a dirty page before its transaction commits (steal) and need not write it at commit (no-force). This is fast, but means the disk holds both uncommitted changes and not-yet-written committed ones. The write-ahead rule keeps it safe: before a page goes to disk, the log up to its page LSN must already be durable, so every change on disk can be undone." },
+    { "title": "Checkpoints bound the work after a crash", "text": "A checkpoint records which pages were dirty and flushes them, then writes a checkpoint record. Recovery starts at the last complete checkpoint instead of the beginning of time, and older log can be recycled or archived. Frequent checkpoints shorten recovery but write more pages, and with full-page writes enabled each page's first change after a checkpoint logs the whole page." },
+    { "title": "Recovery: analysis, redo, undo", "text": "Analysis scans from the checkpoint to find which transactions had committed and which were still running. Redo repeats history: for each logged change it applies it only if the page LSN is older than the record, so it is idempotent and also redoes the losers. Undo then rolls back every unfinished transaction, writing a compensation log record (CLR) for each reversal so a crash during recovery does not undo anything twice." },
+    { "title": "Torn pages, and the log as a stream", "text": "A page write interrupted by power loss can leave a page half new and half old; a checksum detects it, and a full-page image in the log (or a doublewrite buffer) gives redo a clean base. Because the log is an ordered, complete record of changes, replicas replay it for replication and archived segments plus a base backup give point-in-time recovery." }
+  ],
+  "pros": [
+    "Committed data survives power loss and process crashes at the price of one sequential fsync",
+    "Data pages can be written lazily, in the best disk order, without risking consistency",
+    "Recovery time is bounded by the checkpoint interval, not by database size",
+    "The same ordered log drives replication, point-in-time recovery and change data capture"
+  ],
+  "cons": [
+    "Every change is written twice: once to the log, once later to the page, plus full-page images after checkpoints",
+    "The fsync on commit sets a floor on commit latency and a ceiling on commits per second per disk",
+    "A busy log disk or a slow fsync stalls all writers",
+    "Checkpoints cause bursts of I/O, and a long checkpoint interval means long crash recovery and lots of retained log",
+    "Recovery has real cost: seconds to minutes on a large, busy database"
+  ],
+  "whenToUse": [
+    "Any store that must not lose acknowledged writes: relational databases, key-value stores, queues, file systems (journaling)",
+    "When you need replication or point-in-time recovery from an ordered change stream",
+    "When updates are in place on pages and a crash must not leave them inconsistent"
+  ],
+  "whenNotToUse": [
+    "Caches and scratch data that can be rebuilt after a crash, where the log is pure overhead",
+    "Systems that are append-only already (immutable files, LSM memtable plus its own log), where the log is the data",
+    "Disabling fsync or the log for a faster benchmark on data you care about"
+  ],
+  "pitfalls": [
+    "Turning off fsync, or using a disk or RAID controller cache without battery or capacitor, so 'durable' commits sit in volatile memory: the database reports success and loses them on power cut",
+    "Treating asynchronous commit (synchronous_commit=off, innodb_flush_log_at_trx_commit=2) as free: it can lose the last fraction of a second of acknowledged transactions",
+    "Putting the log on the same busy volume as data pages, so checkpoint writes delay commit fsyncs",
+    "A very long checkpoint interval or one huge transaction: recovery then replays gigabytes and the database is down for minutes",
+    "Not monitoring log retention: a stalled replica or an unused replication slot stops old log from being recycled until the disk is full",
+    "Disabling full-page writes or checksums on storage that can tear pages (a page larger than the device's atomic write unit)"
+  ],
+  "related": [
+    { "kind": "concept", "slug": "backups-and-point-in-time-recovery" },
+    { "kind": "concept", "slug": "lsm-trees-vs-b-trees" },
+    { "kind": "concept", "slug": "mvcc-and-isolation-levels" },
+    { "kind": "concept", "slug": "acid-vs-base" },
+    { "kind": "concept", "slug": "database-replication" },
+    { "kind": "concept", "slug": "event-sourcing" },
+    { "kind": "concept", "slug": "logical-clocks" }
+  ],
+  "roles": [
+    { "id": "app", "label": "Transaction", "description": "The client running the transfer and waiting for the commit acknowledgement." },
+    { "id": "pool", "label": "Buffer pool", "description": "Cached 8 KB pages in memory; changed pages are dirty until written back." },
+    { "id": "log", "label": "Write-ahead log", "description": "Sequential file of change records with increasing LSNs; durable after fsync." },
+    { "id": "data", "label": "Data pages", "description": "The table and index files on disk, written lazily and possibly out of date." },
+    { "id": "recovery", "label": "Recovery", "description": "Runs after a crash: analysis, redo from the checkpoint, undo of unfinished transactions." }
+  ]
+}

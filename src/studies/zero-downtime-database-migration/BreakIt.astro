@@ -1,0 +1,106 @@
+---
+import PlaygroundShell from '../../components/PlaygroundShell.astro';
+---
+<PlaygroundShell title="Move a live database" hint="A 5 TB database keeps taking writes while you copy it. Choose how the copy stays in sync, how you check it, and how you cut over. A small seeded model of 1,000 rows (10 chunks of 100) runs the whole migration, and the same 200 writes arrive on the new database after the flip.">
+  <ol class="how">
+    <li>The default is <b>dual-write</b>, <b>no verification</b>, a <b>big-bang</b> flip and the new id counter starting at the snapshot. It looks fine and is wrong: <b>151 rows diverged</b>, <b>42 new ids collide</b> with live rows, and a rollback <b>loses 200 writes</b>.</li>
+    <li>Switch verification to <b>chunk checksums</b>: the differing chunks are found and re-copied, so the diverged rows fall to <b>0</b>. Row counts alone leave <b>116</b>, because a changed value does not change a count.</li>
+    <li>Switch to <b>snapshot + change log</b> with <b>reads first, then a write freeze</b>: the lag of <b>20</b> entries is drained in a <b>2.25 second</b> freeze. With the big-bang flip the same 20 entries are dropped and <b>20 rows</b> diverge. <b>Stop-the-world</b> is exact but down for <b>6.9 hours</b>.</li>
+    <li>Tick <b>leave a gap in the ids</b> to remove the collisions, and pick <b>freeze + reverse replication</b> to bring writes lost on rollback from <b>200</b> to <b>0</b>.</li>
+  </ol>
+  <div class="pg zdm" data-zdm>
+    <div class="pg-row">
+      <label>Keep the copy in sync with <select class="pg-in" data-sync>
+        <option value="stop">stop-the-world copy (writes off)</option>
+        <option value="log">snapshot + change log</option>
+        <option value="dual" selected>dual-write from the application</option>
+      </select></label>
+      <label>Verify before cutover <select class="pg-in" data-verify>
+        <option value="none" selected>nothing</option>
+        <option value="counts">row counts</option>
+        <option value="sums">chunk checksums</option>
+      </select></label>
+      <label>Cutover <select class="pg-in" data-cut>
+        <option value="big" selected>big bang, no freeze</option>
+        <option value="freeze">reads first, then a short write freeze</option>
+        <option value="reverse">freeze + reverse replication to the old database</option>
+      </select></label>
+      <label><input type="checkbox" data-gap /> Leave a gap in the new id sequence</label>
+    </div>
+    <div class="pg-grid">
+      <div class="pg-box" data-b1><h3>Write downtime</h3><span class="pg-mono" data-o1></span><span class="pg-note" data-n1></span></div>
+      <div class="pg-box" data-b2><h3>Rows that differ after cutover</h3><span class="pg-mono" data-o2></span><span class="pg-note" data-n2></span></div>
+      <div class="pg-box" data-b3><h3>Writes lost on rollback</h3><span class="pg-mono" data-o3></span><span class="pg-note" data-n3></span></div>
+      <div class="pg-box" data-b4><h3>Lag at cutover</h3><span class="pg-mono" data-o4></span><span class="pg-note" data-n4></span></div>
+      <div class="pg-box" data-b5><h3>New ids that collide</h3><span class="pg-mono" data-o5></span><span class="pg-note" data-n5></span></div>
+    </div>
+    <p class="pg-out" data-verdict aria-live="polite"></p>
+    <p class="pg-note">Model: 1,000 rows copied in 10 chunks while 50 writes arrive per tick (60% updates, 20% inserts, 20% deletes). Dual-write drops 3% of the writes to the new database, and the backfill copies the snapshot, so it can overwrite a newer value. The change log is applied 80 entries per tick until the lag is below 30. Copy time assumes 5 TB at 200 MB/s. A freeze costs 2 seconds to flip plus the lag at 80 entries per second. After the flip, 200 writes go to the new database.</p>
+  </div>
+</PlaygroundShell>
+<script>
+  document.querySelectorAll<HTMLElement>('[data-zdm]').forEach((root) => {
+    const q = <T extends HTMLElement>(s: string) => root.querySelector<T>(s)!;
+    type Opt = { sync: string; verify: string; cut: string; gap: boolean };
+      function simulate(o: Opt) {
+    let seed = 7; const random = (n: number) => { seed = (seed * 1664525 + 1013904223) % 4294967296; return Math.floor(seed / 65536) % n; };
+    class Db { rows: Map<number, number>; log: any[]; nextId: number; constructor() { this.rows = new Map<number, number>(); this.log = [] as any[]; this.nextId = 1; }
+      set(id: number, v: number) { this.rows.set(id, v); this.log.push({ op: 'set', id, val: v }); }
+      del(id: number) { this.rows.delete(id); this.log.push({ op: 'del', id }); }
+      apply(e: any) { this.nextId = Math.max(this.nextId, e.id + 1); if (e.op === 'set') this.rows.set(e.id, e.val); else this.rows.delete(e.id); } }
+    const workload = (db: Db, n: number) => { for (let i = 0; i < n; i++) { const r = random(10); if (r < 6) db.set(1 + random(db.nextId - 1), random(1000)); else if (r < 8) { const id = db.nextId++; db.set(id, random(1000)); } else db.del(1 + random(db.nextId - 1)); } };
+    const bad = (a: Db, b: Db) => { const ids: number[] = []; for (let id = 1; id < Math.max(a.nextId, b.nextId); id++) if ((a.rows.get(id) ?? -1) !== (b.rows.get(id) ?? -1)) ids.push(id); return ids; };
+    const src = new Db(); for (let i = 0; i < 1000; i++) src.set(src.nextId++, random(1000)); src.log = [];
+    const snap = new Map<number, number>(src.rows), snapNext = src.nextId, dst = new Db();
+    const copy = (t: number) => { for (let id = 1 + t * 100; id < 101 + t * 100; id++) if (snap.has(id)) dst.rows.set(id, snap.get(id)!); };
+    let applied = 0, lag = 0, ticks = 0;
+    if (o.sync === 'stop') { for (let t = 0; t < 10; t++) copy(t); dst.nextId = src.nextId; }
+    else if (o.sync === 'dual') { for (let t = 0; t < 10; t++) { copy(t); const from = src.log.length; workload(src, 50); for (const e of src.log.slice(from)) if (random(100) >= 3) dst.apply(e); } dst.nextId = Math.max(dst.nextId, src.nextId); }
+    else { for (let t = 0; t < 10; t++) { copy(t); workload(src, 50); } while (src.log.length - applied >= 30) { workload(src, 50); for (let k = 0; k < 80 && applied < src.log.length; k++) dst.apply(src.log[applied++]); ticks++; } lag = src.log.length - applied; dst.nextId = Math.max(dst.nextId, src.nextId); }
+    // verification, before the flip
+    const chunkOf = (id: number) => Math.floor((id - 1) / 100);
+    const drain = o.cut !== 'big';
+    if (o.sync === 'log' && drain) while (applied < src.log.length) dst.apply(src.log[applied++]);
+    const found = { chunks: 0, count: 0 };
+    let ids = bad(src, dst);
+    found.chunks = new Set(ids.map(chunkOf)).size; found.count = Math.abs(src.rows.size - dst.rows.size);
+    if (o.verify === 'counts') { for (const id of ids) if (src.rows.has(id) !== dst.rows.has(id)) { if (src.rows.has(id)) dst.rows.set(id, src.rows.get(id)!); else dst.rows.delete(id); } }
+    else if (o.verify === 'sums') { for (const id of ids) { if (src.rows.has(id)) dst.rows.set(id, src.rows.get(id)!); else dst.rows.delete(id); } }
+    dst.nextId = Math.max(dst.nextId, src.nextId);
+    const diverged = bad(src, dst).length;
+    let clash = 0; for (let k = 0; k < 50; k++) if (src.rows.has(snapNext + k)) clash++;
+    if (o.gap) clash = 0; else dst.nextId = snapNext;
+    if (o.gap) dst.nextId = src.nextId + 1000;
+    dst.log = []; workload(dst, 200);
+    const rev = o.cut === 'reverse';
+    if (rev) for (const e of dst.log) src.apply(e);
+    const lost = rev ? 0 : dst.log.length;
+    const hours = 5e6 / 200 / 3600;
+    const freezeS = o.cut === 'big' ? 0 : 2 + (o.sync === 'log' ? lag / 80 : 0);
+    return { diverged, lost, lag, clash, found, hours, freezeS, rollbackOff: bad(src, dst).length };
+}
+
+    const set = (i: number, v: string, n: string, c: string) => { q(`[data-o${i}]`).textContent = v; q(`[data-n${i}]`).textContent = n; q<HTMLElement>(`[data-b${i}]`).style.setProperty('--c', c); };
+    function draw() {
+      const sync = q<HTMLSelectElement>('[data-sync]').value; const verify = q<HTMLSelectElement>('[data-verify]').value; const cut = q<HTMLSelectElement>('[data-cut]').value; const gap = q<HTMLInputElement>('[data-gap]').checked;
+      const r = simulate({ sync, verify, cut, gap });
+      const stop = sync === 'stop';
+      const downS = stop ? r.hours * 3600 + r.freezeS : r.freezeS;
+      const downTxt = stop ? `${r.hours.toFixed(1)} hours` : `${r.freezeS.toFixed(r.freezeS % 1 ? 2 : 0)} seconds`;
+      const probs: string[] = [];
+      if (downS > 60) probs.push(`the service was read-only for ${r.hours.toFixed(1)} hours`);
+      if (r.diverged > 0) probs.push(`${r.diverged} rows differ between the two databases`);
+      if (r.clash > 0) probs.push(`${r.clash} of the first 50 new ids hit live rows`);
+      if (r.lost > 0) probs.push(`a rollback would lose ${r.lost} writes`);
+      set(1, downTxt, stop ? 'every write waits for the whole copy' : cut === 'big' ? 'no freeze, so the writes still in the log are dropped' : `2 seconds to flip${sync === 'log' ? ` plus ${r.lag} entries drained at 80 per second` : ''}`, downS > 60 ? 'var(--bad)' : 'var(--good)');
+      set(2, `${r.diverged} rows`, verify === 'none' ? `nobody looked; ${r.found.chunks} chunks were actually wrong` : verify === 'counts' ? `counts found ${r.found.count} missing or extra rows; changed values slip through` : `${r.found.chunks} wrong chunks found and re-copied`, r.diverged ? 'var(--bad)' : 'var(--good)');
+      set(3, `${r.lost} writes`, cut === 'reverse' ? 'the old database received every new write, so it is current' : 'the old database never saw the 200 new writes', r.lost ? 'var(--bad)' : 'var(--good)');
+      set(4, sync === 'log' ? `${r.lag} entries` : 'none', sync === 'log' ? (cut === 'big' ? 'flipped without draining: these writes are lost' : 'drained during the freeze, so nothing is lost') : 'there is no change log to be behind on', sync === 'log' && cut === 'big' ? 'var(--bad)' : 'var(--accent)');
+      set(5, `${r.clash} of 50`, gap ? 'the new counter starts 1,000 above the old maximum' : 'the new counter restarts at the snapshot value, 1,001', r.clash ? 'var(--bad)' : 'var(--good)');
+      const out = q('[data-verdict]'); out.classList.toggle('bad', probs.length > 0);
+      out.textContent = probs.length ? `Not safe to flip: ${probs.join('; ')}.` : `Clean migration: ${downTxt} of write downtime, 0 rows different, 0 writes lost if you roll back, and no id collisions.`;
+    }
+    root.addEventListener('input', draw); root.addEventListener('change', draw);
+    draw();
+  });
+</script>

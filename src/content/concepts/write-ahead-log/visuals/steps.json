@@ -1,0 +1,62 @@
+{
+  "actors": [
+    { "id": "app", "label": "Transfer T7", "role": "app", "x": 14, "y": 20 },
+    { "id": "pool", "label": "Buffer pool", "role": "pool", "x": 50, "y": 20 },
+    { "id": "log", "label": "WAL", "role": "log", "x": 86, "y": 50 },
+    { "id": "data", "label": "Data pages", "role": "data", "x": 50, "y": 80 },
+    { "id": "recovery", "label": "Recovery", "role": "recovery", "x": 14, "y": 80 }
+  ],
+  "frames": [
+    {
+      "narration": "Transfer $30 from Alice (page 12) to Bob (page 40). The last checkpoint is at LSN 90, and both accounts hold $100 on disk. T7 starts: a BEGIN record is appended to the log.",
+      "messages": [{ "from": "app", "to": "log", "label": "LSN 101 BEGIN T7" }],
+      "states": { "data": "A=100 B=100", "log": "durable to 100" }
+    },
+    {
+      "narration": "Log first, then the page: the debit is logged as LSN 102, and only then does the cached page 12 change to $70 with page LSN 102. Nothing is written to the data file.",
+      "messages": [{ "from": "app", "to": "log", "label": "102 A -30" }, { "from": "app", "to": "pool", "label": "debit" }],
+      "states": { "pool": "A=70 (dirty)", "log": "102 in buffer", "data": "A=100 B=100" },
+      "highlight": ["log"]
+    },
+    {
+      "narration": "The credit is logged as LSN 103 and applied to page 40 in the pool: Bob has $130 in memory. The log records are still only in the log buffer. A crash right now would simply forget T7.",
+      "messages": [{ "from": "app", "to": "log", "label": "103 B +30" }, { "from": "app", "to": "pool", "label": "credit" }],
+      "states": { "pool": "A=70 B=130 (dirty)", "log": "103 in buffer" }
+    },
+    {
+      "narration": "COMMIT is LSN 104. The log is flushed with fsync, about 1 ms, and only then is T7 acknowledged. The data pages on disk still say $100 and $100, and that is fine.",
+      "messages": [{ "from": "app", "to": "log", "label": "104 COMMIT + fsync" }, { "from": "log", "to": "app", "label": "committed" }],
+      "states": { "log": "durable to 104", "data": "A=100 B=100 (old)" },
+      "highlight": ["log"]
+    },
+    {
+      "narration": "Power fails. The buffer pool is gone, so $70 and $130 are lost from memory, and the data pages are out of date. The only record of the committed transfer is the durable log.",
+      "states": { "pool": "lost", "data": "A=100 B=100 (old)", "log": "durable to 104" },
+      "highlight": ["pool"]
+    },
+    {
+      "narration": "Restart. Analysis reads the log from the checkpoint at LSN 90 up to 104 and finds that T7 has a COMMIT record, so it is a winner.",
+      "messages": [{ "from": "recovery", "to": "log", "label": "scan 90..104" }],
+      "states": { "recovery": "T7 committed" },
+      "highlight": ["recovery"]
+    },
+    {
+      "narration": "Redo repeats history: page 12 has page LSN 85, older than 102, so $70 is reapplied; page 40 gets LSN 103 and $130. Had a page already carried LSN 102 or later, the record would be skipped.",
+      "messages": [{ "from": "recovery", "to": "data", "label": "redo 102, 103" }],
+      "states": { "data": "A=70 B=130", "recovery": "2 redone" },
+      "highlight": ["data"]
+    },
+    {
+      "narration": "Another moment: transfer T8 logged its debit as LSN 106, the pool wrote that dirty page to disk (steal) after flushing the log, then power failed before COMMIT. Undo reverses LSN 106 and logs a compensation record, LSN 107, so the money is back.",
+      "messages": [{ "from": "recovery", "to": "data", "label": "undo 106, CLR 107" }],
+      "states": { "recovery": "T8 rolled back", "data": "T8 debit removed" },
+      "highlight": ["recovery"]
+    },
+    {
+      "narration": "A checkpoint flushes the dirty pages and records its position, so the next recovery starts there. Everything before it is no longer needed for crash recovery, only for replicas and point-in-time restore.",
+      "messages": [{ "from": "pool", "to": "data", "label": "flush dirty pages" }, { "from": "pool", "to": "log", "label": "CHECKPOINT" }],
+      "states": { "log": "checkpoint at 120", "data": "up to date" },
+      "highlight": ["data"]
+    }
+  ]
+}

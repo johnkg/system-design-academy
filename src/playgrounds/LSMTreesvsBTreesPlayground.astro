@@ -1,0 +1,300 @@
+---
+import PlaygroundShell from '../components/PlaygroundShell.astro';
+const metrics = [
+  { id: 'wa', title: 'Write amplification', note: 'bytes written to disk per byte the application wrote (log, flushes, compaction, page rewrites)' },
+  { id: 'hit', title: 'Page reads, key exists', note: 'disk pages read per lookup of a key that is stored' },
+  { id: 'miss', title: 'Page reads, key missing', note: 'disk pages read per lookup of a key that is not stored' },
+  { id: 'worst', title: 'Worst single lookup', note: 'most pages any one point lookup read: the tail latency' },
+  { id: 'scan', title: 'Page reads per range scan', note: 'disk pages read to scan 100 consecutive user ids' },
+  { id: 'space', title: 'Space amplification', note: 'bytes stored per byte of live data, after the run' },
+];
+---
+<PlaygroundShell title="Simulate it" hint="The same stream of user-event operations runs through a B-tree and an LSM tree. Change the workload and the LSM settings and compare the bars: shorter is better.">
+  <ol class="how">
+    <li>With the defaults (write-heavy, size-tiered, bloom filters on) the B-tree writes roughly <b>20x</b> the data the application wrote, because it rewrites a whole 4 KB page for every 128-byte row. The LSM tree writes roughly <b>5x</b>: the log, one flush, and a few merges.</li>
+    <li>Switch <b>LSM compaction</b> to <b>Leveled</b>. The LSM write amplification roughly doubles (to about <b>10x</b>, still under half the B-tree) but space amplification falls from about <b>1.8x</b> to <b>1.2x</b> and a range scan opens fewer files.</li>
+    <li>Untick <b>Bloom filters</b>. A lookup of a missing key goes from under <b>0.1</b> pages to about <b>7</b> (about 4 with leveled), and an existing key from about <b>1</b> to about <b>5</b>, because every overlapping file must be read. The B-tree stays at 1. With filters on, the LSM tree is as cheap as the B-tree for existing keys and cheaper for missing ones.</li>
+    <li>Choose <b>Scan-heavy</b>. A scan costs the B-tree about <b>3</b> pages (adjacent leaves) but the tiered LSM about <b>7</b>: every sorted file overlapping the range must be opened, and bloom filters cannot help a range. Look at <b>Worst single lookup</b> too: the B-tree is always 1, the LSM tree is 2 to 3 even with filters.</li>
+  </ol>
+  <div class="pg lsx" data-lsx>
+    <div class="pg-row">
+      <label>Workload <select class="pg-in" data-workload>
+        <option value="write" selected>Write-heavy (90% writes, 8% lookups, 2% scans)</option>
+        <option value="read">Read-heavy (5% writes, 85% lookups, 10% scans)</option>
+        <option value="scan">Scan-heavy (10% writes, 20% lookups, 70% scans)</option>
+      </select></label>
+      <label>Operations <select class="pg-in" data-ops><option value="5000">5,000</option><option value="20000" selected>20,000</option><option value="50000">50,000</option></select></label>
+      <label>Seed <select class="pg-in" data-seed><option value="1" selected>1</option><option value="2">2</option><option value="3">3</option></select></label>
+    </div>
+    <div class="pg-row">
+      <label>LSM compaction <select class="pg-in" data-style><option value="tiered" selected>Size-tiered (merge 4 similar files)</option><option value="leveled">Leveled (one sorted run per level, 4x growth)</option></select></label>
+      <label class="lsx-check"><input type="checkbox" checked data-bloom /> Bloom filters</label>
+      <label>Lookups for missing keys <input type="range" min="0" max="100" step="10" value="30" data-miss /> <b data-missval>30</b>%</label>
+      <button class="btn" type="button" data-reset>Reset</button>
+    </div>
+    <div class="pg-grid">
+      {metrics.map((m) => (
+        <div class="pg-box lsx-metric" data-metric={m.id}>
+          <h3>{m.title}</h3>
+          <div class="lsx-line"><span class="lsx-name">B-tree</span><span class="lsx-track"><span class="lsx-bar" style="--c: var(--role-1)" data-bar="b"></span></span><span class="pg-mono lsx-val" data-val="b">-</span></div>
+          <div class="lsx-line"><span class="lsx-name">LSM tree</span><span class="lsx-track"><span class="lsx-bar" style="--c: var(--role-2)" data-bar="l"></span></span><span class="pg-mono lsx-val" data-val="l">-</span></div>
+          <span class="pg-note" data-verdict></span>
+          <span class="pg-note">{m.note}</span>
+        </div>
+      ))}
+    </div>
+    <div class="pg-out" data-shape aria-live="polite"></div>
+    <p class="pg-note">Model: 128-byte rows, 4 KB pages (32 rows), 20,000 possible users, 8,000 loaded plus a warm-up of overwrites and deletes before measuring. B-tree: 128-way inner pages kept in memory, in-place leaf updates, dirty pages written at a checkpoint every 500 writes plus a log record per write. LSM: 128-row memtable and files, 1% bloom false positives, filters and file indexes kept in memory, so one data page per file consulted. Nothing else is cached. Same seed, same operations, same numbers every time.</p>
+  </div>
+</PlaygroundShell>
+<script>
+  // ---------- simulation core (pure functions, no DOM) ----------
+  const ENTRY = 128; // bytes per row
+  const PAGE_BYTES = 4096; const PAGE = PAGE_BYTES / ENTRY; // 32 rows per 4 KB page
+  const KEYS = 20000; const PRELOAD = 8000; const WARMUP = 6000; // user ids 0..19999, stored as even keys; odd keys never exist
+  const FANOUT = 128; const CHECKPOINT = 500; // B-tree: inner page fan-out, writes between checkpoints
+  const MEM = 128; const FILE = 128; // LSM: memtable rows, rows per SSTable file
+  const TIER_RUNS = 4; const L0_TRIGGER = 4; const L1_FILES = 8; const RATIO = 4; const FP_PCT = 1; // compaction shape, bloom false-positive rate
+  const SCAN_SPAN = 200; // a scan covers 200 key values = 100 user ids
+
+  type OpType = 0 | 1 | 2 | 3 | 4; // put, delete, point read (hit), point read (miss), scan
+  interface Ops { type: Uint8Array; key: Int32Array }
+  interface Options { workload: string; ops: number; style: 'tiered' | 'leveled'; bloom: boolean; missPct: number; seed: number }
+  interface Summary { wa: number; space: number; peak: number; shape: string; work: string }
+  interface Engine { put(k: number): void; del(k: number): void; get(k: number): { pages: number; found: boolean }; scan(lo: number, hi: number): number; finish(): Summary; resetCounters(): void }
+  interface Side extends Summary { worst: number; hit: number; miss: number; scan: number; point: number }
+  interface Result { btree: Side; lsm: Side; counts: { writes: number; hits: number; misses: number; scans: number } }
+
+  const MIXES: Record<string, { write: number; del: number; read: number }> = { // percent of operations; the remainder are scans
+    write: { write: 90, del: 5, read: 8 },
+    read: { write: 5, del: 1, read: 85 },
+    scan: { write: 10, del: 1, read: 20 },
+  };
+
+  function mulberry32(seed: number) {
+    let a = seed >>> 0;
+    return () => { a = (a + 0x6d2b79f5) >>> 0; let t = a; t = Math.imul(t ^ (t >>> 15), t | 1); t ^= t + Math.imul(t ^ (t >>> 7), t | 61); return ((t ^ (t >>> 14)) >>> 0) / 4294967296; };
+  }
+
+  // Engine-independent operation list, so both engines see exactly the same workload.
+  function makeOps(opts: Options): { load: Ops; run: Ops } {
+    const rand = mulberry32(opts.seed * 7919 + 17); const present = new Uint8Array(KEYS);
+    const any = () => Math.floor(rand() * KEYS);
+    const pickPresent = () => { for (let i = 0; i < 40; i++) { const r = any(); if (present[r]) return r; } return -1; };
+    const load: Ops = { type: new Uint8Array(PRELOAD + WARMUP), key: new Int32Array(PRELOAD + WARMUP) }; // a bulk load, then a warm-up of overwrites and deletes
+    for (let i = 0; i < PRELOAD + WARMUP; i++) {
+      const victim = i >= PRELOAD && rand() < 0.1 ? pickPresent() : -1;
+      if (victim >= 0) { load.type[i] = 1; present[victim] = 0; load.key[i] = victim * 2; } else { const r = any(); present[r] = 1; load.key[i] = r * 2; }
+    }
+    const mix = MIXES[opts.workload] ?? MIXES.write; const run: Ops = { type: new Uint8Array(opts.ops), key: new Int32Array(opts.ops) };
+    for (let i = 0; i < opts.ops; i++) {
+      const p = rand() * 100; let type: OpType; let key: number;
+      if (p < mix.write) {
+        const victim = rand() * mix.write < mix.del ? pickPresent() : -1;
+        if (victim >= 0) { type = 1; present[victim] = 0; key = victim * 2; } else { type = 0; const r = any(); present[r] = 1; key = r * 2; }
+      } else if (p < mix.write + mix.read) {
+        const r = rand() * 100 < opts.missPct ? -1 : pickPresent();
+        if (r < 0) { type = 3; key = any() * 2 + 1; } else { type = 2; key = r * 2; }
+      } else { type = 4; key = Math.floor(rand() * (KEYS * 2 - SCAN_SPAN)); }
+      run.type[i] = type; run.key[i] = key;
+    }
+    return { load, run };
+  }
+
+  // ---- B-tree model: 4 KB leaf pages, in-place updates, splits, periodic checkpoint of dirty pages, write-ahead log ----
+  interface Leaf { id: number; lo: number; count: number }
+  function makeBTree(): Engine {
+    const present = new Uint8Array(KEYS * 2); const leaves: Leaf[] = [{ id: 0, lo: 0, count: 0 }];
+    let nextId = 1; const dirty = new Set<number | string>(); let pagesWritten = 0; let walRows = 0; let splits = 0; let userWrites = 0; let sinceCheckpoint = 0;
+    const findLeaf = (k: number) => { let lo = 0; let hi = leaves.length - 1; while (lo < hi) { const mid = (lo + hi + 1) >> 1; if (leaves[mid].lo <= k) lo = mid; else hi = mid - 1; } return lo; };
+    const height = () => { let h = 1; let cap = 1; while (cap < leaves.length) { cap *= FANOUT; h++; } return h; };
+    function split(idx: number) {
+      const leaf = leaves[idx]; const end = idx + 1 < leaves.length ? leaves[idx + 1].lo : KEYS * 2; const half = leaf.count >> 1; let seen = 0; let mid = leaf.lo;
+      for (let k = leaf.lo; k < end; k++) if (present[k]) { if (seen === half) { mid = k; break; } seen++; }
+      const fresh: Leaf = { id: nextId++, lo: mid, count: leaf.count - half }; leaf.count = half; leaves.splice(idx + 1, 0, fresh);
+      dirty.add(fresh.id); dirty.add('inner' + Math.floor(idx / FANOUT)); splits++; // a split writes the new leaf and rewrites the parent
+    }
+    function checkpoint() { pagesWritten += dirty.size; dirty.clear(); sinceCheckpoint = 0; }
+    function write(k: number, on: boolean) {
+      const idx = findLeaf(k); const leaf = leaves[idx];
+      if (on && !present[k]) { present[k] = 1; leaf.count++; } else if (!on && present[k]) { present[k] = 0; leaf.count--; }
+      dirty.add(leaf.id); walRows++; userWrites++; if (leaf.count > PAGE) split(idx);
+      if (++sinceCheckpoint >= CHECKPOINT) checkpoint();
+    }
+    return {
+      resetCounters() { checkpoint(); pagesWritten = 0; walRows = 0; splits = 0; userWrites = 0; },
+      put: (k) => write(k, true), del: (k) => write(k, false),
+      get: (k) => ({ pages: 1, found: present[k] === 1 }), // root and inner pages stay in the buffer pool: one leaf read
+      scan(lo, hi) { let idx = findLeaf(lo); let touched = 1; while (idx + 1 < leaves.length && leaves[idx + 1].lo < hi) { idx++; touched++; } return touched; }, // leaf pages read, linked or re-descended
+      finish() {
+        checkpoint(); let live = 0; for (const l of leaves) live += l.count;
+        let inner = 0; let n = leaves.length; while (n > 1) { n = Math.ceil(n / FANOUT); inner += n; }
+        const space = ((leaves.length + inner) * PAGE) / Math.max(1, live);
+        return { wa: (walRows * ENTRY + pagesWritten * PAGE_BYTES) / Math.max(1, userWrites * ENTRY), space, peak: space, shape: `height ${height()}, ${leaves.length} leaf pages, ${inner} inner pages`, work: `${splits} page splits, ${pagesWritten} pages rewritten at checkpoints (${Math.round(pagesWritten * PAGE_BYTES / 1024)} KB)` };
+      },
+    };
+  }
+
+  // ---- LSM model: write-ahead log, memtable, immutable sorted files, bloom filters, tombstones, two compaction styles ----
+  interface Run { id: number; keys: Int32Array; tomb: Uint8Array; tier: number; min: number; max: number }
+  function makeLsm(style: 'tiered' | 'leveled', bloom: boolean, liveNow: () => number): Engine {
+    let mem = new Map<number, number>(); let nextId = 1; let walRows = 0; let userWrites = 0; let flushRows = 0; let compRead = 0; let compWrite = 0; let merges = 0; let peakRatio = 0;
+    let runs: Run[] = []; // size-tiered: newest first
+    let l0: Run[] = []; const levels: Run[][] = []; const pointer: number[] = []; // leveled: L0 newest first, then L1.. as sorted non-overlapping files
+    const storedRows = () => { let n = 0; const add = (r: Run) => { n += r.keys.length; }; runs.forEach(add); l0.forEach(add); levels.forEach((lv) => lv.forEach(add)); return n; };
+
+    function build(entries: [number, number][], tier: number): Run {
+      const keys = new Int32Array(entries.length); const tomb = new Uint8Array(entries.length);
+      entries.forEach(([k, t], i) => { keys[i] = k; tomb[i] = t; });
+      return { id: nextId++, keys, tomb, tier, min: keys[0], max: keys[keys.length - 1] };
+    }
+    function merge(inputs: Run[], dropTombstones: boolean): [number, number][] { // inputs are newest first; the newest version of a key wins
+      const m = new Map<number, number>();
+      for (let i = inputs.length - 1; i >= 0; i--) { const r = inputs[i]; compRead += r.keys.length; for (let j = 0; j < r.keys.length; j++) m.set(r.keys[j], r.tomb[j]); }
+      const out = [...m].filter(([, t]) => !(dropTombstones && t === 1)).sort((a, b) => a[0] - b[0]);
+      compWrite += out.length; merges++; peakRatio = Math.max(peakRatio, (storedRows() + out.length) / Math.max(1, liveNow())); // inputs are still on disk while the output is written
+      return out;
+    }
+    function compactTiered() {
+      for (let again = true; again;) {
+        again = false;
+        for (let t = 0; t < 12 && !again; t++) {
+          const group = runs.filter((r) => r.tier === t);
+          if (group.length < TIER_RUNS) continue;
+          const first = runs.indexOf(group[0]); const oldest = first + group.length === runs.length; // tiers never interleave: a group is contiguous
+          const out = merge(group, oldest); runs = [...runs.slice(0, first), ...(out.length ? [build(out, t + 1)] : []), ...runs.slice(first + group.length)]; again = true;
+        }
+      }
+    }
+    const overlaps = (f: Run, lo: number, hi: number) => f.max >= lo && f.min <= hi;
+    const deeperEmpty = (from: number) => levels.slice(from).every((lv) => lv.length === 0);
+    function intoLevel(li: number, upper: Run[], lo: number, hi: number) { // merge `upper` files into level li (0 = L1), rewriting only the files they overlap
+      while (levels.length <= li) { levels.push([]); pointer.push(-1); }
+      const target = levels[li]; const hit = target.filter((f) => overlaps(f, lo, hi)); const keep = target.filter((f) => !overlaps(f, lo, hi));
+      const out = merge([...upper, ...hit], deeperEmpty(li + 1)); const files: Run[] = [];
+      for (let i = 0; i < out.length; i += FILE) files.push(build(out.slice(i, i + FILE), li + 1));
+      levels[li] = [...keep, ...files].sort((a, b) => a.min - b.min);
+    }
+    function compactLeveled() {
+      for (let again = true; again;) {
+        again = false;
+        if (l0.length >= L0_TRIGGER) {
+          const lo = Math.min(...l0.map((f) => f.min)); const hi = Math.max(...l0.map((f) => f.max)); const upper = l0; l0 = []; intoLevel(0, upper, lo, hi); again = true; continue;
+        }
+        for (let li = 0; li < levels.length && !again; li++) {
+          if (levels[li].length <= L1_FILES * Math.pow(RATIO, li)) continue;
+          const file = levels[li].find((f) => f.min > pointer[li]) ?? levels[li][0]; pointer[li] = file.max;
+          levels[li] = levels[li].filter((f) => f !== file); intoLevel(li + 1, [file], file.min, file.max); again = true;
+        }
+      }
+    }
+    function flush() {
+      const entries = [...mem].sort((a, b) => a[0] - b[0]); const run = build(entries, 0); flushRows += entries.length; mem = new Map();
+      if (style === 'tiered') { runs.unshift(run); compactTiered(); } else { l0.unshift(run); compactLeveled(); }
+    }
+    function fp(k: number, id: number) { let h = Math.imul(k ^ Math.imul(id, 0x9e3779b1), 0x85ebca6b); h ^= h >>> 13; h = Math.imul(h, 0xc2b2ae35); h ^= h >>> 16; return (h >>> 0) % 100 < FP_PCT; }
+    const lower = (a: Int32Array, x: number) => { let lo = 0; let hi = a.length; while (lo < hi) { const m = (lo + hi) >> 1; if (a[m] < x) lo = m + 1; else hi = m; } return lo; };
+    function write(k: number, tomb: number) { walRows++; userWrites++; mem.set(k, tomb); if (mem.size >= MEM) flush(); }
+
+    return {
+      resetCounters() { walRows = 0; userWrites = 0; flushRows = 0; compRead = 0; compWrite = 0; merges = 0; peakRatio = 0; },
+      put: (k) => write(k, 0), del: (k) => write(k, 1),
+      get(k) {
+        const m = mem.get(k); if (m !== undefined) return { pages: 0, found: m === 0 };
+        let pages = 0;
+        const probe = (r: Run): number => { // 0 = not here, 1 = live value, 2 = tombstone
+          if (k < r.min || k > r.max) return 0; // the file's key range is free metadata
+          const i = lower(r.keys, k); const here = i < r.keys.length && r.keys[i] === k;
+          if (bloom && !here && !fp(k, r.id)) return 0; // the filter answers "definitely not here" from memory
+          pages++; return here ? (r.tomb[i] ? 2 : 1) : 0; // otherwise read one data page
+        };
+        for (const r of style === 'tiered' ? runs : l0) { const p = probe(r); if (p) return { pages, found: p === 1 }; }
+        if (style === 'leveled') for (const lv of levels) { const f = lv.find((x) => k >= x.min && k <= x.max); if (f) { const p = probe(f); if (p) return { pages, found: p === 1 }; } }
+        return { pages, found: false };
+      },
+      scan(lo, hi) { // bloom filters cannot help a range: every file overlapping the range must be opened
+        let pages = 0; const all: Run[] = style === 'tiered' ? runs : [...l0, ...levels.flat()];
+        for (const r of all) { if (r.max < lo || r.min >= hi) continue; const n = lower(r.keys, hi) - lower(r.keys, lo); pages += Math.max(1, Math.ceil(n / PAGE)); }
+        return pages;
+      },
+      finish() {
+        const live = Math.max(1, liveNow()); const stored = storedRows();
+        const shape = style === 'tiered' ? 'files per size tier (small to large): ' + [0, 1, 2, 3, 4, 5].map((t) => runs.filter((r) => r.tier === t).length).join(' / ') + `; ${runs.length} files in total`
+          : `L0 ${l0.length} files` + levels.map((lv, i) => `, L${i + 1} ${lv.length}`).join('');
+        return { wa: (walRows + flushRows + compWrite) / Math.max(1, userWrites), space: stored / live, peak: Math.max(peakRatio, stored / live), shape, work: `${merges} merges read ${compRead} rows and wrote ${compWrite} rows` };
+      },
+    };
+  }
+
+  function simulate(opts: Options): Result {
+    const { load, run } = makeOps(opts); const present = new Uint8Array(KEYS * 2); let liveNow = 0;
+    const engines = [makeBTree(), makeLsm(opts.style, opts.bloom, () => liveNow)];
+    const apply = (type: number, k: number) => { if (type === 0 && !present[k]) { present[k] = 1; liveNow++; } else if (type === 1 && present[k]) { present[k] = 0; liveNow--; } };
+    for (let i = 0; i < load.type.length; i++) { apply(load.type[i], load.key[i]); engines.forEach((e) => (load.type[i] === 0 ? e.put(load.key[i]) : e.del(load.key[i]))); }
+    engines.forEach((e) => e.resetCounters()); // the bulk load and warm-up are not part of the measurement
+    const sides = engines.map(() => ({ hit: [0, 0], miss: [0, 0], scan: [0, 0], worst: 0 })); const counts = { writes: 0, hits: 0, misses: 0, scans: 0 };
+    for (let i = 0; i < run.type.length; i++) {
+      const type = run.type[i]; const k = run.key[i]; apply(type, k);
+      if (type <= 1) { counts.writes++; engines.forEach((e) => (type === 0 ? e.put(k) : e.del(k))); }
+      else if (type === 4) { counts.scans++; engines.forEach((e, j) => { sides[j].scan[0] += e.scan(k, k + SCAN_SPAN); sides[j].scan[1]++; }); }
+      else {
+        if (type === 2) counts.hits++; else counts.misses++;
+        engines.forEach((e, j) => { const r = e.get(k); const slot = type === 2 ? sides[j].hit : sides[j].miss; slot[0] += r.pages; slot[1]++; sides[j].worst = Math.max(sides[j].worst, r.pages); if (r.found !== (type === 2)) throw new Error('stale read at op ' + i); });
+      }
+    }
+    const avg = (p: number[]) => (p[1] ? p[0] / p[1] : NaN);
+    const side = (j: number): Side => { const s = sides[j]; return { ...engines[j].finish(), worst: s.worst, hit: avg(s.hit), miss: avg(s.miss), scan: avg(s.scan), point: avg([s.hit[0] + s.miss[0], s.hit[1] + s.miss[1]]) }; };
+    return { btree: side(0), lsm: side(1), counts };
+  }
+
+  // ---------- page ----------
+  document.querySelectorAll<HTMLElement>('[data-lsx]').forEach((root) => {
+    const q = <T extends HTMLElement>(s: string) => root.querySelector<T>(s)!;
+    const cache = new Map<string, Result>(); let frame = 0;
+    const defaults = { workload: 'write', ops: '20000', seed: '1', style: 'tiered', miss: '30', bloom: true };
+    const options = (): Options => ({
+      workload: q<HTMLSelectElement>('[data-workload]').value, ops: Number(q<HTMLSelectElement>('[data-ops]').value), seed: Number(q<HTMLSelectElement>('[data-seed]').value),
+      style: q<HTMLSelectElement>('[data-style]').value === 'leveled' ? 'leveled' : 'tiered', bloom: q<HTMLInputElement>('[data-bloom]').checked, missPct: Number(q<HTMLInputElement>('[data-miss]').value),
+    });
+    const num = (x: number, digits: number, suffix: string) => (Number.isFinite(x) ? x.toFixed(digits) + suffix : 'n/a');
+    function paint(id: string, b: number, l: number, digits: number, suffix: string) {
+      const box = q('[data-metric="' + id + '"]'); const max = Math.max(Number.isFinite(b) ? b : 0, Number.isFinite(l) ? l : 0, 0.0001);
+      box.querySelector<HTMLElement>('[data-bar="b"]')!.style.width = (Number.isFinite(b) ? Math.max(1.5, (b / max) * 100) : 0) + '%';
+      box.querySelector<HTMLElement>('[data-bar="l"]')!.style.width = (Number.isFinite(l) ? Math.max(1.5, (l / max) * 100) : 0) + '%';
+      box.querySelector('[data-val="b"]')!.textContent = num(b, digits, suffix); box.querySelector('[data-val="l"]')!.textContent = num(l, digits, suffix);
+      let verdict = 'no such operations in this workload';
+      if (Number.isFinite(b) && Number.isFinite(l)) {
+        const ratio = Math.max(b, l) / Math.max(Math.min(b, l), 0.05);
+        verdict = ratio < 1.15 ? 'about equal' : (l < b ? 'LSM tree lower, ' : 'B-tree lower, ') + (ratio >= 10 ? Math.round(ratio) : ratio.toFixed(1)) + 'x less';
+      }
+      box.querySelector('[data-verdict]')!.textContent = verdict;
+    }
+    function render() {
+      q('[data-missval]').textContent = String(options().missPct);
+      const o = options(); const key = JSON.stringify(o); let r = cache.get(key);
+      if (!r) { r = simulate(o); if (cache.size > 30) cache.clear(); cache.set(key, r); }
+      const { btree: b, lsm: l } = r;
+      paint('wa', b.wa, l.wa, 1, 'x'); paint('hit', b.hit, l.hit, 2, ''); paint('miss', b.miss, l.miss, 2, ''); paint('worst', b.worst, l.worst, 0, '');
+      paint('scan', b.scan, l.scan, 1, ''); paint('space', b.space, l.space, 2, 'x');
+      q('[data-shape]').textContent = `B-tree: ${b.shape}. ${b.work}.\nLSM tree: ${l.shape}. ${l.work}. Space amplification peaked at ${l.peak.toFixed(2)}x while merging (inputs and output on disk together).\nWorkload: ${r.counts.writes} writes, ${r.counts.hits} lookups of existing keys, ${r.counts.misses} of missing keys, ${r.counts.scans} scans.`;
+    }
+    function schedule() { if (frame) return; frame = requestAnimationFrame(() => { frame = 0; render(); }); }
+    root.querySelectorAll('select, input[type="checkbox"], input[type="range"]').forEach((el) => el.addEventListener('input', schedule));
+    q('[data-miss]').addEventListener('input', () => { q('[data-missval]').textContent = q<HTMLInputElement>('[data-miss]').value; });
+    q('[data-reset]').addEventListener('click', () => {
+      q<HTMLSelectElement>('[data-workload]').value = defaults.workload; q<HTMLSelectElement>('[data-ops]').value = defaults.ops; q<HTMLSelectElement>('[data-seed]').value = defaults.seed;
+      q<HTMLSelectElement>('[data-style]').value = defaults.style; q<HTMLInputElement>('[data-bloom]').checked = defaults.bloom; q<HTMLInputElement>('[data-miss]').value = defaults.miss; schedule();
+    });
+    render();
+  });
+</script>
+<style is:global>
+  .playground .lsx-check { display: inline-flex; align-items: center; gap: 6px; }
+  .playground .lsx-line { display: grid; grid-template-columns: 4.6rem 1fr 3.6rem; gap: 8px; align-items: center; }
+  .playground .lsx-name { font-size: .85rem; color: var(--muted); }
+  .playground .lsx-track { display: block; height: 14px; border-radius: 7px; background: var(--surface-2); overflow: hidden; }
+  .playground .lsx-bar { display: block; height: 100%; width: 0; border-radius: 7px; background: var(--c); }
+  .playground .lsx-val { text-align: right; }
+  .playground [data-shape] { white-space: pre-wrap; }
+  @media (prefers-reduced-motion: no-preference) { .playground .lsx-bar { transition: width .35s ease-out; } }
+</style>

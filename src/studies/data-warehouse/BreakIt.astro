@@ -1,0 +1,128 @@
+---
+import PlaygroundShell from '../../components/PlaygroundShell.astro';
+---
+<PlaygroundShell title="What does this query scan?" hint="A table of 10 billion sales rows with 20 columns, in 100 daily partitions of 100 million rows. Choose how it is stored and what you ask, and watch the bytes, time and cost.">
+  <ol class="how">
+    <li>Start as it is: a <b>row store</b>, no compression, no pruning, and a <b>sum of one column over 7 days</b>. It reads the <b>whole 2.43 TB table</b>, about 21 minutes and $12.15, to add up one number.</li>
+    <li>Switch the layout to <b>columns</b>: only 2 of 20 columns are read (120 GB). Turn on <b>compression</b> (30.5 GB), then <b>pruning</b> (2.1 GB, 7 partitions, 0.6 seconds), which is over a thousand times less than where you started.</li>
+    <li>Now change the query to <b>select *</b>: all 20 columns are read again (34.7 GB, 16 times more than the sum). The columnar advantage over a row store with the same partitions falls to a few times, because the layout only helps when you skip columns.</li>
+  </ol>
+  <div class="pg dwb" data-dwb>
+    <div class="pg-row">
+      <label>Layout <select class="pg-in" data-layout><option value="row" selected>Row store (whole rows together)</option><option value="column">Column store (one file per column)</option></select></label>
+      <label>Compression <select class="pg-in" data-comp><option value="off" selected>None</option><option value="on">On (dictionary, run-length, delta)</option></select></label>
+      <label>Partition pruning <select class="pg-in" data-prune><option value="off" selected>Off (read every partition)</option><option value="on">On (skip by date with min/max)</option></select></label>
+      <label>Query <select class="pg-in" data-query>
+        <option value="sum7" selected>sum(amount), last 7 days</option>
+        <option value="group30">revenue by country by day, last 30 days</option>
+        <option value="star7">select *, last 7 days (an export)</option>
+        <option value="sumAll">sum(amount), all 100 days</option>
+      </select></label>
+      <label>Worker nodes <input type="range" min="1" max="64" value="8" data-nodes /> <b data-nodesval></b></label>
+      <label>Data cache <select class="pg-in" data-cache><option value="cold" selected>Cold (read from object storage)</option><option value="warm">Warm (on local SSD)</option></select></label>
+    </div>
+    <div class="pg-grid">
+      <div class="pg-box" data-b1><h3>Bytes scanned</h3><span class="pg-mono" data-o1></span><span class="pg-note" data-n1></span><div data-cols role="img" aria-label="Columns read"></div></div>
+      <div class="pg-box" data-b2><h3>Partitions read</h3><span class="pg-mono" data-o2></span><span class="pg-note" data-n2></span><div data-parts role="img" aria-label="Partitions read"></div></div>
+      <div class="pg-box" data-b3><h3>Estimated time</h3><span class="pg-mono" data-o3></span><span class="pg-note" data-n3></span></div>
+      <div class="pg-box" data-b4><h3>Cost of this query</h3><span class="pg-mono" data-o4></span><span class="pg-note" data-n4></span></div>
+    </div>
+    <p class="pg-out" data-verdict aria-live="polite"></p>
+    <p class="pg-note">Model: a row is 219 bytes of values plus 24 bytes of row header. Compression on a column store shrinks the 20 columns to 49.6 bytes per row in all (sorted dates and low-cardinality codes shrink most, free text least); on a row store only generic page compression is possible, about 1.8 times. Each node reads 0.6 GB/s from object storage or 3 GB/s from a warm SSD cache, and a row store is 2.5 times slower per byte because it walks tuple by tuple, where a column store processes vectors of values. Pruning uses each partition's min and max date, so it only helps a query with a date filter; the same effect in a row store comes from a date partition or index. A group-by adds 0.5 seconds for the shuffle of small partial aggregates. Prices: $5 per TB scanned, or $4 per node-hour of compute. The numbers are estimates for comparing choices, not a benchmark.</p>
+  </div>
+</PlaygroundShell>
+<script>
+  document.querySelectorAll<HTMLElement>('[data-dwb]').forEach((root) => {
+    const q = <T extends HTMLElement>(s: string) => root.querySelector<T>(s)!;
+    // name, raw bytes per value, encoded bytes per value
+    const COLS: [string, number, number][] = [
+      ['order_id', 8, 2], ['event_date', 4, 0.05], ['customer_id', 8, 5], ['product_id', 4, 2], ['store_id', 4, 0.5],
+      ['country', 2, 0.2], ['channel', 1, 0.1], ['status', 1, 0.1], ['currency', 3, 0.1], ['qty', 4, 1],
+      ['unit_price', 8, 3], ['discount', 4, 1], ['tax', 8, 3], ['amount', 8, 3], ['shipping_cost', 8, 3],
+      ['payment_method', 12, 0.5], ['coupon_code', 12, 1], ['user_agent', 64, 6], ['ip_address', 16, 6], ['notes', 40, 12],
+    ];
+    const PARTS = 100; const ROWS_PER_PART = 1e8; const ROW_OVERHEAD = 24; const ROW_PAGE_RATIO = 1.8;
+    const idx = (n: string) => COLS.findIndex((c) => c[0] === n);
+    const QUERIES: Record<string, { days: number; cols: string[]; filter: boolean; group: boolean; label: string }> = {
+      sum7: { days: 7, cols: ['amount'], filter: true, group: false, label: 'the sum' },
+      group30: { days: 30, cols: ['amount', 'country', 'event_date'], filter: true, group: true, label: 'the group-by' },
+      star7: { days: 7, cols: COLS.map((c) => c[0]), filter: true, group: false, label: 'select *' },
+      sumAll: { days: 100, cols: ['amount'], filter: false, group: false, label: 'the sum' },
+    };
+    type Cfg = { layout: string; comp: string; prune: string; query: string; nodes: number; cache: string };
+    function model(c: Cfg) {
+      const qy = QUERIES[c.query]; const compressed = c.comp === 'on'; const prune = c.prune === 'on' && qy.filter;
+      const partsRead = prune ? qy.days : PARTS;
+      let needed: number[] = [];
+      if (c.layout === 'row') needed = COLS.map((_, i) => i); // a row is stored whole, so every column is read
+      else { needed = qy.cols.map(idx); if (qy.filter && !prune && !needed.includes(1)) needed.push(1); } // without pruning the date column is needed to filter
+      const rawRow = COLS.reduce((s, x) => s + x[1], 0) + ROW_OVERHEAD;
+      const perRow = c.layout === 'row' ? rawRow / (compressed ? ROW_PAGE_RATIO : 1) : needed.reduce((s, i) => s + (compressed ? COLS[i][2] : COLS[i][1]), 0);
+      const tableRow = c.layout === 'row' ? rawRow / (compressed ? ROW_PAGE_RATIO : 1) : COLS.reduce((s, x) => s + (compressed ? x[2] : x[1]), 0);
+      const bytes = partsRead * ROWS_PER_PART * perRow; const table = PARTS * ROWS_PER_PART * tableRow;
+      const tp = (c.cache === 'warm' ? 3 : 0.6) * (c.layout === 'row' ? 0.4 : 1) * 1e9;
+      const time = bytes / (c.nodes * tp) + 0.2 + (qy.group ? 0.5 : 0);
+      return { partsRead, needed, bytes, table, time, scanCost: (bytes / 1e12) * 5, nodeCost: time * c.nodes * (4 / 3600), prune };
+    }
+    const fmtB = (b: number) => (b >= 1e12 ? `${(b / 1e12).toFixed(2)} TB` : b >= 1e9 ? `${(b / 1e9).toFixed(b >= 1e11 ? 0 : 1)} GB` : `${(b / 1e6).toFixed(0)} MB`);
+    const fmtT = (t: number) => (t >= 3600 ? `${(t / 3600).toFixed(1)} h` : t >= 60 ? `${(t / 60).toFixed(1)} min` : `${t.toFixed(1)} s`);
+    const fmtD = (v: number) => `$${v.toFixed(v < 0.1 ? 3 : 2)}`;
+    const fmtX = (x: number) => (x >= 100 ? Math.round(x).toLocaleString('en-US') : x >= 10 ? x.toFixed(0) : x.toFixed(1));
+
+    // Build the two strips once; the update only changes colours.
+    const cells = (host: HTMLElement, n: number, cols: number, h: number, names?: string[]) => {
+      host.style.display = 'grid'; host.style.gridTemplateColumns = `repeat(${cols}, 1fr)`; host.style.gap = '2px';
+      return Array.from({ length: n }, (_, i) => {
+        const d = document.createElement('span'); d.style.height = `${h}px`; d.style.border = '1px solid var(--border)'; d.style.borderRadius = '2px';
+        if (names) d.title = names[i];
+        host.append(d); return d;
+      });
+    };
+    const colCells = cells(q('[data-cols]'), COLS.length, COLS.length, 16, COLS.map((c) => c[0]));
+    const partCells = cells(q('[data-parts]'), PARTS, 20, 8);
+    const paint = (el: HTMLElement, on: boolean, colour: string) => { el.style.background = on ? colour : 'var(--surface-2)'; el.style.borderColor = on ? colour : 'var(--border)'; };
+    const tone = (el: HTMLElement, c: string) => el.style.setProperty('--c', c);
+
+    function draw() {
+      const cfg: Cfg = {
+        layout: q<HTMLSelectElement>('[data-layout]').value, comp: q<HTMLSelectElement>('[data-comp]').value, prune: q<HTMLSelectElement>('[data-prune]').value,
+        query: q<HTMLSelectElement>('[data-query]').value, nodes: Number(q<HTMLInputElement>('[data-nodes]').value), cache: q<HTMLSelectElement>('[data-cache]').value,
+      };
+      q('[data-nodesval]').textContent = String(cfg.nodes);
+      const r = model(cfg); const qy = QUERIES[cfg.query];
+      const base = model({ ...cfg, layout: 'row', comp: 'off', prune: 'off' });
+      const sameParts = model({ ...cfg, layout: 'row', prune: cfg.prune });
+      const isBase = cfg.layout === 'row' && cfg.comp === 'off' && cfg.prune === 'off';
+      const colour = cfg.layout === 'row' ? 'var(--bad)' : 'var(--accent)';
+      colCells.forEach((el, i) => paint(el, r.needed.includes(i), colour));
+      partCells.forEach((el, i) => paint(el, i >= PARTS - r.partsRead, 'var(--accent)'));
+      q<HTMLElement>('[data-cols]').setAttribute('aria-label', `${r.needed.length} of ${COLS.length} columns read`);
+      q<HTMLElement>('[data-parts]').setAttribute('aria-label', `${r.partsRead} of ${PARTS} partitions read`);
+
+      q('[data-o1]').textContent = fmtB(r.bytes); q('[data-n1]').textContent = `${r.needed.length} of ${COLS.length} columns read, ${((r.bytes / r.table) * 100).toFixed(r.bytes / r.table < 0.1 ? 2 : 0)}% of the stored table (${fmtB(r.table)})`;
+      q('[data-o2]').textContent = `${r.partsRead} of ${PARTS}`; q('[data-n2]').textContent = r.partsRead === PARTS ? (cfg.prune === 'on' && !qy.filter ? 'no date filter, so nothing can be skipped' : 'all days read') : `${PARTS - r.partsRead} skipped by their min/max date`;
+      q('[data-o3]').textContent = fmtT(r.time); q('[data-n3]').textContent = `${cfg.nodes} node${cfg.nodes > 1 ? 's' : ''}, ${cfg.cache === 'warm' ? 'SSD cache' : 'object storage'}`;
+      q('[data-o4]').textContent = fmtD(r.scanCost); q('[data-n4]').textContent = `${fmtD(r.nodeCost)} if billed by node-time instead of bytes scanned`;
+      tone(q('[data-b1]'), r.bytes / r.table > 0.5 ? 'var(--bad)' : r.bytes / r.table < 0.1 ? 'var(--good)' : 'var(--accent)');
+      tone(q('[data-b2]'), r.partsRead === PARTS ? 'var(--bad)' : 'var(--good)');
+      tone(q('[data-b3]'), r.time > 60 ? 'var(--bad)' : r.time < 5 ? 'var(--good)' : 'var(--accent)');
+      tone(q('[data-b4]'), r.scanCost > 5 ? 'var(--bad)' : r.scanCost < 0.1 ? 'var(--good)' : 'var(--accent)');
+
+      const out = q('[data-verdict]'); out.classList.toggle('bad', r.time > 60);
+      let t: string;
+      if (isBase) t = `Baseline: the row store reads every column of ${r.partsRead} partitions, ${fmtB(r.bytes)} in all, takes ${fmtT(r.time)} and costs ${fmtD(r.scanCost)} at $5 per TB scanned. Change one setting at a time to see what each one buys.`;
+      else {
+        t = `Reads ${fmtB(r.bytes)} instead of ${fmtB(base.bytes)} (${fmtX(base.bytes / r.bytes)} times less) and finishes about ${fmtX(base.time / r.time)} times faster than the plain row store.`;
+        if (cfg.layout === 'column' && cfg.query === 'star7') t += ` select * needs all 20 columns, so the layout cannot skip anything. Only compression and pruning help, and a row store with the same settings reads ${fmtB(sameParts.bytes)}, just ${fmtX(sameParts.bytes / r.bytes)} times more.`;
+        else if (cfg.layout === 'column') t += ` It skips ${COLS.length - r.needed.length} of ${COLS.length} columns, so the cost follows the columns you ask for, not the width of the table.`;
+        else t += ' A row store still has to read every column of every row it touches.';
+        if (cfg.prune === 'on' && !qy.filter) t += ' There is no date filter on this query, so pruning has nothing to skip.';
+      }
+      out.textContent = t;
+    }
+    let queued = false;
+    const schedule = () => { if (queued) return; queued = true; requestAnimationFrame(() => { queued = false; draw(); }); };
+    root.addEventListener('input', schedule); root.addEventListener('change', schedule);
+    draw();
+  });
+</script>

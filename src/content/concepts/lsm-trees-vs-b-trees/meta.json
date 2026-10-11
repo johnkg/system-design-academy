@@ -1,0 +1,86 @@
+{
+  "name": "LSM Trees vs B-Trees",
+  "area": "databases",
+  "difficulty": "advanced",
+  "intent": "The two storage-engine families underneath almost every database: update fixed-size pages in place (B-tree), or append sorted immutable files and merge them later (LSM tree).",
+  "scenario": "A user-events table takes a heavy write load: thousands of small 128-byte events per second, spread across random users. Then the product needs point reads (the latest events of one user) and range scans (a user's events for a day). We follow one event into a B-tree and into an LSM tree, then read it back.",
+  "problem": "A disk, an SSD especially, is fast at large sequential writes and slow at many small random ones, and every write must also survive a crash. A structure that keeps keys sorted for fast reads has to put each new row in the right place, which means touching a page somewhere in the middle of the file. The two engine families make opposite choices: pay for it at write time, or pay for it at read time and in background work. Neither is free, and the cost is measured as three amplifications: write (bytes hitting the disk per byte the application wrote), read (pages or files touched per lookup) and space (bytes stored per byte of live data).",
+  "howItWorks": [
+    {
+      "title": "B-tree: sorted fixed-size pages, updated in place",
+      "text": "Data lives in pages of a fixed size (4 KB to 16 KB: 4 KB in SQLite and many file systems, 8 KB in PostgreSQL, 16 KB in InnoDB). Inner pages hold separator keys and child pointers, leaves hold rows. A lookup walks root to leaf: with a fan-out of a few hundred, three or four page reads cover billions of rows, and the top levels stay in the buffer pool, so a point read is usually one disk read. An update finds the leaf, changes it in memory and marks the page dirty."
+    },
+    {
+      "title": "B-tree writes: a log record now, a whole page later",
+      "text": "Before touching the page the engine appends a record to the write-ahead log, which is what makes the change durable. The dirty page is written back later, at a checkpoint or when it is evicted, and always as a whole page: a 128-byte change costs a 4 KB write, up to 32x amplification for an isolated write, less when several changes hit the same page before it is flushed. A full leaf splits in two, writing the new leaf and rewriting the parent; random keys also scatter writes across the file."
+    },
+    {
+      "title": "LSM tree: log, memtable, immutable sorted files",
+      "text": "A write is appended to the write-ahead log (sequential) and inserted into the memtable, a sorted in-memory structure such as a skip list. When the memtable reaches its size limit (tens of MB) it is written out in one sequential pass as an SSTable: an immutable sorted file with a block index and a bloom filter. Nothing is ever modified in place. An update is just a newer version of the key and a delete is a tombstone marker; the older versions are still on disk."
+    },
+    {
+      "title": "LSM reads: newest to oldest, with filters to skip files",
+      "text": "A lookup checks the memtable, then the files from newest to oldest and stops at the first version of the key. Each file's key range, its bloom filter (about 10 bits per key gives roughly a 1% false-positive rate) and its index live in memory, so most files that do not hold the key are skipped without any disk read. A range scan cannot use bloom filters: it has to open every file whose range overlaps and merge the streams."
+    },
+    {
+      "title": "Compaction: merge files to bound reads, at a write cost",
+      "text": "Without cleanup the number of files, and the read cost, would grow forever. Compaction merges sorted files into larger ones, keeps only the newest version of each key and finally drops tombstones once nothing older can hide below them. Size-tiered compaction merges files of similar size: low write amplification, but several overlapping files and temporary doubling of space. Leveled compaction keeps one non-overlapping sorted run per level, each about 10x the previous (RocksDB's default): fewer files per read and little wasted space, but each byte is rewritten once per level, so write amplification is several times higher."
+    },
+    {
+      "title": "Choose by the amplification you can afford",
+      "text": "B-tree: low and predictable read cost, scans over adjacent leaves, but a page rewrite per random write and about 30 to 40% free space inside pages. LSM tree: very high ingest rates, compression-friendly dense files and cheap negative lookups, paid for with background compaction I/O, read latency that varies with the file layout, and space that fluctuates. The tuning knobs (size ratio, filters, compaction style) move the cost between the three amplifications; they never remove it."
+    }
+  ],
+  "pros": [
+    "B-tree: a point lookup is a short, bounded walk (typically one disk read once inner pages are cached) and scans follow adjacent leaves",
+    "B-tree: mature, predictable latency, and in-place updates keep the data in one place with no background merge debt",
+    "LSM: writes are sequential appends, so ingest throughput is high and flash wear is lower, with write amplification often a fraction of a B-tree's for small random writes",
+    "LSM: files are dense and immutable, so they compress well and are easy to snapshot, back up and ship to replicas",
+    "LSM: bloom filters make lookups of missing keys nearly free"
+  ],
+  "cons": [
+    "B-tree: every small random write rewrites a whole page, pages sit partly empty after splits (typically 65 to 70% full), and random writes fragment the file",
+    "B-tree: heavy concurrent writes contend on hot pages and need latching, and a crash during a page write needs a log or doublewrite buffer to repair a torn page",
+    "LSM: compaction burns disk bandwidth and CPU in the background, and when it falls behind reads slow down and writes stall",
+    "LSM: reads touch several places, range scans cannot use bloom filters, and space amplification varies, with size-tiered compaction briefly needing up to about twice the live data",
+    "LSM: deleted data lingers until a compaction reaches it, which matters for retention and privacy deletes"
+  ],
+  "whenToUse": [
+    "LSM tree: write-heavy ingestion of events, metrics, messages or time series (Cassandra, HBase, RocksDB, LevelDB, ScyllaDB, ClickHouse parts)",
+    "LSM tree: data that compresses well, or flash storage where fewer, larger writes extend device life",
+    "B-tree: read-heavy or mixed OLTP with point lookups and range scans, where predictable latency matters (PostgreSQL, MySQL InnoDB, SQL Server, SQLite)",
+    "B-tree: workloads of in-place updates to hot rows, where the buffer pool absorbs repeated changes to the same pages"
+  ],
+  "whenNotToUse": [
+    "LSM tree: a small data set with a modest write rate, where a B-tree's write cost is invisible and its reads are simpler",
+    "LSM tree: strict tail-latency targets on a store that cannot spare headroom for compaction",
+    "B-tree: sustained random-write ingest well beyond what the device can absorb as page rewrites",
+    "Either: choosing by reputation instead of measuring the real read/write mix, key distribution and value size"
+  ],
+  "pitfalls": [
+    "Judging by a benchmark that never reaches steady state: an LSM tree looks wonderful until compaction debt accumulates, and a B-tree looks wonderful until the data no longer fits in the buffer pool",
+    "Under-provisioned compaction: when the write rate exceeds what compaction can merge, files pile up, reads degrade and the engine finally stalls writes",
+    "Deleting or expiring massive amounts of data in an LSM store: tombstones are extra writes, are read past by scans, and the space only returns after compaction; time-window data is better dropped as whole files or partitions",
+    "Reading the stats wrong: write amplification of 20x is not bad for a B-tree that batches page writes at checkpoints, and a 10x LSM figure may be the price of low space and read amplification",
+    "Turning off or undersizing bloom filters on a read-heavy LSM table, so every missing-key lookup opens every overlapping file",
+    "Forgetting that a B-tree needs its log too: in-place page writes are not atomic, and a torn page without a write-ahead log or doublewrite buffer is corruption",
+    "Disabling the LSM write-ahead log for speed: the memtable is only in memory, so a crash loses every write since the last flush"
+  ],
+  "related": [
+    { "kind": "concept", "slug": "write-ahead-log" },
+    { "kind": "concept", "slug": "database-indexing" },
+    { "kind": "concept", "slug": "mvcc-and-isolation-levels" },
+    { "kind": "concept", "slug": "backups-and-point-in-time-recovery" },
+    { "kind": "concept", "slug": "database-replication" },
+    { "kind": "concept", "slug": "sql-vs-nosql" },
+    { "kind": "concept", "slug": "event-sourcing" }
+  ],
+  "roles": [
+    { "id": "client", "label": "Application", "description": "Issues the writes, point reads and range scans." },
+    { "id": "btree", "label": "B-tree page", "description": "A fixed-size leaf page updated in place and rewritten whole." },
+    { "id": "wal", "label": "Write-ahead log", "description": "Sequential append-only record of each change, for durability." },
+    { "id": "memtable", "label": "Memtable", "description": "Sorted in-memory buffer of the newest writes in an LSM tree." },
+    { "id": "sstables", "label": "SSTables", "description": "Immutable sorted files on disk, each with an index and a bloom filter." },
+    { "id": "compactor", "label": "Compaction", "description": "Background job that merges files, keeps the newest versions and drops tombstones." }
+  ]
+}

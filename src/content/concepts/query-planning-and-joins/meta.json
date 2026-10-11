@@ -1,0 +1,66 @@
+{
+  "name": "Query Planning and Joins",
+  "area": "databases",
+  "difficulty": "advanced",
+  "intent": "Turn a declarative SQL query into the cheapest physical plan by estimating row counts from statistics and choosing access paths, join methods and join order.",
+  "scenario": "A report lists every order placed by customers in one country: orders (20,000 rows) joined to customers (1,000 rows) with WHERE country = 'US'. The same SQL can run in half a millisecond or in several seconds depending on the plan the optimiser picks, and that depends on what it believes about the data.",
+  "problem": "SQL says what you want, not how to get it. Even this one join can be executed in many ways that return identical rows but differ in cost by two orders of magnitude: scan or probe an index, loop, hash or merge, customers first or orders first. The database must choose before it runs anything, using only summary statistics, so every bad estimate becomes a bad plan, and a plan that was right yesterday can be wrong after the data changes.",
+  "howItWorks": [
+    { "title": "Parse and build a logical plan", "text": "The parser checks the syntax, resolves names against the catalog and produces a tree of relational operators: scan customers, filter on country, join to orders on customer_id, project. This logical plan says nothing about algorithms. The planner then applies rewrites that never change the result, such as pushing the country filter below the join so fewer rows reach it, and flattening subqueries into joins." },
+    { "title": "Estimate cardinalities from statistics", "text": "ANALYZE (or its automatic version) samples each table, typically a few tens of thousands of rows, and stores the row count, the number of distinct values per column, the most common values with their frequencies and a histogram of the rest. Selectivity is the fraction of rows a predicate keeps: country = 'US' matches 40% of 1,000 customers, so the planner expects 400. The join size is estimated as outer rows x inner rows / distinct join keys. These estimates assume columns are independent and values uniform inside a histogram bucket, which is where plans go wrong." },
+    { "title": "Choose access paths", "text": "For each table the planner compares a sequential scan (read every page, cost 1 per page in PostgreSQL's defaults) with an index scan (a few index pages plus one random heap page per row, random_page_cost 4 by default, about 1.1 on SSDs) and, if the index holds every needed column and the visibility map says the pages are all-visible, an index-only scan that skips the heap. A selective filter favours the index; returning more than roughly 5 to 10% of a table usually favours the sequential scan, because 1 random page costs as much as several sequential ones." },
+    { "title": "Choose join methods and join order", "text": "A nested loop reads the outer side once and probes the inner side per outer row: unbeatable when the outer side is tiny and the inner side has an index, ruinous otherwise (outer rows x inner rows comparisons without one). A hash join builds a hash table on the smaller input and streams the other through it: roughly linear, but needs work_mem and an equality condition, and spills to disk in batches when it does not fit. A merge join walks two inputs sorted on the join key in lock step: linear when the data already arrives sorted from an index or a clustered table, otherwise it pays an n log n sort. With more than two tables the planner enumerates join orders by dynamic programming and switches to genetic or greedy search past about a dozen tables." },
+    { "title": "Cost the plan and execute it", "text": "Each candidate gets a cost: pages read (sequential and random weighted differently) plus CPU for rows processed and operators evaluated. The cheapest total wins and the executor runs it as a pipeline of iterators, each pulling rows from its children. The cost is a unit-less estimate used only to compare plans, not a time prediction; the useful number is how far estimated rows are from actual rows." },
+    { "title": "Read EXPLAIN ANALYZE and repair bad plans", "text": "EXPLAIN shows the chosen plan and its estimates; EXPLAIN ANALYZE actually runs it and adds actual rows, loops, time and buffers per node. The first thing to look for is a node where estimated and actual rows differ by 10x or more: that is where the plan went wrong. Fixes in order of preference: ANALYZE after bulk changes, extended statistics for correlated columns, a composite or partial index that matches the predicate, rewriting the query (avoid functions on indexed columns, replace OFFSET paging, split OR conditions), and only last a hint or a plan override, which freezes a decision the data will eventually outgrow." }
+  ],
+  "pros": [
+    "You write what you want and the engine adapts to table sizes, indexes and data distribution, so the same SQL stays efficient as data grows",
+    "Cost-based choice beats fixed rules: nested loop, hash and merge each win in some regime and the optimiser picks per query",
+    "EXPLAIN ANALYZE makes the engine's reasoning inspectable: estimated against actual rows pinpoints the faulty node",
+    "Fixing statistics or adding one index improves every query that touches that data, not just one"
+  ],
+  "cons": [
+    "The optimiser only sees summaries; skew, correlation and recent changes it has not sampled produce wrong estimates and wrong plans",
+    "Errors compound through a join tree: a 10x underestimate at the first join can become 1000x by the third",
+    "Plans are not stable: an ANALYZE, a data change or a new version can flip a fast plan to a slow one overnight",
+    "Cost units are only a model: random_page_cost, cache hit rates and work_mem differ from the real hardware",
+    "Planning itself costs time and memory, which matters for tiny high-rate queries and for joins of many tables"
+  ],
+  "whenToUse": [
+    "Any relational workload with joins over tables of different sizes, where hand-tuning each query does not scale",
+    "Diagnosing a query that is slow in production but fast in development: compare estimated and actual rows node by node",
+    "Deciding which index to add: read the plan to see which scan or join the index would replace",
+    "After bulk loads, large deletes or migrations, to decide when statistics need refreshing"
+  ],
+  "whenNotToUse": [
+    "Do not hand-force join methods or orders (hints, enable_nestloop = off, join_collapse_limit tricks) as a first move: fix the statistics or the index and keep the planner's freedom",
+    "Do not tune from EXPLAIN alone on a toy dataset: plans for 100 rows say nothing about 100 million, so reproduce with production-sized data or copied statistics",
+    "Do not chase the lowest cost number: cost is for comparing alternatives inside one query, not across queries or machines",
+    "If a query runs once a month on a small table, the hours spent tuning cost more than the query ever will"
+  ],
+  "pitfalls": [
+    "Stale statistics after a bulk load or a big delete: autovacuum analyses only after a fraction of rows changed (about 10% by default), so a freshly loaded table can sit with the old row counts for hours",
+    "Correlated columns (city and country, order status and shipped date): the planner multiplies selectivities as if independent and underestimates by orders of magnitude; create extended statistics on the column group",
+    "Skewed data and parameter sniffing: a plan cached for a rare parameter value (3 rows) is reused for a common one (400,000 rows), or the reverse; look for generic versus custom plans and plan_cache_mode, or use OPTION (RECOMPILE) in SQL Server",
+    "Functions or casts on an indexed column (WHERE lower(email) = ..., WHERE created::date = ...) make the index unusable unless an expression index matches exactly",
+    "A composite index in the wrong column order: (country, customer_id) serves WHERE country = ? but not WHERE customer_id = ? alone; put equality columns first and the range column last",
+    "Reading only the top-line cost and time in EXPLAIN ANALYZE while ignoring loops: a node with actual time 0.05 ms and loops=400,000 took 20 seconds",
+    "Believing an index scan is always faster: for a filter that keeps 30% of the table, the sequential scan is correct and forcing the index makes the query slower",
+    "Fixing the symptom with a hint or a disabled join method in production code, which silently becomes wrong when the table grows 50x"
+  ],
+  "related": [
+    { "kind": "concept", "slug": "database-indexing" },
+    { "kind": "concept", "slug": "lsm-trees-vs-b-trees" },
+    { "kind": "concept", "slug": "mvcc-and-isolation-levels" },
+    { "kind": "concept", "slug": "database-sharding" },
+    { "kind": "concept", "slug": "sql-vs-nosql" },
+    { "kind": "concept", "slug": "online-schema-migrations" }
+  ],
+  "roles": [
+    { "id": "parser", "label": "Parser and rewriter", "description": "Checks syntax, resolves names and builds the logical plan, applying result-preserving rewrites such as pushing filters down." },
+    { "id": "optimiser", "label": "Cost-based optimiser", "description": "Enumerates access paths, join methods and join orders, costs each from estimated row counts and keeps the cheapest." },
+    { "id": "statistics", "label": "Statistics catalog", "description": "Holds row counts, distinct counts, most common values and histograms gathered by ANALYZE; it is only as fresh as the last sample." },
+    { "id": "executor", "label": "Executor", "description": "Runs the chosen plan as a tree of iterators and records actual rows, loops, pages and time for EXPLAIN ANALYZE." },
+    { "id": "storage", "label": "Tables and indexes", "description": "The heap pages and index pages that the plan reads; sequential reads are cheap, random reads are expensive." }
+  ]
+}

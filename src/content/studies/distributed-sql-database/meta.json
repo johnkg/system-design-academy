@@ -1,0 +1,485 @@
+{
+  "name": "Design a Distributed SQL Database",
+  "difficulty": "advanced",
+  "intent": "Build a database with full SQL and serializable transactions that spreads one table over hundreds of machines and several regions, survives machine and region failures, and stays correct without a single point of coordination.",
+  "codeTitle": "ranges, write intents and uncertainty restarts",
+  "finalIntro": "One money transfer across two ranges, then a stale read from a nearby replica.",
+  "prompt": "Design a SQL database in the style of Spanner or CockroachDB. It must scale out by adding machines, keep strongly consistent transactions that can touch rows on many machines, survive the loss of a machine or a whole region, serve users in several continents with low latency, and let the schema change while the application keeps running.",
+  "functional": [
+    "Run SQL queries and multi-statement transactions over tables, with indexes",
+    "Commit a transaction that touches rows on many machines atomically",
+    "Read a consistent snapshot, and optionally read slightly old data much faster",
+    "Place data in chosen regions, for latency and for data residency",
+    "Add machines and grow tables without downtime",
+    "Add columns and indexes while the application keeps running"
+  ],
+  "nonFunctional": [
+    "Serializable transactions by default, and a read always sees every transaction that finished before it began",
+    "A write that touches one range commits in a few milliseconds inside a region",
+    "No data loss and no manual failover when a machine, a zone or (if configured) a region is lost",
+    "Scale to hundreds of machines and hundreds of terabytes by adding nodes",
+    "Cross-region latency is paid only where the data placement requires it",
+    "Schema changes never block reads and writes"
+  ],
+  "firstAttempt": {
+    "text": "One big SQL database on a single primary machine with a standby copy. Transactions run on the primary under row locks, reads go to the primary, and the standby takes over if the primary fails.",
+    "limits": [
+      "All the data and all the writes must fit on one machine, so there is a hard ceiling on size and throughput",
+      "Failover to the standby is slow, can lose the last writes if copying is asynchronous, and is manual or fragile",
+      "Users on another continent pay a full round trip to the primary for every statement",
+      "Losing the region that holds the primary and its standby loses the database",
+      "Adding a column or an index on a huge table can lock it for hours"
+    ]
+  },
+  "nodes": [
+    {
+      "id": "app",
+      "label": "Applications",
+      "kind": "client",
+      "x": 12,
+      "y": 63
+    },
+    {
+      "id": "single",
+      "label": "One SQL database",
+      "kind": "compute",
+      "x": 12,
+      "y": 88,
+      "at": 0,
+      "until": 1
+    },
+    {
+      "id": "gateway",
+      "label": "SQL gateway",
+      "kind": "edge",
+      "x": 37,
+      "y": 63,
+      "at": 1
+    },
+    {
+      "id": "ranges",
+      "label": "Ranges (Raft groups)",
+      "kind": "data",
+      "x": 62,
+      "y": 63,
+      "at": 1
+    },
+    {
+      "id": "coord",
+      "label": "Transaction coordinator",
+      "kind": "compute",
+      "x": 37,
+      "y": 88,
+      "at": 2
+    },
+    {
+      "id": "txnrec",
+      "label": "Transaction record",
+      "kind": "data",
+      "x": 62,
+      "y": 88,
+      "at": 2
+    },
+    {
+      "id": "clock",
+      "label": "Hybrid clock",
+      "kind": "compute",
+      "x": 12,
+      "y": 88,
+      "at": 3
+    },
+    {
+      "id": "allocator",
+      "label": "Rebalancer",
+      "kind": "async",
+      "x": 62,
+      "y": 37,
+      "at": 4
+    },
+    {
+      "id": "replicas",
+      "label": "Replicas in other regions",
+      "kind": "data",
+      "x": 87,
+      "y": 63,
+      "at": 5
+    },
+    {
+      "id": "schema",
+      "label": "Schema change job",
+      "kind": "async",
+      "x": 37,
+      "y": 37,
+      "at": 6
+    }
+  ],
+  "edges": [
+    {
+      "from": "app",
+      "to": "single",
+      "at": 0,
+      "until": 1
+    },
+    {
+      "from": "app",
+      "to": "gateway",
+      "at": 1
+    },
+    {
+      "from": "gateway",
+      "to": "ranges",
+      "at": 1
+    },
+    {
+      "from": "gateway",
+      "to": "coord",
+      "at": 2
+    },
+    {
+      "from": "coord",
+      "to": "txnrec",
+      "at": 2
+    },
+    {
+      "from": "coord",
+      "to": "ranges",
+      "at": 2
+    },
+    {
+      "from": "txnrec",
+      "to": "ranges",
+      "at": 2
+    },
+    {
+      "from": "coord",
+      "to": "clock",
+      "at": 3
+    },
+    {
+      "from": "allocator",
+      "to": "ranges",
+      "at": 4
+    },
+    {
+      "from": "ranges",
+      "to": "replicas",
+      "at": 5
+    },
+    {
+      "from": "schema",
+      "to": "ranges",
+      "at": 6
+    }
+  ],
+  "steps": [
+    {
+      "title": "Cut the key space into ranges, each a Raft group",
+      "problem": "A table with hundreds of terabytes cannot live on one machine, and one primary with an asynchronous standby can lose writes when it fails.",
+      "fix": "Store every row as a sorted key and value, where the key is the table, then the primary key, and every index entry is another key. The whole ordered key space is cut into contiguous ranges of a few hundred megabytes (512 MiB is a common size). Each range is copied to three or five machines and kept identical by its own Raft group. One replica is the leaseholder, which serves reads from its own state without a vote and proposes the writes. Any machine can be a SQL gateway: it parses the query, looks up which range holds each key in a cached directory, and sends the work to that range's leaseholder.",
+      "tradeoff": "Capacity and throughput grow by adding machines, there is no data loss on a machine failure, and sorted keys keep range scans cheap. Every write now needs a majority of a range's replicas to acknowledge it, so its latency is one round trip to the nearest majority. A key that always increases, such as a timestamp or an auto-number, sends every insert to the last range.",
+      "concepts": [
+        {
+          "slug": "database-sharding"
+        },
+        {
+          "slug": "consensus"
+        },
+        {
+          "slug": "leader-election"
+        },
+        {
+          "slug": "database-replication"
+        }
+      ]
+    },
+    {
+      "title": "Commit across ranges with intents and a transaction record",
+      "problem": "A transfer between two accounts changes rows in two ranges, and each range is its own Raft group with its own log, so there is no single place to commit both changes at once.",
+      "fix": "The coordinator on the gateway writes a provisional value, called a write intent, in every range it changes. Each intent carries the transaction id. One transaction record, stored on the first range touched and replicated like any data, says whether the transaction is pending, committed or aborted. Committing is one write that flips that record, which is the single atomic commit point. Afterwards the intents are rewritten as normal values in the background. Anyone who meets an intent reads the transaction record to learn what it means. With parallel commits the intents and a 'staging' record are written together, and the transaction counts as committed as soon as every intent is durable, so the client is answered after one consensus round instead of two.",
+      "tradeoff": "A transaction across many ranges is atomic and survives the loss of its coordinator, because the record is replicated and other transactions can finish or abort it. It costs extra writes and, with the older two-step protocol, a second consensus round. Contention is the other cost: a transaction that meets another one's intent has to wait or restart.",
+      "concepts": [
+        {
+          "slug": "two-phase-commit"
+        },
+        {
+          "slug": "consensus"
+        },
+        {
+          "slug": "acid-vs-base"
+        },
+        {
+          "slug": "idempotency"
+        }
+      ]
+    },
+    {
+      "title": "Order everything with hybrid clocks and versions",
+      "problem": "With no shared clock, a reader could see half of a transaction, or miss a transaction that had already finished in real time, which breaks the promise of strong consistency.",
+      "fix": "Keep several versions of every key, each stamped with its commit timestamp (multi-version concurrency control). A read at timestamp t sees exactly the versions up to t, so it is a consistent snapshot and never blocks writers. Timestamps come from a hybrid logical clock: the wall time plus a counter, pushed forward whenever a message arrives with a later one, so timestamps respect cause and effect. Machine clocks still differ by up to some bound, so a read at t treats a value stamped in the interval from t to t plus the maximum offset as uncertain and restarts above it, because that value may really have committed first. Spanner instead uses TrueTime, where GPS and atomic clocks give a small known error bound, and a writer performs 'commit wait': it holds back the acknowledgement until its commit timestamp has passed on every clock, about twice the error bound.",
+      "tradeoff": "Reads at a timestamp are consistent and lock-free, and the system gets external consistency (a transaction that starts after another has been acknowledged sees it). Hybrid clocks need no special hardware but cause an occasional restart for a read that meets a recent value. TrueTime avoids those restarts but charges every write a few milliseconds of waiting and needs the hardware. Old versions pile up until garbage collection removes them.",
+      "concepts": [
+        {
+          "slug": "logical-clocks"
+        },
+        {
+          "slug": "consistency-models"
+        },
+        {
+          "slug": "latency-and-round-trips"
+        }
+      ]
+    },
+    {
+      "title": "Split, merge and rebalance ranges automatically",
+      "problem": "Tables grow, some keys get far hotter than others, and machines are added and removed. Doing this by hand would mean downtime and manual resharding.",
+      "fix": "A range that grows past its size limit, or carries too much load, splits at a middle key into two ranges, which is only a metadata change plus a new Raft group that shares the data. Small neighbours merge back. A rebalancer watches each machine's range count, disk use and traffic, and moves replicas: it adds a new replica by sending a snapshot, lets it join the Raft group through a membership change, then removes the old one. It also moves leaseholders next to the traffic. Moves are rate-limited so they do not starve the foreground work.",
+      "tradeoff": "The cluster absorbs growth and new machines without anyone choosing shard boundaries, and a dead machine's ranges are re-created elsewhere. A new node only becomes useful after the data has moved to it, which can take hours at a limited rate, and a single hot key cannot be split at all.",
+      "concepts": [
+        {
+          "slug": "database-sharding"
+        },
+        {
+          "slug": "consistent-hashing"
+        },
+        {
+          "slug": "health-checks"
+        },
+        {
+          "slug": "backpressure"
+        }
+      ]
+    },
+    {
+      "title": "Place data across regions and read from nearby replicas",
+      "problem": "Users on three continents each pay a long round trip to the leaseholder, a regional outage must not lose data, and some data has to stay in a particular country.",
+      "fix": "Choose a survival goal per database. To survive a zone failure, keep the three replicas in the home region, so a write needs a quorum round of about a millisecond. To survive a region failure, spread the replicas over at least three regions, so every write pays a round trip to the nearest other region. Set a home region for each row, or for each table, so that its leaseholder and its replicas sit near its users, and so rows with a regional tag stay in that region. Reads that can accept old data use follower reads: the leaseholder keeps promising, through a closed timestamp, that nothing more will be written at or below some time a few seconds ago, so any replica can answer a read at that time from its own copy.",
+      "tradeoff": "Reads can be served in about a millisecond by a local replica, and the cost of surviving a region failure is paid only by writes. A follower read may return data that is several seconds old, and a transaction that touches rows homed in two regions pays the long round trip between them. Data residency rules limit where replicas may go.",
+      "concepts": [
+        {
+          "slug": "consistency-models"
+        },
+        {
+          "slug": "cap-theorem"
+        },
+        {
+          "slug": "latency-and-round-trips"
+        },
+        {
+          "slug": "quorums"
+        }
+      ]
+    },
+    {
+      "title": "Change the schema online in small safe steps",
+      "problem": "Adding an index or a column to a table with billions of rows takes hours, and machines see the new schema at slightly different times, so a naive change could leave rows without index entries.",
+      "fix": "Move the schema element through states: absent, delete-only, write-only, backfilling and then public. At any moment the cluster may use only two adjacent versions of the schema, because each machine holds a time-limited lease on the schema it uses and waits for the others to catch up before the next state. A background job reads the table at a fixed timestamp and writes the new index entries in small resumable batches, while new writes already maintain the index. Once the backfill is validated, the element becomes public. A failure rolls the steps back in reverse.",
+      "tradeoff": "The application keeps running through the whole change and a crashed job simply resumes. The change takes as long as the backfill and the leases need, the backfill competes with live traffic so it is throttled, and a change that cannot be made in these steps, such as changing a column's type in place, needs a rewrite of the column.",
+      "concepts": [
+        {
+          "slug": "database-indexing"
+        },
+        {
+          "slug": "saga"
+        },
+        {
+          "slug": "backpressure"
+        }
+      ]
+    }
+  ],
+  "failures": [
+    {
+      "scenario": "A range's leaseholder machine crashes",
+      "impact": "Reads and writes for the ranges it led stop, and no one is allowed to answer in its place until the old lease is known to be over.",
+      "answer": "The followers notice missing heartbeats and elect a new Raft leader, and the lease is acquired by a replica once the old lease has expired. The new leaseholder starts with a timestamp floor above anything the old one could have served, so no read goes back in time. The range is unavailable for a few seconds, and no committed write is lost because a majority already held it.",
+      "concepts": [
+        {
+          "slug": "leader-election"
+        },
+        {
+          "slug": "health-checks"
+        },
+        {
+          "slug": "consensus"
+        }
+      ]
+    },
+    {
+      "scenario": "The coordinator dies in the middle of a transaction",
+      "impact": "Intents are left in several ranges, and others that meet them cannot tell whether to wait, ignore or apply them.",
+      "answer": "Every intent points at its transaction record. A live coordinator keeps the record's heartbeat fresh, so if the heartbeat has stopped, another transaction aborts the record and clears the intent. If the record is in the staging state, they check whether every listed intent is durable: if so the transaction is committed, if not it is aborted. Clearing an intent can be repeated safely.",
+      "concepts": [
+        {
+          "slug": "two-phase-commit"
+        },
+        {
+          "slug": "idempotency"
+        },
+        {
+          "slug": "retries-and-backoff"
+        }
+      ]
+    },
+    {
+      "scenario": "One machine's clock drifts far from the others",
+      "impact": "Its read timestamps may fall behind committed data, and with an uncertainty window that is too small a read could miss a recent write.",
+      "answer": "Machines compare clocks through their regular messages, and one that finds itself outside the allowed offset from most of its peers removes itself from service instead of continuing. With TrueTime the error bound simply widens when the time source is unreachable, so commit wait grows. Either way the system gets slower or loses a node, rather than returning wrong answers.",
+      "concepts": [
+        {
+          "slug": "logical-clocks"
+        },
+        {
+          "slug": "consistency-models"
+        },
+        {
+          "slug": "health-checks"
+        }
+      ]
+    },
+    {
+      "scenario": "A whole region goes offline",
+      "impact": "Every replica in that region disappears, including some leaseholders, and a range that kept a majority there cannot commit.",
+      "answer": "A database set to survive region failure keeps replicas in other regions, so each range still has a majority. Leases move, and service resumes within seconds. Writes may get slower afterwards, because the nearest majority is now further away. A database set only to survive zone failure loses availability for ranges that kept a majority in that region, but not their data once the region returns.",
+      "concepts": [
+        {
+          "slug": "cap-theorem"
+        },
+        {
+          "slug": "quorums"
+        },
+        {
+          "slug": "database-replication"
+        }
+      ]
+    },
+    {
+      "scenario": "A sequential primary key sends all inserts to one range",
+      "impact": "The newest range is the only one that takes writes, so one leaseholder saturates while the rest of the cluster idles.",
+      "answer": "Use a random identifier, or a hash-sharded index that spreads consecutive keys over several buckets, so inserts land on many ranges. Load-based splitting also divides a busy range, but it cannot divide a range whose traffic is a single key.",
+      "concepts": [
+        {
+          "slug": "database-sharding"
+        },
+        {
+          "slug": "database-indexing"
+        },
+        {
+          "slug": "load-balancing"
+        }
+      ]
+    }
+  ],
+  "alternatives": [
+    {
+      "title": "How to order transactions in time",
+      "options": [
+        {
+          "name": "Hybrid logical clocks with uncertainty restarts",
+          "pro": "Runs on ordinary machines and ordinary clock synchronisation",
+          "con": "A read that meets a value inside its uncertainty window must restart, and a large clock offset causes many restarts"
+        },
+        {
+          "name": "TrueTime with commit wait",
+          "pro": "A tight, known error bound gives external consistency without restarts",
+          "con": "Needs GPS and atomic clocks, and every write waits about twice the error bound"
+        },
+        {
+          "name": "A central timestamp oracle",
+          "pro": "Simple and gives a total order",
+          "con": "One more round trip for every transaction, and the oracle is a throughput and failure bottleneck across regions"
+        }
+      ],
+      "pick": "Hybrid clocks when the hardware is ordinary, TrueTime when the cloud already provides the clocks."
+    },
+    {
+      "title": "How to commit across ranges",
+      "options": [
+        {
+          "name": "Classic two-phase commit with a commit record",
+          "pro": "Easy to reason about",
+          "con": "Two consensus rounds on the critical path"
+        },
+        {
+          "name": "Parallel commits",
+          "pro": "One consensus round, since the transaction is committed once all intents are durable",
+          "con": "A more complex recovery rule for the staging state"
+        },
+        {
+          "name": "Deterministic ordering before execution",
+          "pro": "No two-phase commit at all, since every replica applies the same order",
+          "con": "The transaction's read and write sets must be known up front, which does not suit interactive SQL"
+        }
+      ],
+      "pick": "Parallel commits, with a replicated transaction record so no coordinator is a single point of failure."
+    },
+    {
+      "title": "Where the replicas live",
+      "options": [
+        {
+          "name": "All three replicas in one region",
+          "pro": "Writes commit in about a millisecond",
+          "con": "A regional outage makes the data unavailable"
+        },
+        {
+          "name": "Replicas across three or more regions",
+          "pro": "Survives the loss of a region",
+          "con": "Every write waits for a round trip to the nearest other region"
+        },
+        {
+          "name": "Rows homed in the region of their users",
+          "pro": "Local writes for most users, and data residency is met",
+          "con": "A transaction across homes pays the long round trip, and the schema carries a region column"
+        }
+      ],
+      "pick": "Spread across regions for data that must survive a regional outage, and home each row near its users where latency matters."
+    },
+    {
+      "title": "How fresh a read has to be",
+      "options": [
+        {
+          "name": "Read at the leaseholder",
+          "pro": "Always the latest committed data",
+          "con": "A round trip to wherever the leaseholder is"
+        },
+        {
+          "name": "Follower read at the closed timestamp",
+          "pro": "Served by the nearest replica in a millisecond or two",
+          "con": "Several seconds old, and the exact lag depends on configuration"
+        },
+        {
+          "name": "Read as of a chosen past time",
+          "pro": "Repeatable, cheap, and good for reports and analytics",
+          "con": "Old by design, and unsuitable for read-then-write logic"
+        }
+      ],
+      "pick": "The leaseholder for anything that decides what to write, and follower reads for dashboards, catalogues and pages that tolerate old data."
+    }
+  ],
+  "roles": [
+    {
+      "id": "client",
+      "label": "Applications",
+      "description": "Programs that send SQL and wait for the answer."
+    },
+    {
+      "id": "edge",
+      "label": "SQL gateways",
+      "description": "Any machine that parses SQL and routes it to the right ranges."
+    },
+    {
+      "id": "async",
+      "label": "Background jobs",
+      "description": "Rebalancing, intent cleanup and schema backfills."
+    },
+    {
+      "id": "compute",
+      "label": "Transactions and clocks",
+      "description": "The coordinator and the hybrid clock."
+    },
+    {
+      "id": "data",
+      "label": "Ranges and records",
+      "description": "Raft-replicated ranges, replicas and transaction records."
+    }
+  ]
+}

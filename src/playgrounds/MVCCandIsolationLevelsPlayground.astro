@@ -1,0 +1,384 @@
+---
+import PlaygroundShell from '../components/PlaygroundShell.astro';
+---
+<PlaygroundShell title="Simulate it" hint="Two transactions, T1 and T2, run a scripted interleaving against a tiny multi-version store. Pick an anomaly scenario and an isolation level, then step through it.">
+  <ol class="how">
+    <li>Choose <b>Write skew</b> at <b>Repeatable read</b> and press <b>Run to end</b>. Both transactions count 2 doctors on call, each takes a different doctor off call, and both commit. The verdict is <b>ANOMALY</b>: 0 on call, which no serial order produces. Switch to <b>Serializable</b>: T1 is aborted at commit and 1 doctor stays on call.</li>
+    <li>Choose <b>Lost update</b> at <b>Read committed</b> and step: T2's write is <b>blocked</b> until T1 commits, then overwrites it, so the balance ends at 70 instead of 120. At <b>Repeatable read</b> T2 is aborted instead (first-committer-wins) and the balance is 150 until T2 retries.</li>
+    <li>Try <b>Dirty read</b> at <b>Read uncommitted</b>: T2 reads 500, a value T1 then rolls back. Try <b>Non-repeatable read</b> and <b>Phantom</b> at <b>Read committed</b>: the same query returns two different answers. At <b>Repeatable read</b> both reads agree because the snapshot is fixed. The strip at the bottom shows the outcome at all four levels.</li>
+  </ol>
+  <div class="pg mv" data-mv>
+    <div class="pg-row">
+      <label>Scenario <select class="pg-in" data-scn></select></label>
+      <label>Isolation level <select class="pg-in" data-lvl></select></label>
+    </div>
+    <p class="pg-note" data-blurb></p>
+    <div class="pg-row">
+      <button class="btn pg-primary" type="button" data-step>Step</button>
+      <button class="btn" type="button" data-back>Back</button>
+      <button class="btn" type="button" data-end>Run to end</button>
+      <button class="btn" type="button" data-reset>Reset</button>
+    </div>
+    <div class="pg-grid">
+      <div class="pg-box" style="--c: var(--role-1)" data-box="T1"><h3>T1</h3><span class="pg-mono" data-st="T1"></span><span class="pg-note" data-snap="T1"></span></div>
+      <div class="pg-box" style="--c: var(--role-2)" data-box="T2"><h3>T2</h3><span class="pg-mono" data-st="T2"></span><span class="pg-note" data-snap="T2"></span></div>
+      <div class="pg-box" style="--c: var(--role-3)"><h3>Row versions</h3><div class="mv-store" data-store></div><span class="pg-note">value, xmin = creator, xmax = deleter. Bright border = the version just read.</span></div>
+    </div>
+    <ol class="mv-log" data-log aria-live="polite"></ol>
+    <output class="pg-out" data-out></output>
+    <div class="pg-grid" data-strip></div>
+  </div>
+</PlaygroundShell>
+<script>
+  // ===== CORE START (pure functions, no DOM) =====
+  type Level = 'ru' | 'rc' | 'rr' | 'ser';
+  type Vars = Record<string, number>;
+  interface Op { t: string; kind: 'read' | 'scan' | 'write' | 'commit' | 'rollback'; key?: string; as?: string; val?: (v: Vars) => number; when?: (v: Vars) => boolean; sql: string }
+  interface Scenario { id: string; label: string; blurb: string; anomaly: string; initial: Record<string, number>; ops: Op[] }
+  interface Ver { val: number; xmin: number; xmax: number; st: 'active' | 'committed' | 'aborted' }
+  interface Frame { t: string; sql: string; lines: string[]; tone: 'ok' | 'warn' | 'bad' | 'info'; status: Record<string, string>; snaps: Record<string, string>; store: { key: string; vers: Ver[]; saw: number }[] }
+  interface Obs { label: string; value: number }
+  interface Outcome { frames: Frame[]; state: Record<string, number>; reads: Record<string, Obs[]>; committed: string[]; aborted: string[]; blocked: number; stuck: boolean }
+  interface Verdict { anomaly: boolean; name: string; text: string; sim: Outcome; serial: { order: string[]; state: Record<string, number> }[]; match: string[] | null }
+
+  const LEVELS: { id: Level; label: string; note: string }[] = [
+    { id: 'ru', label: 'Read uncommitted', note: 'reads the newest version, even if uncommitted' },
+    { id: 'rc', label: 'Read committed', note: 'new snapshot for every statement' },
+    { id: 'rr', label: 'Repeatable read (snapshot)', note: 'one snapshot for the whole transaction' },
+    { id: 'ser', label: 'Serializable (SSI)', note: 'snapshot plus read-write dependency tracking' },
+  ];
+  const ID: Record<string, number> = { T1: 11, T2: 12 }; // transaction ids; the data was loaded by transaction 10
+  const SETUP = 10;
+
+  const SCENARIOS: Scenario[] = [
+    { id: 'skew', label: 'Write skew: two doctors go off call', anomaly: 'write skew',
+      blurb: 'alice and bob are on call (1 = on call). Rule: at least one must stay. Each transaction counts the doctors on call and, if there are 2 or more, takes a different doctor off call.',
+      initial: { alice: 1, bob: 1 },
+      ops: [
+        { t: 'T1', kind: 'scan', as: 'n', sql: 'SELECT count(*) FROM doctors WHERE on_call' },
+        { t: 'T2', kind: 'scan', as: 'n', sql: 'SELECT count(*) FROM doctors WHERE on_call' },
+        { t: 'T1', kind: 'write', key: 'alice', val: () => 0, when: (v) => v.n >= 2, sql: "UPDATE doctors SET on_call = 0 WHERE name = 'alice'  -- only if count >= 2" },
+        { t: 'T2', kind: 'write', key: 'bob', val: () => 0, when: (v) => v.n >= 2, sql: "UPDATE doctors SET on_call = 0 WHERE name = 'bob'  -- only if count >= 2" },
+        { t: 'T1', kind: 'commit', sql: 'COMMIT' },
+        { t: 'T2', kind: 'commit', sql: 'COMMIT' },
+      ] },
+    { id: 'lost', label: 'Lost update: two payments on one balance', anomaly: 'lost update',
+      blurb: 'acct holds 100. T1 deposits 50, T2 withdraws 30. Each reads the balance in the application, then writes back its own total. Any serial order ends at 120.',
+      initial: { acct: 100 },
+      ops: [
+        { t: 'T1', kind: 'read', key: 'acct', as: 'b', sql: 'SELECT balance FROM acct' },
+        { t: 'T2', kind: 'read', key: 'acct', as: 'b', sql: 'SELECT balance FROM acct' },
+        { t: 'T1', kind: 'write', key: 'acct', val: (v) => v.b + 50, sql: 'UPDATE acct SET balance = (read value) + 50' },
+        { t: 'T2', kind: 'write', key: 'acct', val: (v) => v.b - 30, sql: 'UPDATE acct SET balance = (read value) - 30' },
+        { t: 'T1', kind: 'commit', sql: 'COMMIT' },
+        { t: 'T2', kind: 'commit', sql: 'COMMIT' },
+      ] },
+    { id: 'dirty', label: 'Dirty read: a value that gets rolled back', anomaly: 'dirty read',
+      blurb: 'acct holds 100. T1 sets it to 500 while a transfer is in progress, then rolls back. T2 reads the balance in between.',
+      initial: { acct: 100 },
+      ops: [
+        { t: 'T1', kind: 'write', key: 'acct', val: () => 500, sql: 'UPDATE acct SET balance = 500' },
+        { t: 'T2', kind: 'read', key: 'acct', as: 'b', sql: 'SELECT balance FROM acct' },
+        { t: 'T1', kind: 'rollback', sql: 'ROLLBACK' },
+        { t: 'T2', kind: 'commit', sql: 'COMMIT' },
+      ] },
+    { id: 'nrr', label: 'Non-repeatable read: a price changes mid-transaction', anomaly: 'non-repeatable read',
+      blurb: 'price is 10. T1 reads it twice, for example while building a report. T2 changes it to 12 and commits between the two reads.',
+      initial: { price: 10 },
+      ops: [
+        { t: 'T1', kind: 'read', key: 'price', as: 'p1', sql: 'SELECT price FROM item   -- first read' },
+        { t: 'T2', kind: 'write', key: 'price', val: () => 12, sql: 'UPDATE item SET price = 12' },
+        { t: 'T2', kind: 'commit', sql: 'COMMIT' },
+        { t: 'T1', kind: 'read', key: 'price', as: 'p2', sql: 'SELECT price FROM item   -- second read' },
+        { t: 'T1', kind: 'commit', sql: 'COMMIT' },
+      ] },
+    { id: 'phantom', label: 'Phantom: a new row appears in a range', anomaly: 'phantom',
+      blurb: 'alice and bob are on call. T1 counts the doctors on call twice. T2 inserts a third doctor, carol, and commits between the two counts.',
+      initial: { alice: 1, bob: 1 },
+      ops: [
+        { t: 'T1', kind: 'scan', as: 'n1', sql: 'SELECT count(*) FROM doctors WHERE on_call   -- first count' },
+        { t: 'T2', kind: 'write', key: 'carol', val: () => 1, sql: "INSERT INTO doctors VALUES ('carol', 1)" },
+        { t: 'T2', kind: 'commit', sql: 'COMMIT' },
+        { t: 'T1', kind: 'scan', as: 'n2', sql: 'SELECT count(*) FROM doctors WHERE on_call   -- second count' },
+        { t: 'T1', kind: 'commit', sql: 'COMMIT' },
+      ] },
+  ];
+
+  interface Db { keys: string[]; chain: Record<string, Ver[]>; status: Record<number, string>; cseq: Record<number, number>; clock: number }
+  interface Tx { name: string; id: number; started: boolean; snap: number; vars: Vars; reads: Set<string>; inE: Set<number>; outE: Set<number>; waitOn: number; blockedOp: Op | null; deferred: Op[]; done: boolean }
+
+  function newDb(initial: Record<string, number>): Db {
+    const db: Db = { keys: [], chain: {}, status: { [SETUP]: 'committed' }, cseq: { [SETUP]: 1 }, clock: 1 };
+    for (const k of Object.keys(initial)) { db.keys.push(k); db.chain[k] = [{ val: initial[k], xmin: SETUP, xmax: 0, st: 'committed' }]; }
+    return db;
+  }
+
+  // Is version v visible to transaction tx at this level? snap is the snapshot (commit sequence number).
+  function visible(db: Db, v: Ver, tx: Tx, level: Level, snap: number): boolean {
+    const seen = (id: number) => id === tx.id || (level === 'ru' ? db.status[id] !== 'aborted' : db.status[id] === 'committed' && db.cseq[id] <= snap);
+    return seen(v.xmin) && !(v.xmax !== 0 && seen(v.xmax));
+  }
+  function snapFor(db: Db, tx: Tx, level: Level): number { return level === 'rc' ? db.clock : tx.snap; }
+
+  function simulate(sc: Scenario, level: Level, opsOverride?: Op[]): Outcome {
+    const db = newDb(sc.initial);
+    const ops = opsOverride ?? sc.ops;
+    const names = Array.from(new Set(ops.map((o) => o.t)));
+    const tx: Record<string, Tx> = {};
+    for (const n of names) tx[n] = { name: n, id: ID[n], started: false, snap: 0, vars: {}, reads: new Set(), inE: new Set(), outE: new Set(), waitOn: 0, blockedOp: null, deferred: [], done: false };
+    const frames: Frame[] = []; const reads: Record<string, Obs[]> = {}; const aborted: string[] = []; const committed: string[] = [];
+    let blocked = 0; let saw: Record<string, number> = {};
+    for (const n of names) reads[n] = [];
+    const byId = (id: number) => names.map((n) => tx[n]).find((x) => x.id === id);
+
+    function statusOf(x: Tx): string {
+      if (db.status[x.id] === 'committed') return 'committed';
+      if (db.status[x.id] === 'aborted') return 'aborted';
+      if (x.waitOn) return `blocked (waits for T${x.waitOn - 10})`;
+      return x.started ? 'active' : 'not started';
+    }
+    function snapText(x: Tx): string {
+      if (!x.started || db.status[x.id] !== 'active') return '';
+      if (level === 'ru') return 'no snapshot: sees everything written';
+      if (level === 'rc') return `snapshot per statement (commits up to #${db.clock})`;
+      return `snapshot fixed at commit #${x.snap}`;
+    }
+    function push(x: Tx, sql: string, lines: string[], tone: Frame['tone']) {
+      const status: Record<string, string> = {}; const snaps: Record<string, string> = {};
+      for (const n of names) { status[n] = statusOf(tx[n]); snaps[n] = snapText(tx[n]); }
+      frames.push({ t: x.name, sql, lines, tone, status, snaps, store: db.keys.map((k) => ({ key: k, vers: db.chain[k].map((v) => ({ ...v })), saw: saw[k] ?? -1 })) });
+      saw = {};
+    }
+    function start(x: Tx): string[] {
+      if (x.started) return [];
+      x.started = true; db.status[x.id] = 'active';
+      if (level === 'rr' || level === 'ser') x.snap = db.clock;
+      return [`BEGIN (transaction id ${x.id})`];
+    }
+    function concurrent(u: Tx, x: Tx): boolean {
+      if (u === x || db.status[u.id] === 'aborted' || !u.started) return false;
+      return db.status[u.id] === 'active' || db.cseq[u.id] > snapFor(db, x, level);
+    }
+    function pickVisible(x: Tx, k: string): { idx: number; skipped: string[] } {
+      const snap = snapFor(db, x, level); const skipped: string[] = [];
+      const chain = db.chain[k]; let idx = -1;
+      for (let i = 0; i < chain.length && idx === -1; i++) if (visible(db, chain[i], x, level, snap)) idx = i;
+      // versions newer than the visible one that this reader must ignore (they are the read-write dependencies)
+      for (let i = idx + 1; i < chain.length; i++) {
+        const v = chain[i];
+        if (v.st === 'aborted' || v.xmin === x.id) continue;
+        const why = db.status[v.xmin] === 'active' ? 'uncommitted' : 'committed after the snapshot';
+        skipped.push(`ignored v${i + 1} (${v.val}, xmin=${v.xmin}): ${why}`);
+        const w = byId(v.xmin); if (level === 'ser' && w && concurrent(w, x)) { x.outE.add(w.id); w.inE.add(x.id); }
+      }
+      return { idx, skipped };
+    }
+    function readLatestForRU(x: Tx, k: string): number {
+      for (let i = db.chain[k].length - 1; i >= 0; i--) if (visible(db, db.chain[k][i], x, level, 0)) return i;
+      return -1;
+    }
+    function abort(x: Tx, why: string): string[] {
+      db.status[x.id] = 'aborted'; x.done = true; aborted.push(x.name);
+      for (const k of db.keys) for (const v of db.chain[k]) { if (v.xmin === x.id) v.st = 'aborted'; if (v.xmax === x.id) v.xmax = 0; }
+      return [why];
+    }
+    function release(x: Tx) {
+      for (const n of names) {
+        const u = tx[n];
+        if (u.waitOn === x.id && u.blockedOp) {
+          const op = u.blockedOp; u.waitOn = 0; u.blockedOp = null;
+          run(op, true);
+          while (u.deferred.length && !u.waitOn && !u.done) run(u.deferred.shift()!, false);
+        }
+      }
+    }
+    function run(op: Op, resumed: boolean) {
+      const x = tx[op.t];
+      if (x.done) return;
+      if (x.waitOn) { x.deferred.push(op); return; }
+      const lines = start(x); if (resumed) lines.unshift(`unblocked: ${x.name} retries the statement now that the lock is free`);
+      if (op.kind === 'read' || op.kind === 'scan') {
+        const keys = op.kind === 'read' ? [op.key!] : db.keys; let total = 0; const parts: string[] = []; const extra: string[] = [];
+        for (const k of keys) {
+          x.reads.add(k);
+          const p = level === 'ru' ? { idx: readLatestForRU(x, k), skipped: [] as string[] } : pickVisible(x, k);
+          if (p.idx >= 0) { const v = db.chain[k][p.idx]; total += v.val; parts.push(`${k}=${v.val}`); saw[k] = p.idx; extra.push(...p.skipped);
+            if (level === 'ru' && v.xmin !== SETUP && db.status[v.xmin] === 'active' && v.xmin !== x.id) extra.push(`DIRTY: v${p.idx + 1} (${v.val}) belongs to uncommitted T${v.xmin - 10}`); }
+          else extra.push(...p.skipped);
+        }
+        if (op.kind === 'scan') x.reads.add('*');
+        x.vars[op.as!] = total; reads[x.name].push({ label: op.as!, value: total });
+        const where = op.kind === 'scan' ? ` rows seen: ${parts.join(', ') || 'none'}` : '';
+        lines.push(`-> ${total}${where}`, ...extra);
+        push(x, op.sql, lines, extra.some((e) => e.startsWith('DIRTY')) ? 'bad' : 'ok');
+        return;
+      }
+      if (op.kind === 'write') {
+        if (op.when && !op.when(x.vars)) { lines.push('condition false: no write'); push(x, op.sql, lines, 'info'); return; }
+        const k = op.key!; const isInsert = !db.chain[k];
+        const val = op.val!(x.vars);
+        if (isInsert) { db.keys.push(k); db.chain[k] = []; }
+        const chain = db.chain[k]; let li = chain.length - 1; while (li >= 0 && chain[li].st === 'aborted') li--;
+        if (li >= 0 && chain[li].xmin !== x.id) {
+          const owner = chain[li].xmin;
+          if (db.status[owner] === 'active') {
+            x.waitOn = owner; x.blockedOp = op; blocked++;
+            lines.push(`BLOCKED: row '${k}' has an uncommitted version from T${owner - 10}; waits for its commit or rollback`);
+            push(x, op.sql, lines, 'warn'); return;
+          }
+          if ((level === 'rr' || level === 'ser') && db.cseq[owner] > snapFor(db, x, level)) {
+            const l2 = abort(x, `ABORT (40001): could not serialize access, row '${k}' was changed by T${owner - 10} after this snapshot (first-committer-wins)`);
+            push(x, op.sql, [...lines, ...l2], 'bad'); release(x); return;
+          }
+        }
+        if (level === 'ser') {
+          for (const n of names) { const u = tx[n]; if (concurrent(u, x) && (u.reads.has(k) || (isInsert && u.reads.has('*')))) { u.outE.add(x.id); x.inE.add(u.id); } }
+        }
+        if (li >= 0 && chain[li].xmin === x.id) { chain[li].val = val; lines.push(`rewrote its own version -> ${val}`); }
+        else {
+          if (li >= 0) { chain[li].xmax = x.id; lines.push(`old version v${li + 1} (${chain[li].val}) gets xmax=${x.id}`); }
+          chain.push({ val, xmin: x.id, xmax: 0, st: 'active' });
+          lines.push(`new version v${chain.length} = ${val} (xmin=${x.id}, uncommitted)`);
+        }
+        push(x, op.sql, lines, 'ok'); return;
+      }
+      if (op.kind === 'rollback') {
+        const l2 = abort(x, 'ROLLBACK: its versions are marked dead (vacuum reclaims them later)'); aborted.pop();
+        push(x, op.sql, [...lines, ...l2], 'info'); release(x); return;
+      }
+      // commit
+      if (level === 'ser') {
+        const live = (s: Set<number>) => Array.from(s).filter((id) => db.status[id] !== 'aborted');
+        if (live(x.inE).length && live(x.outE).length) {
+          const l2 = abort(x, `ABORT (40001): serialization failure. T${x.id - 10} has both an incoming and an outgoing read-write dependency (T${live(x.inE)[0] - 10} -> T${x.id - 10} -> T${live(x.outE)[0] - 10})`);
+          push(x, op.sql, [...lines, ...l2], 'bad'); release(x); return;
+        }
+      }
+      db.clock++; db.cseq[x.id] = db.clock; db.status[x.id] = 'committed'; x.done = true; committed.push(x.name);
+      for (const k of db.keys) for (const v of db.chain[k]) if (v.xmin === x.id && v.st === 'active') v.st = 'committed';
+      lines.push(`committed as #${db.clock}`);
+      push(x, op.sql, lines, 'ok'); release(x);
+    }
+
+    push({ name: '-' } as Tx, 'initial data (loaded by transaction 10)', ['no transaction has started'], 'info');
+    for (const op of ops) run(op, false);
+    const stuck = names.some((n) => !tx[n].done && tx[n].started);
+    const state: Record<string, number> = {};
+    for (const k of db.keys) { const vs = db.chain[k].filter((v) => v.st === 'committed' && !(v.xmax !== 0 && db.status[v.xmax] === 'committed')); if (vs.length) state[k] = vs[vs.length - 1].val; }
+    return { frames, state, reads, committed, aborted, blocked, stuck };
+  }
+
+  function signature(o: Outcome): string {
+    const keys = Object.keys(o.state).sort();
+    return JSON.stringify([keys.map((k) => [k, o.state[k]]), o.committed.slice().sort().map((n) => [n, o.reads[n].map((r) => r.value)])]);
+  }
+  function explain(sc: Scenario, level: Level): Verdict {
+    const sim = simulate(sc, level);
+    const orders = sim.committed.length === 2 ? [['T1', 'T2'], ['T2', 'T1']] : sim.committed.length === 1 ? [sim.committed.slice()] : [[]];
+    const serial = orders.map((order) => {
+      const ops = order.flatMap((n) => sc.ops.filter((o) => o.t === n));
+      const o = simulate(sc, 'rc', ops); return { order, state: o.state, sig: signature(o) };
+    });
+    const mySig = signature(sim);
+    // reads of the concurrent run only count for committed transactions, so the signatures are comparable
+    const hit = serial.find((s) => s.sig === mySig);
+    const anomaly = !hit && !sim.stuck;
+    const fmt = (s: Record<string, number>) => Object.keys(s).map((k) => `${k}=${s[k]}`).join(', ');
+    let text: string;
+    if (anomaly) text = `ANOMALY: ${sc.anomaly}. Final state (${fmt(sim.state)}) and what the transactions read match no serial order. Serial results would be: ${serial.map((s) => `${s.order.join(' then ') || 'none'}: ${fmt(s.state)}`).join(' | ')}.`;
+    else {
+      const ab = sim.aborted.length ? ` ${sim.aborted.join(', ')} was aborted and must be retried.` : '';
+      text = `No anomaly. Final state (${fmt(sim.state)}) equals running ${hit ? (hit.order.join(' then ') || 'nothing') : 'nothing'} serially.${ab}${sim.blocked ? ' A write waited on a row lock.' : ''}`;
+    }
+    return { anomaly, name: sc.anomaly, text, sim, serial: serial.map((s) => ({ order: s.order, state: s.state })), match: hit ? hit.order : null };
+  }
+  // ===== CORE END =====
+
+  document.querySelectorAll<HTMLElement>('[data-mv]').forEach((root) => {
+    const q = <T extends HTMLElement>(s: string) => root.querySelector<T>(s)!;
+    const scnSel = q<HTMLSelectElement>('[data-scn]'); const lvlSel = q<HTMLSelectElement>('[data-lvl]');
+    SCENARIOS.forEach((s, i) => scnSel.add(new Option(s.label, String(i))));
+    LEVELS.forEach((l) => lvlSel.add(new Option(l.label, l.id)));
+    lvlSel.value = 'rr';
+    const strip = q('[data-strip]'); const stripBoxes: { box: HTMLElement; title: HTMLElement; text: HTMLElement }[] = [];
+    LEVELS.forEach(() => {
+      const box = document.createElement('div'); box.className = 'pg-box';
+      const title = document.createElement('h3'); const text = document.createElement('span'); text.className = 'pg-note';
+      box.append(title, text); strip.append(box); stripBoxes.push({ box, title, text });
+    });
+    const storeEl = q('[data-store]'); const logEl = q('[data-log]'); const out = q<HTMLOutputElement>('[data-out]');
+    let verdict: Verdict; let pos = 0; let raf = 0;
+
+    function scenario() { return SCENARIOS[Number(scnSel.value)]; }
+    function level() { return lvlSel.value as Level; }
+    function recompute() {
+      const sc = scenario(); verdict = explain(sc, level()); pos = 0;
+      q('[data-blurb]').textContent = sc.blurb;
+      LEVELS.forEach((l, i) => {
+        const v = explain(sc, l.id); const b = stripBoxes[i];
+        b.title.textContent = l.label;
+        b.text.textContent = v.anomaly ? `ANOMALY: ${sc.anomaly}` : v.sim.aborted.length ? `safe, ${v.sim.aborted.join(', ')} aborted` : 'safe';
+        b.box.style.setProperty('--c', v.anomaly ? 'var(--bad)' : 'var(--good)');
+        b.box.classList.toggle('lit', l.id === level());
+      });
+      logEl.textContent = '';
+      schedule();
+    }
+    function schedule() { if (!raf) raf = requestAnimationFrame(() => { raf = 0; draw(); }); }
+    function draw() {
+      const frames = verdict.sim.frames; const f = frames[pos];
+      q('[data-step]').toggleAttribute('disabled', pos >= frames.length - 1);
+      q('[data-end]').toggleAttribute('disabled', pos >= frames.length - 1);
+      q('[data-back]').toggleAttribute('disabled', pos === 0);
+      for (const n of ['T1', 'T2']) {
+        q('[data-st="' + n + '"]').textContent = f.status[n] ?? 'not started';
+        q('[data-snap="' + n + '"]').textContent = f.snaps[n] ?? '';
+        q('[data-box="' + n + '"]').classList.toggle('lit', f.t === n);
+        q('[data-box="' + n + '"]').classList.toggle('off', (f.status[n] ?? '') === 'not started');
+      }
+      storeEl.textContent = '';
+      for (const row of f.store) {
+        const line = document.createElement('div'); line.className = 'mv-row';
+        const name = document.createElement('b'); name.textContent = row.key; line.append(name);
+        row.vers.forEach((v, i) => {
+          const c = document.createElement('span'); c.className = 'mv-ver ' + v.st + (i === row.saw ? ' saw' : '');
+          c.textContent = `v${i + 1}: ${v.val}  xmin=${v.xmin} xmax=${v.xmax || '-'}${v.st === 'aborted' ? ' dead' : v.st === 'active' ? ' uncommitted' : ''}`;
+          line.append(c);
+        });
+        storeEl.append(line);
+      }
+      while (logEl.children.length > pos) logEl.lastElementChild!.remove();
+      for (let i = logEl.children.length + 1; i <= pos; i++) {
+        const fr = frames[i]; const li = document.createElement('li'); li.className = 'mv-' + fr.tone;
+        const head = document.createElement('b'); head.textContent = `${fr.t}: `; const sql = document.createElement('code'); sql.textContent = fr.sql;
+        li.append(head, sql);
+        for (const l of fr.lines) { const d = document.createElement('div'); d.className = 'pg-note'; d.textContent = l; li.append(d); }
+        logEl.append(li);
+      }
+      const last = pos >= frames.length - 1;
+      out.classList.toggle('bad', last && verdict.anomaly);
+      out.textContent = last ? verdict.text : `Step ${pos} of ${frames.length - 1}. Press Step to run the next statement.`;
+    }
+    function go(to: number) { pos = Math.max(0, Math.min(verdict.sim.frames.length - 1, to)); schedule(); }
+    q('[data-step]').addEventListener('click', () => go(pos + 1));
+    q('[data-back]').addEventListener('click', () => go(pos - 1));
+    q('[data-end]').addEventListener('click', () => go(verdict.sim.frames.length - 1));
+    q('[data-reset]').addEventListener('click', () => go(0));
+    scnSel.addEventListener('change', recompute);
+    lvlSel.addEventListener('change', recompute);
+    recompute();
+  });
+</script>
+<style is:global>
+  .playground .mv-store { display: grid; gap: 6px; }
+  .playground .mv-row { display: flex; flex-wrap: wrap; gap: 4px 6px; align-items: baseline; }
+  .playground .mv-ver { font: .78rem ui-monospace, monospace; padding: 2px 6px; border-radius: 6px; border: 2px solid var(--border); background: var(--surface-2); }
+  .playground .mv-ver.active { border-style: dashed; border-color: var(--role-3); }
+  .playground .mv-ver.committed { border-color: var(--role-2); }
+  .playground .mv-ver.aborted { color: var(--muted); text-decoration: line-through; opacity: .7; }
+  .playground .mv-ver.saw { border-color: var(--accent); box-shadow: 0 0 0 3px color-mix(in srgb, var(--accent) 30%, transparent); }
+  .playground .mv-log { margin: 0; padding-left: 1.3rem; display: grid; gap: 6px; }
+  .playground .mv-log code { font: .82rem ui-monospace, monospace; overflow-wrap: anywhere; }
+  .playground .mv-bad { color: var(--bad-text, var(--bad)); }
+  .playground .mv-warn b { color: var(--role-3); }
+</style>

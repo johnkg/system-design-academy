@@ -151,6 +151,24 @@ export const problems: Problem[] = [
     { slug: 'multi-region-failover', why: 'Decide the recovery time and data loss you can accept, then pick a standby and a failover method.' },
     { slug: 'database-replication', why: 'Replication lag decides how many recent writes are lost on failover.' },
     { slug: 'dns', why: 'DNS time-to-live decides how long clients keep going to the failed region.' } ] },
+  { text: 'Understand why my database is slow at writes or at reads, and what the storage engine is doing', patterns: [
+    { slug: 'lsm-trees-vs-b-trees', why: 'B-trees update pages in place and read fast; LSM trees append and merge, so they write fast and pay in compaction.' },
+    { slug: 'database-indexing', why: 'An index is what turns a scan into a handful of page reads.' } ] },
+  { text: 'Be sure committed data survives a crash or a power cut', patterns: [
+    { slug: 'write-ahead-log', why: 'Log the change durably before touching data pages, then replay the log after a crash.' },
+    { slug: 'database-replication', why: 'A replica holds a second copy of the data, fed from the same log.' } ] },
+  { text: 'Let many users read and write at once without seeing half-finished or inconsistent data', patterns: [
+    { slug: 'mvcc-and-isolation-levels', why: 'Snapshots keep readers and writers apart, and the isolation level decides which anomalies remain.' },
+    { slug: 'acid-vs-base', why: 'Choose how strict the guarantees for a transaction must be.' } ] },
+  { text: 'Find out why a query suddenly became slow', patterns: [
+    { slug: 'query-planning-and-joins', why: 'Read the plan: compare estimated and actual rows, and check the join method and statistics.' },
+    { slug: 'database-indexing', why: 'A missing or unusable index is the most common cause.' } ] },
+  { text: 'Change a table or move a database while the application keeps running', patterns: [
+    { slug: 'online-schema-migrations', why: 'Expand, dual-write, backfill in batches, switch, then contract; or copy into a shadow table and swap.' },
+    { slug: 'blue-green-and-rolling-deployments', why: 'The application versions must work with both the old and the new schema while you roll out.' } ] },
+  { text: 'Get my data back after a bad deploy, an accidental DELETE or a lost server', patterns: [
+    { slug: 'backups-and-point-in-time-recovery', why: 'Restore a base backup and replay the archived log up to just before the mistake.' },
+    { slug: 'database-replication', why: 'A replica is not a backup: it copies the mistake within a second.' } ] },
 ];
 
 export const confusions: Confusion[] = [
@@ -391,5 +409,17 @@ export const confusions: Confusion[] = [
       { aspect: 'Typical failure', values: ['Flapping, or scaling too late for a spike', 'Pods that cannot be placed, or are evicted for lack of memory', 'A rename or immutable change that destroys and recreates a resource'] },
     ],
     rule: 'Infrastructure as code creates the cluster, the orchestrator runs the containers on it, and autoscaling changes how many of them there are. A problem in one layer often shows up as a symptom in another.',
+  },
+  {
+    title: 'Write-ahead log, replication or backup?',
+    blurb: 'Three ways of keeping a second copy of your data. They protect against different things, and none replaces the others.',
+    patterns: ['write-ahead-log', 'database-replication', 'backups-and-point-in-time-recovery'],
+    rows: [
+      { aspect: 'Protects against', values: ['A crash or power loss on this one server', 'Losing a server or a zone, and read load', 'A bad deploy, an accidental delete, corruption, losing everything'] },
+      { aspect: 'Does it copy a mistake?', values: ['Yes, it records every change, including a bad one', 'Yes, within a second or so', 'No: you restore to a moment before the mistake'] },
+      { aspect: 'Where it lives', values: ['The same machine, as a fast sequential file', 'Other machines, kept up to date continuously', 'Separate storage, ideally another account or region'] },
+      { aspect: 'Recovery time', values: ['Seconds to minutes: replay since the last checkpoint', 'Seconds: promote the replica', 'Minutes to hours: restore, then replay the log'] },
+    ],
+    rule: 'They are layers fed by the same log. The log gets you through a crash, a replica through a failed machine, and a backup with the archived log through a human mistake. Test the restore, not just the backup.',
   },
 ];

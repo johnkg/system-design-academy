@@ -1,0 +1,256 @@
+---
+import PlaygroundShell from '../components/PlaygroundShell.astro';
+---
+<PlaygroundShell title="Simulate it" hint="Orders joined to customers, filtered by country. Pick the table size, the filter, the index and how fresh the statistics are, then compare what the planner expects with what really happens.">
+  <ol class="how">
+    <li>Start on <b>Tiny tables</b> with the planner in charge. Press <b>Run EXPLAIN ANALYZE</b>: a <b>nested loop</b> is cheapest (cost about 3.0, against 3.1 for merge and 3.8 for hash join) because building a hash table or sorting costs more than comparing 5 customers with 40 orders.</li>
+    <li>Switch to <b>Large tables</b> (filter US, heap, fresh statistics): the planner picks a <b>hash join</b> (cost about 558). Force <b>Nested loop</b> and run it: 8,000,000 rows compared, cost about 20,435. Force <b>Merge join</b>: it must sort 20,000 orders first, cost about 1,142.</li>
+    <li>Set the storage to <b>Clustered on customer_id</b>: orders already arrive sorted, the sort disappears and <b>merge join</b> wins (about 490). Then pick the rare filter <b>IS</b>: only 3 customers match, so <b>index probes</b> into orders win by a wide margin (about 72 against 536 for a hash join).</li>
+    <li>Back on Large, heap, filter <b>US</b>, set the statistics to <b>Stale</b> and run: the planner expects 1 customer row, the table has 400, so it picks a nested loop that costs about 20,435 instead of 558 (roughly 37 times worse). Set the statistics back to <b>Fresh</b>, which is what <code>ANALYZE</code> does, and the hash join returns.</li>
+  </ol>
+  <div class="pg qp" data-qp>
+    <div class="pg-row">
+      <label>Tables <select class="pg-in" data-scale><option value="tiny">Tiny: 12 customers, 40 orders</option><option value="large" selected>Large: 1,000 customers, 20,000 orders</option></select></label>
+      <label>Filter: country <select class="pg-in" data-country><option value="IS">IS (3 customers in the large table, 0.3%)</option><option value="NL">NL (50 customers, 5%)</option><option value="US" selected>US (400 customers, 40%)</option></select></label>
+    </div>
+    <div class="pg-row">
+      <label>Orders storage <select class="pg-in" data-storage><option value="heap" selected>Heap, no index on customer_id</option><option value="index">B-tree index on customer_id</option><option value="clustered">Clustered: sorted by customer_id</option></select></label>
+      <label>Statistics <select class="pg-in" data-stats><option value="fresh" selected>Fresh (just ran ANALYZE)</option><option value="stale">Stale (taken when tables were 20x smaller and the country was rare)</option></select></label>
+      <label>Join method <select class="pg-in" data-method><option value="auto" selected>Let the planner choose</option><option value="nl">Force nested loop</option><option value="hash">Force hash join</option><option value="merge">Force merge join</option></select></label>
+    </div>
+    <div class="pg-row">
+      <button class="btn pg-primary" type="button" data-run>Run EXPLAIN ANALYZE</button>
+      <button class="btn" type="button" data-reset>Reset</button>
+    </div>
+    <p class="pg-mono" data-sql></p>
+    <div class="pg-grid">
+      <div class="pg-box" style="--c: var(--role-1)" data-b1><h3>Join method</h3><span class="pg-mono" data-method-out></span><span class="pg-note" data-method-note></span></div>
+      <div class="pg-box" style="--c: var(--role-2)"><h3>Rows: estimated vs actual</h3><span class="pg-mono" data-rows></span><span class="pg-note" data-rows-note></span></div>
+      <div class="pg-box" style="--c: var(--role-3)"><h3>Cost: estimated vs actual</h3><span class="pg-mono" data-cost></span><span class="pg-note">1 unit = one sequential page read</span></div>
+      <div class="pg-box" style="--c: var(--role-4)"><h3>Pages read and rows compared</h3><span class="pg-mono" data-work></span><span class="pg-note" data-work-note></span></div>
+    </div>
+    <pre class="pg-out qp-pre" data-plan tabindex="0" aria-label="Query plan"></pre>
+    <pre class="pg-out qp-pre" data-table tabindex="0" aria-label="All join methods compared"></pre>
+    <output class="pg-out" data-verdict aria-live="polite"></output>
+    <p class="pg-note">Cost model: sequential page 1, random page 4, row processed 0.01, comparison 0.0025, hash operation 0.005, hash table setup 1. Estimates use the statistics; actuals are counted while the join really runs on the seeded rows. The customers side is always the outer or build side.</p>
+  </div>
+</PlaygroundShell>
+<script>
+// ---- simulation core: pure functions, no DOM ----
+type Method = 'nl' | 'hash' | 'merge';
+type Variant = 'nl' | 'nlidx' | 'hash' | 'merge';
+type TableLayout = 'heap' | 'index' | 'clustered';
+type Scale = 'tiny' | 'large';
+type Country = 'IS' | 'NL' | 'US';
+interface Work { seq: number; rand: number; tuples: number; cmp: number; hash: number; setup: number }
+interface Data { scale: Scale; storage: TableLayout; nC: number; nO: number; pC: number; pO: number; h: number; countries: string[]; cids: number[]; orderIds: number[]; index: Map<number, number[]>; ndv: number; count: Record<string, number> }
+interface Stats { nC: number; nO: number; ndv: number; sel: number; stale: boolean }
+interface Cand { variant: Variant; est: Work; cost: number }
+interface Run { work: Work; pairs: number[]; k: number }
+
+const RPP_C = 40; const RPP_O = 100; // rows per 8 kB page
+const W_COST = { seq: 1, rand: 4, tuple: 0.01, cmp: 0.0025, hash: 0.005 };
+const SCALES = {
+  tiny: { nC: 12, nO: 40, h: 1, quota: { IS: 1, NL: 2, US: 5 } },
+  large: { nC: 1000, nO: 20000, h: 2, quota: { IS: 3, NL: 50, US: 400 } },
+};
+const OLD_SEL = 0.002; // what the country filter selected when statistics were last gathered
+
+function mulberry32(a: number) {
+  return () => { a = (a + 0x6d2b79f5) | 0; let t = Math.imul(a ^ (a >>> 15), 1 | a); t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t; return ((t ^ (t >>> 14)) >>> 0) / 4294967296; };
+}
+const zero = (): Work => ({ seq: 0, rand: 0, tuples: 0, cmp: 0, hash: 0, setup: 0 });
+const cost = (w: Work) => w.seq * W_COST.seq + w.rand * W_COST.rand + w.tuples * W_COST.tuple + w.cmp * W_COST.cmp + w.hash * W_COST.hash + w.setup;
+const pagesOf = (w: Work) => w.seq + w.rand;
+const comparesOf = (w: Work) => w.cmp + w.hash;
+const log2c = (n: number) => (n <= 1 ? 0 : Math.ceil(Math.log2(n)));
+const round = (x: number) => Math.floor(x + 0.5);
+
+function buildData(scale: Scale, storage: TableLayout): Data {
+  const sc = SCALES[scale]; const rnd = mulberry32(20240611);
+  const countries: string[] = [];
+  const others = ['DE', 'FR', 'BR'];
+  for (const [c, n] of Object.entries(sc.quota)) for (let i = 0; i < n; i++) countries.push(c);
+  for (let i = 0; countries.length < sc.nC; i++) countries.push(others[i % 3]);
+  for (let i = countries.length - 1; i > 0; i--) { const j = Math.floor(rnd() * (i + 1)); [countries[i], countries[j]] = [countries[j], countries[i]]; }
+  // arrival order: customer ids are skewed, so a few customers have many orders
+  let rows = Array.from({ length: sc.nO }, (_, i) => { const u = rnd(); return { id: i + 1, cid: 1 + Math.floor(sc.nC * u * u) }; });
+  if (storage === 'clustered') rows = rows.slice().sort((a, b) => a.cid - b.cid || a.id - b.id);
+  const index = new Map<number, number[]>();
+  rows.forEach((r, pos) => { const l = index.get(r.cid); if (l) l.push(pos); else index.set(r.cid, [pos]); });
+  const count: Record<string, number> = {};
+  countries.forEach((c) => { count[c] = (count[c] || 0) + 1; });
+  return { scale, storage, nC: sc.nC, nO: sc.nO, pC: Math.ceil(sc.nC / RPP_C), pO: Math.ceil(sc.nO / RPP_O), h: sc.h, countries, cids: rows.map((r) => r.cid), orderIds: rows.map((r) => r.id), index, ndv: index.size, count };
+}
+
+// What the optimiser believes. Stale: tables grew 20x since the last ANALYZE and the country was rare back then.
+function makeStats(d: Data, country: Country, stale: boolean): Stats {
+  if (!stale) return { nC: d.nC, nO: d.nO, ndv: d.ndv, sel: d.count[country] / d.nC, stale };
+  return { nC: Math.max(1, Math.floor(d.nC / 20)), nO: Math.max(1, Math.floor(d.nO / 20)), ndv: Math.max(1, Math.floor(d.ndv / 20)), sel: OLD_SEL, stale };
+}
+const estK = (s: Stats) => Math.max(1, round(s.nC * s.sel));
+const estM = (s: Stats) => round((estK(s) * s.nO) / s.ndv);
+
+// Cost of a join variant from row counts alone: this is what the planner can do before running anything.
+function estimateWork(v: Variant, d: Data, s: Stats): Work {
+  const w = zero(); const k = estK(s); const M = estM(s); const nO = s.nO; // page counts are real: they come from the file size
+  w.seq = d.pC; w.tuples = s.nC;
+  if (v === 'nl') { w.seq += d.pO; w.tuples += nO; w.cmp = k * nO; }
+  else if (v === 'nlidx') {
+    const m = M / k; const clustered = d.storage === 'clustered';
+    w.rand = k * d.h + (clustered ? k : M);
+    w.seq += clustered ? k * Math.max(0, Math.ceil(m / RPP_O) - 1) : 0;
+    w.tuples += M; w.cmp = k * log2c(nO) + M;
+  } else if (v === 'hash') { w.seq += d.pO; w.tuples += nO; w.hash = k + nO; w.cmp = M; w.setup = 1; }
+  else { w.seq += d.pO; w.tuples += nO + k; w.cmp = k + nO + (d.storage === 'clustered' ? 0 : Math.ceil(nO * Math.log2(Math.max(nO, 1)))); }
+  return w;
+}
+function candidates(d: Data, s: Stats): Cand[] {
+  const vs: Variant[] = d.storage === 'heap' ? ['nl', 'hash', 'merge'] : ['nl', 'nlidx', 'hash', 'merge'];
+  return vs.map((variant) => { const est = estimateWork(variant, d, s); return { variant, est, cost: cost(est) }; });
+}
+const methodOf = (v: Variant): Method => (v === 'nlidx' ? 'nl' : v);
+// choose = the cheapest candidate of the forced method, or of everything (the planner)
+function choose(cs: Cand[], forced: Method | 'auto'): Cand {
+  const pool = forced === 'auto' ? cs : cs.filter((c) => methodOf(c.variant) === forced);
+  return pool.reduce((a, b) => (b.cost < a.cost ? b : a));
+}
+
+function mergeSort(a: number[][], key: number, counter: { n: number }): number[][] {
+  if (a.length <= 1) return a;
+  const mid = a.length >> 1; const l = mergeSort(a.slice(0, mid), key, counter); const r = mergeSort(a.slice(mid), key, counter);
+  const out: number[][] = []; let i = 0, j = 0;
+  while (i < l.length && j < r.length) { counter.n++; if (r[j][key] < l[i][key]) out.push(r[j++]); else out.push(l[i++]); }
+  while (i < l.length) out.push(l[i++]);
+  while (j < r.length) out.push(r[j++]);
+  return out;
+}
+
+// Real executors over the real rows; they count pages, tuples and comparisons as they go.
+function execute(v: Variant, d: Data, country: Country): Run {
+  const w = zero(); const pairs: number[] = [];
+  w.seq = d.pC; w.tuples = d.nC;
+  const outer: number[] = []; d.countries.forEach((c, i) => { if (c === country) outer.push(i + 1); }); // ids in primary-key order
+  const k = outer.length;
+  const emit = (orderId: number, cid: number) => pairs.push(orderId * 100000 + cid);
+  if (v === 'nl') {
+    w.seq += d.pO; w.tuples += d.nO;
+    for (const c of outer) for (let p = 0; p < d.nO; p++) { w.cmp++; if (d.cids[p] === c) emit(d.orderIds[p], c); }
+  } else if (v === 'nlidx') {
+    for (const c of outer) {
+      w.rand += d.h; w.cmp += log2c(d.nO);
+      const pos = d.index.get(c) || []; const seen = new Set<number>();
+      for (const p of pos) { w.cmp++; w.tuples++; seen.add(Math.floor(p / RPP_O)); emit(d.orderIds[p], c); }
+      if (d.storage === 'clustered') { if (seen.size) { w.rand += 1; w.seq += seen.size - 1; } } else w.rand += seen.size;
+    }
+  } else if (v === 'hash') {
+    w.seq += d.pO; w.tuples += d.nO; w.setup = 1;
+    const table = new Set<number>(); for (const c of outer) { w.hash++; table.add(c); }
+    for (let p = 0; p < d.nO; p++) { w.hash++; if (table.has(d.cids[p])) { w.cmp++; emit(d.orderIds[p], d.cids[p]); } }
+  } else {
+    w.seq += d.pO; w.tuples += d.nO + k;
+    let rows = d.cids.map((cid, p) => [cid, d.orderIds[p]]);
+    if (d.storage !== 'clustered') { const ct = { n: 0 }; rows = mergeSort(rows, 0, ct); w.cmp += ct.n; }
+    let i = 0, j = 0;
+    while (i < k && j < rows.length) {
+      w.cmp++;
+      if (outer[i] < rows[j][0]) i++; else if (outer[i] > rows[j][0]) j++; else { emit(rows[j][1], rows[j][0]); j++; }
+    }
+  }
+  pairs.sort((a, b) => a - b);
+  return { work: w, pairs, k };
+}
+
+// ---- UI ----
+const fmt = (n: number) => Math.round(n).toLocaleString('en-US');
+const fc = (n: number) => n.toLocaleString('en-US', { minimumFractionDigits: 1, maximumFractionDigits: 1 });
+const dataCache = new Map<string, Data>(); const runCache = new Map<string, Run>();
+const dataFor = (sc: Scale, st: TableLayout) => { const k = `${sc}|${st}`; let d = dataCache.get(k); if (!d) { d = buildData(sc, st); dataCache.set(k, d); } return d; };
+const runFor = (v: Variant, d: Data, c: Country) => { const k = `${d.scale}|${d.storage}|${c}|${v}`; let r = runCache.get(k); if (!r) { r = execute(v, d, c); runCache.set(k, r); } return r; };
+const label = (v: Variant, d: Data) => v === 'nl' ? 'Nested loop (scan orders, no index)' : v === 'nlidx' ? 'Nested loop (index probes on orders)' : v === 'hash' ? 'Hash join' : d.storage === 'clustered' ? 'Merge join (orders already sorted)' : 'Merge join (sort orders first)';
+
+function explain(v: Variant, d: Data, s: Stats, country: Country, c: Cand, run?: Run): string {
+  const k = estK(s), M = estM(s); const ak = run ? run.k : undefined; const aM = run ? run.pairs.length : undefined;
+  const r = (est: number, act?: number) => `rows=${fmt(est)}` + (act !== undefined ? ` actual rows=${fmt(act)}` : '');
+  const top = (name: string) => `${name}  (cost=${fc(c.cost)} ${r(M, aM)})` + (run ? ` actual cost=${fc(cost(run.work))}` : '');
+  const custScan = (pad: string) => `${pad}Seq Scan on customers c  (${r(k, ak)})\n${pad}  Filter: (country = '${country}')`;
+  const lines: string[] = [];
+  if (v === 'nl') {
+    lines.push(top('Nested Loop'), `  Join Filter: (o.customer_id = c.id)`, '  ->  ' + custScan('').replace(/\n/g, '\n      '),
+      `  ->  Materialize`, `        ->  Seq Scan on orders o  (${r(s.nO, run ? d.nO : undefined)})   read once, rescanned from memory ${fmt(k)} times`);
+  } else if (v === 'nlidx') {
+    lines.push(top('Nested Loop'), '  ->  ' + custScan('').replace(/\n/g, '\n      '),
+      `  ->  Index Scan using orders_customer_id_idx on orders o  (${r(Math.round(M / k))} per loop, loops=${fmt(k)}${ak !== undefined ? ` actual loops=${fmt(ak)}` : ''})`,
+      `        Index Cond: (customer_id = c.id)` + (d.storage === 'clustered' ? '   heap is in key order: one random page, then sequential' : '   one random heap page per matching row'));
+  } else if (v === 'hash') {
+    lines.push(top('Hash Join'), `  Hash Cond: (o.customer_id = c.id)`, `  ->  Seq Scan on orders o  (${r(s.nO, run ? d.nO : undefined)})`,
+      `  ->  Hash`, '        ->  ' + custScan('').replace(/\n/g, '\n            '));
+  } else {
+    lines.push(top('Merge Join'), `  Merge Cond: (c.id = o.customer_id)`, '  ->  ' + custScan('').replace(/\n/g, '\n      ').replace('Seq Scan on customers c', 'Seq Scan on customers c (primary key order)'),
+      d.storage === 'clustered' ? `  ->  Seq Scan on orders o  (${r(s.nO, run ? d.nO : undefined)})   already sorted by customer_id` : `  ->  Sort  (key: customer_id)\n        ->  Seq Scan on orders o  (${r(s.nO, run ? d.nO : undefined)})`);
+  }
+  return lines.join('\n');
+}
+
+document.querySelectorAll<HTMLElement>('[data-qp]').forEach((root) => {
+  const q = <T extends HTMLElement>(s: string) => root.querySelector<T>(s)!;
+  const sel = (s: string) => q<HTMLSelectElement>(s).value;
+  const defaults: Record<string, string> = { '[data-scale]': 'large', '[data-country]': 'US', '[data-storage]': 'heap', '[data-stats]': 'fresh', '[data-method]': 'auto' };
+  let ran: { variant: Variant; runs: Map<Variant, Run> } | null = null; let frame = 0;
+
+  function render() {
+    frame = 0;
+    const scale = sel('[data-scale]') as Scale; const country = sel('[data-country]') as Country; const storage = sel('[data-storage]') as TableLayout;
+    const stale = sel('[data-stats]') === 'stale'; const forced = sel('[data-method]') as Method | 'auto';
+    const d = dataFor(scale, storage); const s = makeStats(d, country, stale);
+    const cs = candidates(d, s); const auto = choose(cs, 'auto'); const pick = choose(cs, forced);
+    const run = ran && ran.variant === pick.variant ? ran.runs.get(pick.variant) : undefined;
+    const kAct = d.count[country];
+    q('[data-sql]').textContent = `SELECT o.id, c.id FROM orders o JOIN customers c ON o.customer_id = c.id WHERE c.country = '${country}';`;
+    q('[data-method-out]').textContent = label(pick.variant, d);
+    q('[data-method-note]').textContent = forced === 'auto' ? 'chosen by the planner: lowest estimated cost' : `forced by you; the planner would pick: ${label(auto.variant, d)}`;
+    q('[data-rows]').textContent = `customers after filter: est ${fmt(estK(s))}` + (run ? `, actual ${fmt(run.k)}` : '') + `\njoin output: est ${fmt(estM(s))}` + (run ? `, actual ${fmt(run.pairs.length)}` : '');
+    q('[data-rows-note]').textContent = stale ? `statistics are stale: they describe ${fmt(s.nC)} customers and ${fmt(s.nO)} orders (real: ${fmt(d.nC)} and ${fmt(d.nO)})` : `statistics are fresh: ${fmt(d.count[country])} of ${fmt(d.nC)} customers match (${(kAct / d.nC * 100).toFixed(1)}%)`;
+    q('[data-cost]').textContent = `est ${fc(pick.cost)}` + (run ? `\nactual ${fc(cost(run.work))}` : '\nactual: press Run');
+    q('[data-work]').textContent = `pages: est ${fmt(pagesOf(pick.est))}` + (run ? `, actual ${fmt(pagesOf(run.work))}` : '') + `\ncompared: est ${fmt(comparesOf(pick.est))}` + (run ? `, actual ${fmt(comparesOf(run.work))}` : '');
+    q('[data-work-note]').textContent = `table sizes: customers ${d.pC} page${d.pC > 1 ? 's' : ''}, orders ${d.pO} page${d.pO > 1 ? 's' : ''} (8 kB)`;
+    q('[data-plan]').textContent = explain(pick.variant, d, s, country, pick, run);
+
+    // all methods side by side
+    const results = ran ? ran.runs : null; let best: Variant | null = null;
+    if (results) for (const c of cs) { const r = results.get(c.variant); if (r && (best === null || cost(r.work) < cost(results.get(best)!.work))) best = c.variant; }
+    const row = (a: string, b: string, c2: string, e: string, f: string, g: string) => a.padEnd(38) + b.padStart(10) + c2.padStart(11) + e.padStart(8) + f.padStart(13) + '  ' + g;
+    const tl = [row('method', 'est cost', 'act cost', 'pages', 'compared', ''), ...cs.map((c) => {
+      const r = results ? results.get(c.variant) : undefined;
+      const tags = [c.variant === pick.variant ? 'chosen' : '', best === c.variant ? 'cheapest' : ''].filter(Boolean).join(', ');
+      return row(label(c.variant, d), fc(c.cost), r ? fc(cost(r.work)) : '-', r ? fmt(pagesOf(r.work)) : '-', r ? fmt(comparesOf(r.work)) : '-', tags);
+    })];
+    q('[data-table]').textContent = tl.join('\n');
+
+    const v = q('[data-verdict]');
+    if (!results || !run) { v.textContent = 'EXPLAIN only: nothing has run yet. Press Run EXPLAIN ANALYZE to execute every method on the real rows and compare estimate with reality.'; v.classList.remove('bad'); return; }
+    const same = cs.every((c) => { const r = results.get(c.variant)!; const r0 = results.get(cs[0].variant)!; return r.pairs.length === r0.pairs.length && r.pairs.every((x, i) => x === r0.pairs[i]); });
+    const bestCost = cost(results.get(best!)!.work); const ratio = cost(run.work) / bestCost;
+    const parts = [same ? `All ${cs.length} methods returned the same ${fmt(run.pairs.length)} rows, so only the work differs.` : 'MISMATCH: the methods disagree (this is a bug).'];
+    parts.push(ratio < 1.05 ? `${label(pick.variant, d)} is also the cheapest in reality.` : `${label(pick.variant, d)} cost ${ratio.toFixed(1)}x the best method (${label(best!, d)}).`);
+    if (estK(s) * 3 <= run.k || run.k * 3 <= estK(s)) parts.push(`The planner expected ${fmt(estK(s))} customer row${estK(s) === 1 ? '' : 's'} and found ${fmt(run.k)}: ${stale ? 'stale statistics. ANALYZE the tables.' : 'a bad estimate.'}`);
+    v.textContent = parts.join(' '); v.classList.toggle('bad', ratio >= 1.5 || !same);
+  }
+  const schedule = () => { if (!frame) frame = requestAnimationFrame(render); };
+  const change = () => { ran = null; schedule(); };
+  for (const s of Object.keys(defaults)) q(s).addEventListener('change', change);
+  q('[data-run]').addEventListener('click', () => {
+    const d = dataFor(sel('[data-scale]') as Scale, sel('[data-storage]') as TableLayout); const country = sel('[data-country]') as Country;
+    const s = makeStats(d, country, sel('[data-stats]') === 'stale'); const cs = candidates(d, s);
+    const pick = choose(cs, sel('[data-method]') as Method | 'auto'); const runs = new Map<Variant, Run>();
+    for (const c of cs) runs.set(c.variant, runFor(c.variant, d, country));
+    ran = { variant: pick.variant, runs }; render();
+  });
+  q('[data-reset]').addEventListener('click', () => { for (const [s, v] of Object.entries(defaults)) q<HTMLSelectElement>(s).value = v; change(); });
+  render();
+});
+</script>
+<style is:global>
+  .playground .qp-pre { white-space: pre; overflow-x: auto; overflow-wrap: normal; margin: 0; }
+  .playground .qp .pg-box .pg-mono { white-space: pre-line; }
+</style>

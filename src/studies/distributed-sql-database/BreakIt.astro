@@ -1,0 +1,121 @@
+---
+import PlaygroundShell from '../../components/PlaygroundShell.astro';
+---
+<PlaygroundShell title="One transaction, many ranges, three regions" hint="Pick how a transaction reads and commits, how many ranges it touches and where the replicas live. The app is in region A. Regions B and C are 30 ms and 70 ms away from A, and 60 ms from each other.">
+  <ol class="how">
+    <li>At the start, a <b>follower read</b> of 3 ranges takes <b>2 ms</b> with a <b>far</b> leaseholder, but the last write was 2 s ago and the read is about 4.8 s old, so it <b>returns old data</b>. Switch to <b>leaseholder read</b>: <b>71 ms</b> and the latest value.</li>
+    <li>Switch to <b>read and write</b>: <b>202 ms</b> with parallel commit, and <b>333 ms</b> with classic two-phase commit, because that waits for a second consensus round. With <b>1 range</b> there is no second round, so both are 202 ms.</li>
+    <li>Move to <b>a single region</b> and the write is <b>17 ms</b> with atomic clocks, <b>503 ms</b> with ordinary clocks (commit wait of 2 x 250 ms), and <b>5 ms</b> with the wait off, where a leaseholder read of a write only 100 ms old <b>may miss it</b>.</li>
+  </ol>
+  <div class="pg dsb" data-dsb>
+    <div class="pg-row">
+      <label>Transaction <select class="pg-in" data-txn>
+        <option value="ro" selected>Read only</option>
+        <option value="rw">Read and write</option>
+      </select></label>
+      <label>How reads are served <select class="pg-in" data-mode>
+        <option value="leader">Leaseholder read (latest)</option>
+        <option value="follower" selected>Follower read (about 4.8 s old)</option>
+        <option value="stale">Stale read (30 s old)</option>
+      </select></label>
+      <label>Ranges touched <input type="range" min="1" max="8" value="3" data-k /> <b data-kval></b></label>
+      <label>Replica placement <select class="pg-in" data-place>
+        <option value="one">One region (3 replicas in A)</option>
+        <option value="near">Three regions, leaseholders in A</option>
+        <option value="far" selected>Three regions, leaseholders far away in C</option>
+      </select></label>
+    </div>
+    <div class="pg-row">
+      <label>Commit protocol <select class="pg-in" data-protocol>
+        <option value="parallel" selected>Parallel commit (one consensus round)</option>
+        <option value="classic">Classic two-phase commit (two rounds)</option>
+      </select></label>
+      <label>Clock uncertainty and commit wait <select class="pg-in" data-clock>
+        <option value="off">Off: trust the clocks</option>
+        <option value="tt7" selected>On: error bound 7 ms (atomic clocks)</option>
+        <option value="ntp">On: error bound 250 ms (ordinary clocks)</option>
+      </select></label>
+      <label>Last write to the row was <select class="pg-in" data-age>
+        <option value="5">5 ms ago</option>
+        <option value="100">100 ms ago</option>
+        <option value="2000" selected>2 s ago</option>
+        <option value="10000">10 s ago</option>
+        <option value="60000">1 minute ago</option>
+      </select></label>
+    </div>
+    <div class="pg-grid">
+      <div class="pg-box" data-b1><h3>Round trips on the critical path</h3><span class="pg-mono" data-o1></span><span class="pg-note" data-n1></span></div>
+      <div class="pg-box" data-b2><h3>Estimated latency</h3><span class="pg-mono" data-o2></span><span class="pg-note" data-n2></span></div>
+      <div class="pg-box" data-b3><h3>Does it see the latest write?</h3><span class="pg-mono" data-o3></span><span class="pg-note" data-n3></span></div>
+      <div class="pg-box" data-b4><h3>Where the time goes</h3><span class="pg-mono" data-o4></span><span class="pg-note" data-n4></span></div>
+    </div>
+    <p class="pg-out" data-verdict aria-live="polite"></p>
+    <p class="pg-note">Model: a read costs the distance to the replica that serves it plus 1 ms of work, and a nearby replica answers a follower read in 2 ms. A consensus round costs the round trip to the nearest majority plus 1 ms for the disk: 1 ms in one region, 30 ms with leaseholders in A (the nearest other region is B), and 60 ms with leaseholders in C (the nearest other region is B). A write is sent to every range in parallel, and the transaction record sits on one of them. With commit wait on, the write holds back its answer until twice the clock error bound has passed, overlapped with the consensus round. With the wait off, a clock that is behind by up to 250 ms can make a leaseholder read miss a write that is younger than that. A follower read sees data as of a closed timestamp about 4.8 s ago. Reads inside a read and write transaction always go to the leaseholder. Message counts include the client to leaseholder trip and the Raft traffic to two followers, and leave out the clean-up of intents.</p>
+  </div>
+</PlaygroundShell>
+<script>
+  document.querySelectorAll<HTMLElement>('[data-dsb]').forEach((root) => {
+    const q = <T extends HTMLElement>(s: string) => root.querySelector<T>(s)!;
+    const PLACE: Record<string, { lh: number; quorum: number }> = { one: { lh: 1, quorum: 1 }, near: { lh: 1, quorum: 30 }, far: { lh: 70, quorum: 60 } };
+    const EPS: Record<string, number> = { off: 0, tt7: 7, ntp: 250 };
+    const FSYNC = 1; const WORK = 1; const FOLLOWER = 2; const LAG_S = 4.8; const STALE_S = 30; const SKEW_MS = 250;
+    type Cfg = { txn: string; mode: string; k: number; place: string; protocol: string; clock: string; age: number };
+    type Res = { lat: number; trips: number; msgs: number; fresh: string; window: number; round: number; wait: number; parts: string; alt: string };
+    function sim(c: Cfg): Res {
+      const p = PLACE[c.place]; const eps = EPS[c.clock]; const round = p.quorum + FSYNC; const wait = 2 * eps; const k = c.k;
+      const lhRead = p.lh + WORK;
+      const commit = (classic: boolean) => (classic && k > 1 ? p.lh + round : 0) + p.lh + Math.max(round, wait);
+      if (c.txn === 'ro') {
+        const local = c.mode !== 'leader';
+        const window = c.mode === 'follower' ? LAG_S : c.mode === 'stale' ? STALE_S : 0;
+        return {
+          lat: local ? FOLLOWER : lhRead, trips: 1, msgs: 2 * k, window, round, wait,
+          fresh: local ? (c.age / 1000 < window ? 'old' : 'fresh') : (c.clock === 'off' && c.age < SKEW_MS ? 'maybe' : 'latest'),
+          parts: local ? `One trip to the nearest replica: ${FOLLOWER} ms, whatever the placement.` : `One trip to the leaseholders, all asked in parallel: ${p.lh} ms away plus ${WORK} ms of work.`,
+          alt: local ? `The same read at the leaseholder would take ${lhRead} ms.` : `A follower read would take ${FOLLOWER} ms but could be up to ${LAG_S} s old.`,
+        };
+      }
+      const classic = c.protocol === 'classic'; const cm = commit(classic);
+      const other = classic ? commit(false) : commit(true);
+      return {
+        lat: lhRead + cm, trips: 1 + (classic && k > 1 ? 4 : 2), msgs: 2 * k + 6 * k + (classic && k > 1 ? 6 : 0), window: 0, round, wait,
+        fresh: c.clock === 'off' && c.age < SKEW_MS ? 'maybe' : 'latest',
+        parts: `Read ${lhRead} ms, then commit ${cm} ms.` + (wait > round ? ` The commit wait of ${wait} ms is longer than the ${round} ms consensus round, so it adds ${wait - round} ms.` : wait > 0 ? ` The commit wait of ${wait} ms hides inside the ${round} ms consensus round.` : ''),
+        alt: `${classic ? 'Parallel commit' : 'Classic two-phase commit'} would take ${lhRead + other} ms${k === 1 ? ' (the same, since one range needs no second round)' : ''}.`,
+      };
+    }
+    const sel = (s: string) => q<HTMLSelectElement>(s).value;
+    function draw() {
+      const k = Number(q<HTMLInputElement>('[data-k]').value);
+      const c: Cfg = { txn: sel('[data-txn]'), mode: sel('[data-mode]'), k, place: sel('[data-place]'), protocol: sel('[data-protocol]'), clock: sel('[data-clock]'), age: Number(sel('[data-age]')) };
+      q('[data-kval]').textContent = String(k);
+      const rw = c.txn === 'rw';
+      q<HTMLSelectElement>('[data-mode]').disabled = rw; q<HTMLSelectElement>('[data-protocol]').disabled = !rw;
+      const r = sim(c);
+      const ageText = q<HTMLSelectElement>('[data-age]').selectedOptions[0].textContent!.toLowerCase();
+      q('[data-o1]').textContent = `${r.trips} round trip${r.trips > 1 ? 's' : ''}`;
+      q('[data-n1]').textContent = `${r.msgs} messages across ${k} range${k > 1 ? 's' : ''}` + (rw ? (c.protocol === 'classic' && k > 1 ? '; intents, then a commit record' : '; one read, then intents and the commit together') : '; all ranges asked at the same time');
+      q('[data-o2]').textContent = `${r.lat} ms`; q('[data-n2]').textContent = r.alt;
+      q('[data-o3]').textContent = r.fresh === 'old' ? 'No: returns old data' : r.fresh === 'maybe' ? 'Not guaranteed' : r.fresh === 'fresh' ? 'Yes, this time' : 'Yes, always';
+      q('[data-n3]').textContent = r.fresh === 'old' ? `The read is ${r.window} s behind and the last write was ${ageText}, so it falls in the stale window.`
+        : r.fresh === 'fresh' ? `The read is ${r.window} s behind, but the last write was ${ageText}, which is older than that, so the value happens to be current.`
+        : r.fresh === 'maybe' ? `Clocks are trusted, but they can differ by 250 ms, and the last write was ${ageText}, so a node with a slow clock may not see it.`
+        : rw ? 'Reads go to the leaseholder at a timestamp, and the commit orders the writes.' : 'The leaseholder holds every committed write.';
+      q('[data-o4]').textContent = rw ? `consensus round ${r.round} ms` : `no consensus round`;
+      q('[data-n4]').textContent = r.parts;
+      const bad = r.fresh === 'old' || r.fresh === 'maybe';
+      q<HTMLElement>('[data-b1]').style.setProperty('--c', 'var(--accent)');
+      q<HTMLElement>('[data-b2]').style.setProperty('--c', r.lat <= 20 ? 'var(--good)' : r.lat >= 200 ? 'var(--bad)' : 'var(--accent)');
+      q<HTMLElement>('[data-b3]').style.setProperty('--c', bad ? 'var(--bad)' : 'var(--good)');
+      q<HTMLElement>('[data-b4]').style.setProperty('--c', 'var(--accent)');
+      const out = q('[data-verdict]'); out.classList.toggle('bad', bad);
+      out.textContent = r.fresh === 'old' ? `Fast, but wrong for this row: the read took ${r.lat} ms and returned the value from before the last write. Follower and stale reads trade freshness for latency, and are only safe where data up to ${r.window} s old is acceptable.`
+        : r.fresh === 'maybe' ? `Without uncertainty handling or commit wait, the clocks alone cannot promise that a reader sees a write that finished ${ageText}. The ${r.lat} ms answer is quick, but not guaranteed to be current.`
+        : r.fresh === 'fresh' ? `A ${r.lat} ms read that happened to be current, because the row had not changed within the last ${r.window} s. Nothing in the read guarantees that, and a write a moment earlier would have been missed.`
+        : rw ? `Serializable and current in ${r.lat} ms. ${r.wait > r.round ? 'Commit wait dominates: the clock error bound, not the network, sets the latency.' : r.round > 10 ? 'The cross-region consensus round is the cost of surviving a region failure.' : 'Everything stays inside one region, so consensus is cheap.'}`
+        : `The latest value in ${r.lat} ms, read from the leaseholders${c.place === 'far' ? ', which are far from the application' : ''}.`;
+    }
+    root.addEventListener('input', draw); root.addEventListener('change', draw);
+    draw();
+  });
+</script>

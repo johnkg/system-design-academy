@@ -1,0 +1,75 @@
+{
+  "actors": [
+    { "id": "app", "label": "App", "role": "app", "x": 14, "y": 28 },
+    { "id": "table", "label": "users table", "role": "table", "x": 50, "y": 28 },
+    { "id": "replica", "label": "Replica", "role": "replica", "x": 86, "y": 28 },
+    { "id": "job", "label": "Backfill job", "role": "job", "x": 50, "y": 78 }
+  ],
+  "frames": [
+    {
+      "narration": "The users table has 100 million rows and one full_name column. The product needs first_name and last_name, and the app keeps writing about 2,000 rows per second. A single rewriting ALTER would block those writes for roughly 11 minutes.",
+      "messages": [
+        { "from": "app", "to": "table", "label": "UPDATE full_name" }
+      ],
+      "states": { "table": "full_name", "replica": "lag 0 s" }
+    },
+    {
+      "narration": "Expand: ADD COLUMN first_name, last_name as nullable with no default. This is a metadata change that takes the lock for milliseconds (with lock_timeout set). Old code does not know the columns exist and keeps working.",
+      "messages": [
+        { "from": "job", "to": "table", "label": "ADD COLUMN x2" }
+      ],
+      "states": { "table": "full_name + 2 NULL cols" },
+      "highlight": ["table"]
+    },
+    {
+      "narration": "Deploy the dual-writing app: every write sets full_name and first_name/last_name in one statement. Reads still use full_name. This must be live on every instance before the backfill starts.",
+      "messages": [
+        { "from": "app", "to": "table", "label": "write all 3 cols" }
+      ],
+      "states": { "app": "v2: dual-write", "table": "new rows complete" },
+      "highlight": ["app"]
+    },
+    {
+      "narration": "The backfill starts: 10,000 ids per batch, UPDATE ... WHERE id BETWEEN a AND b AND first_name IS NULL. Each batch is a short transaction of about 0.2 seconds and only locks its own 10,000 rows.",
+      "messages": [
+        { "from": "job", "to": "table", "label": "batch of 10k" },
+        { "from": "table", "to": "replica", "label": "10k events" }
+      ],
+      "states": { "job": "batch 1,200 of 10,000", "table": "12M rows filled" },
+      "highlight": ["job"]
+    },
+    {
+      "narration": "Backfill plus live writes now exceed what the replica can apply: it is 7 seconds behind, above the 5 second limit. The job checks the lag between batches and sleeps instead of piling on more.",
+      "messages": [
+        { "from": "job", "to": "replica", "label": "lag?" },
+        { "from": "replica", "to": "job", "label": "7 s: pause" }
+      ],
+      "states": { "replica": "lag 7 s", "job": "paused" },
+      "highlight": ["replica"]
+    },
+    {
+      "narration": "The lag drains below the limit and the job resumes. Staying under the replica's capacity makes the whole run take about an hour instead of 30 minutes, but live traffic and replicas never suffer.",
+      "messages": [
+        { "from": "replica", "to": "job", "label": "2 s: go" },
+        { "from": "job", "to": "table", "label": "batch of 10k" }
+      ],
+      "states": { "replica": "lag 2 s", "job": "running", "table": "70M rows filled" }
+    },
+    {
+      "narration": "All 10,000 batches are done. Verify that no row has NULL or mismatching new columns and that the replica has caught up, then switch reads to first_name/last_name behind a flag. Writes still go to both shapes so the flag can be flipped back.",
+      "messages": [
+        { "from": "app", "to": "table", "label": "read first/last" }
+      ],
+      "states": { "job": "done: 0 NULL rows", "replica": "lag 0 s", "app": "reads new cols" },
+      "highlight": ["app"]
+    },
+    {
+      "narration": "Contract: deploy the version that no longer touches full_name, wait until nothing reads it (apps, reports, ETL), then DROP COLUMN full_name. Every step was a separate deploy that could be reverted on its own.",
+      "messages": [
+        { "from": "app", "to": "table", "label": "write first/last" }
+      ],
+      "states": { "app": "v3", "table": "first_name, last_name" },
+      "highlight": ["table"]
+    }
+  ]
+}

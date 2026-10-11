@@ -1,0 +1,81 @@
+{
+  "name": "MVCC and Isolation Levels",
+  "area": "databases",
+  "difficulty": "advanced",
+  "intent": "Let many transactions read and write the same data at once without blocking each other, by keeping several versions of each row and giving every transaction a consistent snapshot.",
+  "scenario": "Two doctors, Alice and Bob, are on call. The hospital rule is that at least one must stay on call. Each opens the on-call page in a transaction, sees two doctors on call, and goes off call. A second story runs alongside it: two payments update one bank balance at the same time.",
+  "problem": "Locking every row a transaction touches is correct but slow: readers wait for writers and writers wait for readers. Letting transactions run freely is fast but wrong in subtle ways: you read half-finished data, a value changes under you mid-transaction, an update is silently overwritten, or two transactions each make a safe decision that is unsafe together. Databases need a way to run transactions concurrently and still give answers that match some one-at-a-time order, and every product lets you choose how strictly.",
+  "howItWorks": [
+    {
+      "title": "Every write creates a new row version",
+      "text": "An UPDATE does not overwrite the row. It writes a new version and marks the old one as deleted by the updating transaction. In PostgreSQL each tuple carries xmin (the transaction id that created it) and xmax (the one that deleted or replaced it). InnoDB keeps the newest version in the clustered index and rebuilds older ones from undo log records. Either way there are now several versions of one logical row."
+    },
+    {
+      "title": "A snapshot decides which version you see",
+      "text": "A snapshot records which transactions had committed when it was taken. A version is visible if its creator is in the snapshot and its deleter is not. Readers therefore just pick a version and never take a lock a writer needs, so readers do not block writers and writers do not block readers. Two writers on the same row still conflict: the second waits for the first to finish."
+    },
+    {
+      "title": "The isolation level decides when the snapshot is taken",
+      "text": "Read committed takes a fresh snapshot for each statement, so a later query can see newer commits. Repeatable read (snapshot isolation) takes one snapshot for the whole transaction, so every read agrees; a write to a row that changed after the snapshot is rejected under first-committer-wins (PostgreSQL aborts with a serialization failure; InnoDB instead applies the update to the latest committed row). Read uncommitted allows dirty reads in the SQL standard, though PostgreSQL treats it as read committed."
+    },
+    {
+      "title": "Serializable adds conflict detection on top",
+      "text": "Snapshot isolation still allows write skew: two transactions read the same data, update different rows, and break a rule that spans them. Serializable closes that gap either with locks (two-phase locking, with range or gap locks that stop phantoms, as SQL Server does at SERIALIZABLE and InnoDB does for locking reads) or optimistically. PostgreSQL's serializable snapshot isolation tracks read-write dependencies between concurrent transactions and aborts one when it sees a dangerous cycle. The application must be ready to retry."
+    },
+    {
+      "title": "Locking reads handle the cases you know about",
+      "text": "SELECT ... FOR UPDATE reads the latest committed version and locks the row, so a read-modify-write cannot be overwritten. Locking the rows that hold your invariant (or a single parent row) turns a write skew into a plain lock wait. This is pessimistic: you pay the lock up front. Optimistic approaches (a version column, serializable with retry) pay only when a conflict actually happens."
+    },
+    {
+      "title": "Old versions are garbage and must be collected",
+      "text": "A version is dead once no running transaction's snapshot can still see it. PostgreSQL's VACUUM (and autovacuum) marks dead tuples reusable and advances the oldest-visible horizon; InnoDB's purge thread discards undo records. One long-running transaction pins the horizon, so dead versions pile up, tables and indexes bloat, and vacuum cannot reclaim anything behind it."
+    }
+  ],
+  "pros": [
+    "Readers and writers do not block each other, so read-heavy workloads scale on one node",
+    "Each transaction sees a stable, consistent snapshot without holding read locks",
+    "Long reports and backups (pg_dump uses a snapshot) can run next to live writes",
+    "You can choose the cheapest isolation level that is correct for each transaction"
+  ],
+  "cons": [
+    "Old versions use space and need vacuum or purge, which costs IO and tuning",
+    "Snapshot isolation is not serializable: write skew slips through unless you add locks or SERIALIZABLE",
+    "Stricter levels turn conflicts into aborts, so every caller needs retry logic",
+    "Behaviour differs by product, so code that is safe on one database can be unsafe on another"
+  ],
+  "whenToUse": [
+    "OLTP systems with many concurrent readers and writers on the same tables",
+    "Keep the default (read committed on PostgreSQL, repeatable read on MySQL InnoDB) for single-statement work",
+    "Use repeatable read or serializable for multi-statement reads that must agree, such as reports and invariants",
+    "Use SELECT FOR UPDATE for known hot read-modify-write rows such as balances and inventory"
+  ],
+  "whenNotToUse": [
+    "Do not rely on snapshot isolation alone for rules that span rows (at least one on call, no overlapping bookings, unique across a range)",
+    "Do not use serializable if you cannot retry; the aborts will reach users as errors",
+    "Do not hold transactions open across user think time, remote calls or queue waits",
+    "Do not expect any of this to coordinate transactions across separate databases; that needs two-phase commit or sagas"
+  ],
+  "pitfalls": [
+    "Assuming 'repeatable read' means serializable. Snapshot isolation allows write skew, and the SQL standard definition differs from what each product implements",
+    "Read-modify-write in application code (read the balance, add 50, write it back) under read committed loses updates; use UPDATE ... SET balance = balance + 50 or SELECT FOR UPDATE",
+    "An idle-in-transaction session or a forgotten cursor pins the vacuum horizon and bloats tables for hours",
+    "Treating serialization failures (SQLSTATE 40001) or deadlocks as fatal instead of retrying the whole transaction",
+    "Assuming defaults match across databases: PostgreSQL defaults to read committed, MySQL InnoDB to repeatable read, and InnoDB repeatable read behaves differently for plain reads and locking reads",
+    "SELECT FOR UPDATE on a range that matches no rows does not stop another transaction from inserting into it (a phantom) unless the engine takes gap or predicate locks"
+  ],
+  "related": [
+    { "kind": "concept", "slug": "acid-vs-base" },
+    { "kind": "concept", "slug": "consistency-models" },
+    { "kind": "concept", "slug": "write-ahead-log" },
+    { "kind": "concept", "slug": "two-phase-commit" },
+    { "kind": "concept", "slug": "database-indexing" },
+    { "kind": "concept", "slug": "database-replication" },
+    { "kind": "concept", "slug": "lsm-trees-vs-b-trees" },
+    { "kind": "concept", "slug": "logical-clocks" }
+  ],
+  "roles": [
+    { "id": "txn", "label": "Transaction", "description": "A client session that reads and writes inside BEGIN ... COMMIT. It gets a snapshot and a transaction id." },
+    { "id": "store", "label": "Row versions", "description": "The table storage holding every version of each row with its xmin and xmax." },
+    { "id": "checker", "label": "Conflict checker", "description": "Enforces first-committer-wins and, at serializable, tracks read-write dependencies between concurrent transactions." }
+  ]
+}

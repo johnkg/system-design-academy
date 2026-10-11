@@ -1,0 +1,536 @@
+{
+  "name": "Design a Change Data Capture Pipeline",
+  "difficulty": "advanced",
+  "intent": "Turn a database's own write-ahead log into an ordered stream of row changes that keeps a search index, a cache and a warehouse in step with it, without gaps, duplicates that matter, or an unbounded log on the source.",
+  "codeTitle": "a log reader with committed offsets and an idempotent sink",
+  "finalIntro": "One order update travelling from the database's log to its copies, and what happens after a crash.",
+  "prompt": "An orders database holds 200 million rows and takes up to 5,000 changes per second. Keep a search index, a cache and a warehouse up to date with it within a few seconds, including deletes. The copies must never silently diverge, the application must not slow down, and a pipeline outage must not take the database down.",
+  "functional": [
+    "Emit every insert, update and delete on chosen tables, with the row before and after the change",
+    "Start from a complete, consistent copy of the existing rows, then stream new changes with no gap and no loss",
+    "Deliver the changes of one row in the order they were committed",
+    "Carry schema changes (a new column, a changed type) through the stream to every consumer",
+    "Feed several independent consumers: a search index, a cache and a warehouse",
+    "Resume after a crash from the last committed position, and add a new consumer later by replaying"
+  ],
+  "nonFunctional": [
+    "A committed change reaches the copies within a few seconds in normal operation",
+    "Capturing changes adds little load to the source database and no code to the write path",
+    "No change is lost. Delivery is at least once, and the sinks tolerate duplicates",
+    "A slow or dead connector cannot fill the source's disk without anyone being warned",
+    "Large transactions and bulk updates do not break the connector",
+    "Throughput of tens of thousands of events per second, with the lag measured and alerted on"
+  ],
+  "firstAttempt": {
+    "text": "The application writes to the database and, in the same request, to the search index and the cache. A nightly job also finds rows whose updated_at is newer than its last run and copies them to the warehouse.",
+    "limits": [
+      "The two writes in the request are not atomic: if the second fails or the process dies between them, the copies silently diverge",
+      "Two concurrent writers can reach the database and the index in opposite orders, leaving the index with the older value",
+      "Polling by updated_at never sees a deleted row, and it misses a row whose transaction commits after the cursor moved past its timestamp",
+      "Polling collapses several updates into one, so intermediate states are lost, and frequent polls load the production table",
+      "Every new copy needs more code in every service that writes, and a script that fixes data directly in the database skips the copies",
+      "Nothing can be replayed, because there is no record of what changed"
+    ]
+  },
+  "nodes": [
+    {
+      "id": "app",
+      "label": "Application",
+      "kind": "client",
+      "x": 87,
+      "y": 12
+    },
+    {
+      "id": "db",
+      "label": "Source database",
+      "kind": "data",
+      "x": 62,
+      "y": 12
+    },
+    {
+      "id": "job",
+      "label": "Nightly sync job",
+      "kind": "compute",
+      "x": 37,
+      "y": 37,
+      "at": 0,
+      "until": 1
+    },
+    {
+      "id": "index",
+      "label": "Search index",
+      "kind": "edge",
+      "x": 62,
+      "y": 63
+    },
+    {
+      "id": "wal",
+      "label": "Write-ahead log",
+      "kind": "data",
+      "x": 62,
+      "y": 37,
+      "at": 1
+    },
+    {
+      "id": "conn",
+      "label": "CDC connector",
+      "kind": "compute",
+      "x": 37,
+      "y": 37,
+      "at": 1
+    },
+    {
+      "id": "stream",
+      "label": "Change stream",
+      "kind": "async",
+      "x": 37,
+      "y": 63,
+      "at": 1
+    },
+    {
+      "id": "snap",
+      "label": "Snapshot reader",
+      "kind": "compute",
+      "x": 37,
+      "y": 12,
+      "at": 2
+    },
+    {
+      "id": "offsets",
+      "label": "Offset store",
+      "kind": "data",
+      "x": 12,
+      "y": 37,
+      "at": 3
+    },
+    {
+      "id": "registry",
+      "label": "Schema registry",
+      "kind": "data",
+      "x": 12,
+      "y": 12,
+      "at": 4
+    },
+    {
+      "id": "cache",
+      "label": "Cache",
+      "kind": "edge",
+      "x": 37,
+      "y": 88,
+      "at": 5
+    },
+    {
+      "id": "warehouse",
+      "label": "Warehouse",
+      "kind": "edge",
+      "x": 12,
+      "y": 63,
+      "at": 5
+    },
+    {
+      "id": "outbox",
+      "label": "Outbox table",
+      "kind": "data",
+      "x": 87,
+      "y": 37,
+      "at": 6
+    }
+  ],
+  "edges": [
+    {
+      "from": "app",
+      "to": "db",
+      "at": 0
+    },
+    {
+      "from": "app",
+      "to": "index",
+      "at": 0,
+      "until": 1
+    },
+    {
+      "from": "db",
+      "to": "job",
+      "at": 0,
+      "until": 1
+    },
+    {
+      "from": "job",
+      "to": "index",
+      "at": 0,
+      "until": 1
+    },
+    {
+      "from": "db",
+      "to": "wal",
+      "at": 1
+    },
+    {
+      "from": "wal",
+      "to": "conn",
+      "at": 1
+    },
+    {
+      "from": "conn",
+      "to": "stream",
+      "at": 1
+    },
+    {
+      "from": "stream",
+      "to": "index",
+      "at": 1
+    },
+    {
+      "from": "db",
+      "to": "snap",
+      "at": 2
+    },
+    {
+      "from": "snap",
+      "to": "conn",
+      "at": 2
+    },
+    {
+      "from": "conn",
+      "to": "offsets",
+      "at": 3
+    },
+    {
+      "from": "conn",
+      "to": "registry",
+      "at": 4
+    },
+    {
+      "from": "stream",
+      "to": "cache",
+      "at": 5
+    },
+    {
+      "from": "stream",
+      "to": "warehouse",
+      "at": 5
+    },
+    {
+      "from": "app",
+      "to": "outbox",
+      "at": 6
+    },
+    {
+      "from": "outbox",
+      "to": "wal",
+      "at": 6
+    }
+  ],
+  "steps": [
+    {
+      "title": "Read the database's own log instead of polling or dual-writing",
+      "problem": "Writing to two systems in one request cannot be atomic, and polling a table misses deletes, collapses updates and cannot tell the order in which rows really changed.",
+      "fix": "Every database already records each committed change in an ordered log before it touches the data files: the write-ahead log in PostgreSQL, the binlog in MySQL, the oplog in MongoDB. A connector reads that log through the database's own replication interface (logical decoding in PostgreSQL), turns each entry into an event with the table, the operation (create, update, delete), the primary key, the row before and after, and the log position, and publishes it to a change stream. Changes appear in commit order, inserts, updates and deletes alike, and the application has no new code in its write path.",
+      "tradeoff": "The log is the one complete, ordered, atomic record of what happened, so the copies can no longer miss a change by design. The connector depends on the database's log format and settings (a before image needs the full row to be logged), it holds back the database's log cleanup while it is behind, and the events describe table rows rather than business meaning.",
+      "concepts": [
+        {
+          "slug": "database-replication"
+        },
+        {
+          "slug": "event-sourcing"
+        },
+        {
+          "slug": "two-phase-commit"
+        }
+      ]
+    },
+    {
+      "title": "Take a consistent snapshot, then stream without a gap",
+      "problem": "The log only holds recent changes, so a new copy needs the 200 million existing rows first. Copying the table while changes continue produces a mixture of old and new rows, or a hole between the copy and the stream.",
+      "fix": "Create the log reader's position first, so that no change from now on can be lost, then read the table at a consistent point (a transaction snapshot tied to that position) and emit the rows as read events. When the snapshot ends, the connector continues from the saved log position, so the two parts join exactly. For big tables use an incremental snapshot: read the table in primary key chunks while streaming continues, and bracket each chunk with a low and a high watermark written to a signal table, which show up in the log. Chunk rows whose key also appears in the log between the two watermarks are dropped from the chunk, because the stream holds a newer version. Snapshots can then be paused, resumed after a crash, or re-run for one table on request.",
+      "tradeoff": "The new copy is complete and consistent, and the source never has to be locked or stopped. The first snapshot takes time and reads load from the source, a long snapshot makes the source keep log from its start position, and the chunked method needs a signal table and a primary key on every table.",
+      "concepts": [
+        {
+          "slug": "consistency-models"
+        },
+        {
+          "slug": "database-indexing"
+        },
+        {
+          "slug": "backpressure"
+        }
+      ]
+    },
+    {
+      "title": "Track log positions, and commit them only after delivery",
+      "problem": "After a crash the connector must know where to resume. Resume too early and it repeats work, too late and it skips changes. Meanwhile the source must not discard log that the connector has yet to read.",
+      "fix": "The connector stores the log position of the last event the stream has acknowledged, in an offset store (Kafka Connect keeps it in a Kafka topic). It commits the offset only after the broker has acknowledged the events, so a crash replays at most the events since the last commit. The same confirmed position tells the source it may recycle the log before it: a PostgreSQL replication slot keeps WAL until the consumer confirms it. Lag is the distance between the source's newest position and the committed one, and it is measured in bytes and in seconds, with an alert on how much log the slot retains.",
+      "tradeoff": "No change is lost, and the worst case after a crash is a short replay. Delivery is at least once, so duplicates are normal and the sinks must cope. The source now stores log for as long as the connector is behind, which turns a pipeline outage into a disk problem for the database unless limits and alerts exist.",
+      "concepts": [
+        {
+          "slug": "idempotency"
+        },
+        {
+          "slug": "metrics"
+        },
+        {
+          "slug": "alerting"
+        }
+      ]
+    },
+    {
+      "title": "Let schema changes flow through the stream",
+      "problem": "Tables change: a column is added, renamed, widened or dropped. A consumer that expects the old shape breaks, or worse, silently stores wrong data.",
+      "fix": "Each event carries the identity of the schema it was written with, and the schema itself lives in a schema registry. The connector reads schema changes from the log (or from the catalog) and registers a new version when the table changes, in the same position order as the data. Compatibility rules are checked on registration: adding an optional column with a default is backward compatible, while dropping a required column or changing a type is rejected, or at least flagged, before it reaches the stream. Consumers fetch the schema by id and cache it, and they ignore columns they do not know.",
+      "tradeoff": "Consumers are protected from surprises and can upgrade on their own schedule, and old events can still be read. Teams must follow additive-first migrations (expand, migrate, then contract), the registry becomes a component that must be available, and a rename is a new column plus a drop rather than a one-line change.",
+      "concepts": [
+        {
+          "slug": "api-versioning"
+        },
+        {
+          "slug": "api-styles"
+        },
+        {
+          "slug": "sql-vs-nosql"
+        }
+      ]
+    },
+    {
+      "title": "Partition by primary key and write idempotently to each copy",
+      "problem": "With several partitions and consumers, two changes to the same row could be applied in the wrong order, and every retry or restart delivers some events a second time.",
+      "fix": "Events are published with the primary key as the message key, so all changes to one row go to one partition and are consumed in commit order, while different rows are processed in parallel. There is no ordering between keys, which is fine for independent rows. Each sink applies an event as an upsert or delete keyed by the primary key, and ignores an event whose log position is not newer than the one it stored for that row, so a replay does nothing. A delete is followed by a tombstone (a message with the key and no value) so that log compaction on the topic can eventually drop the key. A sink that adds deltas, or appends rows, would double count on replay, so it needs a different dedup key.",
+      "tradeoff": "Per-row order is preserved at full parallel throughput, replays are harmless, and a new sink can be added by reading the topic from the start. Order across rows and across tables is not guaranteed, so a join in the sink may see a child before its parent, and the hottest key is limited to one partition's throughput.",
+      "concepts": [
+        {
+          "slug": "message-queues"
+        },
+        {
+          "slug": "idempotency"
+        },
+        {
+          "slug": "consistent-hashing"
+        },
+        {
+          "slug": "pub-sub"
+        }
+      ]
+    },
+    {
+      "title": "Use a transactional outbox when the events must mean something",
+      "problem": "Row changes expose the table design: a consumer would see five updates to three tables for one 'order placed', with internal columns and no business meaning, and every table rename breaks them.",
+      "fix": "In the same transaction as the business change, the application also inserts a row into an outbox table that holds a purposefully designed event: its type, its aggregate id, and a payload. The connector reads the outbox inserts from the log, as for any other table, and publishes them with the aggregate id as the key. The outbox rows are deleted or archived after publishing. The database's atomic commit gives what dual-writing cannot: the business change and its event exist together or not at all.",
+      "tradeoff": "Consumers get stable, meaningful events, independent of the table layout, and the event is atomic with the change. Application code now has to write the outbox row, the outbox needs cleaning, and the delivery is still at least once, so consumers must deduplicate by event id.",
+      "concepts": [
+        {
+          "slug": "transactional-outbox"
+        },
+        {
+          "slug": "saga"
+        },
+        {
+          "slug": "cqrs"
+        }
+      ]
+    }
+  ],
+  "failures": [
+    {
+      "scenario": "The connector is down for hours and the source keeps its log",
+      "impact": "The replication slot holds back log cleanup, the log grows until the database's disk is full, and the production database stops accepting writes because of a reporting pipeline.",
+      "answer": "Alert on the log retained for each slot, both its size and its age, long before the disk is at risk. Set a hard limit (such as PostgreSQL's max_slot_wal_keep_size) so that the database drops the slot instead of dying. The price is that the connector can no longer resume, and the affected tables are re-copied with a new snapshot. Heartbeat events keep the position moving on a quiet database, and unused slots are removed.",
+      "concepts": [
+        {
+          "slug": "alerting"
+        },
+        {
+          "slug": "metrics"
+        },
+        {
+          "slug": "slos-and-error-budgets"
+        }
+      ]
+    },
+    {
+      "scenario": "The connector crashes after publishing events but before committing their offset",
+      "impact": "On restart it reads from the old offset and sends the same events again, so a sink that adds up changes or appends rows counts them twice.",
+      "answer": "At-least-once delivery is accepted, and the sinks absorb it. Each sink stores the log position per row and ignores older or equal positions, or it uses upserts and deletes by primary key, which are safe to repeat. Counters and aggregates are rebuilt from events with a unique id, not by adding deltas.",
+      "concepts": [
+        {
+          "slug": "idempotency"
+        },
+        {
+          "slug": "retries-and-backoff"
+        },
+        {
+          "slug": "message-queues"
+        }
+      ]
+    },
+    {
+      "scenario": "A migration drops a column, or changes its type, that a consumer relies on",
+      "impact": "Events with the new shape fail to parse, the consumer stops, and its lag grows. Or it silently writes nulls into the warehouse.",
+      "answer": "The registry's compatibility check rejects or flags the incompatible version before events with it flow. Migrations follow expand, migrate, contract: add the new column, move the consumers to it, and drop the old one only when nothing reads it. A consumer that fails on an event goes to a dead-letter queue with an alert instead of dropping data.",
+      "concepts": [
+        {
+          "slug": "api-versioning"
+        },
+        {
+          "slug": "alerting"
+        },
+        {
+          "slug": "circuit-breaker"
+        }
+      ]
+    },
+    {
+      "scenario": "A bulk update changes 50 million rows in a single transaction",
+      "impact": "The transaction's changes only become visible in the log when it commits, so the connector has to buffer them (PostgreSQL spills them to disk), the stream gets a flood at once, and the lag leaps.",
+      "answer": "Run bulk jobs in batches, each its own transaction, and throttle them. Give the connector enough memory or spill space, and rate-limit its publishing so that consumers are not swamped. Transaction boundary events let a consumer that cares about atomicity wait for the whole group. Lag alerts should expect a bulk job and not page for it.",
+      "concepts": [
+        {
+          "slug": "backpressure"
+        },
+        {
+          "slug": "rate-limiting"
+        },
+        {
+          "slug": "acid-vs-base"
+        }
+      ]
+    },
+    {
+      "scenario": "The primary fails over to a replica",
+      "impact": "Log positions are specific to a server, and a replication slot may not exist on the new primary, so the connector's offset points at nothing.",
+      "answer": "Use a database version and setup that carries slots to standbys, or have the connector keep a position that is valid on the new primary (such as a global transaction id in MySQL). If the position cannot be found, re-run an incremental snapshot, which is safe because the sinks are idempotent, and check row counts and checksums afterwards to prove the copies match.",
+      "concepts": [
+        {
+          "slug": "leader-election"
+        },
+        {
+          "slug": "database-replication"
+        },
+        {
+          "slug": "health-checks"
+        }
+      ]
+    }
+  ],
+  "alternatives": [
+    {
+      "title": "How changes are detected",
+      "options": [
+        {
+          "name": "Polling on updated_at",
+          "pro": "Simple, needs no special database settings",
+          "con": "Misses deletes, collapses updates, can skip late-committing rows, and loads the table"
+        },
+        {
+          "name": "Triggers writing to a changes table",
+          "pro": "Captures deletes, works on any SQL database",
+          "con": "Adds work and contention to every write, and the trigger code must be kept up to date"
+        },
+        {
+          "name": "Dual-write from the application",
+          "pro": "No extra infrastructure",
+          "con": "Not atomic, can reorder, and misses changes made outside the application"
+        },
+        {
+          "name": "Log-based CDC",
+          "pro": "Complete, ordered, with deletes and little load on the source",
+          "con": "Needs log access, a connector to run, and care about log retention"
+        },
+        {
+          "name": "Transactional outbox",
+          "pro": "Business-level events that are atomic with the change",
+          "con": "The application must write them, and the table needs cleaning"
+        }
+      ],
+      "pick": "Log-based CDC for copying data, plus an outbox where the events are part of the contract between services."
+    },
+    {
+      "title": "How the first copy is made",
+      "options": [
+        {
+          "name": "Dump the table, then start the stream",
+          "pro": "Easy to reason about",
+          "con": "A gap or overlap unless the log position and the dump are tied together, and the whole table is read in one go"
+        },
+        {
+          "name": "Consistent snapshot tied to the slot position",
+          "pro": "No gap, no overlap",
+          "con": "One long read transaction on the source, and it restarts from scratch if interrupted"
+        },
+        {
+          "name": "Incremental snapshot in chunks with watermarks",
+          "pro": "Resumable, can run beside the stream, and can be repeated per table",
+          "con": "Needs a signal table and primary keys, and is more complex"
+        }
+      ],
+      "pick": "A tied snapshot for small tables, incremental snapshots for large ones and for repairs."
+    },
+    {
+      "title": "What an event contains",
+      "options": [
+        {
+          "name": "Key and after image only",
+          "pro": "Small, and enough for upserting copies",
+          "con": "No before image, so a consumer cannot see what changed or react to a column moving from one value to another"
+        },
+        {
+          "name": "Before and after images",
+          "pro": "Consumers can compute differences, and a delete has the deleted row",
+          "con": "Roughly double the size, and the database must log full rows"
+        },
+        {
+          "name": "Just a notification with the key",
+          "pro": "Tiny, and the consumer reads the current row itself",
+          "con": "Extra reads on the source, and the row may have changed again by then"
+        }
+      ],
+      "pick": "Before and after images for the tables that consumers care about, with a compacted topic and tombstones for deletes."
+    },
+    {
+      "title": "Where the schema lives",
+      "options": [
+        {
+          "name": "Schema registry with compatibility checks",
+          "pro": "Compact messages, safe evolution, and old data stays readable",
+          "con": "One more service that must be available"
+        },
+        {
+          "name": "Schema embedded in every message",
+          "pro": "Self-describing, no extra service",
+          "con": "Large messages and no central rules about compatibility"
+        },
+        {
+          "name": "No schema, plain JSON",
+          "pro": "Fastest to start",
+          "con": "Breaks only at runtime, and nobody knows who reads what"
+        }
+      ],
+      "pick": "A registry with backward-compatible changes enforced, and a binary format for high volume tables."
+    }
+  ],
+  "roles": [
+    {
+      "id": "client",
+      "label": "Application",
+      "description": "The service that writes to the database, and the outbox rows it adds."
+    },
+    {
+      "id": "edge",
+      "label": "Downstream copies",
+      "description": "The search index, cache and warehouse that are kept up to date from the stream."
+    },
+    {
+      "id": "async",
+      "label": "Change stream",
+      "description": "The partitioned, replayable log of events between the connector and the sinks."
+    },
+    {
+      "id": "compute",
+      "label": "Connector",
+      "description": "The log reader, the snapshot reader and the batch job that polling would need."
+    },
+    {
+      "id": "data",
+      "label": "Source and registry",
+      "description": "The database, its write-ahead log, the offset store and the schema registry."
+    }
+  ]
+}

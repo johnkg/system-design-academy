@@ -1,0 +1,56 @@
+{
+  "actors": [
+    { "id": "app", "label": "Application", "role": "client", "x": 14, "y": 16 },
+    { "id": "db", "label": "Orders database and its log", "role": "data", "x": 50, "y": 16 },
+    { "id": "conn", "label": "CDC connector", "role": "compute", "x": 86, "y": 16 },
+    { "id": "reg", "label": "Schema registry", "role": "data", "x": 14, "y": 50 },
+    { "id": "offsets", "label": "Offset store", "role": "data", "x": 50, "y": 50 },
+    { "id": "stream", "label": "Change stream", "role": "async", "x": 86, "y": 50 },
+    { "id": "index", "label": "Search index", "role": "edge", "x": 14, "y": 84 },
+    { "id": "wh", "label": "Warehouse", "role": "edge", "x": 86, "y": 84 }
+  ],
+  "frames": [
+    {
+      "narration": "The application sets order 42 from 'paid' to 'shipped' in a normal transaction. When it commits, the database has already appended the change to its write-ahead log, at position 1042. The application knows nothing about the pipeline.",
+      "messages": [{ "from": "app", "to": "db", "label": "order 42: paid to shipped" }],
+      "states": { "db": "log position 1042" }
+    },
+    {
+      "narration": "The connector holds a replication slot, so the database keeps its log from the connector's last confirmed position. It reads the committed entry at 1042 through the replication interface, in commit order.",
+      "messages": [{ "from": "db", "to": "conn", "label": "log entry 1042" }],
+      "states": { "conn": "decoded 1042" }
+    },
+    {
+      "narration": "Before building the event, the connector looks up the schema of the orders table. The registry answers with version 3, which has the new optional 'carrier' column that was added last week.",
+      "messages": [{ "from": "conn", "to": "reg", "label": "orders schema?" }, { "from": "reg", "to": "conn", "label": "version 3" }],
+      "states": { "reg": "orders v3" }
+    },
+    {
+      "narration": "The connector publishes an update event with the key 42, the row before ('paid'), the row after ('shipped'), the schema version and position 1042. The key picks the partition, so every change to order 42 stays in order.",
+      "messages": [{ "from": "conn", "to": "stream", "label": "u 42: paid to shipped, pos 1042" }],
+      "states": { "stream": "partition of key 42" }
+    },
+    {
+      "narration": "Only after the stream has acknowledged the event does the connector commit position 1042. It also confirms the position to the database, which may now recycle the log before it. If the connector died just before this step, it would simply resend 1042.",
+      "messages": [{ "from": "stream", "to": "conn", "label": "ack" }, { "from": "conn", "to": "offsets", "label": "commit 1042" }, { "from": "conn", "to": "db", "label": "confirmed 1042" }],
+      "states": { "offsets": "1042", "db": "log before 1042 can go" }
+    },
+    {
+      "narration": "The search index and the warehouse each read the stream at their own pace. Each applies the change as an upsert of order 42 and remembers position 1042 for that row.",
+      "messages": [{ "from": "stream", "to": "index", "label": "u 42, pos 1042" }, { "from": "stream", "to": "wh", "label": "u 42, pos 1042" }],
+      "states": { "index": "order 42 shipped, pos 1042", "wh": "order 42 shipped, pos 1042" }
+    },
+    {
+      "narration": "Later the connector crashes after sending the update for order 17 at position 1043, but before committing it. On restart it resumes from the committed 1042 and sends 1043 again. The index has already applied it, sees that the position is not newer, and does nothing.",
+      "messages": [{ "from": "conn", "to": "stream", "label": "u 17, pos 1043 (again)" }, { "from": "stream", "to": "index", "label": "u 17, pos 1043 (again)" }],
+      "states": { "index": "duplicate 1043 ignored" },
+      "highlight": ["index"]
+    },
+    {
+      "narration": "Order 99 is deleted. Polling would never see this, but the log records it. The connector sends a delete event carrying the row as it was, followed by a tombstone with only the key so that the topic can eventually forget order 99. The warehouse removes the row.",
+      "messages": [{ "from": "conn", "to": "stream", "label": "d 99, then tombstone" }, { "from": "stream", "to": "wh", "label": "d 99" }],
+      "states": { "wh": "order 99 removed" },
+      "highlight": ["wh"]
+    }
+  ]
+}

@@ -1,0 +1,63 @@
+{
+  "name": "Backups and Point-in-Time Recovery",
+  "area": "databases",
+  "difficulty": "intermediate",
+  "intent": "Get data back after a disaster or a human mistake: take base backups, archive the write-ahead log, and replay it up to the moment just before things went wrong.",
+  "scenario": "At 14:03 someone runs DELETE FROM orders with no WHERE clause. The last full backup is from 02:00. A replica copied the delete within a second. With the write-ahead log archived, the team restores the 02:00 base backup and replays the log up to 14:02:59.",
+  "problem": "Disks fail, regions go dark and people run the wrong statement. A replica does not help with the last one: it faithfully copies the bad DELETE within a second. A single nightly backup alone means losing everything written since it ran (here 12 hours of orders). You need a way to rewind to an exact moment, and you need to know how much data you can afford to lose (RPO) and how long you can afford to be down (RTO) before you choose the design.",
+  "howItWorks": [
+    { "title": "Base backups: a consistent copy to start from", "text": "A physical base backup copies the data files (or takes a storage snapshot) together with a start position in the log. A logical backup (pg_dump, mysqldump) instead exports SQL or rows: portable across versions and good for one table, but slow to restore (it rebuilds every index) and it is only a point-in-time image. Full backups copy everything; incremental ones copy only blocks changed since the previous backup of any kind, differential ones since the last full. Smaller and faster to take, but a restore needs the whole chain." },
+    { "title": "Archive the write-ahead log continuously", "text": "Every change is first written to the write-ahead log (WAL) as a record with a log sequence number (LSN). Continuous archiving copies each finished WAL segment (16 MB by default in PostgreSQL; MySQL ships binary logs) to separate storage, and a timeout forces a partial segment out every few minutes on a quiet system. The base backup plus an unbroken chain of log is a complete history; one missing segment stops replay at that gap." },
+    { "title": "Restore the base, then replay the log to a target", "text": "Point-in-time recovery restores the newest base backup taken before the target, then replays archived records in order and stops at a target: a timestamp, an LSN, a transaction id or a named restore point. The target is the moment just before the bad statement (14:02:59), and recovery stops there instead of at the end of the log. Replay runs the same redo code as crash recovery, so it is bounded by how fast one process can apply changes." },
+    { "title": "Measure what you lose and how long it takes", "text": "RPO (recovery point objective) is how much recent work you can lose; with archiving it is the time since the last archived segment on a lost server, and about zero for a mistake on a live one. RTO (recovery time objective) is how long you are down: copy time (data size divided by throughput) plus replay time (log written since the base backup divided by replay rate) plus startup and checks. More frequent base backups shorten replay; they do not change RPO once the log is archived." },
+    { "title": "Prove it: restore, verify, keep copies apart", "text": "A backup you have never restored is a hope, not a backup. Restore into a scratch instance on a schedule, check row counts and run checksums or application queries, and time it: that is your real RTO. Keep copies by the 3-2-1 rule (three copies, two kinds of media, one off-site), encrypt them, restrict who can delete them, and retain enough history to discover a mistake that was noticed late." }
+  ],
+  "pros": [
+    "Rewinds to any moment covered by the archived log, so a bad DELETE or deploy costs seconds of data instead of hours",
+    "Protects against what replication cannot: human error, application bugs and corruption that replicate instantly",
+    "Base backups can be taken from a replica or a snapshot with little load on the primary",
+    "Restores into a new instance, so you can inspect or copy back just the damaged table instead of rolling everything back"
+  ],
+  "cons": [
+    "Recovery time grows with data size and log volume: restoring terabytes and replaying a day of log takes hours",
+    "Needs extra storage and bandwidth for the archive, and the log must be complete and ordered",
+    "Restoring to a point discards everything committed after it, including valid work, unless you merge it back by hand",
+    "Operational discipline: monitoring archive lag, rotating and testing backups, managing encryption keys"
+  ],
+  "whenToUse": [
+    "Any database whose loss would hurt the business, which includes almost every production database",
+    "When RPO is in minutes or less and nightly dumps are not good enough",
+    "Before risky operations such as migrations or bulk deletes, as a safety net you have already tested"
+  ],
+  "whenNotToUse": [
+    "As a substitute for replication or failover: they solve availability, backups solve recovery from wrong or lost data, and you need both",
+    "Disposable data that can be rebuilt from a source of truth faster than it can be restored (caches, derived views)",
+    "Without a restore drill: do not claim any RPO or RTO you have not measured"
+  ],
+  "pitfalls": [
+    "Treating a replica as a backup: the DELETE, a dropped table or corrupt data reaches it within about a second",
+    "Never restoring: archives with a missing segment, a backup of the wrong database, or a lost encryption key are discovered during the outage",
+    "Storing backups on the same machine, account or region as the primary, so one failure or one compromised credential removes both",
+    "Letting the archive command fail silently (full disk, expired credentials): the primary keeps running, the log piles up locally, and the chain has a hole",
+    "Estimating RTO from a quiet test: replay is usually single-threaded, so a busy day of log can take hours even on fast storage",
+    "Backups readable or deletable by everyone with database access: an attacker or ransomware encrypts or deletes them first, so use separate credentials and immutable (write-once) storage",
+    "Retention shorter than detection time: a corruption noticed after 10 days is unrecoverable if you only keep 7"
+  ],
+  "related": [
+    { "kind": "concept", "slug": "write-ahead-log" },
+    { "kind": "concept", "slug": "database-replication" },
+    { "kind": "concept", "slug": "mvcc-and-isolation-levels" },
+    { "kind": "concept", "slug": "multi-region-failover" },
+    { "kind": "concept", "slug": "event-sourcing" },
+    { "kind": "concept", "slug": "encryption" },
+    { "kind": "concept", "slug": "slos-and-error-budgets" }
+  ],
+  "roles": [
+    { "id": "operator", "label": "Operator", "description": "The person or tool that decides the restore target and verifies the result." },
+    { "id": "primary", "label": "Primary database", "description": "Takes writes and produces the write-ahead log." },
+    { "id": "replica", "label": "Replica", "description": "Applies the primary's log continuously, so it also applies mistakes." },
+    { "id": "base", "label": "Base backup store", "description": "Holds full, incremental or snapshot copies of the data files." },
+    { "id": "archive", "label": "WAL archive", "description": "Holds the ordered, unbroken chain of log segments since the base backup." },
+    { "id": "restore", "label": "Restore target", "description": "A fresh instance that is loaded from the base backup and replays the log to the target." }
+  ]
+}

@@ -1,0 +1,59 @@
+{
+  "actors": [
+    { "id": "indexer", "label": "Indexer", "role": "compute", "x": 14, "y": 16 },
+    { "id": "queue", "label": "Change event log", "role": "async", "x": 50, "y": 16 },
+    { "id": "db", "label": "Primary database", "role": "data", "x": 86, "y": 16 },
+    { "id": "shard", "label": "Shard 12 (the listing's shard)", "role": "data", "x": 14, "y": 50 },
+    { "id": "coord", "label": "Query coordinator", "role": "edge", "x": 50, "y": 50 },
+    { "id": "others", "label": "The other 66 shards", "role": "data", "x": 86, "y": 50 },
+    { "id": "user", "label": "Shopper", "role": "client", "x": 14, "y": 84 },
+    { "id": "api", "label": "Search API", "role": "edge", "x": 50, "y": 84 },
+    { "id": "analyzer", "label": "Text analyzer", "role": "compute", "x": 86, "y": 84 }
+  ],
+  "frames": [
+    {
+      "narration": "A seller edits listing 8841: a new price and the title 'Wireless Noise-Cancelling Headphones'. The database commits the row and, in the same transaction, a row in an outbox table. A relay publishes it as the event 'listing 8841, version 7'.",
+      "messages": [{ "from": "db", "to": "queue", "label": "listing 8841 v7" }],
+      "states": { "db": "row + outbox committed" }
+    },
+    {
+      "narration": "The indexer consumes the event, reads the current row and runs the title through the analyzer: lowercase, split, stop words dropped, stems taken. It becomes the terms wireless, noise, cancel and headphone, each with its position. A hash of the id 8841 picks shard 12.",
+      "messages": [{ "from": "queue", "to": "indexer", "label": "listing 8841 v7" }],
+      "states": { "indexer": "wireless noise cancel headphone" }
+    },
+    {
+      "narration": "The indexer sends the document to shard 12 with its version. The shard adds it to an in-memory buffer and appends it to its transaction log, then copies it to its replica. An older event arriving late would carry a lower version and be ignored. The listing is not searchable yet.",
+      "messages": [{ "from": "indexer", "to": "shard", "label": "index 8841, version 7" }],
+      "states": { "shard": "buffered + logged" }
+    },
+    {
+      "narration": "About a second later the shard refreshes: it writes the buffer as a new small immutable segment, a complete little inverted index, and starts searching it. The listing is now findable, a few seconds after the edit. The old version of 8841 in an older segment is only marked as deleted. A background merge will later combine small segments and drop it for good.",
+      "states": { "shard": "new segment searchable" },
+      "highlight": ["shard"]
+    },
+    {
+      "narration": "A shopper searches for 'wireles headphone', with a typo, and the request reaches the search API.",
+      "messages": [{ "from": "user", "to": "api", "label": "wireles headphone" }]
+    },
+    {
+      "narration": "The analyzer processes the query like a document. Wireles is not in the term dictionary, so a finite-state automaton over the sorted dictionary finds the terms within one edit, and wireless is the match. The query becomes wireless AND headphone, with the exact spelling scoring a little higher.",
+      "messages": [{ "from": "api", "to": "analyzer", "label": "wireles headphone" }, { "from": "analyzer", "to": "coord", "label": "wireless AND headphone" }],
+      "states": { "analyzer": "wireles -> wireless" }
+    },
+    {
+      "narration": "The coordinator sends the query to one copy of each of the 67 shards, in parallel, picking the least busy replica of each. Each shard holds about 7.5 million documents.",
+      "messages": [{ "from": "coord", "to": "shard", "label": "wireless AND headphone" }, { "from": "coord", "to": "others", "label": "wireless AND headphone" }]
+    },
+    {
+      "narration": "Each shard intersects its two posting lists, starting with the shorter one and jumping over the longer one with skip pointers, then scores the matches with BM25. Block maximums let it skip blocks that cannot reach its current top 10. Each shard returns just its 10 best, so 670 candidates come back.",
+      "messages": [{ "from": "shard", "to": "coord", "label": "10 hits" }, { "from": "others", "to": "coord", "label": "660 hits" }],
+      "states": { "coord": "670 candidates" }
+    },
+    {
+      "narration": "The coordinator merges the 670 candidates into the global top 10, applying the freshness factor, which lifts the listing edited moments ago. Because the slowest shard sets the time, the answer is ready in 38 ms, and the app shows the current price from the database.",
+      "messages": [{ "from": "coord", "to": "api", "label": "top 10" }, { "from": "api", "to": "user", "label": "10 results, 38 ms" }],
+      "states": { "user": "10 results in 38 ms" },
+      "highlight": ["user"]
+    }
+  ]
+}

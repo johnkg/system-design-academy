@@ -1,0 +1,477 @@
+{
+  "name": "Design a Zero-Downtime Database Migration",
+  "difficulty": "advanced",
+  "intent": "Move a live 5 TB production database to a new datacentre or cloud while the application keeps reading and writing, with proof that nothing was lost and a way back if it goes wrong.",
+  "codeTitle": "a live migration with a snapshot, a change log, checksums and a rollback",
+  "finalIntro": "A write reaching the old database, following the change stream to the new one, and the moment traffic moves.",
+  "prompt": "Design the migration of a 5 TB Postgres database serving a busy application from one datacentre to a managed database in another cloud. The application may not go down for more than a few seconds, no committed write may be lost, and if the new system misbehaves after the switch, the team must be able to go back.",
+  "functional": [
+    "Copy all the data to the new database from a consistent point in time",
+    "Keep the new database in sync with the writes that arrive during and after the copy",
+    "Prove the two databases hold the same data before switching",
+    "Move reads, then writes, to the new database in stages",
+    "Roll back to the old database without losing writes made on the new one",
+    "Retire the old system when the migration is done"
+  ],
+  "nonFunctional": [
+    "Writes are paused for seconds at most, not hours",
+    "No committed write is lost or applied twice",
+    "The copy must not slow down production traffic noticeably",
+    "Replication lag is below a few seconds before the cutover starts",
+    "Every row is accounted for, with checks that run while the system is live",
+    "The decision to go back stays possible for days after the switch",
+    "Ids created on the new database never collide with ids the old one handed out"
+  ],
+  "firstAttempt": {
+    "text": "Schedule a maintenance window. Stop the application, dump the database, load the dump into the new one, change the connection string, and start the application again.",
+    "limits": [
+      "At 200 MB/s a 5 TB copy takes about 7 hours, and the whole service is down for all of them",
+      "If the copy is started while the application keeps writing, rows copied early are already out of date when it ends",
+      "There is no check that the new database matches the old one, so a mistake is found by customers",
+      "After the switch the old database stops receiving writes, so going back means losing everything written since",
+      "The new database may hand out ids the old one already used, and one unlucky write overwrites a live row"
+    ]
+  },
+  "nodes": [
+    {
+      "id": "app",
+      "label": "Application",
+      "kind": "client",
+      "x": 62,
+      "y": 37
+    },
+    {
+      "id": "old",
+      "label": "Old database",
+      "kind": "data",
+      "x": 62,
+      "y": 63
+    },
+    {
+      "id": "copier",
+      "label": "Snapshot copier",
+      "kind": "compute",
+      "x": 37,
+      "y": 37,
+      "at": 1,
+      "until": 4
+    },
+    {
+      "id": "new",
+      "label": "New database",
+      "kind": "data",
+      "x": 12,
+      "y": 37,
+      "at": 1
+    },
+    {
+      "id": "log",
+      "label": "Change stream",
+      "kind": "async",
+      "x": 37,
+      "y": 63,
+      "at": 2
+    },
+    {
+      "id": "verify",
+      "label": "Verifier",
+      "kind": "compute",
+      "x": 12,
+      "y": 88,
+      "at": 3
+    },
+    {
+      "id": "router",
+      "label": "Connection router",
+      "kind": "edge",
+      "x": 37,
+      "y": 37,
+      "at": 4
+    },
+    {
+      "id": "idgap",
+      "label": "Id sequence gap",
+      "kind": "compute",
+      "x": 12,
+      "y": 12,
+      "at": 5
+    },
+    {
+      "id": "decom",
+      "label": "Decommission",
+      "kind": "compute",
+      "x": 62,
+      "y": 88,
+      "at": 6
+    }
+  ],
+  "edges": [
+    {
+      "from": "app",
+      "to": "old",
+      "at": 0,
+      "until": 4
+    },
+    {
+      "from": "old",
+      "to": "copier",
+      "at": 1,
+      "until": 4
+    },
+    {
+      "from": "copier",
+      "to": "new",
+      "at": 1,
+      "until": 4
+    },
+    {
+      "from": "old",
+      "to": "log",
+      "at": 2
+    },
+    {
+      "from": "log",
+      "to": "new",
+      "at": 2
+    },
+    {
+      "from": "verify",
+      "to": "old",
+      "at": 3
+    },
+    {
+      "from": "verify",
+      "to": "new",
+      "at": 3
+    },
+    {
+      "from": "app",
+      "to": "router",
+      "at": 4
+    },
+    {
+      "from": "router",
+      "to": "old",
+      "at": 4
+    },
+    {
+      "from": "router",
+      "to": "new",
+      "at": 4
+    },
+    {
+      "from": "idgap",
+      "to": "new",
+      "at": 5
+    },
+    {
+      "from": "new",
+      "to": "old",
+      "at": 5
+    },
+    {
+      "from": "decom",
+      "to": "old",
+      "at": 6
+    }
+  ],
+  "steps": [
+    {
+      "title": "Copy a consistent snapshot while the old database keeps serving",
+      "problem": "Copying a 5 TB database takes hours, and copying rows from a live database gives a mixture of old and new states that never existed at one moment.",
+      "fix": "Take a consistent snapshot at one point in time, such as a base backup plus the log position it corresponds to, or an exported transaction snapshot, and copy that. Run the copy from a replica, in parallel by table and by key range, with a speed limit so production is not starved. Record the exact log position of the snapshot, because everything after it must be replayed. Copying live rows without a snapshot and a log leaves the copy wrong the moment a row changes after it was copied.",
+      "tradeoff": "The old database stays up and the copy is a true picture of one moment. It takes hours, uses network and disk, and from the first second the copy is already behind, so a second mechanism has to deal with the writes that arrive meanwhile.",
+      "concepts": [
+        {
+          "slug": "database-replication"
+        },
+        {
+          "slug": "backpressure"
+        },
+        {
+          "slug": "latency-and-round-trips"
+        }
+      ]
+    },
+    {
+      "title": "Stream the changes and let the new database catch up",
+      "problem": "During the hours of the copy the application made millions of writes, and the new database knows nothing about them.",
+      "fix": "Read the old database's change log, such as the Postgres write-ahead log through logical replication, starting at the snapshot position, and apply every entry to the new database in order. Applying must be safe to repeat, so that an entry replayed after a restart changes nothing. Keep going after the new database catches up, so that it follows the old one with a lag of seconds. Watch that lag as the main health number of the migration.",
+      "tradeoff": "The new database ends up current without stopping writes, and it stays current. The change log must be kept until it is consumed, which fills the old disk if the target falls behind. Apply speed must exceed the write rate, or the lag never closes.",
+      "concepts": [
+        {
+          "slug": "event-sourcing"
+        },
+        {
+          "slug": "idempotency"
+        },
+        {
+          "slug": "message-queues"
+        }
+      ]
+    },
+    {
+      "title": "Verify continuously: counts, chunk checksums and shadow reads",
+      "problem": "Replication can silently drop or alter data through a bug, a type difference or a missed table, and nobody notices until the old system is gone.",
+      "fix": "Run checks all the time, not once. Compare row counts per table. Split each table into key ranges, compute a checksum per range on both sides and compare them, then dig into only the ranges that differ. Count the lag as it moves. Sample live reads: the application also asks the new database, compares the answer and logs a mismatch, but serves the old answer. A differing range is repaired by recopying it, and the cause is fixed before moving on.",
+      "tradeoff": "The mismatch is found while the old system is still the truth, when it costs nothing. Checksum passes read all the data on both sides, so they are throttled and run on replicas, and rows that change during a check can show up as false alarms that must be rechecked.",
+      "concepts": [
+        {
+          "slug": "metrics"
+        },
+        {
+          "slug": "alerting"
+        },
+        {
+          "slug": "database-indexing"
+        }
+      ]
+    },
+    {
+      "title": "Cut over in stages: reads first, then a short write freeze",
+      "problem": "Switching everything at once means any problem hits all traffic, and writes in flight during the switch can be lost or applied to the wrong database.",
+      "fix": "Put a connection router between the application and the databases. First move a small share of reads to the new database and grow it while watching errors and latency, with writes still going to the old one. When the lag is below the agreed threshold, such as two seconds, freeze writes on the old database, let the stream drain the last entries, confirm the positions match, and point writes at the new database. Unfreeze. The freeze is the drain time plus the flip, a few seconds. A big-bang switch without a drain leaves the entries still in the stream behind.",
+      "tradeoff": "Problems show up on a small share of traffic, and writes are never accepted by two databases at once. The router is a new piece to build and trust, and the freeze is real, so the application must hold writes briefly and retry them rather than fail.",
+      "concepts": [
+        {
+          "slug": "proxies"
+        },
+        {
+          "slug": "health-checks"
+        },
+        {
+          "slug": "retries-and-backoff"
+        }
+      ]
+    },
+    {
+      "title": "Handle ids and sequences, and replicate in reverse",
+      "problem": "If the new database starts its id counters from the snapshot, it hands out ids that the old database already issued after the snapshot, and the first inserts collide. Separately, once writes move, the old database goes stale and a rollback would lose everything written since.",
+      "fix": "Before the flip, move every sequence to a value well above the old maximum, for example a gap of a million, or use ids that cannot collide, such as ones generated by the application. After the flip, run the change stream the other way: the new database's writes are replicated back into the old one, so the old system stays current. With that in place, going back is the same short freeze in reverse, and no write is lost.",
+      "tradeoff": "Rolling back stays cheap and safe for days, which is what lets the team accept the cutover. The ids have a gap, and the old database must keep running with its cost and its upkeep. Reverse replication needs the same care as the forward one, including the schema matching in both directions.",
+      "concepts": [
+        {
+          "slug": "idempotency"
+        },
+        {
+          "slug": "database-replication"
+        },
+        {
+          "slug": "saga"
+        }
+      ]
+    },
+    {
+      "title": "Watch, keep the way back open, then decommission",
+      "problem": "Declaring victory the moment the switch works throws away the safety net, and problems like a slow monthly job show up days later.",
+      "fix": "Keep reverse replication and the old database running through a soak period that includes the slowest cycles, such as a month-end report. Compare error rate, latency and the continuous checks to the baseline. Then stop the reverse stream, take a final backup of the old system, revoke its credentials, remove the old connection strings and the router rules, delete the replication slots so they stop holding log space, and finally shut the old database down. Record what was learned.",
+      "tradeoff": "A long soak is the cheapest insurance, at the cost of paying for two databases for weeks. Leaving the old system around forever is the real risk: it keeps credentials and data nobody maintains, and a forgotten replication slot can fill a disk.",
+      "concepts": [
+        {
+          "slug": "slos-and-error-budgets"
+        },
+        {
+          "slug": "secrets-management"
+        },
+        {
+          "slug": "alerting"
+        }
+      ]
+    }
+  ],
+  "failures": [
+    {
+      "scenario": "The change stream falls behind and never catches up",
+      "impact": "The old database keeps its log for the stream, the disk fills, and the old production system can stop.",
+      "answer": "Alert on the lag and on log disk use. Speed up the target by batching and parallel apply, pause the checksum jobs, or lower the copy speed. A slot that has fallen too far is dropped before it stops the source, and the migration restarts from a fresh snapshot.",
+      "concepts": [
+        {
+          "slug": "backpressure"
+        },
+        {
+          "slug": "alerting"
+        },
+        {
+          "slug": "metrics"
+        }
+      ]
+    },
+    {
+      "scenario": "A checksum shows some ranges differ",
+      "impact": "Cutting over would silently lose or change rows, for example from a type conversion or a column the stream skipped.",
+      "answer": "Compare the differing ranges row by row to find the pattern, repair them by recopying, and fix the cause before cutting over. Recheck rows that changed during the check so a moving row is not counted as a fault.",
+      "concepts": [
+        {
+          "slug": "metrics"
+        },
+        {
+          "slug": "idempotency"
+        },
+        {
+          "slug": "structured-logging"
+        }
+      ]
+    },
+    {
+      "scenario": "Sequences restart at the snapshot value",
+      "impact": "New rows get ids that already exist, so inserts fail or, worse, overwrite live rows.",
+      "answer": "Before the flip, set every sequence above the old maximum with a safety gap, and test it by inserting on the new database in a rehearsal. Prefer ids generated by the application, which cannot collide.",
+      "concepts": [
+        {
+          "slug": "idempotency"
+        },
+        {
+          "slug": "database-sharding"
+        },
+        {
+          "slug": "consistency-models"
+        }
+      ]
+    },
+    {
+      "scenario": "The new database misbehaves an hour after the cutover",
+      "impact": "Latency is poor under real load and the team needs to go back, but writes since the flip exist only on the new system.",
+      "answer": "Reverse replication has kept the old database current, so the rollback is a freeze, a drain of the reverse stream and a flip of the router. Without reverse replication the same decision loses every write since the cutover, which is why it is built before the flip, not after.",
+      "concepts": [
+        {
+          "slug": "database-replication"
+        },
+        {
+          "slug": "health-checks"
+        },
+        {
+          "slug": "circuit-breaker"
+        }
+      ]
+    },
+    {
+      "scenario": "A write reaches both databases during the switch",
+      "impact": "The two databases accept different values for the same row, a split brain that is very hard to repair.",
+      "answer": "Only one database is the source of truth at any moment. The old one is made read-only (or fenced) before the new one accepts writes, and the router flips only after the stream has drained to the same position. A fencing token or a leader lease makes a late write from an old connection fail.",
+      "concepts": [
+        {
+          "slug": "leader-election"
+        },
+        {
+          "slug": "consensus"
+        },
+        {
+          "slug": "cap-theorem"
+        }
+      ]
+    }
+  ],
+  "alternatives": [
+    {
+      "title": "How the target stays in sync",
+      "options": [
+        {
+          "name": "Stop-the-world dump and load",
+          "pro": "Simplest, and exact",
+          "con": "Hours of downtime for a 5 TB database"
+        },
+        {
+          "name": "Snapshot plus change log",
+          "pro": "No application changes, ordered, and exact once it drains",
+          "con": "Needs logical replication or a CDC tool, and matching schemas"
+        },
+        {
+          "name": "Dual-write from the application",
+          "pro": "No special database features",
+          "con": "A failed or reordered write on one side diverges silently, and the old rows still need a backfill"
+        }
+      ],
+      "pick": "Snapshot plus a change log, with dual-write only as a read-comparison tool for the checks."
+    },
+    {
+      "title": "How you verify",
+      "options": [
+        {
+          "name": "Row counts",
+          "pro": "Cheap and quick",
+          "con": "A changed value keeps the count the same"
+        },
+        {
+          "name": "Chunk checksums",
+          "pro": "Find any differing range, and tell where to look",
+          "con": "Read all the data on both sides"
+        },
+        {
+          "name": "Sampled shadow reads",
+          "pro": "Tests real queries on real traffic",
+          "con": "Only covers what the application happens to read"
+        }
+      ],
+      "pick": "All three: counts for speed, checksums for completeness, shadow reads for the queries that matter."
+    },
+    {
+      "title": "How you cut over",
+      "options": [
+        {
+          "name": "Big bang",
+          "pro": "One step",
+          "con": "Everything is at risk at once, and the stream's last entries are dropped"
+        },
+        {
+          "name": "Reads first, then a short write freeze",
+          "pro": "Risk grows slowly, and the freeze is seconds",
+          "con": "Needs a router and clients that can wait"
+        },
+        {
+          "name": "Source-of-truth flip behind a feature flag",
+          "pro": "A flip and a flip back are the same switch",
+          "con": "The application must support both targets"
+        }
+      ],
+      "pick": "Reads first, then a short freeze, with the flag if the application can take it."
+    },
+    {
+      "title": "The way back",
+      "options": [
+        {
+          "name": "Restore from backup",
+          "pro": "No extra machinery",
+          "con": "Loses everything since the cutover and takes hours"
+        },
+        {
+          "name": "Keep the old database stale",
+          "pro": "Nothing to build",
+          "con": "Rollback loses the writes made on the new system"
+        },
+        {
+          "name": "Reverse replication",
+          "pro": "The old database stays current, so rollback is a short flip",
+          "con": "Another stream to build, run and check"
+        }
+      ],
+      "pick": "Reverse replication through the soak period."
+    }
+  ],
+  "roles": [
+    {
+      "id": "client",
+      "label": "Application",
+      "description": "The service that keeps reading and writing during the move."
+    },
+    {
+      "id": "edge",
+      "label": "Router",
+      "description": "The connection router that decides which database gets reads and writes."
+    },
+    {
+      "id": "async",
+      "label": "Change stream",
+      "description": "The ordered log of changes, forward and in reverse."
+    },
+    {
+      "id": "compute",
+      "label": "Copy and checks",
+      "description": "The snapshot copier, the verifier, the id fix and the decommission work."
+    },
+    {
+      "id": "data",
+      "label": "Databases",
+      "description": "The old and the new database."
+    }
+  ]
+}
