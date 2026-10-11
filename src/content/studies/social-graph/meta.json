@@ -1,0 +1,180 @@
+{
+  "name": "Design a Social Graph Service",
+  "difficulty": "advanced",
+  "intent": "Store billions of follow and friend edges, and answer who follows whom, mutual friends, friend suggestions and distance between two people in milliseconds, even when one person has a hundred million followers.",
+  "codeTitle": "sorted adjacency lists with mutual friends and bidirectional search",
+  "finalIntro": "Alice opens Bob's profile, sees how they are connected, and adds a new friend.",
+  "prompt": "Design the social graph for a network with a billion users, where each user follows or befriends a few hundred people on average, and a few celebrities have more than a hundred million followers. Other features ask this service about the graph: who follows me, who do I follow, are we connected, who do we both know, who might I know, and how far apart are we. News-feed fan-out is a separate system.",
+  "functional": [
+    "Follow, unfollow, friend and unfriend, and block",
+    "List the people a user follows and the people who follow them, page by page",
+    "Check whether one user follows or is friends with another",
+    "Show the mutual friends of two users, and the count",
+    "Suggest people a user may know",
+    "Tell how many hops separate two users, up to a small limit",
+    "Respect privacy settings and blocks in every answer"
+  ],
+  "nonFunctional": [
+    "A connection check or a list page returns in under 20 ms, and a mutual-friends query in under 100 ms",
+    "Handle hundreds of thousands of graph queries per second at the peak",
+    "Store hundreds of billions of edges, and let it grow",
+    "A follow becomes visible to the follower at once, and to others within a few seconds",
+    "Celebrities with a hundred million followers must not make one machine the bottleneck",
+    "Never lose an edge, and never leave a half-written edge forever",
+    "A blocked user never sees the person who blocked them"
+  ],
+  "firstAttempt": {
+    "text": "One SQL table of edges, with the columns follower and followee, and an index on each column. A follow inserts a row. Followers are a query on the followee column, following is a query on the follower column, and mutual friends are a self-join of the table. Friends of friends are a join of the table with itself, and the distance between two people is a recursive query.",
+    "limits": [
+      "Hundreds of billions of rows with two indexes do not fit on one machine, and the joins on a sharded table must visit every shard",
+      "A self-join for friends of friends touches about the square of the average number of friends for every request, which is tens of thousands of rows for an ordinary user",
+      "A celebrity's followers are millions of rows behind one index value, so every query that touches them is slow and every follow of them contends on the same pages",
+      "A recursive query for the distance between two people can explore most of the network before it finds a path",
+      "There is no place to apply privacy rules or blocks except in each query, so they are easy to forget"
+    ]
+  },
+  "nodes": [
+    { "id": "apps", "label": "Apps and services", "kind": "client", "x": 12, "y": 50 },
+    { "id": "single", "label": "SQL edge table", "kind": "compute", "x": 52, "y": 50, "at": 0, "until": 1 },
+    { "id": "api", "label": "Graph API", "kind": "edge", "x": 30, "y": 50, "at": 1 },
+    { "id": "adj", "label": "Sorted lists in one store", "kind": "data", "x": 52, "y": 50, "at": 1, "until": 2 },
+    { "id": "shards", "label": "List shards by user", "kind": "data", "x": 52, "y": 50, "at": 2 },
+    { "id": "queue", "label": "Reverse-edge queue", "kind": "async", "x": 52, "y": 84, "at": 2 },
+    { "id": "hubs", "label": "Split hub lists", "kind": "data", "x": 88, "y": 50, "at": 3 },
+    { "id": "cache", "label": "Counts and page cache", "kind": "data", "x": 52, "y": 16, "at": 3 },
+    { "id": "query", "label": "Intersection workers", "kind": "compute", "x": 30, "y": 84, "at": 4 },
+    { "id": "job", "label": "Nightly suggestion job", "kind": "async", "x": 74, "y": 84, "at": 5 },
+    { "id": "sugg", "label": "Suggestions store", "kind": "data", "x": 74, "y": 16, "at": 5 },
+    { "id": "guard", "label": "Privacy filter", "kind": "compute", "x": 30, "y": 16, "at": 6 }
+  ],
+  "edges": [
+    { "from": "apps", "to": "single", "at": 0, "until": 1 },
+    { "from": "apps", "to": "api", "at": 1 },
+    { "from": "api", "to": "adj", "at": 1, "until": 2 },
+    { "from": "api", "to": "shards", "at": 2 },
+    { "from": "api", "to": "queue", "at": 2 },
+    { "from": "queue", "to": "shards", "at": 2 },
+    { "from": "shards", "to": "hubs", "at": 3 },
+    { "from": "api", "to": "cache", "at": 3 },
+    { "from": "api", "to": "query", "at": 4 },
+    { "from": "query", "to": "shards", "at": 4 },
+    { "from": "shards", "to": "job", "at": 5 },
+    { "from": "job", "to": "sugg", "at": 5 },
+    { "from": "sugg", "to": "api", "at": 5 },
+    { "from": "guard", "to": "api", "at": 6 }
+  ],
+  "steps": [
+    {
+      "title": "Store every person's connections as two sorted lists",
+      "problem": "A table of edges answers each question with a join or a count over an index, and the questions people ask are almost all about one person's neighbours.",
+      "fix": "Keep two lists for every user, the people they follow and the people who follow them, each a sorted list of 64-bit ids, in a key-value store keyed by user id. A follow adds one id to each of the two lists. Listing is a read of one key, paged by a cursor that is the last id seen. 'Does A follow B' is a binary search in A's list, and the length of each list is stored beside it, so counts are free.",
+      "tradeoff": "Every common question is one key read, and the lists are compact, since a hundred thousand ids fit in under a megabyte. Each edge is stored twice and must be written twice, and a single list for a celebrity is far too big to be one value.",
+      "concepts": [{ "slug": "sql-vs-nosql" }, { "slug": "database-indexing" }, { "slug": "pagination" }]
+    },
+    {
+      "title": "Shard by user id, and write the second half of each edge through a queue",
+      "problem": "Hundreds of billions of entries do not fit on one store, and the two lists of an edge belong to two different users, who are usually on two different shards.",
+      "fix": "Spread users over shards by a hash of the user id, so one user's lists are always on one shard and a single-user read touches one machine. A follow writes the follower's 'following' list first, in a transaction on that shard, together with an outbox record. A queue then applies the matching 'followers' entry on the other shard, and is safe to repeat because adding an id to a sorted set twice changes nothing. A repair job compares both sides and fixes any difference.",
+      "tradeoff": "Writes stay on a single shard and scale out, and a lost message cannot leave the graph wrong for ever. For a moment the followed person's list lacks the follower, so a 'who follows me' page can trail by a few seconds, and the follower's own view must be read from the side that was written first.",
+      "concepts": [{ "slug": "database-sharding" }, { "slug": "transactional-outbox" }, { "slug": "message-queues" }]
+    },
+    {
+      "title": "Cut celebrity lists into buckets, and cache counts and first pages",
+      "problem": "A user with a hundred million followers has a list of 800 MB, which sits on one shard, so that shard takes every read of that list and every follow of that person.",
+      "fix": "Split any list longer than a threshold into buckets of a fixed number of ids, such as 10,000, stored under keys of (user, bucket number) and spread over many shards. A page read fetches one bucket, and a new follower is appended to the last bucket. The count and the first page of each celebrity list live in a cache, which is the part nearly every request wants, and are replicated widely. Algorithms never read a hub list from start to end.",
+      "tradeoff": "No machine holds a whole hub, so read and write load spreads, and the cache answers most celebrity requests. A list is now several keys, so reading it all takes many requests, the bucket directory needs care, and bursts of new followers must still be absorbed by buffering appends.",
+      "concepts": [{ "slug": "caching" }, { "slug": "consistent-hashing" }, { "slug": "backpressure" }]
+    },
+    {
+      "title": "Answer 'are we connected' and 'who do we both know' by intersecting sorted lists",
+      "problem": "Mutual friends are the overlap of two lists on two shards, and a naive version moves a celebrity's whole list to a worker every time.",
+      "fix": "Fetch both lists and walk them together in one pass, advancing the smaller id, which costs at most the sum of the lengths. When one list is small and the other is huge, look each id of the small list up in the big one instead, which is a binary search per id and never reads the whole hub. For the biggest hubs, keep a compressed bitmap, so an intersection is a bitwise AND of words. Often it is enough to return the count, with a handful of examples.",
+      "tradeoff": "The common case reads two short lists and finishes in microseconds, and a hub costs the size of the small list times a logarithm, not the size of the hub. Bitmaps use memory and must be kept in step with the lists, and a fully exact answer for two large lists still moves a lot of data.",
+      "concepts": [{ "slug": "database-indexing" }, { "slug": "caching" }, { "slug": "latency-and-round-trips" }]
+    },
+    {
+      "title": "Compute suggestions offline, and search from both ends for distance",
+      "problem": "Friends of friends is about the square of the average number of friends, and the distance between two people is the cost of a search that grows by a factor of the average number of friends at each hop.",
+      "fix": "A nightly batch job reads the lists, counts for each user the shared friends of each stranger, skips or samples any list longer than a limit, and stores the best twenty or so in a suggestions store, from which the API reads one key. For 'how far apart are we', the API runs a breadth-first search from both people at once, always growing the side with fewer people, and stops when the two searches meet, with a limit of about four hops. Searching from both ends touches around the square root of the work of a single search.",
+      "tradeoff": "Suggestions are a single read, and the expensive counting happens when nobody is waiting. They are up to a day old, and a capped hub can hide a real shared connection. A two-ended search is far cheaper but still cannot be offered for arbitrary distance, so beyond four hops the answer is 'far'.",
+      "concepts": [{ "slug": "message-queues" }, { "slug": "caching" }, { "slug": "latency-and-round-trips" }]
+    },
+    {
+      "title": "Filter every answer for privacy and blocks, and limit crawling",
+      "problem": "A friend list may be private, some people hide from their mutual friends, and a blocked person must see nothing, yet the stored lists and caches hold all the ids.",
+      "fix": "Store and cache the raw lists, and apply a privacy filter to every response on the way out, based on who is asking: each person's visibility setting, and the block lists in both directions, which are small and cached. Suggestions and counts go through the same filter, so a blocked or hidden person never appears. Rate limits per account and per address, and cursor limits on deep paging, stop an account from copying the graph one page at a time.",
+      "tradeoff": "One place decides who may see what, so a new feature cannot forget the rule, and the same cache serves every viewer. The filter adds work to each response, counts must be computed after filtering or they can leak who is hidden, and rate limits will sometimes slow legitimate heavy users.",
+      "concepts": [{ "slug": "authentication-and-authorization" }, { "slug": "rate-limiting" }, { "slug": "api-gateway" }]
+    }
+  ],
+  "failures": [
+    {
+      "scenario": "A shard that owns a million users' lists goes down",
+      "impact": "Those users cannot list their connections, and queries that need them, such as mutual friends, fail.",
+      "answer": "Every shard has replicas that take over within seconds, and reads can go to a replica in the meantime. If a pair of lists is not available, the API returns the answer without that part, for instance a profile without the mutual-friends line, instead of failing the whole page.",
+      "concepts": [{ "slug": "database-replication" }, { "slug": "health-checks" }, { "slug": "circuit-breaker" }]
+    },
+    {
+      "scenario": "A follow is written on one shard and the queue message is lost",
+      "impact": "The follower sees that they follow the celebrity, but the celebrity's followers list and count do not include them.",
+      "answer": "The outbox record was saved with the first write, so a relay resends the message until the other shard confirms it, and applying it twice does no harm. A scheduled repair job compares the two sides for recently changed users and fixes any difference.",
+      "concepts": [{ "slug": "transactional-outbox" }, { "slug": "idempotency" }, { "slug": "retries-and-backoff" }]
+    },
+    {
+      "scenario": "A celebrity gains five million followers in an hour",
+      "impact": "Appends concentrate on the last bucket of one list, and the shard that holds it falls behind.",
+      "answer": "Appends go through a queue and are applied in batches, so thousands of follows become a few writes. New buckets are spread across shards as the list grows, and the count in the cache is updated by increments, not by counting the list. If the queue grows, the service slows non-essential work first.",
+      "concepts": [{ "slug": "backpressure" }, { "slug": "message-queues" }, { "slug": "caching" }]
+    },
+    {
+      "scenario": "A user blocks someone, but a cached page still shows them",
+      "impact": "The blocked person can still see the user in a suggestion or a mutual-friends list for as long as the cache lives.",
+      "answer": "Caches hold unfiltered data, and the block lists are applied to every response when it is built, so a new block takes effect on the next request. Block changes are written synchronously, not through the slow path used for follows.",
+      "concepts": [{ "slug": "caching" }, { "slug": "authentication-and-authorization" }, { "slug": "consistency-models" }]
+    }
+  ],
+  "alternatives": [
+    {
+      "title": "Where the edges live",
+      "options": [
+        { "name": "SQL table of edges", "pro": "Familiar, transactions, and fine up to a few hundred million edges", "con": "Joins and counts across shards are slow, and a hub is a hot index value" },
+        { "name": "Sharded key-value adjacency lists", "pro": "One-key reads for the common questions, and simple to scale out", "con": "Multi-hop queries are code you write, and each edge is stored twice" },
+        { "name": "A graph database", "pro": "Multi-hop queries are natural, and traversal is fast on one machine", "con": "Sharding billions of edges and very large hubs are hard, and few run at this scale" }
+      ],
+      "pick": "Key-value adjacency lists for the online path, and a graph engine or batch system only for offline analysis."
+    },
+    {
+      "title": "What an edge means",
+      "options": [
+        { "name": "Directed follow", "pro": "One write for the follower, and no approval step", "con": "Two lists per person, and 'friends' means finding the overlap of both" },
+        { "name": "Mutual friendship", "pro": "One symmetric relationship, and mutual friends are well defined", "con": "Needs a request and an acceptance, and both lists change together" }
+      ],
+      "pick": "Store directed edges, and derive friendship as a pair of edges that exist in both directions."
+    },
+    {
+      "title": "How to intersect two lists",
+      "options": [
+        { "name": "Merge two sorted lists", "pro": "Simple, exact, and good when the lists are similar in size", "con": "Costs the length of the longer list, which is a disaster for a hub" },
+        { "name": "Look the small list up in the big one", "pro": "Cost is the small size times a logarithm, whatever the hub's size", "con": "Needs random access, such as a binary search or a hash lookup, into the big list" },
+        { "name": "Compressed bitmaps", "pro": "A handful of word operations per thousand ids", "con": "Memory, and keeping the bitmap current as the list changes" }
+      ],
+      "pick": "Merge for similar sizes, lookups for a hub, and bitmaps only for the biggest hubs."
+    },
+    {
+      "title": "When to compute friends of friends",
+      "options": [
+        { "name": "On every request", "pro": "Always fresh", "con": "About the square of the number of friends per request, and hubs make it unbounded" },
+        { "name": "A nightly batch", "pro": "A single key read at request time, and hub lists can be sampled", "con": "Up to a day old" },
+        { "name": "Batch, with a live top-up for new friends", "pro": "Fresh for the connections that just changed", "con": "Two code paths" }
+      ],
+      "pick": "A nightly batch, and a small live computation only for users who just made new friends."
+    }
+  ],
+  "roles": [
+    { "id": "client", "label": "Callers", "description": "Apps and services that ask about the graph." },
+    { "id": "edge", "label": "Entry point", "description": "The graph API." },
+    { "id": "async", "label": "Queues and jobs", "description": "Reverse-edge writes and the nightly suggestion job." },
+    { "id": "compute", "label": "Query and privacy checks", "description": "Intersection workers and the privacy filter." },
+    { "id": "data", "label": "Lists and caches", "description": "Adjacency list shards, hub buckets, caches and suggestions." }
+  ]
+}

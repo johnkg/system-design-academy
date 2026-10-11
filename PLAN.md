@@ -11,7 +11,7 @@ The project began as "Design Patterns Academy" covering the 23 Gang of Four patt
 |---|---|
 | Stack | Astro 5 + TypeScript, static output, vanilla TS for interactivity |
 | Hosting | GitHub Pages via GitHub Actions (`.github/workflows/deploy.yml`) |
-| Areas | Scaling & infrastructure, Data & consistency, Messaging & async, Reliability & resilience, API design, Security, Observability, Networking, Distributed systems, Design patterns |
+| Areas | Scaling & infrastructure, Data & consistency, Messaging & async, Reliability & resilience, API design, Security, Observability, Networking, Distributed systems, Cloud & deployment, Design patterns |
 | Teaching format for concepts | Simulation first. Diagram, animation, interactive simulation, trade-offs. JS, Python and C# code only when a concept has meaningful code |
 | Languages | JavaScript and C# at launch, Python added later; more through `languages.config.ts` |
 | Case studies ("design a URL shortener") | Later, once concepts exist, linking back to them |
@@ -26,7 +26,7 @@ Both live in `src/content/<collection>/<slug>/`, are found automatically, and ap
 Concept page order: problem, how it works, watch it flow, simulate it, trade-offs, code (if any), judgment, related.
 
 ## Wave 1 roadmap (4 areas, 24 concepts)
-Status: all four wave 1 areas are complete (24 of 24 concepts). Load Balancing is the reference implementation. The system design compare page (`/compare-concepts/`) is done. Thirty case studies are done (`url-shortener` is the reference, then `rate-limiter-service`, `notification-system`, `chat-system`, `news-feed`, `video-streaming`, `ride-sharing`, `payment-system`, `search-autocomplete`, `web-crawler`, `key-value-store`, `file-sync`, `ticket-booking`, `metrics-monitoring`, `unique-id-generator`, `collaborative-editor`, `job-scheduler`, `leaderboard`, `stock-exchange`, `hotel-reservation`, `proximity-service`, `ecommerce-checkout`, `distributed-lock-service`, `object-storage`, `ad-click-aggregation`, `message-queue-service`, `photo-sharing`, `email-service`, `code-deployment` and `food-delivery`). Python samples exist for every JS and C# sample. Next: decide between more case studies and more areas.
+Status: all four wave 1 areas are complete (24 of 24 concepts). Load Balancing is the reference implementation. The system design compare page (`/compare-concepts/`) is done. Thirty-nine case studies are done (`url-shortener` is the reference, then `rate-limiter-service`, `notification-system`, `chat-system`, `news-feed`, `video-streaming`, `ride-sharing`, `payment-system`, `search-autocomplete`, `web-crawler`, `key-value-store`, `file-sync`, `ticket-booking`, `metrics-monitoring`, `unique-id-generator`, `collaborative-editor`, `job-scheduler`, `leaderboard`, `stock-exchange`, `hotel-reservation`, `proximity-service`, `ecommerce-checkout`, `distributed-lock-service`, `object-storage`, `ad-click-aggregation`, `message-queue-service`, `photo-sharing`, `email-service`, `code-deployment`, `food-delivery`, `digital-wallet`, `feature-flag-service`, `log-aggregation`, `video-conferencing`, `recommendation-system`, `distributed-cache`, `social-graph`, `container-orchestrator` and `serverless-platform`). Python samples exist for every JS and C# sample. Next: decide between more case studies and another area.
 
 **Scaling & infrastructure** (done): load balancing, caching, CDN, horizontal vs vertical scaling, database sharding, database replication
 **Data & consistency** (done): CAP theorem, ACID vs BASE, consistency models, database indexing, SQL vs NoSQL, consistent hashing
@@ -39,7 +39,8 @@ Status: all four wave 1 areas are complete (24 of 24 concepts). Load Balancing i
 **Observability** (done): structured logging, metrics, distributed tracing, SLOs and error budgets, alerting, health checks
 **Networking** (done): DNS, TCP vs UDP, HTTP versions, proxies, real-time communication, latency and round trips
 **Distributed systems** (done): leader election, consensus, quorums, logical clocks, gossip protocol, two-phase commit
-Next candidates: data engineering; cloud and deployment (a canary deploy simulation would be the reference concept); more case studies (digital wallet, feature flags, log aggregation, recommendations, video conferencing).
+**Cloud & deployment** (done, wave 3): canary deployments (the reference concept for this area), blue-green and rolling deployments, feature flags, autoscaling, containers and orchestration, infrastructure as code, multi-region failover
+Next candidates: data engineering (batch and stream processing); more cloud and deployment concepts (service mesh, GitOps, cost management); more case studies (a CI system, a search engine, a CDN, a payments gateway, a social media timeline).
 
 Simulation ideas: caching (hit/miss ratio with eviction policies), sharding and consistent hashing (add or remove a node and watch keys move), CAP (partition the network and choose consistency or availability), rate limiting (token bucket vs sliding window), circuit breaker (open/half-open/closed under failing calls), message queues (producers, consumers, a slow consumer).
 
@@ -51,4 +52,5 @@ Simulation ideas: caching (hit/miss ratio with eviction policies), sharding and 
 - Design patterns: all 23 built, with JS, Python and C# samples (verified by `npm run check:samples`)
 - Site generalised: area-based catalog with search and filters, concept pages, breadcrumbs, `/compare/` for patterns
 - Accessibility pass done (axe-core clean in light and dark, keyboard checks)
-- Concepts: 18 of 24 in wave 1 (Scaling & infrastructure, Data & consistency, Messaging & async)
+- Concepts: 61 across ten areas (waves 1 to 3), each with a diagram, an animation, a simulation, and JS, C# and Python samples where there is meaningful code
+- Case studies: 39, each with a build-up diagram, an estimator, a break-it simulation and JS, C# and Python samples

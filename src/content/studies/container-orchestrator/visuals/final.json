@@ -1,0 +1,67 @@
+{
+  "actors": [
+    { "id": "you", "label": "kubectl", "role": "client", "x": 14, "y": 16 },
+    { "id": "api", "label": "API server", "role": "edge", "x": 50, "y": 16 },
+    { "id": "etcd", "label": "Store (3 members)", "role": "data", "x": 86, "y": 16 },
+    { "id": "ctrl", "label": "Controllers", "role": "compute", "x": 14, "y": 50 },
+    { "id": "watch", "label": "Watch streams", "role": "async", "x": 50, "y": 50 },
+    { "id": "sched", "label": "Scheduler", "role": "compute", "x": 86, "y": 50 },
+    { "id": "kubelet", "label": "Kubelet, node 812", "role": "compute", "x": 14, "y": 84 },
+    { "id": "proxy", "label": "Service proxy and DNS", "role": "edge", "x": 50, "y": 84 },
+    { "id": "other", "label": "Kubelet, node 3110", "role": "compute", "x": 86, "y": 84 }
+  ],
+  "frames": [
+    {
+      "narration": "A developer applies a deployment: three replicas of 'web', each requesting 0.5 CPU and 1 GB of memory, with limits of 1 CPU and 2 GB. The API server checks who they are, whether they may do this, and whether the object is valid.",
+      "messages": [{ "from": "you", "to": "api", "label": "apply: web x3, request 0.5 CPU / 1 GB" }],
+      "states": { "api": "authorised, valid" }
+    },
+    {
+      "narration": "The API server writes the object to the store. The leader appends it to its log and sends it to the two followers. Once one follower has stored it, two of three members have it, which is a majority, so it is committed at revision 90,412 and acknowledged.",
+      "messages": [{ "from": "api", "to": "etcd", "label": "write desired state" }, { "from": "etcd", "to": "api", "label": "committed, revision 90412" }, { "from": "api", "to": "you", "label": "deployment web created" }],
+      "states": { "etcd": "revision 90412" }
+    },
+    {
+      "narration": "The change is streamed to everyone who watches deployments. The deployment controller wakes up and compares: desired is 3 pods, actual is 0. It does not care how it found out, only about the difference. It asks for three pods to be created, still without a node.",
+      "messages": [{ "from": "api", "to": "watch", "label": "event: deployment web, rev 90412" }, { "from": "watch", "to": "ctrl", "label": "event" }, { "from": "ctrl", "to": "api", "label": "create 3 pods (no node yet)" }],
+      "states": { "ctrl": "desired 3, actual 0" }
+    },
+    {
+      "narration": "The scheduler watches for pods that have no node. For the first pod, it filters: of 5,000 nodes it examines about 500 (the 10% rule at this size), dropping any without 0.5 CPU and 1 GB of unrequested room. It scores the survivors for spread and for balanced CPU and memory use, and node 812 scores best.",
+      "messages": [{ "from": "watch", "to": "sched", "label": "3 pods without a node" }, { "from": "sched", "to": "api", "label": "bind web-1 to node 812" }],
+      "states": { "sched": "500 of 5,000 scored" },
+      "highlight": ["sched"]
+    },
+    {
+      "narration": "The binding is stored. The kubelet on node 812 watches only the pods bound to its own node, so it hears about web-1 straight away. It pulls the image, starts the container with its CPU and memory limits, and writes the status back: running.",
+      "messages": [{ "from": "api", "to": "etcd", "label": "store binding" }, { "from": "watch", "to": "kubelet", "label": "web-1 is yours" }, { "from": "kubelet", "to": "api", "label": "web-1 running" }],
+      "states": { "kubelet": "web-1 running" }
+    },
+    {
+      "narration": "Once web-1 passes its readiness probe, its address joins the endpoint list for the service 'web'. Every node's proxy watches the list, and DNS answers from it, so callers of 'web' now reach three ready pods without knowing where they are.",
+      "messages": [{ "from": "watch", "to": "proxy", "label": "endpoints of web updated" }],
+      "states": { "proxy": "web: 3 endpoints" }
+    },
+    {
+      "narration": "Later, node 812 loses power. Its kubelet had been renewing a small lease every 10 seconds, and now the renewals stop. Nothing else happens yet, because a late heartbeat on a busy network looks the same, and the control plane waits for the 40-second grace period.",
+      "states": { "kubelet": "silent" },
+      "highlight": ["kubelet"]
+    },
+    {
+      "narration": "The grace period runs out. The node lifecycle controller marks node 812 not ready and taints it, and the endpoint list loses web-1. The deployment tolerates the taint for 30 seconds, so nothing is evicted yet in case the node comes back.",
+      "messages": [{ "from": "ctrl", "to": "api", "label": "node 812: not ready, tainted" }, { "from": "watch", "to": "proxy", "label": "web-1 removed" }],
+      "states": { "proxy": "web: 2 endpoints", "ctrl": "node 812 not ready" }
+    },
+    {
+      "narration": "After the 30 seconds the pod is evicted, which means deleted. The replica controller sees 2 pods against 3 desired and creates web-4. The scheduler filters again, now skipping node 812, and picks node 3110.",
+      "messages": [{ "from": "ctrl", "to": "api", "label": "evict web-1, create web-4" }, { "from": "watch", "to": "sched", "label": "web-4 needs a node" }, { "from": "sched", "to": "api", "label": "bind web-4 to node 3110" }],
+      "states": { "ctrl": "desired 3, actual 2", "sched": "500 of 4,999 scored" }
+    },
+    {
+      "narration": "Node 3110 starts web-4, and when it is ready the endpoint list has three entries again. In all, about 80 seconds passed since the power loss: 40 for the grace period, 30 of toleration, and a few for placing and starting. The loop is closed: desired 3, actual 3.",
+      "messages": [{ "from": "watch", "to": "other", "label": "web-4 is yours" }, { "from": "other", "to": "api", "label": "web-4 running" }, { "from": "watch", "to": "proxy", "label": "web-4 added" }],
+      "states": { "other": "web-4 running", "proxy": "web: 3 endpoints", "ctrl": "desired 3, actual 3" },
+      "highlight": ["other"]
+    }
+  ]
+}

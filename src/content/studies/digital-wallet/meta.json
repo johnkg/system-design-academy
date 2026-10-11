@@ -1,0 +1,186 @@
+{
+  "name": "Design a Digital Wallet",
+  "difficulty": "advanced",
+  "intent": "Move money between wallets of 100 million users that live on different database shards, so that a transfer either happens completely or not at all, no money is created or destroyed, and no balance goes below zero.",
+  "codeTitle": "a cross-shard transfer that survives crashes and repeats",
+  "finalIntro": "One person sending money to another whose wallet is on a different shard.",
+  "prompt": "Design a digital wallet like Venmo or Cash App. Each user has a balance and can send money to any other user. There are 100 million users, so the balances are spread over many databases, and the sender and the recipient will usually be on different ones. A transfer must be atomic, balances can never go negative, and a request repeated by a retry must not move money twice. Some accounts, such as big merchants, receive a huge number of payments. Finance must be able to prove that no money was created or lost.",
+  "functional": [
+    "Send money from one wallet to another and see both balances change",
+    "Show the balance and the history of a wallet",
+    "Add money from a bank account and withdraw it to one",
+    "Reject a transfer that would take a balance below zero",
+    "Let a client retry a request safely",
+    "Let merchants receive a large number of payments"
+  ],
+  "nonFunctional": [
+    "Money is never created or destroyed, and a transfer is all or nothing",
+    "A balance never goes below zero, even when many transfers hit one wallet at once",
+    "A repeated request moves money once",
+    "A transfer confirms in under 100 ms and shows on the recipient within a second",
+    "A failed server, shard or coordinator never loses a transfer, and never leaves one half done for ever",
+    "Every cent can be explained from an immutable history, and a nightly check proves the totals",
+    "Handle thousands of transfers per second at the peak, and a single merchant at hundreds per second"
+  ],
+  "firstAttempt": {
+    "text": "One SQL database with a table of wallets: account id and balance. A transfer is one transaction: take the money with 'update wallets set balance = balance - 30 where id = A and balance >= 30', check that one row changed, add the money to the other row, insert a row in a transfers table, and commit. The database makes it atomic and isolated, so money never appears or vanishes and no balance goes negative.",
+    "limits": [
+      "All writes go to one primary, whose throughput and disk have a ceiling, and 100 million users with many transfers a day will outgrow it",
+      "A popular wallet is one row that every transfer locks in turn, so a merchant's payments queue up behind each other",
+      "One database is one failure domain, and a failover or a long migration stops all payments",
+      "A bug or an operator edit can change a balance with no history to prove what happened",
+      "Splitting the table over several databases, the obvious fix, destroys the single transaction that made it all safe"
+    ]
+  },
+  "nodes": [
+    { "id": "players", "label": "Users' apps", "kind": "client", "x": 12, "y": 50 },
+    { "id": "single", "label": "One SQL database", "kind": "data", "x": 50, "y": 50, "at": 0, "until": 1 },
+    { "id": "api", "label": "Wallet API", "kind": "edge", "x": 33, "y": 50, "at": 1 },
+    { "id": "shards", "label": "Balance shards (SQL)", "kind": "data", "x": 58, "y": 50, "at": 1, "until": 4 },
+    { "id": "coord", "label": "2PC coordinator", "kind": "compute", "x": 58, "y": 16, "at": 2, "until": 3 },
+    { "id": "saga", "label": "Transfer log (saga)", "kind": "async", "x": 58, "y": 84, "at": 3, "until": 4 },
+    { "id": "ledger", "label": "Account ledger partitions", "kind": "data", "x": 58, "y": 50, "at": 4 },
+    { "id": "stream", "label": "Transfer stream", "kind": "async", "x": 58, "y": 84, "at": 4 },
+    { "id": "applier", "label": "Credit applier", "kind": "compute", "x": 87, "y": 50, "at": 4 },
+    { "id": "merchant", "label": "Merchant sub-ledgers", "kind": "data", "x": 87, "y": 16, "at": 5 },
+    { "id": "recon", "label": "Reconciler", "kind": "compute", "x": 33, "y": 16, "at": 6 },
+    { "id": "audit", "label": "Immutable audit store", "kind": "data", "x": 12, "y": 16, "at": 6 }
+  ],
+  "edges": [
+    { "from": "players", "to": "single", "at": 0, "until": 1 },
+    { "from": "players", "to": "api", "at": 1 },
+    { "from": "api", "to": "shards", "at": 1, "until": 4 },
+    { "from": "api", "to": "coord", "at": 2, "until": 3 },
+    { "from": "coord", "to": "shards", "at": 2, "until": 3 },
+    { "from": "api", "to": "saga", "at": 3, "until": 4 },
+    { "from": "saga", "to": "shards", "at": 3, "until": 4 },
+    { "from": "api", "to": "ledger", "at": 4 },
+    { "from": "ledger", "to": "stream", "at": 4 },
+    { "from": "stream", "to": "applier", "at": 4 },
+    { "from": "applier", "to": "ledger", "at": 4 },
+    { "from": "applier", "to": "merchant", "at": 5 },
+    { "from": "ledger", "to": "recon", "at": 6 },
+    { "from": "recon", "to": "audit", "at": 6 }
+  ],
+  "steps": [
+    {
+      "title": "Shard the wallets, and keep same-shard transfers local",
+      "problem": "One database cannot take every write for 100 million users, and one machine is one failure domain.",
+      "fix": "Put a wallet API in front and split the wallets over many SQL shards by a hash of the account id, with each shard replicated for failover. A wallet lives on exactly one shard. When the sender and the recipient share a shard, the transfer is still one local transaction with the guarded update 'balance = balance - amount where balance >= amount', and the database keeps it atomic and non-negative. The check and the write are one statement, so two concurrent transfers cannot both pass the check and overdraw the wallet.",
+      "tradeoff": "Writes and storage spread across many machines, and same-shard transfers keep full ACID. With S shards and random pairs, a fraction 1 - 1/S of transfers cross shards, so with 16 shards that is 94 percent, and for those no single transaction covers both wallets. Debit-then-credit as two separate commits would lose the money if anything dies in between, so the next steps are about that gap.",
+      "concepts": [{ "slug": "database-sharding" }, { "slug": "consistent-hashing" }, { "slug": "acid-vs-base" }, { "slug": "database-replication" }]
+    },
+    {
+      "title": "Make a cross-shard transfer atomic with two-phase commit",
+      "problem": "Debit on shard 3, then credit on shard 9, can stop in the middle, and the money is destroyed, or if the order is reversed it is created.",
+      "fix": "A coordinator runs two-phase commit. In the prepare phase each shard checks the rule (the sender has enough, the recipient exists), writes a durable 'prepared' record and keeps its row locks, then votes yes or no. If both vote yes, the coordinator writes the decision to its own durable log, and in the commit phase tells both shards to commit. Any no, or a timeout before the decision, means abort. The result is atomic and isolated: nobody sees half a transfer, and the balances cannot go negative.",
+      "tradeoff": "It is the strongest guarantee and the simplest to reason about, since either both rows change or neither does. It costs two round trips and about five durable writes for one transfer, and the rows stay locked for the whole protocol. The real danger is the coordinator dying after the shards have voted yes: they cannot decide on their own, so they hold their locks, and every other payment touching those wallets waits until the coordinator returns. A hot wallet is locked for about 13 ms per transfer, so it can take only about 77 transfers per second.",
+      "concepts": [{ "slug": "two-phase-commit" }, { "slug": "acid-vs-base" }, { "slug": "consensus" }, { "slug": "latency-and-round-trips" }]
+    },
+    {
+      "title": "Use a saga with compensation, and make every step idempotent",
+      "problem": "Locks that survive a dead coordinator, and a throughput limit set by lock time, are not acceptable for something that runs thousands of times a second.",
+      "fix": "Replace the distributed lock with a durable transfer record and a chain of local transactions. First save the intent (transfer id, sender, recipient, amount, state INIT) on the sender's shard. Then debit the sender with the guarded update, and move the state to DEBITED in the same transaction. Then credit the recipient and mark DONE. The order matters: the debit can be undone by a refund, and a credit cannot be undone once the recipient spends it, so the debit goes first. If the credit is refused, for example the wallet is closed, a compensating step refunds the sender. Every step carries the transfer id, and a shard that has already applied the id returns the old result instead of applying it again, so a worker that crashes can be replayed from the record.",
+      "tradeoff": "No locks are held across shards, so a crash blocks only the one transfer, and throughput is far higher. The price is the loss of isolation: while a transfer is between the debit and the credit, the money is in flight and the sender's balance has dropped before the recipient's has risen, so a naive 'total of all balances' is briefly short. The code must handle every state and every compensation, and a stuck transfer needs an alert and a sweeper that finishes it.",
+      "concepts": [{ "slug": "saga" }, { "slug": "idempotency" }, { "slug": "retries-and-backoff" }, { "slug": "message-queues" }]
+    },
+    {
+      "title": "Give every account a single writer and an event log",
+      "problem": "The saga works, but its correctness lives in many places: guarded SQL, a transfer table, a sweeper and ad hoc compensations. Locks, the balance check and the history are separate things that can disagree.",
+      "fix": "Make each account a partition of an append-only ledger with exactly one active writer, chosen by a lease or by leader election, with a hot standby following its log. The writer handles one request at a time, so 'is the balance enough' is an ordinary if statement in memory with no lock. A transfer becomes one event, 'debited 30 for transfer t-5521', appended to the sender's log together with an outbox entry in the same atomic append. The balance is a fold over the events, with periodic snapshots. A stream carries the entry to the recipient's partition, whose writer appends 'credited 30 for t-5521' once, remembering the transfer id. A refund is simply another event. A request id seen before gets its recorded answer back.",
+      "tradeoff": "Atomic debit, ordering, idempotency and history all come from one mechanism, and the sender sees confirmation after a single append, about 5 ms. Money is still in flight between the two appends, so the system must show it as such and must not stop retrying the credit. A failed writer pauses its partition for the few seconds of failover, and the log and stream must be replicated well enough that an acknowledged event is never lost.",
+      "concepts": [{ "slug": "event-sourcing" }, { "slug": "transactional-outbox" }, { "slug": "leader-election" }, { "slug": "consensus" }, { "slug": "cqrs" }]
+    },
+    {
+      "title": "Absorb hot merchants with batching and sub-ledgers",
+      "problem": "A large merchant is one account with one writer, and it receives hundreds of payments per second, or thousands on a sale day.",
+      "fix": "Credits to an account can never fail the balance check and they commute, so they do not need to be handled one at a time. The writer applies credits in batches, appending 30 or more events with one disk write, which lifts the limit of one account from hundreds to about ten thousand per second. For anything beyond that, the merchant gets several sub-ledgers, with senders spread over them by a hash of the sender, and the balance is the sum, read from a cached total. Debits from the merchant, such as a payout, sweep from the sub-ledgers, and each still uses the single writer's check. Bursts are queued by the stream with backpressure instead of being rejected.",
+      "tradeoff": "A merchant can receive far more than one row lock would allow, and the sender's path is not slowed down. The merchant's displayed balance can lag by a moment, a payout needs a small sweep first, and a hot sender, such as a payroll account paying thousands of people, needs its own fan-out job and rate limit.",
+      "concepts": [{ "slug": "backpressure" }, { "slug": "database-sharding" }, { "slug": "bulkhead" }, { "slug": "rate-limiting" }]
+    },
+    {
+      "title": "Audit with an immutable history and reconcile every night",
+      "problem": "Even with careful design, a bug, a bad deploy, or a manual fix can create or lose money, and the business must be able to prove that it did not.",
+      "fix": "Every event is immutable and is copied to an audit store, never updated. Money enters and leaves only through system accounts for bank deposits and withdrawals, so every transfer is a pair of entries and the sum of all entries, including in-flight transfers, must be exactly zero. A reconciler checks three things continuously and in a full nightly pass. Each partition's stored balance equals the replay of its events. Every debit has a credit or a refund within a time limit, and older ones raise an alert. The total across all partitions plus in-flight money equals deposits minus withdrawals at the bank. A mismatch freezes the affected accounts and is fixed with a new corrective event, never an edit of the old one.",
+      "tradeoff": "Finance gets a proof and engineers get a way to find a bug within a day instead of at the end of the quarter. It costs storage, about 3 TB of entries per year at 40 million transfers a day, and a reconciliation job that has to read all of it, so it works from sealed batches and compares totals before reading details.",
+      "concepts": [{ "slug": "event-sourcing" }, { "slug": "alerting" }, { "slug": "structured-logging" }, { "slug": "metrics" }]
+    }
+  ],
+  "failures": [
+    {
+      "scenario": "The two-phase commit coordinator dies after both shards voted yes",
+      "impact": "Both shards hold prepared transfers and row locks, they cannot commit or abort on their own, and every payment touching those wallets waits.",
+      "answer": "This is why the step 4 design avoids global locks. If 2PC is used, the coordinator's decision log is replicated through consensus so a new coordinator can finish the transfers, and shards expose in-doubt transactions for operators. With the saga or the ledger, nothing holds a lock across shards, and the durable record means any worker can continue or refund the transfer after a restart.",
+      "concepts": [{ "slug": "two-phase-commit" }, { "slug": "consensus" }, { "slug": "saga" }]
+    },
+    {
+      "scenario": "The client retries a transfer after a timeout",
+      "impact": "If the first request did succeed, the sender is charged twice, and the money is not created or lost but moved wrongly.",
+      "answer": "The client generates one transfer id for the intent and sends it with every retry. The sender's partition records the id with the result, so a second request returns the first result without a second event. Each leg also carries the id, so a replayed credit is ignored. Retries use backoff so that a slow system is not buried by them.",
+      "concepts": [{ "slug": "idempotency" }, { "slug": "retries-and-backoff" }, { "slug": "api-gateway" }]
+    },
+    {
+      "scenario": "The recipient's partition is down when the debit has already happened",
+      "impact": "The sender has paid and the recipient has not been credited, so the money is in flight and could look lost.",
+      "answer": "The outbox entry is durable on the sender's side, and the stream keeps the credit until the recipient's writer acknowledges it. A standby takes over within seconds and applies it once, because the transfer id is remembered. The app shows the transfer as pending, and an alert fires if any debit is still unmatched after a minute.",
+      "concepts": [{ "slug": "transactional-outbox" }, { "slug": "message-queues" }, { "slug": "health-checks" }]
+    },
+    {
+      "scenario": "A big sale sends thousands of payments per second to one merchant",
+      "impact": "The merchant's writer or row is saturated, payments queue, and the delay spreads to other traffic that shares its machine.",
+      "answer": "Credits are batched, so one disk write carries many of them, and the merchant has several sub-ledgers that spread the load. The partition has its own queue and resources, so other wallets on that machine are not slowed, and senders see an accepted-and-pending state instead of errors.",
+      "concepts": [{ "slug": "bulkhead" }, { "slug": "backpressure" }, { "slug": "database-sharding" }]
+    },
+    {
+      "scenario": "A bug creates money: the nightly check finds the totals do not add up",
+      "impact": "Balances no longer sum to deposits minus withdrawals, which means money was created or destroyed somewhere.",
+      "answer": "The reconciler narrows it from the global total to a partition and then to the first event whose replay differs. The affected accounts are frozen, the bad events are explained from the immutable log, and the fix is a new corrective event with a reason and an approver. The old events remain, so the history stays true.",
+      "concepts": [{ "slug": "event-sourcing" }, { "slug": "alerting" }, { "slug": "structured-logging" }]
+    }
+  ],
+  "alternatives": [
+    {
+      "title": "How to make a cross-shard transfer atomic",
+      "options": [
+        { "name": "Two-phase commit", "pro": "Strong, isolated, all or nothing, and easy to reason about", "con": "Locks held for the protocol and indefinitely if the coordinator dies, about five writes per transfer, and low throughput on hot accounts" },
+        { "name": "Saga with compensation", "pro": "No cross-shard locks, a crash blocks only one transfer, and high throughput", "con": "No isolation, money visibly in flight, and every state and refund must be coded and swept" },
+        { "name": "Single writer per account with an event log", "pro": "Serial writes make the balance check trivial, and history, idempotency and ordering come for free", "con": "Failover pauses a partition, money is in flight between two appends, and it needs a log and stream infrastructure" }
+      ],
+      "pick": "A single writer per account with a stream for the credit, using saga-style idempotent steps. Two-phase commit is kept for rare cases where two accounts must change together, such as a split payment."
+    },
+    {
+      "title": "How to keep a balance from going negative",
+      "options": [
+        { "name": "Read, check in the app, then write", "pro": "Simple to write", "con": "Two concurrent transfers both pass the check and overdraw the wallet" },
+        { "name": "Guarded update in the database", "pro": "Check and write are one atomic statement", "con": "Takes a row lock, so a hot wallet is serialized by the database" },
+        { "name": "A single writer decides in memory", "pro": "No locks and no retries, and the order is the order of the log", "con": "One writer per partition and a failover to design" }
+      ],
+      "pick": "The single writer for the ledger, and the guarded update wherever SQL shards still hold balances."
+    },
+    {
+      "title": "How to serve a hot merchant",
+      "options": [
+        { "name": "One account, one row", "pro": "Simplest and exact", "con": "Limited by lock time, about 77 transfers per second with two-phase commit" },
+        { "name": "Batched credits at one writer", "pro": "About ten thousand per second with no schema change", "con": "Still one machine and one disk" },
+        { "name": "Sub-ledgers summed for the balance", "pro": "Scales out with the number of sub-ledgers", "con": "Balance is a sum, payouts must sweep, and tests get harder" }
+      ],
+      "pick": "Batch credits first, and add sub-ledgers only for the few merchants that outgrow one writer."
+    },
+    {
+      "title": "How to prove the money adds up",
+      "options": [
+        { "name": "Trust the stored balances", "pro": "Nothing extra to build", "con": "A bug is invisible until a customer complains" },
+        { "name": "Immutable entries plus a nightly reconciliation", "pro": "Finds a mismatch within a day and shows exactly which events caused it", "con": "Storage and a job that reads everything" },
+        { "name": "Continuous reconciliation of sealed batches", "pro": "Alerts within minutes, using cheap total comparisons first", "con": "More moving parts, and in-flight money must be counted correctly" }
+      ],
+      "pick": "Immutable entries, a continuous in-flight alert, and a nightly full reconciliation."
+    }
+  ],
+  "roles": [
+    { "id": "client", "label": "Users", "description": "Apps that send money and show balances." },
+    { "id": "edge", "label": "Wallet API", "description": "Routes each request to the right partition and carries the transfer id." },
+    { "id": "async", "label": "Logs and streams", "description": "The transfer log and the stream that carries credits." },
+    { "id": "compute", "label": "Coordinators and checkers", "description": "The coordinator, the credit applier and the reconciler." },
+    { "id": "data", "label": "Ledgers", "description": "Balance shards, account ledgers, sub-ledgers and the audit store." }
+  ]
+}

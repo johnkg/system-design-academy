@@ -1,0 +1,110 @@
+---
+import PlaygroundShell from '../../components/PlaygroundShell.astro';
+---
+<PlaygroundShell title="Pick what to recommend" hint="120 users and 48 videos in 6 genres. Each user's last watch is hidden, and the recommender must guess it from the earlier ones. Compare popularity, item-to-item co-occurrence, and co-occurrence with a diversity re-rank.">
+  <ol class="how">
+    <li>Start with <b>popularity only</b>: every user gets nearly the same list, so only <b>12 of 49</b> videos are ever shown. Few hits, and a feedback loop that makes the popular videos more popular.</li>
+    <li>Switch to <b>item-to-item co-occurrence</b>: <b>hits rise</b> and almost the whole catalogue is shown, but a list is often <b>one or two genres</b>.</li>
+    <li>Add the <b>diversity re-rank</b>: a few hits are given up for lists with <b>more genres</b>. Then raise the <b>cold-start share</b> (those users have no history and fall back to popularity) and turn on the <b>exploration slot</b> to give the new video its first views.</li>
+  </ol>
+  <div class="pg recb" data-recb>
+    <div class="pg-row">
+      <label>Ranker <select class="pg-in" data-rk>
+        <option value="pop">popularity only</option>
+        <option value="cf" selected>item-to-item co-occurrence</option>
+        <option value="div">co-occurrence + diversity re-rank</option>
+      </select></label>
+      <label>Videos per list <input type="range" min="3" max="10" value="5" data-k /> <b data-kval></b></label>
+      <label>Cold-start users, with no history (%) <input type="range" min="0" max="50" step="10" value="0" data-cold /> <b data-coldval></b></label>
+      <label>Exploration slot for the new video <select class="pg-in" data-ex>
+        <option value="off" selected>off</option>
+        <option value="on">on, for every 10th user</option>
+      </select></label>
+    </div>
+    <div class="pg-grid">
+      <div class="pg-box" data-b1><h3>Hit rate (held-out watch is in the list)</h3><span class="pg-mono" data-o1></span><span class="pg-note" data-n1></span></div>
+      <div class="pg-box" data-b2><h3>Catalogue coverage</h3><span class="pg-mono" data-o2></span><span class="pg-note" data-n2></span></div>
+      <div class="pg-box" data-b3><h3>Genres per list</h3><span class="pg-mono" data-o3></span><span class="pg-note" data-n3></span></div>
+      <div class="pg-box" data-b4><h3>Cold start</h3><span class="pg-mono" data-o4></span><span class="pg-note" data-n4></span></div>
+    </div>
+    <p class="pg-out" data-verdict aria-live="polite"></p>
+    <p class="pg-note">Model: each user mostly watches one genre, and within a genre the low-numbered videos are the popular ones. Training is the first 11 watches of each user, and the test is the 12th. A candidate is scored by its summed cosine similarity (co-occurrence divided by the square root of the two videos' watch counts) to the user's history. The re-rank takes the best 15 and picks greedily, dividing a score by 1 plus the number of videos of that genre already picked. Video 49 is new, with no watches, so co-occurrence can never recommend it.</p>
+  </div>
+</PlaygroundShell>
+<script>
+  document.querySelectorAll<HTMLElement>('[data-recb]').forEach((root) => {
+    const q = <T extends HTMLElement>(s: string) => root.querySelector<T>(s)!;
+    const USERS = 120; const GENRES = 6; const PER = 8; const ITEMS = GENRES * PER; const NEW = ITEMS; const ALL = ITEMS + 1; const POOL = 15;
+    const genreOf = (i: number) => Math.floor(i / PER);
+    let seed = 7; const rnd = (n: number) => { seed = (seed * 1664525 + 1013904223) % 4294967296; return Math.floor(seed / 65536) % n; };
+    const history: number[][] = []; const heldOut: number[] = [];
+    for (let u = 0; u < USERS; u++) {
+      const seen: number[] = [];
+      while (seen.length < 12) { const g = rnd(10) < 8 ? u % GENRES : rnd(GENRES); const item = g * PER + Math.min(rnd(PER), rnd(PER)); if (!seen.includes(item)) seen.push(item); }
+      heldOut.push(seen.pop()!); history.push(seen);
+    }
+    const pop = new Array(ALL).fill(0); const co = Array.from({ length: ALL }, () => new Array(ALL).fill(0));
+    for (const items of history) for (const a of items) { pop[a]++; for (const b of items) if (a !== b) co[a][b]++; }
+    const popular = Array.from({ length: ALL }, (_, i) => i).sort((a, b) => pop[b] - pop[a] || a - b);
+    const sim = (a: number, b: number) => (pop[a] === 0 || pop[b] === 0 ? 0 : co[a][b] / Math.sqrt(pop[a] * pop[b]));
+    const byPop = (items: number[], k: number) => popular.filter((i) => !items.includes(i)).slice(0, k);
+    const ranked = (items: number[]) => Array.from({ length: ALL }, (_, c) => c).filter((c) => !items.includes(c))
+      .map((c) => ({ c, s: items.reduce((t, h) => t + sim(h, c), 0) })).sort((x, y) => y.s - x.s || x.c - y.c);
+    function diverse(items: number[], k: number) {
+      const pool = ranked(items).slice(0, POOL); const picked: number[] = [];
+      while (picked.length < k) {
+        let best = -1; let bestScore = -1;
+        for (const x of pool) { if (picked.includes(x.c)) continue; const adj = x.s / (1 + picked.filter((p) => genreOf(p) === genreOf(x.c)).length); if (adj > bestScore) { best = x.c; bestScore = adj; } }
+        picked.push(best);
+      }
+      return picked;
+    }
+    function recommend(rk: string, items: number[], k: number) {
+      if (rk === 'pop' || items.length === 0) return byPop(items, k);
+      return rk === 'cf' ? ranked(items).slice(0, k).map((x) => x.c) : diverse(items, k);
+    }
+    function run(rk: string, k: number, coldPct: number, explore: boolean) {
+      let hits = 0; let coldHits = 0; let coldN = 0; let newShown = 0; let genreSum = 0; const covered = new Set<number>();
+      for (let u = 0; u < USERS; u++) {
+        const cold = u % 10 < coldPct / 10;
+        let list = recommend(rk, cold ? [] : history[u], k);
+        if (explore && u % 10 === 9 && !cold) list = [...list.slice(0, k - 1), NEW];
+        const hit = list.includes(heldOut[u]);
+        if (hit) hits++;
+        if (cold) { coldN++; if (hit) coldHits++; }
+        if (list.includes(NEW)) newShown++;
+        list.forEach((i) => covered.add(i)); genreSum += new Set(list.map(genreOf)).size;
+      }
+      return { hits, coldHits, coldN, newShown, shown: covered.size, genres: genreSum / USERS };
+    }
+    let frame = 0;
+    function draw() {
+      const rk = q<HTMLSelectElement>('[data-rk]').value; const k = Number(q<HTMLInputElement>('[data-k]').value);
+      const coldPct = Number(q<HTMLInputElement>('[data-cold]').value); const explore = q<HTMLSelectElement>('[data-ex]').value === 'on';
+      q('[data-kval]').textContent = String(k); q('[data-coldval]').textContent = String(coldPct);
+      const r = run(rk, k, coldPct, explore);
+      const base = run('pop', k, coldPct, false);
+      const pct = (n: number, d: number) => `${(Math.floor((n * 1000) / d) / 10).toFixed(1)}%`;
+      q('[data-o1]').textContent = `${r.hits} of ${USERS} (${pct(r.hits, USERS)})`;
+      q('[data-n1]').textContent = rk === 'pop' ? 'the same few videos for everybody' : `popularity alone would get ${base.hits}`;
+      q('[data-o2]').textContent = `${r.shown} of ${ALL} videos`;
+      q('[data-n2]').textContent = r.shown < 30 ? 'most of the catalogue is never shown, so it never gets watched' : 'lists differ from user to user, so the catalogue gets exposure';
+      q('[data-o3]').textContent = `${r.genres.toFixed(2)} of ${GENRES}`;
+      q('[data-n3]').textContent = rk === 'div' ? 'the re-rank spreads each list over more genres' : rk === 'cf' ? 'co-occurrence stays close to what the user already watched' : 'popular videos happen to span genres, but are the same for all';
+      q('[data-o4]').textContent = coldPct === 0 ? 'no cold users' : `${pct(r.coldHits, r.coldN)} hit rate for them`;
+      q('[data-n4]').textContent = `new video shown to ${r.newShown} users${r.newShown === 0 && rk !== 'pop' ? ' (co-occurrence has no data on it)' : explore ? ', which starts its watch data' : ''}`;
+      q<HTMLElement>('[data-b1]').style.setProperty('--c', r.hits > base.hits ? 'var(--good)' : 'var(--bad)');
+      q<HTMLElement>('[data-b2]').style.setProperty('--c', r.shown < 30 ? 'var(--bad)' : 'var(--good)');
+      q<HTMLElement>('[data-b3]').style.setProperty('--c', r.genres >= Math.min(4.5, k - 0.5) ? 'var(--good)' : 'var(--bad)');
+      q<HTMLElement>('[data-b4]').style.setProperty('--c', r.newShown > 0 ? 'var(--good)' : 'var(--bad)');
+      const out = q('[data-verdict]'); const bad = rk === 'pop' || r.newShown === 0;
+      out.classList.toggle('bad', bad);
+      out.textContent = rk === 'pop' ? `Popularity-only shows ${r.shown} of ${ALL} videos and hits ${r.hits} of ${USERS}. What is shown gets watched, and what gets watched is shown again, so the rest of the catalogue starves.`
+        : explore ? `With an exploration slot the new video reaches ${r.newShown} users at a cost of a slot in their list${coldPct > 0 ? `. Cold-start users get the popular list, which is why their hit rate is only ${pct(r.coldHits, r.coldN)}` : ''}.`
+        : `Hit rate ${pct(r.hits, USERS)} against ${pct(base.hits, USERS)} for popularity${rk === 'div' ? `, with ${r.genres.toFixed(2)} genres per list instead of ${run('cf', k, coldPct, false).genres.toFixed(2)}` : ''}. The new video is shown to nobody: with no watches there is nothing for co-occurrence to use. Turn on the exploration slot.`;
+    }
+    const schedule = () => { if (frame) cancelAnimationFrame(frame); frame = requestAnimationFrame(() => { frame = 0; draw(); }); };
+    root.addEventListener('input', schedule); root.addEventListener('change', schedule);
+    draw();
+  });
+</script>

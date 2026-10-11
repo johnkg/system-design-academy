@@ -1,0 +1,115 @@
+---
+import PlaygroundShell from '../components/PlaygroundShell.astro';
+---
+<PlaygroundShell title="Simulate it" hint="400 shoppers, one flag called new-checkout. Each square is a shopper: green sees the new checkout page, grey sees the old one.">
+  <ol class="how">
+    <li>Drag <b>Rollout</b> from 10% up to 50% and then to 100%. The green squares only grow: the <b>lost the feature</b> counter stays at 0, because each shopper has a fixed bucket and the flag turns on for buckets below the percentage.</li>
+    <li>Set Rollout to 25%, then switch the cohort to <b>Different salt (v2)</b>. About the same number are green (around 100), but it is a different set: roughly 75 shoppers lose the feature and roughly 77 others gain it. Changing the hash input mid-rollout reshuffles everybody.</li>
+    <li>Set Rollout to 50% and the cohort to <b>Random on every request</b>, then press <b>Reload page</b> a few times. The total stays near 200, but each reload about 100 shoppers lose the feature and about 100 others gain it, so one person would see the old and new checkout alternate. With the stable hash, a reload changes nobody.</li>
+    <li>Tick <b>Staff always on</b> and <b>Block Germany</b>: rules are checked before the percentage, so staff go green even at 0% and German shoppers stay grey even at 100% (only about 290 of 400 turn green). Tick <b>Kill switch</b> to turn everything grey at once.</li>
+  </ol>
+  <div class="pg ff" data-ff>
+    <div class="pg-row">
+      <label>Rollout <input type="range" min="0" max="100" value="10" data-pct aria-label="Rollout percentage" /> <b data-pctval>10</b>%</label>
+      <label>Cohort
+        <select class="pg-in" data-mode aria-label="How users are chosen">
+          <option value="stable" selected>Stable hash of user id (salt v1)</option>
+          <option value="salt">Different salt (v2)</option>
+          <option value="random">Random on every request</option>
+        </select>
+      </label>
+    </div>
+    <div class="pg-row">
+      <label class="ff-check"><input type="checkbox" data-staff /> Staff always on</label>
+      <label class="ff-check"><input type="checkbox" data-de /> Block Germany</label>
+      <label class="ff-check"><input type="checkbox" data-kill /> Kill switch</label>
+      <button class="btn" type="button" data-reload>Reload page</button>
+      <button class="btn" type="button" data-reset>Reset</button>
+    </div>
+    <div class="ff-grid" data-grid role="img" aria-label="Grid of 400 shoppers, green when they see the new checkout"></div>
+    <div class="pg-grid">
+      <div class="pg-box" style="--c: var(--good)"><h3>See the new checkout</h3><span class="pg-mono" data-seen>0</span><span class="pg-note" data-seennote></span></div>
+      <div class="pg-box" style="--c: var(--bad)"><h3>Lost the feature</h3><span class="pg-mono" data-lost>0</span><span class="pg-note">turned off since the previous view</span></div>
+      <div class="pg-box" style="--c: var(--role-2)"><h3>Gained the feature</h3><span class="pg-mono" data-gained>0</span><span class="pg-note">turned on since the previous view</span></div>
+    </div>
+    <p class="pg-mono" data-stats></p>
+  </div>
+</PlaygroundShell>
+<script>
+  interface Person { id: string; country: string; staff: boolean }
+  interface Cfg { percent: number; mode: 'stable' | 'salt' | 'random'; staff: boolean; blockDe: boolean; kill: boolean; request: number }
+
+  // FNV-1a, 32-bit, with explicit masking (same function as the code samples).
+  function fnv1a(text: string): number {
+    let h = 2166136261;
+    for (let i = 0; i < text.length; i++) { h ^= text.charCodeAt(i); h = Math.imul(h, 16777619) >>> 0; }
+    return h >>> 0;
+  }
+  function mulberry32(seed: number) {
+    let a = seed >>> 0;
+    return () => { a = (a + 0x6d2b79f5) >>> 0; let t = a; t = Math.imul(t ^ (t >>> 15), t | 1); t ^= t + Math.imul(t ^ (t >>> 7), t | 61); return ((t ^ (t >>> 14)) >>> 0) / 4294967296; };
+  }
+  const N = 400; const KEY = 'new-checkout';
+  function makePopulation(): Person[] {
+    const rnd = mulberry32(2024); const people: Person[] = [];
+    for (let i = 1; i <= N; i++) {
+      const c = rnd(); const country = c < 0.4 ? 'US' : c < 0.65 ? 'DE' : c < 0.85 ? 'FR' : 'JP';
+      people.push({ id: `user-${i}`, country, staff: rnd() < 0.05 });
+    }
+    return people;
+  }
+  // Order: kill switch, then rules in order, then the percentage.
+  function evaluate(p: Person, cfg: Cfg): boolean {
+    if (cfg.kill) return false;
+    if (cfg.staff && p.staff) return true;
+    if (cfg.blockDe && p.country === 'DE') return false;
+    const input = cfg.mode === 'random' ? `req${cfg.request}:${p.id}` : `${KEY}:${cfg.mode === 'salt' ? 'v2' : 'v1'}:${p.id}`;
+    return fnv1a(input) % 10000 < cfg.percent * 100;
+  }
+
+  document.querySelectorAll<HTMLElement>('[data-ff]').forEach((root) => {
+    const q = <T extends HTMLElement>(s: string) => root.querySelector<T>(s)!;
+    const people = makePopulation();
+    const grid = q('[data-grid]');
+    const dots = people.map((p) => { const d = document.createElement('span'); d.className = 'ff-dot'; d.title = `${p.id} (${p.country}${p.staff ? ', staff' : ''})`; grid.appendChild(d); return d; });
+    let request = 0; let prev: boolean[] = new Array(N).fill(false); let raf = 0;
+    const cfg = (): Cfg => ({
+      percent: Number(q<HTMLInputElement>('[data-pct]').value), mode: q<HTMLSelectElement>('[data-mode]').value as Cfg['mode'],
+      staff: q<HTMLInputElement>('[data-staff]').checked, blockDe: q<HTMLInputElement>('[data-de]').checked, kill: q<HTMLInputElement>('[data-kill]').checked, request,
+    });
+    function draw() {
+      raf = 0; const c = cfg(); let seen = 0; let lost = 0; let gained = 0;
+      const now = people.map((p) => evaluate(p, c));
+      now.forEach((on, i) => {
+        if (on) seen++;
+        const was = prev[i]; if (was && !on) lost++; if (!was && on) gained++;
+        dots[i].className = 'ff-dot' + (on ? (was ? ' on' : ' gained') : was ? ' lost' : '');
+      });
+      prev = now;
+      q('[data-pctval]').textContent = String(c.percent);
+      q('[data-seen]').textContent = `${seen} of ${N}`;
+      q('[data-seennote]').textContent = c.kill ? 'kill switch is on: everyone gets the old page' : `${((seen / N) * 100).toFixed(1)}% of shoppers (rollout target ${c.percent}%)`;
+      q('[data-lost]').textContent = String(lost); q('[data-gained]').textContent = String(gained);
+      q('[data-stats]').textContent = `page load #${request + 1} · cohort: ${c.mode === 'stable' ? 'hash(new-checkout:v1:user)' : c.mode === 'salt' ? 'hash(new-checkout:v2:user)' : 'random each request'}`;
+    }
+    function schedule() { if (!raf) raf = requestAnimationFrame(draw); }
+    function reset() {
+      q<HTMLInputElement>('[data-pct]').value = '10'; q<HTMLSelectElement>('[data-mode]').value = 'stable';
+      q<HTMLInputElement>('[data-staff]').checked = false; q<HTMLInputElement>('[data-de]').checked = false; q<HTMLInputElement>('[data-kill]').checked = false;
+      request = 0; prev = new Array(N).fill(false); draw();
+    }
+    ['[data-pct]', '[data-mode]', '[data-staff]', '[data-de]', '[data-kill]'].forEach((s) => q(s).addEventListener('input', schedule));
+    q('[data-reload]').addEventListener('click', () => { request++; draw(); });
+    q('[data-reset]').addEventListener('click', reset);
+    draw();
+  });
+</script>
+<style is:global>
+  .playground .ff-check { display: inline-flex; align-items: center; gap: 6px; }
+  .playground .ff-grid { display: grid; grid-template-columns: repeat(20, 1fr); gap: 3px; max-width: 420px; margin: 12px 0; }
+  .playground .ff-dot { aspect-ratio: 1; border-radius: 3px; background: var(--surface-2); border: 1px solid var(--border); transition: background .15s; }
+  .playground .ff-dot.on { background: var(--good); border-color: var(--good); }
+  .playground .ff-dot.gained { background: var(--good); border-color: var(--accent); outline: 2px solid var(--accent); outline-offset: -1px; }
+  .playground .ff-dot.lost { background: var(--bad); border-color: var(--bad); }
+  @media (prefers-reduced-motion: reduce) { .playground .ff-dot { transition: none; } }
+</style>

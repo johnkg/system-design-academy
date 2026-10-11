@@ -9,6 +9,7 @@ export const areas = [
   { id: 'observability', label: 'Observability', blurb: 'How you see what a running system is doing, and know when it is unhealthy' },
   { id: 'networking', label: 'Networking', blurb: 'How data travels between machines, and what it costs in time' },
   { id: 'distributed', label: 'Distributed systems', blurb: 'How many machines agree, stay in step and survive failures together' },
+  { id: 'deployment', label: 'Cloud & deployment', blurb: 'How code reaches production safely, and how infrastructure grows, heals and survives a region failing' },
   { id: 'patterns', label: 'Design patterns', blurb: 'The 23 classic Gang of Four patterns for structuring code' },
 ] as const;
 

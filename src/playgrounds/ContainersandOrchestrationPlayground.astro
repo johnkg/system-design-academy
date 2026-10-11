@@ -1,0 +1,212 @@
+---
+import PlaygroundShell from '../components/PlaygroundShell.astro';
+---
+<PlaygroundShell title="Simulate it" hint="A 4-node cluster (4000m CPU, 8192 MiB each) runs a web deployment. Choose requests and a placement policy, then kill nodes and watch the controller reconcile.">
+  <ol class="how">
+    <li>Default is 8 pods of 500m / 1024 MiB with <b>Spread</b>: 2 pods on every node. Press <b>Kill</b> on Node 1: its 2 pods vanish, the controller creates 2 replacements, and they land on Nodes 2 to 4 (3, 3, 2). Nothing is Pending.</li>
+    <li>Set <b>Replicas</b> to 28, then kill any node. Three nodes fit only 8 pods each (24), so <b>4 pods stay Pending</b>. Press <b>Recover</b> and the Pending pods are scheduled. Pods that already run are never moved back.</li>
+    <li>Switch to <b>Pack</b> and press <b>Redeploy</b>: all 8 pods fill Node 1 (100% of its requests) and the others are empty. Kill Node 1 and every pod must be rescheduled at once.</li>
+    <li>Set <b>Replicas</b> to 12, <b>Load</b> to <b>Spike</b> and <b>Limit</b> to <b>4x</b>, with Pack and Redeploy: Node 1 holds 8 pods whose limits add up to 400% of its memory (32 GiB on an 8 GiB node). Pods burst to about 1.5x their request and the kernel <b>OOM-kills</b> 3 of them (red). Switch to Spread and Redeploy: 3 pods per node and no pod is killed.</li>
+    <li>For CPU, use 1000m CPU, 512 MiB, 8 replicas, Spike, Pack and Redeploy: two full nodes of 4 pods try to use 6000m but only have 4000m, so they show <b>throttled</b> 32% and 25%. Nothing is killed, the pods just run slower.</li>
+  </ol>
+  <div class="pg ct" data-ct>
+    <div class="pg-row">
+      <label>Replicas <input type="range" min="1" max="32" value="8" data-replicas aria-label="Replicas" /> <b data-replicasval>8</b></label>
+      <label>CPU request <select class="pg-in" data-cpu><option value="250">250m</option><option value="500" selected>500m</option><option value="1000">1000m</option></select></label>
+      <label>Memory request <select class="pg-in" data-mem><option value="512">512 MiB</option><option value="1024" selected>1024 MiB</option><option value="2048">2048 MiB</option></select></label>
+      <label>Limit <select class="pg-in" data-limit><option value="1">1x request</option><option value="2" selected>2x request</option><option value="4">4x request</option></select></label>
+    </div>
+    <div class="pg-row">
+      <label>Placement <select class="pg-in" data-policy><option value="spread" selected>Spread (emptiest node)</option><option value="pack">Pack (fullest that fits)</option></select></label>
+      <label>Load <select class="pg-in" data-load><option value="60">Normal (0.6x request)</option><option value="90">Busy (0.9x)</option><option value="150">Spike (1.5x)</option></select></label>
+      <button class="btn" type="button" data-redeploy>Redeploy</button>
+      <button class="btn" type="button" data-reset>Reset</button>
+    </div>
+    <div class="pg-grid" data-nodes></div>
+    <div class="pg-box" data-pendbox style="--c: var(--border)"><h3>Pending (unschedulable)</h3><span class="pg-mono" data-pend>0</span><span class="pg-note" data-pendnote></span><div class="ct-pods" data-pendpods></div></div>
+    <p class="pg-out" data-summary role="status" aria-live="polite"></p>
+    <ol class="pg-log" data-log aria-label="Event log"></ol>
+  </div>
+</PlaygroundShell>
+<script>
+  interface Pod { id: number; node: number }
+  interface Spec { replicas: number; cpu: number; mem: number; limitX: number; policy: 'spread' | 'pack'; load: number }
+  interface Cluster { up: boolean[]; pods: Pod[]; nextId: number }
+  interface NodeStat { pods: number; cpuReq: number; memReq: number; cpuLim: number; memLim: number; cpuUse: number; memUse: number; throttle: number; oom: number[] }
+
+  const NODES = 4; const NODE_CPU = 4000; const NODE_MEM = 8192;
+  const DEFAULTS: Spec = { replicas: 8, cpu: 500, mem: 1024, limitX: 2, policy: 'spread', load: 60 };
+
+  function mulberry32(seed: number) {
+    let a = seed >>> 0;
+    return () => { a = (a + 0x6d2b79f5) >>> 0; let t = a; t = Math.imul(t ^ (t >>> 15), t | 1); t ^= t + Math.imul(t ^ (t >>> 7), t | 61); return ((t ^ (t >>> 14)) >>> 0) / 4294967296; };
+  }
+  // Per-pod burst factor in [0.85, 1.15], fixed by the pod id so runs are reproducible.
+  const jitter = (id: number) => 0.85 + mulberry32(id * 7919 + 13)() * 0.3;
+
+  const makeCluster = (): Cluster => ({ up: [true, true, true, true], pods: [], nextId: 1 });
+  const podsOn = (c: Cluster, n: number) => c.pods.filter((p) => p.node === n);
+
+  // Filter: node up and requests still fit. Score: requested percent of CPU + memory after placing.
+  function schedule(c: Cluster, s: Spec): number {
+    let best = -1; let bestScore = 0;
+    for (let i = 0; i < NODES; i++) {
+      if (!c.up[i]) continue;
+      const used = podsOn(c, i).length;
+      const cpu = (used + 1) * s.cpu; const mem = (used + 1) * s.mem;
+      if (cpu > NODE_CPU || mem > NODE_MEM) continue;
+      const score = Math.floor((cpu * 100) / NODE_CPU) + Math.floor((mem * 100) / NODE_MEM);
+      if (best === -1 || (s.policy === 'spread' ? score < bestScore : score > bestScore)) { best = i; bestScore = score; }
+    }
+    return best;
+  }
+  // Reconcile: create or delete to match desired, then place Pending pods. Returns what happened.
+  function reconcile(c: Cluster, s: Spec) {
+    let created = 0; let removed = 0; let placed = 0;
+    while (c.pods.length < s.replicas) { c.pods.push({ id: c.nextId++, node: -1 }); created++; }
+    while (c.pods.length > s.replicas) {
+      const pend = c.pods.map((p, i) => ({ p, i })).filter((x) => x.p.node === -1).pop();
+      c.pods.splice(pend ? pend.i : c.pods.length - 1, 1); removed++;
+    }
+    for (const pod of c.pods) if (pod.node === -1) { pod.node = schedule(c, s); if (pod.node !== -1) placed++; }
+    return { created, removed, placed, pending: c.pods.filter((p) => p.node === -1).length };
+  }
+  function killNode(c: Cluster, n: number) { const before = c.pods.length; c.up[n] = false; c.pods = c.pods.filter((p) => p.node !== n); return before - c.pods.length; }
+
+  // What the kernel does on each node: CPU above a limit is throttled, memory above a limit or above
+  // the node's capacity gets a container OOM-killed. Pure: nothing is mutated.
+  function measure(c: Cluster, s: Spec): NodeStat[] {
+    const out: NodeStat[] = [];
+    for (let n = 0; n < NODES; n++) {
+      const here = podsOn(c, n);
+      const oom: number[] = []; let alive: { id: number; mem: number; cpu: number }[] = [];
+      for (const p of here) {
+        const j = jitter(p.id);
+        const mem = Math.floor((s.mem * s.load * j) / 100); const cpu = Math.min(Math.floor((s.cpu * s.load * j) / 100), s.cpu * s.limitX);
+        if (mem > s.mem * s.limitX) oom.push(p.id); else alive.push({ id: p.id, mem, cpu });
+      }
+      let memUse = alive.reduce((a, x) => a + x.mem, 0);
+      while (memUse > NODE_MEM && alive.length) {
+        let worst = alive[0];
+        for (const x of alive) if (x.mem > worst.mem || (x.mem === worst.mem && x.id > worst.id)) worst = x;
+        oom.push(worst.id); memUse -= worst.mem; alive = alive.filter((x) => x !== worst);
+      }
+      const cpuWant = alive.reduce((a, x) => a + x.cpu, 0);
+      out.push({ pods: here.length, cpuReq: here.length * s.cpu, memReq: here.length * s.mem, cpuLim: here.length * s.cpu * s.limitX, memLim: here.length * s.mem * s.limitX, cpuUse: Math.min(cpuWant, NODE_CPU), memUse, throttle: cpuWant > NODE_CPU ? Math.round((1 - NODE_CPU / cpuWant) * 100) : 0, oom });
+    }
+    return out;
+  }
+
+  document.querySelectorAll<HTMLElement>('[data-ct]').forEach((root) => {
+    const q = <T extends HTMLElement>(sel: string) => root.querySelector<T>(sel)!;
+    const num = (sel: string) => Number(q<HTMLInputElement>(sel).value);
+    const readSpec = (): Spec => ({ replicas: num('[data-replicas]'), cpu: num('[data-cpu]'), mem: num('[data-mem]'), limitX: num('[data-limit]'), policy: q<HTMLSelectElement>('[data-policy]').value === 'pack' ? 'pack' : 'spread', load: num('[data-load]') });
+    let cluster = makeCluster(); let logLines: string[] = []; let raf = 0;
+    const nodeEls: { box: HTMLElement; title: HTMLElement; btn: HTMLButtonElement; pods: HTMLElement; bars: HTMLElement[]; texts: HTMLElement[]; note: HTMLElement }[] = [];
+    const chips: HTMLElement[][] = [[], [], [], []]; const pendChips: HTMLElement[] = [];
+    const BAR_LABELS = ['CPU requested', 'Memory requested', 'CPU used', 'Memory used'];
+    const BAR_COLOURS = ['var(--role-1)', 'var(--role-1)', 'var(--role-2)', 'var(--role-2)'];
+
+    // Build the DOM once.
+    const grid = q('[data-nodes]');
+    for (let n = 0; n < NODES; n++) {
+      const box = document.createElement('div'); box.className = 'pg-box'; box.style.setProperty('--c', 'var(--role-4)');
+      const head = document.createElement('div'); head.className = 'ct-head';
+      const title = document.createElement('h3'); title.textContent = `Node ${n + 1}`;
+      const btn = document.createElement('button'); btn.type = 'button'; btn.className = 'btn'; btn.dataset.node = String(n); btn.setAttribute('aria-label', `Kill node ${n + 1}`); btn.textContent = 'Kill';
+      head.append(title, btn);
+      const pods = document.createElement('div'); pods.className = 'ct-pods';
+      const bars: HTMLElement[] = []; const texts: HTMLElement[] = []; const meter = document.createElement('div'); meter.className = 'ct-meters';
+      BAR_LABELS.forEach((lab, k) => {
+        const row = document.createElement('div'); row.className = 'ct-meter';
+        const l = document.createElement('span'); l.className = 'pg-note'; l.textContent = lab;
+        const bar = document.createElement('div'); bar.className = 'ct-bar'; const fill = document.createElement('i'); fill.style.background = BAR_COLOURS[k]; bar.append(fill);
+        const t = document.createElement('span'); t.className = 'pg-mono';
+        row.append(l, bar, t); meter.append(row); bars.push(fill); texts.push(t);
+      });
+      const note = document.createElement('span'); note.className = 'pg-note';
+      box.append(head, pods, meter, note); grid.append(box);
+      nodeEls.push({ box, title, btn, pods, bars, texts, note });
+      btn.addEventListener('click', () => {
+        const s = readSpec();
+        if (cluster.up[n]) { const lost = killNode(cluster, n); log(`Node ${n + 1} died: ${lost} pod${lost === 1 ? '' : 's'} lost`); }
+        else { cluster.up[n] = true; log(`Node ${n + 1} recovered (empty)`); }
+        runReconcile(s);
+      });
+    }
+    function syncChips(list: HTMLElement[], host: HTMLElement, count: number) {
+      while (list.length < count) { const c = document.createElement('span'); c.className = 'ct-pod'; host.append(c); list.push(c); }
+      list.forEach((c, i) => { c.hidden = i >= count; });
+    }
+    function log(line: string) { logLines.push(line); if (logLines.length > 8) logLines.shift(); }
+    function runReconcile(s: Spec) {
+      const r = reconcile(cluster, s);
+      if (r.created || r.removed || r.placed) log(`Controller: ${r.created ? `created ${r.created} pod${r.created === 1 ? '' : 's'}` : ''}${r.created && r.removed ? ', ' : ''}${r.removed ? `deleted ${r.removed}` : ''}${r.created || r.removed ? '; ' : ''}scheduler placed ${r.placed}${r.pending ? `, ${r.pending} Pending (no node has room)` : ''}`);
+      else if (r.pending) log(`${r.pending} pod${r.pending === 1 ? '' : 's'} still Pending: no node has room`);
+      schedDraw();
+    }
+    function redeploy(why: string) { const s = readSpec(); cluster.pods = []; log(`${why}: all pods replaced`); runReconcile(s); }
+    function schedDraw() { if (!raf) raf = requestAnimationFrame(() => { raf = 0; draw(); }); }
+
+    function draw() {
+      const s = readSpec(); const stats = measure(cluster, s);
+      q('[data-replicasval]').textContent = String(s.replicas);
+      let ooms = 0; let throttled = 0;
+      stats.forEach((st, n) => {
+        const e = nodeEls[n]; const up = cluster.up[n];
+        e.box.classList.toggle('off', !up); e.box.style.setProperty('--c', up ? 'var(--role-4)' : 'var(--bad)');
+        e.title.textContent = `Node ${n + 1}${up ? '' : ' (down)'}`; e.btn.textContent = up ? 'Kill' : 'Recover'; e.btn.setAttribute('aria-label', `${up ? 'Kill' : 'Recover'} node ${n + 1}`);
+        syncChips(chips[n], e.pods, st.pods);
+        const ids = podsOn(cluster, n);
+        chips[n].forEach((c, i) => { const p = ids[i]; if (!p) return; const dead = st.oom.includes(p.id); c.textContent = String(p.id); c.classList.toggle('dead', dead); c.title = `web-${p.id}${dead ? ' (OOM-killed)' : ''}`; });
+        const pct = (v: number, cap: number) => Math.min(100, Math.round((v / cap) * 100));
+        const vals = [[st.cpuReq, NODE_CPU, `${pct(st.cpuReq, NODE_CPU)}% (${st.cpuReq}m)`], [st.memReq, NODE_MEM, `${pct(st.memReq, NODE_MEM)}% (${st.memReq} MiB)`], [st.cpuUse, NODE_CPU, `${pct(st.cpuUse, NODE_CPU)}%${st.throttle ? `, throttled ${st.throttle}%` : ''}`], [st.memUse, NODE_MEM, `${pct(st.memUse, NODE_MEM)}% (${st.memUse} MiB)`]] as [number, number, string][];
+        vals.forEach(([v, cap, text], k) => { e.bars[k].style.width = `${pct(v, cap)}%`; e.texts[k].textContent = text; });
+        e.note.textContent = !up ? 'not schedulable' : `${st.pods} pod${st.pods === 1 ? '' : 's'} · limits add up to ${Math.round((st.memLim / NODE_MEM) * 100)}% of memory, ${Math.round((st.cpuLim / NODE_CPU) * 100)}% of CPU${st.oom.length ? ` · ${st.oom.length} OOM-killed` : ''}`;
+        ooms += st.oom.length; if (st.throttle) throttled++;
+      });
+      const pend = cluster.pods.filter((p) => p.node === -1).length;
+      q('[data-pend]').textContent = String(pend);
+      q('[data-pendnote]').textContent = pend ? 'every node is full or down: Pending pods wait until capacity appears' : 'none';
+      q<HTMLElement>('[data-pendbox]').style.setProperty('--c', pend ? 'var(--bad)' : 'var(--border)');
+      syncChips(pendChips, q('[data-pendpods]'), pend);
+      const pendIds = cluster.pods.filter((p) => p.node === -1);
+      pendChips.forEach((c, i) => { if (pendIds[i]) { c.textContent = String(pendIds[i].id); c.classList.add('pending'); } });
+      const running = cluster.pods.length - pend; const nodesUp = cluster.up.filter(Boolean).length;
+      const out = q('[data-summary]');
+      out.textContent = `desired ${s.replicas} · running ${running} · pending ${pend} · nodes up ${nodesUp} of ${NODES} · OOM-killed now ${ooms} · nodes throttling CPU ${throttled}`;
+      out.classList.toggle('bad', pend > 0 || ooms > 0);
+      const logEl = q('[data-log]');
+      while (logEl.children.length < logLines.length) logEl.append(document.createElement('li'));
+      Array.from(logEl.children).forEach((li, i) => { li.textContent = logLines[i] ?? ''; (li as HTMLElement).hidden = i >= logLines.length; });
+    }
+    function setSpec(s: Spec) {
+      q<HTMLInputElement>('[data-replicas]').value = String(s.replicas); q<HTMLSelectElement>('[data-cpu]').value = String(s.cpu); q<HTMLSelectElement>('[data-mem]').value = String(s.mem);
+      q<HTMLSelectElement>('[data-limit]').value = String(s.limitX); q<HTMLSelectElement>('[data-policy]').value = s.policy; q<HTMLSelectElement>('[data-load]').value = String(s.load);
+    }
+    q('[data-replicas]').addEventListener('input', () => { runReconcile(readSpec()); });
+    ['[data-cpu]', '[data-mem]', '[data-limit]'].forEach((sel) => q(sel).addEventListener('change', () => redeploy('Pod spec changed (rolling replace)')));
+    q('[data-policy]').addEventListener('change', () => { log('Placement policy changed: it only affects pods placed from now on'); schedDraw(); });
+    q('[data-load]').addEventListener('change', schedDraw);
+    q('[data-redeploy]').addEventListener('click', () => redeploy('Redeploy'));
+    q('[data-reset]').addEventListener('click', () => { setSpec(DEFAULTS); cluster = makeCluster(); logLines = []; log('Cluster reset'); runReconcile(DEFAULTS); });
+    log('Cluster started'); runReconcile(readSpec()); draw();
+  });
+</script>
+<style is:global>
+  .playground .ct-head { display: flex; justify-content: space-between; align-items: center; gap: 8px; }
+  .playground .ct-head h3 { margin: 0; }
+  .playground .ct-pods { display: flex; flex-wrap: wrap; gap: 4px; min-height: 22px; }
+  .playground .ct-pod { min-width: 22px; height: 22px; padding: 0 4px; display: inline-flex; align-items: center; justify-content: center; font: .72rem ui-monospace, monospace; border-radius: 5px; background: var(--role-1); color: var(--on-accent, #fff); }
+  .playground .ct-pod[hidden] { display: none; }
+  .playground .ct-pod.dead { background: var(--bad); }
+  .playground .ct-pod.pending { background: var(--surface-2); color: var(--text); border: 1px dashed var(--bad); }
+  .playground .ct-meters { display: grid; gap: 4px; }
+  .playground .ct-meter { display: grid; grid-template-columns: 1fr auto; gap: 2px 8px; align-items: baseline; }
+  .playground .ct-meter > :first-child { grid-column: 1; grid-row: 1; }
+  .playground .ct-meter .pg-mono { grid-column: 2; grid-row: 1; white-space: nowrap; }
+  .playground .ct-meter .ct-bar { grid-column: 1 / -1; grid-row: 2; }
+  .playground .ct-bar { height: 8px; border-radius: 4px; background: var(--surface-2); border: 1px solid var(--border); overflow: hidden; }
+  .playground .ct-bar i { display: block; height: 100%; width: 0; transition: width .25s; }
+  @media (prefers-reduced-motion: reduce) { .playground .ct-bar i { transition: none; } }
+</style>

@@ -1,0 +1,136 @@
+---
+import PlaygroundShell from '../../components/PlaygroundShell.astro';
+---
+<PlaygroundShell title="Expiry and node loss: who protects the database?" hint="Cached keys expire together, or a cache node dies, while 20 app servers keep asking. Compare six ways of handling a miss and watch the database queries, the slow requests and the timeouts.">
+  <ol class="how">
+    <li>Start with the defaults: <b>the TTL of 100 keys runs out</b> at 4,000 requests per second, and half of the requests are for one hot key. With <b>no protection</b> the database gets <b>2,388 queries</b>, a peak of <b>4,000 per second against 1,000 it can do</b>, and <b>316 requests time out</b>. <b>Single flight</b> cuts it to <b>937</b>, because each of the 20 servers still asks once per key. A <b>lock</b> gives <b>100</b>, one per key. <b>Stale-while-revalidate</b> also makes 100 queries and keeps every request fast, <b>0 over 100 ms</b>.</li>
+    <li>Set the keys to <b>1</b>: only the hot key exists. <b>TTL jitter does nothing</b> (2,000 queries, the same as no protection), because jitter spreads many expiries and one key has one. Single flight now needs only <b>20</b> queries, the lock <b>1</b>.</li>
+    <li>Choose <b>a node dies, no replica</b> with consistent hashing: <b>19 of the 100 keys</b> are cold, including the hot one. <b>Stale-while-revalidate no longer helps</b> (1,210 queries, as with no protection), because there is no old value to serve. The lock still needs <b>19</b>. Switch the routing to <b>hash mod N</b> and <b>92 keys</b> are cold, nearly the whole cache.</li>
+    <li>Choose <b>a node dies, with a replica</b>: only <b>4 keys</b> (the newest writes that had not been replicated) are cold, and the database barely notices.</li>
+  </ol>
+  <div class="pg dcb" data-dcb>
+    <div class="pg-row">
+      <label>What happens <select class="pg-in" data-ev>
+        <option value="ttl" selected>The TTL of all cached keys runs out</option>
+        <option value="dead">A node dies, no replica</option>
+        <option value="replica">A node dies, with a replica</option>
+      </select></label>
+      <label>Routing after a node loss <select class="pg-in" data-rt>
+        <option value="hash" selected>consistent hashing</option>
+        <option value="mod">hash mod N</option>
+      </select></label>
+      <label>Keys cached together <select class="pg-in" data-k>
+        <option value="1">1 (only the hot key)</option>
+        <option value="100" selected>100</option>
+        <option value="1000">1,000</option>
+      </select></label>
+      <label>Requests per second <input type="range" min="1000" max="5000" step="500" value="4000" data-r /> <b data-rval></b></label>
+      <label>App servers <input type="range" min="1" max="50" value="20" data-s /> <b data-sval></b></label>
+      <label>Database query time (ms) <input type="range" min="100" max="1000" step="100" value="500" data-ms /> <b data-msval></b></label>
+    </div>
+    <div class="pg-grid" data-cards></div>
+    <p class="pg-out" data-verdict aria-live="polite"></p>
+    <p class="pg-note">Model: 20 seconds of traffic with the event at time 0. Half of the requests are for one hot key and the rest are spread evenly over the other keys, and each request goes to a random app server. The database does 1,000 queries per second and queues the rest, so a query takes its base time plus its wait. A request that waits more than 2 seconds times out, and a cache hit takes 2 ms. After an event a key is missing until the first query for it completes. Single flight coalesces requests within one server, so it needs one query per server per key. The lock, as a lease, lets one request in the whole fleet load a key and the others poll every 25 ms. Stale-while-revalidate serves the expired value and refreshes it with one query, but only after a TTL expiry, since after a node loss there is no old value and it falls back to a plain miss. Jitter spreads the expiry times of all keys randomly over 10 seconds. The hot key is on the dead node. With hash mod N, 5 of 6 keys change owner when one of 6 nodes is removed. With consistent hashing 1 in 6 keys is on the dead node. A replica has lost 2% of the keys, the writes it had not received. The last card combines jitter, a lock and stale-while-revalidate. Bars show queries sent to the database per half second.</p>
+  </div>
+</PlaygroundShell>
+<style>
+  .dcb-bars { display: flex; align-items: flex-end; gap: 1px; height: 38px; }
+  .dcb-bars span { flex: 1; background: var(--accent); min-height: 1px; border-radius: 1px 1px 0 0; }
+  .dcb-bars span.over { background: var(--bad); }
+</style>
+<script>
+  document.querySelectorAll<HTMLElement>('[data-dcb]').forEach((root) => {
+    const q = <T extends HTMLElement>(s: string) => root.querySelector<T>(s)!;
+    const SPAN = 20000; const CAP = 1000; const TO = 2000; const HIT = 2; const POLL = 25; const NODES = 6; const BUCKET = 500; const NB = SPAN / BUCKET;
+    const STRATS = [
+      { id: 'none', name: 'No protection' }, { id: 'jitter', name: 'TTL jitter' }, { id: 'flight', name: 'Single flight (per server)' },
+      { id: 'lock', name: 'Lock (one in the fleet)' }, { id: 'swr', name: 'Stale-while-revalidate' }, { id: 'combo', name: 'Jitter + lock + stale' },
+    ];
+    type Res = { q: number; peak: number; fail: number; slow: number; maxLat: number; buckets: number[]; cold: number };
+    function simulate(event: string, routing: string, rate: number, keys: number, servers: number, dbMs: number): Record<string, Res> {
+      let seed = 99; const rnd = () => ((seed = (seed * 1664525 + 1013904223) % 4294967296) / 4294967296);
+      const u = Array.from({ length: keys }, () => rnd());
+      const own = Array.from({ length: keys }, (_, k) => (k === 0 ? 0 : Math.floor(rnd() * NODES)));
+      const mv = Array.from({ length: keys }, () => rnd());
+      const lost = Array.from({ length: keys }, () => rnd());
+      const n = Math.floor((rate * SPAN) / 1000);
+      const rk = new Int32Array(n); const rs = new Int32Array(n);
+      for (let i = 0; i < n; i++) { rk[i] = keys === 1 || rnd() < 0.5 ? 0 : 1 + Math.floor(rnd() * (keys - 1)); rs[i] = Math.floor(rnd() * servers); }
+      const cold = (k: number) => (event === 'ttl' ? true : event === 'dead' ? k === 0 || (routing === 'mod' ? mv[k] < 5 / 6 : own[k] === 0) : k !== 0 && lost[k] < 0.02);
+      let coldKeys = 0; for (let k = 0; k < keys; k++) if (cold(k)) coldKeys++;
+      const out: Record<string, Res> = {};
+      for (const { id: s } of STRATS) {
+        const jit = s === 'jitter' || s === 'combo';
+        const exp = new Float64Array(keys).fill(Infinity); const fill = new Float64Array(keys).fill(Infinity);
+        for (let k = 0; k < keys; k++) if (cold(k)) exp[k] = event === 'ttl' && jit ? u[k] * 10000 : 0;
+        const flight = new Float64Array(servers * keys).fill(-1); const lockEnd = new Float64Array(keys).fill(-1); const refreshed = new Uint8Array(keys);
+        let dbFree = 0; let qs = 0; let fail = 0; let slow = 0; let maxLat = 0;
+        const buckets: number[] = new Array(NB).fill(0);
+        const query = (t: number) => { const st = Math.max(t, dbFree); dbFree = st + 1000 / CAP; qs++; buckets[Math.min(NB - 1, Math.floor(t / BUCKET))]++; return st + dbMs; };
+        const stale = event === 'ttl';
+        for (let i = 0; i < n; i++) {
+          const t = (i * 1000) / rate; const k = rk[i]; const sv = rs[i];
+          let lat = HIT;
+          if (t >= exp[k] && t < fill[k]) {
+            if ((s === 'swr' || s === 'combo') && stale) {
+              if (!refreshed[k]) { refreshed[k] = 1; fill[k] = query(t); }
+            } else if (s === 'lock' || s === 'combo') {
+              if (lockEnd[k] < 0) { lockEnd[k] = query(t); fill[k] = lockEnd[k]; lat = lockEnd[k] - t; } else lat = lockEnd[k] - t + POLL;
+            } else if (s === 'flight') {
+              const f = flight[sv * keys + k];
+              if (f >= 0 && t < f) lat = f - t;
+              else { const c = query(t); flight[sv * keys + k] = c; if (c < fill[k]) fill[k] = c; lat = c - t; }
+            } else { const c = query(t); if (c < fill[k]) fill[k] = c; lat = c - t; }
+          }
+          if (lat > TO) { fail++; lat = TO; }
+          if (lat > 100) slow++;
+          if (lat > maxLat) maxLat = lat;
+        }
+        out[s] = { q: qs, peak: Math.max(...buckets) * (1000 / BUCKET), fail, slow, maxLat, buckets, cold: coldKeys };
+      }
+      return out;
+    }
+    const fmt = (n: number) => Math.round(n).toLocaleString('en-US');
+    const cards = STRATS.map((s) => {
+      const box = document.createElement('div'); box.className = 'pg-box';
+      const h = document.createElement('h3'); h.textContent = s.name;
+      const o = document.createElement('span'); o.className = 'pg-mono';
+      const nn = document.createElement('span'); nn.className = 'pg-note';
+      const bars = document.createElement('div'); bars.className = 'dcb-bars'; bars.setAttribute('aria-hidden', 'true');
+      const cells = Array.from({ length: NB }, () => { const c = document.createElement('span'); bars.append(c); return c; });
+      box.append(h, o, nn, bars); q('[data-cards]').append(box);
+      return { box, o, nn, cells };
+    });
+    let pending = false;
+    function draw() {
+      pending = false;
+      const ev = q<HTMLSelectElement>('[data-ev]').value; const rt = q<HTMLSelectElement>('[data-rt]').value; const keys = Number(q<HTMLSelectElement>('[data-k]').value);
+      const rate = Number(q<HTMLInputElement>('[data-r]').value); const servers = Number(q<HTMLInputElement>('[data-s]').value); const dbMs = Number(q<HTMLInputElement>('[data-ms]').value);
+      q('[data-rval]').textContent = fmt(rate); q('[data-sval]').textContent = String(servers); q('[data-msval]').textContent = String(dbMs);
+      q<HTMLSelectElement>('[data-rt]').disabled = ev !== 'dead';
+      const r = simulate(ev, rt, rate, keys, servers, dbMs);
+      const top = Math.max(CAP / (1000 / BUCKET), ...STRATS.map((s) => Math.max(...r[s.id].buckets)));
+      STRATS.forEach((s, i) => {
+        const x = r[s.id]; const c = cards[i];
+        c.o.textContent = `${fmt(x.q)} database ${x.q === 1 ? "query" : "queries"}`;
+        c.nn.textContent = `busiest second: ${fmt(x.peak)} per second. ${fmt(x.slow)} requests over 100 ms, worst ${fmt(x.maxLat)} ms, ${fmt(x.fail)} timed out`;
+        const bad = x.fail > 0 || x.peak > CAP;
+        c.box.style.setProperty('--c', bad ? 'var(--bad)' : x.slow === 0 ? 'var(--good)' : 'var(--accent)');
+        x.buckets.forEach((b, j) => { c.cells[j].style.height = `${Math.max(2, (b / top) * 100)}%`; c.cells[j].classList.toggle('over', b * (1000 / BUCKET) > CAP); });
+      });
+      const none = r.none; const lock = r.lock; const flight = r.flight; const swr = r.swr; const jit = r.jitter;
+      const out = q('[data-verdict]'); out.classList.toggle('bad', none.peak > CAP || none.fail > 0);
+      const cold = `${fmt(none.cold)} of ${fmt(keys)} keys`;
+      if (ev === 'replica') {
+        out.textContent = `The replica takes over, so ${cold} are cold (the writes it had not received). The database sees ${fmt(none.q)} queries even with no protection, a peak of ${fmt(none.peak)} per second. Replicas turn a cold start into a small blip, and the guards then make it smaller still (${fmt(lock.q)} with a lock).`;
+      } else if (ev === 'dead') {
+        out.textContent = `${cold} are cold${rt === 'mod' ? ' (hash mod N sends most keys to a node that does not have them)' : ' (only those on the dead node)'}, including the hot key. With no protection the database gets ${fmt(none.q)} queries at a peak of ${fmt(none.peak)} per second${none.fail > 0 ? ` and ${fmt(none.fail)} requests time out` : ''}. Single flight needs ${fmt(flight.q)}, a lock ${fmt(lock.q)}. Stale-while-revalidate makes ${fmt(swr.q)}, because there is no old value to serve and it falls back to a plain miss.`;
+      } else {
+        out.textContent = `With no protection the database gets ${fmt(none.q)} queries at a peak of ${fmt(none.peak)} per second (it can do ${fmt(CAP)})${none.fail > 0 ? `, and ${fmt(none.fail)} requests time out` : ''}. Jitter makes it ${fmt(jit.q)} with a peak of ${fmt(jit.peak)}${keys === 1 ? ', no better, since one key has only one expiry to spread' : ''}. Single flight needs ${fmt(flight.q)}, a lock ${fmt(lock.q)}, and stale-while-revalidate ${fmt(swr.q)} with ${fmt(swr.slow)} slow requests.`;
+      }
+    }
+    const schedule = () => { if (!pending) { pending = true; requestAnimationFrame(draw); } };
+    root.addEventListener('input', schedule); root.addEventListener('change', schedule);
+    draw();
+  });
+</script>

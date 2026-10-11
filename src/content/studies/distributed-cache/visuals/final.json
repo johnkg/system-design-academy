@@ -1,0 +1,54 @@
+{
+  "actors": [
+    { "id": "app", "label": "App servers", "role": "client", "x": 14, "y": 16 },
+    { "id": "router", "label": "Routing (client library)", "role": "edge", "x": 50, "y": 16 },
+    { "id": "guard", "label": "Refill guard", "role": "compute", "x": 86, "y": 16 },
+    { "id": "shard", "label": "Shard 5 (primary)", "role": "data", "x": 50, "y": 50 },
+    { "id": "db", "label": "Database", "role": "data", "x": 86, "y": 50 },
+    { "id": "stream", "label": "Change stream", "role": "async", "x": 86, "y": 84 },
+    { "id": "replica", "label": "Shard 5 replica", "role": "data", "x": 50, "y": 84 }
+  ],
+  "frames": [
+    {
+      "narration": "An application server wants product:42. The client library hashes the key. The ring has 8 nodes with 128 virtual nodes each, 1,024 points, and the first point clockwise from the key belongs to shard 5.",
+      "messages": [{ "from": "app", "to": "router", "label": "get product:42" }, { "from": "router", "to": "shard", "label": "GET, hash lands on shard 5" }],
+      "states": { "router": "ring: 8 x 128 points" }
+    },
+    {
+      "narration": "The key is there. The shard answers from memory in well under a millisecond, and notes the use, so the key is less likely to be evicted when memory is full.",
+      "messages": [{ "from": "shard", "to": "app", "label": "hit, 1 KB" }],
+      "states": { "shard": "hit, use counted" }
+    },
+    {
+      "narration": "Later the key expires. This one is hot, 2,000 requests per second, and a database read takes 40 ms, so 80 requests would arrive before the first reload finishes. With no protection, all 80 would query the database. The refill guard lets one through.",
+      "messages": [{ "from": "app", "to": "guard", "label": "miss, 80 waiting" }, { "from": "guard", "to": "db", "label": "1 query, not 80" }],
+      "states": { "guard": "1 leader, 79 waiting" }
+    },
+    {
+      "narration": "The database answers. The guard stores the value on shard 5 with a TTL of 300 seconds plus or minus a random 10%, so keys cached together do not all expire together, and releases the 79 waiting requests with the same value.",
+      "messages": [{ "from": "db", "to": "guard", "label": "row" }, { "from": "guard", "to": "shard", "label": "SET, ttl 300 s +/- 30" }, { "from": "guard", "to": "app", "label": "value for all 80" }],
+      "states": { "shard": "refilled" }
+    },
+    {
+      "narration": "Now a price changes. The application writes the database, and the commit appears in the change stream. The stream deletes the cache entry instead of updating it, so the next reader loads the current row.",
+      "messages": [{ "from": "app", "to": "db", "label": "update price" }, { "from": "db", "to": "stream", "label": "change event" }, { "from": "stream", "to": "shard", "label": "DEL product:42" }],
+      "states": { "db": "row updated", "shard": "entry deleted" }
+    },
+    {
+      "narration": "Then shard 5 crashes. The other primaries miss its heartbeats for the node timeout of 3 seconds, and a majority agree that it is down. Its replica is promoted with a higher epoch number, and the clients learn the new owner of the slot range.",
+      "messages": [{ "from": "replica", "to": "router", "label": "promoted, epoch 8" }],
+      "states": { "shard": "down", "replica": "new primary" },
+      "highlight": ["replica"]
+    },
+    {
+      "narration": "Reads now go to the new primary, which has almost all the data because it was fed by replication, so the 1/8 of the cache that shard 5 held is not cold. The few writes in the last milliseconds before the crash may be missing, and the database still has them.",
+      "messages": [{ "from": "app", "to": "router", "label": "get product:42" }, { "from": "router", "to": "replica", "label": "GET" }, { "from": "replica", "to": "app", "label": "hit" }],
+      "states": { "replica": "serving 1/8 of the keys" }
+    },
+    {
+      "narration": "Without a replica, 1/8 of all keys would have been misses at once. Each hot key still reaches the database only once, because of the refill guard, so the database sees a burst of about one query per cold key, which it can queue, instead of one per request.",
+      "messages": [{ "from": "router", "to": "guard", "label": "misses for 1/8 of keys" }, { "from": "guard", "to": "db", "label": "one query per key" }],
+      "states": { "guard": "1 query per key" }
+    }
+  ]
+}

@@ -1,0 +1,185 @@
+---
+import PlaygroundShell from '../components/PlaygroundShell.astro';
+---
+<PlaygroundShell title="Simulate it" hint="A web tier meets a traffic spike, then a quiet night. One step is one minute and one instance serves 100 requests per second. Pick a scaling policy and watch whether capacity keeps up.">
+  <ol class="how">
+    <li>The default is <b>target tracking</b> on <b>requests per instance</b> at 60% with a 3 minute warm-up. Press <b>Reset</b> then <b>Run</b>: the demand line (amber) shoots up faster than the ready capacity (blue) because new instances need 3 minutes. Red marks show about 9 overloaded minutes and roughly 100k dropped or slow requests.</li>
+    <li>Set <b>Warm-up</b> to 0 and the overload nearly vanishes (about 2 minutes). Set it to 6 and it grows to about 12 minutes: lag, not the policy, is what hurts. Next, set <b>Scale on</b> to CPU: CPU stops at 100% so the controller cannot see how big the spike is and ramps in slow jumps, doubling the dropped requests.</li>
+    <li>Set <b>Scale-in</b> to Immediate and <b>Cooldown</b> to 0: the tier chases every wobble in the noisy decline, so scaling actions go from 26 to 35 and flaps (a reversal within 12 minutes) from 3 to 11. It does not even save much: every flap is an instance launched, paid for while warming, and thrown away. Cooldown 3 with immediate scale-in brings it back to 13 actions and 3 flaps.</li>
+    <li>Try <b>Scheduled</b>: it is the cheapest run (about 800 instance-minutes) because it ignores the metric and guesses the spike window with 12 instances, so it is short of capacity for about 21 minutes. Lower the <b>Target</b> to 30% and nothing is dropped, but the cost is about 2300 instance-minutes against about 1300 by default.</li>
+  </ol>
+  <div class="pg as" data-as>
+    <div class="pg-row">
+      <label>Policy <select class="pg-in" data-policy><option value="target" selected>Target tracking</option><option value="step">Step scaling</option><option value="scheduled">Scheduled</option></select></label>
+      <label>Scale on <select class="pg-in" data-metric><option value="rps" selected>Requests per instance</option><option value="cpu">CPU (caps at 100%)</option></select></label>
+      <label>Scale-in <select class="pg-in" data-scalein><option value="patient" selected>Patient (5 calm minutes, one at a time)</option><option value="immediate">Immediate</option></select></label>
+    </div>
+    <div class="pg-row">
+      <label>Target (%) <input type="range" min="30" max="90" step="5" value="60" data-target /> <b data-targetval>60</b></label>
+      <label>Warm-up (min) <input type="range" min="0" max="8" value="3" data-warm /> <b data-warmval>3</b></label>
+      <label>Cooldown (min) <input type="range" min="0" max="10" value="2" data-cool /> <b data-coolval>2</b></label>
+    </div>
+    <div class="pg-row">
+      <label>Min instances <input type="range" min="1" max="6" value="2" data-min /> <b data-minval>2</b></label>
+      <label>Max instances <input type="range" min="6" max="40" value="30" data-max /> <b data-maxval>30</b></label>
+    </div>
+    <div class="pg-row">
+      <button class="btn" type="button" data-run>Run</button>
+      <button class="btn" type="button" data-step>Step</button>
+      <button class="btn" type="button" data-end>Show all</button>
+      <button class="btn" type="button" data-reset>Reset</button>
+      <span class="pg-mono" data-clock></span>
+    </div>
+    <svg class="as-chart" viewBox="0 0 600 190" role="img" aria-label="Demand in requests per second against ready capacity and booked capacity over 120 minutes" preserveAspectRatio="none">
+      <g data-overg></g>
+      <polyline data-booked fill="none" stroke="var(--muted)" stroke-width="1.5" stroke-dasharray="4 3" />
+      <polyline data-capline fill="none" stroke="var(--role-1)" stroke-width="2.5" />
+      <polyline data-demand fill="none" stroke="var(--role-3)" stroke-width="2" />
+      <line data-cursor y1="0" y2="190" stroke="var(--text)" stroke-width="1" opacity=".5" />
+    </svg>
+    <p class="pg-note">Amber: demand. Blue: capacity of instances that are warm. Dashed grey: instances you pay for, including ones still warming up. Red marks: minutes where demand exceeded ready capacity.</p>
+    <div class="pg-grid">
+      <div class="pg-box" style="--c: var(--role-1)"><h3>Instances now</h3><span class="pg-mono" data-inst>0</span><span class="pg-note" data-instnote></span></div>
+      <div class="pg-box" data-loadbox style="--c: var(--role-2)"><h3>Load per ready instance</h3><span class="pg-mono" data-load>0%</span><span class="pg-note">above 100% requests queue or fail</span></div>
+      <div class="pg-box" data-dropbox style="--c: var(--role-2)"><h3>Dropped or slow requests</h3><span class="pg-mono" data-drop>0</span><span class="pg-note" data-dropnote></span></div>
+      <div class="pg-box" style="--c: var(--role-4)"><h3>Cost</h3><span class="pg-mono" data-cost>0</span><span class="pg-note">instance-minutes, warm-up included</span></div>
+      <div class="pg-box" data-flapbox style="--c: var(--role-5)"><h3>Scaling actions</h3><span class="pg-mono" data-acts>0</span><span class="pg-note" data-flapnote></span></div>
+    </div>
+  </div>
+</PlaygroundShell>
+<script>
+  type Policy = 'target' | 'step' | 'scheduled';
+  interface Params { policy: Policy; metric: 'cpu' | 'rps'; target: number; warmup: number; cooldown: number; patient: boolean; min: number; max: number }
+  interface Result { ready: number[]; total: number[]; util: number[]; dropped: number[]; over: number[]; actions: number[]; flaps: number[] }
+  const CAP = 100; const N = 120; const SVG_W = 600; const SVG_H = 190;
+
+  function mulberry32(seed: number) {
+    let a = seed >>> 0;
+    return () => { a = (a + 0x6D2B79F5) >>> 0; let t = a; t = Math.imul(t ^ (t >>> 15), t | 1); t ^= t + Math.imul(t ^ (t >>> 7), t | 61); return ((t ^ (t >>> 14)) >>> 0) / 4294967296; };
+  }
+  // A quiet baseline, a sharp spike, a noisy decline, then a quiet night. Integers, seeded.
+  function makeTraffic(seed: number): number[] {
+    const rnd = mulberry32(seed); const out: number[] = [];
+    for (let t = 0; t < N; t++) {
+      let base = 200;
+      if (t >= 24 && t < 34) base = 200 + (1000 * (t - 24)) / 10;
+      else if (t >= 34 && t < 50) base = 1200;
+      else if (t >= 50 && t < 72) base = 1200 - (900 * (t - 50)) / 22;
+      else if (t >= 72) base = 80;
+      out.push(Math.round(base * (0.92 + 0.16 * rnd())));
+    }
+    return out;
+  }
+  // Cumulative series per minute: what the tier looked like at the end of each step.
+  function simulate(p: Params, traffic: number[]): Result {
+    const lo = Math.min(p.min, p.max); const hi = Math.max(p.min, p.max);
+    let ready = Math.max(lo, Math.min(hi, 4)); let pending: number[] = [];
+    let cool = 0; let calm = 0; let lastDir = 0; let lastAt = -99; let actions = 0; let flaps = 0;
+    const r: Result = { ready: [], total: [], util: [], dropped: [], over: [], actions: [], flaps: [] };
+    for (let t = 0; t < traffic.length; t++) {
+      ready += pending.filter((x) => x <= t).length; pending = pending.filter((x) => x > t);
+      const load = traffic[t]; const total = ready + pending.length; const cap = ready * CAP;
+      const raw = load / cap; const drop = load - Math.min(load, cap);
+      r.ready.push(ready); r.total.push(total); r.util.push(raw); r.dropped.push(drop); r.over.push(raw > 1 ? 1 : 0);
+      const T = p.target / 100; const util = p.metric === 'cpu' ? Math.min(1, raw) : raw;
+      let want = total;
+      if (p.policy === 'target') want = p.metric === 'cpu' ? Math.ceil((ready * util) / T - 1e-9) : Math.ceil(load / (CAP * T) - 1e-9);
+      else if (p.policy === 'step') want = util > T + 0.2 ? total + 3 : util > T ? total + 1 : util < T - 0.3 ? total - 1 : total;
+      else want = t >= 28 && t < 64 ? 12 : lo;
+      want = Math.max(lo, Math.min(hi, want));
+      if (want < total) calm++; else calm = 0;
+      if (cool > 0) cool--;
+      else {
+        let next = total;
+        if (want > total) next = want;
+        else if (want < total && (!p.patient || calm >= 5)) next = p.patient ? total - 1 : want;
+        if (next !== total) {
+          const dir = next > total ? 1 : -1;
+          if (dir > 0) for (let i = 0; i < next - total; i++) pending.push(t + 1 + p.warmup);
+          else { let k = total - next; while (k > 0 && pending.length > 0) { pending.pop(); k--; } ready -= k; }
+          if (lastDir !== 0 && dir !== lastDir && t - lastAt <= 12) flaps++;
+          lastDir = dir; lastAt = t; actions++; cool = p.cooldown;
+        }
+      }
+      r.actions.push(actions); r.flaps.push(flaps);
+    }
+    return r;
+  }
+
+  document.querySelectorAll<HTMLElement>('[data-as]').forEach((root) => {
+    const q = <T extends Element>(s: string) => root.querySelector<T>(s)!;
+    const val = (s: string) => Number(q<HTMLInputElement>(s).value);
+    const traffic = makeTraffic(7);
+    const reduce = window.matchMedia('(prefers-reduced-motion: reduce)').matches;
+    let res: Result; let shown = N; let timer: number | undefined; let onScreen = true; let raf = 0; let running = false;
+    const SVGNS = 'http://www.w3.org/2000/svg';
+    const overRects: SVGRectElement[] = [];
+    for (let i = 0; i < N; i++) {
+      const rc = document.createElementNS(SVGNS, 'rect');
+      rc.setAttribute('x', String((i * SVG_W) / N)); rc.setAttribute('y', String(SVG_H - 10)); rc.setAttribute('width', String(SVG_W / N)); rc.setAttribute('height', '10');
+      rc.setAttribute('fill', 'var(--bad)'); rc.setAttribute('opacity', '0');
+      q('[data-overg]').appendChild(rc); overRects.push(rc);
+    }
+    const params = (): Params => ({
+      policy: q<HTMLSelectElement>('[data-policy]').value as Policy, metric: q<HTMLSelectElement>('[data-metric]').value as 'cpu' | 'rps',
+      target: val('[data-target]'), warmup: val('[data-warm]'), cooldown: val('[data-cool]'),
+      patient: q<HTMLSelectElement>('[data-scalein]').value === 'patient', min: val('[data-min]'), max: val('[data-max]'),
+    });
+    function recompute() { res = simulate(params(), traffic); schedule(); }
+    function schedule() { if (!raf) raf = requestAnimationFrame(() => { raf = 0; draw(); }); }
+
+    function draw() {
+      const pr = params(); const n = Math.max(1, shown);
+      q('[data-targetval]').textContent = String(pr.target); q('[data-warmval]').textContent = String(pr.warmup); q('[data-coolval]').textContent = String(pr.cooldown);
+      q('[data-minval]').textContent = String(pr.min); q('[data-maxval]').textContent = String(pr.max);
+      const usesMetric = pr.policy !== 'scheduled';
+      q<HTMLSelectElement>('[data-metric]').disabled = !usesMetric; q<HTMLInputElement>('[data-target]').disabled = !usesMetric;
+      const ymax = Math.max(1400, ...res.total.map((x) => x * CAP)) * 1.05;
+      const X = (i: number) => (((i + 0.5) * SVG_W) / N).toFixed(1); const Y = (v: number) => (SVG_H - 14 - (v / ymax) * (SVG_H - 20)).toFixed(1);
+      const pts = (f: (i: number) => number) => Array.from({ length: shown }, (_, i) => `${X(i)},${Y(f(i))}`).join(' ');
+      q('[data-demand]').setAttribute('points', pts((i) => traffic[i]));
+      q('[data-capline]').setAttribute('points', pts((i) => res.ready[i] * CAP));
+      q('[data-booked]').setAttribute('points', pts((i) => res.total[i] * CAP));
+      overRects.forEach((rc, i) => rc.setAttribute('opacity', i < shown && res.over[i] ? '1' : '0'));
+      const cur = q('[data-cursor]'); cur.setAttribute('x1', X(n - 1)); cur.setAttribute('x2', X(n - 1));
+      let drop = 0; let cost = 0; let over = 0;
+      for (let i = 0; i < shown; i++) { drop += res.dropped[i] * 60; cost += res.total[i]; over += res.over[i]; }
+      const i = n - 1; const warming = res.total[i] - res.ready[i];
+      q('[data-clock]').textContent = `minute ${shown} of ${N} · demand ${traffic[i]} req/s`;
+      q('[data-inst]').textContent = String(res.total[i]);
+      q('[data-instnote]').textContent = warming > 0 ? `${res.ready[i]} ready, ${warming} still warming up` : `${res.ready[i]} ready`;
+      const load = Math.round(res.util[i] * 100); q('[data-load]').textContent = `${load}%`;
+      q<HTMLElement>('[data-loadbox]').style.setProperty('--c', load > 100 ? 'var(--bad)' : load > 85 ? 'var(--role-3)' : 'var(--good)');
+      q('[data-drop]').textContent = drop.toLocaleString('en-US');
+      q('[data-dropnote]').textContent = `${over} overloaded minute${over === 1 ? '' : 's'}`;
+      q<HTMLElement>('[data-dropbox]').style.setProperty('--c', drop > 0 ? 'var(--bad)' : 'var(--good)');
+      q('[data-cost]').textContent = cost.toLocaleString('en-US');
+      q('[data-acts]').textContent = String(res.actions[i]);
+      q('[data-flapnote]').textContent = `${res.flaps[i]} flap${res.flaps[i] === 1 ? '' : 's'} (a reversal within 12 minutes)`;
+      q<HTMLElement>('[data-flapbox]').style.setProperty('--c', res.flaps[i] >= 6 ? 'var(--bad)' : 'var(--role-5)');
+      q('[data-run]').textContent = running ? 'Pause' : 'Run';
+    }
+    function stop() { window.clearInterval(timer); timer = undefined; running = false; }
+    function advance() { if (shown >= N) { stop(); } else shown++; schedule(); }
+    function clock() {
+      window.clearInterval(timer); timer = undefined;
+      if (running && onScreen && !document.hidden) timer = window.setInterval(advance, 90);
+    }
+    q('[data-run]').addEventListener('click', () => {
+      if (running) { stop(); schedule(); return; }
+      if (shown >= N) shown = 1;
+      if (reduce) { shown = N; schedule(); return; }
+      running = true; clock(); schedule();
+    });
+    q('[data-step]').addEventListener('click', () => { stop(); if (shown >= N) shown = 1; else shown++; schedule(); });
+    q('[data-end]').addEventListener('click', () => { stop(); shown = N; schedule(); });
+    q('[data-reset]').addEventListener('click', () => { stop(); shown = 1; schedule(); });
+    root.querySelectorAll('select, input[type="range"]').forEach((el) => el.addEventListener('input', recompute));
+    new IntersectionObserver(([en]) => { onScreen = en.isIntersecting; clock(); }).observe(root);
+    document.addEventListener('visibilitychange', clock);
+    recompute();
+  });
+</script>
+<style is:global>
+  .playground .as-chart { width: 100%; height: 190px; display: block; background: var(--surface-2); border: 1px solid var(--border); border-radius: 8px; }
+</style>

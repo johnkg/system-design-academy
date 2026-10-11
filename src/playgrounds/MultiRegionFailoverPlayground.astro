@@ -1,0 +1,141 @@
+---
+import PlaygroundShell from '../components/PlaygroundShell.astro';
+---
+<PlaygroundShell title="Simulate it" hint="Region A dies at 25 s while shoppers write about 10 orders a second. Choose how the standby is fed and how traffic moves, then fail the region and read off RTO, RPO and split brain.">
+  <ol class="how">
+    <li>With the defaults (async, warm standby, 60 s TTL, checks every 10 s x 3) press <b>Fail region A</b>. Recovery takes about <b>129 s</b> (RTO), <b>7 acknowledged writes</b> are lost to replication lag (RPO), and when A comes back <b>170 writes</b> land on the old primary: split brain.</li>
+    <li>Tick <b>Fence the old primary</b>. The RTO and the lost writes do not change, but the 170 split-brain writes become <b>rejected</b> instead of accepted.</li>
+    <li>Switch replication to <b>Sync</b>: no acknowledged write is lost (RPO 0), but every write now pays the cross-region round trip. Raise the async lag to 3000 ms instead and the lost tail grows to dozens of writes.</li>
+    <li>Make recovery fast: <b>Hot standby</b>, TTL <b>5 s</b>, checks every <b>5 s</b> with threshold <b>2</b>. The RTO drops to about <b>12 s</b>. Now pick TTL <b>3600 s</b> and watch the DNS tail dominate: roughly an hour.</li>
+  </ol>
+  <div class="pg mrf" data-mrf>
+    <div class="pg-row">
+      <label>Replication <select class="pg-in" data-sync><option value="async" selected>Async (ack in A, copy later)</option><option value="sync">Sync (ack after B has it)</option></select></label>
+      <label>Async lag (ms) <input type="range" min="100" max="3000" step="100" value="500" data-lag /> <b data-lagval>500</b></label>
+      <label>DNS TTL <select class="pg-in" data-ttl><option value="5000">5 s</option><option value="30000">30 s</option><option value="60000" selected>60 s</option><option value="300000">5 min</option><option value="3600000">1 hour</option></select></label>
+    </div>
+    <div class="pg-row">
+      <label>Health check every <select class="pg-in" data-interval><option value="1000">1 s</option><option value="5000">5 s</option><option value="10000" selected>10 s</option><option value="30000">30 s</option><option value="60000">60 s</option></select></label>
+      <label>Failures to declare dead <select class="pg-in" data-threshold><option value="1">1</option><option value="2">2</option><option value="3" selected>3</option><option value="4">4</option><option value="5">5</option></select></label>
+      <label>Standby <select class="pg-in" data-standby><option value="2000">Hot (active-active, 2 s)</option><option value="45000" selected>Warm (45 s to scale up)</option><option value="300000">Pilot light (5 min)</option><option value="1200000">Cold restore (20 min)</option></select></label>
+      <label>Seed <input class="pg-in" type="number" min="1" max="9999" value="42" data-seed aria-label="Random seed" /></label>
+      <label class="mrf-check"><input type="checkbox" data-fence /> Fence the old primary</label>
+    </div>
+    <div class="pg-row"><button class="btn" type="button" data-run>Fail region A</button><button class="btn" type="button" data-reset>Reset</button></div>
+    <div class="mrf-bar" data-bar role="img" aria-label="Timeline of the failover">
+      <span data-seg="up" style="--c: var(--role-2)"></span><span data-seg="detect" style="--c: var(--bad)"></span><span data-seg="promote" style="--c: var(--role-3)"></span><span data-seg="tail" style="--c: var(--role-4)"></span>
+    </div>
+    <p class="pg-note mrf-legend"><span style="--c: var(--role-2)">healthy</span><span style="--c: var(--bad)">outage not yet detected</span><span style="--c: var(--role-3)">promoting standby</span><span style="--c: var(--role-4)">DNS caches expiring</span></p>
+    <div class="pg-grid">
+      <div class="pg-box" data-rtobox><h3>Downtime (RTO)</h3><span class="pg-mono" data-rto>-</span><span class="pg-note" data-rtonote></span></div>
+      <div class="pg-box" data-rpobox><h3>Data lost (RPO)</h3><span class="pg-mono" data-rpo>-</span><span class="pg-note" data-rponote></span></div>
+      <div class="pg-box" data-splitbox><h3>Split brain</h3><span class="pg-mono" data-split>-</span><span class="pg-note" data-splitnote></span></div>
+    </div>
+    <p class="pg-mono" data-times></p>
+    <p class="pg-out" data-out aria-live="polite"></p>
+  </div>
+</PlaygroundShell>
+<script>
+  const FAIL_AT = 25000; const CLIENTS = 100; const SYNC_RTT = 80; const BACK_AFTER_PROMOTE = 15000;
+  interface Params { sync: boolean; lagMs: number; ttlMs: number; intervalMs: number; threshold: number; promoteMs: number; fencing: boolean; seed: number }
+  interface Result { detectAt: number; promoteAt: number; backAt: number; acked: number; lost: number; rpoMs: number; rtoMs: number; p50Ms: number; failed: number; fenced: number; diverged: number }
+
+  function makeRng(seed: number) { let x = seed; return (n: number) => { x = (x * 48271) % 2147483647; return x % n; }; }
+
+  // Pure model: no DOM, deterministic for a given seed.
+  function simulate(p: Params): Result {
+    const rng = makeRng(p.seed);
+    const firstBadCheck = Math.ceil(FAIL_AT / p.intervalMs) * p.intervalMs;
+    const detectAt = firstBadCheck + (p.threshold - 1) * p.intervalMs;
+    const promoteAt = detectAt + p.promoteMs;
+    const backAt = promoteAt + BACK_AFTER_PROMOTE;
+    const recoverAt: number[] = [];
+    for (let c = 0; c < CLIENTS; c++) recoverAt.push(promoteAt + rng(p.ttlMs));
+    const horizon = Math.max(...recoverAt) + 1000;
+    let t = 0; let applied = 0; let acked = 0; let lost = 0; let oldestLost = -1; let failed = 0; let fenced = 0; let diverged = 0;
+    for (;;) {
+      t += 50 + rng(100);
+      if (t >= horizon) break;
+      const client = rng(CLIENTS);
+      const lag = Math.floor((p.lagMs * (50 + rng(100))) / 100);
+      if (t < FAIL_AT) {
+        if (p.sync && t + SYNC_RTT > FAIL_AT) { failed++; continue; }
+        acked++;
+        applied = Math.max(applied, t + (p.sync ? SYNC_RTT : lag));
+        if (!p.sync && applied > FAIL_AT) { lost++; if (oldestLost < 0) oldestLost = t; }
+      } else if (t < recoverAt[client]) {
+        if (t < backAt) failed++;
+        else if (!p.fencing) diverged++;
+        else fenced++; // the old primary's epoch (1) is below the current one (2)
+      }
+    }
+    const sorted = [...recoverAt].sort((a, b) => a - b);
+    return { detectAt, promoteAt, backAt, acked, lost, rpoMs: oldestLost < 0 ? 0 : FAIL_AT - oldestLost, rtoMs: sorted[CLIENTS - 1] - FAIL_AT, p50Ms: sorted[CLIENTS / 2] - FAIL_AT, failed, fenced, diverged };
+  }
+
+  function fmt(ms: number): string {
+    if (ms < 1000) return `${ms} ms`;
+    const s = ms / 1000;
+    if (s < 300) return `${s.toFixed(s < 10 ? 1 : 0)} s`;
+    const m = s / 60;
+    return `${m.toFixed(m < 10 ? 1 : 0)} min`;
+  }
+
+  document.querySelectorAll<HTMLElement>('[data-mrf]').forEach((root) => {
+    const q = <T extends HTMLElement>(s: string) => root.querySelector<T>(s)!;
+    const val = (s: string) => Number(q<HTMLInputElement | HTMLSelectElement>(s).value);
+    let ran = false; let frame = 0;
+
+    function params(): Params {
+      return { sync: q<HTMLSelectElement>('[data-sync]').value === 'sync', lagMs: val('[data-lag]'), ttlMs: val('[data-ttl]'), intervalMs: val('[data-interval]'), threshold: val('[data-threshold]'), promoteMs: val('[data-standby]'), fencing: q<HTMLInputElement>('[data-fence]').checked, seed: Math.max(1, Math.floor(val('[data-seed]')) || 1) };
+    }
+    function clear() {
+      ['[data-rto]', '[data-rpo]', '[data-split]'].forEach((s) => { q(s).textContent = '-'; });
+      ['[data-rtonote]', '[data-rponote]', '[data-splitnote]', '[data-times]'].forEach((s) => { q(s).textContent = ''; });
+      q('[data-out]').textContent = 'Press "Fail region A" to run the failover.';
+      ['up', 'detect', 'promote', 'tail'].forEach((k) => { q(`[data-seg="${k}"]`).style.width = k === 'up' ? '100%' : '0%'; });
+      q<HTMLElement>('[data-rtobox]').style.setProperty('--c', 'var(--border)');
+      q<HTMLElement>('[data-rpobox]').style.setProperty('--c', 'var(--border)');
+      q<HTMLElement>('[data-splitbox]').style.setProperty('--c', 'var(--border)');
+    }
+    function draw() {
+      frame = 0;
+      q('[data-lagval]').textContent = String(val('[data-lag]'));
+      q<HTMLInputElement>('[data-lag]').disabled = q<HTMLSelectElement>('[data-sync]').value === 'sync';
+      if (!ran) { clear(); return; }
+      const p = params(); const r = simulate(p);
+      const total = r.rtoMs + FAIL_AT; // timeline runs from 0 to the last client recovered
+      const pct = (a: number, b: number) => `${(((b - a) / total) * 100).toFixed(2)}%`;
+      q('[data-seg="up"]').style.width = pct(0, FAIL_AT);
+      q('[data-seg="detect"]').style.width = pct(FAIL_AT, r.detectAt);
+      q('[data-seg="promote"]').style.width = pct(r.detectAt, r.promoteAt);
+      q('[data-seg="tail"]').style.width = pct(r.promoteAt, total);
+      q('[data-rto]').textContent = fmt(r.rtoMs);
+      q('[data-rtonote]').textContent = `half of shoppers back after ${fmt(r.p50Ms)}; ${r.failed + r.fenced} writes rejected`;
+      q<HTMLElement>('[data-rtobox]').style.setProperty('--c', r.rtoMs > 120000 ? 'var(--bad)' : 'var(--good)');
+      q('[data-rpo]').textContent = p.sync ? '0 writes' : `${r.lost} writes`;
+      q('[data-rponote]').textContent = p.sync ? `every write waits ${SYNC_RTT} ms for region B, so none acknowledged is lost (write latency about 12 ms -> ${12 + SYNC_RTT} ms)` : r.lost === 0 ? `of ${r.acked} acknowledged writes; replication had caught up` : `of ${r.acked} acknowledged writes; the last ${fmt(r.rpoMs)} of data never reached B`;
+      q<HTMLElement>('[data-rpobox]').style.setProperty('--c', r.lost > 0 ? 'var(--bad)' : 'var(--good)');
+      const stale = p.fencing ? r.fenced : r.diverged;
+      q('[data-split]').textContent = p.fencing ? `${r.fenced} rejected` : `${r.diverged} accepted`;
+      q('[data-splitnote]').textContent = stale === 0 ? 'no shopper still pointed at A when it came back' : p.fencing ? 'A returned with epoch 1; storage requires epoch 2, so its writes are refused' : 'A returned still believing it is primary and took writes B does not have: two histories to reconcile';
+      q<HTMLElement>('[data-splitbox]').style.setProperty('--c', !p.fencing && r.diverged > 0 ? 'var(--bad)' : 'var(--good)');
+      q('[data-times]').textContent = `A fails 25 s · declared dead ${fmt(r.detectAt)} · standby ready ${fmt(r.promoteAt)} · A returns ${fmt(r.backAt)}`;
+      q('[data-out]').textContent = `Downtime ${fmt(r.rtoMs)} until every shopper is served again, ${p.sync ? 'no' : r.lost} acknowledged writes lost, ${p.fencing ? `${r.fenced} stale writes fenced off` : `${r.diverged} split-brain writes accepted by the old primary`}.`;
+    }
+    function schedule() { if (!frame) frame = requestAnimationFrame(draw); }
+    root.querySelectorAll('select, input').forEach((el) => el.addEventListener('input', schedule));
+    root.querySelectorAll('select, input').forEach((el) => el.addEventListener('change', schedule));
+    q('[data-run]').addEventListener('click', () => { ran = true; draw(); });
+    q('[data-reset]').addEventListener('click', () => { ran = false; draw(); });
+    draw();
+  });
+</script>
+<style is:global>
+  .playground .mrf-check { display: inline-flex; align-items: center; gap: 6px; }
+  .playground .mrf-legend { display: flex; flex-wrap: wrap; gap: 4px 14px; }
+  .playground .mrf-legend span::before { content: ''; display: inline-block; width: 10px; height: 10px; margin-right: 5px; border-radius: 2px; background: var(--c); }
+  .playground .mrf-bar { display: flex; height: 18px; border: 1px solid var(--border); border-radius: 6px; overflow: hidden; background: var(--surface-2); margin: 8px 0 4px; }
+  .playground .mrf-bar span { display: block; height: 100%; background: var(--c); transition: width .25s ease; }
+  @media (prefers-reduced-motion: reduce) { .playground .mrf-bar span { transition: none; } }
+</style>

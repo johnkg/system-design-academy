@@ -1,0 +1,141 @@
+---
+import PlaygroundShell from '../../components/PlaygroundShell.astro';
+---
+<PlaygroundShell title="Crash in the middle of a transfer" hint="60 transfers move money between 24 wallets on 4 shards, and every seventh one is hit by a crash. Pick how the transfer is made and see whether money is lost, stuck or blocked.">
+  <ol class="how">
+    <li>Start with <b>debit, then credit</b> and the crash on: the crashed transfers have taken the money from the sender and never paid the recipient. About <b>190 units simply disappear</b>, and nothing in the system records it.</li>
+    <li>Switch to <b>two-phase commit</b>: no money is lost, but the wallets in the crashed transfers stay locked for the whole <b>30 s</b> that the coordinator is down, and a lot of other transfers <b>wait for them</b>. Lower the downtime to 2 s and 13 transfers waiting up to 30 s become 8 waiting up to 1.6 s.</li>
+    <li>Switch to a <b>saga</b>: nothing is locked, the transfers are finished from the log after the restart, and the money is only <b>in flight</b> for a while. Tick <b>closed recipients</b> and the saga refunds the sender instead of losing the money.</li>
+    <li>Switch to the <b>single writer per account</b>: a standby takes over the partition after at most 3 s whatever the downtime, so about 31 transfers wait but never longer than 3 s; the credit is applied from the log and retries are ignored. Tick <b>clients retry</b> with the first option to see people charged twice.</li>
+  </ol>
+  <div class="pg dwb" data-dwb>
+    <div class="pg-row">
+      <label>How the transfer is made <select class="pg-in" data-how>
+        <option value="naive" selected>debit, then credit (nothing else)</option>
+        <option value="2pc">two-phase commit</option>
+        <option value="saga">saga with compensation</option>
+        <option value="single">single writer per account (log + stream)</option>
+      </select></label>
+      <label>What crashes <select class="pg-in" data-crash>
+        <option value="none">nothing</option>
+        <option value="mid" selected>a process dies in the middle of every seventh transfer</option>
+      </select></label>
+      <label>Downtime of the crashed process (seconds) <input type="range" min="1" max="120" value="30" data-down /> <b data-downval></b></label>
+    </div>
+    <div class="pg-row">
+      <label><input type="checkbox" data-closed /> Two recipient wallets are closed</label>
+      <label><input type="checkbox" data-retry /> Clients retry every fifth transfer after a timeout</label>
+    </div>
+    <div class="pg-grid">
+      <div class="pg-box" data-b1><h3>Money created or lost</h3><span class="pg-mono" data-o1></span><span class="pg-note" data-n1></span></div>
+      <div class="pg-box" data-b2><h3>Stuck in flight when traffic stops (6 s)</h3><span class="pg-mono" data-o2></span><span class="pg-note" data-n2></span></div>
+      <div class="pg-box" data-b3><h3>Latency of one cross-shard transfer</h3><span class="pg-mono" data-o3></span><span class="pg-note" data-n3></span></div>
+      <div class="pg-box" data-b4><h3>Transfers blocked by the crash</h3><span class="pg-mono" data-o4></span><span class="pg-note" data-n4></span></div>
+    </div>
+    <div class="pg-box" data-b5><h3>What happened to the crashed transfers</h3><span class="pg-mono" data-o5></span></div>
+    <p class="pg-out" data-verdict aria-live="polite"></p>
+    <p class="pg-note">Model: 24 wallets of 100 units (2,400 in total), wallet w lives on shard w mod 4, and a transfer arrives every 0.1 s. A write to disk costs 3 ms and a round trip between services 2 ms. In two-phase commit the wallets of a crashed transfer stay locked until the coordinator is back, and a later transfer touching one of them waits. A saga holds no locks. The single writer is replaced by a standby after 3 s, or sooner if the downtime is shorter, and the whole partition waits for that time. Transfers that wait are still applied afterwards, so waiting never changes the totals.</p>
+  </div>
+</PlaygroundShell>
+<script>
+  document.querySelectorAll<HTMLElement>('[data-dwb]').forEach((root) => {
+    const q = <T extends HTMLElement>(s: string) => root.querySelector<T>(s)!;
+    const ACC = 24; const SHARDS = 4; const START = 100; const COUNT = 60; const GAP = 0.1; const END = COUNT * GAP;
+    const RTT = 2; const SYNC = 3; const FAILOVER = 3; const CLOSED = [5, 14];
+    let seed = 11; const rnd = (n: number) => { seed = (seed * 1664525 + 1013904223) % 4294967296; return Math.floor(seed / 65536) % n; };
+    type Tx = { id: number; from: number; to: number; amt: number; at: number };
+    const txs: Tx[] = Array.from({ length: COUNT }, (_, id) => { const from = rnd(ACC); return { id, from, to: (from + 1 + rnd(ACC - 1)) % ACC, amt: 10 + rnd(61), at: id * GAP }; });
+
+    type Opts = { how: string; crash: boolean; down: number; closed: boolean; retry: boolean };
+    function sim(o: Opts) {
+      const bal: number[] = new Array(ACC).fill(START);
+      const closed = (w: number) => o.closed && CLOSED.includes(w);
+      const crashes = (t: Tx) => o.crash && t.id % 7 === 3;
+      const retries = (t: Tx) => o.retry && t.id % 5 === 1;
+      let lost = 0; let flightAmt = 0; let flightN = 0; let rejected = 0; let refunded = 0; let ignored = 0; let twice = 0; let completed = 0; let crashed = 0;
+      const fates: string[] = [];
+      const lockedUntil = new Map<number, number>(); // two-phase commit: wallet -> time its lock is released
+      const stalledUntil: number[] = new Array(SHARDS).fill(0); // single writer: partition -> time the standby has taken over
+      const waits: number[] = [];
+      const fate = (t: Tx, text: string) => { if (crashes(t)) { crashed++; if (fates.length < 6) fates.push(`#${t.id}, ${t.amt} from wallet ${t.from} to wallet ${t.to}: ${text}`); } };
+      const inFlight = (t: Tx, until: number) => { if (until > END) { flightAmt += t.amt; flightN++; } };
+      for (const t of txs) {
+        const a = t.from; const b = t.to; const cross = a % SHARDS !== b % SHARDS;
+        if (o.how !== 'naive' && retries(t)) ignored++;
+        if (o.how === 'naive') {
+          for (let r = 0; r < (retries(t) ? 2 : 1); r++) {
+            if (bal[a] < t.amt) { if (r === 0) { rejected++; fate(t, 'rejected, not enough money'); } break; }
+            bal[a] -= t.amt;
+            const dies = r === 0 && crashes(t) && cross;
+            if (dies || (closed(b) && cross)) { lost += t.amt; if (r === 0) fate(t, dies ? 'debited, then the process died: the money is gone' : 'debited, then a closed wallet refused the credit: the money is gone'); continue; }
+            bal[b] += t.amt;
+            if (r === 1) twice++; else { completed++; fate(t, cross ? 'both steps ran before the crash point' : 'same shard, one local transaction: nothing to lose'); }
+          }
+        } else if (o.how === '2pc') {
+          const wait = Math.max(0, (lockedUntil.get(a) ?? 0) - t.at, (lockedUntil.get(b) ?? 0) - t.at);
+          if (wait > 0) waits.push(wait);
+          if (bal[a] < t.amt || closed(b)) { rejected++; fate(t, 'a participant voted no in the prepare phase: nothing moved'); continue; }
+          bal[a] -= t.amt; bal[b] += t.amt; completed++;
+          if (crashes(t) && cross) {
+            const until = t.at + o.down; lockedUntil.set(a, Math.max(lockedUntil.get(a) ?? 0, until)); lockedUntil.set(b, Math.max(lockedUntil.get(b) ?? 0, until));
+            inFlight(t, until); fate(t, `both wallets prepared and locked for ${o.down} s until the coordinator is back, then committed`);
+          } else fate(t, cross ? 'committed before the crash point' : 'same shard, one local transaction: nothing to recover');
+        } else if (o.how === 'saga') {
+          if (bal[a] < t.amt) { rejected++; fate(t, 'rejected at the debit step'); continue; }
+          if (closed(b) && cross) {
+            refunded++; if (crashes(t)) inFlight(t, t.at + o.down);
+            fate(t, 'debited, the credit was refused, so the compensation refunded the sender'); continue;
+          }
+          bal[a] -= t.amt; bal[b] += t.amt; completed++;
+          if (crashes(t) && cross) { inFlight(t, t.at + o.down); fate(t, `debited, the log says the credit is next: done ${o.down} s later after the restart`); }
+          else fate(t, cross ? 'both steps ran before the crash point' : 'same shard, one local transaction: nothing to recover');
+        } else {
+          const p = a % SHARDS; const wait = Math.max(0, stalledUntil[p] - t.at);
+          if (wait > 0) waits.push(wait);
+          if (bal[a] < t.amt || closed(b)) { rejected++; fate(t, 'rejected by the writer before anything was appended'); continue; }
+          bal[a] -= t.amt; bal[b] += t.amt; completed++;
+          if (crashes(t)) {
+            const fo = Math.min(o.down, FAILOVER); stalledUntil[p] = Math.max(stalledUntil[p], t.at + fo);
+            if (cross) inFlight(t, t.at + fo);
+            fate(t, `appended to the log, so the standby replays it after ${fo} s${cross ? ' and the stream delivers the credit' : ''}`);
+          } else fate(t, 'applied');
+        }
+      }
+      const total = bal.reduce((x, y) => x + y, 0);
+      // Latency until both balances are final, for a transfer that crosses shards.
+      const ms = o.how === 'naive' ? 2 * (RTT + SYNC) : o.how === '2pc' ? 2 * (RTT + SYNC) + SYNC : o.how === 'saga' ? SYNC + 2 * (RTT + SYNC) : (RTT + SYNC) + (RTT + SYNC);
+      const ack = o.how === 'single' ? RTT + SYNC : ms;
+      return { total, delta: total - ACC * START, lost, flightAmt, flightN, rejected, refunded, ignored, twice, completed, crashed, ms, ack, blocked: waits.length, blockedMax: waits.reduce((m, w) => Math.max(m, w), 0), blockedSum: waits.reduce((x, y) => x + y, 0), fates };
+    }
+
+    const fmt = (n: number) => n.toLocaleString('en-US');
+    function draw() {
+      const o: Opts = { how: q<HTMLSelectElement>('[data-how]').value, crash: q<HTMLSelectElement>('[data-crash]').value === 'mid', down: Number(q<HTMLInputElement>('[data-down]').value), closed: q<HTMLInputElement>('[data-closed]').checked, retry: q<HTMLInputElement>('[data-retry]').checked };
+      q('[data-downval]').textContent = `${o.down} s`;
+      const r = sim(o);
+      q('[data-o1]').textContent = r.delta === 0 ? 'none: the total is still 2,400' : `${fmt(-r.delta)} lost (total ${fmt(r.total)})`;
+      q('[data-n1]').textContent = r.delta === 0 ? `${fmt(r.completed)} transfers done, ${fmt(r.rejected)} rejected, ${fmt(r.refunded)} refunded` : `${fmt(r.completed)} done, ${fmt(r.rejected)} rejected${r.twice ? `, ${r.twice} charged twice` : ''}. Nothing records where the money went`;
+      q('[data-o2]').textContent = r.flightAmt === 0 ? 'nothing' : `${fmt(r.flightAmt)} in ${r.flightN} transfer${r.flightN === 1 ? '' : 's'}`;
+      q('[data-n2]').textContent = o.how === 'naive' ? 'a lost transfer is not in flight, it is gone' : o.how === '2pc' ? 'held by locks until the coordinator returns' : o.how === 'saga' ? 'debited, waiting for the log to be replayed' : 'appended, waiting for the stream to deliver it';
+      q('[data-o3]').textContent = o.how === 'single' ? `${r.ack} ms to confirm, ${r.ms} ms to be final` : `${r.ms} ms`;
+      q('[data-n3]').textContent = o.how === 'naive' ? '2 round trips with 2 disk writes' : o.how === '2pc' ? 'prepare, decision, commit: 2 round trips and 3 disk writes, holding locks' : o.how === 'saga' ? 'intent, debit, credit: 2 round trips and 3 disk writes, no locks' : 'one append for the sender, then one hop and one append for the receiver';
+      q('[data-o4]').textContent = r.blocked === 0 ? 'none' : `${r.blocked} waiting, longest ${r.blockedMax.toFixed(1)} s`;
+      q('[data-n4]').textContent = r.blocked === 0 ? (o.crash ? 'nothing else needed the affected wallets or partitions' : 'no crash, no waiting') : `${r.blockedSum.toFixed(1)} s of waiting added up`;
+      q('[data-o5]').textContent = o.crash ? (r.fates.join('\n') + (r.crashed > r.fates.length ? `\n... ${r.crashed - r.fates.length} more` : '')) : 'no crash';
+      q<HTMLElement>('[data-b1]').style.setProperty('--c', r.delta === 0 ? 'var(--good)' : 'var(--bad)');
+      q<HTMLElement>('[data-b2]').style.setProperty('--c', r.flightAmt === 0 ? 'var(--good)' : 'var(--accent)');
+      q<HTMLElement>('[data-b3]').style.setProperty('--c', 'var(--accent)');
+      q<HTMLElement>('[data-b4]').style.setProperty('--c', r.blocked === 0 ? 'var(--good)' : 'var(--bad)');
+      const out = q('[data-verdict]'); const bad = r.delta !== 0 || r.twice > 0 || r.blocked > 0; out.classList.toggle('bad', bad);
+      const parts: string[] = [];
+      if (r.delta !== 0) parts.push(`${fmt(-r.delta)} units of money have been destroyed, because a debit was never matched by a credit`);
+      if (r.twice > 0) parts.push(`${r.twice} senders were charged twice by a retry`);
+      if (r.delta === 0 && r.twice === 0) parts.push(`the money is conserved: 2,400 in, 2,400 out, and no wallet went below zero${r.ignored ? `, and ${r.ignored} repeated requests were recognised and ignored` : ''}`);
+      if (r.blocked > 0) parts.push(`${r.blocked} other transfers had to wait, up to ${r.blockedMax.toFixed(1)} s, for locks that a dead process still held`);
+      if (r.flightAmt > 0 && o.how !== 'naive') parts.push(`${fmt(r.flightAmt)} units are in flight at the end of the burst, safe in a log, and arrive after the restart`);
+      out.textContent = parts.join('; ').replace(/^./, (c) => c.toUpperCase()) + '.';
+    }
+    root.addEventListener('input', draw); root.addEventListener('change', draw);
+    draw();
+  });
+</script>

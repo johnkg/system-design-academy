@@ -131,6 +131,26 @@ export const problems: Problem[] = [
   { text: 'Update data in several databases so that it all commits or none of it does', patterns: [
     { slug: 'two-phase-commit', why: 'Prepare and commit phases give strict atomicity, at the cost of locks and blocking.' },
     { slug: 'saga', why: 'Give up strict isolation for compensating actions when participants are slow or external.' } ] },
+  { text: 'Release a new version without taking the site down', patterns: [
+    { slug: 'blue-green-and-rolling-deployments', why: 'Replace servers in batches, or switch traffic between two full environments, so users never see an outage.' },
+    { slug: 'canary-deployments', why: 'Send the new version to a few users first, and let measured error rates decide whether to continue.' },
+    { slug: 'health-checks', why: 'Only send traffic to instances that report themselves ready.' } ] },
+  { text: 'Ship code often, but release features when the business is ready', patterns: [
+    { slug: 'feature-flags', why: 'Deploy the code switched off, then turn it on for chosen users, and off again instantly if it misbehaves.' },
+    { slug: 'canary-deployments', why: 'Roll a risky change out to a small share of traffic while watching the results.' } ] },
+  { text: 'Handle traffic spikes without paying for idle servers all day', patterns: [
+    { slug: 'autoscaling', why: 'Add and remove instances from a metric, accepting a delay while new ones warm up.' },
+    { slug: 'horizontal-vs-vertical-scaling', why: 'Scaling out is the precondition: the app must run happily as many copies.' },
+    { slug: 'load-balancing', why: 'New instances only help once the balancer starts sending them requests.' } ] },
+  { text: 'Run many copies of a service and keep them running when machines die', patterns: [
+    { slug: 'containers-and-orchestration', why: 'An orchestrator places containers on machines and replaces them to match the desired count.' },
+    { slug: 'health-checks', why: 'Liveness and readiness probes tell the orchestrator what to restart and what to route to.' } ] },
+  { text: 'Build the same environment every time, and see what a change will do before it happens', patterns: [
+    { slug: 'infrastructure-as-code', why: 'Describe infrastructure in versioned files, review a plan, then apply it, and detect hand-made drift.' } ] },
+  { text: 'Survive an entire region or data centre going down', patterns: [
+    { slug: 'multi-region-failover', why: 'Decide the recovery time and data loss you can accept, then pick a standby and a failover method.' },
+    { slug: 'database-replication', why: 'Replication lag decides how many recent writes are lost on failover.' },
+    { slug: 'dns', why: 'DNS time-to-live decides how long clients keep going to the failed region.' } ] },
 ];
 
 export const confusions: Confusion[] = [
@@ -347,5 +367,29 @@ export const confusions: Confusion[] = [
       { aspect: 'Best for', values: ['A few fast, reliable databases', 'Long-running work across many services', 'Metadata, locks and replicated state'] },
     ],
     rule: 'Use consensus to make a single coordinator reliable, two-phase commit for strict atomicity across a few stores, and sagas when services are many, slow or outside your control.',
+  },
+  {
+    title: 'Blue-green, rolling or canary?',
+    blurb: 'Three ways to put a new version into production. They trade speed, cost and how much risk users carry.',
+    patterns: ['blue-green-and-rolling-deployments', 'canary-deployments', 'feature-flags'],
+    rows: [
+      { aspect: 'What changes', values: ['Where the traffic goes: a whole environment, or a few servers at a time', 'How much traffic the new version gets, in measured stages', 'Which users see a feature, without redeploying the code'] },
+      { aspect: 'Rollback', values: ['Flip the router back (blue-green) or reverse the batches (rolling)', 'Route all traffic back to the stable version', 'Switch the flag off, in seconds'] },
+      { aspect: 'Extra cost', values: ['A second full environment for blue-green; a little extra capacity for rolling', 'A small separate group of canary instances and a good metrics gate', 'A flag service, plus cleanup of old flags'] },
+      { aspect: 'Catches problems that only show under real traffic', values: ['Only after the switch, though blue-green rolls back instantly', 'Yes, on a small share first', 'Yes, per user group'] },
+    ],
+    rule: 'They stack. Use a rolling or blue-green method to replace servers safely, a canary to learn whether the new version is healthy before everyone gets it, and a flag to decouple the release of a feature from the deploy.',
+  },
+  {
+    title: 'Autoscaling, orchestration or infrastructure as code?',
+    blurb: 'Three automation layers that are often described in the same breath. Each decides something different.',
+    patterns: ['autoscaling', 'containers-and-orchestration', 'infrastructure-as-code'],
+    rows: [
+      { aspect: 'Decides', values: ['How many copies should run right now, from a metric', 'Which machine runs each copy, and replaces copies that die', 'What machines, networks and databases exist at all'] },
+      { aspect: 'Reacts to', values: ['Load: CPU, requests, queue depth, a schedule', 'The gap between the desired and the actual state', 'A reviewed change to a configuration file'] },
+      { aspect: 'Timescale', values: ['Seconds to minutes, with warm-up and cooldown', 'Seconds', 'Minutes to hours, when a person applies a change'] },
+      { aspect: 'Typical failure', values: ['Flapping, or scaling too late for a spike', 'Pods that cannot be placed, or are evicted for lack of memory', 'A rename or immutable change that destroys and recreates a resource'] },
+    ],
+    rule: 'Infrastructure as code creates the cluster, the orchestrator runs the containers on it, and autoscaling changes how many of them there are. A problem in one layer often shows up as a symptom in another.',
   },
 ];

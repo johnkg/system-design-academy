@@ -1,0 +1,112 @@
+---
+import PlaygroundShell from '../../components/PlaygroundShell.astro';
+---
+<PlaygroundShell title="Cold starts, caps and the bill" hint="Ten minutes of the same seeded traffic hit one function. Change how the platform keeps sandboxes warm and watch cold starts, latency, rejected requests and cost move.">
+  <ol class="how">
+    <li>With <b>spiky traffic</b> and the defaults (60 s idle timeout, no provisioned instances, 800 ms start, cap 100) the platform has <b>300 cold starts</b> and <b>rejects 383 of 4,500 requests</b>. While a new sandbox is starting it counts against the cap and cannot take work, so a slow start also eats concurrency.</li>
+    <li>Raise the idle timeout to <b>240 s</b>. The silence between spikes is 234 s, so the sandboxes from the first spike are still alive for the second: <b>cold starts fall to 101</b> and the p95 drops from 881 ms to 147 ms. At 210 s they have already been reaped.</li>
+    <li>Switch to <b>steady</b> and set <b>provisioned to 30</b>: <b>no cold starts at all</b>, but the bill goes up about 2.6 times, because you pay for 30 instances for all ten minutes. Provisioned instances pay off for steady traffic and are wasted on a six-second spike.</li>
+  </ol>
+  <div class="pg slb" data-slb>
+    <div class="pg-row">
+      <label>Traffic <select class="pg-in" data-pat>
+        <option value="steady">steady: 40 requests per second</option>
+        <option value="bursty">bursty: bursts of 150 per second every 90 s</option>
+        <option value="spiky" selected>spiky after silence: 250 per second for 6 s, then quiet for 234 s</option>
+      </select></label>
+      <label>Keep-warm idle timeout (s) <input type="range" min="0" max="600" step="30" value="60" data-idle /> <b data-idleval></b></label>
+      <label>Provisioned concurrency <input type="range" min="0" max="100" step="5" value="0" data-prov /> <b data-provval></b></label>
+      <label>Instance start time (ms) <input type="range" min="100" max="3000" step="100" value="800" data-init /> <b data-initval></b></label>
+      <label>Concurrency cap <input type="range" min="10" max="400" step="10" value="100" data-cap /> <b data-capval></b></label>
+    </div>
+    <div class="pg-grid">
+      <div class="pg-box" data-b1><h3>Cold starts</h3><span class="pg-mono" data-o1></span><span class="pg-note" data-n1></span></div>
+      <div class="pg-box" data-b2><h3>Latency of served requests</h3><span class="pg-mono" data-o2></span><span class="pg-note" data-n2></span></div>
+      <div class="pg-box" data-b3><h3>Throttled requests</h3><span class="pg-mono" data-o3></span><span class="pg-note" data-n3></span></div>
+      <div class="pg-box" data-b4><h3>Cost for the ten minutes</h3><span class="pg-mono" data-o4></span><span class="pg-note" data-n4></span></div>
+    </div>
+    <div class="slb-strip" data-strip role="img" aria-label="Live sandboxes over time"></div>
+    <p class="pg-note slb-axis"><span>0 min</span><span>live sandboxes in each 10 s slice (red: requests were rejected)</span><span>10 min</span></p>
+    <p class="pg-out" data-verdict aria-live="polite"></p>
+    <p class="pg-note">Model: a request needs a free sandbox, which handles one request at a time. Otherwise a new sandbox is started, if fewer than the cap exist, and the request waits for the start and then runs. Requests that find the cap reached are rejected. Run times are 50 to 149 ms. A sandbox is reaped when it has been idle for longer than the timeout, and the most recently used free sandbox is chosen so that the others can age out. Provisioned instances are ready from the start, never reaped and used first. Cost uses $0.0000166667 per GB-second on a 1 GB function, billing the start time of cold starts too, $0.20 per million requests, and $0.0000041667 per GB-second for each provisioned instance. The cost of ordinary warm sandboxes is not on your bill; it is memory the platform holds for you.</p>
+  </div>
+</PlaygroundShell>
+<style>
+  .slb-strip { display: flex; align-items: flex-end; gap: 2px; height: 72px; margin-top: 14px; padding: 4px; background: var(--surface-2); border: 1px solid var(--border); border-radius: 8px; }
+  .slb-strip :global(i) { flex: 1; display: block; min-height: 2px; border-radius: 2px 2px 0 0; background: var(--accent); }
+  .slb-strip :global(i.hot) { background: var(--bad); }
+  .slb-axis { display: flex; justify-content: space-between; gap: 12px; margin-top: 4px; }
+</style>
+<script>
+  document.querySelectorAll<HTMLElement>('[data-slb]').forEach((root) => {
+    const q = <T extends HTMLElement>(s: string) => root.querySelector<T>(s)!;
+    const END = 600 * 1000; const SLICES = 60;
+    type Req = { t: number; ms: number; n: number };
+    const cache: Record<string, Req[]> = {};
+    function traffic(pattern: string): Req[] {
+      if (cache[pattern]) return cache[pattern];
+      let seed = 7; const random = (n: number) => { seed = (seed * 1664525 + 1013904223) % 4294967296; return Math.floor(seed / 65536) % n; };
+      const reqs: Req[] = [];
+      for (let s = 0; s < 600; s++) {
+        let rate = 40;
+        if (pattern === 'bursty') rate = s % 90 < 8 ? 150 : 15;
+        if (pattern === 'spiky') rate = [30, 270, 510].some((a) => s >= a && s < a + 6) ? 250 : 0;
+        for (let i = 0; i < rate; i++) reqs.push({ t: s * 1000 + random(1000), ms: 50 + random(100), n: reqs.length });
+      }
+      return (cache[pattern] = reqs.sort((a, b) => a.t - b.t || a.n - b.n));
+    }
+    type Inst = { start: number; busy: number; kept: boolean };
+    function simulate(reqs: Req[], idleS: number, prov: number, initMs: number, cap: number) {
+      const idle = idleS * 1000; const lives: [number, number][] = []; const hot = new Array(SLICES).fill(false);
+      let pool: Inst[] = Array.from({ length: prov }, () => ({ start: 0, busy: 0, kept: true }));
+      let cold = 0; let thr = 0; let billed = 0; let idleMs = 0; const lat: number[] = [];
+      for (const r of reqs) {
+        pool = pool.filter((x) => { const dead = !x.kept && x.busy <= r.t && x.busy + idle < r.t; if (dead) { idleMs += idle; lives.push([x.start, x.busy + idle]); } return !dead; });
+        let best: Inst | null = null;
+        for (const x of pool) if (x.busy <= r.t && (!best || (x.kept ? 1e12 : 0) + x.busy > (best.kept ? 1e12 : 0) + best.busy)) best = x;
+        if (best) { if (!best.kept) idleMs += r.t - best.busy; best.busy = r.t + r.ms; lat.push(r.ms); billed += r.ms; }
+        else if (pool.length < cap) { cold++; pool.push({ start: r.t, busy: r.t + initMs + r.ms, kept: false }); lat.push(initMs + r.ms); billed += initMs + r.ms; }
+        else { thr++; hot[Math.min(SLICES - 1, Math.floor(r.t / 10000))] = true; }
+      }
+      for (const x of pool) { if (!x.kept) idleMs += Math.max(0, Math.min(idle, END - x.busy)); lives.push([x.start, x.kept ? END : Math.min(END, x.busy + idle)]); }
+      lat.sort((a, b) => a - b);
+      const pct = (p: number) => (lat.length ? lat[Math.floor((lat.length * p + 99) / 100) - 1] : 0);
+      const run = Math.floor(billed / 60); const provFee = Math.floor((prov * END) / 240); const fee = Math.floor(lat.length / 5);
+      const counts = Array.from({ length: SLICES }, (_, i) => lives.filter(([a, b]) => a < (i + 1) * 10000 && b > i * 10000).length);
+      return { n: reqs.length, cold, thr, served: lat.length, p50: pct(50), p95: pct(95), p99: pct(99), idleS: Math.floor(idleMs / 1000), run, provFee, fee, cost: run + provFee + fee, counts, hot };
+    }
+    const bars = Array.from({ length: SLICES }, () => { const b = document.createElement('i'); q('[data-strip]').append(b); return b; });
+    const num = (s: string) => Number(q<HTMLInputElement>(s).value);
+    const fmt = (n: number) => n.toLocaleString('en-US');
+    const dollars = (micro: number) => `$${(micro / 1e6).toFixed(4)}`;
+    function draw() {
+      const pat = q<HTMLSelectElement>('[data-pat]').value; const idleS = num('[data-idle]'); const prov = num('[data-prov]'); const init = num('[data-init]'); const cap = num('[data-cap]');
+      ['idle', 'prov', 'init', 'cap'].forEach((k) => (q(`[data-${k}val]`).textContent = String(num(`[data-${k}]`))));
+      const r = simulate(traffic(pat), idleS, prov, init, cap);
+      q('[data-o1]').textContent = `${fmt(r.cold)} of ${fmt(r.n)} requests`;
+      q('[data-n1]').textContent = r.cold === 0 ? 'every request found a warm sandbox' : `each added ${init} ms; ${(100 * r.cold / r.n).toFixed(1)}% of requests`;
+      q('[data-o2]').textContent = `p50 ${r.p50} / p95 ${r.p95} / p99 ${r.p99} ms`;
+      q('[data-n2]').textContent = r.p99 > r.p50 * 3 ? 'the tail is cold starts, not slow code' : 'a warm request takes 50 to 149 ms';
+      q('[data-o3]').textContent = `${fmt(r.thr)} (${(100 * r.thr / r.n).toFixed(1)}%)`;
+      q('[data-n3]').textContent = r.thr === 0 ? 'the cap was never reached' : `the cap of ${cap} was reached`;
+      q('[data-o4]').textContent = dollars(r.cost);
+      q('[data-n4]').textContent = `run time ${dollars(r.run)}, provisioned ${dollars(r.provFee)}, requests ${dollars(r.fee)}; ordinary warm sandboxes idled ${fmt(r.idleS)} s in total, paid by the platform`;
+      const max = Math.max(1, ...r.counts);
+      bars.forEach((b, i) => { b.style.height = `${Math.max(2, Math.round((100 * r.counts[i]) / max))}%`; b.classList.toggle('hot', r.hot[i]); });
+      q('[data-strip]').setAttribute('aria-label', `Live sandboxes per 10 second slice, at most ${max}`);
+      q<HTMLElement>('[data-b1]').style.setProperty('--c', r.cold === 0 ? 'var(--good)' : r.cold > r.n / 20 ? 'var(--bad)' : 'var(--accent)');
+      q<HTMLElement>('[data-b2]').style.setProperty('--c', r.p99 > r.p50 * 3 ? 'var(--bad)' : 'var(--good)');
+      q<HTMLElement>('[data-b3]').style.setProperty('--c', r.thr > 0 ? 'var(--bad)' : 'var(--good)');
+      q<HTMLElement>('[data-b4]').style.setProperty('--c', 'var(--accent)');
+      const out = q('[data-verdict]'); out.classList.toggle('bad', r.thr > 0 || r.p99 > r.p50 * 3);
+      out.textContent = r.thr > 0 ? `${fmt(r.thr)} requests were rejected: the platform needed more than ${cap} sandboxes at once, partly because ${r.cold} of them spent ${init} ms starting. Raise the cap, shorten the start, or keep sandboxes warm so that fewer are needed.`
+        : r.p99 > r.p50 * 3 ? `Nothing was rejected, but the slowest 1% of requests take ${r.p99} ms against ${r.p50} ms for the median: those requests paid for a cold start of ${init} ms.`
+        : r.cold === 0 && prov > 0 ? `No cold starts: the ${prov} provisioned instances absorbed the load, and they cost ${dollars(r.provFee)} whether or not requests came.`
+        : 'Warm sandboxes served everything quickly. Try spiky traffic, a short idle timeout or a slow start to see what breaks.';
+    }
+    let queued = false;
+    const later = () => { if (queued) return; queued = true; requestAnimationFrame(() => { queued = false; draw(); }); };
+    root.addEventListener('input', later); root.addEventListener('change', later);
+    draw();
+  });
+</script>

@@ -1,0 +1,185 @@
+{
+  "name": "Design a Container Orchestrator",
+  "difficulty": "advanced",
+  "intent": "Run thousands of containers on thousands of machines from a declared desired state, place each one on a node with room, and heal itself when machines fail, using a replicated store and many small control loops.",
+  "codeTitle": "a scheduler, a replica controller and a node failure detector",
+  "finalIntro": "One deployment going from a request to running pods, and then surviving the death of a node.",
+  "prompt": "Design a cluster scheduler like Kubernetes. Users declare what they want to run, such as 'three copies of this container, each needing half a CPU and 1 GB of memory'. The system must start them on a fleet of 5,000 machines, keep them running when machines or containers fail, let them find each other, and stay responsive as the cluster grows.",
+  "functional": [
+    "Accept a declared desired state, such as the image, the number of replicas and the resources each needs",
+    "Place each container on a machine that has room for it",
+    "Keep the actual state matching the desired state: restart failed containers, and replace those on failed machines",
+    "Detect that a machine has failed and move its work elsewhere",
+    "Give groups of containers a stable name and address, and spread traffic across the healthy ones",
+    "Scale a deployment up or down, and roll out a new version gradually"
+  ],
+  "nonFunctional": [
+    "The record of what should run is never lost and never split into two versions, even if a control plane machine dies",
+    "A pod is placed within seconds, and a burst of thousands of pods is placed within a few minutes",
+    "A failed node's workload is running again in about a minute or two, without evicting healthy nodes during a slow network patch",
+    "Support about 5,000 nodes and 150,000 pods, with heartbeat traffic that does not drown the store",
+    "Running workloads keep running if the control plane is down, and one noisy container cannot starve its neighbours",
+    "Every change is authenticated, authorised and recorded"
+  ],
+  "firstAttempt": {
+    "text": "A deploy script with a list of hosts in a database. To start a service it picks a host, connects with SSH, starts the container and writes 'service A runs on host 7' in the database. A cron job pings every host each minute and restarts services on the hosts that do not answer.",
+    "limits": [
+      "The script decides alone, so two scripts running together can put two containers on the same last free CPU, or start the same service twice",
+      "The database says where things should be, not what is really running, so after any crash the two disagree and nothing fixes it",
+      "Picking the first host with room strands capacity and has no idea about CPU and memory limits, so containers fight over the same machine",
+      "One cron job and one database are single points of failure, and a slow ping makes the cron job restart a healthy host's services",
+      "Services find each other through addresses written by hand, which go stale the moment a container moves"
+    ]
+  },
+  "nodes": [
+    { "id": "users", "label": "kubectl and CI", "kind": "client", "x": 12, "y": 50 },
+    { "id": "script", "label": "Deploy script and a database", "kind": "compute", "x": 50, "y": 50, "at": 0, "until": 1 },
+    { "id": "nodes", "label": "Worker nodes", "kind": "data", "x": 87, "y": 50 },
+    { "id": "etcd", "label": "Replicated store (Raft)", "kind": "data", "x": 62, "y": 50, "at": 1 },
+    { "id": "kubelet", "label": "Kubelets", "kind": "compute", "x": 87, "y": 84, "at": 1 },
+    { "id": "api", "label": "API server", "kind": "edge", "x": 37, "y": 50, "at": 2 },
+    { "id": "watch", "label": "Watch streams", "kind": "async", "x": 37, "y": 84, "at": 2 },
+    { "id": "ctrl", "label": "Controllers", "kind": "compute", "x": 62, "y": 16, "at": 3 },
+    { "id": "sched", "label": "Scheduler", "kind": "compute", "x": 87, "y": 16, "at": 4 },
+    { "id": "nodectl", "label": "Node lifecycle controller", "kind": "compute", "x": 37, "y": 16, "at": 5 },
+    { "id": "proxy", "label": "Service proxy and DNS", "kind": "edge", "x": 62, "y": 84, "at": 6 }
+  ],
+  "edges": [
+    { "from": "users", "to": "script", "at": 0, "until": 1 },
+    { "from": "script", "to": "nodes", "at": 0, "until": 1 },
+    { "from": "users", "to": "etcd", "at": 1, "until": 2 },
+    { "from": "kubelet", "to": "etcd", "at": 1, "until": 2 },
+    { "from": "kubelet", "to": "nodes", "at": 1 },
+    { "from": "users", "to": "api", "at": 2 },
+    { "from": "api", "to": "etcd", "at": 2 },
+    { "from": "kubelet", "to": "api", "at": 2 },
+    { "from": "api", "to": "watch", "at": 2 },
+    { "from": "ctrl", "to": "api", "at": 3 },
+    { "from": "sched", "to": "api", "at": 4 },
+    { "from": "nodectl", "to": "api", "at": 5 },
+    { "from": "proxy", "to": "api", "at": 6 },
+    { "from": "proxy", "to": "nodes", "at": 6 }
+  ],
+  "steps": [
+    {
+      "title": "Keep one record of desired and actual state in a replicated store",
+      "problem": "A database next to a script is a single machine, and it only holds intentions. If it is lost, or two writers disagree, the cluster has no idea what should be running.",
+      "fix": "Put all cluster state, desired and actual, in one small key-value store that is replicated with a consensus protocol such as Raft (this is what etcd is). Three or five members elect a leader, every write goes to the leader, and it is committed once a majority has stored it, so the record survives the loss of a minority of members and never splits in two. Every object has a revision number that grows with each change. Users write the desired state ('three replicas'), and agents on the nodes write the actual state ('this container is running').",
+      "tradeoff": "There is one source of truth that survives machine failures, and a revision order that everything else can build on. A write needs a network round trip to a majority and a disk sync, so the store handles thousands of writes per second and not millions, and it is sized for megabytes to a few gigabytes, so everything stored in it has to be small and carefully chosen.",
+      "concepts": [{ "slug": "consensus" }, { "slug": "quorums" }, { "slug": "leader-election" }]
+    },
+    {
+      "title": "Make one API server the only door, and let clients watch",
+      "problem": "If every tool and every node talks to the store directly, none of them can be authorised or validated, they overload the store, and each one must poll to see what changed.",
+      "fix": "Run a stateless API server in front of the store. It authenticates and authorises the caller, validates the object, and stores it. An update carries the revision it was based on, and is rejected if the object changed in the meantime, so two writers cannot silently overwrite each other (optimistic concurrency). Clients ask to watch a kind of object from a revision, and the server streams every change since then. The API servers keep a cache of the objects in memory and serve both reads and watches from it, so the store sees one watch per API server and not one for every client. Several API servers run behind a load balancer.",
+      "tradeoff": "Security, validation, and a clean way to react to change are in one place, and thousands of watchers cost the store almost nothing. Reads from the cache can be slightly behind the store, so a client that needs the very latest value must ask for it explicitly, and a watcher that falls too far behind must reload the full list.",
+      "concepts": [{ "slug": "api-gateway" }, { "slug": "authentication-and-authorization" }, { "slug": "pub-sub" }, { "slug": "consistency-models" }]
+    },
+    {
+      "title": "Run controllers that reconcile desired state with actual state",
+      "problem": "Somebody has to notice that three replicas are wanted and two exist, and create the missing one, and do it again after every failure, without a single script that has to be right about every possible sequence of events.",
+      "fix": "Each controller is a small loop for one job: a replica controller keeps the number of pods equal to the replica count, a deployment controller manages the replica sets of a rolling update, and so on. A controller watches the objects it cares about, puts the names of changed objects on a work queue, and for each name compares desired with actual and makes one step towards the goal. Because it works from the difference and not from the event, it does not matter if events are duplicated, merged or missed: it also re-lists everything on a timer and reaches the same answer. The controllers elect a leader, so there is one active copy and spare copies ready to take over.",
+      "tradeoff": "The system is self-healing, easy to extend with new controllers, and each loop is simple to reason about. The behaviour emerges from many loops, so it is harder to see why something happened, loops can fight each other if they disagree, and there is a short delay between a change and the reaction.",
+      "concepts": [{ "slug": "idempotency" }, { "slug": "message-queues" }, { "slug": "leader-election" }]
+    },
+    {
+      "title": "Place pods in two stages: filter the nodes, then score them",
+      "problem": "A pod needs a node with enough free CPU and memory, and the choice matters. First-fit strands capacity and piles load onto a few nodes, and a perfect choice across 5,000 nodes for every pod is too slow.",
+      "fix": "Each pod declares requests (what it needs, and what the scheduler reserves) and limits (the most it may use: a CPU limit throttles it, and a memory limit gets it killed). The scheduler watches for pods with no node and handles them one at a time. It filters out the nodes that cannot take the pod (not enough unrequested CPU or memory, wrong labels, taints the pod does not tolerate), scores the remaining ones with a set of plug-in rules (spread across nodes and zones, balanced CPU and memory use, image already present), and binds the pod to the best, which means writing the node name on the pod object. At 5,000 nodes it stops filtering once it has found enough feasible nodes (about 10% of them, and at least 100) and scores only those.",
+      "tradeoff": "Placement is fast, flexible and reasonable, and requests make sure that nodes are not overcommitted on paper. Scoring a sample gives a good node, not the best one. One scheduler placing pods one at a time handles around a hundred pods per second, so a burst of 10,000 takes minutes, and requests that are too high waste a lot of capacity that no pod can use.",
+      "concepts": [{ "slug": "load-balancing" }, { "slug": "horizontal-vs-vertical-scaling" }, { "slug": "bulkhead" }]
+    },
+    {
+      "title": "Run an agent on every node, with heartbeats and eviction",
+      "problem": "Someone has to start the containers, enforce the limits and report what is happening, and the control plane has to find out when a whole node has silently died, without confusing a slow network with a dead machine.",
+      "fix": "A kubelet on each node watches for pods bound to its node, asks the container runtime to start them, runs their health probes, enforces the limits, and writes the status back. It also renews a tiny lease object every 10 seconds as a heartbeat (and posts a full status only every few minutes, or when it changes), which keeps the write load low. A node lifecycle controller watches the leases. If a node has not renewed for the grace period, 40 seconds by default, it marks the node as not ready and taints it. Pods that do not tolerate the taint for longer are evicted, which means they are deleted, and the replica controller creates new ones that the scheduler places elsewhere. Eviction can be rate-limited, and paused when too many nodes fail at once, since that points at the network and not the nodes.",
+      "tradeoff": "A dead node's work moves in about a minute or two, and a short blip does nothing. A shorter grace period recovers faster but evicts healthy nodes when the network is slow, and a longer one leaves pods unavailable for longer. A node cut off from the network keeps running its pods, so for a while the same pod can be running twice, and stateful workloads need fencing.",
+      "concepts": [{ "slug": "health-checks" }, { "slug": "gossip-protocol" }, { "slug": "retries-and-backoff" }, { "slug": "backpressure" }]
+    },
+    {
+      "title": "Give pods stable names and addresses, and keep the control plane light",
+      "problem": "Pods come and go and their addresses change, so clients need a stable name that always leads to healthy pods. At the same time, thousands of nodes watching the same objects can overwhelm the control plane.",
+      "fix": "A service gets a stable virtual address and a DNS name. A controller keeps the list of ready pod addresses for it, split into slices of at most 100 endpoints. A proxy on each node watches those lists and programs the node's packet filter to spread connections over the ready pods, and a DNS service answers names from the same data. Only pods that pass their readiness probe are listed. To keep the control plane light at thousands of nodes, heartbeats are small leases, watches go to the API server caches, endpoint lists are split into slices so that one pod change does not resend a huge list, events and leases can use their own store, and clients are rate-limited and retry with backoff.",
+      "tradeoff": "Clients never track individual pods and a rolling update is invisible to them. Every node still receives every change to the lists it watches, so very large and fast-changing services are expensive. Load balancing happens per connection and not per request, and a stale rule on a node can send a few requests to a pod that has just gone.",
+      "concepts": [{ "slug": "dns" }, { "slug": "proxies" }, { "slug": "caching" }, { "slug": "rate-limiting" }]
+    }
+  ],
+  "failures": [
+    {
+      "scenario": "One control plane member, the store leader, dies",
+      "impact": "Writes stop for a moment, since no leader can commit them.",
+      "answer": "The remaining members notice the missing heartbeats from the leader and elect a new one, which takes a second or two. A majority (two of three, three of five) is still alive, so no committed write is lost and there is no split. Running pods are not affected at all, since kubelets keep running what they have. If a majority is lost, the cluster becomes read-only until members are restored from backups.",
+      "concepts": [{ "slug": "leader-election" }, { "slug": "quorums" }, { "slug": "consensus" }]
+    },
+    {
+      "scenario": "A worker node loses power",
+      "impact": "Its pods are gone, but the control plane still lists them as running.",
+      "answer": "Its lease stops being renewed. After the 40-second grace period the node is marked not ready and tainted, and after the pods' toleration time they are evicted. The replica controller sees fewer pods than desired and creates new ones, which the scheduler places on other nodes with room. Service endpoint lists drop the dead pods as soon as the node is marked not ready.",
+      "concepts": [{ "slug": "health-checks" }, { "slug": "message-queues" }, { "slug": "alerting" }]
+    },
+    {
+      "scenario": "A network blip hides a whole zone from the control plane",
+      "impact": "Every node in the zone looks dead, and evicting all of their pods at once would take the service down for no reason.",
+      "answer": "The node lifecycle controller notices that a large fraction of the nodes in a zone are unresponsive and slows or stops evictions there. The nodes are healthy and carry on, and when the network returns the leases resume and nothing was disturbed. Evicting from a few nodes is the normal case, and evicting from a whole zone is treated as a probable network problem.",
+      "concepts": [{ "slug": "circuit-breaker" }, { "slug": "cap-theorem" }, { "slug": "backpressure" }]
+    },
+    {
+      "scenario": "A rolling update ships a bad version",
+      "impact": "New pods start but fail their readiness probe, or crash in a loop.",
+      "answer": "The deployment controller only adds new pods and removes old ones as the new pods become ready, within a maximum surge and a maximum number unavailable. The failing pods never become ready, so the rollout stalls with the old version still serving, and the crash loop backs off exponentially. An alert fires on the stalled rollout, and a rollback sets the desired state back to the previous version.",
+      "concepts": [{ "slug": "health-checks" }, { "slug": "retries-and-backoff" }, { "slug": "slos-and-error-budgets" }]
+    },
+    {
+      "scenario": "A container uses far more memory than it asked for",
+      "impact": "It could starve the other pods on the same node, or push the whole node into trouble.",
+      "answer": "The memory limit is enforced by the kernel, which kills the container when it goes over, and the kubelet restarts it with a back-off. Under node-wide pressure the kubelet evicts pods in an order based on how much they use above their requests, so pods that stayed within their requests are the last to go. Setting requests close to real usage keeps both the scheduler and the eviction order honest.",
+      "concepts": [{ "slug": "bulkhead" }, { "slug": "metrics" }, { "slug": "alerting" }]
+    }
+  ],
+  "alternatives": [
+    {
+      "title": "What holds the cluster state",
+      "options": [
+        { "name": "A replicated consensus store (etcd)", "pro": "Strongly consistent, ordered by revision, with a watch built in", "con": "Limited in size and in write rate, and every write waits for a majority" },
+        { "name": "A general distributed database", "pro": "Scales to far more data and writes", "con": "Weaker or more complex guarantees, and no cheap ordered watch for controllers to rely on" },
+        { "name": "A single database with a failover replica", "pro": "Simple and familiar", "con": "Failover can lose writes or run two primaries, which is exactly the split a cluster cannot afford" }
+      ],
+      "pick": "A consensus store for the core records. Put high-volume data such as events in a separate store."
+    },
+    {
+      "title": "How controllers learn what changed",
+      "options": [
+        { "name": "Level-triggered reconcile loops with watches", "pro": "Missed or duplicated events do not matter, since each pass compares the whole desired and actual state", "con": "A pass does more work than reacting to one event, and results are slightly delayed" },
+        { "name": "Edge-triggered event handlers", "pro": "Immediate and cheap for each event", "con": "A lost or reordered event leaves the cluster wrong for good" },
+        { "name": "Periodic polling of everything", "pro": "Simplest to write", "con": "Slow to react, and thousands of pollers swamp the API server" }
+      ],
+      "pick": "Reconcile loops started by watches, plus a periodic full re-list as the safety net."
+    },
+    {
+      "title": "How a scheduler chooses a node",
+      "options": [
+        { "name": "First-fit", "pro": "Fastest and trivial", "con": "Piles load onto the first nodes and strands capacity" },
+        { "name": "Bin-packing (best-fit)", "pro": "Fills nodes tightly, so idle nodes can be removed to save money", "con": "Concentrates risk, since losing a full node evicts many pods, and leaves little room for bursts" },
+        { "name": "Spread", "pro": "Even load, small blast radius and best resilience", "con": "Uses more nodes and can fragment free space so that big pods cannot be placed" },
+        { "name": "A weighted mix of scores", "pro": "Each team tunes the balance, such as pack at night and spread at the edge", "con": "More to understand, and the weights interact in ways that are hard to predict" }
+      ],
+      "pick": "A weighted mix of spread and balanced use, with bin-packing where saving nodes matters more than resilience."
+    },
+    {
+      "title": "How to detect a failed node",
+      "options": [
+        { "name": "Leases renewed in the central store", "pro": "Simple, observable, and one place decides", "con": "Heartbeat writes go to the store, and the decision depends on the node's link to the control plane" },
+        { "name": "Gossip between nodes", "pro": "No central bottleneck, and nodes can vouch for each other", "con": "Convergence takes time, and the control plane still has to learn the result" },
+        { "name": "Active probing by the control plane", "pro": "Tests real reachability, not a self-report", "con": "Probing thousands of nodes is a load of its own" }
+      ],
+      "pick": "Leases in the store, with a grace period of tens of seconds, and rate-limited eviction."
+    }
+  ],
+  "roles": [
+    { "id": "client", "label": "Users and tools", "description": "kubectl, CI pipelines and anything that declares what should run." },
+    { "id": "edge", "label": "Entry points", "description": "The API server, and the service proxy and DNS." },
+    { "id": "async", "label": "Watch streams", "description": "Ordered change events sent to controllers, the scheduler and kubelets." },
+    { "id": "compute", "label": "Control loops", "description": "Controllers, the scheduler, the node lifecycle controller and kubelets." },
+    { "id": "data", "label": "State", "description": "The replicated store and the worker nodes that run the containers." }
+  ]
+}

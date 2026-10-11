@@ -1,0 +1,120 @@
+---
+import PlaygroundShell from '../../components/PlaygroundShell.astro';
+---
+<PlaygroundShell title="A log burst meets the buffer" hint="An incident makes services log six times as fast for 20 seconds. Choose the buffer, the drop policy, the batch size and the indexing mode, and see which lines are lost, how late the rest become searchable, and what storing them costs.">
+  <ol class="how">
+    <li>The default (<b>50,000-line buffer, drop newest, batches of 1,000, full index</b>) loses <b>81,428 of 400,000 lines, including 8,091 errors</b>. The newest lines are thrown away, and during an incident those are the ones you need.</li>
+    <li>Switch the policy to <b>sample by level</b>: <b>no error is lost</b>. It loses 88,217 lines, but 86,735 of them are debug and 1,482 are info. It even loses more lines than before, because it starts thinning debug when the buffer is 60% full.</li>
+    <li>Switch the indexing mode to <b>minimal index</b> and the policy back to drop newest: nothing is lost, because the indexer keeps up with the burst (10,000 lines per second, against 5,714 for the full index). Lines become searchable after a median of 6 s instead of 3 s, but the 30-day storage bill falls from $495 to $29 a month. Then try <b>batches of 100</b> with a 500,000-line buffer: nothing is lost, but the indexer drops to 1,818 lines per second and the worst line takes 125 s to appear.</li>
+  </ol>
+  <div class="pg lgb" data-lgb>
+    <div class="pg-row">
+      <label>Buffer size <select class="pg-in" data-size>
+        <option value="10000">10,000 lines</option>
+        <option value="50000" selected>50,000 lines</option>
+        <option value="150000">150,000 lines</option>
+        <option value="500000">500,000 lines</option>
+      </select></label>
+      <label>When the buffer is full <select class="pg-in" data-policy>
+        <option value="newest" selected>drop the newest lines</option>
+        <option value="oldest">drop the oldest lines</option>
+        <option value="sample">sample by level (keep errors)</option>
+      </select></label>
+      <label>Batch size <select class="pg-in" data-batch>
+        <option value="100">100 lines</option>
+        <option value="1000" selected>1,000 lines</option>
+        <option value="5000">5,000 lines</option>
+      </select></label>
+      <label>Indexing mode <select class="pg-in" data-mode>
+        <option value="full" selected>full inverted index</option>
+        <option value="min">minimal index + object storage</option>
+      </select></label>
+    </div>
+    <div class="pg-grid">
+      <div class="pg-box" data-b1><h3>Lines lost</h3><span class="pg-mono" data-o1></span><span class="pg-note" data-n1></span></div>
+      <div class="pg-box" data-b2><h3>Errors lost</h3><span class="pg-mono" data-o2></span><span class="pg-note" data-n2></span></div>
+      <div class="pg-box" data-b3><h3>Delay until searchable</h3><span class="pg-mono" data-o3></span><span class="pg-note" data-n3></span></div>
+      <div class="pg-box" data-b4><h3>Storage cost, 30 days</h3><span class="pg-mono" data-o4></span><span class="pg-note" data-n4></span></div>
+    </div>
+    <div class="pg-box" data-b5>
+      <h3>Buffer fill during the run (100 seconds)</h3>
+      <svg viewBox="0 0 200 64" role="img" aria-label="Buffer fill over time, with the burst between seconds 30 and 50" style="width:100%;height:auto;max-height:140px">
+        <rect x="60" y="0" width="40" height="64" style="fill:var(--bad);opacity:.12"></rect>
+        <line x1="0" y1="60" x2="200" y2="60" style="stroke:var(--muted);stroke-width:.5"></line>
+        <polyline data-line fill="none" style="stroke:var(--accent);stroke-width:1.5" points=""></polyline>
+      </svg>
+      <span class="pg-note">The shaded band is the burst. The top of the chart is a full buffer.</span>
+    </div>
+    <p class="pg-out" data-verdict aria-live="polite"></p>
+    <p class="pg-note">Model: 100 seconds, 2,000 lines per second, and 12,000 per second between seconds 30 and 50. Normally 2% of lines are errors, 6% warnings, 32% info and 60% debug; during the incident 10% are errors, 10% warnings, 30% info and 50% debug. The indexer ships one batch at a time and each batch costs 50 ms of fixed overhead plus the lines at 8,000 per second (full index) or 20,000 per second (minimal). Sample by level thins debug to 1 in 10 above 60% full and info to 1 in 2 above 90% full, and when full it evicts the oldest lower-level line instead of an error. Delay is the wait in the buffer, plus the time to fill a batch (at most 5 s), plus 1 s (full index) or 5 s (minimal) before the data can be searched. Cost assumes a line is 300 bytes, every day looks like this run, 30 days are kept, a full index takes as much space as the raw text on SSD at $0.10 per GB-month with 2 copies, and minimal mode keeps compressed chunks (4:1, 7:1 or 9:1 for batches of 100, 1,000 or 5,000) in object storage at $0.023 plus a small index of 3% of the raw size on SSD.</p>
+  </div>
+</PlaygroundShell>
+<script>
+  document.querySelectorAll<HTMLElement>('[data-lgb]').forEach((root) => {
+    const q = <T extends HTMLElement>(s: string) => root.querySelector<T>(s)!;
+    const T = 100; const BURST_FROM = 30; const BURST_TO = 50; const BASE = 2000; const PEAK = 12000; const MAXT = 700;
+    const NAMES = ['debug', 'info', 'warning', 'error'];
+    function simulate(size: number, policy: string, batch: number, mode: string) {
+      let seed = 13; const rnd = () => ((seed = (seed * 1664525 + 1013904223) % 4294967296) / 4294967296);
+      const raw = mode === 'full' ? 8000 : 20000; const rate = batch / (0.05 + batch / raw); const vis = mode === 'full' ? 1 : 5;
+      const qs: number[][] = [[], [], [], []]; const heads = [0, 0, 0, 0]; const lenOf = (l: number) => qs[l].length - heads[l];
+      const arrT: number[] = []; let len = 0; let seq = 0; let sampleCtr = 0;
+      const lost = [0, 0, 0, 0]; const sent = [0, 0, 0, 0]; const hist = new Array(MAXT + 60).fill(0); let shipped = 0; let worst = 0; const depth: number[] = [];
+      const pop = (l: number) => { const s = qs[l][heads[l]++]; len--; return s; };
+      const oldestLevel = (from = 0) => { let b = -1, bs = Infinity; for (let l = from; l < 4; l++) if (lenOf(l) > 0 && qs[l][heads[l]] < bs) { bs = qs[l][heads[l]]; b = l; } return b; };
+      const offer = (l: number, t: number) => {
+        if (policy === 'sample') { if (l === 0 && len >= 0.6 * size && (sampleCtr++ % 10) !== 0) { lost[0]++; return; } if (l === 1 && len >= 0.9 * size && (sampleCtr++ % 2) !== 0) { lost[1]++; return; } }
+        if (len >= size) {
+          if (policy === 'newest') { lost[l]++; return; }
+          if (policy === 'oldest') { lost[oldestLevel()]++; pop(oldestLevel()); }
+          else { let low = -1; for (let k = 0; k < l; k++) if (lenOf(k) > 0) { low = k; break; } if (low < 0) { lost[l]++; return; } pop(low); lost[low]++; }
+        }
+        arrT[seq] = t; qs[l].push(seq++); len++;
+      };
+      let carry = 0;
+      for (let t = 0; t < T + MAXT && (t < T || len > 0); t++) {
+        if (t < T) { const n = t >= BURST_FROM && t < BURST_TO ? PEAK : BASE; const burst = n === PEAK;
+          for (let i = 0; i < n; i++) { const r = rnd() * 100; const l = burst ? (r < 10 ? 3 : r < 20 ? 2 : r < 50 ? 1 : 0) : (r < 2 ? 3 : r < 8 ? 2 : r < 40 ? 1 : 0); offer(l, t); } }
+        carry += rate; let cap = Math.floor(carry); carry -= cap;
+        while (cap > 0 && len > 0) { const l = oldestLevel(); const s = pop(l); cap--; sent[l]++; shipped++;
+          const arr = arrT[s]; const nArr = arr >= BURST_FROM && arr < BURST_TO ? PEAK : BASE; const d = (t - arr) + Math.min(5, batch / nArr) + vis; const b = Math.min(hist.length - 1, Math.floor(d)); hist[b]++; if (d > worst) worst = d; }
+        if (t < T) depth.push(len);
+      }
+      let acc = 0, median = 0; for (let b = 0; b < hist.length; b++) { acc += hist[b]; if (acc >= shipped / 2) { median = b; break; } }
+      return { lost, sent, shipped, median, worst, depth, rate };
+    }
+    const fmt = (n: number) => Math.round(n).toLocaleString('en-US');
+    const secs = (n: number) => `${(Math.round(n * 10) / 10).toLocaleString('en-US')} s`;
+    function draw() {
+      const size = Number(q<HTMLSelectElement>('[data-size]').value); const policy = q<HTMLSelectElement>('[data-policy]').value;
+      const batch = Number(q<HTMLSelectElement>('[data-batch]').value); const mode = q<HTMLSelectElement>('[data-mode]').value;
+      const r = simulate(size, policy, batch, mode);
+      const lost = r.lost.reduce((a, b) => a + b, 0); const total = lost + r.shipped; const errs = r.lost[3];
+      q('[data-o1]').textContent = `${fmt(lost)} of ${fmt(total)}`;
+      q('[data-n1]').textContent = lost === 0 ? 'nothing was dropped' : `${Math.round((lost / total) * 1000) / 10}%: debug ${fmt(r.lost[0])}, info ${fmt(r.lost[1])}, warning ${fmt(r.lost[2])}, error ${fmt(r.lost[3])}`;
+      q('[data-o2]').textContent = fmt(errs);
+      q('[data-n2]').textContent = errs === 0 ? 'every error reached the index' : `${Math.round((errs / (errs + r.sent[3])) * 1000) / 10}% of the errors are gone`;
+      q('[data-o3]').textContent = `median ${secs(r.median)}`;
+      q('[data-n3]').textContent = `worst ${secs(r.worst)}; the indexer takes ${fmt(r.rate)} lines per second`;
+      const gbDay = (r.shipped / T) * 86400 * 300 / 1e9; const ratio = batch === 100 ? 4 : batch === 1000 ? 7 : 9;
+      const cost = mode === 'full' ? gbDay * 30 * 2 * 0.1 : (gbDay / ratio) * 30 * 0.023 + gbDay * 0.03 * 30 * 2 * 0.1;
+      q('[data-o4]').textContent = `$${fmt(cost)} per month`;
+      q('[data-n4]').textContent = `${fmt(gbDay)} GB per day stored, ${mode === 'full' ? 'on SSD with 2 copies' : `compressed ${ratio}:1 in object storage`}`;
+      q('[data-line]').setAttribute('points', r.depth.map((d, i) => `${i * 2},${(60 - Math.min(1, d / size) * 58).toFixed(1)}`).join(' '));
+      const good = (v: boolean) => (v ? 'var(--good)' : 'var(--bad)');
+      q<HTMLElement>('[data-b1]').style.setProperty('--c', good(lost === 0));
+      q<HTMLElement>('[data-b2]').style.setProperty('--c', good(errs === 0));
+      q<HTMLElement>('[data-b3]').style.setProperty('--c', good(r.worst <= 15));
+      q<HTMLElement>('[data-b4]').style.setProperty('--c', 'var(--accent)');
+      const out = q('[data-verdict]'); const bad = errs > 0 || lost > 0 || r.worst > 15; out.classList.toggle('bad', bad);
+      out.textContent = errs > 0 ? `${fmt(errs)} errors were lost, along with ${fmt(r.lost[0])} debug lines. A buffer that drops without looking at the level loses exactly the lines you need during an incident. ${policy === 'oldest' ? 'Dropping the oldest instead erases the start of the incident, where the cause usually is.' : 'Choose "sample by level" or a faster indexer.'}`
+        : lost > 0 ? `No error was lost. ${fmt(lost)} lines were dropped on purpose, ${fmt(r.lost[0])} of them debug, to keep the buffer from overflowing. You trade volume for the lines that matter.`
+        : r.worst > 15 ? `Nothing was lost, but the buffer filled up and the worst line took ${secs(r.worst)} to become searchable. A big buffer turns loss into delay: during an incident you would be looking at logs from long ago.`
+        : `Nothing was lost and every line was searchable within ${secs(r.worst)}. The burst fitted in the buffer, or the indexer kept up with it.`;
+    }
+    let queued = false;
+    const schedule = () => { if (queued) return; queued = true; requestAnimationFrame(() => { queued = false; draw(); }); };
+    root.addEventListener('input', schedule); root.addEventListener('change', schedule);
+    draw();
+  });
+</script>

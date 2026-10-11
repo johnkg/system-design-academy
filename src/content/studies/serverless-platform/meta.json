@@ -1,0 +1,519 @@
+{
+  "name": "Design a Serverless Functions Platform",
+  "difficulty": "advanced",
+  "intent": "Run other people's code on demand, one request per sandbox, scaling from zero to thousands of instances in seconds and billing by the millisecond, without letting tenants hurt each other.",
+  "codeTitle": "a router with warm sandboxes, a cap and reaping",
+  "finalIntro": "One function invoked cold, then warm, then twice at once.",
+  "prompt": "Design a functions-as-a-service platform like AWS Lambda. Customers upload code and the platform runs it when an HTTP request, a queue message or a timer arrives. A function can sit unused for days and then receive thousands of requests in a second. The platform serves many customers on shared hardware, and customers pay only for the time their code runs.",
+  "functional": [
+    "Upload a function (code, runtime, memory size) and invoke it synchronously over HTTP",
+    "Invoke a function asynchronously from queues, streams, storage events and timers, with retries",
+    "Scale from zero to thousands of concurrent instances with no action from the customer",
+    "Let a customer reserve warm capacity (provisioned concurrency) for latency-sensitive functions",
+    "Limit concurrency per function and per account",
+    "Meter every invocation and bill by the millisecond and by memory size"
+  ],
+  "nonFunctional": [
+    "A warm invocation adds only a few milliseconds of platform overhead",
+    "A cold start is a few hundred milliseconds, and rare for steady traffic",
+    "Run untrusted code from many tenants on the same hosts without any tenant reading another's data",
+    "One request runs in one instance at a time, so customer code needs no thread safety",
+    "Absorb a burst of thousands of new instances per function within seconds, up to a documented limit",
+    "A noisy tenant cannot starve the others, and the platform stays above 99.95% availability",
+    "Never lose an accepted asynchronous event"
+  ],
+  "firstAttempt": {
+    "text": "A fleet of ordinary servers behind a load balancer. Each customer function is loaded into a long-running process on every server, and requests are spread round-robin. Servers are added by an autoscaler that watches CPU, and customers are billed per server-hour.",
+    "limits": [
+      "Untrusted code from many customers shares processes and machines, so one tenant can read memory or crash the server for all",
+      "Most functions are idle most of the time, but every server holds all of them, so capacity is paid for and wasted",
+      "A CPU-based autoscaler reacts in minutes, far too slowly for a spike that arrives in one second",
+      "Concurrent requests share one process, so a slow or leaking function hurts its neighbours and customers must write thread-safe code",
+      "A customer is billed for idle server hours rather than for the work done",
+      "There is no way to retry events, throttle a tenant or find out which function used the capacity"
+    ]
+  },
+  "nodes": [
+    {
+      "id": "clients",
+      "label": "Callers",
+      "kind": "client",
+      "x": 62,
+      "y": 88
+    },
+    {
+      "id": "single",
+      "label": "Shared app servers",
+      "kind": "compute",
+      "x": 37,
+      "y": 88,
+      "at": 0,
+      "until": 1
+    },
+    {
+      "id": "frontend",
+      "label": "Invoke frontend",
+      "kind": "edge",
+      "x": 62,
+      "y": 63,
+      "at": 1
+    },
+    {
+      "id": "placement",
+      "label": "Placement service",
+      "kind": "compute",
+      "x": 62,
+      "y": 37,
+      "at": 1
+    },
+    {
+      "id": "workers",
+      "label": "Worker hosts",
+      "kind": "compute",
+      "x": 37,
+      "y": 37,
+      "at": 1
+    },
+    {
+      "id": "sandboxes",
+      "label": "MicroVM sandboxes",
+      "kind": "compute",
+      "x": 37,
+      "y": 63,
+      "at": 2
+    },
+    {
+      "id": "store",
+      "label": "Code and config store",
+      "kind": "data",
+      "x": 12,
+      "y": 37,
+      "at": 2
+    },
+    {
+      "id": "pool",
+      "label": "Warm sandbox pool",
+      "kind": "data",
+      "x": 37,
+      "y": 12,
+      "at": 3
+    },
+    {
+      "id": "scaler",
+      "label": "Capacity scaler",
+      "kind": "compute",
+      "x": 62,
+      "y": 12,
+      "at": 3
+    },
+    {
+      "id": "events",
+      "label": "Event sources",
+      "kind": "client",
+      "x": 12,
+      "y": 88,
+      "at": 4
+    },
+    {
+      "id": "queue",
+      "label": "Async event queue",
+      "kind": "async",
+      "x": 37,
+      "y": 88,
+      "at": 4
+    },
+    {
+      "id": "dlq",
+      "label": "Dead-letter queue",
+      "kind": "async",
+      "x": 87,
+      "y": 63,
+      "at": 4
+    },
+    {
+      "id": "prov",
+      "label": "Provisioned instances",
+      "kind": "data",
+      "x": 12,
+      "y": 63,
+      "at": 5
+    },
+    {
+      "id": "quota",
+      "label": "Limits and quotas",
+      "kind": "compute",
+      "x": 87,
+      "y": 37,
+      "at": 6
+    },
+    {
+      "id": "meter",
+      "label": "Metering and billing",
+      "kind": "data",
+      "x": 12,
+      "y": 12,
+      "at": 6
+    }
+  ],
+  "edges": [
+    {
+      "from": "clients",
+      "to": "single",
+      "at": 0,
+      "until": 1
+    },
+    {
+      "from": "clients",
+      "to": "frontend",
+      "at": 1
+    },
+    {
+      "from": "frontend",
+      "to": "placement",
+      "at": 1
+    },
+    {
+      "from": "frontend",
+      "to": "workers",
+      "at": 1
+    },
+    {
+      "from": "placement",
+      "to": "workers",
+      "at": 1
+    },
+    {
+      "from": "workers",
+      "to": "sandboxes",
+      "at": 2
+    },
+    {
+      "from": "workers",
+      "to": "store",
+      "at": 2
+    },
+    {
+      "from": "workers",
+      "to": "pool",
+      "at": 3
+    },
+    {
+      "from": "scaler",
+      "to": "pool",
+      "at": 3
+    },
+    {
+      "from": "scaler",
+      "to": "placement",
+      "at": 3
+    },
+    {
+      "from": "events",
+      "to": "queue",
+      "at": 4
+    },
+    {
+      "from": "queue",
+      "to": "frontend",
+      "at": 4
+    },
+    {
+      "from": "frontend",
+      "to": "dlq",
+      "at": 4
+    },
+    {
+      "from": "workers",
+      "to": "prov",
+      "at": 5
+    },
+    {
+      "from": "frontend",
+      "to": "quota",
+      "at": 6
+    },
+    {
+      "from": "quota",
+      "to": "placement",
+      "at": 6
+    },
+    {
+      "from": "workers",
+      "to": "meter",
+      "at": 6
+    }
+  ],
+  "steps": [
+    {
+      "title": "Route each call through a frontend and a placement service",
+      "problem": "Loading every function on every server wastes memory, and a round-robin balancer cannot know which server already has the right code ready.",
+      "fix": "Callers reach an invoke frontend, which authenticates the call, finds the function's configuration and asks a placement service where to run it. The placement service keeps a map of which worker hosts hold an idle sandbox for each function, and which workers have spare memory. It returns a worker that has a ready sandbox if one exists, and otherwise the worker with enough free memory. The frontend then sends the payload to that worker. A function lives only where it is needed.",
+      "tradeoff": "The platform uses memory only for functions that are in use, and a request lands on a worker that is already prepared. The placement service sits on every invocation, so it must answer in about a millisecond, hold its map in memory and be replicated, and a stale map sends a request to a worker that no longer has the sandbox.",
+      "concepts": [
+        {
+          "slug": "api-gateway"
+        },
+        {
+          "slug": "load-balancing"
+        },
+        {
+          "slug": "consistent-hashing"
+        }
+      ]
+    },
+    {
+      "title": "Run every request in an isolated microVM sandbox",
+      "problem": "Customers run arbitrary code. A shared process or a plain container shares a kernel, so one escape or one runaway loop harms every other tenant on the host.",
+      "fix": "Each sandbox is a lightweight virtual machine (a microVM) with its own kernel, started in well under a second, limited to the memory the customer chose, with CPU shares proportional to that memory and with network and file access cut down to a minimum. A sandbox serves one request at a time and is dedicated to one function, never shared between customers. A cold start fetches the code from a store, boots the microVM, starts the language runtime and runs the customer's initialisation code. The result is kept for later requests.",
+      "tradeoff": "Hardware-level isolation makes it safe to put different tenants on one machine, and one request per sandbox removes interference inside the sandbox. The price is the cold start, which has three parts that add up to hundreds of milliseconds, and a little memory for each microVM's own kernel and runtime.",
+      "concepts": [
+        {
+          "slug": "bulkhead"
+        },
+        {
+          "slug": "encryption"
+        },
+        {
+          "slug": "latency-and-round-trips"
+        }
+      ]
+    },
+    {
+      "title": "Keep sandboxes warm, reap idle ones and scale from zero",
+      "problem": "Starting a sandbox for each request would add the whole cold start to every call, but keeping every sandbox for ever would fill the hosts with unused functions.",
+      "fix": "After a request finishes, the sandbox stays in a warm pool for the next one, and the router prefers the most recently used idle sandbox so the others can age out. A sandbox idle for longer than a few minutes is reaped to free its memory. When no idle sandbox exists, the placement service starts a new one, so an unused function costs nothing and a busy one grows by one sandbox for each concurrent request. A capacity scaler keeps each host's free memory topped up and applies a burst limit on how many new sandboxes per second a function may add.",
+      "tradeoff": "Steady traffic mostly meets warm sandboxes, and idle functions disappear. After a quiet period the first requests are cold, and while a sandbox starts it already counts against the concurrency limit, so a slow start both adds latency and uses up capacity. A longer idle timeout means fewer cold starts and more memory held for nothing.",
+      "concepts": [
+        {
+          "slug": "horizontal-vs-vertical-scaling"
+        },
+        {
+          "slug": "caching"
+        },
+        {
+          "slug": "backpressure"
+        }
+      ]
+    },
+    {
+      "title": "Accept events from many sources and retry them",
+      "problem": "Most work is not an HTTP call: files arrive, messages are queued and timers fire. These events must not be lost when a function fails or when the platform is busy.",
+      "fix": "Event sources put events on a durable async queue. The frontend invokes the function from the queue with a worker pool whose size follows the number of waiting events, and a failed attempt is retried a couple of times with a growing delay. After the last attempt the event goes to a dead-letter queue for the customer to inspect. Queue and stream sources are polled by the platform itself, so the customer needs no extra servers. Events are delivered at least once.",
+      "tradeoff": "Accepted events survive failures and bursts are smoothed out by the queue. At-least-once delivery means a function can run twice for one event, so customers must make their handlers idempotent, and retries of a persistent failure can delay later events.",
+      "concepts": [
+        {
+          "slug": "message-queues"
+        },
+        {
+          "slug": "retries-and-backoff"
+        },
+        {
+          "slug": "idempotency"
+        }
+      ]
+    },
+    {
+      "title": "Offer provisioned concurrency for predictable latency",
+      "problem": "Some functions, such as a checkout API, cannot tolerate a 500 ms cold start on the first request after a spike, and waiting for scaling is not good enough.",
+      "fix": "A customer asks for a number of provisioned instances. The platform starts that many sandboxes ahead of time, runs the initialisation code and keeps them ready, never reaping them. The router sends requests to a provisioned instance first, and when all are busy it spills over to ordinary on-demand sandboxes, which can cold start. The customer pays a small fee for each instance for as long as it is reserved, and can schedule the number to follow the daily traffic pattern.",
+      "tradeoff": "Latency for the reserved level of traffic is flat, with no cold starts. The customer pays for idle capacity and has to choose the number, and traffic above it still sees cold starts. Reserving the average load gives steady functions a good deal and a rare 6-second spike a poor one.",
+      "concepts": [
+        {
+          "slug": "slos-and-error-budgets"
+        },
+        {
+          "slug": "horizontal-vs-vertical-scaling"
+        },
+        {
+          "slug": "health-checks"
+        }
+      ]
+    },
+    {
+      "title": "Meter to the millisecond and enforce limits per tenant",
+      "problem": "Customers must pay for what they use, and one customer with a runaway function or an attack must not use up the capacity of everyone else.",
+      "fix": "Each worker records, for every invocation, the duration (rounded up to the nearest millisecond, including the initialisation time of a cold start), the memory size and the function, and sends it to a metering pipeline that aggregates it into GB-seconds and request counts for the bill. The frontend checks a concurrency limit for the function and one for the account, and rejects extra calls with a throttling error that tells the caller to back off. Placement spreads a tenant's sandboxes over many hosts and caps their share of any one host, so a noisy neighbour cannot take over a machine's CPU or network.",
+      "tradeoff": "Billing matches the work done, and limits keep tenants separate, so one bad function cannot take the platform down. Metering must be exact and must survive failures without double counting, limits have to be tuned so that they do not throttle good customers, and spreading a tenant over many hosts reduces how densely sandboxes can be packed.",
+      "concepts": [
+        {
+          "slug": "rate-limiting"
+        },
+        {
+          "slug": "metrics"
+        },
+        {
+          "slug": "bulkhead"
+        }
+      ]
+    }
+  ],
+  "failures": [
+    {
+      "scenario": "A worker host dies with sandboxes running",
+      "impact": "In-flight requests on that host are lost, and the placement map points at sandboxes that no longer exist.",
+      "answer": "Health checks and missing heartbeats remove the host from the placement map within seconds. The frontend retries synchronous calls that failed before the function started, and asynchronous events are retried from the queue. Replacement sandboxes start on other hosts as cold starts, and the capacity scaler adds hosts if free memory falls.",
+      "concepts": [
+        {
+          "slug": "health-checks"
+        },
+        {
+          "slug": "retries-and-backoff"
+        },
+        {
+          "slug": "message-queues"
+        }
+      ]
+    },
+    {
+      "scenario": "A viral link sends thousands of calls per second to a function that is idle",
+      "impact": "Every call needs its own new sandbox, and starting thousands of sandboxes at once could exhaust the hosts or overload the code store.",
+      "answer": "A burst limit allows the function to add a documented number of sandboxes at once and then more per minute, up to its concurrency limit. The requests above that are throttled with a clear error so callers back off, rather than queueing without end. Code is cached on each host and as a snapshot, so the repeated start does not hit the store.",
+      "concepts": [
+        {
+          "slug": "backpressure"
+        },
+        {
+          "slug": "rate-limiting"
+        },
+        {
+          "slug": "caching"
+        }
+      ]
+    },
+    {
+      "scenario": "A function calls a slow database and every request takes 30 seconds",
+      "impact": "Each request holds a sandbox for 30 seconds, so concurrency climbs to the limit and other functions in the same account are throttled.",
+      "answer": "A per-function reserved concurrency stops one function from using the whole account limit, and a timeout ends runaway requests. The customer is billed for the long duration, which is a visible signal, and alerting on duration and throttles catches it. The customer's code should use timeouts and a circuit breaker toward the slow dependency.",
+      "concepts": [
+        {
+          "slug": "circuit-breaker"
+        },
+        {
+          "slug": "bulkhead"
+        },
+        {
+          "slug": "metrics"
+        }
+      ]
+    },
+    {
+      "scenario": "An asynchronous event is delivered twice",
+      "impact": "Retries after a timeout can run a function again after it has already done its work, such as charging a card twice.",
+      "answer": "Delivery is at least once, so the event carries a unique id, and the handler records the ids it has handled or uses an idempotent write. Billing is correct either way, since both runs really used compute.",
+      "concepts": [
+        {
+          "slug": "idempotency"
+        },
+        {
+          "slug": "retries-and-backoff"
+        },
+        {
+          "slug": "message-queues"
+        }
+      ]
+    }
+  ],
+  "alternatives": [
+    {
+      "title": "How tenant code is isolated",
+      "options": [
+        {
+          "name": "Containers on a shared kernel",
+          "pro": "Start in tens of milliseconds and pack very densely",
+          "con": "A kernel flaw lets one tenant reach others, which is a poor fit for strangers' code"
+        },
+        {
+          "name": "MicroVMs with their own kernel",
+          "pro": "Strong hardware isolation with a start of a hundred milliseconds or so, and snapshots make it faster",
+          "con": "More memory per sandbox and a more complex host agent"
+        },
+        {
+          "name": "Language isolates in one process",
+          "pro": "Start in about a millisecond and use almost no memory",
+          "con": "Limited to one runtime, with weaker isolation and little control over CPU use"
+        }
+      ],
+      "pick": "MicroVMs for general-purpose functions. Isolates suit short, trusted-ish scripts at the edge."
+    },
+    {
+      "title": "How to shorten cold starts",
+      "options": [
+        {
+          "name": "Keep sandboxes warm longer",
+          "pro": "No change for customers",
+          "con": "Holds memory for functions that may not return"
+        },
+        {
+          "name": "Snapshot an initialised sandbox and restore it",
+          "pro": "Skips runtime start and initialisation, so the start is much shorter",
+          "con": "Code must tolerate being restored, for example refresh random numbers and connections"
+        },
+        {
+          "name": "Provisioned concurrency",
+          "pro": "No cold start for the reserved level",
+          "con": "The customer pays for idle capacity"
+        }
+      ],
+      "pick": "Short idle timeouts and snapshots by default, and provisioned concurrency for customers who need flat latency."
+    },
+    {
+      "title": "How many requests per instance",
+      "options": [
+        {
+          "name": "One request per instance",
+          "pro": "Simple code, no noisy neighbours inside an instance, and billing per request is easy",
+          "con": "More instances for the same traffic, so more cold starts under a spike"
+        },
+        {
+          "name": "Many requests per instance",
+          "pro": "Fewer instances and fewer cold starts for I/O-bound code",
+          "con": "Customers must write thread-safe code, and one slow request hurts the others"
+        }
+      ],
+      "pick": "One request per instance, with a multi-request option only for customers who choose it."
+    },
+    {
+      "title": "What billing counts",
+      "options": [
+        {
+          "name": "Run time only",
+          "pro": "Easy to explain",
+          "con": "Customers get free initialisation work, and the platform pays for it"
+        },
+        {
+          "name": "Run time plus start-up time, in GB-seconds, plus a price per request",
+          "pro": "Reflects the real resources used, with memory size as a lever",
+          "con": "Customers see cold starts on the bill and pay for initialisation"
+        }
+      ],
+      "pick": "Bill the whole duration in milliseconds times memory, plus a small price per request."
+    }
+  ],
+  "roles": [
+    {
+      "id": "client",
+      "label": "Callers",
+      "description": "HTTP clients and the event sources that trigger functions."
+    },
+    {
+      "id": "edge",
+      "label": "Invoke frontend",
+      "description": "Authenticates, checks limits and routes each invocation."
+    },
+    {
+      "id": "async",
+      "label": "Event queues",
+      "description": "Asynchronous events waiting to run, and dead letters."
+    },
+    {
+      "id": "compute",
+      "label": "Placement and workers",
+      "description": "The placement service, scaler, worker hosts and the sandboxes that run customer code."
+    },
+    {
+      "id": "data",
+      "label": "State",
+      "description": "Code store, warm and provisioned pools, and metering."
+    }
+  ]
+}

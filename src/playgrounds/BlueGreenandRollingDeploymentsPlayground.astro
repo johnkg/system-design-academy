@@ -1,0 +1,232 @@
+---
+import PlaygroundShell from '../components/PlaygroundShell.astro';
+---
+<PlaygroundShell title="Simulate it" hint="A web tier of 6 servers moves from v1 to v2 while 500 requests per second keep arriving. Each server handles 100 per second, so 5 healthy servers is the minimum.">
+  <ol class="how">
+    <li>Press <b>Run</b> with the defaults (rolling, <b>max surge 1</b>, <b>max unavailable 0</b>). A seventh server is added first, then an old one is removed once the new one is ready. Capacity never drops below 6 servers, <b>requests failed stays 0</b>, and v1 and v2 serve together for about 25 seconds.</li>
+    <li>Set <b>max unavailable</b> to 2 and <b>max surge</b> to 0. It finishes faster, but capacity falls to 4 servers (400 of 500 requests per second) and about 1,500 requests fail. Untick <b>connection draining</b> on a safe setting and about 300 requests fail, because in-flight requests are cut off.</li>
+    <li>Switch to <b>Blue-green</b>. A full second set of 6 servers warms up (peak 12 servers, the cost), then the router flips once. The mixed-version window is 0 seconds and nothing fails.</li>
+    <li>Tick <b>v2 has a bug</b> and compare. Blue-green sends 100% of traffic to v2 at the flip (error rate 100%, about 3,000 failed requests before it is noticed) but rolls back in 1 second. Rolling exposes only a third of the traffic at worst, yet needs about 16 seconds to roll back.</li>
+  </ol>
+  <div class="pg bgr" data-bgr>
+    <div class="pg-row">
+      <label>Strategy <select class="pg-in" data-strategy><option value="rolling" selected>Rolling update</option><option value="bluegreen">Blue-green</option></select></label>
+      <label>Max surge <select class="pg-in" data-surge><option value="0">0</option><option value="1" selected>1</option><option value="2">2</option><option value="3">3</option></select></label>
+      <label>Max unavailable <select class="pg-in" data-unavail><option value="0" selected>0</option><option value="1">1</option><option value="2">2</option><option value="3">3</option></select></label>
+      <label>Readiness delay (s) <input type="range" min="0" max="10" value="3" data-delay /> <b data-delayval>3</b></label>
+    </div>
+    <div class="pg-row">
+      <label class="bgr-check"><input type="checkbox" data-bug /> v2 has a bug (health check still passes)</label>
+      <label class="bgr-check"><input type="checkbox" checked data-drain /> Connection draining (rolling)</label>
+    </div>
+    <div class="pg-row">
+      <button class="btn pg-primary" type="button" data-run>Run</button>
+      <button class="btn" type="button" data-step>Step 1 s</button>
+      <button class="btn" type="button" data-reset>Reset</button>
+      <span class="pg-note" data-clock></span>
+    </div>
+    <p class="pg-note" data-policy></p>
+    <div class="bgr-fleet" data-fleet></div>
+    <p class="pg-mono" data-now></p>
+    <div class="bgr-chartwrap">
+      <div class="bgr-bars" data-bars role="img" aria-label="Serving capacity over time, with v1 and v2 servers stacked and a line at demand"><div class="bgr-demand" data-demandline></div></div>
+      <div class="bgr-fails" data-fails></div>
+    </div>
+    <p class="pg-note"><span class="bgr-sw" style="--c: var(--role-1)"></span> v1 serving <span class="bgr-sw" style="--c: var(--role-2)"></span> v2 serving <span class="bgr-sw" style="--c: var(--bad)"></span> second with failed requests. The dashed line is demand (500 per second).</p>
+    <div class="pg-grid">
+      <div class="pg-box" style="--c: var(--bad)"><h3>Requests failed</h3><span class="pg-mono" data-failed>0</span><span class="pg-note" data-failednote></span></div>
+      <div class="pg-box" style="--c: var(--role-3)"><h3>Mixed-version window</h3><span class="pg-mono" data-mixed>0 s</span><span class="pg-note">seconds when v1 and v2 both serve</span></div>
+      <div class="pg-box" style="--c: var(--role-2)"><h3>Capacity</h3><span class="pg-mono" data-cap>600</span><span class="pg-note" data-capnote></span></div>
+      <div class="pg-box" style="--c: var(--role-4)"><h3>Cost</h3><span class="pg-mono" data-cost>6 servers</span><span class="pg-note" data-costnote></span></div>
+      <div class="pg-box" style="--c: var(--role-5)"><h3>Rollback</h3><span class="pg-mono" data-rb>not needed</span><span class="pg-note" data-rbnote></span></div>
+    </div>
+    <p class="pg-out" data-outcome></p>
+    <p class="pg-note">Database: during the mixed window, and for a blue-green rollback, v1 and v2 share one database. Use expand/contract: first add the new column or table (expand), deploy code that works with both shapes, and only drop the old one (contract) after v1 is gone and no rollback is needed.</p>
+  </div>
+</PlaygroundShell>
+<script>
+  const N = 6; const CAP = 100; const DEMAND = 500; const BOOT = 2; const DRAIN = 2; const INFLIGHT = 50;
+  const DETECT = 5; const SOAK = 8; const FLIP = 1; const MAXT = 120; const MAXSLOT = 12;
+
+  interface Params { strategy: string; surge: number; unavail: number; delay: number; bug: boolean; drain: boolean }
+  interface Srv { v: number; st: string; t: number; slot: number }
+  interface Tick { t: number; s1: number; s2: number; cap: number; failed: number; lost: number; servers: number; mixed: boolean; slots: ({ v: number; st: string; t: number; serving: boolean } | null)[]; cumFailed: number; cumMixed: number; minCap: number; worst: number; peak: number; extra: number }
+  interface Result { ticks: Tick[]; done: number; detectAt: number; rollbackTime: number; outcome: string; exposeStart: number; unavail: number }
+
+  // Pure model. One tick is one second. A controller step happens first, then traffic is measured, then timers advance.
+  function simulate(p: Params): Result {
+    const surge = p.surge; const unavail = p.strategy === 'rolling' && p.surge === 0 && p.unavail === 0 ? 1 : p.unavail; // 0/0 would never make progress
+    const servers: Srv[] = [];
+    const add = (v: number, st: string, t: number) => { let slot = 0; while (servers.some((s) => s.slot === slot)) slot++; servers.push({ v, st, t, slot }); };
+    const remove = (s: Srv) => { servers.splice(servers.indexOf(s), 1); };
+    for (let i = 0; i < N; i++) add(1, 'ready', 0);
+    const raw: Omit<Tick, 'cumFailed' | 'cumMixed' | 'minCap' | 'worst' | 'peak' | 'extra'>[] = [];
+    let target = 2; let exposeStart = -1; let detectAt = -1; let rollbackDone = -1; let done = -1; let outcome = '';
+    let router = 1; let switchAt = -1; let flipAt = -1; let killed = 0; let prevKilled = 0; let phase = 'warm';
+    const alive = () => servers.filter((s) => s.st !== 'draining');
+    const readyOf = (v: number) => servers.filter((s) => s.st === 'ready' && s.v === v);
+    const stop = (s: Srv) => { if (p.drain) { s.st = 'draining'; s.t = DRAIN; } else { killed++; remove(s); } };
+
+    // The rolling controller: start target-version servers while total <= N + surge, stop other-version ready servers while ready >= N - unavailable.
+    function rollingControl() {
+      const other = target === 2 ? 1 : 2;
+      for (let guard = 0; guard < 50; guard++) {
+        const live = alive();
+        if (live.filter((s) => s.v === target).length < N && live.length < N + surge) { add(target, 'starting', BOOT + p.delay); continue; }
+        const ready = servers.filter((s) => s.st === 'ready').length;
+        const victim = live.find((s) => s.v === other && s.st === 'ready');
+        if (victim && ready - 1 >= N - unavail) { stop(victim); continue; }
+        break;
+      }
+    }
+
+    for (let t = 0; t < MAXT; t++) {
+      if (p.strategy === 'rolling') {
+        const live = alive();
+        const complete = (v: number, o: number) => live.length === N && live.every((s) => s.v === v && s.st === 'ready') && !live.some((s) => s.v === o);
+        if (target === 2 && complete(2, 1)) { if (done < 0) { done = t; outcome = 'Rollout finished: all 6 servers run v2.'; } }
+        else if (target === 1 && complete(1, 2)) { if (rollbackDone < 0) { rollbackDone = t; done = t; outcome = 'Rolled back: all 6 servers run v1 again.'; } }
+        else rollingControl();
+        if (p.bug && target === 2 && exposeStart >= 0 && t - exposeStart >= DETECT && detectAt < 0) { detectAt = t; target = 1; rollingControl(); }
+      } else if (phase === 'warm') {
+        if (!servers.some((s) => s.v === 2)) for (let i = 0; i < N; i++) add(2, 'starting', BOOT + p.delay);
+        if (readyOf(2).length === N) { router = 2; switchAt = t; phase = 'soak'; }
+      } else if (phase === 'soak') {
+        if (p.bug && exposeStart >= 0 && t - exposeStart >= DETECT && detectAt < 0) { detectAt = t; flipAt = t + FLIP; }
+        if (detectAt >= 0 && t >= flipAt && router === 2) { router = 1; rollbackDone = t; }
+        if (detectAt >= 0 && router === 1 && t >= flipAt + 2) { servers.filter((s) => s.v === 2).forEach(remove); done = t; outcome = 'Rolled back with one router flip. The green set is shut down.'; phase = 'end'; }
+        else if (detectAt < 0 && t - switchAt >= SOAK) { servers.filter((s) => s.v === 1).forEach(remove); done = t; outcome = 'Cut over. After a soak period the blue set is shut down.'; phase = 'end'; }
+      }
+      const serving = servers.filter((s) => s.st === 'ready' && (p.strategy === 'rolling' || s.v === router));
+      const R = serving.length; let failed = 0;
+      if (R === 0) failed = DEMAND;
+      else {
+        const per = DEMAND / R;
+        for (const s of serving) { const handled = Math.min(per, CAP); failed += per - handled; if (s.v === 2 && p.bug) failed += handled; }
+      }
+      const s1 = serving.filter((s) => s.v === 1).length; const s2 = serving.filter((s) => s.v === 2).length;
+      if (s2 > 0 && exposeStart < 0) exposeStart = t;
+      raw.push({ t, s1, s2, cap: R * CAP, failed, lost: (killed - prevKilled) * INFLIGHT, servers: servers.length, mixed: s1 > 0 && s2 > 0,
+        slots: Array.from({ length: MAXSLOT }, (_, i) => { const s = servers.find((x) => x.slot === i); return s ? { v: s.v, st: s.st, t: s.t, serving: serving.includes(s) } : null; }) });
+      prevKilled = killed;
+      for (const s of servers.slice()) {
+        if (s.st === 'starting') { s.t--; if (s.t <= 0) s.st = 'ready'; }
+        else if (s.st === 'draining') { s.t--; if (s.t <= 0) remove(s); }
+      }
+      if (done >= 0 && !servers.some((s) => s.st === 'draining')) break;
+    }
+    let cumFailed = 0; let cumMixed = 0; let minCap = Infinity; let worst = 0; let peak = 0; let extra = 0;
+    const ticks = raw.map((k) => {
+      cumFailed += k.failed + k.lost; if (k.mixed) cumMixed++; minCap = Math.min(minCap, k.cap); worst = Math.max(worst, k.failed / DEMAND); peak = Math.max(peak, k.servers); extra += k.servers - N;
+      return { ...k, cumFailed: Math.floor(cumFailed + 0.5), cumMixed, minCap, worst, peak, extra };
+    });
+    return { ticks, done, detectAt, rollbackTime: detectAt >= 0 && rollbackDone >= 0 ? rollbackDone - detectAt : -1, outcome, exposeStart, unavail };
+  }
+
+  document.querySelectorAll<HTMLElement>('[data-bgr]').forEach((root) => {
+    const q = <T extends HTMLElement>(s: string) => root.querySelector<T>(s)!;
+    const num = (s: string) => Number(q<HTMLSelectElement>(s).value);
+    const fleet = q('[data-fleet]'); const bars = q('[data-bars]'); const fails = q('[data-fails]');
+    const reduce = window.matchMedia('(prefers-reduced-motion: reduce)').matches;
+    let res: Result; let cur = 0; let timer: number | undefined; let onScreen = true; let raf = 0; let running = false;
+
+    // Build the DOM once: 12 server tiles and a fixed set of chart columns.
+    const tiles = Array.from({ length: MAXSLOT }, (_, i) => {
+      const el = document.createElement('div'); el.className = 'pg-box bgr-srv off';
+      const name = document.createElement('b'); name.textContent = 'Server ' + (i + 1);
+      const info = document.createElement('span'); info.className = 'pg-note';
+      el.append(name, info); fleet.appendChild(el); return { el, info };
+    });
+    const cols = Array.from({ length: MAXT }, () => {
+      const col = document.createElement('div'); col.className = 'bgr-col';
+      const a = document.createElement('i'); a.style.background = 'var(--role-1)';
+      const b = document.createElement('i'); b.style.background = 'var(--role-2)';
+      col.append(a, b); bars.appendChild(col); return { col, a, b };
+    });
+    const cells = Array.from({ length: MAXT }, () => { const c = document.createElement('i'); fails.appendChild(c); return c; });
+
+    function params(): Params {
+      return { strategy: q<HTMLSelectElement>('[data-strategy]').value, surge: num('[data-surge]'), unavail: num('[data-unavail]'), delay: num('[data-delay]'), bug: q<HTMLInputElement>('[data-bug]').checked, drain: q<HTMLInputElement>('[data-drain]').checked };
+    }
+    function draw() {
+      raf = 0;
+      const p = params(); const k = res.ticks[cur]; const rolling = p.strategy === 'rolling';
+      q('[data-delayval]').textContent = String(p.delay);
+      q<HTMLSelectElement>('[data-surge]').disabled = !rolling; q<HTMLSelectElement>('[data-unavail]').disabled = !rolling; q<HTMLInputElement>('[data-drain]').disabled = !rolling;
+      q('[data-policy]').textContent = rolling
+        ? `Rolling: at most ${p.surge} extra server${p.surge === 1 ? '' : 's'} above 6, and capacity may not fall below ${N - res.unavail} ready servers.${p.surge === 0 && p.unavail === 0 ? ' Surge 0 with unavailable 0 can never make progress, so unavailable 1 is used.' : ''}`
+        : 'Blue-green: start a full second set of 6 (green), wait until every green server is ready, flip the router once, keep blue for a soak period as the rollback target.';
+      q('[data-clock]').textContent = `t = ${k.t} s of ${res.ticks.length - 1} s`;
+      tiles.forEach((tile, i) => {
+        const s = k.slots[i]; const everUsed = res.ticks.some((x) => x.slots[i]);
+        tile.el.hidden = !everUsed;
+        if (!s) { tile.el.classList.add('off'); tile.el.classList.remove('lit'); tile.el.style.setProperty('--c', 'var(--border)'); tile.info.textContent = 'empty'; return; }
+        tile.el.classList.remove('off'); tile.el.classList.toggle('lit', s.serving && s.v === 2 && p.bug);
+        const colour = s.st === 'starting' ? 'var(--muted)' : s.st === 'draining' ? 'var(--role-3)' : s.v === 1 ? 'var(--role-1)' : s.serving && p.bug ? 'var(--bad)' : 'var(--role-2)';
+        tile.el.style.setProperty('--c', colour);
+        tile.info.textContent = `v${s.v} ` + (s.st === 'starting' ? `starting (${s.t} s)` : s.st === 'draining' ? 'draining' : s.serving ? (s.v === 2 && p.bug ? 'serving, buggy' : 'serving') : 'ready, no traffic');
+      });
+      const scale = 900;
+      cols.forEach((c, i) => {
+        const x = res.ticks[i]; const shown = i < res.ticks.length;
+        c.col.style.display = shown ? '' : 'none'; cells[i].style.display = shown ? '' : 'none';
+        if (!shown) return;
+        const live = i <= cur;
+        c.a.style.height = live ? (x.s1 * CAP / scale * 100) + '%' : '0'; c.b.style.height = live ? (x.s2 * CAP / scale * 100) + '%' : '0';
+        cells[i].className = live && (x.failed > 0.5 || x.lost > 0) ? 'f' : '';
+      });
+      q<HTMLElement>('[data-demandline]').style.bottom = (DEMAND / scale * 100) + '%';
+      q('[data-now]').textContent = `${k.s1 + k.s2} serving (${k.s1} on v1, ${k.s2} on v2) · ${Math.min(DEMAND, k.cap)} of ${DEMAND} requests per second handled${k.failed > 0.5 ? ` · ${Math.round(k.failed)} per second failing` : ''}`;
+      q('[data-failed]').textContent = String(k.cumFailed);
+      q('[data-failednote]').textContent = k.worst > 0 ? `worst second: ${Math.round(k.worst * 100)}% of requests failing` : 'no second with errors yet';
+      q('[data-mixed]').textContent = k.cumMixed + ' s';
+      q('[data-cap]').textContent = String(k.cap);
+      q('[data-capnote]').textContent = `lowest so far: ${k.minCap} (demand ${DEMAND})`;
+      q('[data-cost]').textContent = `${k.servers} server${k.servers === 1 ? '' : 's'}`;
+      q('[data-costnote]').textContent = `peak ${k.peak} · extra server-seconds: ${k.extra}`;
+      const rbDone = res.detectAt >= 0 && res.rollbackTime >= 0 && cur >= res.detectAt + res.rollbackTime;
+      q('[data-rb]').textContent = res.detectAt < 0 || cur < res.detectAt ? (p.bug ? 'bug not noticed yet' : 'not needed') : rbDone ? res.rollbackTime + ' s' : 'in progress';
+      q('[data-rbnote]').textContent = res.detectAt >= 0 && cur >= res.detectAt ? `noticed at ${res.detectAt} s, ${DETECT} s after v2 first took traffic` : p.bug ? 'the bug is noticed 5 s after v2 first takes traffic' : '';
+      const finished = res.done >= 0 && cur >= res.done;
+      q('[data-outcome]').textContent = finished ? res.outcome : 'Running…';
+      q('[data-outcome]').classList.toggle('bad', finished && p.bug && res.detectAt >= 0);
+      q<HTMLButtonElement>('[data-run]').textContent = running ? 'Pause' : cur >= res.ticks.length - 1 ? 'Run again' : 'Run';
+      q<HTMLButtonElement>('[data-step]').disabled = cur >= res.ticks.length - 1;
+    }
+    const schedule = () => { if (!raf) raf = requestAnimationFrame(draw); };
+    function stopTimer() { window.clearInterval(timer); timer = undefined; }
+    function advance() { if (cur < res.ticks.length - 1) cur++; if (cur >= res.ticks.length - 1) { running = false; stopTimer(); } schedule(); }
+    function clock() {
+      stopTimer();
+      if (running && onScreen && !document.hidden) timer = window.setInterval(advance, 350);
+    }
+    function recompute() { running = false; stopTimer(); res = simulate(params()); cur = 0; schedule(); }
+    q('[data-run]').addEventListener('click', () => {
+      if (running) { running = false; clock(); schedule(); return; }
+      if (cur >= res.ticks.length - 1) cur = 0;
+      if (reduce) { cur = res.ticks.length - 1; schedule(); return; } // no animation: jump to the end
+      running = true; clock(); schedule();
+    });
+    q('[data-step]').addEventListener('click', () => { running = false; stopTimer(); advance(); });
+    q('[data-reset]').addEventListener('click', recompute);
+    root.querySelectorAll('select, input').forEach((el) => el.addEventListener('input', recompute));
+    new IntersectionObserver(([en]) => { onScreen = en.isIntersecting; clock(); }).observe(root);
+    document.addEventListener('visibilitychange', clock);
+    recompute();
+  });
+</script>
+<style is:global>
+  .playground .bgr-check { display: inline-flex; align-items: center; gap: 6px; }
+  .playground .bgr-fleet { display: grid; grid-template-columns: repeat(auto-fill, minmax(130px, 1fr)); gap: 8px; }
+  .playground .bgr-srv { padding: 6px 10px; gap: 2px; }
+  .playground .bgr-srv[hidden] { display: none; }
+  .playground .bgr-chartwrap { display: grid; gap: 3px; }
+  .playground .bgr-bars { position: relative; display: flex; align-items: flex-end; gap: 1px; height: 90px; border-bottom: 1px solid var(--border); background: var(--surface-2); }
+  .playground .bgr-col { flex: 1; min-width: 1px; height: 100%; display: flex; flex-direction: column-reverse; }
+  .playground .bgr-col i { display: block; width: 100%; }
+  .playground .bgr-demand { position: absolute; left: 0; right: 0; border-top: 2px dashed var(--text); opacity: .6; pointer-events: none; }
+  .playground .bgr-fails { display: flex; gap: 1px; height: 8px; }
+  .playground .bgr-fails i { flex: 1; min-width: 1px; }
+  .playground .bgr-fails i.f { background: var(--bad); }
+  .playground .bgr-sw { display: inline-block; width: 10px; height: 10px; border-radius: 2px; background: var(--c); vertical-align: baseline; margin: 0 2px 0 8px; }
+</style>

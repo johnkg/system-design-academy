@@ -17,7 +17,7 @@ If `npm install` fails with a cache permission error, add `--cache .tmp/npm-cach
 
 Create `src/content/concepts/<slug>/` containing:
 
-- `meta.json`: text content (validated by `src/content.config.ts`; `area` is one of scaling, data, messaging, reliability, api, security, observability, networking, distributed; add new areas in `src/data/areas.ts` and `src/content.config.ts`)
+- `meta.json`: text content (validated by `src/content.config.ts`; `area` is one of scaling, data, messaging, reliability, api, security, observability, networking, distributed, deployment; add new areas in `src/data/areas.ts` and `src/content.config.ts`)
 - `visuals/steps.json`: actors and frames for the animation
 - optional `code/<language-id>.<ext>`: samples, checked by `npm run check:samples`
 - `src/playgrounds/<ConceptName>Playground.astro`: the simulation (name without spaces or punctuation)

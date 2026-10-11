@@ -1,0 +1,194 @@
+{
+  "name": "Design a Distributed Cache",
+  "difficulty": "advanced",
+  "intent": "Build an in-memory cache cluster that spreads keys over many nodes, survives node failures, and keeps the database safe when keys expire together, a hot key is hit by thousands of requests, or a node comes back empty.",
+  "codeTitle": "a hash ring, an LRU cache, single flight and TTL jitter",
+  "finalIntro": "A read, a refill of an expired hot key, a write, and a cache node failing.",
+  "prompt": "Design a shared cache service, like a managed Redis or Memcached cluster, for hundreds of application servers. Services read the same data again and again, such as product pages, user profiles and session data. The cache must absorb most of the reads so that the database only sees a small fraction, it must keep working when a node dies, and it must not make things worse when it misbehaves.",
+  "functional": [
+    "get(key) returns a cached value or a miss, and set(key, value, ttl) stores it",
+    "Entries expire after a time to live, and the least useful entries are evicted when memory is full",
+    "Delete or replace an entry when the underlying data changes",
+    "Add and remove cache nodes without stopping the service",
+    "Applications can use cache-aside, and some can use write-through"
+  ],
+  "nonFunctional": [
+    "Hundreds of thousands of reads per second at the peak, with a hit ratio of 95% or more",
+    "A read takes about a millisecond at the 99th percentile, including the network",
+    "The cache is a copy, so losing it must never lose data, but it must not take the database down either",
+    "A node failure affects only a small part of the keys, and recovers in seconds",
+    "Memory is bounded, and the hottest data stays in the cache",
+    "A stale value is acceptable for a short, known time, but never for ever"
+  ],
+  "firstAttempt": {
+    "text": "Every application server keeps its own in-process hash map of recent database results, with a time to live of five minutes. On a miss the server queries the database and stores the result locally.",
+    "limits": [
+      "With 300 servers the same hot rows are cached 300 times, so the memory is wasted and the hit ratio is low",
+      "Each server has to warm up on its own, so a deploy or an autoscale empties a cache and sends a burst of misses to the database",
+      "A change cannot be removed from 300 maps, so users see different data from different servers for up to five minutes",
+      "When a popular entry expires, every server queries the database at the same time",
+      "The cache is limited to what the application's own memory can spare, and its garbage collection pauses get worse as the maps grow"
+    ]
+  },
+  "nodes": [
+    { "id": "app", "label": "App servers", "kind": "client", "x": 12, "y": 50 },
+    { "id": "local", "label": "Per-server maps", "kind": "compute", "x": 37, "y": 50, "at": 0, "until": 1 },
+    { "id": "cache1", "label": "One cache server", "kind": "data", "x": 37, "y": 16, "at": 1, "until": 2 },
+    { "id": "router", "label": "Routing (library or proxy)", "kind": "edge", "x": 37, "y": 50, "at": 2 },
+    { "id": "shards", "label": "Cache shards on a hash ring", "kind": "data", "x": 62, "y": 50, "at": 2 },
+    { "id": "replicas", "label": "Replicas", "kind": "data", "x": 62, "y": 84, "at": 3 },
+    { "id": "failover", "label": "Failure detection and promotion", "kind": "compute", "x": 37, "y": 84, "at": 3 },
+    { "id": "guard", "label": "Refill guard", "kind": "compute", "x": 62, "y": 16, "at": 4 },
+    { "id": "near", "label": "Near cache for hot keys", "kind": "compute", "x": 12, "y": 16, "at": 5 },
+    { "id": "stream", "label": "Change stream", "kind": "async", "x": 87, "y": 84, "at": 6 },
+    { "id": "db", "label": "Database", "kind": "data", "x": 87, "y": 16 }
+  ],
+  "edges": [
+    { "from": "app", "to": "local", "at": 0, "until": 1 },
+    { "from": "local", "to": "db", "at": 0, "until": 1 },
+    { "from": "app", "to": "cache1", "at": 1, "until": 2 },
+    { "from": "app", "to": "db", "at": 1, "until": 2 },
+    { "from": "app", "to": "router", "at": 2 },
+    { "from": "router", "to": "shards", "at": 2 },
+    { "from": "router", "to": "db", "at": 2, "until": 4 },
+    { "from": "shards", "to": "replicas", "at": 3 },
+    { "from": "failover", "to": "shards", "at": 3 },
+    { "from": "failover", "to": "replicas", "at": 3 },
+    { "from": "router", "to": "guard", "at": 4 },
+    { "from": "guard", "to": "db", "at": 4 },
+    { "from": "guard", "to": "shards", "at": 4 },
+    { "from": "app", "to": "near", "at": 5 },
+    { "from": "db", "to": "stream", "at": 6 },
+    { "from": "stream", "to": "shards", "at": 6 }
+  ],
+  "steps": [
+    {
+      "title": "Share one cache and decide what leaves when memory is full",
+      "problem": "Per-server maps duplicate the data, start cold, cannot be corrected and cannot be sized on their own.",
+      "fix": "Move the cache to a separate service that all the servers share, used cache-aside: the application asks the cache, and on a miss it reads the database and stores the result with a time to live. The cache has a hard memory limit. When it is reached, it evicts entries by a policy: LRU removes the one least recently used, and LFU removes the one least often used, which protects a popular entry from a one-time scan. Real systems approximate this. Redis samples a few random entries and evicts the worst of them, instead of keeping an exact list for hundreds of millions of keys. Expired entries are removed lazily when they are read, and by a background sweep.",
+      "tradeoff": "One copy of each entry, a high hit ratio, and the memory is bounded. A single node is still one machine, with a memory and throughput limit and a single point of failure, and an eviction policy is a guess that a bad access pattern, such as a big scan, can defeat.",
+      "concepts": [{ "slug": "caching" }, { "slug": "latency-and-round-trips" }, { "slug": "metrics" }]
+    },
+    {
+      "title": "Shard the keys with consistent hashing and virtual nodes",
+      "problem": "A hundred times more data and traffic than one node can hold, and adding a node must not empty the cache.",
+      "fix": "Spread the keys over many nodes. With hash(key) mod N, adding a node changes the owner of almost every key, so nearly the whole cache is lost at once. Consistent hashing puts nodes and keys on a ring, and a key belongs to the first node clockwise from it, so adding or removing one node of N moves only about 1/N of the keys. Each node is placed on the ring many times, as virtual nodes, usually 100 or more, to even out the load and to let a failed node's keys spread over all the others instead of one neighbour. Routing can sit in a smart client library (Memcached style, with the node list from configuration), in a proxy tier (Twemproxy, mcrouter), or use hash slots with redirects (Redis Cluster has 16,384 slots and answers MOVED when a client asks the wrong node).",
+      "tradeoff": "Capacity grows by adding nodes, and only a small part of the cache is cold after a change. A client library is the fastest path but every language and every client needs the same node list and the same hash. A proxy keeps clients simple and hides topology changes, at the cost of one more network hop and a tier that must itself scale.",
+      "concepts": [{ "slug": "consistent-hashing" }, { "slug": "database-sharding" }, { "slug": "proxies" }, { "slug": "horizontal-vs-vertical-scaling" }]
+    },
+    {
+      "title": "Replicate every shard and fail over automatically",
+      "problem": "When a node dies, all its keys miss at once, and the database has to serve them cold.",
+      "fix": "Each shard has one or two replicas on other machines, fed by asynchronous replication from the primary. The nodes send each other heartbeats, usually with a gossip protocol. When most of the other primaries have not heard from a node for the timeout (a few seconds), they agree it is down, and a replica is promoted with an epoch number that makes the newest primary win. Clients refresh their view of the ring. Replicas can also serve reads for hot shards. Replication is asynchronous, so the last few milliseconds of writes can be missing after a promotion, which is fine for a cache because the database holds the truth.",
+      "tradeoff": "A node failure becomes a few seconds of errors for one shard instead of a cold start of its keys, but the memory bill doubles or triples. Asynchronous replication can lose the newest entries and, if a partition isolates the old primary, two nodes can briefly both accept writes. Promotion that is too eager will flap when a node only had a long garbage-collection pause.",
+      "concepts": [{ "slug": "database-replication" }, { "slug": "gossip-protocol" }, { "slug": "leader-election" }, { "slug": "health-checks" }, { "slug": "cap-theorem" }]
+    },
+    {
+      "title": "Guard the database against stampedes",
+      "problem": "A popular entry expires, and thousands of requests miss in the same instant and all query the database. The same happens for a whole shard after a cold start.",
+      "fix": "Put a refill guard on the miss path. Single flight lets one request per process load the key while the others wait for its answer, and a short distributed lock or a Memcached lease does the same across all servers. Stale-while-revalidate keeps the expired value and serves it while one background request refreshes it, so users never wait. Randomised TTLs, with jitter of about 10%, stop many keys cached together from expiring together. Probabilistic early refresh starts the reload a little before the expiry, with a chance that rises as the expiry gets closer. A negative entry, with a short TTL, remembers that a key does not exist. Beyond that, a circuit breaker or a limit on concurrent database reads protects the database when everything else fails.",
+      "tradeoff": "The database sees about one query per hot key instead of thousands, and users see no spike. Waiting requests still pay the load time, a lock needs an expiry and a fallback for when its holder dies, and stale-while-revalidate cannot help when there is no old value, as after a node loss.",
+      "concepts": [{ "slug": "circuit-breaker" }, { "slug": "bulkhead" }, { "slug": "rate-limiting" }, { "slug": "backpressure" }, { "slug": "retries-and-backoff" }]
+    },
+    {
+      "title": "Spread hot keys over nodes and servers",
+      "problem": "One key can get more traffic than a whole node can serve, and adding nodes does not help because the key lives on only one of them.",
+      "fix": "Find hot keys by counting in the client or proxy, or by sampling the cache's own statistics. Serve a hot key from a small near cache in each application server with a very short TTL, such as one second, which removes most of the traffic before it leaves the server. For a key that is still too hot, store several copies under names such as product:42#0 to product:42#7 and have each client read a random one, and let replicas answer reads. Both give up a little freshness: a write must remove every copy, and a near cache can be a second behind.",
+      "tradeoff": "A single key can now be as popular as the whole fleet can serve, and the node that owned it stops being a bottleneck. Writes have to reach many copies, the near caches use application memory, and detection needs care so that it does not copy a key that was only hot for a moment.",
+      "concepts": [{ "slug": "load-balancing" }, { "slug": "caching" }, { "slug": "consistency-models" }]
+    },
+    {
+      "title": "Invalidate on change and warm up gently",
+      "problem": "A TTL alone leaves stale data for minutes, and a naive update of the cache can leave it wrong for ever. A restarted or new node has an empty cache.",
+      "fix": "On a write, update the database first and then delete the cache entry, rather than updating it, so a later read reloads the current value. The deletes come from the change stream of the database (the binlog or a transactional outbox), so they are reliable and also cover writes from other services. A TTL stays as a backstop for any invalidation that is lost. A read that raced with a write, and put an old value back after the delete, is limited by that TTL, by a version number stored with the value, or by a lease that a delete cancels. Write-through writes the database and the cache together for data that is read right after it is written. A new or restarted node first loads a snapshot from its replica, or the proxy gives it a small share of the traffic at first and raises it as it fills.",
+      "tradeoff": "Readers see a change within about a second of it being committed, and a lost message costs at most one TTL of staleness. The invalidation stream is a new component to run and monitor, and deleting instead of updating makes the first read after each write a miss.",
+      "concepts": [{ "slug": "transactional-outbox" }, { "slug": "message-queues" }, { "slug": "idempotency" }, { "slug": "pub-sub" }]
+    }
+  ],
+  "failures": [
+    {
+      "scenario": "A cache node dies and there is no replica",
+      "impact": "Its keys, about 1/N of the cache, are gone. Requests for them all miss, and the database gets many times its normal load until they are cached again.",
+      "answer": "With consistent hashing only that node's share is cold, and virtual nodes spread the refills over all other nodes. The refill guard turns many misses for the same key into one database read, and a limit on concurrent database reads protects it as a last resort. With replicas, the replica is promoted in seconds and nothing is cold. A new node is warmed up from a snapshot or given traffic gradually.",
+      "concepts": [{ "slug": "consistent-hashing" }, { "slug": "circuit-breaker" }, { "slug": "database-replication" }]
+    },
+    {
+      "scenario": "A hot key expires while thousands of requests per second arrive",
+      "impact": "All of them miss while the first reload is still running, and the database gets as many queries as requests arrive during the reload. Its latency rises, which makes the reload slower, which lets in even more requests.",
+      "answer": "Single flight or a lock keeps it to one query, stale-while-revalidate hides even that wait, and early refresh with TTL jitter avoids the expiry at a fixed moment in the first place. Alert on the database's query rate and on the share of cache misses, not just on the hit ratio.",
+      "concepts": [{ "slug": "backpressure" }, { "slug": "retries-and-backoff" }, { "slug": "alerting" }]
+    },
+    {
+      "scenario": "A reader puts an old value back after a write has deleted it",
+      "impact": "Reader A reads the old row from the database, a writer updates the row and deletes the cache entry, and then A stores the old value. The cache is wrong until the TTL runs out, with no error anywhere.",
+      "answer": "The race is rare but real. Keep a TTL on every entry so that the damage has an end. Store a version with the value and refuse to overwrite a newer one, or use a lease: a miss returns a token, and a delete invalidates the token, so A's late store is rejected. A delayed second delete after a short time also narrows the window.",
+      "concepts": [{ "slug": "consistency-models" }, { "slug": "idempotency" }, { "slug": "logical-clocks" }]
+    },
+    {
+      "scenario": "A network partition separates the old primary from the rest",
+      "impact": "The cluster promotes a replica, but some clients can still reach the old primary and write to it, so two nodes briefly hold different values for the same keys.",
+      "answer": "Promotion needs agreement of a majority of the primaries, and the isolated primary stops accepting writes after the node timeout when it cannot see a majority. Epoch numbers make clients and nodes prefer the newer primary. For a cache this divergence is bounded by the TTL, and the database stays the source of truth.",
+      "concepts": [{ "slug": "quorums" }, { "slug": "consensus" }, { "slug": "cap-theorem" }]
+    },
+    {
+      "scenario": "Memory fills up with a flood of keys that are used only once",
+      "impact": "A crawler or a batch job reads millions of items once each. With plain LRU these push out the hot working set, the hit ratio collapses and the database is overloaded.",
+      "answer": "Use LFU, or an admission policy such as TinyLFU, so that a key must prove it is popular before it displaces another one. Give batch jobs their own cache or a way to bypass it, set a maximum value size, and alert on evictions per second and on the hit ratio.",
+      "concepts": [{ "slug": "caching" }, { "slug": "bulkhead" }, { "slug": "metrics" }]
+    }
+  ],
+  "alternatives": [
+    {
+      "title": "Where the routing lives",
+      "options": [
+        { "name": "Smart client library", "pro": "No extra hop, the lowest latency, and no proxy tier to run", "con": "Every language needs the same library, and node list changes must reach every client" },
+        { "name": "Proxy tier", "pro": "Simple clients, topology hidden, and a place for pooling, metrics and hot-key handling", "con": "An extra hop of latency, and the proxies are another fleet to scale and keep available" },
+        { "name": "Server-side redirects", "pro": "Nodes own the truth about who holds which slot, as with Redis Cluster", "con": "A wrong guess costs a round trip, and clients must understand redirects" }
+      ],
+      "pick": "A client library for latency-critical paths, and a proxy where many languages or teams share the cache."
+    },
+    {
+      "title": "How to place keys on nodes",
+      "options": [
+        { "name": "hash(key) mod N", "pro": "Trivial, and perfectly even", "con": "Changing N moves nearly all keys, so the cache is effectively flushed" },
+        { "name": "Consistent hashing with virtual nodes", "pro": "Adding or removing a node moves about 1/N of the keys, and the load is smooth", "con": "More state to keep in sync, and balance depends on the number of virtual nodes" },
+        { "name": "Fixed hash slots assigned to nodes", "pro": "Slots move one by one with a clear state, and operators can place them", "con": "A table of slots must be kept consistent across the cluster" }
+      ],
+      "pick": "Consistent hashing with at least 100 virtual nodes, or fixed slots when the system manages the assignment itself."
+    },
+    {
+      "title": "How reads and writes use the cache",
+      "options": [
+        { "name": "Cache-aside", "pro": "The cache holds only what is read, and a cache failure leaves the database path working", "con": "Every miss is slow, and the app has to code the refill and invalidation" },
+        { "name": "Write-through", "pro": "The cache is always current after a write, and the next read hits", "con": "Every write pays for two systems, and data that is never read still fills memory" },
+        { "name": "Write-behind", "pro": "Very fast writes, and many updates to one key become one database write", "con": "Data can be lost if the cache fails before it is flushed, so it is rarely right for important data" }
+      ],
+      "pick": "Cache-aside with delete-on-write for most data, and write-through for data that is read right after it is written."
+    },
+    {
+      "title": "What to evict",
+      "options": [
+        { "name": "LRU", "pro": "Simple, and follows recent use well", "con": "One big scan can push out the whole working set" },
+        { "name": "LFU", "pro": "Keeps the genuinely popular keys through scans", "con": "Needs counters that decay, or yesterday's hot keys never leave" },
+        { "name": "TTL only", "pro": "Predictable, with nothing to tune", "con": "Memory can still fill before anything expires, so there must be a fallback" }
+      ],
+      "pick": "LFU with decay, or approximated LRU, plus a TTL on everything."
+    },
+    {
+      "title": "How much to protect against failure of a node",
+      "options": [
+        { "name": "No replicas", "pro": "Half or a third of the memory cost", "con": "A node loss is a cold start for its keys, and the database must be able to take it" },
+        { "name": "One asynchronous replica per shard", "pro": "Failover in seconds, and reads can be spread", "con": "Double the memory, and the newest writes can be lost" },
+        { "name": "Synchronous replication", "pro": "No acknowledged write is lost", "con": "Higher write latency and less availability, which is rarely needed for a cache" }
+      ],
+      "pick": "One asynchronous replica for important shards, and no replica for data that is cheap to rebuild."
+    }
+  ],
+  "roles": [
+    { "id": "client", "label": "Applications", "description": "The servers that read and write through the cache." },
+    { "id": "edge", "label": "Routing", "description": "The client library or the proxy that maps a key to a node." },
+    { "id": "async", "label": "Invalidation", "description": "The change stream that deletes stale entries." },
+    { "id": "compute", "label": "Protection", "description": "Refill guard, near cache, and failure detection with promotion." },
+    { "id": "data", "label": "Storage", "description": "Cache shards, their replicas, and the database." }
+  ]
+}

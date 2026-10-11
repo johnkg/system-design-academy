@@ -1,0 +1,163 @@
+---
+import PlaygroundShell from '../components/PlaygroundShell.astro';
+---
+<PlaygroundShell title="Simulate it" hint="Checkout serves 1000 requests per minute. v1 fails 1% of them. Release v2 as a canary and watch the health gate compare the two versions, minute by minute.">
+  <ol class="how">
+    <li>Leave the defaults (5% canary, 5 minute bake, 3 sigma, wait for 300 requests, v2 buggy at 2%) and press <b>Run to end</b>. The 5% stage has to wait until minute 6 for enough requests, then <b>passes</b> because 4 errors in 311 requests is inside the noise. At 25% the gate <b>rolls back</b> at minute 9 (15 errors in 762 requests against 0.8% on v1). Only 19 requests were failed by v2.</li>
+    <li>Now the small-sample trap. Set <b>Gate rule</b> to <b>Judge immediately</b>, <b>Canary share</b> to <b>1%</b>, <b>Bake time</b> to <b>2 min</b>, and <b>Seed</b> to 12. The gate judges on a few dozen requests, sees nothing, and <b>promotes the buggy v2 to 100%</b>: a missed bug.</li>
+    <li>And the opposite. Set <b>v2</b> to <b>Healthy</b>, <b>Rollback threshold</b> to <b>2 sigma</b> and <b>Seed</b> to 7 (keep judge immediately, 1%, 2 min). The healthy v2 is <b>rolled back at minute 3</b> by random noise: a false alarm. Now set the threshold back to <b>3 sigma</b> and the rule to <b>Wait for 300 requests</b>: the same release is promoted, but only after about 33 minutes.</li>
+    <li>Go back to the buggy v2 with seed 12, 1% and 2 min, and choose <b>Wait for 300 requests</b>: the gate now rolls back at minute 32 instead of promoting. Waiting for a real sample makes both mistakes rarer, and the price is time: at 1% only 10 canary requests arrive per minute, so 300 takes 30 minutes.</li>
+  </ol>
+  <div class="pg cd" data-cd>
+    <div class="pg-row">
+      <label>Canary share <select class="pg-in" data-share><option value="1">1%</option><option value="5" selected>5%</option><option value="10">10%</option><option value="25">25%</option></select></label>
+      <label>Bake time per stage <select class="pg-in" data-bake><option value="2">2 min</option><option value="5" selected>5 min</option><option value="10">10 min</option></select></label>
+      <label>Rollback threshold <select class="pg-in" data-zt><option value="20">2 sigma (sensitive)</option><option value="30" selected>3 sigma</option><option value="40">4 sigma (relaxed)</option></select></label>
+      <label>Gate rule <select class="pg-in" data-rule><option value="300" selected>Wait for 300 requests</option><option value="0">Judge immediately</option></select></label>
+      <label>v2 is <select class="pg-in" data-v2><option value="bug" selected>Buggy (2% errors)</option><option value="ok">Healthy (1% errors)</option></select></label>
+      <label>Seed <input class="pg-in" type="number" min="1" max="999" value="8" data-seed style="width:5.5rem" /></label>
+    </div>
+    <div class="pg-row">
+      <button class="btn" type="button" data-step>Step 1 minute</button>
+      <button class="btn" type="button" data-run>Run to end</button>
+      <button class="btn" type="button" data-reset>Reset</button>
+    </div>
+    <div class="pg-grid">
+      <div class="pg-box" data-stagebox><h3>Rollout</h3><span class="pg-mono" data-stage></span><span class="pg-note" data-stagenote></span></div>
+      <div class="pg-box" style="--c: var(--role-1)"><h3>Error rate users see</h3><span class="pg-mono" data-usr></span><span class="pg-note" data-usrnote></span></div>
+      <div class="pg-box" data-gatebox><h3>Health gate</h3><span class="pg-mono" data-gate></span><span class="pg-note" data-gatenote></span></div>
+    </div>
+    <div class="pg-box" style="--c: var(--border)">
+      <h3>Canary against stable (this stage)</h3>
+      <div class="cd-bar"><span class="cd-name">Stable v1</span><span class="cd-track"><span class="cd-fill" style="--c: var(--role-2)" data-bar-s></span></span><span class="pg-mono" data-text-s></span></div>
+      <div class="cd-bar"><span class="cd-name">Canary v2</span><span class="cd-track"><span class="cd-fill" style="--c: var(--role-3)" data-bar-c></span></span><span class="pg-mono" data-text-c></span></div>
+      <span class="pg-note">Bars show the error rate on a 0 to 4% scale. With few requests the canary bar jumps around; with many it settles near the truth.</span>
+    </div>
+    <div class="pg-box" style="--c: var(--border)">
+      <h3>Timeline, one cell per minute</h3>
+      <div class="cd-strip" data-strip></div>
+      <span class="pg-note">Amber: waiting for data. Teal: passing, still baking. Green: widened or promoted. Red: rolled back.</span>
+    </div>
+    <p class="pg-out" data-result role="status"></p>
+    <ol class="pg-log" data-log></ol>
+  </div>
+</PlaygroundShell>
+<script>
+  const PER_MIN = 1000; const STABLE = 100; const BUGGY = 200; const MAX_MIN = 90;
+  type Action = 'hold' | 'bake' | 'widen' | 'promote' | 'rollback';
+  interface Row { m: number; share: number; action: Action; ce: number; cn: number; be: number; bn: number; z10: number; failed: number; n: number; canaryFailed: number; canaryN: number }
+  interface Sim { rows: Row[]; outcome: 'promoted' | 'rolled back' | 'running' }
+
+  // Core: pure functions. Rates are counts out of 10000, the gate uses integers only.
+  function makeRng(seed: number) {
+    let s = seed >>> 0;
+    return () => { s = (Math.imul(s, 1664525) + 1013904223) >>> 0; return (s >>> 8) % 10000; };
+  }
+  // verdict plus the distance above the stable rate in tenths of a standard deviation.
+  function gate(ce: number, cn: number, be: number, bn: number, zt: number, minN: number): { verdict: 'hold' | 'pass' | 'rollback'; z10: number } {
+    if (cn === 0 || cn < minN) return { verdict: 'hold', z10: 0 };
+    const p = Math.max(Math.floor((be * 10000) / bn), 10);
+    const x = ce * 10000 - cn * p;
+    const z10 = x > 0 ? Math.floor((10 * x) / Math.sqrt(cn * p * 10000)) : 0;
+    return { verdict: x > 0 && x * x >= zt * zt * cn * p * 100 ? 'rollback' : 'pass', z10 };
+  }
+  function simulate(share: number, bake: number, zt: number, minN: number, canaryRate: number, seed: number): Sim {
+    const rnd = makeRng(seed);
+    const stages = [share, ...[25, 50].filter((s) => s > share)];
+    const rows: Row[] = [];
+    let stage = 0; let inStage = 0; let ce = 0; let cn = 0; let be = 0; let bn = 0; let failed = 0; let n = 0; let canaryFailed = 0; let canaryN = 0;
+    let outcome: Sim['outcome'] = 'running';
+    for (let m = 1; m <= MAX_MIN && outcome === 'running'; m++) {
+      for (let i = 0; i < PER_MIN; i++) {
+        const toCanary = rnd() < stages[stage] * 100;
+        const err = rnd() < (toCanary ? canaryRate : STABLE);
+        n++;
+        if (err) failed++;
+        if (toCanary) { cn++; canaryN++; if (err) { ce++; canaryFailed++; } } else { bn++; if (err) be++; }
+      }
+      inStage++;
+      const g = gate(ce, cn, be, bn, zt, minN);
+      let action: Action = g.verdict === 'pass' ? 'bake' : g.verdict;
+      const last = stage === stages.length - 1;
+      if (g.verdict === 'pass' && inStage >= bake) action = last ? 'promote' : 'widen';
+      rows.push({ m, share: stages[stage], action, ce, cn, be, bn, z10: g.z10, failed, n, canaryFailed, canaryN });
+      if (action === 'rollback') outcome = 'rolled back';
+      else if (action === 'promote') outcome = 'promoted';
+      else if (action === 'widen') { stage++; inStage = 0; ce = cn = be = bn = 0; }
+    }
+    return { rows, outcome };
+  }
+  const pct = (e: number, n: number) => (n === 0 ? '-' : (Math.round((e * 10000) / n) / 100).toFixed(2) + '%');
+  const sigma = (z10: number) => (z10 / 10).toFixed(1);
+  const colour: Record<Action, string> = { hold: 'var(--role-3)', bake: 'var(--role-2)', widen: 'var(--good)', promote: 'var(--good)', rollback: 'var(--bad)' };
+  const label: Record<Action, string> = { hold: 'waiting for data', bake: 'passing, baking', widen: 'passed, widen', promote: 'passed, promote to 100%', rollback: 'ROLL BACK' };
+
+  document.querySelectorAll<HTMLElement>('[data-cd]').forEach((root) => {
+    const q = <T extends HTMLElement>(s: string) => root.querySelector<T>(s)!;
+    const val = (s: string) => Number(q<HTMLInputElement | HTMLSelectElement>(s).value);
+    const strip = q('[data-strip]'); const log = q('[data-log]');
+    const cells: HTMLElement[] = [];
+    for (let i = 0; i < MAX_MIN; i++) { const c = document.createElement('span'); c.className = 'cd-cell'; strip.appendChild(c); cells.push(c); }
+    let sim: Sim = { rows: [], outcome: 'running' }; let shown = 0; let logged = 0; let raf = 0;
+
+    function rebuild() {
+      const seed = Math.max(1, Math.min(999, Math.floor(val('[data-seed]')) || 1));
+      sim = simulate(val('[data-share]'), val('[data-bake]'), val('[data-zt]'), val('[data-rule]'), q<HTMLSelectElement>('[data-v2]').value === 'bug' ? BUGGY : STABLE, seed);
+      shown = 0; logged = 0; log.textContent = '';
+      draw();
+    }
+    function draw() {
+      const stages = [val('[data-share]'), ...[25, 50].filter((s) => s > val('[data-share]'))];
+      const r = shown > 0 ? sim.rows[shown - 1] : undefined;
+      const done = shown === sim.rows.length && sim.outcome !== 'running';
+      while (logged < shown) {
+        const x = sim.rows[logged++]; const li = document.createElement('li');
+        li.textContent = `minute ${x.m}, ${x.share}%: canary ${x.ce}/${x.cn} (${pct(x.ce, x.cn)}) vs stable ${x.be}/${x.bn} (${pct(x.be, x.bn)}), ${sigma(x.z10)} sigma: ${label[x.action]}`;
+        log.appendChild(li); log.scrollTop = log.scrollHeight;
+      }
+      cells.forEach((c, i) => {
+        const x = sim.rows[i]; const on = i < shown && !!x;
+        c.style.setProperty('--c', on ? colour[x.action] : 'var(--border)');
+        c.classList.toggle('on', on);
+        c.title = on ? `minute ${x.m}: ${label[x.action]}` : '';
+      });
+      q('[data-stage]').textContent = r ? `${done ? sim.outcome.toUpperCase() : r.share + '% canary'}, minute ${r.m}` : `ready: stages ${stages.join('% > ')}% > 100%`;
+      q('[data-stagenote]').textContent = r ? (done ? (sim.outcome === 'promoted' ? 'v2 now takes all traffic' : 'v2 weight set to 0, v1 serves everything') : `bake ${val('[data-bake]')} min per stage`) : 'press Step or Run to start';
+      q<HTMLElement>('[data-stagebox]').style.setProperty('--c', done ? (sim.outcome === 'promoted' ? 'var(--good)' : 'var(--bad)') : 'var(--role-2)');
+      q('[data-usr]').textContent = r ? pct(r.failed, r.n) : '-';
+      q('[data-usrnote]').textContent = r ? `${r.failed} of ${r.n} requests failed, ${r.canaryFailed} of them on v2 (${r.canaryN} requests hit v2)` : 'v1 alone would be 1.00%';
+      q('[data-gate]').textContent = r ? label[r.action].toUpperCase() : 'idle';
+      q('[data-gatenote]').textContent = r ? (r.action === 'hold' && val('[data-rule]') > 0 ? `canary has ${r.cn} of ${val('[data-rule]')} requests needed` : `${sigma(r.z10)} sigma above stable, limit ${(val('[data-zt]') / 10).toFixed(1)}`) : 'compares canary with stable';
+      q<HTMLElement>('[data-gatebox]').style.setProperty('--c', r ? colour[r.action] : 'var(--border)');
+      const bar = (sel: string, e: number, n: number) => { q<HTMLElement>(sel).style.width = `${n === 0 ? 0 : Math.min(100, (e / n) * 100 * 25)}%`; };
+      bar('[data-bar-s]', r ? r.be : 0, r ? r.bn : 0); bar('[data-bar-c]', r ? r.ce : 0, r ? r.cn : 0);
+      q('[data-text-s]').textContent = r ? `${pct(r.be, r.bn)} (${r.be}/${r.bn})` : '-';
+      q('[data-text-c]').textContent = r ? `${pct(r.ce, r.cn)} (${r.ce}/${r.cn})` : '-';
+      const truthBuggy = q<HTMLSelectElement>('[data-v2]').value === 'bug';
+      q('[data-result]').textContent = !done ? '' : sim.outcome === 'promoted'
+        ? (truthBuggy ? `Missed bug: v2 really fails 2% of requests but the gate promoted it. Judging on a few hundred requests per stage cannot reliably see a 1 point difference.` : `Correct: v2 is healthy and was promoted.`)
+        : (truthBuggy ? `Correct: v2 was buggy and was rolled back at minute ${r!.m}; it failed ${r!.canaryFailed} requests.` : `False alarm: v2 is healthy, but random noise in a small sample tripped the gate at minute ${r!.m}.`);
+      (q('[data-step]') as HTMLButtonElement).disabled = shown >= sim.rows.length;
+      (q('[data-run]') as HTMLButtonElement).disabled = shown >= sim.rows.length;
+    }
+    const schedule = () => { if (raf) return; raf = requestAnimationFrame(() => { raf = 0; draw(); }); };
+    q('[data-step]').addEventListener('click', () => { if (shown < sim.rows.length) shown++; schedule(); });
+    q('[data-run]').addEventListener('click', () => { shown = sim.rows.length; schedule(); });
+    q('[data-reset]').addEventListener('click', rebuild);
+    ['[data-share]', '[data-bake]', '[data-zt]', '[data-rule]', '[data-v2]'].forEach((s) => q(s).addEventListener('change', rebuild));
+    q('[data-seed]').addEventListener('input', rebuild);
+    rebuild();
+  });
+</script>
+<style is:global>
+  .playground .cd-bar { display: grid; grid-template-columns: 5.5rem minmax(4rem, 1fr) max-content; gap: 8px; align-items: center; }
+  .playground .cd-bar .pg-mono { white-space: nowrap; }
+  .playground .cd-name { font-size: .85rem; }
+  .playground .cd-track { height: 12px; border-radius: 6px; background: var(--surface-2); overflow: hidden; }
+  .playground .cd-fill { display: block; height: 100%; width: 0; background: var(--c); transition: width .3s; }
+  .playground .cd-strip { display: flex; flex-wrap: wrap; gap: 3px; }
+  .playground .cd-cell { width: 12px; height: 16px; border-radius: 3px; border: 1px solid var(--border); background: var(--surface); }
+  .playground .cd-cell.on { background: var(--c); border-color: var(--c); }
+  @media (prefers-reduced-motion: reduce) { .playground .cd-fill { transition: none; } }
+  @media (max-width: 520px) { .playground .cd-bar { grid-template-columns: 1fr; gap: 2px; } .playground .cd-bar .pg-mono { white-space: normal; } }
+</style>

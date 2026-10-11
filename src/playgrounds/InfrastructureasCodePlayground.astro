@@ -1,0 +1,145 @@
+---
+import PlaygroundShell from '../components/PlaygroundShell.astro';
+---
+<PlaygroundShell title="Simulate it" hint="Edit the code for a small stack, read the plan, then apply it. Nothing changes until you press Apply.">
+  <ol class="how">
+    <li>At the start the code matches reality, so the plan says <b>No changes</b>. Set <b>Server size</b> to <b>medium</b>: the plan shows <b>2 to update</b> in place. Press <b>Apply</b>, then <b>Apply</b> again: the second run reports <b>0 API calls</b> (idempotent).</li>
+    <li>Change <b>Server image</b> to <b>ami-2</b> or <b>Database engine</b> to <b>postgres16</b>. Those attributes are immutable, so the plan shows <b>replace</b> (destroy, then create). For the database a red warning says its data is lost. Raising <b>Servers</b> to 3 is just <b>1 to create</b>.</li>
+    <li>Change <b>Resource name</b> from <b>web</b> to <b>app</b> with 2 servers. The settings are identical, but the plan shows <b>2 destroy and 2 create</b>, because the tool tracks resources by name.</li>
+    <li>Press <b>Drift: resize first server by hand</b> or <b>Drift: delete last server by hand</b> without touching the code. The plan now shows <b>1 update</b> or <b>1 create</b> to put reality back as the code says. Apply fixes it.</li>
+  </ol>
+  <div class="pg iac" data-iac>
+    <div class="pg-row">
+      <label>Servers <input type="range" min="1" max="4" value="2" data-count aria-label="Number of servers" /> <b data-countval>2</b></label>
+      <label>Server size <select class="pg-in" data-size><option value="small" selected>small</option><option value="medium">medium</option><option value="large">large</option></select></label>
+      <label>Server image <select class="pg-in" data-image><option value="ami-1" selected>ami-1</option><option value="ami-2">ami-2</option></select></label>
+      <label>Resource name <select class="pg-in" data-prefix><option value="web" selected>web</option><option value="app">app</option></select></label>
+    </div>
+    <div class="pg-row">
+      <label>Database engine <select class="pg-in" data-engine><option value="postgres15" selected>postgres15</option><option value="postgres16">postgres16</option></select></label>
+      <label>Database storage (GB) <select class="pg-in" data-storage><option value="20" selected>20</option><option value="50">50</option><option value="100">100</option></select></label>
+    </div>
+    <div class="pg-row">
+      <button class="btn pg-primary" type="button" data-apply>Apply</button>
+      <button class="btn" type="button" data-drift-resize>Drift: resize first server by hand</button>
+      <button class="btn" type="button" data-drift-delete>Drift: delete last server by hand</button>
+      <button class="btn" type="button" data-reset>Reset</button>
+    </div>
+    <div class="pg-grid">
+      <div class="pg-box" style="--c: var(--accent)"><h3>Plan (code vs real)</h3><ul class="pg-log iac-plan" data-plan></ul><span class="pg-mono" data-summary></span></div>
+      <div class="pg-box" style="--c: var(--role-2)"><h3>Real infrastructure</h3><pre class="pg-code" data-actual></pre></div>
+    </div>
+    <p class="pg-out" data-out aria-live="polite"></p>
+    <p class="pg-mono" data-stats></p>
+  </div>
+</PlaygroundShell>
+<script>
+  type Attrs = Record<string, string>;
+  type State = Record<string, Attrs>;
+  type Action = 'create' | 'update' | 'replace' | 'destroy';
+  interface Step { action: Action; key: string; changes: [string, string, string][] }
+  interface Cfg { count: number; size: string; image: string; prefix: string; engine: string; storage: string }
+
+  const IMMUTABLE: Record<string, string[]> = { vpc: ['cidr'], subnet: ['cidr'], server: ['image', 'subnet'], db: ['engine'] };
+  const DEFAULTS: Cfg = { count: 2, size: 'small', image: 'ami-1', prefix: 'web', engine: 'postgres15', storage: '20' };
+  const cmp = (a: string, b: string) => (a < b ? -1 : a > b ? 1 : 0);
+  const clone = <T,>(x: T): T => JSON.parse(JSON.stringify(x));
+
+  function buildDesired(c: Cfg): State {
+    const s: State = { 'vpc.main': { cidr: '10.0.0.0/16' }, 'subnet.app': { cidr: '10.0.1.0/24' }, 'db.main': { engine: c.engine, storage: c.storage } };
+    for (let i = 1; i <= c.count; i++) s[`server.${c.prefix}-${i}`] = { size: c.size, image: c.image, subnet: 'subnet.app' };
+    return s;
+  }
+  function diffAttrs(from: Attrs, to: Attrs): [string, string, string][] {
+    const names = [...new Set([...Object.keys(from), ...Object.keys(to)])].sort(cmp);
+    return names.filter((n) => from[n] !== to[n]).map((n) => [n, from[n] ?? '(none)', to[n] ?? '(none)'] as [string, string, string]);
+  }
+  function plan(desired: State, actual: State): Step[] {
+    const steps: Step[] = [];
+    for (const key of [...new Set([...Object.keys(desired), ...Object.keys(actual)])].sort(cmp)) {
+      if (!(key in actual)) { steps.push({ action: 'create', key, changes: [] }); continue; }
+      if (!(key in desired)) { steps.push({ action: 'destroy', key, changes: [] }); continue; }
+      const changes = diffAttrs(actual[key], desired[key]);
+      if (!changes.length) continue;
+      const forced = changes.some(([n]) => IMMUTABLE[key.split('.')[0]].includes(n));
+      steps.push({ action: forced ? 'replace' : 'update', key, changes });
+    }
+    return steps;
+  }
+  function applyPlan(actual: State, steps: Step[], desired: State): number {
+    let calls = 0;
+    for (const s of steps) {
+      if (s.action === 'destroy') { delete actual[s.key]; calls += 1; }
+      else { actual[s.key] = clone(desired[s.key]); calls += s.action === 'replace' ? 2 : 1; }
+    }
+    return calls;
+  }
+  const count = (steps: Step[], a: Action) => steps.filter((s) => s.action === a).length;
+  const servers = (s: State) => Object.keys(s).filter((k) => k.startsWith('server.')).sort(cmp);
+
+  document.querySelectorAll<HTMLElement>('[data-iac]').forEach((root) => {
+    const q = <T extends HTMLElement>(s: string) => root.querySelector<T>(s)!;
+    const sel = (s: string) => q<HTMLSelectElement>(s).value;
+    const SIGN: Record<Action, string> = { create: '+', update: '~', replace: '-/+', destroy: '-' };
+    const COLOUR: Record<Action, string> = { create: 'var(--good)', update: 'var(--role-3)', replace: 'var(--bad)', destroy: 'var(--bad)' };
+    let actual: State = buildDesired(DEFAULTS);
+    let applies = 0; let totalCalls = 0; let message = 'Code and reality match. Edit a setting to see a plan.'; let bad = false; let raf = 0;
+
+    const cfg = (): Cfg => ({ count: Number(q<HTMLInputElement>('[data-count]').value), size: sel('[data-size]'), image: sel('[data-image]'), prefix: sel('[data-prefix]'), engine: sel('[data-engine]'), storage: sel('[data-storage]') });
+    function draw() {
+      raf = 0;
+      const desired = buildDesired(cfg()); const steps = plan(desired, actual);
+      q('[data-countval]').textContent = String(cfg().count);
+      const list = q('[data-plan]'); list.replaceChildren();
+      if (!steps.length) { const li = document.createElement('li'); li.textContent = 'No changes. Real infrastructure matches the code.'; list.append(li); }
+      for (const s of steps) {
+        const li = document.createElement('li'); li.style.color = COLOUR[s.action];
+        const why = s.changes.map(([n, a, b]) => `${n}: ${a} -> ${b}`).join(', ');
+        li.textContent = `${SIGN[s.action]} ${s.action} ${s.key}${why ? ` (${why})` : ''}${s.action === 'replace' ? ' forces replacement' : ''}`;
+        list.append(li);
+      }
+      q('[data-summary]').textContent = `Plan: ${count(steps, 'create')} create, ${count(steps, 'update')} update, ${count(steps, 'replace')} replace, ${count(steps, 'destroy')} destroy`;
+      q('[data-actual]').textContent = Object.keys(actual).sort(cmp).map((k) => `${k}  ${Object.keys(actual[k]).sort(cmp).filter((n) => n !== 'subnet').map((n) => `${n}=${actual[k][n]}`).join(' ')}`).join('\n');
+      const dbLost = steps.some((s) => s.key === 'db.main' && (s.action === 'replace' || s.action === 'destroy'));
+      const warn = dbLost ? ' WARNING: db.main will be destroyed and recreated. Its data is lost unless you restore a backup.' : '';
+      const out = q('[data-out]'); out.textContent = message + warn; out.classList.toggle('bad', bad || dbLost);
+      q('[data-stats]').textContent = `applies run: ${applies} · API calls made so far: ${totalCalls}`;
+    }
+    const schedule = () => { if (!raf) raf = requestAnimationFrame(draw); };
+
+    function applyNow() {
+      const desired = buildDesired(cfg()); const steps = plan(desired, actual);
+      const calls = applyPlan(actual, steps, desired); applies++; totalCalls += calls;
+      bad = false; message = steps.length ? `Applied ${steps.length} change${steps.length > 1 ? 's' : ''} with ${calls} API calls. Plan again: ${plan(desired, actual).length} changes.${steps.some((x) => x.key === 'db.main' && x.action === 'replace') ? ' The database was replaced: it started empty.' : ''}` : 'Nothing to do: 0 changes, 0 API calls. Applying again is safe.';
+      draw();
+    }
+    function driftResize() {
+      const first = servers(actual)[0]; bad = false;
+      if (!first) { message = 'No server exists to resize.'; draw(); return; }
+      const want = cfg().size; actual[first].size = want === 'large' ? 'small' : 'large';
+      message = `Someone changed ${first} to ${actual[first].size} in the console. The code was not touched.`; draw();
+    }
+    function driftDelete() {
+      const all = servers(actual); const last = all[all.length - 1]; bad = false;
+      if (!last) { message = 'No server exists to delete.'; draw(); return; }
+      delete actual[last]; message = `Someone deleted ${last} in the console. The code was not touched.`; draw();
+    }
+    function reset() {
+      const set = (s: string, v: string) => { q<HTMLSelectElement>(s).value = v; };
+      q<HTMLInputElement>('[data-count]').value = String(DEFAULTS.count); set('[data-size]', DEFAULTS.size); set('[data-image]', DEFAULTS.image);
+      set('[data-prefix]', DEFAULTS.prefix); set('[data-engine]', DEFAULTS.engine); set('[data-storage]', DEFAULTS.storage);
+      actual = buildDesired(DEFAULTS); applies = 0; totalCalls = 0; bad = false; message = 'Code and reality match. Edit a setting to see a plan.'; draw();
+    }
+    const edited = () => { bad = false; message = 'Plan updated from your edit. Nothing has changed in the real infrastructure until you press Apply.'; schedule(); };
+    root.querySelectorAll('input, select').forEach((el) => el.addEventListener('input', edited));
+    root.querySelectorAll('select').forEach((el) => el.addEventListener('change', edited));
+    q('[data-apply]').addEventListener('click', applyNow);
+    q('[data-drift-resize]').addEventListener('click', driftResize);
+    q('[data-drift-delete]').addEventListener('click', driftDelete);
+    q('[data-reset]').addEventListener('click', reset);
+    draw();
+  });
+</script>
+<style is:global>
+  .playground .iac-plan { list-style: none; padding-left: 0; max-height: 260px; }
+</style>
