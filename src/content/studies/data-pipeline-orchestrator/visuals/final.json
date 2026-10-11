@@ -1,0 +1,53 @@
+{
+  "actors": [
+    { "id": "sensor", "label": "File sensor", "role": "compute", "x": 14, "y": 16 },
+    { "id": "sched", "label": "Scheduler", "role": "edge", "x": 50, "y": 16 },
+    { "id": "meta", "label": "Metadata DB", "role": "data", "x": 86, "y": 16 },
+    { "id": "queue", "label": "Task queue", "role": "async", "x": 14, "y": 50 },
+    { "id": "worker", "label": "Worker", "role": "compute", "x": 50, "y": 50 },
+    { "id": "wh", "label": "Warehouse", "role": "data", "x": 86, "y": 50 },
+    { "id": "ops", "label": "Backfill and alerts", "role": "async", "x": 50, "y": 84 }
+  ],
+  "frames": [
+    {
+      "narration": "The run for 2026-10-10 is created after midnight. The first task is a sensor that checks every 10 minutes for the day's file, with a 30 minute timeout. The file lands at minute 12, so the poke at minute 20 finds it.",
+      "messages": [{ "from": "sched", "to": "sensor", "label": "wait for file 10-10" }, { "from": "sensor", "to": "sched", "label": "found at minute 20" }],
+      "states": { "sensor": "success" }
+    },
+    {
+      "narration": "The extract task is now ready. The scheduler marks it queued in the metadata database in one transaction and puts a message on the queue. Only one scheduler instance can win that update.",
+      "messages": [{ "from": "sched", "to": "meta", "label": "extract: queued" }, { "from": "sched", "to": "queue", "label": "run extract 10-10" }],
+      "states": { "meta": "extract queued" }
+    },
+    {
+      "narration": "A worker takes the message, claims the task instance and marks it running. It reads the data of 2026-10-10 only, because the interval is passed in and the task never looks at the clock.",
+      "messages": [{ "from": "queue", "to": "worker", "label": "extract 10-10" }, { "from": "worker", "to": "meta", "label": "running" }],
+      "states": { "worker": "running" }
+    },
+    {
+      "narration": "The first attempt fails because the database is briefly overloaded. The task is not failed yet: it has 3 attempts, and it waits 30 seconds, then retries.",
+      "messages": [{ "from": "worker", "to": "meta", "label": "attempt 1 failed, retry in 30 s" }],
+      "states": { "meta": "up for retry" }
+    },
+    {
+      "narration": "The retry works. The worker replaces the partition for 2026-10-10 in the warehouse in one atomic swap, so the failed attempt left nothing behind. Then it records success.",
+      "messages": [{ "from": "worker", "to": "wh", "label": "overwrite partition 10-10" }, { "from": "worker", "to": "meta", "label": "extract: success" }],
+      "states": { "wh": "partition 10-10 replaced", "meta": "extract success" }
+    },
+    {
+      "narration": "Next the clean task runs, then the two aggregations in parallel, then the report, which waits for both. Each step is queued only when all its upstream tasks are in success.",
+      "messages": [{ "from": "sched", "to": "queue", "label": "clean, then 2 in parallel, then report" }, { "from": "worker", "to": "meta", "label": "4 tasks success" }],
+      "states": { "meta": "run 10-10: 6 of 6 success" }
+    },
+    {
+      "narration": "Two weeks later a bug in clean is found. The team starts a backfill for the last 14 days. The runner clears clean and everything after it for each day, and releases 3 days at a time so the warehouse is not flooded.",
+      "messages": [{ "from": "ops", "to": "sched", "label": "backfill 14 days, 3 at a time" }, { "from": "sched", "to": "meta", "label": "clear clean and downstream" }]
+    },
+    {
+      "narration": "Each re-run overwrites its own day, so the backfill can be stopped, restarted or run twice with the same result. Extract and the sensor are still in success and are skipped. If a run misses its deadline, an alert goes to the owner.",
+      "messages": [{ "from": "worker", "to": "wh", "label": "overwrite 14 partitions" }, { "from": "sched", "to": "ops", "label": "SLA alert if late" }],
+      "states": { "wh": "14 days rebuilt, no duplicates" },
+      "highlight": ["wh"]
+    }
+  ]
+}

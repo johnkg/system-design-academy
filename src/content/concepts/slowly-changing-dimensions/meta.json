@@ -1,0 +1,79 @@
+{
+  "name": "Slowly Changing Dimensions",
+  "area": "dataengineering",
+  "difficulty": "intermediate",
+  "intent": "Decide what a warehouse dimension table does when a descriptive attribute changes, so that facts are reported against the truth that applied when they happened, or deliberately against today's truth.",
+  "scenario": "A retailer's warehouse has 200 sales and a customer dimension with a region column. Customers move: customer 3 is recorded as moving from South to East with effect from day 150, but the change reaches the warehouse only on day 250. Revenue per region has to come out right for days 1 to 360, for sales that were loaded before the change arrived and for those loaded after it.",
+  "problem": "Fact tables record events and point at dimension rows (customer, product, store) for descriptive context. Those descriptions change slowly and unpredictably: a customer moves, a product changes category, a sales rep is reassigned. If the dimension is simply updated in place, last year's sales silently move to the customer's new region and old reports change after the fact. If every change is kept as history, the loader has to decide which version each fact belongs to, close the previous version, ignore redelivered records that changed nothing, and cope with changes that arrive days after they took effect. Getting this wrong does not crash anything: the totals are just quietly wrong.",
+  "howItWorks": [
+    {
+      "title": "Give every dimension row its own surrogate key",
+      "text": "The business key (customer id 3) identifies a customer, not a version of one. The warehouse issues a surrogate key (an integer it generates) per row, and facts store that key. Because the join target is a row rather than a person, one customer can have several rows, each describing them at a different time, and a fact keeps pointing at the row that was right for it. Surrogate keys also decouple the warehouse from source systems that reuse or renumber ids."
+    },
+    {
+      "title": "Type 1: overwrite and keep no history",
+      "text": "On a change the loader updates the row in place. It is one UPDATE or MERGE, storage does not grow, and joins stay trivial, which is exactly right for corrections such as a fixed typo in a name. But every old fact now reports the new value, and a report run today differs from the one run last quarter. In the scenario it leaves 8 rows and 65 of 200 sales attributed to a region the customer was not in when they bought."
+    },
+    {
+      "title": "Type 2: close the old version, insert a new one",
+      "text": "The loader sets valid_to on the current row, inserts a new row with a new surrogate key, valid_from equal to the change date, valid_to open (a NULL or a far-future date such as 9999-12-31) and often an is_current flag. Each fact is loaded with the surrogate key of the row valid on the fact's date, found by a point-in-time lookup, so history is preserved: 8 customers and 7 effective changes become 15 rows. The cost is more rows and joins that must pick one version, either by the key stored on the fact or by a range predicate on dates."
+    },
+    {
+      "title": "Detect change with a hash of the tracked attributes",
+      "text": "Source feeds often redeliver unchanged records, and wide dimensions make column-by-column comparison costly. The loader hashes only the attributes it tracks (region and tier here), a 64 or 128 bit hash in practice, compares it with the stored hash of the current row, and does nothing when equal. The choice of tracked columns is a business decision: tracking tier creates a version for every basic to gold promotion, ignoring it keeps the table smaller but loses that history. Skipping unchanged records also makes the load idempotent when a batch is replayed."
+    },
+    {
+      "title": "Handle late-arriving changes by effective date",
+      "text": "valid_from must be when the change became true in the business, not when the warehouse heard about it. If customer 3 moved on day 150 and the record arrives on day 250, the loader must close the version covering day 150, split the history there, and re-key the facts already loaded between day 150 and day 250 so they point at the new version. Stamping the arrival date instead is the common bug: the history is internally consistent but the 7 sales in between stay on the wrong version."
+    },
+    {
+      "title": "Pick the type per attribute, not per table",
+      "text": "Real dimensions mix types: Type 1 for corrections, Type 2 for attributes that reports slice by (region, segment, price band). Type 3 keeps one previous value in an extra column (previous_region) when only 'before and after' matters, and Type 6 hybrids add the current value onto every historical row so reports can group by either. Where full history is needed on rapidly changing attributes, move them to a separate mini-dimension or into the fact table instead of versioning a huge dimension."
+    }
+  ],
+  "pros": [
+    "Reports are reproducible: last quarter's revenue per region does not change when customers move afterwards",
+    "Facts answer 'as it was then' and, with an is_current flag or a join to the current row, 'as it is now' as well",
+    "Hash comparison makes loads cheap and safe to replay, since unchanged records are skipped",
+    "Each attribute can use the cheapest type that satisfies its business question"
+  ],
+  "cons": [
+    "Type 2 multiplies rows, and a frequently changing attribute can make a dimension larger than the fact table it describes",
+    "Loaders get complicated: closing versions, point-in-time lookups, late arrivals, re-keying facts",
+    "Queries need care: forgetting the validity filter or the current-row flag double counts or picks the wrong version",
+    "Type 2 history is only as good as the dates in the source: a missing or wrong effective date silently misattributes facts"
+  ],
+  "whenToUse": [
+    "Reporting must stay stable over time and be sliceable by an attribute that changes (customer region, product category, account owner)",
+    "Audit or regulatory questions such as 'which price list or tier applied on that date'",
+    "Warehouses built on star schemas where facts reference dimensions by surrogate key"
+  ],
+  "whenNotToUse": [
+    "The attribute is a correction or has no analytical meaning in the past (typos, formatting): use Type 1",
+    "Nobody ever reports on the old value, or the source system already keeps an audit trail you can query when needed",
+    "The attribute changes very often (a status, a balance, a last-seen timestamp): that is fact or event data, so do not version a dimension row for it",
+    "Wide, single-purpose tables or a pure event stream, where the event itself carries the values at the time"
+  ],
+  "pitfalls": [
+    "Stamping valid_from with the load date instead of the effective date, so late-arriving changes leave already-loaded facts on the wrong version",
+    "Overlapping or gapped validity ranges: the close of the old row and the open of the new row must use the same boundary (from <= day < to), otherwise a day matches two rows or none",
+    "Loading facts before their dimension rows exist and then not fixing them (late-arriving dimension): park them on an 'unknown' row and re-key when the member arrives",
+    "Hashing too many columns, such as an updated_at timestamp, so every redelivery looks like a change and versions explode",
+    "Joining on the business key and filtering is_current in reports, which quietly turns a Type 2 table into a Type 1 view of today",
+    "Using the same surrogate key generator in parallel loads without coordination, producing duplicates or gaps that break the 'exactly one current row per customer' invariant"
+  ],
+  "related": [
+    { "kind": "concept", "slug": "schema-evolution-and-compatibility" },
+    { "kind": "concept", "slug": "idempotency" },
+    { "kind": "concept", "slug": "event-sourcing" },
+    { "kind": "concept", "slug": "query-planning-and-joins" },
+    { "kind": "concept", "slug": "mvcc-and-isolation-levels" },
+    { "kind": "concept", "slug": "table-formats-and-the-lakehouse" }
+  ],
+  "roles": [
+    { "id": "source", "label": "Source system", "description": "The customer database or change feed that reports moves, sometimes days after they took effect." },
+    { "id": "loader", "label": "Loader", "description": "The ETL job that hashes tracked attributes, closes old versions, inserts new ones and looks up the right version for each fact." },
+    { "id": "dim", "label": "Customer dimension", "description": "One row per customer version, each with its own surrogate key and valid_from / valid_to." },
+    { "id": "fact", "label": "Sales facts", "description": "Sales events that store the surrogate key of the dimension row valid on the sale date." }
+  ]
+}

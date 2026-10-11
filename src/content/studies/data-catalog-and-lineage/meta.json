@@ -1,0 +1,186 @@
+{
+  "name": "Design a Data Catalog and Lineage Service",
+  "difficulty": "advanced",
+  "intent": "Let people in a company find the data they need, trust it, and see what breaks downstream before they change it, by collecting metadata and lineage from every pipeline and keeping it fresh.",
+  "codeTitle": "a lineage graph with impact analysis and search",
+  "finalIntro": "One pipeline run reaching the catalog, and then an engineer asking what a change would break.",
+  "prompt": "Design the data catalog for a company with 100,000 tables and dashboards, 20,000 scheduled jobs and thousands of data users. People must be able to search for data, see who owns it and how healthy it is, and see which jobs and dashboards sit upstream and downstream of any table, so that an engineer can tell who is affected before changing or deleting something.",
+  "functional": [
+    "Collect names, schemas, descriptions and tags from warehouses, databases, streams and dashboards",
+    "Record lineage: which job read which assets and wrote which assets, down to the column where possible",
+    "Search for assets by name, description, column or tag, with the most useful results first",
+    "Show upstream and downstream assets for any asset, and the full list of things a change would affect",
+    "Show the owner, the freshness and the results of quality checks for each asset",
+    "Notify the owners of affected assets when a breaking change is planned"
+  ],
+  "nonFunctional": [
+    "A new table or a changed schema shows up in the catalog within about 15 minutes",
+    "Search answers in under 300 ms, and a lineage page in under 1 second",
+    "Handle bursts of run events when thousands of jobs finish at the same hour",
+    "Lineage must not be wrong in the dangerous direction: missing an edge is worse than showing an extra one",
+    "Users only see assets and sample values they are allowed to see",
+    "A broken connector or a flood of events must not take the catalog down"
+  ],
+  "firstAttempt": {
+    "text": "A wiki or a shared spreadsheet where each team lists its tables, a description and an owner, and draws a diagram of its pipelines. People search it with the browser's find function, and teams are asked to keep it up to date.",
+    "limits": [
+      "Nobody updates it, so within weeks it disagrees with what actually exists",
+      "Diagrams show what someone intended, not what jobs really read and write",
+      "There is no way to ask what depends on a table without reading every team's page",
+      "Search finds words on a page, not tables, columns or the popular copy of a table",
+      "Nothing shows whether data is fresh or has failed its checks, and there is no access control per asset"
+    ]
+  },
+  "nodes": [
+    { "id": "users", "label": "Data users", "kind": "client", "x": 12, "y": 37 },
+    { "id": "wiki", "label": "Wiki and spreadsheet", "kind": "compute", "x": 37, "y": 37, "at": 0, "until": 1 },
+    { "id": "api", "label": "Catalog API", "kind": "edge", "x": 37, "y": 37, "at": 1 },
+    { "id": "store", "label": "Metadata store", "kind": "data", "x": 62, "y": 37, "at": 1 },
+    { "id": "connectors", "label": "Connectors", "kind": "edge", "x": 62, "y": 63, "at": 1 },
+    { "id": "sources", "label": "Jobs and sources", "kind": "client", "x": 87, "y": 63, "at": 1 },
+    { "id": "events", "label": "Run events", "kind": "async", "x": 62, "y": 88, "at": 2 },
+    { "id": "graph", "label": "Lineage graph", "kind": "data", "x": 37, "y": 63, "at": 2 },
+    { "id": "impact", "label": "Impact service", "kind": "compute", "x": 12, "y": 63, "at": 3 },
+    { "id": "search", "label": "Search index", "kind": "data", "x": 37, "y": 12, "at": 4 },
+    { "id": "owners", "label": "Owners and checks", "kind": "compute", "x": 62, "y": 12, "at": 5 },
+    { "id": "notifier", "label": "Notifier", "kind": "async", "x": 87, "y": 12, "at": 5 },
+    { "id": "policy", "label": "Access filter", "kind": "compute", "x": 12, "y": 12, "at": 6 }
+  ],
+  "edges": [
+    { "from": "users", "to": "wiki", "at": 0, "until": 1 },
+    { "from": "users", "to": "api", "at": 1, "until": 6 },
+    { "from": "api", "to": "store", "at": 1 },
+    { "from": "sources", "to": "connectors", "at": 1 },
+    { "from": "connectors", "to": "store", "at": 1 },
+    { "from": "sources", "to": "events", "at": 2 },
+    { "from": "events", "to": "graph", "at": 2 },
+    { "from": "api", "to": "graph", "at": 2 },
+    { "from": "api", "to": "impact", "at": 3 },
+    { "from": "impact", "to": "graph", "at": 3 },
+    { "from": "store", "to": "search", "at": 4 },
+    { "from": "api", "to": "search", "at": 4 },
+    { "from": "store", "to": "owners", "at": 5 },
+    { "from": "owners", "to": "notifier", "at": 5 },
+    { "from": "users", "to": "policy", "at": 6 },
+    { "from": "policy", "to": "api", "at": 6 }
+  ],
+  "steps": [
+    {
+      "title": "Collect metadata automatically with connectors",
+      "problem": "A catalog that people fill in by hand is out of date by the time it is finished, and nobody trusts it.",
+      "fix": "Run a connector for each kind of system: a warehouse, a database, a message stream, a dashboard tool. On a schedule, and when the system can send change notifications, it reads the schemas, table and column names, descriptions, sizes and last-updated times and writes them into one metadata store with a common model. Each asset gets a stable identifier built from its system and its full name, such as 'warehouse.sales.orders', and each ingest is an upsert keyed on that identifier, so reading the same table twice changes nothing. People add what machines cannot know, such as descriptions and tags, on top.",
+      "tradeoff": "The catalog describes what really exists and fills itself. Connectors are code per system that must follow each system's changes, a full crawl of a large warehouse is slow and loads it, and a table that is renamed looks like a delete plus a create unless the connector can tell.",
+      "concepts": [{ "slug": "idempotency" }, { "slug": "schema-evolution-and-compatibility" }, { "slug": "webhooks" }, { "slug": "retries-and-backoff" }]
+    },
+    {
+      "title": "Record lineage from run events, not from diagrams",
+      "problem": "Knowing what a table is does not tell you what produces it or who reads it, and hand-drawn diagrams are wrong as soon as a job changes.",
+      "fix": "Each job reports what it did when it runs: a small event saying that this run read these inputs and wrote these outputs, with a unique run id and, where the engine can tell, which input columns went into which output columns. Events go on a queue and a writer adds edges to a graph store, where a node is an asset and an edge says 'was read to produce'. The writer remembers the ids of events it has applied, so a delivery that arrives twice, or a whole replay, adds nothing new, and an edge that is already known is not added again. Parsing query logs fills in jobs that cannot send events.",
+      "tradeoff": "The graph shows what happened, so it stays correct as jobs change, and a replay repairs gaps. It only knows about runs it was told about: a job that ran before reporting began, or one that never reports, leaves a hole. Edges built from guessed SQL parsing can be missing or wrong, so each edge should carry where it came from.",
+      "concepts": [{ "slug": "message-queues" }, { "slug": "idempotency" }, { "slug": "delivery-guarantees" }, { "slug": "dead-letter-queues-and-poison-messages" }, { "slug": "event-sourcing" }]
+    },
+    {
+      "title": "Answer 'what breaks if I change this?' with a graph walk",
+      "problem": "Seeing the direct readers of a table is not enough: the dashboard that breaks may be five jobs away.",
+      "fix": "An impact service walks the graph downstream from the changed asset, breadth first. It keeps a map of assets already visited, so a shared table reached by twenty routes is processed once and a feedback loop between jobs cannot make the walk run forever. The result lists every affected asset with its distance in hops, and the walk can be limited by depth for the page view, but never for a safety check. The same walk upstream answers 'where does this number come from?'. At 100,000 assets the whole graph, with a few hundred thousand edges, fits in the memory of one machine, with a graph database or an adjacency table as the durable copy.",
+      "tradeoff": "One query gives the complete list of what is affected, and the walk costs only as much as the part of the graph it reaches. The result can still be thousands of assets for a core table, so it needs grouping by owner, and a depth limit used by mistake gives a falsely small answer, which is exactly the dangerous direction.",
+      "concepts": [{ "slug": "sql-vs-nosql" }, { "slug": "database-indexing" }, { "slug": "caching" }, { "slug": "query-planning-and-joins" }]
+    },
+    {
+      "title": "Build a search index that ranks by usefulness",
+      "problem": "A search for 'orders' returns thirty tables and copies of tables, and the one people should use is somewhere in the middle.",
+      "fix": "Copy each asset's name, description, column names, tags and owner into a search index, kept in step with the metadata store by change events. Rank first by how well the text matches, giving weight to an exact name, and then by signals of usefulness: how many assets read it (its number of downstream edges, taken from the graph), how recently it was queried, how many people query it, whether it is certified, and whether it is deprecated, which pushes it down. Typing a prefix is answered by a prefix index, and filters by system, owner and tag narrow the results.",
+      "tradeoff": "The popular, maintained table comes first, which is what people want. The index is a second copy that lags the store by seconds, and a popularity signal makes the rich get richer, so a good new table needs a boost for a while and certification helps people look past raw counts.",
+      "concepts": [{ "slug": "database-indexing" }, { "slug": "pagination" }, { "slug": "caching" }, { "slug": "pub-sub" }]
+    },
+    {
+      "title": "Attach owners and quality signals, and tell the right people",
+      "problem": "Finding a table is not enough. People need to know who to ask, whether the data is fresh, and who has to hear about a change.",
+      "fix": "Every asset has an owner, a person or a team, taken from the source system where it is recorded and otherwise assigned, and unowned assets are reported until they are claimed. Quality results come in from the checks that pipelines already run: freshness, row-count and null-rate tests, each with a time and a pass or fail, shown as a badge and kept as history. When someone plans a breaking change, the impact result is grouped by owner and the notifier sends each owning team a message that lists its affected assets. Failures upstream also show on every downstream asset, so a dashboard owner sees why a number is stale.",
+      "tradeoff": "People can trust and contact the right owner, and a change is announced to exactly the teams it affects. Ownership data decays when people move teams, so it needs regular reviews, and a noisy check that fails constantly teaches everyone to ignore the badge.",
+      "concepts": [{ "slug": "alerting" }, { "slug": "slos-and-error-budgets" }, { "slug": "metrics" }, { "slug": "webhooks" }, { "slug": "health-checks" }]
+    },
+    {
+      "title": "Filter results by what each person may see",
+      "problem": "Some tables hold salaries, health data or other personal information. The catalog must not leak their names, sample rows or lineage to people who cannot read them.",
+      "fix": "Assets and columns carry tags such as 'personal data' or 'finance only', set by people and by automatic classifiers. An access filter in front of the API trims every response by the caller's identity and groups: search results, lineage pages and previews leave out or mask what the caller may not see. A hidden node can still be shown as an anonymous 'restricted asset' in a lineage chain so that the chain is not broken, and the impact check still counts it, so its owner is notified. Every access to sensitive metadata is written to an audit log.",
+      "tradeoff": "The catalog can be open to the whole company without leaking. Checking permissions on every result adds cost, a search must filter before it counts or the totals leak, and masked nodes in a lineage graph can confuse users who do not see why a chain continues.",
+      "concepts": [{ "slug": "authentication-and-authorization" }, { "slug": "access-control-models" }, { "slug": "structured-logging" }, { "slug": "encryption" }]
+    }
+  ],
+  "failures": [
+    {
+      "scenario": "A job reports the same run twice, or a whole day of events is replayed",
+      "impact": "Edges are added twice, counts are inflated, and the 'how many things read this' signal that drives search ranking is wrong.",
+      "answer": "Every event has a unique run id, and the writer records the ids it has applied, so a repeat does nothing. An edge that already exists is not added again, so duplicates and replays are harmless and a replay can be used to repair a gap on purpose.",
+      "concepts": [{ "slug": "idempotency" }, { "slug": "delivery-guarantees" }, { "slug": "message-queues" }]
+    },
+    {
+      "scenario": "Two jobs feed each other, so the graph has a cycle",
+      "impact": "A naive walk follows the loop forever, or visits the same assets millions of times, and the impact query never returns.",
+      "answer": "The walk keeps a visited map and never expands an asset twice, so a cycle ends the walk after one lap, and the work is bounded by the size of the reachable part of the graph. A cycle is also reported as a data-quality problem, because it usually means a job was misconfigured.",
+      "concepts": [{ "slug": "timeouts-and-deadlines" }, { "slug": "load-shedding" }, { "slug": "alerting" }]
+    },
+    {
+      "scenario": "A connector breaks after a source system upgrade",
+      "impact": "That source's metadata stops updating, so schemas go stale and new tables never appear, with no visible error to users.",
+      "answer": "Each asset shows the time it was last synced, and each connector reports a heartbeat and a count of what it read. An alert fires when a connector's sync is late or its count drops sharply. Other connectors keep working, as they are isolated from each other, and a retry with backoff picks up when the source recovers.",
+      "concepts": [{ "slug": "bulkhead" }, { "slug": "retries-and-backoff" }, { "slug": "alerting" }, { "slug": "health-checks" }]
+    },
+    {
+      "scenario": "Thousands of jobs finish at midnight and send events at once",
+      "impact": "The writer falls behind, lineage lags by hours, and an engineer checks impact on a graph that is missing last night's edges.",
+      "answer": "Events wait in the queue, which absorbs the burst, and writers are added in proportion to the backlog. Events are partitioned by output asset so that two writers do not fight over one asset's edges. The impact page shows how far behind the graph is, so nobody mistakes an incomplete graph for a complete one.",
+      "concepts": [{ "slug": "backpressure" }, { "slug": "autoscaling" }, { "slug": "ordering-and-partitioning" }, { "slug": "message-queues" }]
+    },
+    {
+      "scenario": "A column is renamed and the lineage of the old name stops",
+      "impact": "The new column looks like a brand new asset with no history, and downstream readers still point to a name that no longer exists.",
+      "answer": "Schema changes are recorded as versions of the asset, and a rename that the source system reports is stored as a rename, keeping the asset's identity. Lineage edges are kept with the time they were observed, so history can be shown for the old name, and downstream jobs that still read the old name are flagged as broken by the impact service.",
+      "concepts": [{ "slug": "schema-evolution-and-compatibility" }, { "slug": "online-schema-migrations" }, { "slug": "api-versioning" }]
+    }
+  ],
+  "alternatives": [
+    {
+      "title": "How lineage is captured",
+      "options": [
+        { "name": "Run events emitted by the jobs", "pro": "Exact for what really ran, and cheap to receive", "con": "Every job or engine needs an integration, and unreported jobs are invisible" },
+        { "name": "Parsing SQL and query logs", "pro": "Needs no change to the jobs and works on history", "con": "Dynamic SQL and some functions cannot be parsed, so edges are missed or guessed" },
+        { "name": "Declared by the teams", "pro": "Easy to start", "con": "Drifts from reality like any diagram" }
+      ],
+      "pick": "Run events where possible, with log parsing for the jobs that cannot send them, and each edge tagged with its source."
+    },
+    {
+      "title": "Where the lineage graph lives",
+      "options": [
+        { "name": "A graph database", "pro": "Traversals are a natural query and fast for deep walks", "con": "Another system to run, and a smaller pool of people who know it" },
+        { "name": "Edge table in a relational database", "pro": "Familiar, transactional, and good enough for a few hundred thousand edges", "con": "Deep walks are many round trips or a recursive query" },
+        { "name": "Held in memory, loaded from a durable store", "pro": "Whole walks take milliseconds", "con": "Needs loading, and must be refreshed as events arrive" }
+      ],
+      "pick": "A relational edge table as the durable copy, with the graph cached in memory for walks, until the size demands a graph database."
+    },
+    {
+      "title": "How the impact is computed",
+      "options": [
+        { "name": "Walk the graph when asked", "pro": "Always current, and no extra storage", "con": "Core tables can have thousands of descendants, so each query does real work" },
+        { "name": "Precompute the closure", "pro": "A lookup is instant", "con": "One new edge can change thousands of stored results, and the closure is large" }
+      ],
+      "pick": "Walk on demand with a visited map, cache the result briefly for the hottest assets, and precompute only what proves to be slow."
+    },
+    {
+      "title": "Granularity of lineage",
+      "options": [
+        { "name": "Table level", "pro": "Small graph and easy to collect", "con": "Says a dashboard depends on a table even if it uses a column nobody is changing" },
+        { "name": "Column level", "pro": "Precise impact for a column change, and traces a figure to its source", "con": "Much larger graph, and needs a SQL parser or engine support" }
+      ],
+      "pick": "Table level everywhere, and column level for the sources that can give it, linking a column edge to its table edge."
+    }
+  ],
+  "roles": [
+    { "id": "client", "label": "Users and sources", "description": "People who search the catalog, and the jobs and systems that produce metadata." },
+    { "id": "edge", "label": "Entry points", "description": "The catalog API and the connectors." },
+    { "id": "async", "label": "Event flow", "description": "Run events and notifications in transit." },
+    { "id": "compute", "label": "Services", "description": "Impact analysis, ownership and quality checks, and the access filter." },
+    { "id": "data", "label": "State", "description": "The metadata store, the lineage graph and the search index." }
+  ]
+}

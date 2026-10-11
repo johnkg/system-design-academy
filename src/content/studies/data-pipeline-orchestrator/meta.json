@@ -1,0 +1,177 @@
+{
+  "name": "Design a Data Pipeline Orchestrator",
+  "difficulty": "advanced",
+  "intent": "Run thousands of dependent data jobs on schedule, retry the ones that fail, wait for late inputs, and re-run history without ever duplicating or losing data.",
+  "codeTitle": "a DAG runner with a sensor, retries and an idempotent backfill",
+  "finalIntro": "One daily pipeline run, a late file, a failed task, and a safe backfill.",
+  "prompt": "Design a workflow orchestrator like Airflow. Teams define pipelines as graphs of tasks with dependencies, such as extract, clean, aggregate and publish. Each pipeline runs on a schedule for a slice of time, tasks run on a fleet of workers, failures are retried, and when a bug is fixed the team can re-run months of history.",
+  "functional": [
+    "Define a pipeline as a DAG of tasks with dependencies",
+    "Run each pipeline on a schedule, once per data interval such as a day",
+    "Run a task only after all its upstream tasks have succeeded",
+    "Retry failed tasks with backoff, and time out tasks that hang",
+    "Wait for external events such as a file arriving, using sensors",
+    "Backfill or re-run past intervals without duplicating data",
+    "Show the state of every run and alert on failures or missed deadlines"
+  ],
+  "nonFunctional": [
+    "Handle about 1,000 pipelines and 100,000 task runs per day",
+    "Start a ready task within a few seconds of its upstream finishing",
+    "Never run the same task instance twice at once, and never lose a run when a component restarts",
+    "Re-running any task or interval gives the same data, so it is always safe",
+    "The scheduler has no single point of failure",
+    "One slow or runaway pipeline must not starve the others"
+  ],
+  "firstAttempt": {
+    "text": "A cron job per pipeline on one server, each running a shell script that does all the steps in order. If a step fails the script stops and sends an email. To fix a failure someone logs in and re-runs the script by hand.",
+    "limits": [
+      "Steps that could run in parallel run one after another, and a failure in the middle restarts everything",
+      "Nobody can see which step failed or what has run, except by reading logs",
+      "A script that waits for a late file either sleeps for hours or runs too early",
+      "Re-running a script appends the same rows a second time",
+      "The cron server is a single point of failure, and one heavy script slows all the others"
+    ]
+  },
+  "nodes": [
+    { "id": "sources", "label": "Data sources", "kind": "client", "x": 12, "y": 63 },
+    { "id": "cron", "label": "Cron scripts", "kind": "compute", "x": 37, "y": 63, "at": 0, "until": 1 },
+    { "id": "dags", "label": "DAG definitions", "kind": "data", "x": 12, "y": 12, "at": 1 },
+    { "id": "scheduler", "label": "Scheduler", "kind": "edge", "x": 37, "y": 37, "at": 1 },
+    { "id": "metadb", "label": "Metadata DB", "kind": "data", "x": 62, "y": 12, "at": 1 },
+    { "id": "warehouse", "label": "Warehouse", "kind": "data", "x": 87, "y": 63, "at": 0 },
+    { "id": "queue", "label": "Task queue", "kind": "async", "x": 62, "y": 37, "at": 2 },
+    { "id": "workers", "label": "Workers", "kind": "compute", "x": 87, "y": 37, "at": 2 },
+    { "id": "sensor", "label": "Sensors", "kind": "compute", "x": 37, "y": 63, "at": 4 },
+    { "id": "backfill", "label": "Backfill runner", "kind": "edge", "x": 12, "y": 37, "at": 5 },
+    { "id": "alerts", "label": "Alerts", "kind": "async", "x": 62, "y": 63, "at": 6 }
+  ],
+  "edges": [
+    { "from": "sources", "to": "cron", "at": 0, "until": 1 },
+    { "from": "cron", "to": "warehouse", "at": 0, "until": 1 },
+    { "from": "dags", "to": "scheduler", "at": 1 },
+    { "from": "scheduler", "to": "metadb", "at": 1 },
+    { "from": "scheduler", "to": "workers", "at": 1, "until": 2 },
+    { "from": "scheduler", "to": "queue", "at": 2 },
+    { "from": "queue", "to": "workers", "at": 2 },
+    { "from": "workers", "to": "warehouse", "at": 1 },
+    { "from": "workers", "to": "metadb", "at": 2 },
+    { "from": "sources", "to": "sensor", "at": 4 },
+    { "from": "sensor", "to": "scheduler", "at": 4 },
+    { "from": "backfill", "to": "scheduler", "at": 5 },
+    { "from": "scheduler", "to": "alerts", "at": 6 }
+  ],
+  "steps": [
+    {
+      "title": "Describe pipelines as DAGs and run them with a scheduler",
+      "problem": "A script that runs everything in a fixed order cannot run independent steps in parallel, cannot resume from the middle, and gives no view of what happened.",
+      "fix": "Each pipeline is a directed acyclic graph: tasks are nodes and dependencies are edges. A scheduler reads the definitions and creates one run per data interval, for example the run for 2026-10-10 covers the data of that day and starts after the day ends. For each run it creates task instances and records their state (none, queued, running, success, failed, upstream_failed) in a metadata database. A task becomes ready when all its upstream tasks are in success.",
+      "tradeoff": "Independent branches run in parallel, a failure stops only what depends on it, and the state of every task is visible and durable. The scheduler and the metadata database become the heart of the system, and the graph must be acyclic, which is checked when the definition is loaded.",
+      "concepts": [{ "slug": "pipeline-orchestration" }, { "slug": "batch-vs-stream-processing" }, { "slug": "leader-election" }]
+    },
+    {
+      "title": "Hand ready tasks to a pool of workers through a queue",
+      "problem": "If the scheduler executes tasks itself, it is limited to one machine, and one heavy task can block the scheduling of all the others.",
+      "fix": "The scheduler only decides and never works. When a task is ready it marks the instance as queued in the metadata database, in a transaction that makes sure only one scheduler does it, and puts a message on a task queue. Workers pull messages, mark the task running, execute it and record the final state. Queues and worker pools can be separated by kind of work, and each pool has concurrency limits per pipeline so that a runaway pipeline cannot take every slot.",
+      "tradeoff": "Execution scales by adding workers, and heavy work is isolated from scheduling. A queued message and the database row can disagree after a crash, so a reaper must find tasks stuck in queued or running whose worker has gone, and reset them.",
+      "concepts": [{ "slug": "message-queues" }, { "slug": "bulkhead" }, { "slug": "horizontal-vs-vertical-scaling" }, { "slug": "health-checks" }]
+    },
+    {
+      "title": "Retry with backoff and put a time limit on every task",
+      "problem": "Most failures are transient: a network blip, an overloaded database, a worker killed by the host. Failing the whole run for those wastes people's time, while retrying instantly makes an overload worse.",
+      "fix": "Each task has a retry count, a delay that doubles with each attempt and a random jitter, and an execution timeout so that a hung task is killed and counted as a failure. A task that exhausts its retries becomes failed, and everything downstream becomes upstream_failed instead of running. A person can clear a task, which resets it to none so that the scheduler runs it again, together with its downstream tasks if asked.",
+      "tradeoff": "Transient problems fix themselves and permanent ones are reported after a bounded time. Retries are only safe if running the task twice has the same effect as once, which is the job of the idempotent design in the next steps, and retries add load when a shared dependency is already struggling.",
+      "concepts": [{ "slug": "retries-and-backoff" }, { "slug": "idempotency" }, { "slug": "circuit-breaker" }, { "slug": "backpressure" }]
+    },
+    {
+      "title": "Wait for late inputs with sensors",
+      "problem": "A file or a partition often arrives at an unpredictable time. Starting at midnight sharp reads incomplete data, and sleeping inside a task holds a worker slot for hours.",
+      "fix": "A sensor is a task that checks a condition (a file exists, a table partition has landed, another pipeline finished) and succeeds when it is true. It pokes at an interval, for example every 10 minutes, and has a timeout, after which it fails or is skipped. In reschedule mode the sensor frees its worker slot between pokes and the scheduler wakes it up at the next poke time. The downstream tasks depend on the sensor like on any other task.",
+      "tradeoff": "Pipelines start as soon as the data is really there and never read half a file. Many sensors poking often can load the source system, so the interval should match the real arrival pattern, and a timeout is needed so that a file which never comes becomes an alert and not a silent wait.",
+      "concepts": [{ "slug": "pipeline-orchestration" }, { "slug": "retries-and-backoff" }, { "slug": "webhooks" }, { "slug": "backpressure" }]
+    },
+    {
+      "title": "Make every task idempotent so backfills are safe",
+      "problem": "After a bug fix or a late source change, the team must re-run the last 90 days. If tasks append rows or use the current time, running them again duplicates data or gives different answers.",
+      "fix": "A task computes everything from its data interval, which the orchestrator passes in, never from the wall clock, and writes its output by replacing the partition for that interval (overwrite, or delete and insert in one transaction, or write to a temporary location and swap). Run again for the same interval, it produces the same result in the same place. A backfill then simply creates runs for the missing or cleared intervals, runs them with a limit on how many at once, and skips tasks that are already in success.",
+      "tradeoff": "Retries, re-runs and backfills become routine operations that nobody fears, and history can be rebuilt from raw inputs. Writing at partition granularity costs more than appending, tasks must be written to be deterministic, and inputs that change over time need to be snapshotted for a true replay.",
+      "concepts": [{ "slug": "idempotency" }, { "slug": "columnar-formats-and-partitioning" }, { "slug": "table-formats-and-the-lakehouse" }, { "slug": "event-sourcing" }]
+    },
+    {
+      "title": "Keep it available, observable, and fair",
+      "problem": "A single scheduler is a single point of failure, and with thousands of pipelines operators need to know that a run is late before the business notices.",
+      "fix": "Several scheduler instances run at the same time and coordinate through row locks in the metadata database (or through a leader), so a task instance is queued by exactly one of them. The database is replicated. Each pipeline can declare a deadline (an SLA), and the system alerts when a run has not finished by then, and on failures, retries and long queue times. Metrics such as queue length, task duration, scheduler lag and slots in use show whether the platform is healthy, and pools and priorities keep important pipelines ahead of bulk backfills.",
+      "tradeoff": "The platform survives a scheduler crash and people hear about problems early. The metadata database is the shared bottleneck and must be sized for the task-state writes, and alert rules need tuning so that real incidents are not buried in noise.",
+      "concepts": [{ "slug": "alerting" }, { "slug": "metrics" }, { "slug": "slos-and-error-budgets" }, { "slug": "database-replication" }, { "slug": "leader-election" }]
+    }
+  ],
+  "failures": [
+    {
+      "scenario": "A worker dies in the middle of a task",
+      "impact": "The task is marked running forever, and everything downstream waits.",
+      "answer": "Running tasks send a heartbeat to the metadata database. When the heartbeats stop, the reaper marks the instance failed or up for retry, and the task runs again on another worker. This is only safe because the task replaces its partition and so a half-finished earlier attempt is overwritten.",
+      "concepts": [{ "slug": "health-checks" }, { "slug": "idempotency" }, { "slug": "retries-and-backoff" }]
+    },
+    {
+      "scenario": "The scheduler crashes between marking a task queued and sending the message",
+      "impact": "The database says queued, but nothing is on the queue, so the task never runs.",
+      "answer": "Queued tasks have a timeout too. If a task stays queued longer than it should, the reaper resets it to scheduled, and the message is sent again. A duplicate message is harmless, because a worker first claims the instance with a conditional update and only one claim wins.",
+      "concepts": [{ "slug": "transactional-outbox" }, { "slug": "message-queues" }, { "slug": "idempotency" }]
+    },
+    {
+      "scenario": "The input file never arrives",
+      "impact": "The sensor waits and the whole pipeline for that day is stuck, perhaps for ever.",
+      "answer": "The sensor has a timeout and fails with a clear message, and the deadline alert fires when the run is still unfinished at its SLA. The owner can fix the source and clear the sensor, and the run continues from there without re-running what already succeeded.",
+      "concepts": [{ "slug": "alerting" }, { "slug": "slos-and-error-budgets" }, { "slug": "pipeline-orchestration" }]
+    },
+    {
+      "scenario": "A 365-day backfill is started during the working day",
+      "impact": "It floods the queue and the warehouse, and the daily pipelines miss their deadlines.",
+      "answer": "Backfill runs have lower priority and their own pool, with a cap on how many intervals run at once. The runner creates intervals in order and releases more as earlier ones finish, so it is a steady stream and not a spike.",
+      "concepts": [{ "slug": "bulkhead" }, { "slug": "backpressure" }, { "slug": "rate-limiting" }]
+    }
+  ],
+  "alternatives": [
+    {
+      "title": "How tasks are started",
+      "options": [
+        { "name": "Time-based only (cron)", "pro": "Trivial to run and understand", "con": "No dependencies, no awareness of late data or failures" },
+        { "name": "Dependency-based scheduling (DAG)", "pro": "Runs tasks as soon as their inputs are ready, and is aware of failures", "con": "Needs state storage and a scheduler to operate" },
+        { "name": "Event-driven (data-aware)", "pro": "Runs when a dataset is updated, with no polling", "con": "Needs every producer to emit events, and time-based reporting still needs a clock" }
+      ],
+      "pick": "A DAG scheduler with time-based runs, adding dataset events where producers can publish them."
+    },
+    {
+      "title": "How a task writes its output",
+      "options": [
+        { "name": "Append rows", "pro": "Cheapest and simplest to write", "con": "A retry or a re-run duplicates data" },
+        { "name": "Overwrite the interval's partition", "pro": "Same result however many times it runs", "con": "Rewrites the whole partition, and readers could see it half-written without an atomic swap" },
+        { "name": "Merge (upsert) by key", "pro": "Safe to repeat and good for updates to existing rows", "con": "More expensive, and needs a reliable key" }
+      ],
+      "pick": "Overwrite the partition atomically for batch loads, and merge by key where rows are updated in place."
+    },
+    {
+      "title": "How a sensor waits",
+      "options": [
+        { "name": "Poke inside a worker slot", "pro": "Reacts at once, simplest code", "con": "Holds a slot for the whole wait" },
+        { "name": "Reschedule between pokes", "pro": "Frees the slot, so many sensors are cheap", "con": "Reaction is delayed up to one interval" },
+        { "name": "Event trigger", "pro": "No polling, and instant", "con": "The source system must send the event" }
+      ],
+      "pick": "Reschedule mode with a sensible interval, or an event trigger when the source can send one."
+    },
+    {
+      "title": "Where the scheduler state lives",
+      "options": [
+        { "name": "A relational database with row locks", "pro": "Transactions give exactly-one queuing, and tooling is mature", "con": "It is the shared bottleneck for task-state writes" },
+        { "name": "A consensus store with a single leader", "pro": "Clear ownership of scheduling", "con": "More moving parts, and the leader's capacity limits throughput" }
+      ],
+      "pick": "A replicated relational database with row-level locking, which handles the scale of 100,000 tasks per day with large margin."
+    }
+  ],
+  "roles": [
+    { "id": "client", "label": "Sources", "description": "Systems that produce the input data and files." },
+    { "id": "edge", "label": "Scheduling", "description": "The scheduler and the backfill runner that decide what runs." },
+    { "id": "async", "label": "Queues and alerts", "description": "The task queue and the notifications." },
+    { "id": "compute", "label": "Execution", "description": "Workers, sensors and the old cron scripts." },
+    { "id": "data", "label": "State", "description": "DAG definitions, the metadata database and the warehouse." }
+  ]
+}

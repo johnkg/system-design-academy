@@ -1,0 +1,179 @@
+{
+  "name": "Design a Batch Processing Framework",
+  "difficulty": "advanced",
+  "intent": "Run one computation over terabytes of data on thousands of cheap machines, finish in minutes, and still get the right answer when machines fail or crawl.",
+  "codeTitle": "a tiny MapReduce with a shuffle, lineage recovery and a backup task",
+  "finalIntro": "One word-count job from submission to a finished result.",
+  "prompt": "Design a framework like MapReduce or Spark. A user writes a map function and a reduce function, points them at 100 TB of files, and gets the result written back. The framework splits the data, runs the work on thousands of machines, moves data between the two phases, and copes with machines that die or run slowly.",
+  "functional": [
+    "Accept a job: input files, a map function, a reduce function and the number of reducers",
+    "Split the input and run map tasks in parallel",
+    "Group the map output by key and deliver each key to one reduce task (the shuffle)",
+    "Write the final output to the file store",
+    "Chain several stages into one pipeline",
+    "Report progress and let a user cancel a job"
+  ],
+  "nonFunctional": [
+    "Scale by adding machines: twice the machines should take about half the time",
+    "A job over 100 TB finishes in minutes to hours, not days",
+    "Machines fail daily at this scale, and a failure must never change the answer",
+    "One slow machine must not set the time of the whole job",
+    "Move computation to the data, since the network is the scarce resource",
+    "Share the cluster fairly between many users"
+  ],
+  "firstAttempt": {
+    "text": "One program on one big machine: read every file, call the map function on each record, keep a hash table from key to list of values in memory, then call the reduce function on each key and write the result.",
+    "limits": [
+      "100 TB takes days to read through one machine's disks and network card",
+      "The table of keys and values does not fit in one machine's memory",
+      "If the machine dies on day two, everything starts again",
+      "Only one CPU-bound pipeline runs, so the other hundreds of cores of a cluster would be idle",
+      "There is no way to share the machine between users"
+    ]
+  },
+  "nodes": [
+    { "id": "client", "label": "Job submitter", "kind": "client", "x": 12, "y": 37 },
+    { "id": "single", "label": "One big script", "kind": "compute", "x": 37, "y": 37, "at": 0, "until": 1 },
+    { "id": "master", "label": "Job coordinator", "kind": "edge", "x": 37, "y": 37, "at": 1 },
+    { "id": "store", "label": "Input file store", "kind": "data", "x": 87, "y": 37, "at": 1 },
+    { "id": "maps", "label": "Map workers", "kind": "compute", "x": 62, "y": 12, "at": 1 },
+    { "id": "shuffle", "label": "Shuffle", "kind": "async", "x": 62, "y": 37, "at": 2 },
+    { "id": "reducers", "label": "Reduce workers", "kind": "compute", "x": 62, "y": 63, "at": 2 },
+    { "id": "output", "label": "Result files", "kind": "data", "x": 87, "y": 63, "at": 2 },
+    { "id": "monitor", "label": "Straggler monitor", "kind": "compute", "x": 37, "y": 12, "at": 3 },
+    { "id": "disks", "label": "Map output on local disks", "kind": "data", "x": 87, "y": 12, "at": 4 },
+    { "id": "lineage", "label": "Lineage record", "kind": "data", "x": 37, "y": 63, "at": 4 },
+    { "id": "planner", "label": "Pipeline planner", "kind": "edge", "x": 12, "y": 12, "at": 5 },
+    { "id": "scheduler", "label": "Cluster scheduler", "kind": "edge", "x": 12, "y": 63, "at": 6 }
+  ],
+  "edges": [
+    { "from": "client", "to": "single", "at": 0, "until": 1 },
+    { "from": "client", "to": "master", "at": 1 },
+    { "from": "store", "to": "maps", "at": 1 },
+    { "from": "master", "to": "maps", "at": 1 },
+    { "from": "maps", "to": "shuffle", "at": 2 },
+    { "from": "shuffle", "to": "reducers", "at": 2 },
+    { "from": "master", "to": "reducers", "at": 2 },
+    { "from": "reducers", "to": "output", "at": 2 },
+    { "from": "monitor", "to": "maps", "at": 3 },
+    { "from": "monitor", "to": "master", "at": 3 },
+    { "from": "maps", "to": "disks", "at": 4 },
+    { "from": "disks", "to": "shuffle", "at": 4 },
+    { "from": "master", "to": "lineage", "at": 4 },
+    { "from": "client", "to": "planner", "at": 5 },
+    { "from": "planner", "to": "master", "at": 5 },
+    { "from": "scheduler", "to": "master", "at": 6 }
+  ],
+  "steps": [
+    {
+      "title": "Split the input and send the code to the data",
+      "problem": "One machine cannot read 100 TB in a reasonable time, and moving 100 TB across the network to some central place is just as slow.",
+      "fix": "A job coordinator cuts every input file into splits of about one file-system block, such as 128 MB, so 100 TB makes roughly 800,000 splits. Each split becomes one map task, and the coordinator hands the task to a worker that holds a copy of that block on its own disk, or failing that one in the same rack. The map function runs on every record of its split and emits key and value pairs. Thousands of workers read their local disks at the same moment.",
+      "tradeoff": "Reading is spread across all disks and almost no input crosses the network. Splits that are too small waste time on starting tasks, and splits that are too big make slow tasks and poor balance, so one block is a good middle size. Tasks must be independent of each other so any worker may run any of them.",
+      "concepts": [{ "slug": "mapreduce-and-shuffles" }, { "slug": "batch-vs-stream-processing" }, { "slug": "horizontal-vs-vertical-scaling" }, { "slug": "ordering-and-partitioning" }]
+    },
+    {
+      "title": "Shuffle: group by key with a hash partition",
+      "problem": "To add up all the counts for one word, every pair with that word must meet in the same place, but the pairs were made on thousands of different machines.",
+      "fix": "Each map task sorts or hashes its output into one bucket per reducer, using hash(key) modulo the number of reducers. A combiner can add up equal keys inside the mapper first, so a word seen 400 times in a split is sent as one pair. When map tasks finish, each reduce task fetches its own bucket from every map output over the network, merges them by key and calls the reduce function once per key. The result is written to the file store.",
+      "tradeoff": "The same key always lands at the same reducer, so the answer is exact. The shuffle is an all-to-all transfer of M times R small fetches, and it is usually the most expensive part of the job. A combiner can cut it by a large factor but only works for operations that can be applied in pieces, such as sums, counts and maximums.",
+      "concepts": [{ "slug": "mapreduce-and-shuffles" }, { "slug": "consistent-hashing" }, { "slug": "database-sharding" }, { "slug": "backpressure" }]
+    },
+    {
+      "title": "Back up the stragglers",
+      "problem": "A job is as slow as its slowest task. With 10,000 tasks, a few land on a machine with a failing disk, a busy neighbour or a bad network card and take several times longer than the rest.",
+      "fix": "The coordinator tracks how far each task has got through heartbeats. When most tasks of a phase are done and a few have run much longer than the median, such as more than 1.5 times, it starts a backup copy of each on another machine. Whichever copy finishes first wins, and the other is cancelled. Tasks are deterministic and write to a temporary name that is renamed on success, so two copies running at once cannot corrupt the output.",
+      "tradeoff": "One slow machine no longer sets the job time, and in published results this took a large share off the total time for a few percent of extra work. Backups use extra capacity, and they do nothing for a task that is slow because its data is skewed, as the backup would get just as much to do.",
+      "concepts": [{ "slug": "hedged-requests-and-tail-latency" }, { "slug": "health-checks" }, { "slug": "failure-detection" }, { "slug": "idempotency" }]
+    },
+    {
+      "title": "Recover by recomputing only what was lost",
+      "problem": "Over a 6-hour job on 5,000 machines something will fail. Map outputs sit on the local disk of the worker that made them, so a dead worker takes finished work with it.",
+      "fix": "The coordinator records for each piece of output which input and which task produced it, which is its lineage. If a worker dies, only its tasks are rerun, and only the lost buckets are rebuilt, because every task is a deterministic function of its input. Finished reduce output is already in the replicated file store and is kept. If a reduce task fails, it just fetches its buckets again. A failed coordinator restarts from a saved log.",
+      "tradeoff": "A failure costs a few tasks instead of the whole job, and no replicated copy of the intermediate data is needed. This only works if tasks are deterministic and free of side effects, and in a long chain of stages a failure late in the chain can force a cascade of recomputation, so long jobs also save checkpoints.",
+      "concepts": [{ "slug": "idempotency" }, { "slug": "write-ahead-log" }, { "slug": "event-sourcing" }, { "slug": "database-replication" }, { "slug": "failure-detection" }]
+    },
+    {
+      "title": "Plan multi-stage pipelines and handle skew",
+      "problem": "Real work needs many stages, such as join, filter and aggregate, and writing every intermediate result to disk is slow. Separately, a popular key, such as one word or one user, can send most of the data to a single reducer.",
+      "fix": "A planner turns the user's program into a graph of stages and cuts it only at the points that need a shuffle. Steps that work record by record are fused into one task, and a result that is reused is kept in memory, while lineage can rebuild it if it is lost. For a skewed key, the job splits it by adding a random suffix, aggregates the pieces, then combines them in a second small stage, or sends the popular keys to several reducers.",
+      "tradeoff": "Fewer disk writes make iterative jobs many times faster, and skewed keys stop being the straggler that backups cannot help. The planner adds complexity, memory-heavy caching needs a limit and an eviction rule, and skew handling needs knowledge of which keys are hot.",
+      "concepts": [{ "slug": "pipeline-orchestration" }, { "slug": "batch-vs-stream-processing" }, { "slug": "columnar-formats-and-partitioning" }, { "slug": "caching" }]
+    },
+    {
+      "title": "Share the cluster between jobs",
+      "problem": "One giant job could take every machine for hours while a small urgent query waits, and a user with a bug could launch a million tasks.",
+      "fix": "A cluster scheduler hands out slots of CPU and memory to jobs under queues with guaranteed shares and limits, and the unused share of one queue can be borrowed. Urgent jobs may preempt tasks of low-priority ones, which is safe because a killed task is simply rerun. Each task runs in a container with memory limits, and the coordinator asks for more or fewer workers as the job's phases change size.",
+      "tradeoff": "The cluster stays busy and everyone gets a fair share. Preemption wastes the work already done by the killed tasks, and strict quotas leave capacity idle that someone else could have used, so shares are a policy choice that needs tuning.",
+      "concepts": [{ "slug": "containers-and-orchestration" }, { "slug": "autoscaling" }, { "slug": "bulkhead" }, { "slug": "queueing-theory-and-littles-law" }]
+    }
+  ],
+  "failures": [
+    {
+      "scenario": "A map worker dies after its tasks finished",
+      "impact": "Its output buckets were on its local disk and are gone, so reducers that still need them cannot fetch them.",
+      "answer": "Reducers report the failed fetch, the coordinator marks those map tasks as not done and reruns them on other workers from the source splits, which are replicated in the file store. Reducers retry and then get the new output. Only that worker's tasks are redone, and the result is identical because the tasks are deterministic.",
+      "concepts": [{ "slug": "failure-detection" }, { "slug": "retries-and-backoff" }, { "slug": "idempotency" }, { "slug": "mapreduce-and-shuffles" }]
+    },
+    {
+      "scenario": "One reducer receives most of the data",
+      "impact": "That reducer runs for hours while the others finish in minutes, and a backup copy would have the same amount to do.",
+      "answer": "Detect the skew from bucket sizes after the map phase, then salt the hot key so it is spread over several reducers and merge the partial results in a short second stage. Where the operation allows it, a combiner in the mappers makes most of the skew vanish before the shuffle.",
+      "concepts": [{ "slug": "ordering-and-partitioning" }, { "slug": "database-sharding" }, { "slug": "hedged-requests-and-tail-latency" }]
+    },
+    {
+      "scenario": "The coordinator crashes in the middle of a job",
+      "impact": "Nobody knows which tasks are done, so 6 hours of work might look lost.",
+      "answer": "The coordinator writes its task table to a replicated log and takes snapshots. A standby takes over by leader election, reloads the table, and workers reconnect and report what they hold. Completed tasks are not repeated.",
+      "concepts": [{ "slug": "leader-election" }, { "slug": "write-ahead-log" }, { "slug": "consensus" }, { "slug": "health-checks" }]
+    },
+    {
+      "scenario": "A task is run twice and both write output",
+      "impact": "Duplicate or half-written files would change the result, for example by counting a split twice.",
+      "answer": "Each attempt writes to its own temporary file. The coordinator accepts exactly one attempt per task and renames that file to the final name in a single atomic step, and the other attempt's file is deleted. A repeated commit message changes nothing.",
+      "concepts": [{ "slug": "idempotency" }, { "slug": "delivery-guarantees" }, { "slug": "two-phase-commit" }]
+    }
+  ],
+  "alternatives": [
+    {
+      "title": "Where intermediate data lives",
+      "options": [
+        { "name": "Local disk of the map worker", "pro": "Cheap and fast to write, and no replication cost", "con": "Lost with the worker, so tasks must be rerun" },
+        { "name": "Replicated file store", "pro": "Survives any single failure, so no recomputation", "con": "Each shuffle byte is written two or three times over the network" },
+        { "name": "Memory with lineage", "pro": "Much faster for iterative work", "con": "Limited by memory, with recomputation after a loss" }
+      ],
+      "pick": "Local disk by default and memory for reused results, with lineage as the safety net. Replicate only the final output."
+    },
+    {
+      "title": "How to use combiners",
+      "options": [
+        { "name": "No combiner", "pro": "Works for any reduce function", "con": "Shuffles every record" },
+        { "name": "Combiner in the mapper", "pro": "Cuts shuffle volume by a large factor on repeated keys", "con": "Only valid when the operation can be applied in parts and in any order" }
+      ],
+      "pick": "Use one whenever the operation is a sum, count, minimum or maximum, and not for medians or exact distinct counts."
+    },
+    {
+      "title": "Fault tolerance",
+      "options": [
+        { "name": "Rerun the lost tasks", "pro": "Nothing extra is written during the run", "con": "A late failure can be expensive, and tasks must be deterministic" },
+        { "name": "Checkpoint every stage", "pro": "Bounded loss, whatever the task does", "con": "A lot of extra writing in the normal case" }
+      ],
+      "pick": "Rerun using lineage, with occasional checkpoints in long chains."
+    },
+    {
+      "title": "Batch or streaming",
+      "options": [
+        { "name": "Batch over a finished dataset", "pro": "Simple, exact, easy to rerun and cheapest per record", "con": "The answer arrives after the data has stopped" },
+        { "name": "Stream processing", "pro": "Answers within seconds", "con": "Needs state, windows and late-data rules" }
+      ],
+      "pick": "Batch for the daily and the historic answers, and streaming for the cases that cannot wait."
+    }
+  ],
+  "roles": [
+    { "id": "client", "label": "Users", "description": "The people and programs that submit jobs." },
+    { "id": "edge", "label": "Coordination", "description": "The job coordinator, the pipeline planner and the cluster scheduler." },
+    { "id": "async", "label": "Shuffle", "description": "Data moving from the map tasks to the reduce tasks." },
+    { "id": "compute", "label": "Workers", "description": "Map workers, reduce workers and the monitor that watches for slow tasks." },
+    { "id": "data", "label": "Storage", "description": "Input and result files, map outputs and the lineage record." }
+  ]
+}

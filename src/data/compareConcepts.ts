@@ -213,6 +213,19 @@ export const problems: Problem[] = [
     { slug: 'failure-detection', why: 'Heartbeats and phi accrual trade detection speed against false alarms.' },
     { slug: 'leases-and-fencing-tokens', why: 'Fencing tokens make a stale owner harmless when the lease moved on.' },
     { slug: 'merkle-trees-and-anti-entropy', why: 'Replicas find and repair their differences by comparing hash trees.' } ] },
+  { text: 'Process a huge dataset in parallel and combine the results', patterns: [
+    { slug: 'mapreduce-and-shuffles', why: 'Map in parallel, move records to the reducer that owns each key, then reduce; watch for hot keys.' },
+    { slug: 'batch-vs-stream-processing', why: 'Decide whether a periodic recompute is enough or the answer must keep up with events.' } ] },
+  { text: 'Compute running totals over events that arrive late or out of order', patterns: [
+    { slug: 'windowing-and-watermarks', why: 'Group by event time and let a watermark decide when each window is complete.' },
+    { slug: 'stateful-stream-processing', why: 'Keep the per-key state in the processor and checkpoint it so a crash does not lose or repeat events.' } ] },
+  { text: 'Run a chain of data jobs on a schedule, retry failures and re-run history safely', patterns: [
+    { slug: 'pipeline-orchestration', why: 'Model the jobs as a DAG with retries, dependencies and idempotent partition writes.' } ] },
+  { text: 'Make analytic queries over huge files cheaper and faster', patterns: [
+    { slug: 'columnar-formats-and-partitioning', why: 'Read only the columns, partitions and row groups the query needs.' },
+    { slug: 'table-formats-and-the-lakehouse', why: 'Add snapshots, atomic commits and compaction on top of files in object storage.' } ] },
+  { text: 'Keep the history of how customer or product attributes changed over time', patterns: [
+    { slug: 'slowly-changing-dimensions', why: 'Choose between overwriting and versioned rows, and decide which version a late-arriving fact joins to.' } ] },
 ];
 
 export const confusions: Confusion[] = [
@@ -465,5 +478,16 @@ export const confusions: Confusion[] = [
       { aspect: 'Recovery time', values: ['Seconds to minutes: replay since the last checkpoint', 'Seconds: promote the replica', 'Minutes to hours: restore, then replay the log'] },
     ],
     rule: 'They are layers fed by the same log. The log gets you through a crash, a replica through a failed machine, and a backup with the archived log through a human mistake. Test the restore, not just the backup.',
+  },
+  {
+    title: 'Windows, watermarks or checkpoints?',
+    blurb: 'Three mechanisms inside a stream processor that are easy to mix up. Each answers a different question.',
+    patterns: ['windowing-and-watermarks', 'stateful-stream-processing', 'batch-vs-stream-processing'],
+    rows: [
+      { aspect: 'Answers', values: ['When is a result for a slice of event time ready, and what counts as late?', 'What happens to my counters and joins when a task crashes or restarts?', 'How fresh must the answer be, and can it be recomputed later?'] },
+      { aspect: 'Depends on', values: ['Event time and how out of order events arrive', 'Saved state and the position in the input log', 'How much delay and how much redundant work you accept'] },
+      { aspect: 'Typical failure', values: ['A watermark too eager drops late events; too patient delays every answer', 'Offsets committed apart from state, so events are double counted or lost', 'A stream answer never corrected, or a batch that runs too rarely to be useful'] },
+    ],
+    rule: 'Watermarks decide when a window may close, checkpoints decide what survives a crash, and the batch-or-stream choice decides how often you can afford to be wrong and fix it later. Most pipelines need all three.',
   },
 ];

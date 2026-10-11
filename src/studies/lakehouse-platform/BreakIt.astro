@@ -1,0 +1,114 @@
+---
+import PlaygroundShell from '../../components/PlaygroundShell.astro';
+---
+<PlaygroundShell title="Writers race to commit" hint="Several jobs append to one table in ten rounds, all starting from the same snapshot, while compaction (and maybe a delete) runs in round 6. Change the commit rule and see what is lost, rejected or only retried.">
+  <ol class="how">
+    <li>With <b>4 writers</b>, <b>overwrite the pointer</b> and <b>compaction on</b>: readers see only <b>310 of 1,257 rows</b>. Every commit replaces the pointer with its own snapshot, so the last writer of each round wins and the others vanish.</li>
+    <li>Switch to <b>fail if the table moved</b>: nothing is lost, but <b>61 commits are rejected</b> and their <b>2,172 rows</b> of files are written again. Rejected writers start over, and then collide again.</li>
+    <li>Switch to <b>rebase when nothing overlaps</b>: nothing is lost and nothing is rejected, and the <b>31 retries</b> only rebuild metadata. Choose <b>compaction plus a delete</b> and exactly one commit, the compaction, replans, because a file it merged is already gone.</li>
+  </ol>
+  <div class="pg lhb" data-lhb>
+    <div class="pg-row">
+      <label>Commit rule <select class="pg-in" data-mode>
+        <option value="blind" selected>overwrite the pointer, no check</option>
+        <option value="abort">fail if the table moved, start over</option>
+        <option value="rebase">rebase when nothing overlaps</option>
+      </select></label>
+      <label>Writers per round <input type="range" min="1" max="8" value="4" data-w /> <b data-wval></b></label>
+      <label>Maintenance in round 6 <select class="pg-in" data-comp>
+        <option value="none">none</option>
+        <option value="plain" selected>compaction of small files</option>
+        <option value="delete">compaction plus a delete in a file it merges</option>
+      </select></label>
+    </div>
+    <div class="pg-grid">
+      <div class="pg-box" data-b1><h3>Rows in the table now</h3><span class="pg-mono" data-o1></span><span class="pg-note" data-n1></span></div>
+      <div class="pg-box" data-b2><h3>Commits rejected</h3><span class="pg-mono" data-o2></span><span class="pg-note" data-n2></span></div>
+      <div class="pg-box" data-b3><h3>Retries that only rebuild metadata</h3><span class="pg-mono" data-o3></span><span class="pg-note" data-n3></span></div>
+      <div class="pg-box" data-b4><h3>Compaction replans</h3><span class="pg-mono" data-o4></span><span class="pg-note" data-n4></span></div>
+    </div>
+    <p class="pg-out" data-verdict aria-live="polite"></p>
+    <p class="pg-note">Model: ten rounds. In each round every writer starts from the head snapshot of that moment and adds one file of 10 to 49 rows; the writers then commit one after another. The compaction (and the delete of 5 rows) starts at the beginning of round 6 and commits after the writers, so both are stale. A rejected commit throws away its uploaded file and writes it again from the new head. A rebase checks only whether a file it removes is already gone. Counts are for one seeded run, and the compaction merges the files under 30 rows.</p>
+  </div>
+</PlaygroundShell>
+<script>
+  document.querySelectorAll<HTMLElement>('[data-lhb]').forEach((root) => {
+    const q = <T extends HTMLElement>(s: string) => root.querySelector<T>(s)!;
+    type F = [string, number];
+    type Tx = { base: number; remove: string[]; add: F[]; rows: number };
+    function sim(mode: string, W: number, comp: string) {
+      let seed = 11; const rnd = (n: number) => { seed = (Math.imul(seed, 1664525) + 1013904223) >>> 0; return (seed >>> 8) % n; };
+      const snaps: F[][] = [[]]; let seq = 0; const head = () => snaps.length - 1;
+      const mk = (rows: number): F => [`f${++seq}`, rows];
+      let expected = 0, rejected = 0, wasted = 0, rebases = 0, replans = 0;
+      const apply = (tx: Tx, onto: number) => snaps[onto].filter(([n]) => !tx.remove.includes(n)).concat(tx.add);
+      function commit(tx: Tx): string {
+        if (mode === 'blind') { snaps.push(apply(tx, tx.base)); return 'ok'; }
+        if (mode === 'abort') { if (tx.base !== head()) return 'stale'; snaps.push(apply(tx, head())); return 'ok'; }
+        for (;;) {
+          if (tx.base === head()) { snaps.push(apply(tx, head())); return 'ok'; }
+          if (tx.remove.some((n) => !snaps[head()].some(([m]) => m === n))) return 'conflict';
+          tx.base = head(); rebases++;
+        }
+      }
+      const plan = (): Tx => { const base = head(); const small = snaps[base].filter(([, r]) => r < 30); const rows = small.reduce((s, [, r]) => s + r, 0); return { base, remove: small.map(([n]) => n), add: [mk(rows)], rows }; };
+      const settle = (first: Tx, again: () => Tx) => {
+        let tx = first;
+        for (;;) {
+          const res = commit(tx);
+          if (res === 'ok') return;
+          if (res === 'stale') rejected++; else replans++;
+          wasted += tx.rows; tx = again();
+        }
+      };
+      for (let r = 0; r < 10; r++) {
+        const base = head(); const writers: Tx[] = [];
+        const compTx = comp !== 'none' && r === 5 ? plan() : null;
+        for (let w = 0; w < W; w++) { const rows = 10 + rnd(40); expected += rows; writers.push({ base, remove: [], add: [mk(rows)], rows }); }
+        if (mode === 'abort') {
+          let pending = writers;
+          while (pending.length) {
+            const next: number[] = [];
+            for (const tx of pending) if (commit(tx) === 'stale') { rejected++; wasted += tx.rows; next.push(tx.rows); }
+            pending = next.map((rows) => ({ base: head(), remove: [], add: [mk(rows)], rows }));
+          }
+        } else for (const tx of writers) commit(tx);
+        if (compTx && comp === 'delete' && compTx.remove.length) {
+          const victim = compTx.remove[0];
+          expected -= 5;
+          const mkDel = (): Tx => { const b = head(); const v = (snaps[b].find(([n]) => n === victim) || snaps[compTx.base].find(([n]) => n === victim))!; return { base: b, remove: [victim], add: [mk(v[1] - 5)], rows: v[1] - 5 }; };
+          const d = mkDel(); d.base = compTx.base;
+          settle(d, mkDel);
+        }
+        if (compTx) settle(compTx, plan);
+      }
+      const visible = snaps[head()].reduce((s, [, r]) => s + r, 0);
+      return { expected, visible, lost: expected - visible, rejected, wasted, rebases, replans, files: snaps[head()].length };
+    }
+    const fmt = (n: number) => n.toLocaleString('en-US');
+    function draw() {
+      const mode = q<HTMLSelectElement>('[data-mode]').value; const W = Number(q<HTMLInputElement>('[data-w]').value); const comp = q<HTMLSelectElement>('[data-comp]').value;
+      q('[data-wval]').textContent = String(W);
+      const r = sim(mode, W, comp);
+      q('[data-o1]').textContent = `${fmt(r.visible)} of ${fmt(r.expected)}`;
+      q('[data-n1]').textContent = r.lost > 0 ? `${fmt(r.lost)} rows are missing, in ${r.files} files` : `nothing missing, in ${r.files} files`;
+      q('[data-o2]').textContent = fmt(r.rejected);
+      q('[data-n2]').textContent = r.rejected > 0 ? `${fmt(r.wasted)} rows of uploaded files thrown away and written again` : 'no uploaded file is wasted by a rejection';
+      q('[data-o3]').textContent = fmt(r.rebases);
+      q('[data-n3]').textContent = mode === 'rebase' ? 'a second try at the pointer, with no data rewritten' : 'only the rebase rule retries this way';
+      q('[data-o4]').textContent = fmt(r.replans);
+      q('[data-n4]').textContent = r.replans > 0 ? `${fmt(r.wasted)} rows of merged file written again` : (comp === 'none' ? 'no compaction in this run' : 'the compaction committed at its first real attempt');
+      q<HTMLElement>('[data-b1]').style.setProperty('--c', r.lost > 0 ? 'var(--bad)' : 'var(--good)');
+      q<HTMLElement>('[data-b2]').style.setProperty('--c', r.rejected > 0 ? 'var(--accent)' : 'var(--good)');
+      q<HTMLElement>('[data-b3]').style.setProperty('--c', 'var(--accent)');
+      q<HTMLElement>('[data-b4]').style.setProperty('--c', r.replans > 0 ? 'var(--accent)' : 'var(--good)');
+      const out = q('[data-verdict]'); out.classList.toggle('bad', r.lost > 0);
+      if (r.lost > 0) out.textContent = W === 1 && comp === 'none' ? '' : `Data loss: ${fmt(r.lost)} rows disappeared without any error, because a commit that ignores the snapshot it started from replaces the work of the others. Always make the pointer swap conditional.`;
+      else if (mode === 'abort') out.textContent = W === 1 ? 'With one writer nothing collides, so the check never fires. It costs something only under concurrency.' : `Safe, but wasteful: ${fmt(r.rejected)} commits were rejected and ${fmt(r.wasted)} rows of files were uploaded again, and more writers make it worse, since every round of retries collides again.`;
+      else if (mode === 'rebase') out.textContent = r.replans > 0 ? `Safe and cheap: ${fmt(r.rebases)} metadata-only retries, no rejected commits. The one real conflict, between the compaction and the delete, was caught: the compaction replanned and rewrote ${fmt(r.wasted)} rows.` : `Safe and cheap: appends never overlap, so ${fmt(r.rebases)} retries rebuilt only metadata and no data file was written twice.`;
+      else out.textContent = 'Nothing to race here: with one writer and no maintenance every rule gives the same table. Add writers to see them differ.';
+    }
+    root.addEventListener('input', draw); root.addEventListener('change', draw);
+    draw();
+  });
+</script>

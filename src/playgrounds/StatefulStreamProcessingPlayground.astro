@@ -1,0 +1,129 @@
+---
+import PlaygroundShell from '../components/PlaygroundShell.astro';
+---
+<PlaygroundShell title="Simulate it" hint="600 orders for 12 customers are counted on 3 instances. The job crashes at the offset you choose and recovers from its last checkpoint.">
+  <ol class="how">
+    <li>Defaults (checkpoint every <b>50</b>, plain sink, crash at <b>330</b>): the job restores offset 300 and replays <b>30</b> events. All 12 counters are exact, but the plain sink received those <b>30</b> outputs twice.</li>
+    <li>Set the sink to <b>Idempotent upsert</b> or <b>Transactional (two-phase commit)</b>: duplicates drop to <b>0</b>. The upsert sink ends with 12 rows; the transactional sink aborts its 30 uncommitted records and writes them once.</li>
+    <li>Set the interval to <b>200</b> (restore at 200, replay <b>130</b>) or <b>none</b> (replay all <b>330</b>): state stays exact, only recovery work and duplicates grow.</li>
+    <li>Tick <b>Commit offsets separately</b> (every 120 events, not with the state). With interval 50 the offset is behind the state, so <b>60</b> events are counted twice; with interval 200 it is ahead, so <b>40</b> events are lost. Counters go wrong either way.</li>
+  </ol>
+  <div class="pg ssp" data-ssp>
+    <div class="pg-row">
+      <label>Checkpoint every
+        <select class="pg-in" data-int>
+          <option value="0">none (restart from zero)</option><option value="25">25 events</option><option value="50" selected>50 events</option><option value="100">100 events</option><option value="200">200 events</option>
+        </select></label>
+      <label>Sink
+        <select class="pg-in" data-sink>
+          <option value="plain" selected>Plain (at-least-once)</option><option value="idempotent">Idempotent upsert</option><option value="transactional">Transactional (two-phase commit)</option>
+        </select></label>
+      <label>Crash at offset <input type="range" min="60" max="590" step="10" value="330" data-crash /> <b data-crashval>330</b></label>
+      <label class="ssp-check"><input type="checkbox" data-sep /> Commit offsets separately</label>
+      <button class="btn" type="button" data-reset>Reset</button>
+    </div>
+    <div class="pg-grid">
+      <div class="pg-box" style="--c: var(--role-1)"><h3>Recovery</h3><span class="pg-mono" data-rec></span><span class="pg-note" data-recnote></span></div>
+      <div class="pg-box" data-statebox><h3>State after replay</h3><span class="pg-mono" data-state></span><span class="pg-note" data-statenote></span></div>
+      <div class="pg-box" data-sinkbox><h3>Sink</h3><span class="pg-mono" data-sinkout></span><span class="pg-note" data-sinknote></span></div>
+    </div>
+    <h3>Counters per customer (restored vs true)</h3>
+    <div class="ssp-keys" data-keys></div>
+    <p class="pg-out" data-verdict aria-live="polite"></p>
+    <p class="pg-note">Assumptions: 600 seeded orders, customer = event key, 3 instances each owning 4 customers, one crash, instant restart. Checkpoints cover state and offset together and complete as the interval is reached; with separate commits the offset is committed every 120 events by itself.</p>
+  </div>
+</PlaygroundShell>
+<script>
+  const N = 600, KEYS = 12, OPS = 3, COMMIT_EVERY = 120;
+  const EVENTS: number[] = [];
+  { let x = 12345;
+    for (let i = 0; i < N; i++) { x = (x * 48271) % 2147483647; const r = x % 1000; EVENTS.push(Math.floor((r * r * KEYS) / 1000000)); } }
+  const opOf = (k: number) => Math.floor((((k * 7 + 2) % 12) * OPS) / 12);
+
+  type Kind = 'plain' | 'idempotent' | 'transactional';
+  function simulate(interval: number, kind: Kind, separate: boolean, crash: number) {
+    const records: number[] = []; let pending: number[] = []; const table = new Array(KEYS).fill(0); let writes = 0;
+    const emit = (off: number, k: number, count: number) => {
+      if (kind === 'plain') records.push(off);
+      else if (kind === 'idempotent') { table[k] = count; writes++; }
+      else pending.push(off);
+    };
+    const commit = () => { records.push(...pending); pending = []; };
+    const zero = () => Array.from({ length: OPS }, () => new Array(KEYS).fill(0));
+    const copy = (s: number[][]) => s.map((a) => a.slice());
+    let ops = zero(); let snap = { ops: zero(), offset: 0 };
+    const process = (off: number) => { const k = EVENTS[off], o = opOf(k); ops[o][k]++; emit(off, k, ops[o][k]); };
+    for (let off = 0; off < crash; off++) {
+      process(off);
+      if (interval > 0 && (off + 1) % interval === 0) { snap = { ops: copy(ops), offset: off + 1 }; commit(); }
+    }
+    const aborted = pending.length; pending = [];
+    const restore = separate ? Math.floor(crash / COMMIT_EVERY) * COMMIT_EVERY : snap.offset;
+    ops = copy(snap.ops);
+    for (let off = restore; off < crash; off++) process(off);
+    commit();
+    const truth = new Array(KEYS).fill(0);
+    for (let i = 0; i < crash; i++) truth[EVENTS[i]]++;
+    const got = truth.map((_, k) => ops[opOf(k)][k]);
+    const wrong = got.filter((g, k) => g !== truth[k]).length;
+    let rows: number, dup = 0, missing = 0, extra = 0;
+    if (kind === 'idempotent') { rows = table.filter((c) => c > 0).length; extra = writes - crash; }
+    else { rows = records.length; const u = new Set(records).size; dup = rows - u; missing = crash - u; extra = aborted; }
+    return { snapOffset: snap.offset, restore, replayed: crash - restore, lost: Math.max(0, restore - snap.offset), double: Math.max(0, snap.offset - restore), wrong, rows, dup, missing, extra, truth, got };
+  }
+
+  document.querySelectorAll<HTMLElement>('[data-ssp]').forEach((root) => {
+    const q = <T extends HTMLElement>(s: string) => root.querySelector<T>(s)!;
+    const keysEl = q('[data-keys]');
+    const chips: HTMLElement[] = [];
+    for (let k = 0; k < KEYS; k++) { const c = document.createElement('span'); c.className = 'ssp-chip pg-mono'; keysEl.appendChild(c); chips.push(c); }
+    let raf = 0;
+    function draw() {
+      const interval = Number(q<HTMLSelectElement>('[data-int]').value);
+      const kind = q<HTMLSelectElement>('[data-sink]').value as Kind;
+      const sep = q<HTMLInputElement>('[data-sep]').checked;
+      const crash = Number(q<HTMLInputElement>('[data-crash]').value);
+      q('[data-crashval]').textContent = String(crash);
+      const r = simulate(interval, kind, sep, crash);
+      q('[data-rec]').textContent = `restore offset ${r.restore}, replay ${r.replayed} events`;
+      q('[data-recnote]').textContent = sep ? `state snapshot at ${r.snapOffset}, offset committed at ${r.restore}: they disagree unless equal` : interval === 0 ? 'no checkpoint exists: everything is replayed' : `last checkpoint at ${r.snapOffset}`;
+      q('[data-state]').textContent = r.wrong === 0 ? 'all 12 counters exact' : `${r.wrong} of 12 counters wrong`;
+      q('[data-statenote]').textContent = r.double > 0 ? `${r.double} events counted twice` : r.lost > 0 ? `${r.lost} events never counted` : 'every event counted once';
+      q<HTMLElement>('[data-statebox]').style.setProperty('--c', r.wrong === 0 ? 'var(--good)' : 'var(--bad)');
+      if (kind === 'idempotent') {
+        q('[data-sinkout]').textContent = `${r.rows} rows, ${r.dup} duplicates`;
+        q('[data-sinknote]').textContent = `${r.extra} upserts re-applied by replay, same values`;
+      } else {
+        q('[data-sinkout]').textContent = `${r.rows} records, ${r.dup} duplicates`;
+        q('[data-sinknote]').textContent = kind === 'transactional' ? `${r.extra} uncommitted records aborted at the crash` : `${r.missing} outputs missing`;
+      }
+      q<HTMLElement>('[data-sinkbox]').style.setProperty('--c', r.dup === 0 && r.missing <= 0 ? 'var(--good)' : 'var(--bad)');
+      for (let k = 0; k < KEYS; k++) {
+        const bad = r.got[k] !== r.truth[k];
+        chips[k].textContent = `c${k}: ${r.got[k]}${bad ? ` (true ${r.truth[k]})` : ''}`;
+        chips[k].classList.toggle('bad', bad);
+      }
+      const v = q<HTMLElement>('[data-verdict]');
+      let msg: string; let bad = false;
+      if (r.wrong > 0) { bad = true; msg = r.double > 0 ? 'Offset and state come from different moments: events between them are counted twice.' : 'Offset and state come from different moments: events between them are lost.'; }
+      else if (r.dup > 0) msg = `State is exact (exactly-once state), but the plain sink saw ${r.dup} outputs twice: the guarantee ends at the job boundary.`;
+      else if (kind === 'idempotent') msg = 'State exact, and replayed upserts overwrite the same values: no duplicates.';
+      else if (kind === 'transactional') msg = 'State exact and no duplicates: open transaction aborted, replay wrote each record once, visible only at checkpoint boundaries.';
+      else msg = 'State exact and the sink saw no duplicates (nothing was replayed past a committed output).';
+      v.textContent = msg; v.classList.toggle('bad', bad);
+    }
+    const schedule = () => { if (raf) return; raf = requestAnimationFrame(() => { raf = 0; draw(); }); };
+    root.querySelectorAll('select, input').forEach((e) => { e.addEventListener('input', schedule); e.addEventListener('change', schedule); });
+    q('[data-reset]').addEventListener('click', () => {
+      q<HTMLSelectElement>('[data-int]').value = '50'; q<HTMLSelectElement>('[data-sink]').value = 'plain';
+      q<HTMLInputElement>('[data-crash]').value = '330'; q<HTMLInputElement>('[data-sep]').checked = false; draw();
+    });
+    draw();
+  });
+</script>
+<style is:global>
+  .playground .ssp-check { display: inline-flex; align-items: center; gap: 6px; }
+  .playground .ssp-keys { display: grid; grid-template-columns: repeat(auto-fill, minmax(8.5rem, 1fr)); gap: 6px; }
+  .playground .ssp-chip { padding: 4px 8px; border: 1px solid var(--border); border-radius: 6px; background: var(--surface-2); color: var(--text); }
+  .playground .ssp-chip.bad { border-color: var(--bad); background: color-mix(in srgb, var(--bad) 14%, var(--surface)); color: var(--bad-text); }
+</style>

@@ -1,0 +1,134 @@
+---
+import PlaygroundShell from '../components/PlaygroundShell.astro';
+---
+<PlaygroundShell title="Simulate it" hint="Streaming writers append to today's partition of an orders table, one commit per micro-batch. Step through a day and watch small files, commit conflicts and query time.">
+  <ol class="how">
+    <li>With the defaults (2 writers, 30 commits each per hour, compaction <b>Off</b>) press <b>Run to hour 24</b>. Today's partition ends up with <b>1,440 files of about 8 MB</b> and the query needs roughly <b>13 seconds</b>, half of it just planning over 1,440 manifests.</li>
+    <li>Set compaction to <b>every hour</b> and run again: about <b>24 files of about 480 MB</b> and a query near <b>3.8 seconds</b>. Storage is higher until you tick <b>Expire old snapshots</b>, because the replaced small files are still referenced by older snapshots.</li>
+    <li>Set writers to <b>8</b> and commits per writer to <b>120</b> (compaction Off): every commit races for the same table pointer, so you see thousands of retries and some commits that give up after 4 retries.</li>
+  </ol>
+  <div class="pg tf" data-tf>
+    <div class="pg-row">
+      <label>Writers <input type="range" min="1" max="8" value="2" data-w /> <b data-wval>2</b></label>
+      <label>Commits per writer per hour <input type="range" min="1" max="120" value="30" data-c /> <b data-cval>30</b></label>
+      <label>Compaction <select class="pg-in" data-k><option value="0" selected>Off</option><option value="1">Every hour</option><option value="6">Every 6 hours</option><option value="24">Once a day</option></select></label>
+      <label class="tf-check"><input type="checkbox" data-expire /> Expire old snapshots</label>
+    </div>
+    <div class="pg-row">
+      <button class="btn" type="button" data-step>Step 1 hour</button>
+      <button class="btn" type="button" data-run>Run to hour 24</button>
+      <button class="btn" type="button" data-reset>Reset</button>
+      <span class="pg-mono" data-hour>hour 0 of 24</span>
+    </div>
+    <div class="pg-grid">
+      <div class="pg-box" style="--c: var(--role-1)"><h3>Data files today</h3><span class="pg-mono" data-files>0</span><span class="pg-note" data-avg>average size: -</span></div>
+      <div class="pg-box" style="--c: var(--role-2)"><h3>Manifests to plan over</h3><span class="pg-mono" data-man>0</span><span class="pg-note" data-snaps>0 snapshots</span></div>
+      <div class="pg-box" style="--c: var(--role-3)"><h3>Commit retries</h3><span class="pg-mono" data-retries>0</span><span class="pg-note" data-failed>0 gave up after 4 retries</span></div>
+      <div class="pg-box" style="--c: var(--role-4)"><h3>Query: today so far</h3><span class="pg-mono" data-query>-</span><span class="pg-note" data-qnote>plan + scan</span></div>
+      <div class="pg-box" style="--c: var(--role-5)"><h3>Storage</h3><span class="pg-mono" data-store>0 GB</span><span class="pg-note" data-obs>0 GB held by old snapshots</span></div>
+    </div>
+    <h3 class="tf-h">Query time after each hour</h3>
+    <div class="tf-bars" data-bars role="img" aria-label="Query time after each simulated hour"></div>
+    <p class="pg-note" data-verdict></p>
+    <p class="pg-note">Assumptions: 480 MB of events arrive per hour into one day partition; one file per commit; a commit takes 3 s to build and a retry 1 s; the query runs 32 parallel tasks, opens a file in 60 ms, reads 100 MB/s per task and reads 8 manifests in parallel at 40 ms each. Compaction merges only the small files into about 512 MB files and its own commit conflicts are ignored. Failed commits are re-queued by the writer, so the file count is unchanged. Real numbers vary with the object store and engine.</p>
+  </div>
+</PlaygroundShell>
+<script>
+  // CORE START
+  const COMMIT_S = 3; const RETRY_S = 1; const MAX_RETRY = 4; const HOUR_MB = 480; const TARGET_MB = 512;
+  const OPEN_MS = 60; const MB_PER_S = 100; const SLOTS = 32; const MAN_PAR = 8; const MAN_MS = 40;
+  function rng(seed: number) {
+    let a = seed | 0;
+    return () => { a = (a + 0x6D2B79F5) | 0; let t = Math.imul(a ^ (a >>> 15), 1 | a); t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t; return ((t ^ (t >>> 14)) >>> 0) / 4294967296; };
+  }
+  interface Att { start: number; w: number; readV: number; cas: number; tries: number }
+  // One hour of optimistic commits against a single table pointer (compare-and-swap).
+  function hourCommits(writers: number, perWriter: number, seed: number) {
+    const rnd = rng(seed);
+    const todo: Att[] = [];
+    for (let w = 0; w < writers; w++) for (let i = 0; i < perWriter; i++) { const s = rnd() * 3600; todo.push({ start: s, w, readV: 0, cas: s + COMMIT_S, tries: 1 }); }
+    todo.sort((a, b) => a.start - b.start || a.w - b.w);
+    const live: Att[] = []; let head = 0; let retries = 0; let failed = 0;
+    while (todo.length || live.length) {
+      let mi = -1; let mt = Infinity;
+      live.forEach((s, i) => { if (s.cas < mt || (s.cas === mt && s.w < live[mi].w)) { mt = s.cas; mi = i; } });
+      if (todo.length && todo[0].start <= mt) { const s = todo.shift()!; s.readV = head; live.push(s); continue; }
+      const s = live[mi];
+      if (s.readV === head) { head++; live.splice(mi, 1); }
+      else if (s.tries > MAX_RETRY) { failed++; live.splice(mi, 1); }
+      else { retries++; s.tries++; s.readV = head; s.cas += RETRY_S; }
+    }
+    return { commits: writers * perWriter, retries, failed };
+  }
+  interface TState { hour: number; small: number; smallMB: number; big: number; bigMB: number; commits: number; manifests: number; retries: number; failed: number; obsoleteMB: number; compactions: number; queryMs: number[] }
+  function fresh(): TState { return { hour: 0, small: 0, smallMB: 0, big: 0, bigMB: 0, commits: 0, manifests: 0, retries: 0, failed: 0, obsoleteMB: 0, compactions: 0, queryMs: [] }; }
+  function queryMs(s: TState) {
+    const files = s.small + s.big; const mb = s.smallMB + s.bigMB;
+    const plan = Math.ceil(s.manifests / MAN_PAR) * MAN_MS;
+    const scan = (files * OPEN_MS + (mb / MB_PER_S) * 1000) / SLOTS;
+    return plan + scan;
+  }
+  function stepHour(s: TState, writers: number, perWriter: number, every: number, expire: boolean) {
+    const r = hourCommits(writers, perWriter, 1000 + s.hour);
+    s.hour++; s.commits += r.commits; s.retries += r.retries; s.failed += r.failed;
+    s.small += r.commits; s.smallMB += HOUR_MB; s.manifests += r.commits;
+    if (every > 0 && s.hour % every === 0) {
+      s.big += Math.ceil(s.smallMB / TARGET_MB); s.bigMB += s.smallMB;
+      s.obsoleteMB += expire ? 0 : s.smallMB;
+      s.small = 0; s.smallMB = 0; s.manifests = s.big; s.compactions++;
+    }
+    s.queryMs.push(queryMs(s));
+  }
+  // CORE END
+  document.querySelectorAll<HTMLElement>('[data-tf]').forEach((root) => {
+    const q = <T extends HTMLElement>(sel: string) => root.querySelector<T>(sel)!;
+    const val = (sel: string) => Number(q<HTMLInputElement | HTMLSelectElement>(sel).value);
+    let st = fresh();
+    const bars = q('[data-bars]');
+    const barEls: HTMLElement[] = [];
+    for (let i = 0; i < 24; i++) { const b = document.createElement('span'); b.className = 'tf-bar'; b.title = `hour ${i + 1}`; bars.appendChild(b); barEls.push(b); }
+    const fmtMs = (ms: number) => (ms >= 1000 ? (ms / 1000).toFixed(1) + ' s' : Math.round(ms) + ' ms');
+    const gb = (mb: number) => (mb / 1024).toFixed(1) + ' GB';
+    function draw() {
+      q('[data-wval]').textContent = String(val('[data-w]')); q('[data-cval]').textContent = String(val('[data-c]'));
+      const files = st.small + st.big; const mb = st.smallMB + st.bigMB;
+      q('[data-hour]').textContent = `hour ${st.hour} of 24`;
+      q('[data-files]').textContent = files.toLocaleString('en-US');
+      q('[data-avg]').textContent = files ? `average size: ${mb / files >= 100 ? Math.round(mb / files) : (mb / files).toFixed(1)} MB` : 'average size: -';
+      q('[data-man]').textContent = st.manifests.toLocaleString('en-US');
+      q('[data-snaps]').textContent = `${(st.commits + st.compactions).toLocaleString('en-US')} snapshots written`;
+      q('[data-retries]').textContent = st.retries.toLocaleString('en-US');
+      q('[data-failed]').textContent = `${st.failed.toLocaleString('en-US')} gave up after ${MAX_RETRY} retries`;
+      const qm = st.queryMs.length ? st.queryMs[st.queryMs.length - 1] : 0;
+      q('[data-query]').textContent = st.hour ? fmtMs(qm) : '-';
+      const plan = Math.ceil(st.manifests / MAN_PAR) * MAN_MS;
+      q('[data-qnote]').textContent = st.hour ? `planning ${fmtMs(plan)} + scan ${fmtMs(qm - plan)}` : 'plan + scan';
+      q('[data-store]').textContent = gb(mb + st.obsoleteMB);
+      q('[data-obs]').textContent = `${gb(st.obsoleteMB)} held by old snapshots`;
+      const max = Math.max(1, ...st.queryMs);
+      barEls.forEach((b, i) => {
+        const v = st.queryMs[i];
+        b.style.height = v === undefined ? '2px' : Math.max(2, Math.round((v / max) * 100)) + 'px';
+        b.title = v === undefined ? `hour ${i + 1}` : `hour ${i + 1}: ${fmtMs(v)}`;
+      });
+      const every = val('[data-k]');
+      q('[data-verdict]').textContent = !st.hour ? 'Press Step or Run to start the day.'
+        : st.failed > 0 ? `${st.failed.toLocaleString('en-US')} commits gave up: too many writers are racing for one table pointer. Batch more rows per commit or partition the writers.`
+        : files > 500 ? `${files.toLocaleString('en-US')} small files: the query spends its time opening files and reading metadata, not reading data. Compaction fixes this.`
+        : every > 0 && files <= 100 ? 'Compaction keeps the file count low, so planning and scanning stay cheap.'
+        : 'File counts are still manageable.';
+    }
+    function step() { if (st.hour >= 24) return; stepHour(st, val('[data-w]'), val('[data-c]'), val('[data-k]'), q<HTMLInputElement>('[data-expire]').checked); }
+    q('[data-step]').addEventListener('click', () => { step(); draw(); });
+    q('[data-run]').addEventListener('click', () => { while (st.hour < 24) step(); draw(); });
+    q('[data-reset]').addEventListener('click', () => { st = fresh(); draw(); });
+    ['[data-w]', '[data-c]', '[data-k]', '[data-expire]'].forEach((sel) => q(sel).addEventListener('input', () => { st = fresh(); draw(); }));
+    draw();
+  });
+</script>
+<style is:global>
+  .playground .tf-check { display: inline-flex; align-items: center; gap: 6px; }
+  .playground .tf-h { margin: 12px 0 6px; font-size: .95rem; }
+  .playground .tf-bars { display: flex; align-items: flex-end; gap: 2px; height: 104px; border-bottom: 1px solid var(--border); }
+  .playground .tf-bar { flex: 1 1 0; min-width: 0; background: var(--role-4); border-radius: 2px 2px 0 0; height: 2px; }
+</style>

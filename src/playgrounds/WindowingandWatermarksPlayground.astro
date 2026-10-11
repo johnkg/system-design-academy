@@ -1,0 +1,125 @@
+---
+import PlaygroundShell from '../components/PlaygroundShell.astro';
+---
+<PlaygroundShell title="Simulate it" hint="40 click events with event times 2 to 99 are counted in 10-second event-time windows. Each event arrives up to the chosen disorder after its event time. A window fires when the watermark (newest event time minus the delay) passes its end.">
+  <ol class="how">
+    <li>With the defaults (disorder 12 s, watermark delay 5 s) press <b>Run to end</b>: 2 of the 40 events are <b>late</b>, the affected windows come out too low (red rows), and the average wait after a window ends is about 10.7 s (Set A).</li>
+    <li>Raise the <b>watermark delay</b> to 12 s or more, matching the disorder: <b>late</b> drops to 0 and every window is exact, but the average wait rises to about 15.5 s.</li>
+    <li>Set the delay to 0 s: results come out fastest (about 3.9 s) but 12 events are late. Set <b>disorder</b> to 0 s and even a delay of 0 s loses nothing, because the stream is in order. Use <b>Step</b> to watch the watermark advance one arrival at a time.</li>
+  </ol>
+  <div class="pg wm" data-wm>
+    <div class="pg-row">
+      <label>Watermark delay (s) <input type="range" min="0" max="20" value="5" data-delay /> <b data-delayval>5</b></label>
+      <label>Disorder (s) <input type="range" min="0" max="20" value="12" data-dis /> <b data-disval>12</b></label>
+      <label>Data set <select class="pg-in" data-seed><option value="7" selected>Set A</option><option value="21">Set B</option><option value="99">Set C</option></select></label>
+    </div>
+    <div class="pg-row">
+      <button class="btn pg-primary" type="button" data-step>Step</button>
+      <button class="btn" type="button" data-run>Run to end</button>
+      <button class="btn" type="button" data-reset>Reset</button>
+    </div>
+    <div class="pg-grid">
+      <div class="pg-box" style="--c: var(--role-4)"><h3>Watermark</h3><span class="pg-mono" data-wmval>none yet</span><span class="pg-note" data-wmnote></span></div>
+      <div class="pg-box" style="--c: var(--role-3)"><h3>Events processed</h3><span class="pg-mono" data-prog>0 of 40</span><span class="pg-note" data-counts></span></div>
+    </div>
+    <h3 class="wm-h">Events in arrival order (event time in seconds)</h3>
+    <div class="wm-chips" data-chips role="list" aria-label="Events in arrival order"></div>
+    <h3 class="wm-h">Windows</h3>
+    <div class="wm-scroll" tabindex="0" role="region" aria-label="Window results table, scrolls horizontally on small screens">
+      <table class="wm-table"><thead><tr><th scope="col">Window</th><th scope="col">Counted</th><th scope="col">True count</th><th scope="col">Status</th></tr></thead><tbody data-rows></tbody></table>
+    </div>
+    <p class="pg-out" data-out aria-live="polite"></p>
+  </div>
+</PlaygroundShell>
+<script>
+  const WIN = 10; const N = 40; const NWIN = 10;
+  interface Ev { t: number; arr: number }
+  function mulberry32(a: number) { return () => { a |= 0; a = (a + 0x6d2b79f5) | 0; let t = Math.imul(a ^ (a >>> 15), 1 | a); t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t; return ((t ^ (t >>> 14)) >>> 0) / 4294967296; }; }
+  // Events in arrival order. Event time grows about 2.4 s per event; arrival = event time + a random delay 0..disorder.
+  function gen(seed: number, disorder: number): Ev[] {
+    const rnd = mulberry32(seed); const evs: Ev[] = [];
+    for (let i = 0; i < N; i++) {
+      const t = Math.min(99, 2 + Math.floor(i * 2.4 + rnd() * 2)); const lag = Math.floor(rnd() * (disorder + 1));
+      evs.push({ t, arr: t + lag });
+    }
+    return evs.map((e, i) => ({ e, i })).sort((a, b) => a.e.arr - b.e.arr || a.i - b.i).map((x) => x.e);
+  }
+  interface Win { count: number; fired: boolean; firedAt: number }
+  interface Sim { wm: number | null; state: ('pending' | 'ok' | 'late')[]; wins: Win[]; late: number; truth: number[]; lat: number; fired: number }
+  // Process the first `upto` arrivals. upto === N also flushes the windows still open (end of input).
+  function simulate(evs: Ev[], delay: number, upto: number): Sim {
+    const wins: Win[] = Array.from({ length: NWIN }, () => ({ count: 0, fired: false, firedAt: 0 }));
+    const state: ('pending' | 'ok' | 'late')[] = evs.map(() => 'pending');
+    const truth = new Array(NWIN).fill(0); for (const e of evs) truth[Math.floor(e.t / WIN)]++;
+    let wm: number | null = null; let max = -1; let late = 0;
+    const fire = (at: number) => { wins.forEach((w, k) => { if (!w.fired && w.count > 0 && (k + 1) * WIN <= (wm as number)) { w.fired = true; w.firedAt = at; } }); };
+    for (let i = 0; i < upto; i++) {
+      const k = Math.floor(evs[i].t / WIN);
+      if (wm !== null && (k + 1) * WIN <= wm) { state[i] = 'late'; late++; continue; }
+      wins[k].count++; state[i] = 'ok'; max = Math.max(max, evs[i].t); wm = max - delay; fire(evs[i].arr);
+    }
+    if (upto === N) { wm = 1e9; fire(evs[N - 1].arr); }
+    let lat = 0; let fired = 0;
+    wins.forEach((w, k) => { if (w.fired) { lat += Math.max(0, w.firedAt - (k + 1) * WIN); fired++; } });
+    return { wm, state, wins, late, truth, lat: fired ? lat / fired : 0, fired };
+  }
+
+  document.querySelectorAll<HTMLElement>('[data-wm]').forEach((root) => {
+    const q = <T extends HTMLElement>(s: string) => root.querySelector<T>(s)!;
+    const val = (s: string) => Number(q<HTMLInputElement>(s).value);
+    const reduce = window.matchMedia('(prefers-reduced-motion: reduce)').matches;
+    let evs: Ev[] = []; let pos = 0; let raf = 0;
+    const chipsEl = q('[data-chips]'); const rowsEl = q('[data-rows]');
+    const chips: HTMLElement[] = []; const rows: { count: HTMLElement; truth: HTMLElement; status: HTMLElement; tr: HTMLElement }[] = [];
+    for (let i = 0; i < N; i++) { const c = document.createElement('span'); c.className = 'wm-chip'; c.setAttribute('role', 'listitem'); chipsEl.appendChild(c); chips.push(c); }
+    for (let k = 0; k < NWIN; k++) {
+      const tr = document.createElement('tr'); const th = document.createElement('th'); th.scope = 'row'; th.textContent = `[${k * WIN}, ${(k + 1) * WIN})`; tr.appendChild(th);
+      const cells = [0, 1, 2].map(() => { const td = document.createElement('td'); tr.appendChild(td); return td; });
+      rowsEl.appendChild(tr); rows.push({ tr, count: cells[0], truth: cells[1], status: cells[2] });
+    }
+    function draw() {
+      raf = 0;
+      const delay = val('[data-delay]'); const s = simulate(evs, delay, pos);
+      q('[data-delayval]').textContent = String(delay); q('[data-disval]').textContent = String(val('[data-dis]'));
+      q('[data-wmval]').textContent = s.wm === null ? 'none yet' : pos === N ? 'end of input (infinity)' : `${s.wm} s`;
+      q('[data-wmnote]').textContent = pos === N ? 'flushes every window still open' : s.wm === null ? 'newest event time minus the delay' : `newest event time ${s.wm + delay} minus ${delay}`;
+      q('[data-prog]').textContent = `${pos} of ${N}`;
+      q('[data-counts]').textContent = `counted ${s.state.filter((x) => x === 'ok').length}, late ${s.late}`;
+      chips.forEach((c, i) => { c.textContent = String(evs[i].t); c.className = `wm-chip ${s.state[i]}${i === pos - 1 ? ' now' : ''}`; c.title = s.state[i] === 'late' ? 'late: its window already fired' : s.state[i] === 'ok' ? 'counted' : 'not processed yet'; c.setAttribute('aria-label', `event time ${evs[i].t}, ${s.state[i] === 'late' ? 'late' : s.state[i] === 'ok' ? 'counted' : 'not processed yet'}`); });
+      s.wins.forEach((w, k) => {
+        const r = rows[k]; const wrong = w.fired && w.count !== s.truth[k];
+        r.count.textContent = String(w.count); r.truth.textContent = String(s.truth[k]);
+        r.status.textContent = w.fired ? (wrong ? `fired, ${s.truth[k] - w.count} missed` : 'fired, exact') : w.count > 0 ? 'open' : '-';
+        r.tr.className = wrong ? 'wrong' : w.fired ? 'done' : '';
+      });
+      const out = q('[data-out]');
+      if (pos === N) {
+        const missed = s.truth.reduce((a, b, k) => a + Math.abs(b - s.wins[k].count), 0);
+        out.textContent = `Finished: ${N - s.late} counted, ${s.late} late, total error ${missed} clicks, average wait after window end ${s.lat.toFixed(1)} s`;
+        out.classList.toggle('bad', s.late > 0);
+      } else { out.textContent = `Step through the arrivals or press Run to end.`; out.classList.remove('bad'); }
+    }
+    function schedule() { if (reduce) draw(); else if (!raf) raf = requestAnimationFrame(draw); }
+    function rebuild() { evs = gen(val('[data-seed]'), val('[data-dis]')); pos = 0; schedule(); }
+    q('[data-step]').addEventListener('click', () => { if (pos < N) pos++; schedule(); });
+    q('[data-run]').addEventListener('click', () => { pos = N; schedule(); });
+    q('[data-reset]').addEventListener('click', () => { pos = 0; schedule(); });
+    q('[data-delay]').addEventListener('input', schedule);
+    q('[data-dis]').addEventListener('input', rebuild);
+    q('[data-seed]').addEventListener('change', rebuild);
+    rebuild();
+  });
+</script>
+<style is:global>
+  .playground .wm-h { margin: 14px 0 6px; font-size: .95rem; }
+  .playground .wm-chips { display: flex; flex-wrap: wrap; gap: 4px; }
+  .playground .wm-chip { min-width: 2.2em; text-align: center; font: .8rem ui-monospace, monospace; padding: 2px 6px; border-radius: 6px; border: 1px solid var(--border); background: var(--surface); color: var(--muted); }
+  .playground .wm-chip.ok { border-color: var(--good); background: color-mix(in srgb, var(--good) 14%, var(--surface)); color: var(--text); }
+  .playground .wm-chip.late { border-color: var(--bad); background: color-mix(in srgb, var(--bad) 14%, var(--surface)); color: var(--bad-text); text-decoration: line-through; }
+  .playground .wm-chip.now { outline: 2px solid var(--accent); outline-offset: 1px; }
+  .playground .wm-scroll { overflow-x: auto; }
+  .playground .wm-table { border-collapse: collapse; font: .85rem ui-monospace, monospace; width: 100%; }
+  .playground .wm-table th, .playground .wm-table td { text-align: left; padding: 4px 10px; border-bottom: 1px solid var(--border); white-space: nowrap; }
+  .playground .wm-table tr.wrong td { color: var(--bad-text); }
+  .playground .wm-table tr.done th { font-weight: 600; }
+</style>

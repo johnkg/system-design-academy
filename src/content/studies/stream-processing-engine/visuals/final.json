@@ -1,0 +1,54 @@
+{
+  "actors": [
+    { "id": "phone", "label": "Phone app", "role": "client", "x": 14, "y": 16 },
+    { "id": "log", "label": "Event log, partition 4", "role": "async", "x": 50, "y": 16 },
+    { "id": "jm", "label": "Job manager", "role": "edge", "x": 86, "y": 16 },
+    { "id": "task", "label": "Window task 4", "role": "compute", "x": 14, "y": 50 },
+    { "id": "state", "label": "Local state", "role": "data", "x": 50, "y": 50 },
+    { "id": "snap", "label": "Snapshot storage", "role": "data", "x": 86, "y": 50 },
+    { "id": "sink", "label": "Output store", "role": "data", "x": 50, "y": 84 }
+  ],
+  "frames": [
+    {
+      "narration": "A purchase event for user 17 happened at 12:00:07 and is appended to the log, which keeps it for days. The event carries its own event time.",
+      "messages": [{ "from": "phone", "to": "log", "label": "user 17, 12:00:07, 9 EUR" }],
+      "states": { "log": "offset 5,120" }
+    },
+    {
+      "narration": "Window task 4 owns the key group of user 17. It reads the event and adds 9 to user 17's total for the window from 12:00:00 to 12:00:10, in its local state. This is a local update taking microseconds, with no network call.",
+      "messages": [{ "from": "log", "to": "task", "label": "event at offset 5,120" }, { "from": "task", "to": "state", "label": "17, window 12:00:00: +9" }],
+      "states": { "state": "17: 9 EUR in open window" }
+    },
+    {
+      "narration": "Events keep arriving out of order. The newest event time seen is 12:00:15, and the allowed delay is 4 seconds, so the watermark is 12:00:11. It is past the window's end at 12:00:10, so the window fires and its state is dropped. Its result is written into an open transaction, not yet visible.",
+      "messages": [{ "from": "task", "to": "state", "label": "watermark 12:00:11: close window" }, { "from": "task", "to": "sink", "label": "17: 9 EUR (uncommitted)" }],
+      "states": { "task": "watermark 12:00:11", "sink": "result in open transaction" }
+    },
+    {
+      "narration": "Time for a checkpoint. The job manager starts checkpoint 41 and the source puts a barrier into the stream, after offset 5,200. The source saves its offset.",
+      "messages": [{ "from": "jm", "to": "log", "label": "start checkpoint 41" }, { "from": "log", "to": "task", "label": "barrier 41" }]
+    },
+    {
+      "narration": "When the barrier reaches window task 4 from all its inputs, it saves its state to durable storage and pre-commits the sink transaction. Events after the barrier carry on without waiting for the upload to finish.",
+      "messages": [{ "from": "task", "to": "snap", "label": "state of task 4, offset 5,200" }, { "from": "task", "to": "sink", "label": "pre-commit" }, { "from": "task", "to": "jm", "label": "checkpoint 41 done" }],
+      "states": { "snap": "checkpoint 41 saved" }
+    },
+    {
+      "narration": "All tasks have reported, so checkpoint 41 is complete. The job manager tells the sinks to commit. Only now can readers see the result for user 17.",
+      "messages": [{ "from": "jm", "to": "sink", "label": "commit checkpoint 41" }],
+      "states": { "sink": "17: 9 EUR visible" },
+      "highlight": ["sink"]
+    },
+    {
+      "narration": "Window task 4 crashes at offset 5,340. The job manager detects it and restarts the task from checkpoint 41. It restores the state from the snapshot and the open transaction for events after the barrier is aborted.",
+      "messages": [{ "from": "jm", "to": "task", "label": "restart from checkpoint 41" }, { "from": "snap", "to": "task", "label": "restore state" }],
+      "states": { "task": "restarted, offset 5,200" }
+    },
+    {
+      "narration": "The task reads the log again from offset 5,200 and reprocesses the 140 events up to 5,340 that it had already seen. Because state and output both went back to the checkpoint, nothing is counted twice, and the output is the same as if there had been no crash.",
+      "messages": [{ "from": "log", "to": "task", "label": "replay 5,200 to 5,340" }, { "from": "task", "to": "sink", "label": "same results, committed once" }],
+      "states": { "sink": "no duplicates" },
+      "highlight": ["task", "sink"]
+    }
+  ]
+}

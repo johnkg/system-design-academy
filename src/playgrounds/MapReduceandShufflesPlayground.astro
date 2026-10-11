@@ -1,0 +1,129 @@
+---
+import PlaygroundShell from '../components/PlaygroundShell.astro';
+---
+<PlaygroundShell title="Simulate it" hint="4 mappers each emit 2,500 (key, 1) events, 10,000 in total. Records are hash-partitioned to reducers. A reducer's time is proportional to the records it receives.">
+  <ol class="how">
+    <li>With the defaults (60 keys, skew 1.5, 4 reducers) the hottest key sits on one reducer: the <b>slowest reducer</b> receives about 5,000 of the 10,000 records, roughly <b>2.0x</b> a fair share, and the whole job waits for it. Drag <b>Key skew</b> to 0 and every reducer gets about the same.</li>
+    <li>Set skew to 2.0 and raise <b>Reducers</b> from 4 to 12: the slowest reducer barely improves (about 6,600 down to about 6,200 records) because one key cannot be split by hash partitioning. More reducers only make the other 11 idle.</li>
+    <li>Tick <b>Salt the hot key</b> (back at skew 1.5): the hot key is spread over one salted key per reducer, the slowest reducer drops to about 3,400 records, and a tiny second stage merges the partial counts.</li>
+    <li>Tick <b>Combiner</b>: each mapper pre-sums its own keys, so only about 240 records cross the network instead of 10,000. Now pick <b>20,000 distinct keys</b> with skew 0: the combiner saves almost nothing (about 9,400 records still shuffle), because keys rarely repeat inside one mapper.</li>
+  </ol>
+  <div class="pg mr" data-mr>
+    <div class="pg-row">
+      <label>Reducers <input type="range" min="1" max="12" value="4" data-red aria-label="Number of reducers" /> <b data-redval>4</b></label>
+      <label>Key skew <input type="range" min="0" max="20" value="15" data-skew aria-label="Key skew, Zipf exponent times ten" /> <b data-skewval>1.5</b></label>
+      <label>Distinct keys <select class="pg-in" data-keys aria-label="Number of distinct keys"><option value="60" selected>60 keys</option><option value="20000">20,000 keys</option></select></label>
+    </div>
+    <div class="pg-row">
+      <label class="mr-check"><input type="checkbox" data-comb /> Combiner (pre-sum in each mapper)</label>
+      <label class="mr-check"><input type="checkbox" data-salt /> Salt the hot key</label>
+    </div>
+    <div class="pg-grid">
+      <div class="pg-box" style="--c: var(--role-1)"><h3>Shuffled records</h3><span class="pg-mono" data-shuf>0</span><span class="pg-note" data-shufnote></span></div>
+      <div class="pg-box" data-slowbox style="--c: var(--role-2)"><h3>Slowest reducer</h3><span class="pg-mono" data-slow>0</span><span class="pg-note" data-slownote></span></div>
+    </div>
+    <h3 class="mr-h">Records received per reducer</h3>
+    <ul class="mr-bars" data-bars aria-label="Records received by each reducer; the dashed line marks a fair share"></ul>
+    <p class="pg-out" data-verdict aria-live="polite"></p>
+    <p class="pg-note">Assumptions: 60 or 20,000 keys with Zipf-distributed popularity (skew is the exponent), keys placed by a 32-bit FNV-1a hash modulo the number of reducers, reduce cost proportional to records received, equal-speed reducers. The hot key is the most popular one. Seeded, so results repeat exactly.</p>
+  </div>
+</PlaygroundShell>
+<script>
+  const M = 4; const N = 2500; const MAX_R = 12;
+  function fnv1a(s: string): number { let h = 2166136261; for (let i = 0; i < s.length; i++) h = Math.imul(h ^ s.charCodeAt(i), 16777619) >>> 0; return h; }
+  function mulberry32(seed: number) { let a = seed; return () => { a = (a + 0x6d2b79f5) | 0; let t = Math.imul(a ^ (a >>> 15), 1 | a); t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t; return ((t ^ (t >>> 14)) >>> 0) / 4294967296; }; }
+  const countCache = new Map<string, number[][]>(); const hashCache = new Map<number, number[]>();
+  function keyHashes(K: number): number[] {
+    let h = hashCache.get(K); if (!h) { h = Array.from({ length: K }, (_, k) => fnv1a('k' + k)); hashCache.set(K, h); } return h;
+  }
+  function mapCounts(skewTenths: number, K: number): number[][] {
+    const ck = skewTenths + ':' + K; const hit = countCache.get(ck); if (hit) return hit;
+    const s = skewTenths / 10; const w: number[] = []; let tot = 0;
+    for (let k = 0; k < K; k++) { tot += 1 / Math.pow(k + 1, s); w.push(tot); }
+    const counts: number[][] = [];
+    for (let m = 0; m < M; m++) {
+      const rnd = mulberry32(1000 + m); const c = new Array<number>(K).fill(0);
+      for (let i = 0; i < N; i++) { const x = rnd() * tot; let lo = 0; let hi = K - 1; while (lo < hi) { const mid = (lo + hi) >> 1; if (w[mid] > x) hi = mid; else lo = mid + 1; } c[lo]++; }
+      counts.push(c);
+    }
+    countCache.set(ck, counts); return counts;
+  }
+  interface Opts { skew: number; reducers: number; combiner: boolean; salt: boolean; keys: number }
+  function simulate(o: Opts) {
+    const counts = mapCounts(o.skew, o.keys); const kh = keyHashes(o.keys); const R = o.reducers;
+    const load = new Array<number>(R).fill(0); let mapped = 0; let shuffled = 0;
+    const salting = o.salt && R > 1;
+    const saltHash = Array.from({ length: R }, (_, j) => fnv1a('k0#' + j) % R);
+    for (let m = 0; m < M; m++) for (let k = 0; k < o.keys; k++) {
+      const c = counts[m][k]; if (!c) continue; mapped += c;
+      if (salting && k === 0) {
+        for (let j = 0; j < R; j++) {
+          const part = Math.floor(c / R) + ((j + m) % R < c % R ? 1 : 0); if (!part) continue;
+          const recs = o.combiner ? 1 : part; load[saltHash[j]] += recs; shuffled += recs;
+        }
+      } else { const recs = o.combiner ? 1 : c; load[kh[k] % R] += recs; shuffled += recs; }
+    }
+    const max = Math.max(...load); const avg = shuffled / R;
+    return { mapped, shuffled, stage2: salting ? R : 0, load, max, avg, ratio: avg > 0 ? max / avg : 1, slowest: load.indexOf(max) };
+  }
+  const fmt = (n: number) => n.toLocaleString('en-US');
+
+  document.querySelectorAll<HTMLElement>('[data-mr]').forEach((root) => {
+    const q = <T extends HTMLElement>(s: string) => root.querySelector<T>(s)!;
+    const num = (s: string) => Number(q<HTMLInputElement>(s).value);
+    const barsEl = q('[data-bars]'); const rows: { li: HTMLElement; fill: HTMLElement; val: HTMLElement }[] = [];
+    for (let i = 0; i < MAX_R; i++) {
+      const li = document.createElement('li'); li.className = 'mr-bar';
+      const name = document.createElement('span'); name.className = 'pg-mono mr-name'; name.textContent = 'R' + (i + 1);
+      const track = document.createElement('span'); track.className = 'mr-track';
+      const fill = document.createElement('span'); fill.className = 'mr-fill'; track.appendChild(fill);
+      const mark = document.createElement('span'); mark.className = 'mr-mark'; track.appendChild(mark);
+      const val = document.createElement('span'); val.className = 'pg-mono mr-val';
+      li.append(name, track, val); barsEl.appendChild(li); rows.push({ li, fill, val });
+    }
+    let frame = 0;
+    function draw() {
+      frame = 0;
+      const R = num('[data-red]'); const skew = num('[data-skew]');
+      q('[data-redval]').textContent = String(R); q('[data-skewval]').textContent = (skew / 10).toFixed(1);
+      const r = simulate({ skew, reducers: R, combiner: q<HTMLInputElement>('[data-comb]').checked, salt: q<HTMLInputElement>('[data-salt]').checked, keys: num('[data-keys]') });
+      q('[data-shuf]').textContent = fmt(r.shuffled);
+      q('[data-shufnote]').textContent = `of ${fmt(r.mapped)} mapped records` + (r.stage2 ? `, plus ${r.stage2} partial counts in a second stage` : '');
+      q('[data-slow]').textContent = fmt(r.max);
+      q('[data-slownote]').textContent = `${r.ratio.toFixed(2)}x a fair share of ${fmt(Math.round(r.avg))}`;
+      q<HTMLElement>('[data-slowbox]').style.setProperty('--c', r.ratio >= 1.5 ? 'var(--bad)' : 'var(--role-2)');
+      const scale = Math.max(r.avg * 3, 1); const mark = Math.min(100, (r.avg / scale) * 100);
+      rows.forEach((row, i) => {
+        row.li.hidden = i >= R; if (i >= R) return;
+        row.fill.style.width = Math.min(100, (r.load[i] / scale) * 100) + '%';
+        row.fill.style.background = i === r.slowest && r.ratio >= 1.5 ? 'var(--bad)' : 'var(--role-1)';
+        (row.fill.nextElementSibling as HTMLElement).style.left = mark + '%';
+        row.val.textContent = fmt(r.load[i]);
+      });
+      const speedup = r.max > 0 ? (r.avg / r.max) : 1;
+      q('[data-verdict]').textContent = R === 1
+        ? 'One reducer: nothing to balance, but also no parallelism. Every record is processed by a single task.'
+        : r.ratio >= 1.5
+          ? `Straggler: the job finishes when the slowest reducer does, so it runs at ${(speedup * 100).toFixed(0)}% of the speed a balanced shuffle would give with ${R} reducers.`
+          : r.ratio >= 1.15
+            ? `Mild imbalance: the slowest reducer is ${((r.ratio - 1) * 100).toFixed(0)}% above a fair share, so the job runs at ${(speedup * 100).toFixed(0)}% of the balanced speed.`
+            : `Balanced: the slowest reducer is within ${((r.ratio - 1) * 100).toFixed(0)}% of a fair share, so ${R} reducers are used almost fully.`;
+    }
+    function schedule() { if (!frame) frame = requestAnimationFrame(draw); }
+    root.querySelectorAll('input, select').forEach((el) => el.addEventListener('input', schedule));
+    root.querySelectorAll('input, select').forEach((el) => el.addEventListener('change', schedule));
+    draw();
+  });
+</script>
+<style is:global>
+  .playground .mr-check { display: inline-flex; align-items: center; gap: 6px; }
+  .playground .mr-h { margin: 12px 0 6px; font-size: 1rem; }
+  .playground .mr-bars { list-style: none; margin: 0 0 8px; padding: 0; display: flex; flex-direction: column; gap: 4px; }
+  .playground .mr-bar { display: grid; grid-template-columns: max-content minmax(0, 1fr) max-content; gap: 8px; align-items: center; }
+  .playground .mr-bar[hidden] { display: none; }
+  .playground .mr-name { min-width: 2.2em; }
+  .playground .mr-val { min-width: 4.5em; text-align: right; white-space: nowrap; }
+  .playground .mr-track { position: relative; height: 14px; background: var(--surface-2); border: 1px solid var(--border); border-radius: 4px; overflow: hidden; }
+  .playground .mr-fill { position: absolute; left: 0; top: 0; bottom: 0; width: 0; }
+  .playground .mr-mark { position: absolute; top: 0; bottom: 0; border-left: 2px dashed var(--text); }
+</style>

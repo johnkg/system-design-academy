@@ -1,0 +1,71 @@
+{
+  "name": "Table Formats and the Lakehouse",
+  "area": "dataengineering",
+  "difficulty": "advanced",
+  "intent": "Put database-like tables on cheap object storage by tracking files in versioned metadata and committing changes with one atomic pointer swap.",
+  "scenario": "An orders table lives as Parquet files in an object store. Two streaming writers append micro-batches to it while analysts query it. Without a table format, a reader can see half a write and a writer can overwrite another's work. With one, each commit is an atomic snapshot and a lost race simply retries.",
+  "problem": "A directory of Parquet files is not a table. Object stores have no transactions and no rename that is atomic for many files, so a reader can list a half-finished write, two writers can clobber each other, a failed job leaves stray files, and a query has to list thousands of objects to learn what the table contains. You also cannot update or delete one row without rewriting whole files, and you cannot ask what the table looked like yesterday.",
+  "howItWorks": [
+    { "title": "Data files are immutable", "text": "Rows live in columnar files (Parquet, ORC) that are written once and never modified. An update or delete writes new files, and either rewrites the affected files (copy-on-write) or adds small delete files that are merged at read time (merge-on-read). Immutability is what makes snapshots and time travel cheap." },
+    { "title": "Metadata says which files are the table", "text": "A snapshot is a list of data files, kept in manifest files with per-file stats: row counts and min/max per column. In Iceberg a metadata file points to a manifest list, which points to manifests, which point to data files. Delta Lake keeps an ordered JSON transaction log with periodic checkpoints. Hudi keeps a timeline. The table is whatever the latest snapshot lists, not whatever sits in the bucket." },
+    { "title": "A commit is one atomic pointer swap", "text": "A writer uploads its data files first, then writes new manifests and a new metadata file, and finally asks the catalog (Hive metastore, REST catalog, Glue, or a conditional put on an object) to move the table pointer from the version it started from to the new one, only if nothing changed. Until that swap, nothing is visible, so readers never see a partial write." },
+    { "title": "Concurrency is optimistic", "text": "If the swap fails because another writer won, the loser re-reads the new head and validates: appends commute and can be replayed, but a rewrite of a file that someone else already replaced is a real conflict and must abort. Iceberg retries a few times by default (commit.retry.num-retries is 4) with backoff. The isolation level is snapshot or serializable per table, not across tables." },
+    { "title": "Readers pin a snapshot and prune with stats", "text": "A query reads the head once and sees that snapshot for its whole life, even while writers commit. The planner prunes partitions and files using manifest stats before opening any data file, which avoids listing the bucket. The same mechanism gives time travel: query an older snapshot by id or timestamp." },
+    { "title": "Maintenance keeps it healthy", "text": "Streaming writes create many small files, so a compaction job rewrites them to roughly 128 MB to 1 GB each. Old snapshots keep replaced files alive, so you periodically expire snapshots and delete orphan files. Without this, query planning slows down and storage grows without bound." }
+  ],
+  "pros": [
+    "Atomic, isolated commits on storage that has no transactions of its own",
+    "Readers get a consistent snapshot without locking writers",
+    "Schema and partition evolution without rewriting the table",
+    "Time travel, audit and rollback to an earlier snapshot",
+    "Stats in metadata let engines skip files without listing the bucket",
+    "Open specs mean Spark, Trino, Flink, Snowflake and DuckDB can share one copy of the data"
+  ],
+  "cons": [
+    "Every commit is a few object-store round trips, so commit latency is seconds, not milliseconds",
+    "Many concurrent writers on one table fight over the same pointer",
+    "Needs ongoing maintenance: compaction, snapshot expiry, orphan file cleanup",
+    "Row-level updates are expensive compared with a database: they rewrite files or add delete files",
+    "Transactions stop at the table boundary; there is no multi-table atomicity in the basic formats",
+    "Engine and catalog support for features differs between Iceberg, Delta and Hudi"
+  ],
+  "whenToUse": [
+    "Analytical data that is large, append-heavy and read by several engines",
+    "Streaming or frequent micro-batch ingestion into a table that analysts query",
+    "You need reliable reruns, backfills, audit or the ability to roll back a bad load",
+    "You want one copy of data shared by warehouse, notebooks and ML jobs instead of exporting copies"
+  ],
+  "whenNotToUse": [
+    "Transactional workloads with point reads and frequent single-row updates: use a real database",
+    "A small dataset (gigabytes) that a single Postgres or a plain Parquet folder serves well",
+    "Sub-second end-to-end freshness requirements, since each commit takes seconds and creates small files",
+    "A single warehouse already holds and serves all the data and no other engine needs it"
+  ],
+  "pitfalls": [
+    "Committing every second from many writers: thousands of tiny files, commit conflicts and slow planning",
+    "Never running compaction or snapshot expiry, so manifests and storage grow without bound",
+    "Expiring snapshots too aggressively while a long query or a time-travel consumer still needs them",
+    "Deleting orphan files younger than the longest running write, which removes files a commit is about to reference",
+    "Partitioning on a high-cardinality column, which creates millions of tiny partitions",
+    "Assuming a file listing is the table: other tools that write to the folder bypass the transaction log",
+    "GDPR deletes that only add delete files: the data is still in older files and snapshots until compaction and expiry"
+  ],
+  "related": [
+    { "kind": "concept", "slug": "columnar-formats-and-partitioning" },
+    { "kind": "concept", "slug": "slowly-changing-dimensions" },
+    { "kind": "concept", "slug": "batch-vs-stream-processing" },
+    { "kind": "concept", "slug": "pipeline-orchestration" },
+    { "kind": "concept", "slug": "optimistic-concurrency-and-etags" },
+    { "kind": "concept", "slug": "mvcc-and-isolation-levels" },
+    { "kind": "concept", "slug": "write-ahead-log" },
+    { "kind": "concept", "slug": "schema-evolution-and-compatibility" },
+    { "kind": "concept", "slug": "lsm-trees-vs-b-trees" },
+    { "kind": "concept", "slug": "backups-and-point-in-time-recovery" }
+  ],
+  "roles": [
+    { "id": "writer", "label": "Writer", "description": "A batch or streaming job that uploads data files and then tries to commit a new snapshot." },
+    { "id": "catalog", "label": "Catalog", "description": "Holds the pointer to the table's current metadata and performs the atomic compare-and-swap." },
+    { "id": "storage", "label": "Object store", "description": "Holds immutable data files, manifests and metadata files, with no transactions of its own." },
+    { "id": "engine", "label": "Query engine", "description": "Reads the head, plans from manifest stats and reads only the files it needs." }
+  ]
+}

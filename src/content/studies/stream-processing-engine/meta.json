@@ -1,0 +1,183 @@
+{
+  "name": "Design a Stream Processing Engine",
+  "difficulty": "advanced",
+  "intent": "Run continuous computations over unbounded streams of events, with state kept per key, results by event time, and every event counted exactly once even when machines crash.",
+  "codeTitle": "a mini stream engine with windows, watermarks and checkpoints",
+  "finalIntro": "One event arriving, updating state, closing a window, and surviving a crash.",
+  "prompt": "Design a Flink-like stream processing engine. Users write a job as a graph of operators, such as filter, map, key-by and window-aggregate, which reads from a partitioned event log and writes results to a store. Jobs run for months over hundreds of thousands of events per second, hold terabytes of state, and must give correct results even though events arrive late and out of order and machines fail.",
+  "functional": [
+    "Run a graph of operators (source, map, filter, key-by, window, aggregate, join, sink) as one job",
+    "Keep per-key state, such as counts, sessions and join buffers, across events",
+    "Group events into windows by the time they happened, not the time they arrived",
+    "Handle late and out-of-order events by a clear rule",
+    "Recover after a failure without losing or double-counting events",
+    "Change the number of parallel tasks, and upgrade a job, without losing its state"
+  ],
+  "nonFunctional": [
+    "Handle 500,000 events per second, with results a few seconds after the events happened",
+    "Hold up to several terabytes of state, far more than fits in memory on one machine",
+    "Exactly-once effect on state and on output, even with crashes",
+    "Recover from a task failure in well under a minute, with bounded replay",
+    "Slow operators slow the sources down instead of running out of memory",
+    "Run for months without restarts, and scale up or down while running"
+  ],
+  "firstAttempt": {
+    "text": "One consumer program reads the log, keeps counts in an in-memory map, and writes each result straight to a database. The offset is committed after each batch, and windows are cut by the clock of the machine running the program.",
+    "limits": [
+      "One process caps the throughput, and its state must fit in a single machine's memory",
+      "A crash loses the in-memory map, so the counts restart from zero or are rebuilt by rereading the whole log",
+      "A crash between writing results and committing the offset gives duplicates or gaps in the output",
+      "Windows cut by the arrival clock give wrong answers when a phone sends yesterday's events today",
+      "There is no way to upgrade the program or add machines without losing state"
+    ]
+  },
+  "nodes": [
+    { "id": "prod", "label": "Event producers", "kind": "client", "x": 12, "y": 12, "at": 0 },
+    { "id": "log", "label": "Partitioned event log", "kind": "async", "x": 12, "y": 37, "at": 0 },
+    { "id": "single", "label": "One consumer program", "kind": "compute", "x": 37, "y": 37, "at": 0, "until": 1 },
+    { "id": "ops", "label": "Parallel keyed operators", "kind": "compute", "x": 37, "y": 37, "at": 1 },
+    { "id": "state", "label": "Local keyed state", "kind": "data", "x": 37, "y": 63, "at": 2 },
+    { "id": "wm", "label": "Windows and watermarks", "kind": "compute", "x": 62, "y": 37, "at": 3 },
+    { "id": "jm", "label": "Job manager", "kind": "edge", "x": 62, "y": 12, "at": 4 },
+    { "id": "snaps", "label": "Snapshot storage", "kind": "data", "x": 87, "y": 12, "at": 4 },
+    { "id": "sink", "label": "Output store", "kind": "data", "x": 87, "y": 37, "at": 0 },
+    { "id": "readers", "label": "Dashboards and apps", "kind": "client", "x": 87, "y": 63, "at": 0 },
+    { "id": "scaler", "label": "Autoscaler", "kind": "edge", "x": 37, "y": 12, "at": 6 }
+  ],
+  "edges": [
+    { "from": "prod", "to": "log", "at": 0 },
+    { "from": "log", "to": "single", "at": 0, "until": 1 },
+    { "from": "single", "to": "sink", "at": 0, "until": 1 },
+    { "from": "log", "to": "ops", "at": 1 },
+    { "from": "ops", "to": "sink", "at": 1, "until": 3 },
+    { "from": "ops", "to": "state", "at": 2 },
+    { "from": "ops", "to": "wm", "at": 3 },
+    { "from": "wm", "to": "sink", "at": 3 },
+    { "from": "jm", "to": "ops", "at": 4 },
+    { "from": "ops", "to": "snaps", "at": 4 },
+    { "from": "jm", "to": "sink", "at": 5 },
+    { "from": "sink", "to": "readers", "at": 0 },
+    { "from": "scaler", "to": "jm", "at": 6 }
+  ],
+  "steps": [
+    {
+      "title": "Run the job as parallel tasks, partitioned by key",
+      "problem": "One program cannot read 500,000 events per second, and an aggregation per user needs all the events of one user in the same place.",
+      "fix": "A job is a graph of operators. Each operator runs as many parallel tasks. The source tasks each read some partitions of the event log. Between operators, events are sent by a hash of the key, so all events for one user reach the same task of the next operator, and a stateless step such as map or filter is simply chained into the same task to avoid a network hop. With about 15 tasks at 35,000 events per second each, the job handles 500,000 events per second with headroom.",
+      "tradeoff": "Throughput grows by adding tasks, and the per-key grouping needed for aggregation is built in. The key-by exchange is a network shuffle, and one very popular key can overload a single task however many tasks there are.",
+      "concepts": [{ "slug": "ordering-and-partitioning" }, { "slug": "message-queues" }, { "slug": "consistent-hashing" }, { "slug": "database-sharding" }]
+    },
+    {
+      "title": "Keep state next to the operator, per key",
+      "problem": "Looking up and updating a counter in a remote database for every event costs a network round trip each, which cannot keep up with 35,000 events per second per task.",
+      "fix": "Each task keeps the state of its own keys in a local store: a hash map in memory for small state, or an embedded LSM-tree store on local disk with an in-memory cache for state that is far bigger than memory. Reading and updating a key is a local call taking microseconds. State is split into key groups, small fixed ranges of the hash space, so that a key group can later be moved to another task as a unit.",
+      "tradeoff": "State access is as fast as local memory or disk, and the state size scales with the number of tasks. The state of a task is lost with its machine unless it is saved elsewhere, and the state cannot be queried from outside without extra work.",
+      "concepts": [{ "slug": "stateful-stream-processing" }, { "slug": "lsm-trees-vs-b-trees" }, { "slug": "caching" }, { "slug": "database-sharding" }]
+    },
+    {
+      "title": "Use event time, with watermarks to close windows",
+      "problem": "Events arrive late and out of order, so a window cut by the arrival clock puts events in the wrong window and gives a different answer on every replay.",
+      "fix": "Each event carries the time it happened. A window, for example the 10 seconds from 12:00:00, collects the events whose event time falls in it. The task also tracks a watermark, a claim that no event older than this time is still expected, typically the largest event time seen minus an allowed delay of a few seconds. When the watermark passes the end of the window, the window fires: it emits its result and drops its state. An event that arrives after its window fired is late, and is counted separately, sent to a side output, or merged by an updated result within an allowed lateness.",
+      "tradeoff": "Results are correct for the time events happened and the same on every replay, whatever the arrival order. A longer allowed delay catches more late events and makes every result wait that much longer, and each parallel input has its own watermark, so one idle partition can hold back the whole job unless it is marked idle.",
+      "concepts": [{ "slug": "windowing-and-watermarks" }, { "slug": "logical-clocks" }, { "slug": "stateful-stream-processing" }, { "slug": "backpressure" }]
+    },
+    {
+      "title": "Snapshot the state with checkpoint barriers",
+      "problem": "When a task or machine fails, its state is gone, and rereading months of log to rebuild it takes far too long.",
+      "fix": "The job manager periodically, say every 60 seconds, tells the sources to inject a checkpoint barrier into the stream. A source records its log offsets and passes the barrier on. When an operator has received the barrier from all its inputs, it snapshots its state to durable storage, then forwards the barrier. When all tasks have finished, the checkpoint is complete: a consistent cut of the offsets and all the state, taken without stopping the job. After a failure the job restarts from the last completed checkpoint, restores the state, and rereads the log from the saved offsets. Snapshots can be incremental, saving only the files changed since the last checkpoint.",
+      "tradeoff": "Recovery replays at most one checkpoint interval of events, and the job never has to stop to take a snapshot. A shorter interval means less replay and more snapshot traffic, and barrier alignment on a busy or backpressured path can make checkpoints slow.",
+      "concepts": [{ "slug": "write-ahead-log" }, { "slug": "delivery-guarantees" }, { "slug": "consensus" }, { "slug": "backups-and-point-in-time-recovery" }]
+    },
+    {
+      "title": "Commit output with the checkpoint for exactly-once",
+      "problem": "After a restart the events since the last checkpoint are processed again, so a sink that writes immediately receives their results twice.",
+      "fix": "State is exactly-once because it is rolled back to the checkpoint. For output, the sink writes results into an open transaction, for example a Kafka transaction or a staging file, and pre-commits it when the barrier arrives. The job manager commits all the sinks' transactions only after the whole checkpoint is complete, which is a two-phase commit driven by the checkpoint. After a crash, transactions of the unfinished checkpoint are aborted, and those of a completed one are committed again, which is safe because commit is idempotent. A sink that can overwrite by key, such as an upsert on the window and key, gets the same effect more simply.",
+      "tradeoff": "Readers never see duplicates or half-finished output, even across crashes. Results become visible only at the next completed checkpoint, so latency is at least the checkpoint interval, and the sink must support transactions or idempotent writes.",
+      "concepts": [{ "slug": "two-phase-commit" }, { "slug": "idempotency" }, { "slug": "delivery-guarantees" }, { "slug": "transactional-outbox" }]
+    },
+    {
+      "title": "Scale, rescale and push back under load",
+      "problem": "Load changes through the day, a slow sink stalls the pipeline, and the job needs more or fewer tasks without losing months of state.",
+      "fix": "Between tasks, events travel through bounded buffers with credit-based flow control: a receiver only gets what it has room for, so a slow operator makes its upstream stop, all the way back to the sources, which simply read the log more slowly. The autoscaler watches backpressure and lag, then asks the job manager to take a savepoint (a checkpoint kept on purpose), stop, and restart with a different parallelism. State is redistributed by moving whole key groups to the new tasks. The job manager is made highly available with leader election, so its failure does not stop the running tasks.",
+      "tradeoff": "The job slows down instead of failing when it is overloaded, and it can be resized or upgraded from a savepoint. A rescale takes a short pause, backpressure shows up as higher latency instead of an error, and the number of key groups limits the largest possible parallelism.",
+      "concepts": [{ "slug": "backpressure" }, { "slug": "autoscaling" }, { "slug": "leader-election" }, { "slug": "load-shedding" }, { "slug": "consistent-hashing" }]
+    }
+  ],
+  "failures": [
+    {
+      "scenario": "A worker machine dies in the middle of a checkpoint",
+      "impact": "Its state and the events it was processing are gone, and the checkpoint that was in progress can never finish.",
+      "answer": "The job manager notices the missing heartbeats, abandons the unfinished checkpoint and restarts the affected tasks, or the whole job, from the last completed one. State is restored from snapshot storage, sources rewind to the saved offsets, and the open sink transactions are aborted. At most one interval of events is reprocessed, and the result is the same as if nothing had happened.",
+      "concepts": [{ "slug": "failure-detection" }, { "slug": "health-checks" }, { "slug": "delivery-guarantees" }, { "slug": "write-ahead-log" }]
+    },
+    {
+      "scenario": "A phone sends events from yesterday after the window has already fired",
+      "impact": "The event belongs to a closed window, so its result was already emitted without it.",
+      "answer": "The event is late by the watermark rule. Depending on the job it is dropped and counted in a metric, sent to a side output for a correction job, or, within the allowed lateness, it reopens the window and emits an updated result that the sink handles as an upsert. The allowed delay is chosen from the real distribution of lateness, so very few events are late and results are not held back much.",
+      "concepts": [{ "slug": "windowing-and-watermarks" }, { "slug": "idempotency" }, { "slug": "metrics" }]
+    },
+    {
+      "scenario": "One partition goes quiet and the watermark stops moving",
+      "impact": "The watermark of a task is the minimum over its inputs, so windows stop firing and results are delayed without any error.",
+      "answer": "Sources mark a partition idle after a timeout, and the task ignores idle inputs when computing the minimum. Alerts on watermark lag, the difference between now and the watermark, show the stall. If an idle partition later wakes up with old events, they are handled as late data.",
+      "concepts": [{ "slug": "windowing-and-watermarks" }, { "slug": "alerting" }, { "slug": "metrics" }, { "slug": "timeouts-and-deadlines" }]
+    },
+    {
+      "scenario": "One hot key sends most of the traffic to a single task",
+      "impact": "That task is saturated and backpressure slows the whole job, though the other tasks are almost idle.",
+      "answer": "Add a pre-aggregation step before the key-by, so each upstream task sends one partial count per key and interval instead of every event. For skew that remains, split the hot key into salted sub-keys such as user-17#0 to user-17#7, aggregate each, and combine the eight partial results in a second stage. The metrics per task show which key group is hot.",
+      "concepts": [{ "slug": "ordering-and-partitioning" }, { "slug": "backpressure" }, { "slug": "database-sharding" }, { "slug": "metrics" }]
+    },
+    {
+      "scenario": "The output store is down for ten minutes",
+      "impact": "Sinks cannot commit, so checkpoints cannot complete and the unprocessed events pile up.",
+      "answer": "Checkpoints time out and are retried, while the sink's buffers fill and backpressure stops the operators and then the sources. The log keeps the events safely, since it retains them for days. When the store returns, the sinks commit, the checkpoint completes, and the job drains the backlog at full speed, using its spare capacity.",
+      "concepts": [{ "slug": "backpressure" }, { "slug": "retries-and-backoff" }, { "slug": "circuit-breaker" }, { "slug": "message-queues" }]
+    }
+  ],
+  "alternatives": [
+    {
+      "title": "How events are processed",
+      "options": [
+        { "name": "Continuous operators (Flink style)", "pro": "Events flow one by one, so latency can be milliseconds, with fine-grained state", "con": "Needs checkpoint machinery and long-running tasks to operate" },
+        { "name": "Micro-batches (Spark Streaming style)", "pro": "Reuses a batch engine, and recovery is simply rerunning a small batch", "con": "Latency is at least the batch interval, and per-event state is clumsier" },
+        { "name": "Consumers in a service with a database", "pro": "Nothing new to run for a small job", "con": "You rebuild windows, state recovery and scaling yourself" }
+      ],
+      "pick": "Continuous operators with checkpoints, because latency, large state and exact recovery all matter here."
+    },
+    {
+      "title": "Where state lives",
+      "options": [
+        { "name": "In-memory heap per task", "pro": "Fastest access", "con": "Limited by memory, and snapshots copy the whole state" },
+        { "name": "Embedded LSM store per task", "pro": "State far larger than memory, and incremental snapshots of changed files", "con": "Slower than memory and costs serialisation on every access" },
+        { "name": "An external database", "pro": "State survives the job and can be queried", "con": "A network round trip per event, and exactly-once now needs transactions across two systems" }
+      ],
+      "pick": "An embedded LSM store for big state, with heap state for small jobs."
+    },
+    {
+      "title": "How to get exactly-once output",
+      "options": [
+        { "name": "Checkpoints with a transactional sink", "pro": "Works for any deterministic job and any sink with transactions", "con": "Results appear only at checkpoint commits" },
+        { "name": "Idempotent upserts by key", "pro": "Low latency, and no transactions needed", "con": "Only works when the output has a natural key, and readers may see a result replaced" },
+        { "name": "At-least-once and deduplicate downstream", "pro": "Simplest for the engine", "con": "Every consumer has to deduplicate, and mistakes show up as wrong numbers" }
+      ],
+      "pick": "A transactional sink where it is available, and keyed upserts otherwise."
+    },
+    {
+      "title": "How long to wait for late events",
+      "options": [
+        { "name": "A fixed delay behind the newest event", "pro": "Simple and predictable latency", "con": "Late events beyond the delay are dropped or corrected later" },
+        { "name": "Wait for a percentile of lateness", "pro": "Tuned to the real data", "con": "Needs measuring, and drifts when the traffic changes" },
+        { "name": "Fire early and update later", "pro": "Fast first answer, then a correction as late events come in", "con": "Consumers must handle results that change" }
+      ],
+      "pick": "A small fixed delay, with an allowed lateness that sends corrected results as upserts."
+    }
+  ],
+  "roles": [
+    { "id": "client", "label": "Producers and readers", "description": "Apps that emit events and apps that read results." },
+    { "id": "edge", "label": "Control plane", "description": "The job manager and the autoscaler." },
+    { "id": "async", "label": "Event log", "description": "The partitioned, replayable log that the sources read." },
+    { "id": "compute", "label": "Operators", "description": "Parallel tasks running the job graph, windows and watermarks." },
+    { "id": "data", "label": "State and storage", "description": "Local keyed state, snapshots and the output store." }
+  ]
+}

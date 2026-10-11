@@ -1,0 +1,164 @@
+---
+import PlaygroundShell from '../components/PlaygroundShell.astro';
+---
+<PlaygroundShell title="Simulate it" hint="A daily pipeline of 7 tasks runs for 5 days (March 1 to 5) with seeded failures. Choose how it retries, how it writes, and what the operator does afterwards.">
+  <ol class="how">
+    <li>Leave the defaults (no retries, overwrite). <b>4 task instances fail</b> and <b>12 are marked upstream_failed</b>, so only 210 of 350 rows exist (140 missing). Nothing is duplicated.</li>
+    <li>Switch retries to <b>2 with backoff</b>. 3 of the 4 failures were transient and recover, leaving <b>1 failed and 4 upstream_failed</b>. The cost is time: the run takes longer, and lowering <b>concurrency</b> to 1 stretches it from 30 to 71 minutes with no retries.</li>
+    <li>Set the action to <b>Clear failed task and downstream</b>. Every cell turns green and the table holds exactly 350 rows. Now flip the writes to <b>Append</b>: the same recovery leaves <b>duplicate rows</b>, because each failed attempt had already written half its rows.</li>
+    <li>Choose <b>Backfill all 5 days</b> with <b>Append</b>: every day that was fine is loaded twice. With <b>Overwrite</b> the table ends at exactly 350 rows, but the backfill re-runs all 35 tasks (39 minutes at 3 slots) instead of only the broken ones.</li>
+  </ol>
+  <div class="pg po" data-po>
+    <div class="pg-row">
+      <label>Retry policy <select class="pg-in" data-retries><option value="0" selected>None</option><option value="2">2 retries, exponential backoff</option></select></label>
+      <label>Writes <select class="pg-in" data-idem><option value="1" selected>Overwrite partition (idempotent)</option><option value="0">Append</option></select></label>
+      <label>Failure pattern <select class="pg-in" data-seed><option value="1" selected>Seed 1 (one hard failure)</option><option value="8">Seed 8 (all transient)</option><option value="2">Seed 2 (one hard failure, more retries)</option></select></label>
+    </div>
+    <div class="pg-row">
+      <label>Concurrency (task slots) <input type="range" min="1" max="7" value="3" data-slots /> <b data-slotsval>3</b></label>
+      <label>Operator action <select class="pg-in" data-action><option value="none" selected>None</option><option value="retry">Retry the failed tasks only</option><option value="downstream">Clear failed task and downstream</option><option value="backfill">Backfill all 5 days</option></select></label>
+    </div>
+    <p class="pg-out" role="status" data-verdict></p>
+    <div class="pg-grid">
+      <div class="pg-box" style="--c: var(--role-3)"><h3>Wall time</h3><span class="pg-mono" data-time></span><span class="pg-note" data-timenote></span></div>
+      <div class="pg-box" data-failbox style="--c: var(--bad)"><h3>Failed and skipped</h3><span class="pg-mono" data-fails></span><span class="pg-note">failed tasks, and downstream tasks marked upstream_failed</span></div>
+      <div class="pg-box" data-rowsbox style="--c: var(--role-2)"><h3>Output table</h3><span class="pg-mono" data-rows></span><span class="pg-note" data-rowsnote></span></div>
+    </div>
+    <h3>Run states after the scheduled runs</h3>
+    <div class="po-scroll" tabindex="0" aria-label="Task states per day after the scheduled runs" data-grid1></div>
+    <div data-after>
+      <h3>Run states after the operator action</h3>
+      <div class="po-scroll" tabindex="0" aria-label="Task states per day after the operator action" data-grid2></div>
+    </div>
+    <p class="pg-note">Legend: <b>ok</b> success, <b>FAIL</b> failed after its retries, <b>up_fail</b> upstream_failed (never ran), a trailing <b>x2</b> means the task needed that many attempts.</p>
+    <h3>Output table by date</h3>
+    <div class="po-scroll" tabindex="0" aria-label="Rows in the output table per date" data-out></div>
+    <p class="pg-note">Model assumptions: task durations are 4, 3, 3, 2, 5, 2 and 1 minutes (extract_orders, extract_users, clean_orders, clean_users, aggregate, publish, notify). Each task writes 10 rows for its date. A failing attempt dies after writing 5 of them, then the retry waits 2 minutes and then 4. Concurrency is one pool of slots shared by all 5 runs. The operator fixes the cause first, so manual re-runs succeed. Timeouts and SLA misses are not simulated.</p>
+  </div>
+</PlaygroundShell>
+<script>
+  const TASKS = [
+    { id: 'extract_orders', up: [], dur: 4 },
+    { id: 'extract_users', up: [], dur: 3 },
+    { id: 'clean_orders', up: [0], dur: 3 },
+    { id: 'clean_users', up: [1], dur: 2 },
+    { id: 'aggregate', up: [2, 3], dur: 5 },
+    { id: 'publish', up: [4], dur: 2 },
+    { id: 'notify', up: [5], dur: 1 },
+  ];
+  const DAYS = 5, ROWS = 10, PARTIAL = 5;
+  function mulberry32(a) { return function () { a |= 0; a = (a + 0x6d2b79f5) | 0; let t = Math.imul(a ^ (a >>> 15), 1 | a); t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t; return ((t ^ (t >>> 14)) >>> 0) / 4294967296; }; }
+  function makeFailures(seed) {
+    const r = mulberry32(seed); const f = [];
+    for (let d = 0; d < DAYS; d++) { f.push([]); for (let t = 0; t < TASKS.length; t++) { const x = r(); f[d].push(x < 0.03 ? 3 : x < 0.06 ? 2 : x < 0.14 ? 1 : 0); } }
+    return f;
+  }
+  function newCells() { const c = []; for (let d = 0; d < DAYS; d++) for (let t = 0; t < TASKS.length; t++) c.push({ d, t, state: 'queued', attempts: 0, rows: 0, distinct: 0 }); return c; }
+  const at = (cells, d, t) => cells[d * TASKS.length + t];
+  function write(c, full, idem) { const n = full ? ROWS : PARTIAL; if (idem) c.rows = n; else c.rows += n; c.distinct = Math.max(c.distinct, n); }
+  // Runs the given cells under a pool of `slots`. Returns the minute at which the phase ended (relative to 0).
+  function runPhase(cells, run, o) {
+    const { slots, retries, idem, fails, manual } = o;
+    run.forEach((c) => { c.state = 'queued'; c.readyAt = 0; c.phaseAttempts = 0; });
+    let running = []; let t = 0; let last = 0;
+    for (let guard = 0; guard < 5000; guard++) {
+      for (const r of running.filter((x) => x.end === t)) {
+        const c = r.c; c.attempts++; c.phaseAttempts++; last = t;
+        const fail = !manual && c.phaseAttempts <= fails[c.d][c.t];
+        write(c, !fail, idem);
+        if (!fail) c.state = 'success';
+        else if (c.phaseAttempts <= retries) { c.state = 'retrying'; c.readyAt = t + Math.pow(2, c.phaseAttempts); }
+        else c.state = 'failed';
+      }
+      running = running.filter((x) => x.end !== t);
+      for (let changed = true; changed;) { changed = false; for (const c of run) if ((c.state === 'queued' || c.state === 'retrying') && TASKS[c.t].up.some((u) => { const s = at(cells, c.d, u).state; return s === 'failed' || s === 'upstream_failed'; })) { c.state = 'upstream_failed'; changed = true; } }
+      for (const c of run) {
+        if (running.length >= slots) break;
+        if ((c.state === 'queued' || c.state === 'retrying') && c.readyAt <= t && TASKS[c.t].up.every((u) => at(cells, c.d, u).state === 'success') && !running.some((x) => x.c === c)) { c.state = 'running'; running.push({ c, end: t + TASKS[c.t].dur }); }
+      }
+      if (!running.length && !run.some((c) => c.state === 'queued' || c.state === 'retrying')) break;
+      t++;
+    }
+    return last;
+  }
+  function simulate(cfg) {
+    const fails = makeFailures(cfg.seed); const cells = newCells();
+    const base = { slots: cfg.slots, retries: cfg.retries, idem: cfg.idem, fails };
+    const t1 = runPhase(cells, cells.slice(), { ...base, manual: false });
+    const before = cells.map((c) => c.state); const attemptsBefore = cells.map((c) => c.attempts);
+    let t2 = 0; let rerun = 0;
+    if (cfg.action !== 'none') {
+      let run;
+      if (cfg.action === 'backfill') run = cells.slice();
+      else if (cfg.action === 'retry') run = cells.filter((c) => c.state === 'failed');
+      else run = cells.filter((c) => c.state === 'failed' || c.state === 'upstream_failed');
+      rerun = run.length;
+      if (run.length) t2 = runPhase(cells, run, { ...base, manual: true });
+    }
+    const perDay = []; let rows = 0, distinct = 0;
+    for (let d = 0; d < DAYS; d++) { let r = 0, di = 0; for (let t = 0; t < TASKS.length; t++) { const c = at(cells, d, t); r += c.rows; di += c.distinct; } perDay.push({ rows: r, distinct: di, dup: r - di, missing: TASKS.length * ROWS - di }); rows += r; distinct += di; }
+    const count = (arr, s) => arr.filter((x) => x === s).length;
+    return { cells, before, attemptsBefore, t1, t2, rerun, perDay, rows, distinct, dup: rows - distinct, missing: DAYS * TASKS.length * ROWS - distinct, failedBefore: count(before, 'failed'), ufBefore: count(before, 'upstream_failed'), failedAfter: count(cells.map((c) => c.state), 'failed'), ufAfter: count(cells.map((c) => c.state), 'upstream_failed'), retried: cells.filter((c) => c.attempts > 1).length, fails };
+  }
+  
+  const DAY_NAMES = ['03-01', '03-02', '03-03', '03-04', '03-05'];
+  const SHORT: Record<string, string> = { success: 'ok', failed: 'FAIL', upstream_failed: 'up_fail', queued: '-', running: '-', retrying: '-' };
+  const FILL: Record<string, string> = { success: 'var(--good)', failed: 'var(--bad)', upstream_failed: 'var(--role-3)', queued: 'var(--border)', running: 'var(--border)', retrying: 'var(--border)' };
+  document.querySelectorAll<HTMLElement>('[data-po]').forEach((root) => {
+    const q = <T extends HTMLElement>(s: string) => root.querySelector<T>(s)!;
+    const mk = (tag: string, text = '', cls = '') => { const e = document.createElement(tag); if (text) e.textContent = text; if (cls) e.className = cls; return e; };
+    function buildGrid(host: HTMLElement) {
+      const table = mk('table', '', 'po-table'); const head = mk('tr'); head.append(mk('th', 'date'));
+      TASKS.forEach((t) => { const th = mk('th', t.id); th.scope = 'col'; head.append(th); });
+      const thead = mk('thead'); thead.append(head); const tbody = mk('tbody'); const cells: HTMLElement[] = [];
+      for (let d = 0; d < DAYS; d++) { const tr = mk('tr'); const rh = mk('th', DAY_NAMES[d]); rh.scope = 'row'; tr.append(rh); for (let t = 0; t < TASKS.length; t++) { const td = mk('td', '-', 'po-cell'); cells.push(td); tr.append(td); } tbody.append(tr); }
+      table.append(thead, tbody); host.append(table); return cells;
+    }
+    function paint(cells: HTMLElement[], states: string[], attempts: number[]) {
+      cells.forEach((td, i) => { const s = states[i]; td.textContent = SHORT[s] + (attempts[i] > 1 ? ' x' + attempts[i] : ''); td.style.setProperty('--c', FILL[s]); td.dataset.state = s; });
+    }
+    const grid1 = buildGrid(q('[data-grid1]')); const grid2 = buildGrid(q('[data-grid2]'));
+    const outHost = q('[data-out]'); const outTable = mk('table', '', 'po-table'); const oh = mk('tr');
+    ['date', 'rows', 'distinct', 'duplicates', 'missing'].forEach((h) => { const th = mk('th', h); th.scope = 'col'; oh.append(th); });
+    const othead = mk('thead'); othead.append(oh); const otbody = mk('tbody'); const outCells: HTMLElement[][] = [];
+    for (let d = 0; d <= DAYS; d++) { const tr = mk('tr'); const rh = mk('th', d < DAYS ? DAY_NAMES[d] : 'total'); rh.scope = 'row'; tr.append(rh); const row: HTMLElement[] = []; for (let k = 0; k < 4; k++) { const td = mk('td', '0'); row.push(td); tr.append(td); } outCells.push(row); otbody.append(tr); }
+    outTable.append(othead, otbody); outHost.append(outTable);
+
+    function update() {
+      const slots = Number((q('[data-slots]') as HTMLInputElement).value);
+      const action = (q('[data-action]') as HTMLSelectElement).value;
+      q('[data-slotsval]').textContent = String(slots);
+      const s = simulate({ seed: Number((q('[data-seed]') as HTMLSelectElement).value), slots, retries: Number((q('[data-retries]') as HTMLSelectElement).value), idem: (q('[data-idem]') as HTMLSelectElement).value === '1', action });
+      const total = s.t1 + s.t2;
+      q('[data-time]').textContent = total + ' min';
+      q('[data-timenote]').textContent = s.t2 ? 'scheduled runs ' + s.t1 + ' min, then the action ' + s.t2 + ' min (' + s.rerun + ' task instances re-run)' : 'scheduled runs only, ' + slots + ' slot' + (slots === 1 ? '' : 's');
+      q('[data-fails]').textContent = s.failedAfter + ' failed, ' + s.ufAfter + ' upstream_failed';
+      q('[data-rows]').textContent = s.rows + ' rows (expected ' + DAYS * TASKS.length * ROWS + ')';
+      q('[data-rowsnote]').textContent = s.dup + ' duplicate, ' + s.missing + ' missing';
+      q<HTMLElement>('[data-rowsbox]').style.setProperty('--c', s.dup || s.missing ? 'var(--bad)' : 'var(--role-2)');
+      q<HTMLElement>('[data-failbox]').style.setProperty('--c', s.failedAfter || s.ufAfter ? 'var(--bad)' : 'var(--role-2)');
+      paint(grid1, s.before, s.attemptsBefore);
+      q<HTMLElement>('[data-after]').hidden = action === 'none';
+      paint(grid2, s.cells.map((c: any) => c.state), s.cells.map((c: any) => c.attempts));
+      s.perDay.forEach((p: any, d: number) => { [p.rows, p.distinct, p.dup, p.missing].forEach((v, k) => { outCells[d][k].textContent = String(v); }); });
+      [s.rows, s.distinct, s.dup, s.missing].forEach((v, k) => { outCells[DAYS][k].textContent = String(v); });
+      let verdict: string;
+      if (!s.failedAfter && !s.ufAfter && !s.dup && !s.missing) verdict = 'Clean: every task succeeded and the table holds each row exactly once.';
+      else if (!s.failedAfter && !s.ufAfter && s.dup) verdict = 'Complete but wrong: no data is missing, yet ' + s.dup + ' rows are duplicated, so sums are inflated. Append is not safe to retry.';
+      else verdict = 'Incomplete: ' + s.failedAfter + ' failed and ' + s.ufAfter + ' upstream_failed task instances leave ' + s.missing + ' rows missing' + (s.dup ? ' and ' + s.dup + ' duplicated' : '') + '. An operator or a retry policy has to act.';
+      q('[data-verdict]').textContent = verdict;
+    }
+    root.querySelectorAll('select, input').forEach((el) => el.addEventListener('input', update));
+    update();
+  });
+</script>
+<style is:global>
+  .playground .po-scroll { overflow-x: auto; max-width: 100%; }
+  .playground .po-table { border-collapse: collapse; font: .8rem ui-monospace, monospace; width: 100%; }
+  .playground .po-table th, .playground .po-table td { border: 1px solid var(--border); padding: 4px 8px; text-align: left; white-space: nowrap; }
+  .playground .po-table thead th { background: var(--surface-2); color: var(--text); }
+  .playground .po-cell { background: color-mix(in srgb, var(--c, var(--border)) 28%, var(--surface)); color: var(--text); }
+  .playground .po-cell[data-state="failed"], .playground .po-cell[data-state="upstream_failed"] { font-weight: 700; }
+  .playground .po h3 { margin: 14px 0 6px; }
+  .playground .po .pg-box h3 { margin: 0; }
+</style>

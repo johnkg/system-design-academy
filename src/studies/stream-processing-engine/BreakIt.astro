@@ -1,0 +1,75 @@
+---
+import PlaygroundShell from '../../components/PlaygroundShell.astro';
+---
+<PlaygroundShell title="Crash the job, and count the damage" hint="A job counts 2,000 events and crashes at random moments. Change how it saves state and writes output, and see what is lost, duplicated, or delayed.">
+  <ol class="how">
+    <li>Start with <b>checkpoints and a plain sink</b> and <b>4 crashes</b>: the counts are right, but every crash makes the sink receive the events since the last checkpoint <b>a second time</b>, so there are duplicate rows (<b>146</b> in total with an interval of 50).</li>
+    <li>Switch to <b>no checkpoints</b>: nothing is duplicated, but the in-memory counts vanish at each crash and <b>732</b> of the 2,000 events are missing from the final counts.</li>
+    <li>Switch to the <b>transactional sink</b>: duplicates and losses are both <b>0</b>. The price is that a result becomes visible only when the checkpoint commits (an average wait of <b>0.25 s</b> at an interval of 50, and 2.5 s at 500). An <b>idempotent</b> sink is also exact, with no wait, but only when the output has a key.</li>
+  </ol>
+  <div class="pg spb" data-spb>
+    <div class="pg-row">
+      <label>How the job saves progress and writes output <select class="pg-in" data-mode>
+        <option value="none">No checkpoints (state in memory only)</option>
+        <option value="plain" selected>Checkpoints, plain sink</option>
+        <option value="txn">Checkpoints, transactional sink (exactly once)</option>
+        <option value="idem">Checkpoints, idempotent sink (upsert by key)</option>
+      </select></label>
+      <label>Crashes <input type="range" min="0" max="8" value="4" data-c /> <b data-cval></b></label>
+      <label>Checkpoint interval (events) <select class="pg-in" data-i>
+        <option value="25">25</option><option value="50" selected>50</option><option value="100">100</option><option value="250">250</option><option value="500">500</option>
+      </select></label>
+    </div>
+    <div class="pg-grid">
+      <div class="pg-box" data-b1><h3>Events missing from the final counts</h3><span class="pg-mono" data-o1></span><span class="pg-note" data-n1></span></div>
+      <div class="pg-box" data-b2><h3>Duplicate output rows</h3><span class="pg-mono" data-o2></span><span class="pg-note" data-n2></span></div>
+      <div class="pg-box" data-b3><h3>Events processed again</h3><span class="pg-mono" data-o3></span><span class="pg-note" data-n3></span></div>
+      <div class="pg-box" data-b4><h3>Average wait for a result</h3><span class="pg-mono" data-o4></span><span class="pg-note" data-n4></span></div>
+    </div>
+    <p class="pg-out" data-verdict aria-live="polite"></p>
+    <p class="pg-note">Model: 2,000 events arrive at 100 per second, and each event adds to a count and produces one output row. A checkpoint is taken every interval of events. Crashes happen at fixed pseudo-random offsets, and a crash returns the job to its last checkpoint. With no checkpoints the in-memory state is simply lost. The wait for a result is half an interval for the transactional sink, which commits only when a checkpoint completes, and zero for the others.</p>
+  </div>
+</PlaygroundShell>
+<script>
+  document.querySelectorAll<HTMLElement>('[data-spb]').forEach((root) => {
+    const q = <T extends HTMLElement>(s: string) => root.querySelector<T>(s)!;
+    const TOTAL = 2000; const RATE = 100;
+    let seed = 11; const rnd = () => ((seed = (seed * 1664525 + 1013904223) % 4294967296) / 4294967296);
+    // eight crash offsets, chosen once; the slider uses the first k of them in time order
+    const picked: number[] = []; while (picked.length < 8) { const c = 100 + Math.floor(rnd() * 1800); if (!picked.includes(c)) picked.push(c); }
+    function simulate(mode: string, k: number, every: number) {
+      const crashes = picked.slice(0, k).sort((a, b) => a - b);
+      let missing = 0; let dup = 0; let replayed = 0;
+      for (const c of crashes) {
+        if (mode === 'none') { missing = c; continue; } // all state counted so far is lost, and the job resumes at the newest offset
+        const back = c - Math.floor(c / every) * every; replayed += back;
+        if (mode === 'plain') dup += back; // those rows were already written once
+      }
+      const wait = mode === 'txn' ? every / 2 / RATE : 0;
+      return { missing, dup, replayed, wait, checkpoints: mode === 'none' ? 0 : Math.floor(TOTAL / every), crashes };
+    }
+    function draw() {
+      const mode = q<HTMLSelectElement>('[data-mode]').value; const k = Number(q<HTMLInputElement>('[data-c]').value); const every = Number(q<HTMLSelectElement>('[data-i]').value);
+      q('[data-cval]').textContent = String(k);
+      const r = simulate(mode, k, every);
+      const f = (n: number) => n.toLocaleString('en-US');
+      q('[data-o1]').textContent = `${f(r.missing)} of ${f(TOTAL)}`; q('[data-n1]').textContent = mode === 'none' ? 'counts restart from zero after the last crash' : 'state comes back from the checkpoint';
+      q('[data-o2]').textContent = f(r.dup); q('[data-n2]').textContent = mode === 'plain' ? 'rows written before the crash are written again' : mode === 'idem' ? 'repeats overwrite the same key, so the store shows one row' : mode === 'txn' ? 'uncommitted output was aborted' : 'nothing is replayed';
+      q('[data-o3]').textContent = f(r.replayed); q('[data-n3]').textContent = mode === 'none' ? 'nothing to replay from' : `${r.checkpoints} checkpoints taken, ${k} crashes`;
+      q('[data-o4]').textContent = r.wait === 0 ? '0 s' : `${r.wait.toFixed(2)} s`; q('[data-n4]').textContent = mode === 'txn' ? 'results are held until the checkpoint commits' : 'results are visible at once';
+      const exact = r.missing === 0 && r.dup === 0;
+      q<HTMLElement>('[data-b1]').style.setProperty('--c', r.missing === 0 ? 'var(--good)' : 'var(--bad)');
+      q<HTMLElement>('[data-b2]').style.setProperty('--c', r.dup === 0 ? 'var(--good)' : 'var(--bad)');
+      q<HTMLElement>('[data-b3]').style.setProperty('--c', 'var(--accent)');
+      q<HTMLElement>('[data-b4]').style.setProperty('--c', r.wait > 1 ? 'var(--bad)' : 'var(--accent)');
+      const out = q('[data-verdict]'); out.classList.toggle('bad', !exact);
+      out.textContent = k === 0 ? 'No crash, so every option is exact. The differences only appear when something fails.'
+        : mode === 'none' ? `Wrong: after ${k} crashes ${f(r.missing)} events are missing, because the counts lived only in memory and the job restarted with an empty state.`
+        : mode === 'plain' ? (r.dup > 0 ? `State is right, but the sink got ${f(r.dup)} rows twice. The job replayed ${f(r.replayed)} events and wrote their output again. This is at-least-once output.` : 'No duplicates this time, because each crash happened exactly at a checkpoint. It is luck, not safety.')
+        : mode === 'txn' ? `Exact: nothing missing and no duplicates, though ${f(r.replayed)} events were processed again. Output from the unfinished checkpoint was aborted. The cost is a wait of ${r.wait.toFixed(2)} s, half the interval.`
+        : `Exact too: ${f(r.replayed)} events were processed again, but repeated rows overwrite the same key. It needs output with a natural key, and readers may briefly see a value replaced.`;
+    }
+    root.addEventListener('input', draw); root.addEventListener('change', draw);
+    draw();
+  });
+</script>

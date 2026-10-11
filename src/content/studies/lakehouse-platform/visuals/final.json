@@ -1,0 +1,60 @@
+{
+  "actors": [
+    { "id": "stream", "label": "Event stream", "role": "async", "x": 14, "y": 16 },
+    { "id": "w1", "label": "Writer A", "role": "compute", "x": 50, "y": 16 },
+    { "id": "w2", "label": "Writer B", "role": "compute", "x": 86, "y": 16 },
+    { "id": "catalog", "label": "Catalog", "role": "edge", "x": 50, "y": 50 },
+    { "id": "store", "label": "Object storage", "role": "data", "x": 86, "y": 50 },
+    { "id": "reader", "label": "Query engine", "role": "client", "x": 14, "y": 84 },
+    { "id": "maint", "label": "Compaction and vacuum", "role": "compute", "x": 86, "y": 84 }
+  ],
+  "frames": [
+    {
+      "narration": "Writer A reads a ten-second micro-batch of 40,000 events from the stream, about 4 MB of compressed columns. It writes them as one new data file under a fresh name. Nobody can see this file yet, because no snapshot lists it.",
+      "messages": [{ "from": "stream", "to": "w1", "label": "40,000 events, offset 9,100" }, { "from": "w1", "to": "store", "label": "write file f812 (4 MB)" }],
+      "states": { "w1": "started from v41" }
+    },
+    {
+      "narration": "Writer B, working on another job, also started from snapshot v41 and has written its own file f813. Both writers now try to commit. Writer A is first: it asks the catalog to move the pointer from v41 to v42, and only if the pointer is still v41.",
+      "messages": [{ "from": "w2", "to": "store", "label": "write file f813" }, { "from": "w1", "to": "catalog", "label": "swap v41 to v42" }],
+      "states": { "w2": "started from v41" }
+    },
+    {
+      "narration": "The swap succeeds. Snapshot v42 lists the old files plus f812, and stores the stream offset 9,100 in the same commit. From this instant every new query sees f812, and none saw it a moment ago.",
+      "messages": [{ "from": "catalog", "to": "w1", "label": "ok, now v42" }],
+      "states": { "catalog": "current: v42" },
+      "highlight": ["catalog"]
+    },
+    {
+      "narration": "Writer B tries to swap v41 to its own next snapshot and is refused, because the pointer is v42. It reads v42, sees that the winner only added a file and removed none, so there is no conflict. It rebuilds its metadata on top of v42, without rewriting f813.",
+      "messages": [{ "from": "w2", "to": "catalog", "label": "swap v41 to v42?" }, { "from": "catalog", "to": "w2", "label": "refused, now v42" }, { "from": "w2", "to": "store", "label": "read v42, write new manifest" }],
+      "states": { "w2": "rebase onto v42" }
+    },
+    {
+      "narration": "Writer B tries again, from v42 to v43, and wins. Two jobs committed at the same moment and neither lost its rows. The cost to B was one extra round trip and a small metadata file.",
+      "messages": [{ "from": "w2", "to": "catalog", "label": "swap v42 to v43" }, { "from": "catalog", "to": "w2", "label": "ok, now v43" }],
+      "states": { "catalog": "current: v43", "w2": "committed" }
+    },
+    {
+      "narration": "A query engine starts a scan with a filter on one day. It asks the catalog for the current snapshot, v43, and reads its manifests. The minimum and maximum of each file show that only 3 of 1,200 files can hold that day, so it opens only those 3.",
+      "messages": [{ "from": "reader", "to": "catalog", "label": "current snapshot?" }, { "from": "catalog", "to": "reader", "label": "v43" }, { "from": "reader", "to": "store", "label": "read manifests, open 3 of 1,200 files" }],
+      "states": { "reader": "pinned to v43" }
+    },
+    {
+      "narration": "An analyst asks for the table as of v40. The engine reads the manifests of v40 instead of v43. The files are immutable, so the answer is exactly what the table held then, even though newer commits have happened.",
+      "messages": [{ "from": "reader", "to": "store", "label": "read v40 manifests and files" }],
+      "states": { "reader": "time travel to v40" }
+    },
+    {
+      "narration": "Later, compaction merges 60 small files of about 4 MB each into one file of about 240 MB and commits v44, which removes the 60 and adds the one. Readers on v43 keep using the small files.",
+      "messages": [{ "from": "maint", "to": "store", "label": "write merged file (240 MB)" }, { "from": "maint", "to": "catalog", "label": "swap v43 to v44" }],
+      "states": { "catalog": "current: v44" }
+    },
+    {
+      "narration": "After seven days, snapshots up to v40 are expired. Vacuum deletes the files that no remaining snapshot uses, and that are older than the safety margin, including the 60 small ones. Storage drops back to the size of the data.",
+      "messages": [{ "from": "maint", "to": "store", "label": "delete unreferenced files" }],
+      "states": { "store": "old files removed" },
+      "highlight": ["store"]
+    }
+  ]
+}

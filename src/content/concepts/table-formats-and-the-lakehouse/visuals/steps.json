@@ -1,0 +1,76 @@
+{
+  "actors": [
+    { "id": "wa", "label": "Writer A", "role": "writer", "x": 14, "y": 20 },
+    { "id": "wb", "label": "Writer B", "role": "writer", "x": 14, "y": 80 },
+    { "id": "cat", "label": "Catalog", "role": "catalog", "x": 50, "y": 20 },
+    { "id": "store", "label": "Object store", "role": "storage", "x": 50, "y": 80 },
+    { "id": "eng", "label": "Query engine", "role": "engine", "x": 86, "y": 50 }
+  ],
+  "linkLabel": "reads and writes",
+  "frames": [
+    {
+      "narration": "The orders table is at snapshot v7. The catalog holds one tiny fact: the table's current metadata file is v7. Writers A and B both read that pointer before starting their micro-batches.",
+      "messages": [
+        { "from": "cat", "to": "wa", "label": "head = v7" },
+        { "from": "cat", "to": "wb", "label": "head = v7" }
+      ],
+      "states": { "cat": "head: v7", "store": "v7: 3 files" },
+      "highlight": ["cat"]
+    },
+    {
+      "narration": "Each writer first uploads its own new Parquet file. Nobody can see these files yet, because no snapshot lists them. A crash here leaves only an orphan file, never a half-written table.",
+      "messages": [
+        { "from": "wa", "to": "store", "label": "put a.parquet" },
+        { "from": "wb", "to": "store", "label": "put b.parquet" }
+      ],
+      "states": { "wa": "base v7", "wb": "base v7", "store": "5 files, 3 visible" },
+      "highlight": ["store"]
+    },
+    {
+      "narration": "Writer A writes a manifest and a new metadata file for snapshot v8 (v7's 3 files plus a.parquet), then asks the catalog to swap the pointer from v7 to v8 only if it is still v7. It is, so A wins.",
+      "messages": [
+        { "from": "wa", "to": "cat", "label": "swap v7 to v8" },
+        { "from": "cat", "to": "wa", "label": "ok" }
+      ],
+      "states": { "cat": "head: v8", "wa": "committed v8" },
+      "highlight": ["cat"]
+    },
+    {
+      "narration": "Writer B tries the same swap, v7 to v8. The head is no longer v7, so the catalog refuses. Nothing was overwritten: B just lost an optimistic race.",
+      "messages": [
+        { "from": "wb", "to": "cat", "label": "swap v7 to v8" },
+        { "from": "cat", "to": "wb", "label": "rejected" }
+      ],
+      "states": { "wb": "conflict", "cat": "head: v8" },
+      "highlight": ["wb"]
+    },
+    {
+      "narration": "B re-reads v8 and checks whether A's change conflicts with its own. Two appends do not touch the same files, so B rebuilds its metadata on top of v8 (4 files plus b.parquet) and swaps v8 to v9. The data file is reused, only metadata is rewritten.",
+      "messages": [
+        { "from": "wb", "to": "cat", "label": "swap v8 to v9" },
+        { "from": "cat", "to": "wb", "label": "ok" }
+      ],
+      "states": { "cat": "head: v9", "wb": "committed v9 (2nd try)", "store": "v9: 5 files" },
+      "highlight": ["cat"]
+    },
+    {
+      "narration": "The query engine reads the head (v9), opens its manifests and prunes files using the min/max stats stored there, for example order_date = today. It reads only 2 of the 5 files and never lists the bucket. Rerunning the query on v7 would still return the old answer.",
+      "messages": [
+        { "from": "eng", "to": "cat", "label": "head?" },
+        { "from": "cat", "to": "eng", "label": "v9" },
+        { "from": "store", "to": "eng", "label": "2 of 5 files" }
+      ],
+      "states": { "eng": "snapshot v9", "store": "skipped 3 files" },
+      "highlight": ["eng"]
+    },
+    {
+      "narration": "Hours later a compaction job merges hundreds of small files into a few large ones and commits v10 with the same swap. Old files stay in the store because v9 and older still point to them. Only expiring snapshots lets them be deleted.",
+      "messages": [
+        { "from": "store", "to": "wa", "label": "read small files" },
+        { "from": "wa", "to": "cat", "label": "swap v9 to v10" }
+      ],
+      "states": { "wa": "compaction", "cat": "head: v10", "store": "old files kept" },
+      "highlight": ["store"]
+    }
+  ]
+}

@@ -1,0 +1,171 @@
+{
+  "name": "Design a Lakehouse Platform",
+  "difficulty": "advanced",
+  "intent": "Turn files on cheap object storage into tables that many engines and writers can read and change safely, with snapshots, time travel and background compaction.",
+  "codeTitle": "a table of immutable files with snapshot commits",
+  "finalIntro": "Two writers commit to one table, a reader scans it, and maintenance cleans up.",
+  "prompt": "Design the storage layer of a lakehouse. Events and batch jobs land in one very large table on object storage. Analysts and jobs run queries on it while writers append, update and delete. Several writers commit at the same time, readers must see consistent data, people want to query the table as it was yesterday, and the storage bill must stay under control.",
+  "functional": [
+    "Append, update and delete rows in a table made of files",
+    "Let readers scan a consistent version while writes continue",
+    "Let several writers commit to the same table at once",
+    "Query the table as of an earlier time or version",
+    "Merge small files into big ones in the background",
+    "Delete data files that no kept version needs, and add or rename columns without rewriting data"
+  ],
+  "nonFunctional": [
+    "A commit is atomic: readers see all of it or none of it",
+    "Nothing is lost when two writers commit at the same moment",
+    "Handle hundreds of thousands of rows per second of ingest into one table",
+    "Planning a query reads metadata for the files it needs, not for the whole table",
+    "Storage cost stays close to the size of the data, and old versions are kept only for a set time",
+    "Work on plain object storage, with no server that holds the data"
+  ],
+  "firstAttempt": {
+    "text": "Write Parquet files into a folder on object storage. A query lists the folder and reads every file in it. An update rewrites the files it touches under the same names, and a delete removes them.",
+    "limits": [
+      "A writer that fails halfway leaves some new files in the folder, so a reader sees half of a job's output",
+      "Rewriting a file in place while a reader has it open gives the reader a broken or mixed result",
+      "Two writers can overwrite each other's files without noticing, and one job's output silently disappears",
+      "Listing millions of objects is slow and does not give one consistent view of the folder",
+      "There is no way to see the table as it was yesterday, and no way to undo a bad job"
+    ]
+  },
+  "nodes": [
+    { "id": "engines", "label": "Query engines", "kind": "client", "x": 12, "y": 37 },
+    { "id": "folder", "label": "Folder of files", "kind": "data", "x": 62, "y": 37, "at": 0, "until": 1 },
+    { "id": "meta", "label": "Metadata files", "kind": "data", "x": 62, "y": 37, "at": 1 },
+    { "id": "files", "label": "Data files", "kind": "data", "x": 87, "y": 37, "at": 1 },
+    { "id": "catalog", "label": "Catalog", "kind": "edge", "x": 37, "y": 37, "at": 2 },
+    { "id": "writers", "label": "Writer jobs", "kind": "compute", "x": 12, "y": 63, "at": 3 },
+    { "id": "compactor", "label": "Compaction", "kind": "compute", "x": 62, "y": 63, "at": 4 },
+    { "id": "vacuum", "label": "Vacuum", "kind": "compute", "x": 87, "y": 63, "at": 5 },
+    { "id": "stream", "label": "Event stream", "kind": "async", "x": 12, "y": 88, "at": 6 }
+  ],
+  "edges": [
+    { "from": "engines", "to": "folder", "at": 0, "until": 1 },
+    { "from": "engines", "to": "meta", "at": 1, "until": 2 },
+    { "from": "meta", "to": "files", "at": 1 },
+    { "from": "engines", "to": "catalog", "at": 2 },
+    { "from": "catalog", "to": "meta", "at": 2 },
+    { "from": "writers", "to": "catalog", "at": 3 },
+    { "from": "compactor", "to": "catalog", "at": 4 },
+    { "from": "compactor", "to": "files", "at": 4 },
+    { "from": "vacuum", "to": "meta", "at": 5 },
+    { "from": "vacuum", "to": "files", "at": 5 },
+    { "from": "stream", "to": "writers", "at": 6 }
+  ],
+  "steps": [
+    {
+      "title": "Never change a file: add new ones and describe the table in metadata",
+      "problem": "Files that are rewritten in place cannot give readers a stable view, and listing a folder is both slow and not a reliable statement of what is in the table.",
+      "fix": "Treat every data file as immutable. A write creates new columnar files, and the table is defined by metadata files that list exactly which data files belong to it, with the row count and the minimum and maximum of each column for every file. An update or delete writes new files for the rows it changes and records that the old file has been replaced. A reader opens the metadata, takes the list of files and reads only those, so it never lists the folder and never sees a file that is still being written.",
+      "tradeoff": "Readers get a fixed, exact list of files, and old files stay valid for anyone still reading them. Changing one row means writing a whole new file, and the old files stay around until something deletes them.",
+      "concepts": [{ "slug": "table-formats-and-the-lakehouse" }, { "slug": "columnar-formats-and-partitioning" }, { "slug": "lsm-trees-vs-b-trees" }, { "slug": "schema-evolution-and-compatibility" }]
+    },
+    {
+      "title": "Make a commit one atomic swap of a pointer",
+      "problem": "A job writes many data files and several metadata files. If a reader can see some of them, the table is half updated, and a crash leaves a mess.",
+      "fix": "Each commit produces a new snapshot: a manifest list that points to the manifests, which point to the data files. All of it is written first under new names, where nobody looks. The commit itself is a single atomic operation in a catalog: change the pointer 'current snapshot' from the old snapshot to the new one, and only if it still points to the old one. Until that swap, the files are invisible garbage. After it, every reader sees the whole new snapshot. A reader fixes the snapshot at the start of a query and keeps reading it, whatever commits happen meanwhile.",
+      "tradeoff": "A commit is atomic and a crash before the swap changes nothing. The catalog is a small service that must be highly available and must offer a compare-and-swap, and every commit pays for one round trip to it.",
+      "concepts": [{ "slug": "write-ahead-log" }, { "slug": "mvcc-and-isolation-levels" }, { "slug": "consistency-models" }, { "slug": "database-replication" }]
+    },
+    {
+      "title": "Let writers race, and have losers rebase their metadata",
+      "problem": "Two jobs start from the same snapshot and both try to commit. The second pointer swap would overwrite the first job's work if nothing checked it.",
+      "fix": "Commits are optimistic. Each writer remembers the snapshot it started from and passes it to the compare-and-swap. The loser is told that the table has moved. It reads the new snapshot and checks whether the change that won touched anything it depends on: a pure append never does, so it only rebuilds its metadata on top of the new snapshot and tries the swap again, without rewriting any data file. If the winner removed or changed a file that the loser also removes, that is a real conflict, and the loser aborts or replans from the new snapshot.",
+      "tradeoff": "No locks are held while data is written, and appends from many jobs almost never conflict. A busy table turns into a queue at the catalog, and a writer that keeps losing retries many times, so the commit rate of one table is limited to a few per second.",
+      "concepts": [{ "slug": "optimistic-concurrency-and-etags" }, { "slug": "idempotency" }, { "slug": "retries-and-backoff" }, { "slug": "leases-and-fencing-tokens" }]
+    },
+    {
+      "title": "Compact small files in the background",
+      "problem": "Frequent small commits produce thousands of tiny files. Planning slows down, every query opens too many objects, and the metadata grows quickly.",
+      "fix": "A maintenance job reads a group of small files, writes their rows as a few files of the target size, such as 256 MB, and commits a snapshot that removes the small files and adds the big one. This is just another commit: it starts from a snapshot, can be rebased over appends that landed meanwhile, and is a conflict only if a writer changed one of the files it merged, in which case it replans. Readers on an older snapshot keep using the small files, which are not deleted.",
+      "tradeoff": "Queries open far fewer files and metadata stays small. Compaction rewrites data, so it costs reads, writes and compute, and for a while the table holds both the small files and the merged copy.",
+      "concepts": [{ "slug": "table-formats-and-the-lakehouse" }, { "slug": "lsm-trees-vs-b-trees" }, { "slug": "columnar-formats-and-partitioning" }, { "slug": "autoscaling" }]
+    },
+    {
+      "title": "Keep snapshots for time travel, then vacuum",
+      "problem": "People want to query yesterday's table or undo a bad job, but keeping every old file forever makes storage cost many times the real data size.",
+      "fix": "Every snapshot is kept in the table history, so a query can say 'as of version 120' or 'as of this timestamp' and gets exactly that file list. Retention is a policy: for example snapshots older than seven days are expired. A vacuum job then deletes the data files that no remaining snapshot refers to, and only files older than a safety margin, so a long-running reader or a writer that has uploaded files but not yet committed does not lose them.",
+      "tradeoff": "Time travel, audits and quick rollback of a bad write come almost free. The retention window sets the storage cost, and a query older than it fails, as would a vacuum run with a window shorter than the longest query.",
+      "concepts": [{ "slug": "backups-and-point-in-time-recovery" }, { "slug": "mvcc-and-isolation-levels" }, { "slug": "schema-evolution-and-compatibility" }, { "slug": "slos-and-error-budgets" }]
+    },
+    {
+      "title": "Stream into micro-batches and skip files that cannot match",
+      "problem": "Rows arrive one at a time, but a commit per row would make thousands of tiny files and overwhelm the catalog. Queries on a huge table must not read it all.",
+      "fix": "A streaming job buffers events from the event stream and writes one file per writer for each micro-batch of, say, ten seconds, then commits them in one snapshot. The offsets it has read are stored in the same commit, so a restart continues exactly where the table ends and no batch is added twice. For queries, the engine compares the filter with the per-file minimum and maximum and with the partition values in the manifests, and opens only the files that could contain matching rows.",
+      "tradeoff": "Ingest stays cheap and exact, and most queries read a small slice of the table. A longer micro-batch means fewer commits and bigger files, while a shorter one gives fresher data and more small files. Pruning only works if the data is laid out so that the filter columns have narrow ranges per file.",
+      "concepts": [{ "slug": "batch-vs-stream-processing" }, { "slug": "delivery-guarantees" }, { "slug": "message-queues" }, { "slug": "database-indexing" }]
+    }
+  ],
+  "failures": [
+    {
+      "scenario": "A writer crashes after uploading files but before the commit",
+      "impact": "Data files sit in storage that no snapshot refers to, and the job's output is not in the table.",
+      "answer": "Nothing is visible, because the pointer never moved, so readers are unaffected. The job simply runs again, and with stored stream offsets it is safe to repeat. The orphan files are found and deleted by vacuum once they are older than the safety margin.",
+      "concepts": [{ "slug": "idempotency" }, { "slug": "write-ahead-log" }, { "slug": "delivery-guarantees" }]
+    },
+    {
+      "scenario": "A compaction and a delete try to change the same file",
+      "impact": "If both commits were accepted, the deleted rows could come back in the merged file.",
+      "answer": "Whichever commits second finds that the first removed a file it also wanted to remove, which is a real conflict. The compaction throws away its merged file, replans from the new snapshot, and tries again. Because it never overwrites anything, the deleted rows cannot return.",
+      "concepts": [{ "slug": "optimistic-concurrency-and-etags" }, { "slug": "mvcc-and-isolation-levels" }, { "slug": "retries-and-backoff" }]
+    },
+    {
+      "scenario": "A vacuum removes a file that a long query still reads",
+      "impact": "The query fails halfway with a missing-file error, or a writer's pending files vanish.",
+      "answer": "Vacuum only deletes files that no kept snapshot uses and that are older than a safety margin, and the margin is set longer than the longest query or write. Queries that need data older than the retention window are told so up front and should use an archive.",
+      "concepts": [{ "slug": "backups-and-point-in-time-recovery" }, { "slug": "timeouts-and-deadlines" }, { "slug": "slos-and-error-budgets" }]
+    },
+    {
+      "scenario": "The catalog is unavailable",
+      "impact": "Nobody can learn the current snapshot or commit, though the files in storage are fine.",
+      "answer": "The catalog is a small, replicated store with a conditional update, so it is run as a highly available service. Readers with a cached recent snapshot id can keep reading it, writers retry their commit with backoff, and uncommitted files wait harmlessly in storage.",
+      "concepts": [{ "slug": "health-checks" }, { "slug": "retries-and-backoff" }, { "slug": "multi-region-failover" }, { "slug": "caching" }]
+    }
+  ],
+  "alternatives": [
+    {
+      "title": "How files are organised",
+      "options": [
+        { "name": "A folder of files", "pro": "Nothing to build, and any tool can read it", "con": "No atomic commits, no consistent listing and no history" },
+        { "name": "A table format with a metadata tree", "pro": "Atomic snapshots, pruning from statistics and time travel on plain object storage", "con": "Engines must support the format, and metadata needs maintenance" },
+        { "name": "A warehouse that owns the storage", "pro": "Tuned, managed performance and simple operations", "con": "Data is locked in, and compute and storage are priced and scaled together" }
+      ],
+      "pick": "A table format on object storage, with a warehouse engine in front when needed."
+    },
+    {
+      "title": "How concurrent writers are handled",
+      "options": [
+        { "name": "Table-level lock", "pro": "Simple, and no conflicts to explain", "con": "One writer at a time, and a crashed writer holds the lock" },
+        { "name": "Optimistic commit with a conditional update", "pro": "Appends run in parallel and losers retry cheaply", "con": "Heavy contention causes retries, and the catalog must support compare-and-swap" },
+        { "name": "A single committer service", "pro": "Orders all commits without any retry", "con": "Another service to run and scale, and a bottleneck for one table" }
+      ],
+      "pick": "Optimistic commits, with a single committer only for tables that are extremely hot."
+    },
+    {
+      "title": "How updates and deletes are stored",
+      "options": [
+        { "name": "Copy on write", "pro": "Reads stay fast, since files always hold the final rows", "con": "A small update rewrites a whole file" },
+        { "name": "Merge on read with delete files", "pro": "Writes are cheap, because they record only what changed", "con": "Readers must merge, and compaction has to apply the deletes later" }
+      ],
+      "pick": "Copy on write for tables that are read much more than written, merge on read for frequent small changes."
+    },
+    {
+      "title": "How long to keep history",
+      "options": [
+        { "name": "A few days", "pro": "Low storage cost, and enough to undo a bad job", "con": "No audit further back" },
+        { "name": "Months", "pro": "Reproduce an old report exactly", "con": "Storage grows with every rewrite, and metadata grows too" }
+      ],
+      "pick": "Days of snapshots on the table, with a separate archive for audit needs."
+    }
+  ],
+  "roles": [
+    { "id": "client", "label": "Query engines", "description": "Engines that scan and change the table." },
+    { "id": "edge", "label": "Catalog", "description": "The small service that holds the pointer to the current snapshot." },
+    { "id": "async", "label": "Event stream", "description": "Events waiting to be turned into files." },
+    { "id": "compute", "label": "Jobs", "description": "Writers, compaction and vacuum." },
+    { "id": "data", "label": "Object storage", "description": "Immutable data files and the metadata that describes them." }
+  ]
+}

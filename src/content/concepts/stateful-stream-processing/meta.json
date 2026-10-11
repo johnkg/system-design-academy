@@ -1,0 +1,93 @@
+{
+  "name": "Stateful Stream Processing",
+  "area": "dataengineering",
+  "difficulty": "advanced",
+  "intent": "Let a stream processor remember things across events (counts, windows, join sides) and survive crashes by snapshotting state and input position together.",
+  "scenario": "A job keeps a running count of orders per customer across 3 parallel operator instances. At input offset 300 a checkpoint completes; at offset 330 one worker crashes. The job must come back with every customer's count exactly right, and the downstream system must not see 30 orders announced twice.",
+  "problem": "A counter, a window or a join buffer lives in the memory of one operator instance. When that process dies, the memory is gone, and the broker only knows how far the consumer had read, not what the state looked like at that point. Restart from the latest offset and you lose counts; restart from an older offset with the old state and you count events twice; restart from zero and recovery takes as long as the whole history. The state, the input position and the output sent to the outside world have to be recovered as one consistent unit, without stopping the stream to take a picture of it.",
+  "howItWorks": [
+    {
+      "title": "Keyed state, one owner per key",
+      "text": "The stream is partitioned by a key (customer id). Each key is hashed to a key group (Flink defaults to a max parallelism of 128 groups; Kafka Streams uses the input partition), and each group is owned by exactly one operator instance. That instance keeps the state for its keys in a local store: a heap hash map for small state, or an embedded LSM store such as RocksDB for state larger than memory. Because no two instances ever touch the same key, updates need no locks or network round trips, and per-key order is preserved."
+    },
+    {
+      "title": "Barriers cut a consistent snapshot while data keeps flowing",
+      "text": "Every checkpoint interval (commonly 10 s to 5 min), a coordinator asks the sources to insert a numbered barrier into each partition. A source records its offset and forwards the barrier; the barrier flows with the data. When an operator has received the barrier on all its inputs (it holds back the faster inputs until the slower ones catch up, or snapshots in-flight records with unaligned checkpoints), it copies its state to durable storage, usually asynchronously and incrementally with RocksDB, then forwards the barrier. This is the Chandy-Lamport idea: the set of per-operator snapshots and source offsets forms a consistent cut without ever pausing the pipeline."
+    },
+    {
+      "title": "A checkpoint is the state plus the offsets, as one unit",
+      "text": "When the last operator and sink have acknowledged barrier n, the coordinator marks checkpoint n complete. It contains every operator's state and every source's offset as of the same logical instant: state reflects exactly the events before the offset, no more, no less. Kafka Streams reaches the same place differently: state stores are backed by a compacted changelog topic and the offsets are committed in the same Kafka transaction as the output."
+    },
+    {
+      "title": "Recovery: restore, rewind, replay",
+      "text": "On a failure the job restarts (the whole job, or the connected region), every operator loads its part of the last completed checkpoint, and every source seeks back to the saved offset. The events since the checkpoint are replayed through the restored state. The result is exactly-once state: each event affects the state once. Recovery time is roughly the restart cost plus the replay length, which is what the checkpoint interval buys you."
+    },
+    {
+      "title": "Output to the outside is a separate problem",
+      "text": "Replay re-emits the outputs of the replayed events. A plain sink therefore sees them twice (at-least-once). Two fixes: make writes idempotent (a keyed upsert of count=44 for customer ada can be applied any number of times), or use a two-phase-commit sink that writes into an open transaction and commits it only when the checkpoint completes (Flink's TwoPhaseCommitSinkFunction and the Kafka transactional producer). A crash aborts the open transaction, so the replay writes those records once. The price is output latency: results become visible only at checkpoint boundaries."
+    },
+    {
+      "title": "Rescale and clean up",
+      "text": "Because state is split into key groups, changing parallelism means reassigning whole groups to instances and loading the matching slices of a checkpoint or savepoint, not rehashing every key. State that only grows (one entry per customer ever seen, per session, per join side) needs a TTL or timers that clear it, or the checkpoint size and recovery time grow forever."
+    }
+  ],
+  "pros": [
+    "State is exactly right after a crash: no lost and no double-counted events inside the job",
+    "Snapshots are taken while the stream keeps flowing, with no stop-the-world pause",
+    "Local state gives per-event updates in microseconds without a remote database call",
+    "Recovery cost is bounded by the checkpoint interval, not by the history length",
+    "Incremental checkpoints (RocksDB) copy only the files that changed, so very large state stays practical",
+    "Key groups make rescaling a data move rather than a recomputation"
+  ],
+  "cons": [
+    "Exactly-once covers state only: external effects are at-least-once unless the sink is idempotent or transactional",
+    "Checkpoints cost CPU, network and storage; a barrier stuck behind a slow input stalls the others (alignment) or inflates the snapshot (unaligned)",
+    "Large state means slow restores, because recovery must download it before processing resumes",
+    "Two-phase-commit sinks delay output until the checkpoint completes and hold open transactions (Kafka transaction timeouts must exceed the checkpoint interval)",
+    "A hot key puts all its load on one instance, and no amount of parallelism splits it",
+    "Debugging and evolving state is hard: changing the state schema or the operator graph can make old checkpoints unusable"
+  ],
+  "whenToUse": [
+    "Continuous aggregations, sessionization, deduplication and stream-to-stream joins where the answer depends on earlier events",
+    "Latency requirements of seconds or less that a periodic batch job cannot meet",
+    "State too large or too hot to fetch from a remote database for every event",
+    "Pipelines that must be correct after failures without a manual reconciliation step"
+  ],
+  "whenNotToUse": [
+    "Stateless transforms (filter, map, enrich from a small broadcast table), which need no checkpointing at all and just restart from the committed offset",
+    "Daily or hourly freshness is enough: a batch job with a re-runnable input is simpler to operate and reason about",
+    "The state is a few counters that one database upsert per event can hold, and the event rate is modest",
+    "A sink that cannot be made idempotent or transactional while duplicates are unacceptable: the guarantee stops at the job boundary no matter how good the engine is"
+  ],
+  "pitfalls": [
+    "Committing consumer offsets on their own schedule (auto-commit) while state is checkpointed separately: restoring state from one moment and offsets from another loses or double counts events",
+    "Assuming exactly-once means no duplicates downstream; a plain sink or an HTTP call from an operator is replayed along with the events",
+    "A checkpoint interval shorter than the checkpoint duration, so checkpoints queue up and the job spends its time snapshotting; leave a minimum pause between checkpoints",
+    "Unbounded keyed state (a counter per session id forever) with no TTL, so state and recovery time grow until the job cannot restart",
+    "Non-deterministic logic in operators (wall clock, random, iteration order, calling a mutable external service): replay then produces different results than the first run",
+    "Choosing too small a max parallelism (key group count) up front; it caps how far you can ever scale out without migrating state",
+    "Upgrading a job with a changed state schema or removed operator ids, so the old checkpoint cannot be mapped onto the new graph",
+    "Hot keys: one customer generating a third of the traffic pins a third of the work on one instance, and backpressure then stalls the whole pipeline"
+  ],
+  "related": [
+    { "kind": "concept", "slug": "delivery-guarantees" },
+    { "kind": "concept", "slug": "write-ahead-log" },
+    { "kind": "concept", "slug": "two-phase-commit" },
+    { "kind": "concept", "slug": "idempotency" },
+    { "kind": "concept", "slug": "ordering-and-partitioning" },
+    { "kind": "concept", "slug": "backpressure" },
+    { "kind": "concept", "slug": "consistent-hashing" },
+    { "kind": "concept", "slug": "lsm-trees-vs-b-trees" },
+    { "kind": "concept", "slug": "message-queues" },
+    { "kind": "concept", "slug": "event-sourcing" },
+    { "kind": "concept", "slug": "batch-vs-stream-processing" },
+    { "kind": "concept", "slug": "windowing-and-watermarks" }
+  ],
+  "roles": [
+    { "id": "source", "label": "Source", "description": "The partitioned input log (Kafka). Records its read offset in every checkpoint and rewinds to it on recovery." },
+    { "id": "operator", "label": "Keyed operator", "description": "One of several parallel instances. Owns the key groups assigned to it and keeps their counters in a local state store." },
+    { "id": "coordinator", "label": "Coordinator", "description": "Triggers checkpoints by injecting barriers, collects acknowledgements, and orchestrates restore after a failure." },
+    { "id": "store", "label": "Checkpoint store", "description": "Durable storage (object store or distributed file system) holding completed snapshots of operator state and offsets." },
+    { "id": "sink", "label": "Sink", "description": "The external system receiving results. Plain, idempotent or transactional, which decides whether replay shows up as duplicates." }
+  ]
+}

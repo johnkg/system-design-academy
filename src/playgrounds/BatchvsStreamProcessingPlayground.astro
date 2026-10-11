@@ -1,0 +1,161 @@
+---
+import PlaygroundShell from '../components/PlaygroundShell.astro';
+---
+<PlaygroundShell title="Simulate it" hint="800 order events over 80 minutes, counted per 10-minute window of event time. Some events arrive late. Choose when the result is produced and see freshness, completeness and cost trade off.">
+  <ol class="how">
+    <li>Default is <b>Stream</b> with a 30 s watermark wait and 10% late events (up to 5 min): each window is answered about <b>36 s</b> after it closes, but <b>13</b> of 613 events arrive too late and are missing.</li>
+    <li>Raise the <b>watermark wait</b> to 5 min: nothing is missing any more, but every answer now takes about <b>306 s</b>. Completeness is bought with latency.</li>
+    <li>Switch to <b>Batch</b> with a 60 minute interval: first answers are about <b>1500 s</b> late and 3 events are still missing, but a later run corrects them, so the final result is exact.</li>
+    <li>Try batch every <b>1 minute</b>: answers are fresh (a micro-batch) and exact within about 190 s, but it re-reads <b>20047</b> events to process 800. Set <b>late events</b> to 0 and streaming with no wait is both fast and complete.</li>
+  </ol>
+  <div class="pg bs" data-bs>
+    <div class="pg-row">
+      <label>Engine <select class="pg-in" data-mode><option value="stream" selected>Stream (watermark)</option><option value="batch">Batch (scheduled recompute)</option></select></label>
+      <label>Watermark wait <select class="pg-in" data-wait><option value="0">0 s</option><option value="30" selected>30 s</option><option value="120">2 min</option><option value="300">5 min</option><option value="600">10 min</option></select></label>
+      <label>Batch interval <select class="pg-in" data-interval><option value="1">1 min</option><option value="5">5 min</option><option value="15" selected>15 min</option><option value="60">60 min</option></select></label>
+    </div>
+    <div class="pg-row">
+      <label>Late events <input type="range" min="0" max="30" value="10" step="5" data-late /> <b data-lateval>10</b>%</label>
+      <label>Latest arrival <select class="pg-in" data-lmax><option value="60">1 min late</option><option value="300" selected>5 min late</option><option value="600">10 min late</option></select></label>
+      <button class="btn" type="button" data-reset>Reset</button>
+    </div>
+    <div class="pg-grid">
+      <div class="pg-box" style="--c: var(--role-1)"><h3>Answer delay</h3><span class="pg-mono" data-delay>0</span><span class="pg-note">average time after a window closes until its first answer</span></div>
+      <div class="pg-box" data-missbox style="--c: var(--role-2)"><h3>Missing from first answer</h3><span class="pg-mono" data-miss>0</span><span class="pg-note" data-missnote></span></div>
+      <div class="pg-box" style="--c: var(--role-3)"><h3>Events read</h3><span class="pg-mono" data-read>0</span><span class="pg-note">to process the 800 events</span></div>
+    </div>
+    <div class="bs-scroll" tabindex="0" role="region" aria-label="Per-window results">
+      <table class="bs-table">
+        <thead><tr><th scope="col">Window</th><th scope="col">True</th><th scope="col">First answer</th><th scope="col">Answered at</th><th scope="col">Exact at</th></tr></thead>
+        <tbody data-rows></tbody>
+      </table>
+    </div>
+    <p class="pg-out" data-verdict role="status"></p>
+    <p class="pg-note">Assumptions: event time is uniform over 80 minutes; on-time events arrive 0 to 3 s after they happen, late ones 20 s up to the chosen limit. The stream emits a window once the watermark (newest event time minus the wait) passes its end and drops events for windows already emitted. The batch recomputes the whole log on each run (simple and idempotent) and a window is exact at the first run that sees all its events. Only the first 6 windows are reported; the later two keep the stream clock moving. Fixed seed, so results are repeatable.</p>
+  </div>
+</PlaygroundShell>
+<script>
+  const WIN = 600; const NWIN = 8; const REPORT = 6; const SPAN = 4800; const N = 800; const SEED = 7;
+  interface Ev { i: number; t: number; a: number }
+  interface Row { w: number; truth: number; first: number; firstAt: number; correctAt: number }
+  interface Res { rows: Row[]; read: number; dropped: number }
+
+  function gen(n: number, latePct: number, lateMax: number, seed: number): Ev[] {
+    let s = seed >>> 0;
+    const next = () => { s = (Math.imul(s, 1664525) + 1013904223) >>> 0; return s >>> 8; };
+    const ev: Ev[] = [];
+    for (let i = 0; i < n; i++) {
+      const t = next() % SPAN; const r = next() % 100;
+      const d = r < latePct ? 20 + (next() % (lateMax - 19)) : next() % 4;
+      ev.push({ i, t, a: t + d });
+    }
+    return ev;
+  }
+  function trueCounts(ev: Ev[]): number[] {
+    const c = new Array<number>(REPORT).fill(0);
+    for (const e of ev) { const w = Math.floor(e.t / WIN); if (w < REPORT) c[w]++; }
+    return c;
+  }
+  function stream(ev: Ev[], wait: number): Res {
+    const order = [...ev].sort((x, y) => x.a - y.a || x.t - y.t || x.i - y.i);
+    const cnt = new Array<number>(NWIN).fill(0); const em = new Array<boolean>(NWIN).fill(false);
+    const at = new Array<number>(NWIN).fill(0); const ec = new Array<number>(NWIN).fill(0);
+    let dropped = 0; let maxET = -1; let last = 0;
+    for (const e of order) {
+      const w = Math.floor(e.t / WIN); last = e.a;
+      if (em[w]) { if (w < REPORT) dropped++; } else cnt[w]++;
+      if (e.t > maxET) maxET = e.t;
+      const wm = maxET - wait;
+      for (let x = 0; x < NWIN; x++) if (!em[x] && (x + 1) * WIN <= wm) { em[x] = true; at[x] = e.a; ec[x] = cnt[x]; }
+    }
+    for (let x = 0; x < NWIN; x++) if (!em[x]) { em[x] = true; at[x] = last; ec[x] = cnt[x]; }
+    const tc = trueCounts(ev); const rows: Row[] = [];
+    for (let w = 0; w < REPORT; w++) rows.push({ w, truth: tc[w], first: ec[w], firstAt: at[w], correctAt: ec[w] === tc[w] ? at[w] : -1 });
+    return { rows, read: ev.length, dropped };
+  }
+  function batch(ev: Ev[], minutes: number): Res {
+    const step = minutes * 60; const tc = trueCounts(ev);
+    const cntAt = (w: number, R: number) => { let c = 0; for (const e of ev) if (e.a <= R && Math.floor(e.t / WIN) === w) c++; return c; };
+    const rows: Row[] = []; let lastR = 0;
+    for (let w = 0; w < REPORT; w++) {
+      const end = (w + 1) * WIN; let R = Math.ceil(end / step) * step; const firstR = R; const first = cntAt(w, R);
+      while (cntAt(w, R) !== tc[w]) R += step;
+      rows.push({ w, truth: tc[w], first, firstAt: firstR, correctAt: R }); if (R > lastR) lastR = R;
+    }
+    let read = 0;
+    for (let R = step; R <= lastR; R += step) for (const e of ev) if (e.a <= R) read++;
+    return { rows, read, dropped: 0 };
+  }
+  function summarize(res: Res) {
+    const n = res.rows.length;
+    const avg = (f: (r: Row) => number) => Math.floor(res.rows.reduce((s, r) => s + f(r), 0) / n + 0.5);
+    const missing = res.rows.reduce((s, r) => s + r.truth - r.first, 0);
+    const total = res.rows.reduce((s, r) => s + r.truth, 0);
+    const never = res.rows.some((r) => r.correctAt < 0);
+    return { firstDelay: avg((r) => r.firstAt - (r.w + 1) * WIN), missing, total, read: res.read, correctDelay: never ? -1 : avg((r) => r.correctAt - (r.w + 1) * WIN) };
+  }
+  function mmss(sec: number): string { const m = Math.floor(sec / 60); const s = sec % 60; return `${m}:${s < 10 ? '0' : ''}${s}`; }
+
+  document.querySelectorAll<HTMLElement>('[data-bs]').forEach((root) => {
+    const q = <T extends HTMLElement>(s: string) => root.querySelector<T>(s)!;
+    const val = (s: string) => Number(q<HTMLInputElement>(s).value);
+    const tbody = q('[data-rows]');
+    const cells: HTMLElement[][] = [];
+    for (let w = 0; w < REPORT; w++) {
+      const tr = document.createElement('tr'); const row: HTMLElement[] = [];
+      for (let c = 0; c < 5; c++) { const td = document.createElement(c === 0 ? 'th' : 'td'); if (c === 0) td.setAttribute('scope', 'row'); tr.appendChild(td); row.push(td); }
+      row[0].textContent = `${mmss(w * WIN)} to ${mmss((w + 1) * WIN)}`;
+      tbody.appendChild(tr); cells.push(row);
+    }
+    let raf = 0;
+    function draw() {
+      raf = 0;
+      const mode = q<HTMLSelectElement>('[data-mode]').value;
+      const isStream = mode === 'stream';
+      q<HTMLSelectElement>('[data-wait]').disabled = !isStream;
+      q<HTMLSelectElement>('[data-interval]').disabled = isStream;
+      q('[data-lateval]').textContent = String(val('[data-late]'));
+      const ev = gen(N, val('[data-late]'), val('[data-lmax]'), SEED);
+      const res = isStream ? stream(ev, val('[data-wait]')) : batch(ev, val('[data-interval]'));
+      const sm = summarize(res);
+      res.rows.forEach((r, w) => {
+        cells[w][1].textContent = String(r.truth);
+        cells[w][2].textContent = String(r.first);
+        cells[w][2].className = r.first === r.truth ? '' : 'bs-bad';
+        cells[w][3].textContent = `${mmss(r.firstAt)} (+${r.firstAt - (w + 1) * WIN} s)`;
+        cells[w][4].textContent = r.correctAt < 0 ? 'never (dropped)' : mmss(r.correctAt);
+        cells[w][4].className = r.correctAt < 0 ? 'bs-bad' : '';
+      });
+      q('[data-delay]').textContent = `${sm.firstDelay} s`;
+      q('[data-miss]').textContent = `${sm.missing} of ${sm.total}`;
+      q<HTMLElement>('[data-missbox]').style.setProperty('--c', sm.missing === 0 ? 'var(--role-2)' : 'var(--bad)');
+      q('[data-missnote]').textContent = isStream ? (sm.missing === 0 ? 'every event made it' : 'arrived after the window was emitted and were dropped') : (sm.missing === 0 ? 'every event made it' : 'a later run fixes these');
+      q('[data-read]').textContent = String(sm.read);
+      let v: string;
+      if (isStream) {
+        v = sm.missing === 0
+          ? `Streaming answers each window about ${sm.firstDelay} s after it closes and counts every event.`
+          : `Streaming answers each window about ${sm.firstDelay} s after it closes, but ${sm.missing} of ${sm.total} events (${(100 * sm.missing / sm.total).toFixed(1)}%) arrived after their window was emitted and are lost from the result.`;
+      } else {
+        v = `Batch gives first answers about ${sm.firstDelay} s after a window closes${sm.missing ? `, missing ${sm.missing} late events` : ''}, and the result is exact after about ${sm.correctDelay} s on average because a later run re-reads the log. It read ${sm.read} events to process ${N}.`;
+      }
+      q('[data-verdict]').textContent = v;
+    }
+    const schedule = () => { if (!raf) raf = requestAnimationFrame(draw); };
+    function reset() {
+      q<HTMLSelectElement>('[data-mode]').value = 'stream'; q<HTMLSelectElement>('[data-wait]').value = '30';
+      q<HTMLSelectElement>('[data-interval]').value = '15'; q<HTMLInputElement>('[data-late]').value = '10';
+      q<HTMLSelectElement>('[data-lmax]').value = '300'; draw();
+    }
+    ['[data-mode]', '[data-wait]', '[data-interval]', '[data-late]', '[data-lmax]'].forEach((s) => { q(s).addEventListener('input', schedule); q(s).addEventListener('change', schedule); });
+    q('[data-reset]').addEventListener('click', reset);
+    draw();
+  });
+</script>
+<style is:global>
+  .playground .bs-scroll { overflow-x: auto; margin: 12px 0; }
+  .playground .bs-table { border-collapse: collapse; width: 100%; font-size: .9rem; font-variant-numeric: tabular-nums; }
+  .playground .bs-table th, .playground .bs-table td { padding: 6px 10px; border-bottom: 1px solid var(--border); text-align: left; white-space: nowrap; }
+  .playground .bs-table thead th { color: var(--muted); font-weight: 600; }
+  .playground .bs-bad { color: var(--bad-text, var(--text)); font-weight: 600; }
+</style>

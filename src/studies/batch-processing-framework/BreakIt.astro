@@ -1,0 +1,88 @@
+---
+import PlaygroundShell from '../../components/PlaygroundShell.astro';
+---
+<PlaygroundShell title="Slow machines and dead machines" hint="A map phase of 200 tasks runs on 20 workers, and 6 tasks land on a bad machine and run about 4 to 5 times slower. Choose how to deal with the slow ones and how to recover from machines that die near the end.">
+  <ol class="how">
+    <li>With <b>no backups</b> and <b>0 failures</b> the phase takes <b>172</b>, while healthy work would be about <b>118</b> per worker: the slow tasks, which take around 55, are scheduled late and decide the end.</li>
+    <li>Choose <b>backup after 1.5 times the median</b>: the phase drops to <b>144</b> for just 6 extra copies. <b>Duplicating every task</b> hides the slow ones too, but it doubles the work, and on the same 20 workers it takes <b>297</b>, worse than no backups.</li>
+    <li>Now kill <b>2 workers</b> at 90%. <b>Restarting the phase</b> takes <b>274</b>, <b>lineage</b> reruns only 20 lost tasks and takes <b>168</b>, and <b>replicating map outputs</b> reruns nothing but pays 25% on every run, <b>180</b>, even with no failures at all.</li>
+  </ol>
+  <div class="pg bpb" data-bpb>
+    <div class="pg-row">
+      <label>Slow tasks <select class="pg-in" data-bk>
+        <option value="none">no backups</option>
+        <option value="late" selected>backup after 1.5 times the median</option>
+        <option value="all">duplicate every task</option>
+      </select></label>
+      <label>Workers that die at 90% <input type="range" min="0" max="5" value="2" data-f /> <b data-fval></b></label>
+      <label>Recovery <select class="pg-in" data-rc>
+        <option value="restart">restart the whole phase</option>
+        <option value="lineage" selected>rerun only the lost tasks (lineage)</option>
+        <option value="replicate">replicate map outputs while running</option>
+      </select></label>
+    </div>
+    <div class="pg-grid">
+      <div class="pg-box" data-b1><h3>Phase time</h3><span class="pg-mono" data-o1></span><span class="pg-note" data-n1></span></div>
+      <div class="pg-box" data-b2><h3>Total work done</h3><span class="pg-mono" data-o2></span><span class="pg-note" data-n2></span></div>
+      <div class="pg-box" data-b3><h3>Tasks run again</h3><span class="pg-mono" data-o3></span><span class="pg-note" data-n3></span></div>
+    </div>
+    <p class="pg-out" data-verdict aria-live="polite"></p>
+    <p class="pg-note">Model: 20 workers with one slot each, 200 tasks of 10 to 14 time units, 6 slow tasks that take 4.5 times as long, and a median of 12. A backup starts when a task passes 18 and takes a normal 12. Dead workers lose their finished map outputs, about 10 tasks each, and recovery tasks are spread over the remaining workers. Replicating adds 25% to every task. The random numbers are seeded, so the page is repeatable.</p>
+  </div>
+</PlaygroundShell>
+<script>
+  document.querySelectorAll<HTMLElement>('[data-bpb]').forEach((root) => {
+    const q = <T extends HTMLElement>(s: string) => root.querySelector<T>(s)!;
+    const N = 200; const W = 20; const SLOW = 6; const MED = 12; const LIMIT = 18;
+    let seed = 11; const rnd = () => ((seed = (seed * 1664525 + 1013904223) % 4294967296) / 4294967296);
+    const base = Array.from({ length: N }, () => 10 + Math.floor(rnd() * 5));
+    const slowIds = new Set<number>(); while (slowIds.size < SLOW) slowIds.add(Math.floor(rnd() * N));
+    const dur = base.map((b, i) => (slowIds.has(i) ? Math.round(b * 4.5) : b));
+    // Greedy list scheduling of jobs (durations) on workers; returns the finish time of each job and the makespan.
+    function schedule(jobs: number[], workers: number) {
+      const free = new Array(workers).fill(0); const fin: number[] = [];
+      for (const d of jobs) { let k = 0; for (let i = 1; i < workers; i++) if (free[i] < free[k]) k = i; free[k] += d; fin.push(free[k]); }
+      return { fin, end: Math.max(...free) };
+    }
+    function sim(bk: string, f: number, rc: string) {
+      let work = 0; let phase = 0; let again = 0;
+      if (bk === 'none') { const s = schedule(dur, W); phase = s.end; work = dur.reduce((a, b) => a + b, 0); }
+      else if (bk === 'late') {
+        // a task past the limit gets a backup of normal length that starts at the limit; the first copy to finish wins
+        const eff = dur.map((d, i) => (d > LIMIT ? Math.min(d, LIMIT + base[i]) : d));
+        const extra = dur.filter((d) => d > LIMIT).length;
+        const s = schedule(eff, W); phase = s.end; again = extra;
+        work = eff.reduce((a, b) => a + b, 0) + dur.reduce((a, d, i) => a + (d > LIMIT ? base[i] : 0), 0);
+      } else {
+        // every task is run twice on different slots; a task is done when its first copy finishes
+        const second = dur.map((d, i) => (slowIds.has(i) && i % 2 === 0 ? d : base[i]));
+        const jobs: number[] = []; dur.forEach((d, i) => { jobs.push(d, second[i]); });
+        const s = schedule(jobs, W); phase = 0;
+        for (let i = 0; i < N; i++) phase = Math.max(phase, Math.min(s.fin[2 * i], s.fin[2 * i + 1]));
+        work = jobs.reduce((a, b) => a + b, 0); again = N;
+      }
+      if (rc === 'replicate') { phase *= 1.25; work *= 1.25; }
+      if (f > 0) {
+        const lost = f * (N / W);
+        if (rc === 'restart') { phase = phase * 0.9 + phase; work += work * 0.9; again += Math.round(N * 0.9); }
+        else if (rc === 'lineage') { const redo = Math.ceil(lost / (W - f)) * MED; phase += redo; work += lost * MED; again += lost; }
+      }
+      return { phase: Math.round(phase), work: Math.round(work), again };
+    }
+    function draw() {
+      const bk = q<HTMLSelectElement>('[data-bk]').value; const rc = q<HTMLSelectElement>('[data-rc]').value; const f = Number(q<HTMLInputElement>('[data-f]').value);
+      q('[data-fval]').textContent = String(f);
+      const r = sim(bk, f, rc); const ideal = sim('none', 0, 'lineage'); const healthy = Math.round(base.reduce((a, b) => a + b, 0) / W);
+      q('[data-o1]').textContent = `${r.phase}`; q('[data-n1]').textContent = `a healthy cluster would need about ${healthy}`;
+      q('[data-o2]').textContent = `${r.work}`; q('[data-n2]').textContent = `the 200 tasks alone: ${ideal.work} (no backups, no failures)`;
+      q('[data-o3]').textContent = `${r.again}`; q('[data-n3]').textContent = bk === 'late' ? 'backup copies plus any recomputed tasks' : bk === 'all' ? 'every task has a second copy' : 'recomputed tasks after failures';
+      q<HTMLElement>('[data-b1]').style.setProperty('--c', r.phase > ideal.phase * 1.5 ? 'var(--bad)' : 'var(--good)');
+      q<HTMLElement>('[data-b2]').style.setProperty('--c', r.work > ideal.work * 1.3 ? 'var(--bad)' : 'var(--accent)');
+      q<HTMLElement>('[data-b3]').style.setProperty('--c', 'var(--accent)');
+      const out = q('[data-verdict]'); const bad = r.phase > ideal.phase * 1.5; out.classList.toggle('bad', bad);
+      out.textContent = `Phase time ${r.phase} with ${r.work} units of work. ` + (bad ? 'A slow task or a restart is setting the time of the whole job.' : 'The slow tasks and the failures cost little.');
+    }
+    root.addEventListener('input', draw); root.addEventListener('change', draw);
+    draw();
+  });
+</script>

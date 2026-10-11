@@ -11,6 +11,7 @@ export const areas = [
   { id: 'distributed', label: 'Distributed systems', blurb: 'How many machines agree, stay in step and survive failures together' },
   { id: 'deployment', label: 'Cloud & deployment', blurb: 'How code reaches production safely, and how infrastructure grows, heals and survives a region failing' },
   { id: 'databases', label: 'Databases & storage', blurb: 'How a database stores, protects, queries and changes your data underneath the SQL' },
+  { id: 'dataengineering', label: 'Data engineering', blurb: 'How data is moved, transformed and kept trustworthy at scale, in batches and in streams' },
   { id: 'patterns', label: 'Design patterns', blurb: 'The 23 classic Gang of Four patterns for structuring code' },
 ] as const;
 

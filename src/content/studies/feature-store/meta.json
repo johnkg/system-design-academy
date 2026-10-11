@@ -1,0 +1,179 @@
+{
+  "name": "Design a Feature Store",
+  "difficulty": "advanced",
+  "intent": "Give machine-learning models the same feature values when they train and when they serve: one definition, a history for training with point-in-time correct joins, a fast store for predictions, known freshness and repeatable backfills.",
+  "codeTitle": "a feature store with an as-of join and a backfill",
+  "finalIntro": "One prediction being served, and one training set being built from the same definition.",
+  "prompt": "Design a feature store for a company with 50 million users and a few dozen models, such as fraud scoring and recommendations. Data scientists define features such as a user's spend over the last 7 days. Models need them in a few milliseconds when serving, and in a correct historical form when training.",
+  "functional": [
+    "Define a feature once, with its source, its logic and its owner",
+    "Serve the latest feature values for an entity in a few milliseconds",
+    "Build training sets that give each labelled example the values the model would have seen at that moment",
+    "Compute features from streams and from batch data",
+    "Backfill a new or corrected feature over past data",
+    "Show how fresh each feature is, and alert when it is late"
+  ],
+  "nonFunctional": [
+    "An online lookup of dozens of features takes under 10 ms at the 99th percentile",
+    "The online and offline values of a feature agree, with no training-serving skew",
+    "A training set never contains information from after its label time",
+    "Handle tens of thousands of events per second at the peak, and 50,000 or more lookups per second",
+    "Every training set and backfill can be reproduced exactly",
+    "Freshness of each feature is measured and has a target"
+  ],
+  "firstAttempt": {
+    "text": "Each team writes its own feature code twice: a SQL query in a notebook for training, and code in the model service for serving. Training joins each label to the latest row of a feature table, and the service computes its values from the application database when a request arrives.",
+    "limits": [
+      "The two implementations drift apart, so the model sees different numbers in production than it learned from",
+      "Joining to the latest row leaks the future into training, so offline scores look great and production results disappoint",
+      "Computing features at request time from the main database is slow and adds load to it",
+      "Nobody knows which features exist, so teams rebuild the same ones",
+      "Fixing a feature means recomputing history by hand, and the result cannot be reproduced"
+    ]
+  },
+  "nodes": [
+    { "id": "events", "label": "Event stream", "kind": "async", "x": 12, "y": 37, "at": 0 },
+    { "id": "notebook", "label": "Notebook SQL", "kind": "compute", "x": 37, "y": 12, "at": 0, "until": 1 },
+    { "id": "svc", "label": "Service code", "kind": "compute", "x": 37, "y": 63, "at": 0, "until": 1 },
+    { "id": "model", "label": "Model service", "kind": "client", "x": 12, "y": 63, "at": 0 },
+    { "id": "defs", "label": "Feature definitions", "kind": "compute", "x": 37, "y": 12, "at": 1 },
+    { "id": "pipeline", "label": "Feature pipeline", "kind": "compute", "x": 37, "y": 37, "at": 1 },
+    { "id": "offline", "label": "Offline history", "kind": "data", "x": 62, "y": 12, "at": 2 },
+    { "id": "join", "label": "As-of join", "kind": "compute", "x": 62, "y": 37, "at": 3 },
+    { "id": "trainer", "label": "Training job", "kind": "client", "x": 87, "y": 12, "at": 3 },
+    { "id": "serving", "label": "Serving API", "kind": "edge", "x": 37, "y": 63, "at": 4 },
+    { "id": "online", "label": "Online store", "kind": "data", "x": 62, "y": 63, "at": 4 },
+    { "id": "monitor", "label": "Freshness monitor", "kind": "compute", "x": 87, "y": 63, "at": 5 },
+    { "id": "backfill", "label": "Backfill job", "kind": "compute", "x": 12, "y": 12, "at": 6 }
+  ],
+  "edges": [
+    { "from": "events", "to": "notebook", "at": 0, "until": 1 },
+    { "from": "events", "to": "svc", "at": 0, "until": 1 },
+    { "from": "svc", "to": "model", "at": 0, "until": 1 },
+    { "from": "events", "to": "pipeline", "at": 1 },
+    { "from": "defs", "to": "pipeline", "at": 1 },
+    { "from": "pipeline", "to": "offline", "at": 2 },
+    { "from": "offline", "to": "join", "at": 3 },
+    { "from": "join", "to": "trainer", "at": 3 },
+    { "from": "pipeline", "to": "online", "at": 4 },
+    { "from": "model", "to": "serving", "at": 4 },
+    { "from": "serving", "to": "online", "at": 4 },
+    { "from": "online", "to": "monitor", "at": 5 },
+    { "from": "backfill", "to": "events", "at": 6 },
+    { "from": "backfill", "to": "pipeline", "at": 6 }
+  ],
+  "steps": [
+    {
+      "title": "Define each feature once, and compute it in one pipeline",
+      "problem": "When training code and serving code are written separately, they disagree about details such as time zones, null handling and window edges. The model then meets numbers in production that it never saw during training. This is called training-serving skew.",
+      "fix": "A feature is declared once in a registry: the entity it describes (a user), the source events, the logic (the sum of purchases in the last 7 days), the owner and the freshness target. One pipeline runs that definition and writes its results to both stores. The logic lives in one place, so there is nothing to drift, and the registry lets teams search for features and reuse them.",
+      "tradeoff": "Skew from duplicated code disappears, and features become shared assets. Everyone must express features in the one definition language, which cannot do everything, and a change to a popular definition now affects many models.",
+      "concepts": [{ "slug": "schema-evolution-and-compatibility" }, { "slug": "batch-vs-stream-processing" }, { "slug": "pipeline-orchestration" }]
+    },
+    {
+      "title": "Keep an offline history of every value, with its time",
+      "problem": "Training needs to know what a feature was at a past moment. A table that holds only the current value cannot answer that, and every update destroys the history.",
+      "fix": "The pipeline appends a row each time a value changes: entity key, feature values and the time at which the value became true. Nothing is updated in place. The rows sit in cheap columnar storage in a table format that supports partitions by date and snapshots, so a query can read a day or a version without scanning everything.",
+      "tradeoff": "Any past moment can be reconstructed, and the table is the basis for reproducible training sets. It grows with every change, so it needs partitioning, compaction and a retention rule, and it is too slow for per-request lookups.",
+      "concepts": [{ "slug": "columnar-formats-and-partitioning" }, { "slug": "table-formats-and-the-lakehouse" }, { "slug": "event-sourcing" }, { "slug": "slowly-changing-dimensions" }]
+    },
+    {
+      "title": "Join training labels with a point-in-time, as-of join",
+      "problem": "A training example is a label that happened at some time, such as 'this payment was fraud', and it must be paired with the feature values known before that time. Joining with the newest row hands the model information from the future, and its offline accuracy is then a lie.",
+      "fix": "The join takes, for each label, the latest feature row whose time is at or before the label time (and, if values arrive late, whose available time is at or before it). Inside the engine this is a sort-merge on entity and time, or a binary search per entity. A label that has no earlier row gets a default, never a later row.",
+      "tradeoff": "Training data now looks as the model will see it in production, so offline metrics can be trusted. The join is heavier than a plain key join, it needs correct timestamps on every row, and its result changes if the timestamps are wrong, which is hard to notice.",
+      "concepts": [{ "slug": "query-planning-and-joins" }, { "slug": "logical-clocks" }, { "slug": "windowing-and-watermarks" }, { "slug": "mapreduce-and-shuffles" }]
+    },
+    {
+      "title": "Serve the newest values from a fast online store",
+      "problem": "A model scoring a payment has perhaps 20 ms in total, and cannot run a warehouse query or compute 7-day sums from raw events.",
+      "fix": "The same pipeline also writes the newest value of each feature for each entity to a key-value store, so one batched read by entity key returns every feature the model needs in a millisecond or two. A write with an older time than the stored one is ignored, because events can arrive out of order, and a time-to-live removes entities that have gone quiet. The serving API reads the store, never the source databases.",
+      "tradeoff": "Lookups are fast, predictable and isolated from the application database. The store holds only the present, so it costs memory for every entity, and the offline and online copies must be kept equal by the shared pipeline and checked by a test.",
+      "concepts": [{ "slug": "caching" }, { "slug": "sql-vs-nosql" }, { "slug": "consistency-models" }, { "slug": "idempotency" }]
+    },
+    {
+      "title": "Measure freshness, and choose stream or batch for each feature",
+      "problem": "Some features are worth minutes of delay and some are not. A fraud model needs the last minute of activity, while a 90-day average can be a day old. If a pipeline stalls, models quietly keep using stale numbers.",
+      "fix": "Each feature has a freshness target, and the monitor compares the newest event time that has reached the online store with the clock. Features that need to be fresh are computed by a streaming job with windows and watermarks, and slow ones by a nightly batch job. A late feature raises an alert, and the model can fall back to a default or to a simpler model. Value distributions are compared between training and serving to catch skew early.",
+      "tradeoff": "The cost goes where freshness pays, and a stalled pipeline becomes visible. Streaming jobs are harder to run than batch jobs, and every freshness target is a promise someone must be paged for.",
+      "concepts": [{ "slug": "stateful-stream-processing" }, { "slug": "windowing-and-watermarks" }, { "slug": "alerting" }, { "slug": "slos-and-error-budgets" }, { "slug": "graceful-degradation" }]
+    },
+    {
+      "title": "Backfill and version features reproducibly",
+      "problem": "A new feature has no history, and a bug fix changes the history of an old one. Without the past, a data scientist cannot train on it for weeks, and a hand-made fix cannot be repeated or checked.",
+      "fix": "A backfill reruns the same definition over the raw events of the past, in time order, and writes the rows with their original times, in a new version of the table. The computation is a pure function of the events, so a second run gives identical output, and a write is a replace of whole partitions so it can be repeated safely. The new version is checked against the old one before models switch to it, and each training set records the versions it used.",
+      "tradeoff": "New and corrected features get a full history within hours, and any result can be reproduced. A long backfill uses a lot of compute and storage, it needs the raw events to be kept, and keeping many versions of tables costs money.",
+      "concepts": [{ "slug": "pipeline-orchestration" }, { "slug": "idempotency" }, { "slug": "backups-and-point-in-time-recovery" }, { "slug": "online-schema-migrations" }]
+    }
+  ],
+  "failures": [
+    {
+      "scenario": "The streaming job stalls for two hours",
+      "impact": "The online store keeps returning old values, and the fraud model scores with a stale picture of each user without any error.",
+      "answer": "The freshness monitor sees the newest event time falling behind and pages the owner. Meanwhile the serving API marks stale features and the model uses a default or a fallback model. When the job restarts it resumes from its saved offsets, and the older-write rule in the online store lets the replay land safely.",
+      "concepts": [{ "slug": "alerting" }, { "slug": "graceful-degradation" }, { "slug": "stateful-stream-processing" }]
+    },
+    {
+      "scenario": "Events arrive late or out of order",
+      "impact": "A purchase that happened at 10:00 reaches the pipeline at 10:12. The online store lacked it for twelve minutes, but a naive history shows it from 10:00 and the model trains on a value it never had.",
+      "answer": "Rows carry both the event time and the time they became available, and the as-of join uses the available time. The streaming job uses a watermark to decide how long to wait, and the online store ignores a write that is older than the value it already has.",
+      "concepts": [{ "slug": "windowing-and-watermarks" }, { "slug": "logical-clocks" }, { "slug": "ordering-and-partitioning" }]
+    },
+    {
+      "scenario": "A bug in a feature is found after six months",
+      "impact": "Every model trained on that feature has learned from wrong numbers.",
+      "answer": "The definition is fixed and a backfill writes a new table version over the past, from the raw events. The old version is kept, so models can be retrained and compared, and the training sets that used the bad version are listed from the recorded versions.",
+      "concepts": [{ "slug": "pipeline-orchestration" }, { "slug": "table-formats-and-the-lakehouse" }, { "slug": "idempotency" }]
+    },
+    {
+      "scenario": "The online store loses a node",
+      "impact": "Lookups for part of the user base fail, and models cannot score.",
+      "answer": "The store is replicated, so a replica takes over within seconds. If data is lost, it is refilled from the stream and from the latest offline snapshot, because both come from the same definition. Meanwhile the serving API times out quickly and returns defaults.",
+      "concepts": [{ "slug": "database-replication" }, { "slug": "timeouts-and-deadlines" }, { "slug": "health-checks" }]
+    }
+  ],
+  "alternatives": [
+    {
+      "title": "Where feature logic runs",
+      "options": [
+        { "name": "Separate code for training and serving", "pro": "Each side uses its natural tools", "con": "The two drift apart and cause skew" },
+        { "name": "One definition run by one pipeline", "pro": "Training and serving values come from the same code", "con": "A single language that has limits, and a shared dependency" },
+        { "name": "Compute on request from raw data", "pro": "Always fresh and no online store", "con": "Slow and heavy, and it loads the source systems" }
+      ],
+      "pick": "One definition run by one pipeline, with request-time computation only for values that exist only in the request."
+    },
+    {
+      "title": "Stream or batch",
+      "options": [
+        { "name": "Batch only", "pro": "Simple, cheap and easy to repeat", "con": "Features are hours or a day old" },
+        { "name": "Streaming only", "pro": "Seconds of freshness", "con": "Complex state, and history needs a separate replay" },
+        { "name": "Chosen per feature", "pro": "Pays for freshness only where it matters", "con": "Two ways of running to operate" }
+      ],
+      "pick": "Choose per feature from its freshness target, with batch as the default."
+    },
+    {
+      "title": "Online store technology",
+      "options": [
+        { "name": "A key-value store in memory", "pro": "Sub-millisecond reads", "con": "Costs the most per gigabyte" },
+        { "name": "A wide-column or document database on SSD", "pro": "Cheaper, and holds many more entities", "con": "A few milliseconds per read" }
+      ],
+      "pick": "A disk-backed store for most features, and memory for the few that need the lowest latency."
+    },
+    {
+      "title": "How to join for training",
+      "options": [
+        { "name": "Latest row per entity", "pro": "Trivial to write", "con": "Leaks the future, and offline metrics are inflated" },
+        { "name": "As-of the label's event time", "pro": "No future values", "con": "Includes late data that was not yet available when serving" },
+        { "name": "As-of the time the value was available", "pro": "Matches what serving saw", "con": "Requires the available time to be recorded for each row" }
+      ],
+      "pick": "As-of by available time wherever lateness matters, which is nearly always."
+    }
+  ],
+  "roles": [
+    { "id": "client", "label": "Model users", "description": "The model service and the training job." },
+    { "id": "edge", "label": "Serving API", "description": "The entry point for online lookups." },
+    { "id": "async", "label": "Event stream", "description": "Raw events from the product." },
+    { "id": "compute", "label": "Pipelines", "description": "Feature definitions, pipelines, joins and monitors." },
+    { "id": "data", "label": "State", "description": "The offline history and the online store." }
+  ]
+}

@@ -1,0 +1,81 @@
+{
+  "actors": [
+    { "id": "source", "label": "Order log", "role": "source", "x": 12, "y": 50 },
+    { "id": "coord", "label": "Coordinator", "role": "coordinator", "x": 12, "y": 15 },
+    { "id": "opA", "label": "Counter A", "role": "operator", "x": 48, "y": 18 },
+    { "id": "opB", "label": "Counter B", "role": "operator", "x": 48, "y": 50 },
+    { "id": "opC", "label": "Counter C", "role": "operator", "x": 48, "y": 82 },
+    { "id": "sink", "label": "Sink", "role": "sink", "x": 86, "y": 40 },
+    { "id": "store", "label": "Checkpoint store", "role": "store", "x": 86, "y": 85 }
+  ],
+  "frames": [
+    {
+      "narration": "Orders are keyed by customer. Every order for ada goes to the same instance (Counter A), which keeps count[ada] in a local state store. At offset 300 ada has 41 orders.",
+      "messages": [
+        { "from": "source", "to": "opA", "label": "ada" },
+        { "from": "source", "to": "opB", "label": "bo" },
+        { "from": "source", "to": "opC", "label": "cy" }
+      ],
+      "states": { "source": "offset 300", "opA": "ada=41", "opB": "bo=17", "opC": "cy=9" }
+    },
+    {
+      "narration": "Every 50 events the coordinator starts checkpoint 6. The source notes its offset (300) and inserts barrier 6 into the stream. Nothing is paused.",
+      "messages": [{ "from": "coord", "to": "source", "label": "start cp 6" }],
+      "states": { "source": "barrier 6 @300" },
+      "highlight": ["coord", "source"]
+    },
+    {
+      "narration": "The barrier flows with the data. When it reaches an operator, that operator has seen exactly the events before offset 300, so its state is a consistent cut.",
+      "messages": [
+        { "from": "source", "to": "opA", "label": "barrier 6" },
+        { "from": "source", "to": "opB", "label": "barrier 6" },
+        { "from": "source", "to": "opC", "label": "barrier 6" }
+      ],
+      "states": { "opA": "snapshot ada=41", "opB": "snapshot bo=17", "opC": "snapshot cy=9" },
+      "highlight": ["opA", "opB", "opC"]
+    },
+    {
+      "narration": "Each operator copies its state to durable storage (asynchronously, incrementally with RocksDB) and forwards the barrier. The sink closes its transaction for events up to 300 and waits.",
+      "messages": [
+        { "from": "opA", "to": "store", "label": "state A" },
+        { "from": "opB", "to": "store", "label": "state B" },
+        { "from": "opC", "to": "sink", "label": "barrier 6" }
+      ],
+      "states": { "store": "cp 6 partial", "sink": "pre-commit" }
+    },
+    {
+      "narration": "All acknowledgements are in: checkpoint 6 is complete, holding all state plus offset 300 as one unit. Only now does the transactional sink commit the outputs up to offset 300.",
+      "messages": [
+        { "from": "store", "to": "coord", "label": "cp 6 done" },
+        { "from": "coord", "to": "sink", "label": "commit" }
+      ],
+      "states": { "store": "cp 6 = state + 300", "sink": "committed <= 300" },
+      "highlight": ["store", "sink"]
+    },
+    {
+      "narration": "The stream keeps going. Offsets 301 to 330 raise ada to 44, and their outputs sit in an open transaction. Then Counter B crashes and its memory is gone.",
+      "messages": [{ "from": "source", "to": "opA", "label": "ada x3" }],
+      "states": { "source": "offset 330", "opA": "ada=44", "opB": "CRASHED", "sink": "open txn: 30" },
+      "highlight": ["opB"]
+    },
+    {
+      "narration": "Recovery: the job restarts, every operator reloads checkpoint 6 (ada back to 41), the source rewinds to offset 300, and the sink aborts its open transaction.",
+      "messages": [
+        { "from": "store", "to": "opA", "label": "restore" },
+        { "from": "store", "to": "opB", "label": "restore" },
+        { "from": "coord", "to": "source", "label": "rewind to 300" }
+      ],
+      "states": { "source": "offset 300", "opA": "ada=41", "opB": "bo=17", "sink": "abort txn" },
+      "highlight": ["store", "coord"]
+    },
+    {
+      "narration": "The 30 events since the checkpoint are replayed. ada reaches 44 again, exactly once in the state. A plain sink would now see those 30 outputs twice; the transactional sink writes them once and commits at checkpoint 7.",
+      "messages": [
+        { "from": "source", "to": "opA", "label": "replay 30" },
+        { "from": "opA", "to": "sink", "label": "ada=44" }
+      ],
+      "states": { "source": "offset 330", "opA": "ada=44", "sink": "30 in new txn" },
+      "highlight": ["sink"]
+    }
+  ]
+}

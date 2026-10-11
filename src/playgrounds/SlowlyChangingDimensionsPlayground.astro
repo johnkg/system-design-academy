@@ -1,0 +1,187 @@
+---
+import PlaygroundShell from '../components/PlaygroundShell.astro';
+---
+<PlaygroundShell title="Simulate it" hint="200 sales and 8 customers who move between regions over 360 days. Load the customer dimension three different ways and compare revenue per region with what was true on the day of each sale.">
+  <ol class="how">
+    <li>With <b>Type 1 (overwrite)</b> the dimension keeps 8 rows, but 65 of the 200 sales are attributed to a region the customer was not in when they bought, so the revenue per region drifts away from the true figures.</li>
+    <li>Choose <b>Type 2 (history)</b> and untick <b>Use the effective date</b>: the dimension grows to 15 rows and only 7 sales are wrong. They belong to customer 3, whose move was effective on day 150 but only arrived on day 250, so the new version starts at day 250. Pick <b>Customer 3</b> to see it.</li>
+    <li>Tick <b>Use the effective date</b>: the version now starts at day 150, the 7 sales that had already been loaded are re-keyed to it, and every number matches the true column.</li>
+    <li>Untick <b>Track tier changes</b> with Type 2: a customer moving from basic to gold no longer creates a version. The dimension shrinks to 14 rows and 2 incoming records are skipped as unchanged, because they differ in no tracked attribute.</li>
+  </ol>
+  <div class="pg scd" data-scd>
+    <div class="pg-row">
+      <label>Strategy
+        <select class="pg-in" data-type>
+          <option value="1">Type 1 (overwrite)</option>
+          <option value="2" selected>Type 2 (history)</option>
+        </select>
+      </label>
+      <label class="scd-check"><input type="checkbox" data-backdate /> Use the effective date for late changes</label>
+      <label class="scd-check"><input type="checkbox" data-tier checked /> Track tier changes</label>
+      <label>Customer to inspect
+        <select class="pg-in" data-cust>
+          <option value="0">Customer 0</option><option value="1">Customer 1</option><option value="2">Customer 2</option>
+          <option value="3" selected>Customer 3</option><option value="4">Customer 4</option><option value="5">Customer 5</option>
+          <option value="6">Customer 6</option><option value="7">Customer 7</option>
+        </select>
+      </label>
+    </div>
+    <div class="pg-grid">
+      <div class="pg-box" style="--c: var(--role-1)"><h3>Dimension rows</h3><span class="pg-mono" data-rows>0</span><span class="pg-note" data-rowsnote></span></div>
+      <div class="pg-box" data-wrongbox><h3>Sales on the wrong version</h3><span class="pg-mono" data-wrong>0</span><span class="pg-note">of 200 sales, compared with the region true on the sale date</span></div>
+      <div class="pg-box" style="--c: var(--role-3)"><h3>Loader work</h3><span class="pg-mono" data-work>0</span><span class="pg-note">records skipped as unchanged / sales re-keyed</span></div>
+    </div>
+    <h3 class="scd-h">Revenue by region</h3>
+    <div class="scd-scroll" tabindex="0" role="region" aria-label="Revenue by region: true, loaded and difference">
+      <table class="scd-table">
+        <thead><tr><th scope="col">Region</th><th scope="col">True</th><th scope="col">Loaded</th><th scope="col">Difference</th></tr></thead>
+        <tbody data-revenue></tbody>
+      </table>
+    </div>
+    <h3 class="scd-h" data-custtitle>Versions of customer 3</h3>
+    <div class="scd-scroll" tabindex="0" role="region" aria-label="Dimension rows of the selected customer">
+      <table class="scd-table">
+        <thead><tr><th scope="col">Surrogate key</th><th scope="col">Region</th><th scope="col">Tier</th><th scope="col">Valid from</th><th scope="col">Valid to</th></tr></thead>
+        <tbody data-versions></tbody>
+      </table>
+    </div>
+    <p class="pg-note">Assumptions: the data is synthetic and seeded, so the numbers never change between visits. Days run 1 to 360 and a version is valid for from &lt;= day &lt; to. One change (customer 3 to East) takes effect on day 150 but is delivered on day 250; one record is a redelivery of an unchanged region; one changes only the tier. Facts are loaded in the order they happen and look up the version valid on the sale date.</p>
+  </div>
+</PlaygroundShell>
+<script>
+  const REGIONS = ['North', 'South', 'East', 'West'];
+  const INIT = ['North', 'South', 'East', 'South', 'West', 'East', 'North', 'West'];
+  const FEED = [
+    { cust: 6, eff: 80, arrive: 80, region: 'South', tier: 'basic' },
+    { cust: 1, eff: 100, arrive: 100, region: 'West', tier: 'basic' },
+    { cust: 3, eff: 150, arrive: 250, region: 'East', tier: 'basic' },
+    { cust: 4, eff: 200, arrive: 200, region: 'North', tier: 'basic' },
+    { cust: 0, eff: 200, arrive: 200, region: 'North', tier: 'basic' },
+    { cust: 4, eff: 220, arrive: 220, region: 'North', tier: 'gold' },
+    { cust: 6, eff: 270, arrive: 270, region: 'East', tier: 'basic' },
+    { cust: 2, eff: 300, arrive: 300, region: 'South', tier: 'basic' },
+  ];
+
+  // Same seeded generator as the code samples, so the numbers match them.
+  function makeFacts() {
+    let seed = 7;
+    const next = () => { seed = (Math.imul(seed, 1664525) + 1013904223) >>> 0; return seed >>> 8; };
+    const facts: any[] = [];
+    for (let id = 0; id < 200; id++) facts.push({ id, day: 1 + (next() % 360), cust: next() % 8, amount: 20 + (next() % 181) });
+    return facts;
+  }
+  const FACTS = makeFacts();
+
+  function tracked(rec: any, trackTier: boolean) { return trackTier ? rec.region + '|' + rec.tier : rec.region; }
+
+  function truthRegion(f: any) {
+    let region = INIT[f.cust]; let best = 0;
+    for (const c of FEED) if (c.cust === f.cust && c.eff <= f.day && c.eff >= best) { region = c.region; best = c.eff; }
+    return region;
+  }
+
+  function revenue(regionOf: (f: any) => string) {
+    const t: Record<string, number> = {};
+    for (const r of REGIONS) t[r] = 0;
+    for (const f of FACTS) t[regionOf(f)] += f.amount;
+    return t;
+  }
+
+  // Pure core: load the dimension and the facts in arrival order.
+  function simulate(type: number, backdate: boolean, trackTier: boolean) {
+    const rows: any[] = []; let nextSk = 1; let skipped = 0; let rekeyed = 0;
+    INIT.forEach((region, cust) => rows.push({ sk: nextSk++, cust, region, tier: 'basic', key: tracked({ region, tier: 'basic' }, trackTier), from: 1, to: null }));
+    const covering = (cust: number, day: number) => rows.find((r) => r.cust === cust && r.from <= day && (r.to === null || day < r.to));
+    const events: any[] = [
+      ...FEED.map((c, i) => ({ key: c.arrive * 1000000 + i, change: c })),
+      ...FACTS.map((f) => ({ key: f.day * 1000000 + 100000 + f.id, fact: f })),
+    ].sort((a, b) => a.key - b.key);
+    const factSk = new Map<number, number>();
+    for (const e of events) {
+      if (e.change) {
+        const c = e.change; const k = tracked(c, trackTier);
+        if (type === 1) {
+          const r = rows.find((x) => x.cust === c.cust);
+          if (r.key === k) skipped++; else Object.assign(r, { region: c.region, tier: c.tier, key: k });
+        } else {
+          const vf = backdate ? c.eff : c.arrive;
+          const old = covering(c.cust, vf);
+          if (old.key === k) { skipped++; continue; }
+          const row = { sk: nextSk++, cust: c.cust, region: c.region, tier: c.tier, key: k, from: vf, to: old.to };
+          old.to = vf; rows.push(row);
+          for (const f of FACTS) {
+            if (f.cust === c.cust && factSk.has(f.id) && f.day >= row.from && (row.to === null || f.day < row.to)) { factSk.set(f.id, row.sk); rekeyed++; }
+          }
+        }
+      } else {
+        const f = e.fact;
+        factSk.set(f.id, type === 1 ? rows.find((x) => x.cust === f.cust).sk : covering(f.cust, f.day).sk);
+      }
+    }
+    const bySk = new Map<number, any>(rows.map((r) => [r.sk, r]));
+    const regionOf = (f: any) => bySk.get(factSk.get(f.id)!).region;
+    const wrong = FACTS.filter((f) => regionOf(f) !== truthRegion(f)).length;
+    return { rows, skipped, rekeyed, wrong, totals: revenue(regionOf), truth: revenue(truthRegion) };
+  }
+
+  document.querySelectorAll<HTMLElement>('[data-scd]').forEach((root) => {
+    const q = <T extends HTMLElement>(s: string) => root.querySelector<T>(s)!;
+    const typeSel = q<HTMLSelectElement>('[data-type]');
+    const backdate = q<HTMLInputElement>('[data-backdate]');
+    const tier = q<HTMLInputElement>('[data-tier]');
+    const custSel = q<HTMLSelectElement>('[data-cust]');
+    const revBody = q<HTMLElement>('[data-revenue]');
+    const verBody = q<HTMLElement>('[data-versions]');
+
+    // Build the revenue table once; later updates only change text.
+    const revCells: Record<string, HTMLElement[]> = {};
+    for (const r of REGIONS) {
+      const tr = document.createElement('tr');
+      const cells = [document.createElement('th'), document.createElement('td'), document.createElement('td'), document.createElement('td')];
+      cells[0].scope = 'row'; cells[0].textContent = r;
+      cells.forEach((c) => tr.appendChild(c));
+      revBody.appendChild(tr); revCells[r] = cells;
+    }
+
+    let frame = 0;
+    function draw() {
+      frame = 0;
+      const type = Number(typeSel.value);
+      backdate.disabled = type === 1; // only meaningful for Type 2
+      const res = simulate(type, backdate.checked, tier.checked);
+      q('[data-rows]').textContent = String(res.rows.length);
+      q('[data-rowsnote]').textContent = type === 1 ? 'one row per customer, history overwritten' : 'one row per customer version';
+      q('[data-wrong]').textContent = String(res.wrong);
+      q<HTMLElement>('[data-wrongbox]').style.setProperty('--c', res.wrong === 0 ? 'var(--good)' : 'var(--bad)');
+      q('[data-work]').textContent = res.skipped + ' / ' + res.rekeyed;
+      for (const r of REGIONS) {
+        const diff = res.totals[r] - res.truth[r];
+        revCells[r][1].textContent = String(res.truth[r]);
+        revCells[r][2].textContent = String(res.totals[r]);
+        revCells[r][3].textContent = diff === 0 ? '0 (matches)' : (diff > 0 ? '+' : '') + diff;
+        revCells[r][3].style.color = diff === 0 ? '' : 'var(--bad-text, var(--text))';
+      }
+      const cust = Number(custSel.value);
+      q('[data-custtitle]').textContent = 'Versions of customer ' + cust;
+      verBody.textContent = '';
+      res.rows.filter((r) => r.cust === cust).sort((a, b) => a.from - b.from).forEach((r) => {
+        const tr = document.createElement('tr');
+        [String(r.sk), r.region, r.tier, 'day ' + r.from, r.to === null ? 'open (current)' : 'day ' + r.to].forEach((v) => {
+          const td = document.createElement('td'); td.textContent = v; tr.appendChild(td);
+        });
+        verBody.appendChild(tr);
+      });
+    }
+    const schedule = () => { if (!frame) frame = requestAnimationFrame(draw); };
+    [typeSel, backdate, tier, custSel].forEach((el) => el.addEventListener('change', schedule));
+    draw();
+  });
+</script>
+<style is:global>
+  .playground .scd-check { display: inline-flex; align-items: center; gap: 6px; }
+  .playground .scd-h { margin: 14px 0 6px; font-size: 1rem; }
+  .playground .scd-scroll { overflow-x: auto; }
+  .playground .scd-table { border-collapse: collapse; width: 100%; font-size: .9rem; }
+  .playground .scd-table th, .playground .scd-table td { text-align: left; padding: 4px 10px; border-bottom: 1px solid var(--border); white-space: nowrap; font-variant-numeric: tabular-nums; }
+  .playground .scd-table thead th { color: var(--muted); font-weight: 600; }
+</style>
