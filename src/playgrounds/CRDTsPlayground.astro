@@ -1,0 +1,284 @@
+---
+import PlaygroundShell from '../components/PlaygroundShell.astro';
+const replicas = ['A', 'B', 'C'];
+const tags = ['urgent', 'billing', 'vip'];
+---
+<PlaygroundShell title="Simulate it" hint="Three replicas of a like counter and a tag set. Update them while partitioned, then merge in different orders.">
+  <ol class="how">
+    <li>Start with the <b>naive counter (last write wins)</b>. Press <b>Scripted partition updates</b>, then <b>Heal and merge</b>. All replicas agree on 12, but 20 likes were counted: <b>8 are lost</b>. Move the <b>clock</b> slider to 500, reset and repeat: a different replica wins and the value changes.</li>
+    <li>Switch to <b>G-Counter</b> or <b>PN-Counter</b> and repeat. Every merge order gives 21 (G-Counter, which refuses the unlike) or 20 (PN-Counter), with nothing lost. Tick <b>duplicates and stale copies</b>: the number of deliveries that changed anything stays 0.</li>
+    <li>Switch to the <b>naive set (op log)</b> and repeat: A removed <b>urgent</b> while B re-added it, and the replicas <b>disagree</b> after the merge, whatever the merge order. Do the same on the <b>OR-Set</b>: all three agree on &#123;billing, urgent&#125;, because B's add used a tag A never saw.</li>
+    <li>On the <b>PN-Counter</b> press <b>Everyone unlikes 8</b> then <b>Heal and merge</b>: each replica passed its local check, and the merged value is -14. A CRDT cannot enforce a floor. Press <b>Churn</b> to see state size: it stays at 6 for the counter and grows for the sets.</li>
+  </ol>
+  <div class="pg crdt" data-crdt>
+    <div class="pg-row">
+      <label>Data type
+        <select class="pg-in" data-kind>
+          <option value="lww" selected>Naive counter (last write wins)</option>
+          <option value="g">G-Counter</option>
+          <option value="pn">PN-Counter</option>
+          <option value="nset">Naive set (op log, arrival order)</option>
+          <option value="orset">OR-Set</option>
+        </select>
+      </label>
+      <label>Merge order
+        <select class="pg-in" data-order>
+          <option value="hubA" selected>Hub A: A pulls B, C; then B, C pull A</option>
+          <option value="hubB">Hub B: B pulls A, C; then A, C pull B</option>
+          <option value="hubC">Hub C: C pulls A, B; then A, B pull C</option>
+          <option value="ringF">Ring A, B, C, twice</option>
+          <option value="ringR">Ring A, C, B, twice</option>
+        </select>
+      </label>
+      <label class="crdt-check"><input type="checkbox" data-dup /> Duplicates and stale copies</label>
+      <label>Clock of C is behind by <input type="range" min="0" max="500" step="50" value="0" data-skew aria-label="Clock skew of replica C in milliseconds" /> <b data-skewval>0</b> ms</label>
+    </div>
+    <div class="pg-row">
+      <button class="btn" type="button" data-script>Scripted partition updates</button>
+      <button class="btn" type="button" data-burst>Random burst (12 updates)</button>
+      <button class="btn" type="button" data-unlike>Everyone unlikes 8</button>
+      <button class="btn" type="button" data-churn>Churn on A</button>
+      <button class="btn pg-primary" type="button" data-heal>Heal and merge</button>
+      <button class="btn" type="button" data-reset>Reset</button>
+    </div>
+    <p class="pg-note" data-status></p>
+    <div class="pg-grid">
+      {replicas.map((name, i) => (
+        <div class="pg-box" style={`--c: var(--role-${i + 1})`} data-panel={i}>
+          <h3>Replica {name}</h3>
+          <span class="pg-mono crdt-val" data-val></span>
+          <span class="pg-mono" data-state></span>
+          <span class="pg-note" data-size></span>
+          <div class="pg-row" data-counterops>
+            <button class="btn" type="button" data-op="inc" aria-label={`+1 like, replica ${name}`}>+1 like</button>
+            <button class="btn" type="button" data-op="dec" aria-label={`-1 unlike, replica ${name}`}>-1 unlike</button>
+          </div>
+          <div class="pg-row" data-setops hidden>
+            <select class="pg-in" data-tag aria-label={`Replica ${name}: tag`}>{tags.map((t) => <option value={t}>{t}</option>)}</select>
+            <button class="btn" type="button" data-op="add" aria-label={`Add, replica ${name}: the selected tag`}>Add</button>
+            <button class="btn" type="button" data-op="rm" aria-label={`Remove, replica ${name}: the selected tag`}>Remove</button>
+          </div>
+        </div>
+      ))}
+    </div>
+    <output class="pg-out" data-out aria-live="polite"></output>
+    <p class="pg-note" data-stats></p>
+    <p class="pg-note">Assumptions: 10 likes and the tag urgent exist before the partition; updates are 100 ms apart on a wall clock, and the clock slider shifts replica C's timestamps. The naive counter stores a number and a timestamp and keeps the newest on merge. The naive set ships an operation log and appends unseen operations in arrival order, with no causal delivery. The OR-Set uses unique add tags and a tombstone set. Everything is deterministic; the random burst uses a seeded generator.</p>
+  </div>
+</PlaygroundShell>
+<script>
+  // ---- core: pure functions, no DOM ----
+  type Kind = 'lww' | 'g' | 'pn' | 'nset' | 'orset';
+  interface Op { id: string; k: 'add' | 'rm'; el: string }
+  interface RS { v: number; ts: number; by: number; p: number[]; n: number[]; log: Op[]; adds: [string, string][]; rem: string[]; seq: number }
+  type Val = number | string[];
+  const IDS = ['A', 'B', 'C'];
+  const TAGS = ['urgent', 'billing', 'vip'];
+  const START = 10;
+  const ORDERS: Record<string, number[][]> = {
+    hubA: [[0, 1], [0, 2], [1, 0], [2, 0]],
+    hubB: [[1, 0], [1, 2], [0, 1], [2, 1]],
+    hubC: [[2, 0], [2, 1], [0, 2], [1, 2]],
+    ringF: [[0, 1], [1, 2], [2, 0], [0, 1], [1, 2], [2, 0]],
+    ringR: [[0, 2], [2, 1], [1, 0], [0, 2], [2, 1], [1, 0]],
+  };
+  const sum = (a: number[]) => a.reduce((x, y) => x + y, 0);
+  const maxv = (a: number[], b: number[]) => a.map((x, i) => Math.max(x, b[i]));
+  function clone<T>(x: T): T { return JSON.parse(JSON.stringify(x)); }
+  function mulberry32(seed: number) {
+    let a = seed >>> 0;
+    return () => { a = (a + 0x6d2b79f5) >>> 0; let t = a; t = Math.imul(t ^ (t >>> 15), t | 1); t ^= t + Math.imul(t ^ (t >>> 7), t | 61); return ((t ^ (t >>> 14)) >>> 0) / 4294967296; };
+  }
+  const isCounter = (k: Kind) => k === 'lww' || k === 'g' || k === 'pn';
+  function initState(r: number): RS {
+    return { v: START, ts: 0, by: 0, p: [4, 3, 3], n: [0, 0, 0], log: [{ id: 'A0', k: 'add', el: 'urgent' }], adds: [['A0', 'urgent']], rem: [], seq: r === 0 ? 1 : 0 };
+  }
+  function value(kind: Kind, s: RS): Val {
+    switch (kind) {
+      case 'lww': return s.v;
+      case 'g': return sum(s.p);
+      case 'pn': return sum(s.p) - sum(s.n);
+      case 'nset': { const set = new Set<string>(); s.log.forEach((o) => { if (o.k === 'add') set.add(o.el); else set.delete(o.el); }); return [...set].sort(); }
+      default: { const dead = new Set(s.rem); return [...new Set(s.adds.filter(([t]) => !dead.has(t)).map(([, e]) => e))].sort(); }
+    }
+  }
+  const fmt = (x: Val) => (typeof x === 'number' ? String(x) : x.length ? '{' + x.join(', ') + '}' : '{ }');
+  function bump(kind: Kind, s: RS, r: number, d: number, ts: number): boolean {
+    if (kind === 'lww') { s.v += d; s.ts = ts; s.by = r; return true; }
+    if (kind === 'g') { if (d < 0) return false; s.p[r]++; return true; }
+    if (kind === 'pn') { if (d > 0) s.p[r]++; else s.n[r]++; return true; }
+    return false;
+  }
+  function setOp(kind: Kind, s: RS, r: number, op: 'add' | 'rm', el: string): boolean {
+    if (kind === 'nset') {
+      if (op === 'rm' && !(value(kind, s) as string[]).includes(el)) return false;
+      s.log.push({ id: IDS[r] + s.seq++, k: op, el }); return true;
+    }
+    if (kind === 'orset') {
+      if (op === 'add') { s.adds.push([IDS[r] + s.seq++, el]); return true; }
+      const dead = new Set(s.rem); const tags = s.adds.filter(([t, e]) => e === el && !dead.has(t)).map(([t]) => t);
+      if (!tags.length) return false;
+      s.rem.push(...tags); return true;
+    }
+    return false;
+  }
+  function merge(kind: Kind, a: RS, b: RS): RS {
+    const out = clone(a);
+    if (kind === 'lww') { if (b.ts > a.ts || (b.ts === a.ts && b.by > a.by)) { out.v = b.v; out.ts = b.ts; out.by = b.by; } }
+    else if (kind === 'g') out.p = maxv(a.p, b.p);
+    else if (kind === 'pn') { out.p = maxv(a.p, b.p); out.n = maxv(a.n, b.n); }
+    else if (kind === 'nset') { const seen = new Set(a.log.map((o) => o.id)); out.log = a.log.concat(clone(b.log.filter((o) => !seen.has(o.id)))); }
+    else {
+      const tags = new Set(a.adds.map(([t]) => t)); out.adds = a.adds.concat(clone(b.adds.filter(([t]) => !tags.has(t))));
+      out.rem = [...new Set([...a.rem, ...b.rem])];
+    }
+    return out;
+  }
+  function canon(kind: Kind, s: RS): string {
+    switch (kind) {
+      case 'lww': return `${s.v}@${s.ts}`;
+      case 'g': return s.p.join(',');
+      case 'pn': return s.p.join(',') + '|' + s.n.join(',');
+      case 'nset': return s.log.map((o) => o.id).join(',');
+      default: return s.adds.map(([t, e]) => `${t}=${e}`).sort().join(';') + '|' + [...s.rem].sort().join(',');
+    }
+  }
+  function size(kind: Kind, s: RS): number {
+    switch (kind) { case 'lww': return 2; case 'g': return 3; case 'pn': return 6; case 'nset': return s.log.length; default: return s.adds.length + s.rem.length; }
+  }
+  function describe(kind: Kind, s: RS): string {
+    switch (kind) {
+      case 'lww': return `value ${s.v}, timestamp ${s.ts}, written on ${IDS[s.by]}`;
+      case 'g': return `slots A=${s.p[0]} B=${s.p[1]} C=${s.p[2]}`;
+      case 'pn': return `P: A=${s.p[0]} B=${s.p[1]} C=${s.p[2]} | N: A=${s.n[0]} B=${s.n[1]} C=${s.n[2]}`;
+      case 'nset': return 'log: ' + s.log.map((o) => (o.k === 'add' ? '+' : '-') + o.el).join(' ');
+      default: { const dead = new Set(s.rem); return 'tags: ' + s.adds.map(([t, e]) => (dead.has(t) ? 'x' : '') + e + '#' + t).join(' '); }
+    }
+  }
+  function mergeAll(kind: Kind, st: RS[], pulls: number[][], dup: boolean) {
+    const snaps = st.map(clone); let deliveries = 0; let extra = 0; let changed = 0;
+    const pull = (d: number, s: number, counted: boolean) => {
+      const before = canon(kind, st[d]); st[d] = merge(kind, st[d], st[s]); deliveries++;
+      if (counted) { extra++; if (canon(kind, st[d]) !== before) changed++; }
+    };
+    pulls.forEach(([d, s]) => { pull(d, s, false); if (dup) pull(d, s, true); });
+    if (dup) for (let d = 0; d < 3; d++) snaps.forEach((snap) => {
+      const before = canon(kind, st[d]); st[d] = merge(kind, st[d], snap); deliveries++; extra++;
+      if (canon(kind, st[d]) !== before) changed++;
+    });
+    return { deliveries, extra, changed };
+  }
+  function summarise(kind: Kind, st: RS[], dirty: number, everMerged: boolean, net: number): { text: string; bad: boolean } {
+    const vals = st.map((s) => value(kind, s));
+    const same = vals.every((v) => JSON.stringify(v) === JSON.stringify(vals[0]));
+    const counter = isCounter(kind); const expected = START + net;
+    if (dirty > 0) {
+      return { text: counter
+        ? `Partitioned: ${dirty} update${dirty === 1 ? '' : 's'} not merged yet, so each replica shows only what it saw. A counter that loses nothing would show ${expected} after the merge.`
+        : `Partitioned: ${dirty} update${dirty === 1 ? '' : 's'} not merged yet, so each replica shows only what it saw.`, bad: false };
+    }
+    if (!everMerged) return { text: `All replicas agree: ${fmt(vals[0])}. Make updates, then heal.`, bad: false };
+    if (!same) return { text: `Replicas DISAGREE after the merge: A=${fmt(vals[0])}, B=${fmt(vals[1])}, C=${fmt(vals[2])}. They received the same updates; only the order differed, and nothing will fix it.`, bad: true };
+    if (counter) {
+      const v = vals[0] as number; const lost = Math.abs(expected - v);
+      if (v < 0) return { text: `All replicas agree: ${v}. Every update was counted, and the value is below zero: each replica passed its own check, and merge cannot enforce a floor.`, bad: true };
+      return lost === 0
+        ? { text: `All replicas agree: ${v}. Expected ${expected}: nothing was lost.`, bad: false }
+        : { text: `All replicas agree: ${v}, but ${expected} was expected: ${lost} update${lost === 1 ? '' : 's'} lost.`, bad: true };
+    }
+    return { text: `All replicas agree: ${fmt(vals[0])}.`, bad: false };
+  }
+
+  // ---- UI ----
+  document.querySelectorAll<HTMLElement>('[data-crdt]').forEach((root) => {
+    const q = <T extends Element>(s: string) => root.querySelector<T>(s)!;
+    const panels = Array.from(root.querySelectorAll<HTMLElement>('[data-panel]'));
+    let kind: Kind = 'lww'; let st: RS[] = []; let step = 0; let net = 0; let dirty = 0; let everMerged = false; let bursts = 0;
+    let lastMerge = ''; let frame = 0;
+    const skew = () => Number(q<HTMLInputElement>('[data-skew]').value);
+
+    function reset() { kind = q<HTMLSelectElement>('[data-kind]').value as Kind; st = [0, 1, 2].map(initState); step = 0; net = 0; dirty = 0; everMerged = false; bursts = 0; lastMerge = ''; draw(); }
+    function doOp(r: number, t: 'inc' | 'dec' | 'add' | 'rm', el = ''): boolean {
+      step++; const ts = step * 100 - (r === 2 ? skew() : 0); let ok = false;
+      if (t === 'inc' || t === 'dec') {
+        if (!isCounter(kind)) { step--; return false; }
+        const d = t === 'inc' ? 1 : -1; ok = bump(kind, st[r], r, d, ts); if (ok) net += d;
+      } else {
+        if (isCounter(kind)) { step--; return false; }
+        ok = setOp(kind, st[r], r, t, el);
+      }
+      if (ok) dirty++; else step--;
+      return ok;
+    }
+    function script() {
+      const counterOps: [number, 'inc' | 'dec'][] = [[0, 'inc'], [1, 'inc'], [2, 'inc'], [0, 'inc'], [1, 'inc'], [2, 'inc'], [0, 'inc'], [1, 'inc'], [1, 'inc'], [1, 'inc'], [2, 'inc'], [2, 'dec']];
+      if (isCounter(kind)) counterOps.forEach(([r, t]) => doOp(r, t));
+      else { doOp(0, 'rm', 'urgent'); doOp(1, 'add', 'urgent'); doOp(2, 'add', 'billing'); }
+    }
+    function burst() {
+      const rng = mulberry32(1000 + bursts++);
+      for (let i = 0; i < 12; i++) {
+        const r = Math.floor(rng() * 3);
+        if (isCounter(kind)) doOp(r, rng() < 0.75 ? 'inc' : 'dec');
+        else { const el = TAGS[Math.floor(rng() * 3)]; doOp(r, rng() < 0.6 ? 'add' : 'rm', el); }
+      }
+    }
+    function unlike() { if (!isCounter(kind)) return; for (let r = 0; r < 3; r++) for (let i = 0; i < 8; i++) doOp(r, 'dec'); }
+    function churn() {
+      if (isCounter(kind)) { for (let i = 0; i < 20; i++) doOp(0, 'inc'); }
+      else for (let i = 0; i < 10; i++) { doOp(0, 'add', 'vip'); doOp(0, 'rm', 'vip'); }
+    }
+    function heal() {
+      const key = q<HTMLSelectElement>('[data-order]').value; const dup = q<HTMLInputElement>('[data-dup]').checked;
+      const res = mergeAll(kind, st, ORDERS[key], dup);
+      dirty = 0; everMerged = true;
+      lastMerge = `last merge: ${res.deliveries} deliveries` + (dup ? `, ${res.extra} of them duplicates or stale copies, ${res.changed} of those changed a state` : '');
+      draw();
+    }
+    function paint() {
+      frame = 0;
+      const counter = isCounter(kind);
+      q('[data-skewval]').textContent = String(skew());
+      panels.forEach((panel, r) => {
+        const s = st[r]; const v = value(kind, s);
+        panel.querySelector('[data-val]')!.textContent = counter ? `${fmt(v)} likes` : fmt(v);
+        panel.querySelector('[data-state]')!.textContent = describe(kind, s);
+        panel.querySelector('[data-size]')!.textContent = `state size: ${size(kind, s)} entries`;
+        panel.querySelector<HTMLElement>('[data-counterops]')!.hidden = !counter;
+        panel.querySelector<HTMLElement>('[data-setops]')!.hidden = counter;
+        const dec = panel.querySelector<HTMLButtonElement>('[data-op="dec"]')!; dec.disabled = kind === 'g'; dec.title = kind === 'g' ? 'A G-Counter can only grow' : '';
+      });
+      (root.querySelector<HTMLButtonElement>('[data-unlike]'))!.disabled = !counter || kind === 'g';
+      q<HTMLButtonElement>('[data-churn]').textContent = counter ? 'Churn on A (20 likes)' : 'Churn on A (10 add/remove)';
+      q('[data-status]').textContent = dirty > 0 ? `${dirty} update${dirty === 1 ? '' : 's'} since the last merge: replicas are partitioned.` : everMerged ? 'Replicas have exchanged state.' : 'Replicas start in sync.';
+      const res = summarise(kind, st, dirty, everMerged, net);
+      const out = q<HTMLElement>('[data-out]'); out.textContent = res.text; out.classList.toggle("bad", res.bad);
+      const sizes = st.map((s) => size(kind, s)); const states = new Set(st.map((s) => canon(kind, s)));
+      q('[data-stats]').textContent = `State size A/B/C: ${sizes.join(' / ')} entries · identical internal state: ${states.size === 1 ? 'yes' : 'no'}` + (lastMerge ? ` · ${lastMerge}` : '');
+    }
+    function draw() { if (!frame) frame = requestAnimationFrame(paint); }
+
+    panels.forEach((panel, r) => {
+      panel.querySelectorAll<HTMLButtonElement>('[data-op]').forEach((btn) => btn.addEventListener('click', () => {
+        const t = btn.dataset.op as 'inc' | 'dec' | 'add' | 'rm'; doOp(r, t, panel.querySelector<HTMLSelectElement>('[data-tag]')!.value); draw();
+      }));
+    });
+    q('[data-kind]').addEventListener('change', reset);
+    q('[data-order]').addEventListener('change', draw);
+    q('[data-dup]').addEventListener('change', draw);
+    q('[data-skew]').addEventListener('input', draw);
+    q('[data-script]').addEventListener('click', () => { script(); draw(); });
+    q('[data-burst]').addEventListener('click', () => { burst(); draw(); });
+    q('[data-unlike]').addEventListener('click', () => { unlike(); draw(); });
+    q('[data-churn]').addEventListener('click', () => { churn(); draw(); });
+    q('[data-heal]').addEventListener('click', heal);
+    q('[data-reset]').addEventListener('click', reset);
+    reset();
+  });
+</script>
+<style is:global>
+  .playground .crdt-check { display: inline-flex; align-items: center; gap: 6px; }
+  .playground .crdt [hidden] { display: none !important; }
+  .playground .crdt .crdt-val { font-size: 1.05rem; font-weight: 600; }
+  .playground .crdt .pg-box .pg-row { gap: 6px; }
+</style>

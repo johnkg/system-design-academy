@@ -1,0 +1,278 @@
+---
+import PlaygroundShell from '../components/PlaygroundShell.astro';
+---
+<PlaygroundShell title="Simulate it" hint="A seeded blog database: 50 posts, 20 comments each, 40 users. Pick a query, how the resolvers fetch, and a guard, then count the database queries and the simulated time.">
+  <ol class="how">
+    <li>Start on <b>posts, authors, comments, comment authors</b> with <b>Naive</b> resolvers (the defaults): <b>1,101 queries</b> (1 + 50 + 50 + 1,000) in 3 sequential rounds, about <b>340 ms</b> of simulated time even with 10 connections working in parallel.</li>
+    <li>Switch to <b>DataLoader batching</b>: <b>4 queries</b> (posts, users, comments, users) and about 26 ms. Then <b>batching + per-request cache</b>: still 4 queries, but <b>1,010 key lookups</b> are served from the cache, so the second users query asks for 28 ids instead of 1,000 (90 keys sent in total instead of 1,100). Choose <b>Join in the root resolver</b>: 1 query and 1 round trip, but 1,000 wide rows come back (about 2.5 times a normal row), so it is slower than batching here (about 32 ms against 24 to 26).</li>
+    <li>Choose <b>Hostile: deep cycle</b> (posts, comments, post, comments, post, comments) with the guard <b>Off</b> and <b>Batching + cache</b>: only 3 queries, yet the response holds <b>442,050 objects</b> and costs about 884 ms of resolver CPU. Set the guard to <b>Max depth 4</b> and it is rejected before any resolver runs; <b>Hostile: 50 aliases</b> has depth 3 and slips past the depth limit, but <b>Max cost 5,000</b> rejects it.</li>
+    <li>With the guard off, Naive and the full query, add a <b>200 ms timeout</b>: the executor stops issuing queries once the deadline passes and aborts, with 651 of the 1,101 queries already sent to the database. A timeout limits the damage; it does not prevent it.</li>
+  </ol>
+  <div class="pg gq" data-gq>
+    <div class="pg-row">
+      <label>Query <select class="pg-in" data-shape>
+        <option value="a">posts + authors</option>
+        <option value="b">posts + authors + comments</option>
+        <option value="c" selected>posts, authors, comments, comment authors</option>
+        <option value="deep">Hostile: deep cycle (depth 6)</option>
+        <option value="wide">Hostile: 50 aliases of the full query</option>
+      </select></label>
+      <label>Resolvers <select class="pg-in" data-strategy>
+        <option value="naive" selected>Naive: one query per field</option>
+        <option value="batch">DataLoader batching</option>
+        <option value="cache">Batching + per-request cache</option>
+        <option value="join">Join in the root resolver</option>
+      </select></label>
+    </div>
+    <div class="pg-row">
+      <label>Guard <select class="pg-in" data-guard>
+        <option value="off" selected>Off</option>
+        <option value="depth">Max depth 4</option>
+        <option value="cost">Max cost 5,000 objects</option>
+        <option value="both">Max depth 4 and max cost 5,000</option>
+      </select></label>
+      <label>Timeout <select class="pg-in" data-timeout>
+        <option value="0" selected>None</option>
+        <option value="200">200 ms</option>
+        <option value="1000">1,000 ms</option>
+      </select></label>
+      <button class="btn" type="button" data-reset>Reset</button>
+    </div>
+    <p class="pg-mono" data-gql></p>
+    <div class="pg-grid">
+      <div class="pg-box" style="--c: var(--role-1)"><h3>Database queries</h3><span class="pg-mono" data-queries>-</span><span class="pg-note" data-queries-note></span></div>
+      <div class="pg-box" style="--c: var(--role-2)"><h3>Sequential rounds</h3><span class="pg-mono" data-rounds>-</span><span class="pg-note">levels of the tree that had to wait for the previous one</span></div>
+      <div class="pg-box" style="--c: var(--role-3)"><h3>Simulated latency</h3><span class="pg-mono" data-ms>-</span><span class="pg-note" data-ms-note></span></div>
+      <div class="pg-box" style="--c: var(--role-4)"><h3>Keys, rows and cache</h3><span class="pg-mono" data-work>-</span><span class="pg-note" data-work-note></span></div>
+    </div>
+    <pre class="pg-out gq-pre" data-levels tabindex="0" aria-label="Work per level of the query tree"></pre>
+    <pre class="pg-out gq-pre" data-table tabindex="0" aria-label="All resolver strategies compared"></pre>
+    <output class="pg-out" data-verdict aria-live="polite"></output>
+    <p class="pg-note">Assumptions: every query costs 3 ms (network round trip plus parse and plan) + 0.01 ms per row returned + 0.002 ms per key in an IN list; 10 database connections run queries of one level in parallel; a level waits for its parent level; the resolver CPU is 0.002 ms per object and runs on one thread. A join row counts as wider the more tables it spans ((tables + 1) / 2 times a normal row) and the join output has as many rows as the largest list in the tree. The guard estimates cost as the number of objects the query asks for, from the page sizes in the query (first: 50 posts, first: 20 comments). Results are identical for every strategy; the code sample proves that with a real executor.</p>
+  </div>
+</PlaygroundShell>
+<script>
+// ---- simulation core: pure functions, no DOM ----
+type Strategy = 'naive' | 'batch' | 'cache' | 'join';
+type ShapeId = 'a' | 'b' | 'c' | 'deep' | 'wide';
+type FieldName = 'Post.author' | 'Post.comments' | 'Comment.author' | 'Comment.post';
+type Loader = 'users' | 'posts' | 'comments';
+interface Sel { f: FieldName; kids: Sel[] }
+interface Shape { id: ShapeId; label: string; gql: string; repeat: number; tables: number; sel: Sel[] }
+interface Data { postAuthor: Int32Array; commentAuthor: Int32Array; commentPost: Int32Array }
+interface Level { names: string[]; fields: { loader: Loader; keys: Int32Array; rows: number }[]; objects: number; root: boolean }
+interface Trace { levels: Level[]; objects: number; checksum: number }
+interface LevelOut { label: string; queries: number; cancelled: number; ms: number }
+interface Result { queries: number; rounds: number; ms: number; rows: number; keys: number; avoided: number; objects: number; aborted: boolean; cancelled: number; levels: LevelOut[] }
+interface Guard { depth: number; cost: number }
+
+const N_USERS = 40; const N_POSTS = 50; const PER_POST = 20; const POOL = 10;
+const BASE_MS = 3; const ROW_MS = 0.01; const KEY_MS = 0.002; const OBJ_MS = 0.002;
+
+const SHAPES: Record<ShapeId, Shape> = {
+  a: { id: 'a', tables: 2, label: 'posts + authors', repeat: 1, gql: '{ posts(first: 50) { title author { name } } }', sel: [{ f: 'Post.author', kids: [] }] },
+  b: { id: 'b', tables: 3, label: 'posts + authors + comments', repeat: 1, gql: '{ posts(first: 50) { title author { name } comments(first: 20) { body } } }', sel: [{ f: 'Post.author', kids: [] }, { f: 'Post.comments', kids: [] }] },
+  c: { id: 'c', tables: 4, label: 'full query', repeat: 1, gql: '{ posts(first: 50) { title author { name } comments(first: 20) { body author { name } } } }', sel: [{ f: 'Post.author', kids: [] }, { f: 'Post.comments', kids: [{ f: 'Comment.author', kids: [] }] }] },
+  deep: { id: 'deep', tables: 6, label: 'deep cycle', repeat: 1, gql: '{ posts(first: 50) { comments(first: 20) { post { comments(first: 20) { post { comments(first: 20) { body } } } } } } }', sel: [{ f: 'Post.comments', kids: [{ f: 'Comment.post', kids: [{ f: 'Post.comments', kids: [{ f: 'Comment.post', kids: [{ f: 'Post.comments', kids: [] }] }] }] }] }] },
+  wide: { id: 'wide', tables: 4, label: '50 aliases', repeat: 50, gql: '{ a1: posts(first: 50) {...full} a2: posts(first: 50) {...full} ... a50: posts(first: 50) {...full} }', sel: [{ f: 'Post.author', kids: [] }, { f: 'Post.comments', kids: [{ f: 'Comment.author', kids: [] }] }] },
+};
+const FIELD_LOADER: Record<FieldName, Loader> = { 'Post.author': 'users', 'Post.comments': 'comments', 'Comment.author': 'users', 'Comment.post': 'posts' };
+
+function mulberry32(a: number) {
+  return () => { a = (a + 0x6d2b79f5) | 0; let t = Math.imul(a ^ (a >>> 15), 1 | a); t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t; return ((t ^ (t >>> 14)) >>> 0) / 4294967296; };
+}
+const round = (x: number) => Math.floor(x + 0.5);
+
+function buildData(): Data {
+  const rnd = mulberry32(20240917);
+  const postAuthor = new Int32Array(N_POSTS + 1); const commentAuthor = new Int32Array(N_POSTS * PER_POST + 1); const commentPost = new Int32Array(N_POSTS * PER_POST + 1);
+  for (let p = 1; p <= N_POSTS; p++) { const u = rnd(); postAuthor[p] = 1 + Math.floor(12 * u * u); } // a dozen prolific writers
+  for (let c = 1; c <= N_POSTS * PER_POST; c++) { const u = rnd(); commentAuthor[c] = 1 + Math.floor(N_USERS * u * u); commentPost[c] = Math.floor((c - 1) / PER_POST) + 1; }
+  return { postAuthor, commentAuthor, commentPost };
+}
+
+function rowsPerKey(loader: Loader) { return loader === 'comments' ? PER_POST : 1; }
+
+function walkShape(sel: Sel[], fn: (s: Sel, depth: number) => void, depth = 2) { for (const s of sel) { fn(s, depth); walkShape(s.kids, fn, depth + 1); } }
+function shapeDepth(shape: Shape) { let d = 1; walkShape(shape.sel, (_s, depth) => { if (depth > d) d = depth; }); return d; }
+// static estimate: the number of objects the query asks for, from the page sizes written in the query
+function shapeCost(shape: Shape) {
+  const root = N_POSTS * shape.repeat; let total = root;
+  const go = (sel: Sel[], parents: number) => { for (const s of sel) { const n = parents * rowsPerKey(FIELD_LOADER[s.f]); total += n; go(s.kids, n); } };
+  go(shape.sel, root);
+  return total;
+}
+
+function expand(d: Data, f: FieldName, parents: Int32Array): { keys: Int32Array; rows: Int32Array } {
+  const n = parents.length;
+  if (f === 'Post.comments') {
+    const rows = new Int32Array(n * PER_POST);
+    for (let i = 0; i < n; i++) for (let j = 0; j < PER_POST; j++) rows[i * PER_POST + j] = (parents[i] - 1) * PER_POST + 1 + j;
+    return { keys: parents, rows };
+  }
+  const keys = new Int32Array(n);
+  for (let i = 0; i < n; i++) keys[i] = f === 'Post.author' ? d.postAuthor[parents[i]] : f === 'Comment.author' ? d.commentAuthor[parents[i]] : d.commentPost[parents[i]];
+  return { keys, rows: keys };
+}
+
+// resolve the whole tree once, level by level, and record which keys each level asked for
+function trace(d: Data, shape: Shape): Trace {
+  const rootRows = new Int32Array(N_POSTS * shape.repeat);
+  for (let i = 0; i < rootRows.length; i++) rootRows[i] = (i % N_POSTS) + 1;
+  const levels: Level[] = [{ names: [shape.repeat > 1 ? `${shape.repeat} x posts` : 'posts'], fields: [], objects: rootRows.length, root: true }];
+  let objects = rootRows.length; let h = 17;
+  let frontier: { sel: Sel; parents: Int32Array }[] = shape.sel.map((sel) => ({ sel, parents: rootRows }));
+  while (frontier.length) {
+    const level: Level = { names: [], fields: [], objects: 0, root: false }; const next: { sel: Sel; parents: Int32Array }[] = [];
+    for (const { sel, parents } of frontier) {
+      const { keys, rows } = expand(d, sel.f, parents);
+      level.names.push(sel.f); level.fields.push({ loader: FIELD_LOADER[sel.f], keys, rows: rows.length }); level.objects += rows.length;
+      for (let i = 0; i < rows.length; i++) h = (Math.imul(h, 31) + rows[i]) | 0;
+      for (const k of sel.kids) next.push({ sel: k, parents: rows });
+    }
+    levels.push(level); objects += level.objects; frontier = next;
+  }
+  return { levels, objects, checksum: h };
+}
+
+interface QueryList { rows: number[]; keys: number[] }
+
+// run one level's queries on the connection pool; queries that would start after the deadline are never sent
+function schedule(q: QueryList, width: number, start: number, deadline: number) {
+  const free = new Array(POOL).fill(start); let sent = 0; let rows = 0; let keys = 0; let killed = false;
+  for (let i = 0; i < q.rows.length; i++) {
+    let c = 0; for (let j = 1; j < POOL; j++) if (free[j] < free[c]) c = j;
+    if (free[c] >= deadline) break;
+    const end = free[c] + BASE_MS + ROW_MS * width * q.rows[i] + KEY_MS * q.keys[i];
+    sent++; rows += q.rows[i]; keys += q.keys[i]; free[c] = end;
+    if (end > deadline) killed = true;
+  }
+  let end = start; for (const f of free) if (f > end) end = f;
+  return { sent, rows, keys, end, cancelled: q.rows.length - sent, killed };
+}
+
+function queriesFor(strategy: Strategy, tr: Trace, shape: Shape) {
+  const perLevel: { q: QueryList; avoided: number; width: number }[] = [];
+  const seen: Record<Loader, Uint8Array> = { users: new Uint8Array(N_USERS + 1), posts: new Uint8Array(N_POSTS + 1), comments: new Uint8Array(N_POSTS + 1) };
+  tr.levels.forEach((lv) => {
+    if (strategy === 'join') return;
+    if (lv.root) { perLevel.push({ q: { rows: new Array(shape.repeat).fill(N_POSTS), keys: new Array(shape.repeat).fill(0) }, avoided: 0, width: 1 }); return; }
+    if (strategy === 'naive') {
+      const rows: number[] = []; const keys: number[] = [];
+      for (const f of lv.fields) { const r = rowsPerKey(f.loader); for (let i = 0; i < f.keys.length; i++) { rows.push(r); keys.push(1); } }
+      perLevel.push({ q: { rows, keys }, avoided: 0, width: 1 }); return;
+    }
+    const byLoader = new Map<Loader, Int32Array[]>();
+    for (const f of lv.fields) { const l = byLoader.get(f.loader); if (l) l.push(f.keys); else byLoader.set(f.loader, [f.keys]); }
+    const rows: number[] = []; const keys: number[] = []; let avoided = 0;
+    for (const [loader, lists] of byLoader) {
+      const distinct = new Uint8Array(seen[loader].length); let requested = 0; let sentKeys = 0; let distinctRows = 0;
+      for (const list of lists) for (let i = 0; i < list.length; i++) {
+        requested++; const k = list[i];
+        if (strategy === 'cache') { if (seen[loader][k] || distinct[k]) continue; distinct[k] = 1; sentKeys++; distinctRows += rowsPerKey(loader); }
+        else { sentKeys++; if (!distinct[k]) { distinct[k] = 1; distinctRows += rowsPerKey(loader); } }
+      }
+      if (strategy === 'cache') { avoided += requested - sentKeys; for (let k = 0; k < distinct.length; k++) if (distinct[k]) seen[loader][k] = 1; }
+      if (sentKeys > 0) { rows.push(distinctRows); keys.push(sentKeys); }
+    }
+    perLevel.push({ q: { rows, keys }, avoided, width: 1 });
+  });
+  return perLevel;
+}
+
+function execute(strategy: Strategy, tr: Trace, shape: Shape, timeoutMs: number): Result {
+  const deadline = timeoutMs > 0 ? timeoutMs : Infinity;
+  const out: Result = { queries: 0, rounds: 0, ms: 0, rows: 0, keys: 0, avoided: 0, objects: 0, aborted: false, cancelled: 0, levels: [] };
+  let t = 0;
+  const plan: { q: QueryList; avoided: number; width: number; label: string; objects: number }[] = [];
+  if (strategy === 'join') {
+    const tables = shape.tables;
+    let rowsEach = N_POSTS; for (const lv of tr.levels) for (const f of lv.fields) rowsEach = Math.max(rowsEach, f.rows / shape.repeat);
+    plan.push({ q: { rows: new Array(shape.repeat).fill(rowsEach), keys: new Array(shape.repeat).fill(0) }, avoided: 0, width: (tables + 1) / 2, label: `1 join across ${tables} tables${shape.repeat > 1 ? ' x ' + shape.repeat : ''}`, objects: tr.objects });
+  } else {
+    const per = queriesFor(strategy, tr, shape);
+    per.forEach((p, i) => plan.push({ ...p, label: tr.levels[i].names.join(' + '), objects: tr.levels[i].objects }));
+  }
+  for (const p of plan) {
+    const s = schedule(p.q, p.width, t, deadline);
+    out.queries += s.sent; out.rows += s.rows; out.keys += s.keys; out.cancelled += s.cancelled; out.avoided += p.avoided;
+    if (s.sent > 0) out.rounds++;
+    const cpuEnd = s.end + p.objects * OBJ_MS;
+    if (s.cancelled > 0 || s.killed || cpuEnd > deadline) {
+      out.aborted = true; out.levels.push({ label: p.label, queries: s.sent, cancelled: s.cancelled, ms: deadline - t }); t = deadline; break;
+    }
+    out.levels.push({ label: p.label, queries: s.sent, cancelled: 0, ms: cpuEnd - t }); t = cpuEnd; out.objects += p.objects;
+  }
+  out.ms = t;
+  return out;
+}
+
+function guardVerdict(shape: Shape, guard: string): string | null {
+  const depth = shapeDepth(shape); const cost = shapeCost(shape);
+  if ((guard === 'depth' || guard === 'both') && depth > 4) return `depth ${depth} is over the limit of 4`;
+  if ((guard === 'cost' || guard === 'both') && cost > 5000) return `estimated cost ${cost.toLocaleString('en-US')} objects is over the limit of 5,000`;
+  return null;
+}
+
+// ---- DOM ----
+const fmtN = (n: number) => n.toLocaleString('en-US');
+const fmtMs = (ms: number) => (ms >= 10000 ? `${fmtN(round(ms))} ms` : ms >= 100 ? `${round(ms)} ms` : `${(round(ms * 10) / 10).toFixed(1)} ms`);
+const STRATEGY_NAME: Record<Strategy, string> = { naive: 'Naive', batch: 'DataLoader batching', cache: 'Batching + cache', join: 'Join in root resolver' };
+const ORDER: Strategy[] = ['naive', 'batch', 'cache', 'join'];
+
+document.querySelectorAll<HTMLElement>('[data-gq]').forEach((root) => {
+  const q = <T extends HTMLElement>(s: string) => root.querySelector<T>(s)!;
+  const data = buildData(); const traces = new Map<ShapeId, Trace>();
+  const traceOf = (shape: Shape) => { let t = traces.get(shape.id); if (!t) { t = trace(data, shape); traces.set(shape.id, t); } return t; };
+  const val = (s: string) => q<HTMLSelectElement>(s).value;
+  let raf = 0;
+
+  function show() {
+    const shape = SHAPES[val('[data-shape]') as ShapeId]; const strategy = val('[data-strategy]') as Strategy;
+    const guard = val('[data-guard]'); const timeout = Number(val('[data-timeout]'));
+    q('[data-gql]').textContent = `${shape.gql}   (depth ${shapeDepth(shape)}, estimated cost ${fmtN(shapeCost(shape))} objects)`;
+    const reason = guardVerdict(shape, guard);
+    const verdict = q<HTMLElement>('[data-verdict]'); verdict.classList.toggle('bad', false);
+    if (reason) {
+      q('[data-queries]').textContent = '0'; q('[data-queries-note]').textContent = 'rejected before execution';
+      q('[data-rounds]').textContent = '0'; q('[data-ms]').textContent = '0.0 ms'; q('[data-ms-note]').textContent = 'no resolver ran';
+      q('[data-work]').textContent = '0 keys, 0 rows'; q('[data-work-note]').textContent = '';
+      q('[data-levels]').textContent = `Rejected by the guard: ${reason}.\nNo database query was issued and no resolver ran.`;
+      q('[data-table]').textContent = 'Every strategy: rejected before execution, 0 queries.';
+      verdict.textContent = `Rejected: ${reason}. The cost of validating the query is a walk over the query text, not over the data.`; verdict.classList.add('bad');
+      return;
+    }
+    const tr = traceOf(shape);
+    const results = {} as Record<Strategy, Result>;
+    for (const s of ORDER) results[s] = execute(s, tr, shape, timeout);
+    const r = results[strategy];
+    q('[data-queries]').textContent = fmtN(r.queries) + (r.cancelled ? ` sent, ${fmtN(r.cancelled)} never sent` : '');
+    q('[data-queries-note]').textContent = r.aborted ? 'aborted at the deadline' : strategy === 'naive' ? 'one per field per parent object' : strategy === 'join' ? 'one statement, hand-written for this shape' : 'one per loader per tick';
+    q('[data-rounds]').textContent = String(r.rounds);
+    q('[data-ms]').textContent = fmtMs(r.ms);
+    q('[data-ms-note]').textContent = r.aborted ? `stopped by the ${fmtN(timeout)} ms timeout` : `database plus ${fmtMs(r.objects * OBJ_MS)} of resolver CPU for ${fmtN(r.objects)} objects`;
+    q('[data-work]').textContent = `${fmtN(r.keys)} keys, ${fmtN(r.rows)} rows`;
+    q('[data-work-note]').textContent = strategy === 'cache' ? `${fmtN(r.avoided)} key lookups served from the per-request cache` : strategy === 'batch' ? 'duplicate keys are still sent' : strategy === 'join' ? 'rows repeat the parent columns' : '';
+    q('[data-levels]').textContent = r.levels.map((l, i) => `level ${i}  ${l.label.padEnd(30)}  ${fmtN(l.queries).padStart(6)} queries${l.cancelled ? ` (+${fmtN(l.cancelled)} not sent)` : ''}  ${fmtMs(l.ms).padStart(10)}`).join('\n') + (r.aborted ? '\nABORTED: deadline reached' : '');
+    const head = 'strategy                 queries  rounds       latency\n';
+    q('[data-table]').textContent = head + ORDER.map((s) => { const x = results[s]; return `${(s === strategy ? '> ' : '  ') + STRATEGY_NAME[s].padEnd(22)} ${fmtN(x.queries).padStart(8)} ${String(x.rounds).padStart(7)} ${fmtMs(x.ms).padStart(13)}${x.aborted ? '  aborted' : ''}`; }).join('\n');
+    const naive = results.naive; const batch = results.cache;
+    if (r.aborted) verdict.textContent = `Aborted at the ${fmtN(timeout)} ms deadline after ${fmtN(r.queries)} queries had already reached the database. The timeout stopped the work, but the database did it first.`;
+    else if (strategy === 'naive') verdict.textContent = `${fmtN(r.queries)} queries in ${r.rounds} rounds: every parent object issues its own lookup. ${naive.queries > batch.queries ? `Batching + cache would need ${fmtN(batch.queries)}.` : ''}`;
+    else if (strategy === 'join') verdict.textContent = `${fmtN(r.queries)} query, ${r.rounds} round trip, ${fmtN(r.rows)} rows with repeated parent columns. It only covers the shape it was written for.`;
+    else if (shape.id === 'deep' || shape.id === 'wide') verdict.textContent = `Only ${fmtN(r.queries)} queries, but the response has ${fmtN(r.objects)} objects and ${fmtMs(r.objects * OBJ_MS)} of resolver CPU. Batching hides the cost from the database, not from your server: add a depth or cost limit.`;
+    else verdict.textContent = `${fmtN(r.queries)} queries instead of ${fmtN(naive.queries)} (${Math.round(naive.queries / r.queries)}x fewer), ${fmtMs(r.ms)} instead of ${fmtMs(naive.ms)}.`;
+  }
+  function schedule_() { if (raf) return; raf = requestAnimationFrame(() => { raf = 0; show(); }); }
+  function reset() {
+    q<HTMLSelectElement>('[data-shape]').value = 'c'; q<HTMLSelectElement>('[data-strategy]').value = 'naive';
+    q<HTMLSelectElement>('[data-guard]').value = 'off'; q<HTMLSelectElement>('[data-timeout]').value = '0'; show();
+  }
+  for (const s of ['[data-shape]', '[data-strategy]', '[data-guard]', '[data-timeout]']) q(s).addEventListener('change', schedule_);
+  q('[data-reset]').addEventListener('click', reset);
+  show();
+});
+</script>
+<style is:global>
+  .playground .gq-pre { margin: 0; overflow-x: auto; white-space: pre; }
+</style>

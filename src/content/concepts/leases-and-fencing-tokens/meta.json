@@ -1,0 +1,80 @@
+{
+  "name": "Leases and Fencing Tokens",
+  "area": "distributed",
+  "difficulty": "advanced",
+  "intent": "Give a node temporary ownership of a resource that expires on its own, and use a monotonically increasing token so the resource itself can refuse a holder whose lease has been lost.",
+  "scenario": "Worker A holds a 10 second lease to write a shared file. A garbage collection pause freezes it from t=3 to t=18. The lease expires at t=10 and Worker B is granted it. When A wakes up it still believes it is the owner and writes: without fencing tokens the file is corrupted, with them the storage rejects the stale write.",
+  "problem": "A plain lock held by a crashed node blocks everyone forever, so locks need an expiry. But expiry is a judgement made by one machine's clock about another machine's liveness, and it can be wrong: a holder can be alive yet frozen by a stop-the-world GC, a VM migration, a swapped-out page or a delayed packet. It wakes up after its lease expired and another node was granted it, still believing it is the owner. Checking the lease before acting does not help, because the pause can happen right after the check. Safety cannot depend on the holder noticing.",
+  "howItWorks": [
+    {
+      "title": "Grant a time-limited lease",
+      "text": "A node asks the lease service (a replicated store such as etcd, ZooKeeper or Chubby, or a conditional write on an object) for a resource. If nobody holds a live lease it gets one that expires at a deadline. If the holder crashes, the lease simply runs out and the resource becomes available again, which a plain lock cannot do. The grantor measures the duration on its own clock, which is the only clock that matters for expiry."
+    },
+    {
+      "title": "Renew well before expiry",
+      "text": "A healthy holder renews periodically, typically every one third to one half of the lease duration, so one or two lost renewals do not lose the lease. Kubernetes node heartbeats use a Lease object renewed about every 10 seconds, and leader election defaults are around a 15 second lease with 10 second renew deadline and 2 second retry period. The holder should stop using the lease a safety margin before the grantor will expire it, to absorb clock drift (commonly well under 0.1 percent, so milliseconds per lease) and renewal latency."
+    },
+    {
+      "title": "The hole: pauses and delays make the holder wrong",
+      "text": "Holder-side checks protect against slow clocks, not against pauses. A holder that checks 'is my lease valid?' and is then frozen for 15 seconds, or whose request sits in a network queue, performs the action after the lease is gone. Stop-the-world pauses of seconds to minutes happen in practice (GC, VM live migration, a laptop lid, a stalled disk), so a lease alone gives mutual exclusion only in the absence of pauses."
+    },
+    {
+      "title": "Issue a fencing token with every grant",
+      "text": "Each time the lease service grants a lease to a new holder it also returns a number that is strictly larger than any it has issued before: a counter, a Raft log index, a ZooKeeper zxid or znode version, or an etcd revision. The holder must attach that token to every request it sends to the resource."
+    },
+    {
+      "title": "The resource rejects stale tokens",
+      "text": "The storage remembers the highest token it has accepted and rejects any request with a lower one. A frozen holder wakes up, sends its write with the old token, and is refused; it then learns it lost the lease. Safety now comes from the resource, which sees every write in one order, not from clocks or from the client's good behaviour. This is the same idea as a conditional write (compare-and-swap on a version or ETag) and as an epoch number in Raft or Paxos."
+    },
+    {
+      "title": "Tune the duration for failover, not for safety",
+      "text": "With fencing, the lease duration only decides how fast a crashed holder is replaced and how much renewal traffic you pay for. Short leases (a few seconds) fail over quickly but expire spuriously during GC pauses or network blips and multiply renewal load. Long leases (30 to 60 seconds or more) are calm but leave the resource unowned for that long after a real crash."
+    }
+  ],
+  "pros": [
+    "A crashed or partitioned holder cannot block the resource forever, which a plain lock cannot guarantee",
+    "Fencing tokens make correctness independent of clocks, GC pauses and network delays",
+    "The check is one integer comparison in the resource, so it is cheap and easy to reason about",
+    "The lease duration becomes a pure tuning knob for failover time versus renewal load"
+  ],
+  "cons": [
+    "Without fencing, a lease gives only best-effort mutual exclusion: two owners are possible",
+    "The resource must cooperate and persist the highest token, and many third-party systems cannot",
+    "After a crash the resource stays unavailable for up to the full lease duration",
+    "Renewals are traffic and a dependency on the lease service, and a lease service outage expires every lease at once",
+    "Holders must handle losing the lease at any instruction and stop work safely"
+  ],
+  "whenToUse": [
+    "Exactly one writer or leader must act on a shared resource and holders can crash or stall",
+    "Leader leases for lease-based reads (Raft leader leases, Spanner leader leases) where the leader serves reads locally while its lease is valid",
+    "Coordinating batch workers, schedulers or singleton jobs where a duplicate run corrupts data",
+    "Failure detection with cheap soft state, such as node heartbeats or session leases"
+  ],
+  "whenNotToUse": [
+    "Efficiency-only locking, where a rare duplicate run just wastes some work: a plain best-effort lease is enough",
+    "Operations that are already idempotent or protected by a conditional write on the data itself, which makes the lock redundant",
+    "When the resource cannot check a token and you cannot change it: a lease then gives a false sense of safety and you need a different design",
+    "As a replacement for consensus: the lease service itself must be a replicated, linearizable store"
+  ],
+  "pitfalls": [
+    "Checking lease validity on the client right before the write and calling that safe: the pause happens after the check",
+    "Taking the token from the lease service and checking it in the client or a proxy, instead of in the storage that applies the write",
+    "Tokens that are not strictly increasing across failovers, for example a counter held in memory that restarts from zero",
+    "Using wall-clock time for the expiry decision: NTP steps or leap-second handling can move it backwards, so use a monotonic clock on each side",
+    "Choosing a lease shorter than your worst pause, so leases expire constantly and the system flaps between owners",
+    "Forgetting that the old holder may have started a side effect (an email, an external API call) that no token can undo"
+  ],
+  "related": [
+    { "kind": "concept", "slug": "leader-election" },
+    { "kind": "concept", "slug": "consensus" },
+    { "kind": "concept", "slug": "logical-clocks" },
+    { "kind": "concept", "slug": "health-checks" },
+    { "kind": "concept", "slug": "optimistic-concurrency-and-etags" },
+    { "kind": "concept", "slug": "failure-detection" }
+  ],
+  "roles": [
+    { "id": "lease", "label": "Lease service", "description": "Grants leases with an expiry and a strictly increasing fencing token, using its own clock." },
+    { "id": "worker", "label": "Worker", "description": "Acquires, renews and uses a lease, and attaches its token to every request. May pause without knowing." },
+    { "id": "storage", "label": "Storage", "description": "The protected resource. Remembers the highest token seen and rejects anything lower." }
+  ]
+}

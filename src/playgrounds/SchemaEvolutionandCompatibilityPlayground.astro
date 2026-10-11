@@ -1,0 +1,364 @@
+---
+import PlaygroundShell from '../components/PlaygroundShell.astro';
+---
+<PlaygroundShell title="Simulate it" hint="An order event is encoded by a producer and decoded by Billing, Shipping and Analytics. Pick a schema change and a rollout order, then see which old/new combinations decode, and how they fail.">
+  <ol class="how">
+    <li>Defaults (<b>Protobuf</b>, <b>Add an optional field</b>): all four cards are safe, and BACKWARD, FORWARD and FULL all pass. Press <b>Run all</b>: no message is bad in any step, in either rollout order.</li>
+    <li>Choose <b>Reuse a field number</b>: with Protobuf both cards that cross versions show <b>WRONG VALUE</b>, not a crash. Money-like numbers are read as a different field and nothing alerts you. Switch to <b>Avro</b>, or to <b>JSON</b> with <b>Tolerant readers</b> ticked, and every message is readable again, because they match fields by name (strict JSON still crashes on the unknown property).</li>
+    <li>Choose <b>Add a required field</b>: only the old-data-to-new-reader card breaks (BACKWARD fails). Compare <b>Producer first</b> with <b>Consumers first</b> and press <b>Run all</b>: producer first breaks only the 2 queued old messages each new consumer reads (12 bad messages in total), consumers first also breaks the live traffic from the not yet upgraded producer (66).</li>
+    <li>Choose <b>Add an enum value</b> and press <b>Run all</b>: old readers crash on the 2 of 8 messages carrying the new value. Tick <b>Tolerant readers</b> and they route it to a default branch instead. Choose <b>Rename a field</b> and flip the format: Protobuf is fine, Avro fails one way (old readers), JSON fails both ways.</li>
+  </ol>
+  <div class="pg se" data-se>
+    <div class="pg-row">
+      <label>Format <select class="pg-in" data-fmt><option value="proto" selected>Protobuf</option><option value="avro">Avro (writer schema from a registry)</option><option value="json">JSON (typed deserializer)</option></select></label>
+      <label>Schema change <select class="pg-in" data-change></select></label>
+      <label>Rollout order <select class="pg-in" data-order><option value="producer" selected>Producer first</option><option value="consumers">Consumers first</option></select></label>
+      <label class="se-check"><input type="checkbox" data-tolerant /> Tolerant readers</label>
+    </div>
+    <p class="pg-note se-explain" data-explain></p>
+    <div class="pg-grid se-cells" data-cells></div>
+    <div class="pg-out se-verdict" data-verdict role="status"></div>
+    <div class="pg-row">
+      <button class="btn" type="button" data-step>Step</button>
+      <button class="btn pg-primary" type="button" data-run>Run all</button>
+      <button class="btn" type="button" data-reset>Reset</button>
+    </div>
+    <div class="se-scroll" tabindex="0" role="region" aria-label="Rollout table: messages decoded by each service at every deploy step">
+      <table class="se-table">
+        <caption class="pg-note">Each step: every consumer decodes 10 messages, 8 fresh from the producer at its current version and 2 old ones from the queue.</caption>
+        <thead><tr><th scope="col">Deploy step</th><th scope="col">Billing</th><th scope="col">Shipping</th><th scope="col">Analytics</th><th scope="col">Bad</th></tr></thead>
+        <tbody data-rows></tbody>
+      </table>
+    </div>
+    <p class="pg-mono" data-total></p>
+    <p class="pg-note">Assumptions: the sample order has an id, an amount in cents, a status and an optional discount; every consumer runs the same code at the same version; Avro readers get the exact writer schema from a registry; the JSON reader is a typed deserializer that rejects unknown properties unless tolerant (Jackson does by default). The Bad column counts crashes, wrong values and silently lost data. "Defaulted" and "dropped" are readable. Tolerant readers means unknown JSON properties are ignored and unknown enum values go to a default branch (Avro: an enum default symbol); Protobuf already skips unknown fields. Compatibility modes are read off the data here; real registries compare schemas, and the TRANSITIVE variants repeat the check against every earlier version rather than only the previous one. Fresh messages carry the new enum value in 2 of every 8.</p>
+  </div>
+</PlaygroundShell>
+<script>
+  type FType = 'int' | 'str' | 'enum';
+  type Val = number | string;
+  interface Fld { key: string; name: string; num: number; type: FType; def?: Val; syms?: string[]; alias?: string }
+  type Fmt = 'proto' | 'avro' | 'json';
+  type Msg = Record<string, Val>;
+  interface Dec { crash?: string; rec: Record<string, Val>; fallback: boolean }
+  interface One { sev: number; note: string; wire: string; seen: string }
+  interface Summary { counts: number[]; worst: number; note: string; sample: One }
+
+  const SEV = ['ok', 'dropped', 'default', 'lost', 'wrong', 'crash'];
+  const SEV_LABEL = ['OK', 'OK, extra data ignored', 'OK, default used', 'DATA SILENTLY LOST', 'WRONG VALUE', 'CRASH'];
+  const BROKEN = 3; // severities from here up make a direction incompatible
+  const SYMS = ['NEW', 'PAID', 'SHIPPED'];
+  const BASE: Fld[] = [
+    { key: 'id', name: 'id', num: 1, type: 'int' },
+    { key: 'amount', name: 'amount_cents', num: 2, type: 'int' },
+    { key: 'status', name: 'status', num: 3, type: 'enum', syms: SYMS, def: 'NEW' },
+    { key: 'discount', name: 'discount_cents', num: 4, type: 'int', def: 0 },
+  ];
+  interface Change { label: string; explain: string; fix: string; apply: (f: Fld[]) => Fld[] }
+  const CHANGES: Record<string, Change> = {
+    add_optional: { label: 'Add an optional field', explain: 'v2 adds currency (field 5, string, default "USD").', fix: 'Already safe. Give the new field a default and make no reader require it.',
+      apply: (f) => [...f, { key: 'currency', name: 'currency', num: 5, type: 'str', def: 'USD' }] },
+    add_required: { label: 'Add a required field', explain: 'v2 adds currency (field 5, string) and readers insist on it.', fix: 'Expand/contract: ship it optional with a default, make every writer fill it, then enforce it once no old data or old writer remains.',
+      apply: (f) => [...f, { key: 'currency', name: 'currency', num: 5, type: 'str' }] },
+    rename: { label: 'Rename a field', explain: 'v2 renames amount_cents to total_cents (same field number 2; the Avro v2 schema declares the old name as an alias).', fix: 'Expand/contract: write both names for a deprecation window, move readers over, then stop writing the old one and reserve it. With Protobuf only generated code and JSON mappings change.',
+      apply: (f) => f.map((x) => (x.key === 'amount' ? { ...x, name: 'total_cents', alias: 'amount_cents' } : x)) },
+    remove_optional: { label: 'Remove an optional field', explain: 'v2 drops discount_cents (field 4, it had a default).', fix: 'Stop reading it first, then stop writing it, then delete it and mark the number reserved. Old readers silently see the default meanwhile.',
+      apply: (f) => f.filter((x) => x.key !== 'discount') },
+    remove_required: { label: 'Remove a required field', explain: 'v2 drops amount_cents (field 2), which old readers require.', fix: 'Make it optional with a default in a first release, wait until no reader requires it, then remove it.',
+      apply: (f) => f.filter((x) => x.key !== 'amount') },
+    type_change: { label: 'Change int to string', explain: 'v2 changes amount_cents from int to string.', fix: 'Add a new field with the new type next to the old one (expand), migrate, then retire the old field (contract). Never change a type in place.',
+      apply: (f) => f.map((x) => (x.key === 'amount' ? { ...x, type: 'str' as FType } : x)) },
+    enum_add: { label: 'Add an enum value', explain: 'v2 adds the status REFUNDED. Fresh messages carry it in 2 of every 8.', fix: 'Upgrade every reader to handle unknown values (a default branch, or an Avro enum default) before any writer emits the new value.',
+      apply: (f) => f.map((x) => (x.key === 'status' ? { ...x, syms: [...SYMS, 'REFUNDED'] } : x)) },
+    reuse: { label: 'Reuse a field number', explain: 'v2 deletes discount_cents (field 4) and adds tip_cents, also an int, with the same number 4.', fix: 'Never reuse a number. Declare reserved 4; (and the old name) when deleting, and let buf breaking enforce it. Give tip_cents a new number.',
+      apply: (f) => [...f.filter((x) => x.key !== 'discount'), { key: 'tip', name: 'tip_cents', num: 4, type: 'int', def: 0 }] },
+  };
+
+  const TOOLS: Record<string, Record<Fmt, string>> = {
+    add_optional: { proto: 'buf breaking: no findings. A registry passes BACKWARD, FORWARD and FULL.', avro: 'Registry: BACKWARD, FORWARD and FULL pass, because the new field has a default.', json: 'A JSON Schema registry passes it only if additionalProperties is not false. Strict deserializers are the real gate.' },
+    add_required: { proto: 'buf has nothing to flag (proto3 has no required), so the break is only in your validation code. A registry running BACKWARD on a schema with a required property fails it.', avro: 'Registry BACKWARD fails: the new field has no default, so the new reader cannot fill it for old data.', json: 'A JSON Schema registry in BACKWARD mode fails it: a new required property.' },
+    rename: { proto: 'buf WIRE: clean, the number is the identity. buf FILE and WIRE_JSON flag it (FIELD_SAME_NAME) because JSON mappings and generated code change.', avro: 'Registry FORWARD fails: old readers have no alias for the new name and no default. BACKWARD passes only with the alias.', json: 'Registry fails BACKWARD and FORWARD: a rename is a remove plus an add.' },
+    remove_optional: { proto: 'buf breaking: FIELD_NO_DELETE_UNLESS_NUMBER_RESERVED unless you write reserved 4; (and the name for JSON).', avro: 'Registry passes FORWARD only because the old schema gave the field a default. Removing a field without a default fails FORWARD.', json: 'Passes in BACKWARD and FORWARD only if the old reader treated it as optional.' },
+    remove_required: { proto: 'buf: FIELD_NO_DELETE_UNLESS_NUMBER_RESERVED. Old readers that validate presence fail, so treat it as FORWARD-incompatible.', avro: 'Registry FORWARD fails: the old reader requires a field the new writer no longer sends. BACKWARD passes.', json: 'Registry FORWARD fails: the old schema required the property.' },
+    type_change: { proto: 'buf breaking: FIELD_SAME_TYPE. Registry fails BACKWARD and FORWARD.', avro: 'Registry fails both directions. Avro only promotes numeric types (int to long, float, double) and string to bytes; int to string is not a promotion.', json: 'Registry fails both directions: type of a property changed.' },
+    enum_add: { proto: 'buf breaking passes (adding a value is allowed). Nothing can tell whether your switch has a default branch.', avro: 'Registry FORWARD fails unless the old reader schema has an enum default symbol; BACKWARD passes.', json: 'A JSON Schema registry usually flags the new enum value as FORWARD-incompatible.' },
+    reuse: { proto: 'buf breaking: FIELD_NO_DELETE_UNLESS_NUMBER_RESERVED. A plain registry type check can pass because both fields are ints, which is why you reserve numbers.', avro: 'Avro has no field numbers, so there is nothing to reuse. A new field must have a default; this one does.', json: 'JSON matches by name, so there is no number to reuse. A new property with a default is safe.' },
+  };
+
+  function mulberry32(seed: number) {
+    let a = seed >>> 0;
+    return () => { a = (a + 0x6d2b79f5) >>> 0; let t = Math.imul(a ^ (a >>> 15), 1 | a); t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t; return ((t ^ (t >>> 14)) >>> 0) / 4294967296; };
+  }
+  function varint(o: number[], n: number) { while (n >= 128) { o.push((n % 128) | 128); n = Math.floor(n / 128); } o.push(n); }
+  const zero = (f: Fld): Val => (f.type === 'int' ? 0 : f.type === 'str' ? '' : f.syms![0]);
+  const fv = (v: Val | undefined) => (typeof v === 'string' ? `"${v}"` : String(v));
+
+  /** One order. Only the fields the writer's schema knows are included. */
+  function genMsg(i: number, w: Fld[]): Msg {
+    const r = mulberry32(7000 + i);
+    const base: Msg = { id: 1000 + i, amount: 1500 + Math.floor(r() * 900), discount: 100 + (i % 5) * 50, currency: ['EUR', 'GBP', 'USD'][i % 3], tip: 150 + (i % 4) * 25 };
+    const st = w.find((f) => f.key === 'status');
+    base.status = st && st.syms!.length > 3 && i % 4 === 3 ? 'REFUNDED' : SYMS[i % 3];
+    const m: Msg = {};
+    for (const f of w) m[f.key] = f.type === 'str' && typeof base[f.key] === 'number' ? String(base[f.key]) : base[f.key];
+    return m;
+  }
+
+  function encode(fmt: Fmt, w: Fld[], m: Msg): { bytes?: number[]; text?: string } {
+    if (fmt === 'json') { const o: Record<string, Val> = {}; for (const f of w) o[f.name] = m[f.key]; return { text: JSON.stringify(o) }; }
+    const o: number[] = [];
+    for (const f of w) {
+      const v = m[f.key];
+      if (fmt === 'proto') varint(o, f.num * 8 + (f.type === 'str' ? 2 : 0));
+      if (f.type === 'str') { const s = String(v); varint(o, fmt === 'avro' ? s.length * 2 : s.length); for (const c of s) o.push(c.charCodeAt(0)); }
+      else if (f.type === 'enum') { const ix = f.syms!.indexOf(String(v)); varint(o, fmt === 'avro' ? ix * 2 : ix); }
+      else varint(o, fmt === 'avro' ? Number(v) * 2 : Number(v));
+    }
+    return { bytes: o };
+  }
+
+  function decodeProto(r: Fld[], bytes: number[], tolerant: boolean): Dec {
+    const seen: Record<number, { wt: number; v: Val }> = {};
+    let i = 0;
+    const rv = () => { let v = 0, m = 1, b: number; do { b = bytes[i++]; v += (b & 127) * m; m *= 128; } while (b & 128); return v; };
+    while (i < bytes.length) {
+      const tag = rv(); const num = Math.floor(tag / 8); const wt = tag % 8;
+      if (wt === 0) seen[num] = { wt, v: rv() };
+      else { const n = rv(); seen[num] = { wt, v: String.fromCharCode(...bytes.slice(i, i + n)) }; i += n; }
+    }
+    const rec: Record<string, Val> = {}; let fallback = false;
+    for (const f of r) {
+      const s = seen[f.num]; const want = f.type === 'str' ? 2 : 0;
+      if (s && s.wt === want) {
+        if (f.type === 'enum') {
+          const sym = f.syms![Number(s.v)];
+          if (sym === undefined) { if (!tolerant) return { crash: `no case for enum value ${s.v} in ${f.name}`, rec, fallback }; rec[f.name] = zero(f); fallback = true; } else rec[f.name] = sym;
+        } else rec[f.name] = s.v;
+      } else if (f.def === undefined) return { crash: `required field ${f.name} (${f.num}) is missing`, rec, fallback };
+      else rec[f.name] = zero(f); // proto3: the zero value, not the schema default
+    }
+    return { rec, fallback };
+  }
+
+  function decodeJson(r: Fld[], text: string, tolerant: boolean): Dec {
+    const o = JSON.parse(text) as Record<string, Val>; const rec: Record<string, Val> = {}; let fallback = false;
+    if (!tolerant) for (const k of Object.keys(o)) if (!r.some((f) => f.name === k)) return { crash: `unknown property "${k}" rejected`, rec, fallback };
+    for (const f of r) {
+      if (f.name in o) {
+        const v = o[f.name]; const ok = f.type === 'int' ? typeof v === 'number' : typeof v === 'string';
+        if (!ok) return { crash: `${f.name}: expected ${f.type === 'int' ? 'number' : 'string'}, got ${typeof v}`, rec, fallback };
+        if (f.type === 'enum' && !f.syms!.includes(String(v))) { if (!tolerant) return { crash: `no case for enum value ${v} in ${f.name}`, rec, fallback }; rec[f.name] = f.def!; fallback = true; } else rec[f.name] = v;
+      } else if (f.def === undefined) return { crash: `required property ${f.name} is missing`, rec, fallback };
+      else rec[f.name] = f.def;
+    }
+    return { rec, fallback };
+  }
+
+  function decodeAvro(r: Fld[], w: Fld[], bytes: number[], tolerant: boolean): Dec {
+    const rec: Record<string, Val> = {}; let fallback = false;
+    const match = (rf: Fld) => w.find((wf) => wf.name === rf.name || (rf.alias !== undefined && wf.name === rf.alias));
+    for (const rf of r) { // schema resolution happens before any data is read
+      const wf = match(rf);
+      if (wf && wf.type !== rf.type) return { crash: `cannot resolve writer ${wf.type} to reader ${rf.type} for ${rf.name}`, rec, fallback };
+      if (!wf && rf.def === undefined) return { crash: `reader field ${rf.name} has no default and the writer does not send it`, rec, fallback };
+    }
+    let i = 0;
+    const rv = () => { let v = 0, m = 1, b: number; do { b = bytes[i++]; v += (b & 127) * m; m *= 128; } while (b & 128); return v / 2; };
+    const got: Record<string, Val> = {};
+    for (const wf of w) {
+      if (wf.type === 'str') { const n = rv(); got[wf.name] = String.fromCharCode(...bytes.slice(i, i + n)); i += n; }
+      else if (wf.type === 'enum') got[wf.name] = wf.syms![rv()];
+      else got[wf.name] = rv();
+    }
+    for (const rf of r) {
+      const wf = match(rf);
+      if (!wf) { rec[rf.name] = rf.def!; continue; }
+      const v = got[wf.name];
+      if (rf.type === 'enum' && !rf.syms!.includes(String(v))) {
+        if (!tolerant) return { crash: `writer symbol ${v} is not in the reader enum and it has no default symbol`, rec, fallback };
+        rec[rf.name] = rf.def!; fallback = true;
+      } else rec[rf.name] = v;
+    }
+    return { rec, fallback };
+  }
+
+  const readerDefault = (fmt: Fmt, f: Fld): Val => (fmt === 'proto' ? zero(f) : f.def !== undefined ? f.def : zero(f));
+
+  /** Encode one message with the writer schema, decode it with the reader schema, and judge the result. */
+  function evalOne(fmt: Fmt, w: Fld[], r: Fld[], i: number, tolerant: boolean): One {
+    const msg = genMsg(i, w); const enc = encode(fmt, w, msg);
+    const hex = enc.text ?? (enc.bytes!.length > 40 ? enc.bytes!.slice(0, 40) : enc.bytes!).map((b) => b.toString(16).padStart(2, '0')).join(' ') + (enc.bytes!.length > 40 ? ' ...' : '');
+    const dec = fmt === 'json' ? decodeJson(r, enc.text!, tolerant) : fmt === 'proto' ? decodeProto(r, enc.bytes!, tolerant) : decodeAvro(r, w, enc.bytes!, tolerant);
+    if (dec.crash) return { sev: 5, note: dec.crash, wire: hex, seen: 'error: ' + dec.crash };
+    let sev = 0; let note = 'every field matches what the writer meant';
+    const bump = (s: number, n: string) => { if (s > sev) { sev = s; note = n; } };
+    for (const rf of r) {
+      const wf = w.find((x) => x.key === rf.key); const actual = dec.rec[rf.name]; const rdef = readerDefault(fmt, rf);
+      if (wf && dec.fallback && rf.type === 'enum' && !rf.syms!.includes(String(msg[wf.key]))) { bump(2, `status ${msg[wf.key]} is unknown to the reader and is routed to its default branch (${actual})`); continue; }
+      if (wf) {
+        if (actual !== msg[wf.key]) {
+          if (actual === rdef) bump(3, `${rf.name}: ${fv(msg[wf.key])} was sent but the reader saw ${fv(rdef)}`);
+          else bump(4, `${rf.name} read as ${fv(actual)} but the writer meant ${wf.name}=${fv(msg[wf.key])}`);
+        }
+      } else if (actual !== rdef) bump(4, `${rf.name} read as ${fv(actual)}, but the writer sent that number as a different field`);
+      else bump(2, `${rf.name} was not sent, the reader used ${fv(rdef)}${fmt === 'proto' && rf.def !== undefined && rf.def !== rdef ? ' (proto cannot express the default ' + fv(rf.def) + ')' : ''}`);
+    }
+    for (const wf of w) if (!r.some((x) => x.key === wf.key)) bump(1, `${wf.name} is not known to the reader and was skipped`);
+    const seen = '{' + r.map((f) => `${f.name}: ${fv(dec.rec[f.name])}`).join(', ') + '}';
+    return { sev, note, wire: hex, seen };
+  }
+
+  function summarize(fmt: Fmt, w: Fld[], r: Fld[], idx: number[], tolerant: boolean, sampleAt: number): Summary {
+    const counts = [0, 0, 0, 0, 0, 0]; let worst = 0; let note = 'every field matches what the writer meant'; let sample: One | undefined;
+    idx.forEach((i, k) => {
+      const o = evalOne(fmt, w, r, i, tolerant); counts[o.sev]++;
+      if (o.sev > worst) { worst = o.sev; note = o.note; }
+      if (k === sampleAt) sample = o;
+    });
+    return { counts, worst, note, sample: sample! };
+  }
+
+  const range = (from: number, n: number) => Array.from({ length: n }, (_, k) => from + k);
+
+  /** The 2x2 matrix: writer version by reader version, 8 messages each. */
+  function matrix(fmt: Fmt, change: string, tolerant: boolean) {
+    const v1 = BASE; const v2 = CHANGES[change].apply(BASE); const idx = range(0, 8);
+    const cell = (w: Fld[], r: Fld[]) => summarize(fmt, w, r, idx, tolerant, 3);
+    return { oo: cell(v1, v1), on: cell(v1, v2), no: cell(v2, v1), nn: cell(v2, v2) };
+  }
+
+  const fresh = 8; const queued = 2;
+  function steps(order: string) {
+    const start = { label: 'Start: everything on v1', prod: 1, cons: [1, 1, 1] };
+    const names = ['Billing', 'Shipping', 'Analytics'];
+    const out = [start];
+    const cons = [1, 1, 1]; let prod = 1;
+    const producer = () => { prod = 2; out.push({ label: 'Producer deploys v2', prod, cons: [...cons] }); };
+    if (order === 'producer') producer();
+    names.forEach((n, k) => { cons[k] = 2; out.push({ label: `${n} deploys v2`, prod, cons: [...cons] }); });
+    if (order !== 'producer') producer();
+    return out;
+  }
+
+  /** What one consumer decodes in one deploy step. */
+  function consumerStep(fmt: Fmt, change: string, tolerant: boolean, step: number, prod: number, cons: number) {
+    const v1 = BASE; const v2 = CHANGES[change].apply(BASE); const r = cons === 2 ? v2 : v1;
+    const a = summarize(fmt, prod === 2 ? v2 : v1, r, range(step * 10, fresh), tolerant, 0);
+    const b = summarize(fmt, v1, r, range(500 + step * 10, queued), tolerant, 0);
+    const counts = a.counts.map((c, k) => c + b.counts[k]);
+    return { counts, bad: counts[3] + counts[4] + counts[5], worstBad: counts[5] ? 'crash' : counts[4] ? 'wrong value' : 'lost data', defaulted: counts[2] };
+  }
+
+  function verdict(m: ReturnType<typeof matrix>, change: string, fmt: Fmt) {
+    const back = m.on.worst < BROKEN; const fwd = m.no.worst < BROKEN;
+    const silent = [m.on, m.no].some((c) => c.worst === 3 || c.worst === 4);
+    let order: string;
+    if (back && fwd) order = 'Safe in any order: both directions are readable.';
+    else if (back) order = 'Safe order: consumers first, then the producer. Producing the new shape before every reader is upgraded breaks the old readers.';
+    else if (fwd) order = 'Safe order: producer first, but the new readers cannot read the old messages already in the queue and in storage: drain or migrate them before upgrading any consumer.';
+    else order = 'No safe order exists: each order breaks something. Split the change into compatible steps (expand/contract).';
+    const mode = (ok: boolean, name: string) => `${name} ${ok ? 'pass' : 'FAIL'}`;
+    return {
+      modes: `${mode(back, 'BACKWARD')} · ${mode(fwd, 'FORWARD')} · ${mode(back && fwd, 'FULL')}`,
+      order,
+      silent: silent ? ' Nothing throws: wrong or missing values flow downstream, so only a schema check or a test catches this.' : '',
+      tool: TOOLS[change][fmt], fix: CHANGES[change].fix,
+    };
+  }
+
+  document.querySelectorAll<HTMLElement>('[data-se]').forEach((root) => {
+    const q = <T extends HTMLElement>(s: string) => root.querySelector<T>(s)!;
+    const sel = (s: string) => q<HTMLSelectElement>(s).value;
+    const changeSel = q<HTMLSelectElement>('[data-change]');
+    for (const [id, c] of Object.entries(CHANGES)) { const o = document.createElement('option'); o.value = id; o.textContent = c.label; changeSel.appendChild(o); }
+
+    // Build the four matrix cards once.
+    const cellDefs: [string, string][] = [['oo', 'Old writer to old reader'], ['on', 'Old writer to new reader (backward)'], ['no', 'New writer to old reader (forward)'], ['nn', 'New writer to new reader']];
+    const cells: Record<string, { box: HTMLElement; badge: HTMLElement; count: HTMLElement; note: HTMLElement; wire: HTMLElement; seen: HTMLElement }> = {};
+    const cellHost = q('[data-cells]');
+    for (const [id, title] of cellDefs) {
+      const box = document.createElement('div'); box.className = 'pg-box';
+      const h = document.createElement('h3'); h.textContent = title;
+      const badge = document.createElement('span'); badge.className = 'pg-mono se-badge';
+      const count = document.createElement('span'); count.className = 'pg-note';
+      const note = document.createElement('span'); note.className = 'pg-note';
+      const wire = document.createElement('span'); wire.className = 'pg-mono se-wire';
+      const seen = document.createElement('span'); seen.className = 'pg-mono se-wire';
+      box.append(h, badge, count, note, wire, seen); cellHost.appendChild(box);
+      cells[id] = { box, badge, count, note, wire, seen };
+    }
+    // Build the rollout rows once.
+    const rowHost = q('[data-rows]');
+    const rows = range(0, 5).map(() => {
+      const tr = document.createElement('tr'); const tds: HTMLElement[] = [];
+      const th = document.createElement('th'); th.scope = 'row'; tr.appendChild(th);
+      for (let k = 0; k < 4; k++) { const td = document.createElement('td'); tr.appendChild(td); tds.push(td); }
+      rowHost.appendChild(tr); return { th, tds, tr };
+    });
+
+    let shown = 0; let plan: ReturnType<typeof steps> = [];
+    const colourFor = (s: number) => (s >= BROKEN ? 'var(--bad)' : s === 0 ? 'var(--role-2)' : 'var(--role-3)');
+
+    function renderRows() {
+      let total = 0; let msgs = 0;
+      rows.forEach((row, k) => {
+        const step = plan[k]; row.th.textContent = `${k + 1}. ${step.label}`;
+        if (k >= shown) { row.tds.forEach((td) => { td.textContent = '·'; td.className = 'se-pending'; }); row.tr.classList.remove('se-now'); return; }
+        let bad = 0;
+        step.cons.forEach((cv, c) => {
+          const r = consumerStep(sel('[data-fmt]') as Fmt, sel('[data-change]'), q<HTMLInputElement>('[data-tolerant]').checked, k, step.prod, cv);
+          const td = row.tds[c]; bad += r.bad; msgs += fresh + queued;
+          td.textContent = `v${cv}: ` + (r.bad ? `${r.bad} ${r.worstBad}` : r.defaulted ? `ok, ${r.defaulted} defaulted` : 'ok');
+          td.className = r.bad ? 'se-bad' : 'se-ok';
+        });
+        total += bad; row.tds[3].textContent = String(bad); row.tds[3].className = bad ? 'se-bad' : 'se-ok';
+        row.tr.classList.toggle('se-now', k === shown - 1);
+      });
+      q('[data-total]').textContent = shown === 0 ? 'Press Step to deploy one service at a time.' : `Deployed ${shown} of ${plan.length} steps: ${total} bad of ${msgs} messages decoded so far.`;
+      q<HTMLButtonElement>('[data-step]').disabled = shown >= plan.length; q<HTMLButtonElement>('[data-run]').disabled = shown >= plan.length;
+    }
+
+    function recompute() {
+      const fmt = sel('[data-fmt]') as Fmt; const change = sel('[data-change]'); const tolerant = q<HTMLInputElement>('[data-tolerant]').checked;
+      q('[data-explain]').textContent = CHANGES[change].explain;
+      const m = matrix(fmt, change, tolerant);
+      for (const [id] of cellDefs) {
+        const s = m[id as keyof typeof m]; const c = cells[id];
+        c.box.style.setProperty('--c', colourFor(s.worst));
+        c.badge.textContent = SEV_LABEL[s.worst];
+        c.count.textContent = s.worst === 0 ? 'all 8 messages decode cleanly' : `${s.counts[s.worst]} of 8 messages: ${SEV[s.worst]}`;
+        c.note.textContent = s.note;
+        c.wire.textContent = 'wire: ' + s.sample.wire;
+        c.seen.textContent = 'reader sees: ' + s.sample.seen;
+      }
+      const v = verdict(m, change, fmt);
+      q('[data-verdict]').textContent = `${v.modes}. ${v.order}${v.silent} Schema check: ${v.tool} Fix: ${v.fix}`;
+      q('[data-verdict]').classList.toggle('bad', m.on.worst >= BROKEN || m.no.worst >= BROKEN);
+      plan = steps(sel('[data-order]')); shown = 0; renderRows();
+    }
+    function advance(all: boolean) { shown = all ? plan.length : Math.min(plan.length, shown + 1); renderRows(); }
+
+    root.querySelectorAll('select, input[type=checkbox]').forEach((el) => el.addEventListener('change', recompute));
+    q('[data-step]').addEventListener('click', () => advance(false));
+    q('[data-run]').addEventListener('click', () => advance(true));
+    q('[data-reset]').addEventListener('click', () => { shown = 0; renderRows(); });
+    recompute();
+  });
+</script>
+<style is:global>
+  .playground .se-check { display: inline-flex; align-items: center; gap: 6px; }
+  .playground .se { display: grid; gap: 12px; }
+  .playground .se-explain { margin: 0; }
+  .playground .se-cells { grid-template-columns: repeat(auto-fit, minmax(min(100%, 250px), 1fr)); }
+  .playground .se-badge { font-weight: 700; }
+  .playground .se-wire { color: var(--muted); }
+  .playground .se-verdict { white-space: normal; line-height: 1.5; }
+  .playground .se-scroll { overflow-x: auto; border: 1px solid var(--border); border-radius: 8px; }
+  .playground .se-table { border-collapse: collapse; width: 100%; font-size: .85rem; min-width: 560px; }
+  .playground .se-table caption { text-align: left; padding: 6px 10px; }
+  .playground .se-table th, .playground .se-table td { padding: 6px 10px; border-top: 1px solid var(--border); text-align: left; white-space: nowrap; }
+  .playground .se-table thead th { background: var(--surface-2); border-top: 0; }
+  .playground .se-pending { color: var(--muted); }
+  .playground .se-bad { color: var(--bad-text); font-weight: 600; }
+  .playground .se-now th, .playground .se-now td { background: var(--accent-soft); }
+</style>

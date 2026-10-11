@@ -1,0 +1,206 @@
+---
+import PlaygroundShell from '../components/PlaygroundShell.astro';
+---
+<PlaygroundShell title="Simulate it" hint="Support agents edit customer records. Each edit reads a record, takes 30 to 100 ms to type, then saves it with one more note. Pick how the server guards the save and watch which edits survive.">
+  <ol class="how">
+    <li>Start with <b>No check (last write wins)</b>, 6 agents, 2 customers (seed 1). Every save is accepted and nobody sees an error, yet 39 of the 72 notes are missing from the final records. Raise <b>Customers shared</b> to 20 and the loss falls to 3, because agents rarely touch the same record.</li>
+    <li>Switch to <b>Version check, auto-retry</b>: nothing is lost (0), but there are 82 refused saves (412) and retries, and the worst edit takes 990 ms instead of 110 ms. Put 12 agents on 1 customer and the retries pile up: 496 retries and 17 edits give up after 8 attempts.</li>
+    <li><b>Version check, reject only</b> is cheap and also loses nothing, but it pushes the work back on the agent: with the defaults 38 of 72 edits are refused and must be redone by hand.</li>
+    <li><b>Pessimistic lock</b> never loses an edit and never retries, but agents wait (about 85 ms on average at the defaults). Put 12 agents on 1 customer and 63 edits give up at the 400 ms lock timeout. Set <b>Each edit touches</b> to 2 customers, share 3, with 8 agents and two agents grab the same two records in opposite order: deadlocks, which only the lock timeout breaks.</li>
+  </ol>
+  <div class="pg oc" data-oc>
+    <div class="pg-row">
+      <label>Strategy <select class="pg-in" data-strategy>
+        <option value="lww" selected>No check (last write wins)</option>
+        <option value="retry">Version check, auto-retry</option>
+        <option value="reject">Version check, reject only</option>
+        <option value="lock">Pessimistic lock with timeout</option>
+      </select></label>
+      <label>Agents <input type="range" min="2" max="16" value="6" data-clients /> <b data-clientsval>6</b></label>
+      <label>Customers shared <input type="range" min="1" max="20" value="2" data-records /> <b data-recordsval>2</b></label>
+    </div>
+    <div class="pg-row">
+      <label>Each edit touches <select class="pg-in" data-per><option value="1" selected>1 customer</option><option value="2">2 customers (e.g. a merge)</option></select></label>
+      <label>Lock timeout (ms) <input type="range" min="100" max="1000" step="50" value="400" data-timeout /> <b data-timeoutval>400</b></label>
+      <button class="btn" type="button" data-reroll>New interleaving</button>
+      <button class="btn" type="button" data-reset>Reset to seed 1</button>
+      <span class="pg-note">Seed <b data-seed>1</b></span>
+    </div>
+    <div class="pg-out" data-verdict role="status"></div>
+    <div class="pg-grid">
+      <div class="pg-box" style="--c: var(--role-1)"><h3>Edits saved</h3><span class="pg-mono" data-saved></span><span class="pg-note" data-savednote></span></div>
+      <div class="pg-box" data-lostbox><h3>Lost updates</h3><span class="pg-mono" data-lost></span><span class="pg-note" data-lostnote></span></div>
+      <div class="pg-box" style="--c: var(--role-3)"><h3>Latency per edit</h3><span class="pg-mono" data-lat></span><span class="pg-note">from first read to saved</span></div>
+      <div class="pg-box" style="--c: var(--role-4)"><h3>Conflicts and waiting</h3><span class="pg-mono" data-conf></span><span class="pg-note" data-confnote></span></div>
+    </div>
+    <div class="oc-scroll" tabindex="0" role="region" aria-label="Comparison of the four strategies on the same interleaving"><table class="oc-table"><thead><tr><th scope="col">Strategy</th><th scope="col">Lost</th><th scope="col">Conflicts</th><th scope="col">Retries</th><th scope="col">Failed</th><th scope="col">Avg ms</th><th scope="col">Worst ms</th><th scope="col">Kept per s</th></tr></thead><tbody data-rows></tbody></table></div>
+    <h3>First notable events</h3>
+    <ol class="pg-log" data-log tabindex="0" aria-label="First notable events of the selected strategy"></ol>
+    <p class="pg-note">Model: 10 ms ticks, a read takes 10 ms, typing takes 30 to 100 ms (scaled down so runs stay short), each agent makes 12 edits and pauses 30 to 150 ms between them, and every edit adds one note to the customer record(s). A lost update is an acknowledged note missing from the final record. Version check: the save carries the version it read and is refused when the version moved. Auto-retry re-reads after a jittered exponential back-off and gives up after 8 retries. Reject only drops the edit (the agent must redo it). The lock is FIFO per customer, held from before the read until the save, and an agent that waits longer than the timeout gives the edit up. Saves in the same tick are applied in a seeded random order. Kept per s counts saved edits that survive per second of simulated time.</p>
+  </div>
+</PlaygroundShell>
+<script>
+  type Strategy = 'lww' | 'retry' | 'reject' | 'lock';
+  interface Params { strategy: Strategy; clients: number; records: number; perEdit: number; timeout: number; seed: number }
+  interface Result {
+    strategy: Strategy; expected: number; final: number; lost: number; acked: number; failed: number; conflicts: number; retries: number;
+    gaveUp: number; rejected: number; timeouts: number; deadlocks: number; avgMs: number; worstMs: number; perSec: number; avgWaitMs: number; worstWaitMs: number;
+    makespanMs: number; events: string[];
+  }
+  const EDITS = 12; const TICK_MS = 10; const MAX_RETRY = 8; const READ_T = 1;
+  function prng(seed: number) { let s = seed >>> 0; return () => { s = (s + 0x6d2b79f5) >>> 0; let t = s; t = Math.imul(t ^ (t >>> 15), t | 1); t ^= t + Math.imul(t ^ (t >>> 7), t | 61); return ((t ^ (t >>> 14)) >>> 0) / 4294967296; }; }
+
+  interface Client {
+    id: number; phase: 'idle' | 'lockwait' | 'reading' | 'thinking' | 'backoff' | 'done'; timer: number; done: number;
+    recs: number[]; snap: number[][]; start: number; attempt: number; lockIdx: number; waitStart: number; held: number[];
+  }
+
+  function simulate(p: Params): Result {
+    const rnd = prng(p.seed * 7919 + 17);
+    const M = p.records; const per = Math.min(p.perEdit, M); const timeoutTicks = Math.round(p.timeout / TICK_MS);
+    const value = new Array<number>(M).fill(0); const ver = new Array<number>(M).fill(0);
+    const holder = new Array<number>(M).fill(-1); const queue: number[][] = Array.from({ length: M }, () => []);
+    const clients: Client[] = Array.from({ length: p.clients }, (_, id) => ({ id, phase: 'idle', timer: Math.floor(rnd() * 10), done: 0, recs: [], snap: [], start: 0, attempt: 0, lockIdx: 0, waitStart: 0, held: [] }));
+    const r: Result = { strategy: p.strategy, expected: 0, final: 0, lost: 0, acked: 0, failed: 0, conflicts: 0, retries: 0, gaveUp: 0, rejected: 0, timeouts: 0, deadlocks: 0, avgMs: 0, worstMs: 0, perSec: 0, avgWaitMs: 0, worstWaitMs: 0, makespanMs: 0, events: [] };
+    let latSum = 0; let waitSum = 0; let waitN = 0; let t = 0; let ackedWrites = 0;
+    const log = (s: string) => { if (r.events.length < 12) r.events.push(`t=${t * TICK_MS} ms  ${s}`); };
+    const name = (c: Client) => `Agent ${c.id + 1}`;
+    const recName = (c: Client) => c.recs.map((x) => `#${x + 1}`).join(' + ');
+    const finishEdit = (c: Client, gap = true) => { c.done++; c.phase = c.done >= EDITS ? 'done' : 'idle'; c.timer = gap ? 3 + Math.floor(rnd() * 12) : 0; };
+    const release = (c: Client) => { c.held.forEach((x) => { holder[x] = -1; }); c.held = []; };
+    const beginRead = (c: Client) => { c.phase = 'reading'; c.timer = READ_T; };
+    const cycle = (c: Client) => {
+      let cur = c; const seen = new Set<number>();
+      while (cur.phase === 'lockwait' && !seen.has(cur.id)) {
+        seen.add(cur.id); const h = holder[cur.recs[cur.lockIdx]];
+        if (h < 0) return false; if (h === c.id) return true; cur = clients[h];
+      }
+      return false;
+    };
+    const ack = (c: Client) => { const lat = t - c.start + 1; latSum += lat; r.worstMs = Math.max(r.worstMs, lat * TICK_MS); r.acked++; ackedWrites += c.recs.length; finishEdit(c); };
+
+    while (clients.some((c) => c.phase !== 'done') && t < 200000) {
+      const order = clients.map((c) => c.id);
+      for (let i = order.length - 1; i > 0; i--) { const j = Math.floor(rnd() * (i + 1)); [order[i], order[j]] = [order[j], order[i]]; }
+      for (const id of order) {
+        const c = clients[id];
+        if (c.phase === 'done') continue;
+        if (c.phase === 'idle') {
+          if (c.timer > 0) { c.timer--; continue; }
+          const first = Math.floor(rnd() * M); c.recs = [first];
+          if (per === 2) { let second = Math.floor(rnd() * (M - 1)); if (second >= first) second++; c.recs.push(second); }
+          c.start = t; c.attempt = 0;
+          if (p.strategy === 'lock') { c.phase = 'lockwait'; c.lockIdx = 0; c.waitStart = t; } else beginRead(c);
+        }
+        if (c.phase === 'lockwait') {
+          const rec = c.recs[c.lockIdx];
+          if (!queue[rec].includes(c.id)) queue[rec].push(c.id);
+          if (holder[rec] < 0 && queue[rec][0] === c.id) {
+            queue[rec].shift(); holder[rec] = c.id; c.held.push(rec); c.lockIdx++;
+            if (c.lockIdx >= c.recs.length) { const w = t - c.waitStart; waitSum += w; waitN++; r.worstWaitMs = Math.max(r.worstWaitMs, w * TICK_MS); beginRead(c); continue; }
+          } else if (t - c.waitStart >= timeoutTicks) {
+            const dead = cycle(c); r.timeouts++; if (dead) r.deadlocks++;
+            log(`${name(c)} gave up waiting for the lock on customer #${rec + 1} after ${t - c.waitStart} ticks${dead ? ' (deadlock: it holds a lock the holder needs)' : ''}`);
+            queue[rec] = queue[rec].filter((x) => x !== c.id); release(c); r.failed++; finishEdit(c); continue;
+          } else continue;
+        }
+        if (c.phase === 'reading') {
+          if (--c.timer > 0) continue;
+          c.snap = c.recs.map((x) => [value[x], ver[x]]);
+          if (r.events.length < 4) log(`${name(c)} reads customer ${recName(c)} (v${c.snap.map((s) => s[1]).join(', v')})`);
+          c.phase = 'thinking'; c.timer = 3 + Math.floor(rnd() * 8); continue;
+        }
+        if (c.phase === 'backoff') { if (--c.timer <= 0) beginRead(c); continue; }
+        if (c.phase === 'thinking') {
+          if (--c.timer > 0) continue;
+          if (p.strategy === 'lww') {
+            c.recs.forEach((x, k) => { if (ver[x] !== c.snap[k][1]) log(`${name(c)} saves customer #${x + 1} from v${c.snap[k][1]} over v${ver[x]}: ${ver[x] - c.snap[k][1]} newer edit(s) silently overwritten`); value[x] = c.snap[k][0] + 1; ver[x]++; });
+            ack(c);
+          } else if (p.strategy === 'lock') {
+            c.recs.forEach((x, k) => { value[x] = c.snap[k][0] + 1; ver[x]++; });
+            release(c); ack(c);
+          } else if (c.recs.every((x, k) => ver[x] === c.snap[k][1])) {
+            c.recs.forEach((x, k) => { value[x] = c.snap[k][0] + 1; ver[x]++; }); ack(c);
+          } else {
+            r.conflicts++;
+            const x = c.recs.find((y, k) => ver[y] !== c.snap[k][1])!;
+            if (p.strategy === 'reject') { log(`${name(c)} save refused (412): customer #${x + 1} is v${ver[x]}, they saw v${c.snap[c.recs.indexOf(x)][1]}. They must reload and redo`); r.rejected++; r.failed++; finishEdit(c); }
+            else {
+              c.attempt++;
+              if (c.attempt > MAX_RETRY) { log(`${name(c)} gave up after ${MAX_RETRY} retries`); r.gaveUp++; r.failed++; finishEdit(c); }
+              else { r.retries++; log(`${name(c)} save refused (412) on customer #${x + 1}: re-read and retry #${c.attempt}`); c.phase = 'backoff'; c.timer = 1 + Math.floor(rnd() * 2 ** Math.min(c.attempt, 4)); }
+            }
+          }
+        }
+      }
+      t++;
+    }
+    r.expected = ackedWrites; r.final = value.reduce((a, b) => a + b, 0); r.lost = r.expected - r.final;
+    r.avgMs = r.acked ? Math.round((latSum * TICK_MS) / r.acked) : 0;
+    r.makespanMs = t * TICK_MS; r.perSec = Math.round(((r.final / per) * 1000) / Math.max(1, r.makespanMs) * 10) / 10;
+    r.avgWaitMs = waitN ? Math.round((waitSum * TICK_MS) / waitN) : 0;
+    return r;
+  }
+
+  const NAMES: Record<Strategy, string> = { lww: 'No check (last write wins)', retry: 'Version check, auto-retry', reject: 'Version check, reject only', lock: 'Pessimistic lock with timeout' };
+  const ORDER: Strategy[] = ['lww', 'retry', 'reject', 'lock'];
+  document.querySelectorAll<HTMLElement>('[data-oc]').forEach((root) => {
+    const q = <T extends HTMLElement>(s: string) => root.querySelector<T>(s)!;
+    const val = (s: string) => Number(q<HTMLInputElement>(s).value);
+    let seed = 1; let queued = false;
+    const rows = ORDER.map((st) => {
+      const tr = document.createElement('tr'); tr.innerHTML = '<th scope="row"></th>' + '<td></td>'.repeat(7);
+      tr.querySelector('th')!.textContent = NAMES[st]; q('[data-rows]').appendChild(tr);
+      return { st, tr, cells: Array.from(tr.querySelectorAll('td')) };
+    });
+    function render() {
+      queued = false;
+      const p = { clients: val('[data-clients]'), records: val('[data-records]'), perEdit: val('[data-per]'), timeout: val('[data-timeout]'), seed };
+      const sel = q<HTMLSelectElement>('[data-strategy]').value as Strategy;
+      q('[data-clientsval]').textContent = String(p.clients); q('[data-recordsval]').textContent = String(p.records);
+      q('[data-timeoutval]').textContent = String(p.timeout); q('[data-seed]').textContent = String(seed);
+      q<HTMLInputElement>('[data-timeout]').disabled = sel !== 'lock';
+      const total = p.clients * EDITS; const per = Math.min(p.perEdit, p.records);
+      const results = {} as Record<Strategy, Result>;
+      ORDER.forEach((st) => { results[st] = simulate({ ...p, strategy: st }); });
+      rows.forEach(({ st, tr, cells }) => {
+        const r = results[st]; const v = [r.lost, r.conflicts, r.retries, r.failed, r.avgMs, r.worstMs, r.perSec];
+        v.forEach((x, i) => { cells[i].textContent = String(x); });
+        tr.classList.toggle('sel', st === sel);
+      });
+      const r = results[sel];
+      const keptEdits = Math.round(r.final / per);
+      q('[data-saved]').textContent = `${r.acked} of ${total}`;
+      q('[data-savednote]').textContent = r.failed ? `${r.failed} edits failed and were not saved` : 'every edit was acknowledged';
+      q('[data-lost]').textContent = `${r.lost} of ${r.expected}`;
+      q('[data-lostnote]').textContent = r.lost ? `${keptEdits} edits' worth of notes survive` : 'every acknowledged note is in the record';
+      q<HTMLElement>('[data-lostbox]').style.setProperty('--c', r.lost ? 'var(--bad)' : 'var(--role-2)');
+      q('[data-lat]').textContent = `avg ${r.avgMs} ms, worst ${r.worstMs} ms`;
+      q('[data-conf]').textContent = sel === 'lock' ? `wait avg ${r.avgWaitMs} ms, worst ${r.worstWaitMs} ms` : `${r.conflicts} conflicts, ${r.retries} retries`;
+      q('[data-confnote]').textContent = sel === 'lock' ? `${r.timeouts} lock timeouts, ${r.deadlocks} of them deadlocks` : sel === 'lww' ? 'nothing is checked, so nothing is detected' : sel === 'retry' ? `${r.gaveUp} edits gave up after ${MAX_RETRY} retries` : `${r.rejected} edits refused with 412`;
+      const verdict = q('[data-verdict]');
+      let text: string;
+      if (sel === 'lww') text = r.lost ? `${r.lost} of ${r.expected} acknowledged notes are gone and no agent saw an error. The server said OK every time.` : 'No loss on this run: the agents never overlapped on a record. Add agents or share fewer customers.';
+      else if (sel === 'retry') text = `0 lost. ${r.conflicts} saves were refused and ${r.retries} were retried; ${r.gaveUp ? `${r.gaveUp} edits still gave up after ${MAX_RETRY} retries` : 'every edit eventually saved'}. Worst edit: ${r.worstMs} ms.`;
+      else if (sel === 'reject') text = `0 lost. ${r.rejected} of ${total} edits were refused and need a manual redo (reload, re-apply, save).`;
+      else text = `0 lost. Agents waited ${r.avgWaitMs} ms on average (worst ${r.worstWaitMs} ms); ${r.timeouts} edits hit the lock timeout${r.deadlocks ? `, ${r.deadlocks} of them deadlocks that only the timeout could break` : ''}.`;
+      verdict.textContent = text; verdict.classList.toggle('bad', sel === 'lww' && r.lost > 0);
+      const log = q('[data-log]'); log.textContent = '';
+      (r.events.length ? r.events : ['No conflicts or timeouts on this run.']).forEach((e) => { const li = document.createElement('li'); li.textContent = e; log.appendChild(li); });
+    }
+    function schedule() { if (queued) return; queued = true; requestAnimationFrame(render); }
+    ['[data-strategy]', '[data-clients]', '[data-records]', '[data-per]', '[data-timeout]'].forEach((s) => q(s).addEventListener('input', schedule));
+    q('[data-reroll]').addEventListener('click', () => { seed++; schedule(); });
+    q('[data-reset]').addEventListener('click', () => { seed = 1; schedule(); });
+    render();
+  });
+</script>
+<style is:global>
+  .playground .oc-scroll { overflow-x: auto; }
+  .playground .oc-table { border-collapse: collapse; font-size: .85rem; width: 100%; }
+  .playground .oc-table th, .playground .oc-table td { border-bottom: 1px solid var(--border); padding: 5px 8px; text-align: right; white-space: nowrap; font-variant-numeric: tabular-nums; }
+  .playground .oc-table th[scope='row'], .playground .oc-table thead th:first-child { text-align: left; }
+  .playground .oc-table tr.sel { background: var(--accent-soft); font-weight: 600; }
+  .playground .oc h3 { margin: 4px 0 0; }
+  .playground .oc .pg-box h3 { margin: 0; font-size: 1rem; }
+</style>

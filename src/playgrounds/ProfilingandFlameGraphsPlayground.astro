@@ -1,0 +1,243 @@
+---
+import PlaygroundShell from '../components/PlaygroundShell.astro';
+---
+<PlaygroundShell title="Simulate it" hint="Sample the stacks of the GET /orders handler, merge them into a flame graph, and see what the sample rate, the mode and the regression change.">
+  <ol class="how">
+    <li>With the defaults (100 Hz for 10 s = 1,000 samples, CPU mode, regression <b>on</b>) the flame graph shows one wide plateau: <b>encode_loop</b> is roughly 58% of the width. <b>serialize</b> is roughly 65% total but only a few percent self: it is wide because of its callee. The request costs 2,000 microseconds of CPU.</li>
+    <li>Untick the regression: <b>encode_loop</b> drops to roughly 17% and the request costs 1,000 microseconds. Put the regression back and set <b>Colours</b> to <b>Diff vs baseline</b>: encode_loop and every frame above it down to the root (its callers) turn red, everything else stays grey.</li>
+    <li>Watch <b>audit_log</b> (3% of CPU without the regression, 1.5% with it). At 100 Hz for 10 s it gets about 15 samples and the interval is about half the value. At 10 Hz for 10 s it gets a handful and the interval is wider than the estimate; at 10 Hz for 1 s it is usually not seen at all. At 1000 Hz for 60 s it gets hundreds of samples and the error is about 0.1 point, but the profiler costs about 10% of a core. <b>New random seed</b> shows how much a short profile varies.</li>
+    <li>Switch to <b>Wall-clock</b>: waiting on the database socket (about 54% of 5,600 microseconds) and a mutex appear, and encode_loop shrinks to roughly 20%. A CPU profile never shows those waits (watch socket_wait in CPU mode: no frame).</li>
+    <li>Tick <b>Inlined frames lost</b> (CPU mode): json_encode and encode_loop are folded into serialize, which now looks like the culprit with roughly 65% self, and the name of the real loop is gone.</li>
+  </ol>
+  <div class="pg pf" data-pf>
+    <div class="pg-row">
+      <label>Sample rate <select class="pg-in" data-rate><option value="10">10 Hz</option><option value="100" selected>100 Hz</option><option value="1000">1000 Hz</option></select></label>
+      <label>Duration <select class="pg-in" data-dur><option value="1">1 s</option><option value="10" selected>10 s</option><option value="60">60 s</option></select></label>
+      <label>Mode <select class="pg-in" data-mode><option value="cpu" selected>CPU time</option><option value="wall">Wall-clock time</option></select></label>
+      <label>Colours <select class="pg-in" data-colour><option value="depth" selected>By depth</option><option value="diff">Diff vs baseline</option></select></label>
+    </div>
+    <div class="pg-row">
+      <label class="pf-check"><input type="checkbox" checked data-regress /> Release 412 regression (O(n^2) loop in encode_loop)</label>
+      <label class="pf-check"><input type="checkbox" data-inline /> Inlined frames lost</label>
+    </div>
+    <div class="pg-row">
+      <label>Function to watch <select class="pg-in" data-watch></select></label>
+      <button class="btn" type="button" data-reseed>New random seed</button>
+      <button class="btn" type="button" data-reset>Reset</button>
+      <span class="pg-note" data-seedlabel></span>
+    </div>
+    <div class="pg-grid">
+      <div class="pg-box" style="--c: var(--role-1)"><h3>Samples</h3><span class="pg-mono" data-n></span><span class="pg-note">rate x duration</span></div>
+      <div class="pg-box" data-ovbox style="--c: var(--role-2)"><h3>Profiler overhead</h3><span class="pg-mono" data-ov></span><span class="pg-note">assumes about 100 microseconds per sample (signal, stack walk, buffer write)</span></div>
+      <div class="pg-box" style="--c: var(--role-3)"><h3>True cost per request</h3><span class="pg-mono" data-req></span><span class="pg-note" data-reqnote></span></div>
+    </div>
+    <div class="pf-flame" data-flame role="img" aria-label="Flame graph"></div>
+    <p class="pg-note" data-legend></p>
+    <div class="pg-out" data-verdict aria-live="polite"></div>
+    <div class="pf-scroll" tabindex="0" role="region" aria-label="Estimate of the watched function as the number of samples grows">
+      <table class="pf-table"><thead><tr><th scope="col">Samples</th><th scope="col">Hits</th><th scope="col">Estimate</th><th scope="col">95% interval</th></tr></thead><tbody data-err></tbody></table>
+    </div>
+    <div class="pf-scroll" tabindex="0" role="region" aria-label="Self and total time per function">
+      <table class="pf-table"><thead><tr><th scope="col">Function</th><th scope="col">Self</th><th scope="col">Total</th><th scope="col">True self</th><th scope="col">Change per request</th></tr></thead><tbody data-fn></tbody></table>
+    </div>
+  </div>
+</PlaygroundShell>
+<script>
+  // ---- core (pure) ----
+  const INLINED = new Set(['json_encode', 'encode_loop', 'regex_match']);
+  const CPU: [string, number][] = [
+    ['handler', 160], ['handler;auth', 120], ['handler;route', 80], ['handler;parse', 60], ['handler;parse;regex_match', 100],
+    ['handler;db_query', 50], ['handler;db_query;driver_decode', 90], ['handler;serialize', 50], ['handler;serialize;json_encode', 90],
+    ['handler;serialize;json_encode;encode_loop', 170], ['handler;audit_log', 30],
+  ];
+  const WAIT: [string, number][] = [['handler;db_query;socket_wait', 3000], ['handler;mutex_wait', 600]];
+  const REG_FN = 'encode_loop'; const REG_EXTRA = 1000; const COST_US = 100; const MAX_N = 60000; const DIFF_US = 60;
+  const NAMES = ['handler', 'auth', 'route', 'parse', 'regex_match', 'db_query', 'driver_decode', 'serialize', 'json_encode', 'encode_loop', 'audit_log', 'socket_wait', 'mutex_wait'];
+
+  // microseconds per request by (merged) stack, for the mode, the regression flag and inlining
+  function pathWeights(mode: string, regress: boolean, inl: boolean): Map<string, number> {
+    const m = new Map<string, number>();
+    for (const [s, w] of mode === 'wall' ? CPU.concat(WAIT) : CPU) {
+      let fr = s.split(';'); const leaf = fr[fr.length - 1];
+      const wt = w + (regress && leaf === REG_FN ? REG_EXTRA : 0);
+      if (inl) fr = fr.filter((f) => !INLINED.has(f));
+      const k = fr.join(';'); m.set(k, (m.get(k) || 0) + wt);
+    }
+    return m;
+  }
+  // MINSTD generator (x * 48271 mod 2^31-1); exact in doubles. Returns the index of the sampled stack for each of n samples.
+  function stream(weights: number[], seed: number, n: number): Int32Array {
+    const cum: number[] = []; let t = 0;
+    for (const w of weights) { t += w; cum.push(t); }
+    let x = (seed * 7919 + 13) % 2147483646 + 1;
+    for (let i = 0; i < 8; i++) x = (x * 48271) % 2147483647;
+    const out = new Int32Array(n);
+    for (let i = 0; i < n; i++) {
+      x = (x * 48271) % 2147483647; const r = x % t;
+      let lo = 0; let hi = cum.length - 1;
+      while (lo < hi) { const mid = (lo + hi) >> 1; if (cum[mid] > r) hi = mid; else lo = mid + 1; }
+      out[i] = lo;
+    }
+    return out;
+  }
+  function countsAt(s: Int32Array, k: number, len: number): Int32Array {
+    const c = new Int32Array(len); for (let i = 0; i < k; i++) c[s[i]]++; return c;
+  }
+  // 95% half-width in percentage points for k hits in n samples
+  function halfWidth(k: number, n: number): number { const p = k / n; return 196 * Math.sqrt(p * (1 - p) / n); }
+  function verdict(name: string, k: number, n: number, truePct: number): string {
+    if (truePct === 0 && k === 0) return `${name} has no frame in this profile (it is either not on the CPU in this mode, or inlined into its caller). A profile can only show what it samples and symbolizes.`;
+    const est = (100 * k) / n;
+    if (k === 0) return `${name} is truly ${truePct.toFixed(1)}% but got 0 of ${n} samples: it is invisible here. Raise the rate or the duration.`;
+    const rel = (halfWidth(k, n) / est);
+    if (k < 5 || rel > 0.5) return `${name}: ${k} samples, estimate ${est.toFixed(1)}% plus or minus ${halfWidth(k, n).toFixed(1)} points (true ${truePct.toFixed(1)}%). Visible, but too few samples to trust the number.`;
+    return `${name}: ${k} samples, estimate ${est.toFixed(1)}% plus or minus ${halfWidth(k, n).toFixed(1)} points (true ${truePct.toFixed(1)}%). Measured well enough to act on.`;
+  }
+  // ---- DOM ----
+  interface FNode { key: string; name: string; depth: number; kids: FNode[]; self: number; total: number; el: HTMLElement; bar: HTMLElement; row?: HTMLTableRowElement; cells?: HTMLElement[] }
+
+  document.querySelectorAll<HTMLElement>('[data-pf]').forEach((root) => {
+    const q = <T extends HTMLElement>(s: string) => root.querySelector<T>(s)!;
+    const sel = (s: string) => q<HTMLSelectElement>(s).value;
+    const reduced = window.matchMedia('(prefers-reduced-motion: reduce)').matches;
+    let seed = 1; let queued = false;
+
+    // fixed union tree of every stack that can occur
+    const nodes = new Map<string, FNode>();
+    const mk = (key: string, name: string, depth: number): FNode => {
+      const el = document.createElement('div'); el.className = 'pf-node';
+      const bar = document.createElement('div'); bar.className = 'pf-bar';
+      const kidsEl = document.createElement('div'); kidsEl.className = 'pf-kids';
+      el.appendChild(bar); el.appendChild(kidsEl);
+      return { key, name, depth, kids: [], self: 0, total: 0, el, bar };
+    };
+    const rootNode = mk('', 'all', 0); nodes.set('', rootNode);
+    for (const mode of ['cpu', 'wall']) for (const inl of [false, true]) {
+      for (const k of pathWeights(mode, true, inl).keys()) {
+        const fr = k.split(';');
+        for (let i = 1; i <= fr.length; i++) {
+          const key = fr.slice(0, i).join(';');
+          if (!nodes.has(key)) {
+            const n = mk(key, fr[i - 1], i); nodes.set(key, n);
+            const parent = nodes.get(fr.slice(0, i - 1).join(';'))!; parent.kids.push(n);
+          }
+        }
+      }
+    }
+    nodes.forEach((n) => { n.kids.sort((a, b) => (a.name < b.name ? -1 : 1)); const kidsEl = n.el.lastElementChild as HTMLElement; n.kids.forEach((c) => kidsEl.appendChild(c.el)); });
+    q('[data-flame]').appendChild(rootNode.el);
+    const byDepth = [...nodes.values()].sort((a, b) => b.depth - a.depth);
+    const list = [...nodes.values()].filter((n) => n !== rootNode);
+
+    NAMES.forEach((nm) => { const o = document.createElement('option'); o.value = nm; o.textContent = nm; if (nm === 'audit_log') o.selected = true; q('[data-watch]').appendChild(o); });
+    const errBody = q('[data-err]'); const errRows: HTMLElement[][] = [];
+    for (let i = 0; i < 6; i++) { const tr = document.createElement('tr'); const cells: HTMLElement[] = []; for (let j = 0; j < 4; j++) { const td = document.createElement('td'); tr.appendChild(td); cells.push(td); } errBody.appendChild(tr); errRows.push([tr, ...cells]); }
+    const fnBody = q('[data-fn]');
+    list.forEach((n) => { const tr = document.createElement('tr'); const cells: HTMLElement[] = []; for (let j = 0; j < 5; j++) { const td = document.createElement('td'); tr.appendChild(td); cells.push(td); } n.row = tr; n.cells = cells; fnBody.appendChild(tr); });
+
+    const pc = (x: number) => `${(100 * x).toFixed(1)}%`;
+    function rollup() { byDepth.forEach((n) => { n.total = n.self + n.kids.reduce((a, c) => a + c.total, 0); }); }
+
+    function update() {
+      queued = false;
+      const rate = Number(sel('[data-rate]')); const dur = Number(sel('[data-dur]')); const mode = sel('[data-mode]'); const diff = sel('[data-colour]') === 'diff';
+      const regress = q<HTMLInputElement>('[data-regress]').checked; const inl = q<HTMLInputElement>('[data-inline]').checked; const watch = sel('[data-watch]');
+      const N = rate * dur;
+      const pw = pathWeights(mode, regress, inl); const keys = [...pw.keys()]; const ws = [...pw.values()];
+      const base = pathWeights(mode, false, inl);
+      const TT = ws.reduce((a, b) => a + b, 0); const TB = [...base.values()].reduce((a, b) => a + b, 0);
+      const st = stream(ws, seed, MAX_N); const cnt = countsAt(st, N, keys.length);
+
+      // true and baseline totals (microseconds per request) and sampled counts per node
+      const trueTot = new Map<string, number>(); const baseTot = new Map<string, number>();
+      nodes.forEach((n) => { n.self = 0; });
+      keys.forEach((k, i) => { nodes.get(k)!.self = cnt[i]; });
+      rollup();
+      const rollUs = (src: Map<string, number>, out: Map<string, number>) => {
+        nodes.forEach((n) => out.set(n.key, 0));
+        src.forEach((w, k) => { const fr = k.split(';'); for (let i = 0; i <= fr.length; i++) { const key = fr.slice(0, i).join(';'); out.set(key, (out.get(key) || 0) + w); } });
+      };
+      rollUs(pw, trueTot); rollUs(base, baseTot);
+
+      // flame graph
+      const tops: string[] = [];
+      nodes.forEach((n) => {
+        const parent = n === rootNode ? null : nodes.get(n.key.includes(';') ? n.key.slice(0, n.key.lastIndexOf(';')) : '')!;
+        const share = n.total / N; const w = parent ? (parent.total ? (100 * n.total) / parent.total : 0) : 100;
+        n.el.style.display = n.total > 0 ? '' : 'none'; n.el.style.width = `${w}%`;
+        const estUs = share * TT; const delta = estUs - (baseTot.get(n.key) || 0);
+        let c = `var(--role-${(n.depth % 6) + 1})`;
+        if (diff) c = delta > DIFF_US ? 'var(--bad)' : delta < -DIFF_US ? 'var(--good)' : 'var(--border)';
+        n.bar.style.setProperty('--c', c);
+        n.bar.textContent = share >= 0.06 ? `${n.name} ${pc(share)}` : n.name;
+        n.bar.title = `${n.name}: total ${pc(share)} (${n.total} samples), self ${pc(n.self / N)}; change vs baseline ${delta >= 0 ? '+' : ''}${Math.round(delta)} us per request`;
+      });
+      const topSelf = list.filter((n) => n.self > 0).sort((a, b) => b.self - a.self).slice(0, 3).map((n) => `${n.name} ${pc(n.self / N)}`).join(', ');
+      q('[data-flame]').setAttribute('aria-label', `Flame graph of ${N} samples. Largest self time: ${topSelf}.`);
+      q('[data-legend]').textContent = diff
+        ? `Red: at least ${DIFF_US} microseconds per request more than the baseline (the same profile without the regression); green: that much less; grey: within noise. Width is still the share of samples; the x axis is not time.`
+        : 'Width is the share of samples that contain the frame; the root is at the bottom and callees stack above. Siblings are sorted alphabetically, so the x axis is NOT time. The part of a bar not covered by the bars above it is its self time.';
+
+      // header boxes
+      q('[data-n]').textContent = `${N.toLocaleString('en-US')} samples`;
+      const ov = (rate * COST_US) / 10000;
+      q('[data-ov]').textContent = `${ov.toFixed(2)}% of a core`;
+      q('[data-ovbox]').style.setProperty('--c', ov >= 5 ? 'var(--bad)' : 'var(--role-2)');
+      q('[data-req]').textContent = `${TT.toLocaleString('en-US')} us ${mode === 'wall' ? 'wall' : 'CPU'}`;
+      q('[data-reqnote]').textContent = regress ? `baseline without the regression: ${TB.toLocaleString('en-US')} us` : 'no regression';
+      q('[data-seedlabel]').textContent = `seed ${seed}`;
+
+      // watched function, with the estimate as samples accumulate
+      const isW = (k: string) => k.split(';').pop() === watch;
+      const flag = new Uint8Array(keys.length); keys.forEach((k, i) => { flag[i] = isW(k) ? 1 : 0; });
+      let trueW = 0; keys.forEach((k, i) => { if (flag[i]) trueW += ws[i]; });
+      const truePct = (100 * trueW) / TT;
+      const cps = [10, 100, 1000, 10000, 60000]; if (!cps.includes(N)) cps.push(N); cps.sort((a, b) => a - b);
+      let hits = 0; let pos = 0;
+      cps.forEach((k, r) => {
+        for (; pos < k; pos++) hits += flag[st[pos]];
+        const row = errRows[r]; row[0].style.display = '';
+        const est = (100 * hits) / k;
+        row[1].textContent = k.toLocaleString('en-US') + (k === N ? ' (now)' : ''); row[2].textContent = String(hits);
+        row[3].textContent = `${est.toFixed(1)}%`; row[4].textContent = hits === 0 ? 'none seen' : `${Math.max(0, est - halfWidth(hits, k)).toFixed(1)}% to ${(est + halfWidth(hits, k)).toFixed(1)}%`;
+        row[0].className = k === N ? 'pf-now' : '';
+      });
+      for (let r = cps.length; r < errRows.length; r++) errRows[r][0].style.display = 'none';
+      let hitsN = 0; for (let i = 0; i < N; i++) hitsN += flag[st[i]];
+      const vEl = q('[data-verdict]'); vEl.textContent = verdict(watch, hitsN, N, truePct);
+      vEl.classList.toggle('bad', hitsN === 0 && truePct > 0);
+
+      // per-function table, sorted by self samples
+      const rows = list.filter((n) => n.total > 0 || (trueTot.get(n.key) || 0) > 0).sort((a, b) => b.self - a.self || (a.name < b.name ? -1 : 1));
+      list.forEach((n) => { n.row!.hidden = !(rows.includes(n)); });
+      rows.forEach((n) => {
+        const ts = pw.get(n.key) || 0; const dlt = (n.total / N) * TT - (baseTot.get(n.key) || 0);
+        n.cells![0].textContent = n.name; n.cells![1].textContent = `${pc(n.self / N)} (${n.self})`; n.cells![2].textContent = pc(n.total / N);
+        n.cells![3].textContent = pc(ts / TT); n.cells![4].textContent = `${dlt >= 0 ? '+' : ''}${Math.round(dlt)} us`;
+        fnBody.appendChild(n.row!);
+      });
+    }
+    const schedule = () => { if (queued) return; queued = true; if (reduced) update(); else requestAnimationFrame(update); };
+    root.querySelectorAll('select, input[type=checkbox]').forEach((el) => el.addEventListener('change', schedule));
+    q('[data-reseed]').addEventListener('click', () => { seed++; schedule(); });
+    q('[data-reset]').addEventListener('click', () => {
+      seed = 1; q<HTMLSelectElement>('[data-rate]').value = '100'; q<HTMLSelectElement>('[data-dur]').value = '10'; q<HTMLSelectElement>('[data-mode]').value = 'cpu';
+      q<HTMLSelectElement>('[data-colour]').value = 'depth'; q<HTMLSelectElement>('[data-watch]').value = 'audit_log';
+      q<HTMLInputElement>('[data-regress]').checked = true; q<HTMLInputElement>('[data-inline]').checked = false; schedule();
+    });
+    update();
+  });
+</script>
+<style is:global>
+  .playground .pf-check { display: inline-flex; align-items: center; gap: 6px; }
+  .playground .pf-flame { border: 1px solid var(--border); border-radius: 8px; background: var(--surface); padding: 8px; overflow: hidden; min-height: 60px; }
+  .playground .pf-node { flex: 0 0 auto; display: flex; flex-direction: column-reverse; min-width: 0; }
+  .playground .pf-kids { display: flex; align-items: flex-end; width: 100%; min-width: 0; }
+  .playground .pf-bar { height: 24px; box-sizing: border-box; border: 1px solid var(--c, var(--border)); background: color-mix(in srgb, var(--c, var(--border)) 32%, var(--surface)); color: var(--text); font: .72rem ui-monospace, monospace; line-height: 22px; padding: 0 4px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; border-radius: 2px; }
+  .playground .pf-scroll { overflow-x: auto; max-width: 100%; }
+  .playground .pf-table { border-collapse: collapse; width: 100%; font: .82rem ui-monospace, monospace; }
+  .playground .pf-table th, .playground .pf-table td { text-align: left; padding: 4px 10px; border-bottom: 1px solid var(--border); white-space: nowrap; }
+  .playground .pf-table th { color: var(--muted); font-weight: 600; }
+  .playground .pf-table tr.pf-now td { background: var(--accent-soft); }
+  .playground .pf-table tr[hidden] { display: none; }
+</style>

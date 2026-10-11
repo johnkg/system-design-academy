@@ -1,0 +1,220 @@
+---
+import PlaygroundShell from '../components/PlaygroundShell.astro';
+---
+<PlaygroundShell title="Simulate it" hint="An order queue where 2% of messages have a bad address. Pick what happens to a message that keeps failing, then step through time.">
+  <ol class="how">
+    <li>Start as it is: <b>Retry forever</b>, <b>ordered per key</b>. Press <b>Run</b> (or drag the time slider to the end). The 4 poison messages sit in 3 of the 4 partitions and pin them: by tick 150 only <b>101 of 200</b> orders are delivered, <b>99 are waiting</b>, and <b>380 attempts</b> were wasted on poison.</li>
+    <li>Switch to <b>Retry 3 times, then park in the DLQ</b>. The same 4 messages cost 12 attempts, <b>196</b> orders are delivered on time and the 4 poison messages wait in the DLQ with their error and attempt count. <b>Retry 3 times, then drop</b> delivers the same 196 but the DLQ stays empty: the 4 orders are lost.</li>
+    <li>With the DLQ, set the retry limit to <b>1</b>: the 14 healthy orders that failed once (a timeout) are parked too, 18 in all. Turn on <b>Classify bad address as permanent</b> and wasted attempts drop from 12 to 4, because a validation error is not retried.</li>
+    <li>Tick <b>Deploy a fix at tick 90 and redrive</b> with the DLQ: the 4 parked orders are replayed and all <b>200</b> are delivered, but in ordered mode <b>118</b> pairs of messages are now delivered out of order. Switch to <b>Unordered</b> with <b>Retry forever</b>: the poison messages burn workers instead of blocking a key, and only 164 are delivered.</li>
+  </ol>
+  <div class="pg dl" data-dl>
+    <div class="pg-row">
+      <label>When a message fails <select class="pg-in" data-policy>
+        <option value="forever" selected>Retry forever (in place)</option>
+        <option value="drop">Retry N times, then drop</option>
+        <option value="dlq">Retry N times, then park in the DLQ</option>
+        <option value="backoff">Delayed retries (2, 4, 8 ticks), then DLQ</option>
+      </select></label>
+      <label>Ordering <select class="pg-in" data-order>
+        <option value="ordered" selected>Ordered per key (4 partitions)</option>
+        <option value="unordered">Unordered (shared pool of 4 workers)</option>
+      </select></label>
+      <label>Retry limit (attempts) <input type="range" min="1" max="8" value="3" data-limit /> <b data-limitval>3</b></label>
+      <label>Bad address rate <input type="range" min="0" max="10" value="2" data-bad /> <b data-badval>2</b>%</label>
+    </div>
+    <div class="pg-row">
+      <label class="dl-check"><input type="checkbox" data-classify /> Classify bad address as permanent (do not retry)</label>
+      <label class="dl-check"><input type="checkbox" data-fix /> Deploy a fix at tick 90 and redrive the DLQ</label>
+    </div>
+    <div class="pg-row">
+      <button class="btn pg-primary" type="button" data-step>Step 1 tick</button>
+      <button class="btn pg-primary" type="button" data-run>Run</button>
+      <button class="btn" type="button" data-reset>Reset</button>
+      <label>Time (tick) <input type="range" min="0" max="149" value="0" data-time /> <b data-timeval>0</b> of 150</label>
+    </div>
+    <div class="pg-grid dl-workers" data-workers></div>
+    <div class="pg-grid">
+      <div class="pg-box" style="--c: var(--role-2)"><h3>Delivered</h3><span class="pg-mono" data-delivered></span><span class="pg-note" data-late></span></div>
+      <div class="pg-box" data-waitbox style="--c: var(--role-3)"><h3>Waiting</h3><span class="pg-mono" data-waiting></span><span class="pg-note" data-oldest></span></div>
+      <div class="pg-box" data-dropbox style="--c: var(--border)"><h3>Dropped (lost)</h3><span class="pg-mono" data-dropped></span><span class="pg-note">gone for good</span></div>
+      <div class="pg-box" data-dlqbox style="--c: var(--role-1)"><h3>Dead-letter queue</h3><span class="pg-mono" data-dlq></span><span class="pg-note" data-dlqnote></span></div>
+    </div>
+    <div class="dl-chart" role="img" aria-label="Orders delivered per 10 ticks" data-chart></div>
+    <div class="dl-axis" aria-hidden="true"><span>tick 0</span><span>dashed line: arrival rate, 30 orders per 10 ticks</span><span>150</span></div>
+    <p class="pg-mono" data-stats></p>
+    <p class="pg-out" data-verdict aria-live="polite"></p>
+    <p class="pg-note">Model: 200 orders arrive, 3 per tick. Four workers each make one attempt per tick (ordered mode: one worker per partition, key = order number mod 4). The bad address rate sets how many orders are poison and they always fail. A separate 8% of orders fail their first 1 or 2 attempts (a timeout) and then succeed. In-place retries go back to the head of the queue; delayed retries rejoin the back after 2, 4, 8 ticks. An order older than 10 ticks, or never delivered, counts as late. Out of order pairs are counted per key. One fixed seed, so every run is reproducible.</p>
+  </div>
+</PlaygroundShell>
+<script>
+  type Policy = 'forever' | 'drop' | 'dlq' | 'backoff';
+  interface Cfg { policy: Policy; limit: number; ordered: boolean; classify: boolean; badPct: number; fix: boolean }
+  interface Msg { id: number; part: number; arrival: number; poison: boolean; transient: boolean; tf: number; tries: number; doneAt: number; state: string }
+  interface Snap { t: number; delivered: number; dropped: number; parked: number; parkedPoison: number; parkedGood: number; waiting: number; oldest: number; attempts: number; wasted: number; goodLate: number; tickDelivered: number; workers: string[]; inversions: number; redriven: number }
+
+  const N = 200; const W = 4; const PER_TICK = 3; const HORIZON = 150; const FIX_TICK = 89; const LATE = 10; const TRANSIENT = 0.08; const SEED = 10; const BUCKET = 10;
+
+  function mulberry32(a: number) { return function () { a |= 0; a = (a + 0x6d2b79f5) | 0; let t = Math.imul(a ^ (a >>> 15), 1 | a); t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t; return ((t ^ (t >>> 14)) >>> 0) / 4294967296; }; }
+
+  // Pure core: the same worker loop as the code samples, over a seeded message list.
+  function simulate(cfg: Cfg): Snap[] {
+    const rnd = mulberry32(SEED);
+    const ms: Msg[] = [];
+    for (let i = 0; i < N; i++) {
+      const rp = rnd(); const rt = rnd(); const rf = rnd();
+      const poison = rp < cfg.badPct / 100;
+      ms.push({ id: i, part: i % W, arrival: Math.floor(i / PER_TICK), poison, transient: !poison && rt < TRANSIENT, tf: rf < 0.5 ? 1 : 2, tries: 0, doneAt: -1, state: 'new' });
+    }
+    const queues: Msg[][] = cfg.ordered ? Array.from({ length: W }, () => []) : [[]];
+    const qOf = (m: Msg) => queues[cfg.ordered ? m.part : 0];
+    let delayed: { m: Msg; due: number }[] = [];
+    const dlq: Msg[] = []; let fixed = false;
+    let delivered = 0; let dropped = 0; let attempts = 0; let wasted = 0; let redriven = 0; let inversions = 0;
+    const snaps: Snap[] = [];
+    for (let t = 0; t < HORIZON; t++) {
+      if (cfg.fix && t === FIX_TICK) {
+        fixed = true; // the bug is fixed, so the parked messages can now succeed
+        while (dlq.length) { const m = dlq.shift()!; m.tries = 0; m.state = 'queued'; qOf(m).push(m); redriven++; }
+      }
+      ms.forEach((m) => { if (m.arrival === t) { m.state = 'queued'; qOf(m).push(m); } });
+      const due = delayed.filter((d) => d.due <= t); delayed = delayed.filter((d) => d.due > t);
+      due.forEach((d) => { d.m.state = 'queued'; qOf(d.m).push(d.m); });
+      const picks: (Msg | null)[] = [];
+      for (let w = 0; w < W; w++) { const q = queues[cfg.ordered ? w : 0]; picks.push(q.length ? q.shift()! : null); }
+      const front: Msg[] = []; const workers: string[] = []; let tickDelivered = 0;
+      picks.forEach((m) => {
+        if (!m) { workers.push('idle'); return; }
+        m.tries++; attempts++;
+        const permanent = m.poison && !fixed;
+        const fail = permanent || (m.transient && m.tries <= m.tf);
+        if (!fail) {
+          m.state = 'done'; m.doneAt = t; delivered++; tickDelivered++; workers.push(`ok #${m.id}`);
+          if (cfg.ordered) ms.forEach((o) => { if (o.part === m.part && o.id > m.id && o.state === 'done') inversions++; });
+          return;
+        }
+        if (permanent) wasted++;
+        workers.push(`${permanent ? 'poison' : 'retry'} #${m.id}`);
+        if (cfg.policy === 'forever') { front.push(m); return; }
+        if ((cfg.classify && permanent) || m.tries >= cfg.limit) {
+          if (cfg.policy === 'drop') { m.state = 'dropped'; dropped++; } else { m.state = 'dlq'; dlq.push(m); }
+        } else if (cfg.policy === 'backoff') { m.state = 'delayed'; delayed.push({ m, due: t + 2 * Math.pow(2, m.tries - 1) }); }
+        else front.push(m);
+      });
+      for (let i = front.length - 1; i >= 0; i--) { front[i].state = 'queued'; qOf(front[i]).unshift(front[i]); }
+      let waiting = 0; let oldest = 0; let goodLate = 0;
+      ms.forEach((m) => {
+        if (m.state === 'queued' || m.state === 'delayed') { waiting++; oldest = Math.max(oldest, t - m.arrival); }
+        if (!m.poison) {
+          const age = m.state === 'done' ? m.doneAt - m.arrival : m.state === 'new' ? 0 : t - m.arrival;
+          if (age > LATE) goodLate++;
+        }
+      });
+      const parkedPoison = dlq.filter((m) => m.poison && !fixed).length;
+      snaps.push({ t, delivered, dropped, parked: dlq.length, parkedPoison, parkedGood: dlq.length - parkedPoison, waiting, oldest, attempts, wasted, goodLate, tickDelivered, workers, inversions, redriven });
+    }
+    return snaps;
+  }
+
+  function verdict(s: Snap, cfg: Cfg): string {
+    const out: string[] = [];
+    if (s.waiting > 0 && s.oldest > LATE) out.push(`${s.waiting} orders are waiting, the oldest for ${s.oldest} ticks.`);
+    if (s.wasted > 0 && cfg.policy === 'forever') out.push(`${s.wasted} attempts have been spent on orders that can never succeed.`);
+    if (s.dropped > 0) out.push(`${s.dropped} orders were dropped and cannot be recovered.`);
+    if (s.parked > 0) out.push(`${s.parked} in the DLQ: ${s.parkedPoison} poison${s.parkedGood ? `, ${s.parkedGood} healthy orders parked by mistake (limit too low)` : ''}.`);
+    if (s.redriven > 0) out.push(`${s.redriven} orders redriven after the fix.`);
+    if (!out.length) out.push(s.t < 2 ? 'Press Step or Run.' : 'No order is late, lost or parked so far.');
+    return out.join(' ');
+  }
+
+  document.querySelectorAll<HTMLElement>('[data-dl]').forEach((root) => {
+    const q = <T extends HTMLElement>(s: string) => root.querySelector<T>(s)!;
+    const val = (s: string) => Number(q<HTMLInputElement>(s).value);
+    const cfg = (): Cfg => ({ policy: q<HTMLSelectElement>('[data-policy]').value as Policy, limit: val('[data-limit]'), ordered: q<HTMLSelectElement>('[data-order]').value === 'ordered', classify: q<HTMLInputElement>('[data-classify]').checked, badPct: val('[data-bad]'), fix: q<HTMLInputElement>('[data-fix]').checked });
+    let snaps: Snap[] = []; let tick = 0; let timer: number | undefined; let onScreen = true; let raf = 0; let running = false;
+    const reduce = window.matchMedia('(prefers-reduced-motion: reduce)').matches;
+
+    const wcells: { box: HTMLElement; name: HTMLElement; what: HTMLElement }[] = [];
+    for (let w = 0; w < W; w++) {
+      const box = document.createElement('div'); box.className = 'pg-box dl-w';
+      box.innerHTML = '<h3></h3><span class="pg-mono"></span>';
+      q('[data-workers]').appendChild(box);
+      wcells.push({ box, name: box.querySelector('h3')!, what: box.querySelector('span')! });
+    }
+    const bars: { fill: HTMLElement; col: HTMLElement }[] = [];
+    for (let b = 0; b < HORIZON / BUCKET; b++) {
+      const col = document.createElement('div'); col.className = 'dl-col';
+      col.innerHTML = '<div class="dl-fill"></div>';
+      q('[data-chart]').appendChild(col);
+      bars.push({ col, fill: col.firstElementChild as HTMLElement });
+    }
+    const guide = document.createElement('div'); guide.className = 'dl-guide'; q('[data-chart]').appendChild(guide);
+
+    function compute() { snaps = simulate(cfg()); tick = Math.min(tick, snaps.length - 1); }
+    function draw() {
+      raf = 0;
+      const c = cfg(); const s = snaps[tick];
+      q('[data-limitval]').textContent = String(c.limit); q('[data-badval]').textContent = String(c.badPct);
+      q<HTMLInputElement>('[data-limit]').disabled = c.policy === 'forever';
+      q<HTMLInputElement>('[data-time]').value = String(tick); q('[data-timeval]').textContent = String(tick + 1);
+      q('[data-run]').textContent = running ? 'Pause' : 'Run';
+      wcells.forEach((wc, w) => {
+        const what = s.workers[w];
+        wc.name.textContent = c.ordered ? `Partition ${w + 1}` : `Worker ${w + 1}`;
+        wc.what.textContent = what;
+        const col = what.startsWith('ok') ? 'var(--good)' : what.startsWith('poison') ? 'var(--bad)' : what.startsWith('retry') ? 'var(--role-3)' : 'var(--border)';
+        wc.box.style.setProperty('--c', col);
+      });
+      q('[data-delivered]').textContent = `${s.delivered} of ${N}`;
+      q('[data-late]').textContent = `healthy orders late (over ${LATE} ticks): ${s.goodLate}`;
+      q('[data-waiting]').textContent = String(s.waiting);
+      q('[data-oldest]').textContent = s.waiting ? `oldest waiting ${s.oldest} ticks` : 'queues are empty';
+      q('[data-waitbox]').style.setProperty('--c', s.waiting && s.oldest > LATE ? 'var(--bad)' : 'var(--role-3)');
+      q('[data-dropped]').textContent = String(s.dropped);
+      q('[data-dropbox]').style.setProperty('--c', s.dropped ? 'var(--bad)' : 'var(--border)');
+      q('[data-dlq]').textContent = String(s.parked);
+      q('[data-dlqnote]').textContent = s.parked ? `${s.parkedPoison} poison, ${s.parkedGood} healthy; each keeps error, attempts, source queue` : c.policy === 'dlq' || c.policy === 'backoff' ? 'empty' : 'not used by this policy';
+      const counts: number[] = bars.map(() => 0);
+      for (let i = 0; i <= tick; i++) counts[Math.floor(i / BUCKET)] += snaps[i].tickDelivered;
+      let total = 0;
+      bars.forEach((b, i) => { total += counts[i]; b.fill.style.height = `${Math.min(100, (counts[i] / (BUCKET * W)) * 100)}%`; b.col.classList.toggle('future', i * BUCKET > tick); });
+      guide.style.bottom = `${(PER_TICK / W) * 100}%`;
+      q('[data-chart]').setAttribute('aria-label', `Orders delivered per 10 ticks: ${counts.slice(0, Math.floor(tick / BUCKET) + 1).join(', ')}`);
+      const ord = c.ordered ? `out of order pairs: ${s.inversions}` : 'ordering: not promised';
+      q('[data-stats]').textContent = `tick ${tick + 1} · attempts: ${s.attempts} · wasted on poison: ${s.wasted} · ${ord}${c.fix ? ` · fix at tick ${FIX_TICK + 1}` : ''}`;
+      q('[data-verdict]').textContent = verdict(s, c);
+    }
+    const schedule = () => { if (!raf) raf = requestAnimationFrame(draw); };
+    function clock() {
+      window.clearInterval(timer); timer = undefined;
+      if (!running || !onScreen || document.hidden) return;
+      timer = window.setInterval(() => { if (tick >= snaps.length - 1) { running = false; clock(); schedule(); return; } tick++; schedule(); }, 90);
+    }
+    function change() { compute(); schedule(); }
+    ['[data-policy]', '[data-order]', '[data-classify]', '[data-fix]'].forEach((s) => q(s).addEventListener('change', change));
+    ['[data-limit]', '[data-bad]'].forEach((s) => q(s).addEventListener('input', change));
+    q('[data-time]').addEventListener('input', () => { tick = val('[data-time]'); schedule(); });
+    q('[data-step]').addEventListener('click', () => { running = false; clock(); tick = Math.min(tick + 1, snaps.length - 1); schedule(); });
+    q('[data-run]').addEventListener('click', () => {
+      if (reduce) { tick = snaps.length - 1; running = false; schedule(); return; }
+      if (tick >= snaps.length - 1) tick = 0;
+      running = !running; clock(); schedule();
+    });
+    q('[data-reset]').addEventListener('click', () => { running = false; clock(); tick = 0; schedule(); });
+    new IntersectionObserver(([en]) => { onScreen = en.isIntersecting; clock(); }).observe(root);
+    document.addEventListener('visibilitychange', clock);
+    compute(); draw();
+  });
+</script>
+<style is:global>
+  .playground .dl-check { display: inline-flex; align-items: center; gap: 6px; }
+  .playground .dl-w h3 { font-size: .9rem; margin: 0; }
+  .playground .dl-workers { grid-template-columns: repeat(auto-fit, minmax(120px, 1fr)); }
+  .playground .dl-chart { position: relative; display: flex; align-items: flex-end; gap: 3px; height: 90px; padding: 0 2px; border-bottom: 2px solid var(--border); }
+  .playground .dl-col { flex: 1 1 0; height: 100%; display: flex; align-items: flex-end; background: var(--surface-2); border-radius: 3px 3px 0 0; }
+  .playground .dl-col.future { opacity: .45; }
+  .playground .dl-fill { width: 100%; background: var(--accent); border-radius: 3px 3px 0 0; transition: height .1s linear; }
+  .playground .dl-guide { position: absolute; left: 0; right: 0; border-top: 2px dashed var(--muted); pointer-events: none; }
+  .playground .dl-axis { display: flex; justify-content: space-between; gap: 8px; color: var(--muted); font-size: .8rem; }
+  .playground .dl-axis span:nth-child(2) { text-align: center; }
+</style>

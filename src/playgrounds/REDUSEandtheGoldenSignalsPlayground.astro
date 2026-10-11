@@ -1,0 +1,238 @@
+---
+import PlaygroundShell from '../components/PlaygroundShell.astro';
+---
+<PlaygroundShell title="Simulate it" hint="Checkout is slow this evening. A hidden fault is hiding behind a small dashboard. Choose which signals you can see, name the cause, and find out whether those signals were enough.">
+  <ol class="how">
+    <li>Pick a signal set, choose a <b>suspect</b> and press <b>Check my diagnosis</b>. The verdict tells you whether you were right and whether those signals could have told the six faults apart. It compares their fingerprints on the same dashboard.</li>
+    <li><b>Average latency only</b>: five of the six faults draw the same rising line, and a <b>bad deploy</b> is invisible (the average even falls a little, because fast errors are quick).</li>
+    <li><b>RED</b> pins four faults, but <b>pool exhaustion</b> and a <b>memory leak</b> look alike: checkout is slow and every dependency is normal. <b>USE</b> pins two, but <b>lock contention</b> and <b>pool exhaustion</b> look alike (full pool, idle database), and a slow downstream or bad deploy leaves every resource flat.</li>
+    <li><b>RED + USE</b> separates all six. After a check you can switch the set and press the button again to compare on the same incident, or press <b>New incident</b> for the next cause.</li>
+  </ol>
+  <div class="pg rg" data-rg>
+    <div class="pg-row">
+      <label>Signals shown <select class="pg-in" data-set aria-label="Signals shown">
+        <option value="avg">Average latency only</option>
+        <option value="red">RED</option>
+        <option value="use">USE</option>
+        <option value="both" selected>RED + USE</option>
+      </select></label>
+      <label>Suspected cause <select class="pg-in" data-guess aria-label="Suspected cause"></select></label>
+    </div>
+    <div class="pg-row">
+      <button class="btn pg-primary" type="button" data-check>Check my diagnosis</button>
+      <button class="btn" type="button" data-next>New incident</button>
+      <button class="btn" type="button" data-reset>Back to incident 1</button>
+    </div>
+    <p class="pg-mono" data-incident></p>
+    <div class="pg-grid rg-grid" data-cards></div>
+    <p class="pg-note">Each graph covers the last 30 minutes (left is 30 minutes ago, right is now) and starts at zero. Four services (web, checkout, payments, inventory) and a database behind a 20-connection pool sit under the checkout page. Values are synthetic and seeded: a healthy checkout has 120 requests per second, p99 220 ms, 35% of the pool in use. A fault starts about 14 minutes in, except the memory leak, which builds from minute 6.</p>
+    <div class="pg-out" role="status" aria-live="polite" data-verdict>Choose a suspect, then press Check my diagnosis.</div>
+    <h3>Fault-to-signal matrix</h3>
+    <div class="rg-wrap" tabindex="0" role="region" aria-label="Fault to signal matrix, scrolls sideways on narrow screens" data-matrix></div>
+    <p class="pg-note">Pinned means one fault produces that fingerprint. N look alike means the visible signals cannot separate N faults. Invisible means every visible signal stayed flat. Computed from the same model as the graphs, not typed in.</p>
+  </div>
+</PlaygroundShell>
+<script>
+  // ---------- simulation core (pure functions) ----------
+  type FaultId = 'lock' | 'pool' | 'downstream' | 'leak' | 'deploy' | 'spike';
+  type GroupId = 'avg' | 'red' | 'use';
+  type SetId = 'avg' | 'red' | 'use' | 'both';
+  interface MetricDef { id: string; group: GroupId; title: string; tag: string; unit: string; base: number; digits: number; up: number; down: number; min: number }
+  interface Effect { start: number; ramp: number; to: Record<string, number> }
+  const MINUTES = 30;
+  const BASE_N = 6; // first minutes form the baseline
+  const LATE_N = 5; // last minutes form the "now" value
+  const FAULT_IDS: FaultId[] = ['lock', 'pool', 'downstream', 'leak', 'deploy', 'spike'];
+  const SEQUENCE: FaultId[] = ['downstream', 'pool', 'deploy', 'leak', 'lock', 'spike'];
+  const M = (id: string, group: GroupId, title: string, tag: string, unit: string, base: number, digits: number, min: number, up = 1.5, down = 0.7): MetricDef => ({ id, group, title, tag, unit, base, digits, up, down, min });
+  const METRICS: MetricDef[] = [
+    M('avg_latency', 'avg', 'Average latency', 'Latency (mean)', 'ms', 95, 0, 20),
+    M('rate', 'red', 'Requests per second', 'RED: Rate', '/s', 120, 0, 20),
+    M('errors', 'red', 'Error ratio', 'RED: Errors', '%', 0.2, 1, 0.8),
+    M('p99_ok', 'red', 'p99 duration, successful', 'RED: Duration', 'ms', 220, 0, 80),
+    M('failed_p50', 'red', 'p50 duration, failed', 'RED: Duration of errors', 'ms', 250, 0, 100),
+    M('payments_p99', 'red', 'Payments call p99', 'RED: Duration, dependency', 'ms', 150, 0, 60),
+    M('inventory_p99', 'red', 'Inventory call p99', 'RED: Duration, dependency', 'ms', 60, 0, 30),
+    M('db_p99', 'red', 'Database query p99', 'RED: Duration, dependency', 'ms', 12, 0, 6),
+    M('cpu', 'use', 'Checkout CPU', 'USE: Utilization', '%', 40, 0, 10),
+    M('runq', 'use', 'Run queue per core', 'USE: Saturation', '', 1, 1, 1),
+    M('mem', 'use', 'Checkout memory', 'USE: Utilization', '%', 55, 0, 10),
+    M('gc', 'use', 'GC time', 'USE: Saturation', '%', 2, 0, 3),
+    M('pool_util', 'use', 'DB pool in use', 'USE: Utilization', '%', 35, 0, 10),
+    M('waiters', 'use', 'Threads waiting for a connection', 'USE: Saturation', '', 0, 0, 5),
+    M('db_cpu', 'use', 'Database CPU', 'USE: Utilization', '%', 30, 0, 8),
+  ];
+  const ids = (g: GroupId) => METRICS.filter((m) => m.group === g).map((m) => m.id);
+  const SETS: Record<SetId, { label: string; ids: string[] }> = {
+    avg: { label: 'Average latency only', ids: ids('avg') },
+    red: { label: 'RED', ids: ids('red') },
+    use: { label: 'USE', ids: ids('use') },
+    both: { label: 'RED + USE', ids: [...ids('red'), ...ids('use')] },
+  };
+  const EFFECTS: Record<FaultId, Effect> = {
+    lock: { start: 14, ramp: 3, to: { avg_latency: 520, errors: 2.0, p99_ok: 1300, failed_p50: 3000, db_p99: 900, pool_util: 100, waiters: 40, db_cpu: 14 } },
+    pool: { start: 14, ramp: 3, to: { avg_latency: 480, errors: 2.2, p99_ok: 1200, failed_p50: 3000, pool_util: 100, waiters: 55, db_cpu: 18 } },
+    downstream: { start: 14, ramp: 3, to: { avg_latency: 700, errors: 1.5, p99_ok: 2600, failed_p50: 2500, payments_p99: 2500 } },
+    leak: { start: 6, ramp: 18, to: { avg_latency: 330, errors: 1.2, p99_ok: 1100, failed_p50: 1800, cpu: 68, runq: 1.4, mem: 94, gc: 18 } },
+    deploy: { start: 14, ramp: 1, to: { avg_latency: 85, errors: 12, failed_p50: 15 } },
+    spike: { start: 14, ramp: 5, to: { avg_latency: 600, rate: 360, errors: 3.0, p99_ok: 1800, failed_p50: 3000, payments_p99: 165, inventory_p99: 66, db_p99: 14, cpu: 97, runq: 12, pool_util: 80, waiters: 3, db_cpu: 70 } },
+  };
+  const INFO: Record<FaultId, { name: string; tell: string; cure: string }> = {
+    lock: { name: 'Database lock contention', tell: 'the database query duration jumps while the pool is full and the database CPU is idle', cure: 'transactions queue on a row lock, so each holds its pooled connection for about a second' },
+    pool: { name: 'Connection pool exhaustion', tell: 'the pool is full with threads waiting, while database queries are still fast and the database is idle', cure: 'connections are leaked or held too long, so requests wait for a connection before any query is sent' },
+    downstream: { name: 'Slow downstream dependency', tell: 'only the payments call duration climbs, and every local resource looks normal', cure: 'checkout waits on payments, so its own latency rises without any of its resources being busy' },
+    leak: { name: 'Memory leak causing GC pressure', tell: 'memory climbs toward 100% with GC time and CPU, while no dependency is slow and traffic is flat', cure: 'the collector runs more and more often and pauses the service' },
+    deploy: { name: 'Bad deploy raising errors', tell: 'the error ratio jumps with fast failures, and successful latency and every resource stay normal', cure: 'the new build fails quickly, which is also why the average latency drops' },
+    spike: { name: 'Traffic spike beyond capacity', tell: 'the request rate triples while CPU and run queue saturate', cure: 'demand exceeds what the hosts can serve, so requests queue for CPU' },
+  };
+
+  function mulberry32(seed: number) {
+    let a = seed >>> 0;
+    return () => { a = (a + 0x6d2b79f5) >>> 0; let t = a; t = Math.imul(t ^ (t >>> 15), t | 1); t ^= t + Math.imul(t ^ (t >>> 7), t | 61); return ((t ^ (t >>> 14)) >>> 0) / 4294967296; };
+  }
+  const clamp = (v: number, lo: number, hi: number) => Math.max(lo, Math.min(hi, v));
+
+  // Thirty one-minute samples per metric: baseline, a ramp toward the fault value, then multiplicative noise.
+  function makeSeries(fault: FaultId, seed: number): Record<string, number[]> {
+    const rand = mulberry32(seed); const fx = EFFECTS[fault]; const out: Record<string, number[]> = {};
+    METRICS.forEach((m) => {
+      const to = fx.to[m.id] ?? m.base; const values: number[] = [];
+      for (let t = 0; t < MINUTES; t++) {
+        const ramp = clamp((t - fx.start) / fx.ramp, 0, 1);
+        let v = (m.base + (to - m.base) * ramp) * (1 + (rand() - 0.5) * 0.12);
+        const cap = m.unit === '%' && m.id !== 'errors' ? 100 : Infinity;
+        v = clamp(v, 0, cap);
+        const f = Math.pow(10, m.digits); values.push(Math.round(v * f) / f);
+      }
+      out[m.id] = values;
+    });
+    return out;
+  }
+  const avgOf = (xs: number[]) => xs.reduce((a, b) => a + b, 0) / xs.length;
+  type Token = 'flat' | 'up' | 'down' | 'high' | 'full';
+  // Turn a series into a coarse reading, like an engineer glancing at a graph: flat, up, down.
+  function tokenOf(m: MetricDef, values: number[]): Token {
+    const base = avgOf(values.slice(0, BASE_N)); const late = avgOf(values.slice(-LATE_N)); const delta = late - base;
+    if (m.id === 'errors') return late >= 5 ? 'high' : delta >= 0.8 ? 'up' : 'flat';
+    if (m.id === 'pool_util' && late >= 97) return 'full';
+    if (late >= base * m.up && delta >= m.min) return 'up';
+    if (late <= base * m.down && -delta >= m.min) return 'down';
+    return 'flat';
+  }
+  const fingerprint = (s: Record<string, number[]>, metricIds: string[]) => metricIds.map((id) => tokenOf(METRICS.find((m) => m.id === id)!, s[id]));
+  interface Analysis { candidates: FaultId[]; invisible: boolean }
+  // Which faults leave the same fingerprint as the truth on the visible signals?
+  function analyse(set: SetId, truth: FaultId, seed: number): Analysis {
+    const metricIds = SETS[set].ids; const prints = {} as Record<FaultId, string>;
+    FAULT_IDS.forEach((f) => { prints[f] = fingerprint(makeSeries(f, seed), metricIds).join(','); });
+    const flat = metricIds.map(() => 'flat').join(',');
+    return { candidates: FAULT_IDS.filter((f) => prints[f] === prints[truth]), invisible: prints[truth] === flat };
+  }
+  const cellOf = (a: Analysis) => (a.invisible ? 'Invisible' : a.candidates.length === 1 ? 'Pinned' : `${a.candidates.length} look alike`);
+  // The cheapest extra signal that tells two faults apart.
+  function separator(a: FaultId, b: FaultId, seed: number): string {
+    const pa = fingerprint(makeSeries(a, seed), SETS.both.ids); const pb = fingerprint(makeSeries(b, seed), SETS.both.ids);
+    const i = pa.findIndex((t, k) => t !== pb[k]);
+    return i < 0 ? '' : METRICS.find((m) => m.id === SETS.both.ids[i])!.title;
+  }
+  function verdict(set: SetId, truth: FaultId, guess: FaultId, seed: number): string {
+    const a = analyse(set, truth, seed); const label = SETS[set].label; const info = INFO[truth];
+    const head = guess === truth ? `Correct: ${info.name}.` : `Not this time. The cause was ${info.name}; you suspected ${INFO[guess].name}.`;
+    let body: string;
+    if (a.invisible) {
+      body = `With ${label} this fault is invisible: every signal you can see stayed flat. The real tell is that ${info.tell}.`;
+    } else if (a.candidates.length > 1) {
+      const others = a.candidates.filter((f) => f !== truth);
+      const names = a.candidates.map((f) => INFO[f].name).join(', ');
+      const sep = separator(truth, others[0], seed);
+      body = `${label} cannot separate these: ${names}. They leave the same fingerprint.${guess === truth ? ` Your answer was a guess among ${a.candidates.length}.` : ''}${sep ? ` For example, add "${sep}" to tell it from ${INFO[others[0]].name}.` : ''}`;
+    } else {
+      body = `${label} was enough: only this fault gives that fingerprint, namely ${info.tell}.`;
+    }
+    return `${head} ${body} Why: ${info.cure}.`;
+  }
+  // ---------- end core ----------
+
+  document.querySelectorAll<HTMLElement>('[data-rg]').forEach((root) => {
+    const q = <T extends HTMLElement>(s: string) => root.querySelector<T>(s)!;
+    const setSel = q<HTMLSelectElement>('[data-set]'); const guessSel = q<HTMLSelectElement>('[data-guess]');
+    const verdictEl = q('[data-verdict]');
+    let n = 0; let revealed = false; let data: Record<string, number[]> = {};
+    const fault = () => SEQUENCE[n % SEQUENCE.length]; const seed = () => 101 + n * 37;
+    const groupColour: Record<GroupId, string> = { avg: 'var(--role-3)', red: 'var(--role-1)', use: 'var(--role-2)' };
+
+    guessSel.innerHTML = '<option value="">Choose a suspect...</option>' + FAULT_IDS.map((f) => `<option value="${f}">${INFO[f].name}</option>`).join('');
+
+    // Cards are built once; sparklines and numbers are updated in place.
+    interface Card { box: HTMLElement; line: SVGPolylineElement; svg: SVGElement; nums: HTMLElement; def: MetricDef }
+    const cards: Card[] = METRICS.map((def) => {
+      const box = document.createElement('div'); box.className = 'pg-box rg-card'; box.style.setProperty('--c', groupColour[def.group]);
+      box.innerHTML = '<h3></h3><span class="pg-note"></span><svg class="rg-svg" viewBox="0 0 120 34" preserveAspectRatio="none" role="img"><line class="rg-axis" x1="0" y1="33" x2="120" y2="33"></line><polyline class="rg-line" fill="none" points=""></polyline></svg><span class="pg-mono"></span>';
+      box.querySelector('h3')!.textContent = def.title; box.querySelector('.pg-note')!.textContent = def.tag;
+      q('[data-cards]').appendChild(box);
+      return { box, def, line: box.querySelector('polyline')!, svg: box.querySelector('svg')!, nums: box.querySelector('.pg-mono')! };
+    });
+    const fmt = (m: MetricDef, v: number) => `${v.toFixed(m.digits)}${m.unit ? (m.unit === '/s' ? ' /s' : m.unit === '%' ? '%' : ' ' + m.unit) : ''}`;
+
+    // The matrix is computed once from the model.
+    (function buildMatrix() {
+      const sets: SetId[] = ['avg', 'red', 'use', 'both']; const wrap = q('[data-matrix]');
+      const table = document.createElement('table'); table.className = 'rg-table';
+      table.innerHTML = '<thead><tr><th scope="col">Hidden cause</th>' + sets.map((s) => `<th scope="col">${SETS[s].label}</th>`).join('') + '</tr></thead>';
+      const body = document.createElement('tbody');
+      FAULT_IDS.forEach((f) => {
+        const tr = document.createElement('tr'); tr.dataset.fault = f;
+        tr.innerHTML = `<th scope="row">${INFO[f].name}</th>` + sets.map((s) => { const c = cellOf(analyse(s, f, 11)); const k = c === 'Pinned' ? 'pin' : c === 'Invisible' ? 'inv' : 'amb'; return `<td class="rg-${k}" data-set="${s}">${c}</td>`; }).join('');
+        body.appendChild(tr);
+      });
+      table.appendChild(body); wrap.appendChild(table);
+    })();
+
+    function draw() {
+      const set = setSel.value as SetId; const show = new Set(SETS[set].ids);
+      cards.forEach((c) => {
+        const vals = data[c.def.id]; c.box.hidden = !show.has(c.def.id);
+        const max = Math.max(...vals, c.def.base, 1) * 1.1;
+        c.line.setAttribute('points', vals.map((v, i) => `${((i * 120) / (MINUTES - 1)).toFixed(1)},${(32 - (v / max) * 30).toFixed(1)}`).join(' '));
+        const base = avgOf(vals.slice(0, BASE_N)); const late = avgOf(vals.slice(-LATE_N));
+        c.nums.textContent = `was ${fmt(c.def, base)}, now ${fmt(c.def, late)}`;
+        c.svg.setAttribute('aria-label', `${c.def.title}: was ${fmt(c.def, base)}, now ${fmt(c.def, late)}`);
+      });
+      q('[data-incident]').textContent = `Incident ${n + 1} · seed ${seed()} · cause ${revealed ? INFO[fault()].name : 'hidden'}`;
+      root.querySelectorAll<HTMLElement>('[data-matrix] tr[data-fault]').forEach((tr) => {
+        tr.classList.toggle('rg-now', revealed && tr.dataset.fault === fault());
+        tr.querySelectorAll<HTMLElement>('td').forEach((td) => td.classList.toggle('rg-col', revealed && td.dataset.set === set));
+      });
+    }
+    function load() { data = makeSeries(fault(), seed()); draw(); }
+    function check() {
+      const g = guessSel.value as FaultId | '';
+      if (!g) { verdictEl.textContent = 'Pick a suspect first, then press Check my diagnosis.'; verdictEl.classList.remove('bad'); return; }
+      revealed = true; verdictEl.textContent = verdict(setSel.value as SetId, fault(), g, seed());
+      verdictEl.classList.toggle('bad', g !== fault()); draw();
+    }
+    function fresh(next: number) { n = next; revealed = false; guessSel.value = ''; verdictEl.textContent = 'Choose a suspect, then press Check my diagnosis.'; verdictEl.classList.remove('bad'); load(); }
+    setSel.addEventListener('change', () => { draw(); });
+    q('[data-check]').addEventListener('click', check);
+    q('[data-next]').addEventListener('click', () => fresh(n + 1));
+    q('[data-reset]').addEventListener('click', () => fresh(0));
+    load();
+  });
+</script>
+<style is:global>
+  .playground .rg-grid { grid-template-columns: repeat(auto-fill, minmax(150px, 1fr)); }
+  .playground .rg-card[hidden] { display: none; }
+  .playground .rg-card h3 { font-size: .85rem; line-height: 1.25; }
+  .playground .rg-svg { width: 100%; height: 44px; display: block; }
+  .playground .rg-line { stroke: var(--c); stroke-width: 1.8; vector-effect: non-scaling-stroke; stroke-linejoin: round; }
+  .playground .rg-axis { stroke: var(--border); stroke-width: 1; vector-effect: non-scaling-stroke; }
+  .playground .rg-wrap { overflow-x: auto; }
+  .playground .rg-table { border-collapse: collapse; font-size: .85rem; min-width: 560px; width: 100%; }
+  .playground .rg-table th, .playground .rg-table td { border: 1px solid var(--border); padding: 6px 8px; text-align: left; white-space: nowrap; }
+  .playground .rg-table thead th { background: var(--surface-2); }
+  .playground .rg-pin { background: color-mix(in srgb, var(--good) 22%, var(--surface)); }
+  .playground .rg-amb { background: color-mix(in srgb, var(--role-3) 20%, var(--surface)); }
+  .playground .rg-inv { background: color-mix(in srgb, var(--bad) 18%, var(--surface)); }
+  .playground .rg-now th { box-shadow: inset 4px 0 0 var(--accent); }
+  .playground .rg-col { font-weight: 700; }
+</style>

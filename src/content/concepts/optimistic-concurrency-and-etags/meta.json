@@ -1,0 +1,69 @@
+{
+  "name": "Optimistic Concurrency and ETags",
+  "area": "api",
+  "difficulty": "intermediate",
+  "intent": "Stop two clients that read the same resource from silently overwriting each other, without locks: the client sends back the version it read and the server applies the write only if that version is still current.",
+  "scenario": "Two support agents, Ana and Ben, open the same customer record (version 7) at the same time. Ana changes the phone number and saves. Ben, still looking at the old copy, adds a billing note and saves a few seconds later. Without a check, Ben's PUT replaces the whole record and Ana's phone number is gone, and both agents got a 200 OK.",
+  "problem": "Read-modify-write over HTTP is not atomic: between the GET and the PUT the data can change, and a plain PUT or UPDATE just overwrites it. This is the default behaviour (last write wins), and it is the worst kind of failure because it is silent: nothing errors, nothing is logged, and a correct-looking record is missing someone's work. Holding a database lock across a human's think time is not an answer either, because locks held over network round trips and user pauses block everyone else and leak when clients vanish.",
+  "howItWorks": [
+    { "title": "Read the resource together with its version", "text": "The GET response carries a validator that identifies this exact state of the resource: an ETag header such as ETag: \"7\" (often derived from a version column, a row hash or an updated_at timestamp). The client keeps it next to the data it displays." },
+    { "title": "Send the version back as a precondition", "text": "To change the resource the client sends PUT or PATCH with If-Match: \"7\". The header means: apply this only if the current ETag is still \"7\". Without it the server cannot tell an update based on fresh data from one based on stale data." },
+    { "title": "The server checks and writes atomically", "text": "The check and the write must be one atomic step, otherwise two requests can both pass the check. In SQL that is UPDATE customers SET phone = ?, version = version + 1 WHERE id = ? AND version = 7 and then looking at the affected row count: 1 means success (the new ETag is \"8\"), 0 means someone got there first." },
+    { "title": "A mismatch is rejected with 412, not merged silently", "text": "When the version has moved, the server answers 412 Precondition Failed and changes nothing. The client must re-GET the current state (and the new ETag), then decide what to do: retry the same change on top of the new state, merge non-conflicting fields automatically, or show both versions to the user." },
+    { "title": "Make the precondition mandatory with 428", "text": "A client that simply omits If-Match would silently get last-write-wins again. For resources where lost updates matter, the server answers 428 Precondition Required to any PUT or PATCH without If-Match, so the safe path is the only path." },
+    { "title": "Choose the retry policy deliberately", "text": "Automatic retry with a jittered back-off fits small commutative changes (increment a counter, add a tag). A form edited by a human should surface the conflict instead. Under heavy contention on a few hot rows, optimistic checks waste work and a pessimistic lock or a queue per record is cheaper." }
+  ],
+  "pros": [
+    "No locks are held while a client thinks, so nothing blocks and a crashed client leaves nothing behind",
+    "Lost updates become loud (412) instead of silent, and the data stays correct",
+    "Costs one version column and one WHERE clause; works across HTTP, caches and any number of servers",
+    "Reuses standard HTTP semantics (ETag, If-Match, 412, 428), so generic clients and proxies understand it",
+    "Cheap when conflicts are rare, which is the common case for human-edited records"
+  ],
+  "cons": [
+    "Under high contention most attempts fail and the work is thrown away: retries amplify the load on the hot row",
+    "Pushes conflict handling onto every client: retry loops, merge logic or a conflict screen",
+    "Can starve an unlucky client that keeps losing the race, since there is no queue or fairness",
+    "A version only protects the resource it covers: a check on one row says nothing about invariants across several rows",
+    "Weak or badly derived ETags (timestamps with one-second resolution, hashes that skip fields) let some conflicts through"
+  ],
+  "whenToUse": [
+    "Resources edited by humans or slow clients (profiles, documents, settings, tickets) where conflicts are rare but must never be silent",
+    "Public or partner APIs where you cannot hold server-side locks across calls",
+    "Read-modify-write cycles that span network round trips, caches or several services",
+    "Any PUT or PATCH on a resource that more than one actor can edit"
+  ],
+  "whenNotToUse": [
+    "Very hot single rows (a global counter, an inventory row on a flash sale): use an atomic increment (UPDATE ... SET n = n + 1), a queue or a pessimistic lock instead",
+    "When a conflict is very expensive to redo (a long computation or an external side effect already triggered): lock first, or make the step idempotent",
+    "Append-only data such as events and logs, where concurrent writers never touch the same value",
+    "When the data merges naturally (counters, sets): a CRDT or a commutative update needs no version check",
+    "Single-writer resources where only one actor can ever edit"
+  ],
+  "pitfalls": [
+    "Doing the version check in application code (SELECT then UPDATE) instead of in the UPDATE's WHERE clause, which just moves the race one step later",
+    "Not requiring If-Match (no 428): one client that skips the header brings back silent last-write-wins for everyone",
+    "Auto-retrying a failed conditional write with the old If-Match instead of re-reading first, so it can never succeed; or retrying without a cap or jitter, which turns a hot row into a retry storm",
+    "ETags built from a timestamp with one-second resolution, or a hash that omits some fields, so two different states share the same validator",
+    "Confusing strong and weak ETags: a weak validator (W/\"7\") means semantically equivalent, and If-Match requires the strong comparison, so it never matches a weak tag",
+    "Returning 409 or 400 for a failed precondition, or ignoring If-Match on PATCH and DELETE, so clients cannot rely on the standard behaviour",
+    "Combining retries with side effects but no idempotency key: a retried request that actually succeeded the first time is applied twice",
+    "Forgetting that the version must also change on every other write path (batch jobs, admin tools, triggers), or the check guards only part of the writes"
+  ],
+  "related": [
+    { "kind": "concept", "slug": "idempotency" },
+    { "kind": "concept", "slug": "mvcc-and-isolation-levels" },
+    { "kind": "concept", "slug": "retries-and-backoff" },
+    { "kind": "concept", "slug": "api-styles" },
+    { "kind": "concept", "slug": "caching" },
+    { "kind": "concept", "slug": "consistency-models" },
+    { "kind": "concept", "slug": "http-caching-headers" },
+    { "kind": "concept", "slug": "crdts" },
+    { "kind": "concept", "slug": "leases-and-fencing-tokens" }
+  ],
+  "roles": [
+    { "id": "agent", "label": "Support agent", "description": "A client that reads a customer record, edits it and saves it back, sending the ETag it read." },
+    { "id": "api", "label": "API server", "description": "Compares If-Match with the current ETag and answers 200, 412 or 428." },
+    { "id": "db", "label": "Database", "description": "Holds the row and its version column; the conditional UPDATE is atomic." }
+  ]
+}

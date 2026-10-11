@@ -1,0 +1,70 @@
+{
+  "name": "Timeouts and Deadlines",
+  "area": "reliability",
+  "difficulty": "intermediate",
+  "intent": "Bound how long every caller waits, and pass the remaining time down the call chain so each hop knows its budget and stops work nobody is waiting for.",
+  "scenario": "A request fans through A, B and C to a database, and the user gives up after 2 seconds. The database is occasionally slow. With a 5 second timeout on every hop, a 4 second query holds a thread in all four components long after the user left, and at 20 requests per second those orphaned calls fill the pools.",
+  "problem": "A call with no timeout can wait forever: the thread, connection and memory behind it are never released, and a single slow dependency drains the pool until the whole service stops, even for requests that never touch it. Adding timeouts is not enough on its own. If each hop picks its own number, the inner timeout is often longer than the outer one, so the work continues after the caller gave up. Retries then multiply the waiting. Each hop needs to know how much of the user's patience is left.",
+  "howItWorks": [
+    { "title": "Every blocking call gets a timeout, split by phase", "text": "A connect timeout bounds the TCP and TLS handshake (typically 100 ms to 1 s: it either works fast or the host is gone). A read timeout bounds the wait for bytes on an established connection, and is only a per-read limit, so a server that trickles one byte every few seconds never trips it. A total (request) timeout bounds the whole call including redirects and body streaming. Many clients default to infinite for read or total: check, because the default is the bug." },
+    { "title": "Choose the value from a percentile and from your own budget", "text": "Measure the dependency's latency distribution and set the timeout just above a high percentile, such as p99 or p99.9 of its healthy latency, not the average: the average says nothing about the tail you are cutting. Then cap it by what the caller can afford. If the user waits 2 s and you have three sequential calls, no single call can take 2 s. A timeout at p99 means about 1% of healthy calls are cut off, which is the price of freeing resources fast, and it is why a retry usually follows." },
+    { "title": "Nest timeouts so the inside gives up first", "text": "The outer timeout must exceed the inner work it contains: the caller's timeout is at least the callee's timeout times its attempts, plus local work. With A to B at 1.8 s, B to C at 1.2 s and C to the database at 0.4 s per attempt, the innermost fires first and each layer can still return an answer. Invert them and the caller leaves while the callee carries on, which is wasted work and held resources." },
+    { "title": "Propagate a deadline, not a duration", "text": "A fixed per-hop number cannot know how much time earlier hops already spent. Instead the edge computes an absolute deadline (arrival time plus patience) or a remaining budget, and passes it on: gRPC sends the remaining time in the grpc-timeout header and each server sets its own deadline from it, Go carries a deadline in context.Context, and HTTP services use a header such as X-Request-Deadline. Prefer remaining time on the wire (clocks between machines disagree) and convert to a local monotonic deadline on arrival. Every hop then uses min(its own limit, remaining) and can fail fast, or skip optional work, when little is left." },
+    { "title": "Cancel downstream work when the caller leaves", "text": "A timeout only frees the caller. The callee keeps running unless it is told: gRPC cancels the server call and its context, Go's context cancellation propagates through database/sql, and HTTP/2 sends RST_STREAM. The callee must check for cancellation or the deadline between steps, and the database must be able to abort a query (statement timeout, pg_cancel_backend) or the work continues to completion." },
+    { "title": "Make retries fit inside the deadline", "text": "Retries multiply waiting: three attempts of 400 ms take 1.2 s plus backoff. Attempt timeouts times attempts plus backoff must fit inside the budget left, so a retry starts only when there is time for it to finish. Retry at one layer and stop when the budget is gone (see retries and backoff). A timeout also differs from a circuit breaker: the timeout bounds one call, the breaker watches many calls and stops sending them." }
+  ],
+  "pros": [
+    "Failures become bounded in time, so threads and connections are always released",
+    "A slow dependency can no longer exhaust the pools of services that call it",
+    "A propagated deadline stops downstream work the moment nobody is waiting for it",
+    "Each hop can fail fast or skip optional work instead of starting what cannot finish",
+    "Cancellation saves real capacity at the tail, exactly when the system is slow"
+  ],
+  "cons": [
+    "A timeout below the true latency tail turns slow successes into failures and adds load through retries",
+    "A timed-out call is ambiguous: the callee may still have performed the write, so retries need idempotency",
+    "Deadline propagation needs every service and client library on the path to cooperate; one hop that drops the header breaks the chain",
+    "Cancellation is cooperative: code and databases that ignore it keep working",
+    "Values drift as the dependency changes, so they need review against current percentiles"
+  ],
+  "whenToUse": [
+    "Every network call, with no exceptions: a missing timeout is a latent outage",
+    "Call chains of two or more hops where the user has a patience limit",
+    "Calls to dependencies you do not control or whose latency has a long tail",
+    "Expensive downstream work (large queries, fan-out) that should stop when the caller is gone"
+  ],
+  "whenNotToUse": [
+    "As a standalone fix for an overloaded dependency: a timeout frees the caller but the callee still has the load (add load shedding and backpressure)",
+    "Long-running operations that legitimately take minutes: use an asynchronous job with polling or a callback instead of a huge timeout",
+    "A single timeout shared by unrelated calls, where one slow and one fast operation need different budgets",
+    "Strict per-hop budgets on a two-hop internal call where the cost of plumbing a deadline exceeds the saved work"
+  ],
+  "pitfalls": [
+    "No timeout at all: many HTTP clients and database drivers default to infinite or to minutes",
+    "Setting only a read timeout and assuming it bounds the total, while a slow trickle or a long connect still passes",
+    "Sizing from the average or the median: p50 is tiny, so the timeout is right for the half of calls that never matter",
+    "Inner timeout longer than outer, or the same 5 s everywhere, so the caller leaves while the callee keeps working",
+    "Retries inside a timeout that cannot hold them (3 x 2 s inside 2 s): the later attempts are certain to be wasted",
+    "Sending a fixed duration down instead of the remaining budget, so each hop restarts the clock",
+    "Comparing absolute deadlines across machines with unsynchronised clocks; send the remaining time or allow for skew",
+    "Cancelling the caller but not the database query, which keeps a connection and CPU busy",
+    "Treating a timeout as proof the operation failed; for writes it may have succeeded"
+  ],
+  "related": [
+    { "kind": "concept", "slug": "retries-and-backoff" },
+    { "kind": "concept", "slug": "circuit-breaker" },
+    { "kind": "concept", "slug": "bulkhead" },
+    { "kind": "concept", "slug": "backpressure" },
+    { "kind": "concept", "slug": "distributed-tracing" },
+    { "kind": "concept", "slug": "idempotency" },
+    { "kind": "concept", "slug": "load-shedding" },
+    { "kind": "concept", "slug": "hedged-requests-and-tail-latency" },
+    { "kind": "concept", "slug": "queueing-theory-and-littles-law" },
+    { "kind": "concept", "slug": "graceful-degradation" }
+  ],
+  "roles": [
+    { "id": "user", "label": "User", "description": "The person or client at the top whose patience (here 2 s) sets the budget for the whole chain." },
+    { "id": "service", "label": "Service hop", "description": "A service in the chain (A, B, C) that calls the next one, holds a thread while waiting, and applies a timeout or a propagated deadline." },
+    { "id": "database", "label": "Database", "description": "The slow dependency at the bottom, whose query keeps running unless it is cancelled." }
+  ]
+}

@@ -1,0 +1,231 @@
+---
+import PlaygroundShell from '../components/PlaygroundShell.astro';
+---
+<PlaygroundShell title="Simulate it" hint="Clients ask for a large report. Four workers build them, each report takes 5 s to 90 s (mean about 20 s), and the server never cancels work whose client has gone away. Pick how the clients wait.">
+  <ol class="how">
+    <li>Start with <b>Synchronous</b> (8 requests per minute, 40 clients): 31 of 40 get a report. Any report whose queue wait plus build time passes 30 s times out and the client retries once. Without a key that retry starts a second copy (10 duplicates) and 19 finished reports have nobody waiting. Tick <b>Idempotency keys</b>: the retry joins the same job and all 40 are served.</li>
+    <li>Switch to <b>fixed polling</b> at 1 s: all 40 get their report, with about 870 status calls (2.6 per second) and a result seen 0.4 s late on average. The box also shows what this cadence means for a million waiting clients: about a million requests per second. Choose <b>backoff</b> (about 250 calls) or set the interval to 10 s (about 100 calls) and the calls fall, but results arrive 4 to 6 s late on average. <b>Webhook</b> makes no status calls and adds 0.2 s.</li>
+    <li>Choose <b>crash, job lost</b>: the job in flight is lost, its client polls until it gives up (39 of 40), and extra polls pile up. Tick <b>Idempotency keys</b> and the 4 duplicate jobs from lost replies disappear. With <b>crash, re-queued after a 30 s lease</b> nothing is lost, but one job ran twice, so workers must be idempotent.</li>
+  </ol>
+  <div class="pg aa" data-aa>
+    <div class="pg-row">
+      <label>Client style <select class="pg-in" data-style>
+        <option value="sync">Synchronous, 30 s timeout</option>
+        <option value="poll" selected>Async, fixed-interval polling</option>
+        <option value="backoff">Async, polling with backoff</option>
+        <option value="hook">Async, webhook callback</option>
+      </select></label>
+      <label>Polling interval (s) <input type="range" min="1" max="10" value="1" data-interval /> <b data-intervalval>1</b></label>
+      <label>Requests per minute <input type="range" min="4" max="14" value="8" data-rate /> <b data-rateval>8</b></label>
+    </div>
+    <div class="pg-row">
+      <label>Worker failure <select class="pg-in" data-crash>
+        <option value="none" selected>None</option>
+        <option value="lost">Crash at 60 s, job lost</option>
+        <option value="lease">Crash at 60 s, re-queued after a 30 s lease</option>
+      </select></label>
+      <label class="aa-check"><input type="checkbox" data-keys /> Idempotency keys</label>
+      <button class="btn" type="button" data-reroll>Re-roll workload</button>
+    </div>
+    <div class="pg-grid" data-boxes></div>
+    <div>
+      <h3 class="aa-h">Status requests per second (10 s buckets)</h3>
+      <div class="aa-chart" role="img" data-chart></div>
+    </div>
+    <div class="aa-scroll" tabindex="0" role="region" aria-label="Comparison of the four client styles under the current settings">
+      <table class="aa-table">
+        <thead><tr><th scope="col">Client style</th><th scope="col">Got result</th><th scope="col">Avg polls/s</th><th scope="col">Avg time to result</th><th scope="col">Duplicates</th><th scope="col">Wasted</th><th scope="col">Lost</th></tr></thead>
+        <tbody data-rows></tbody>
+      </table>
+    </div>
+    <p class="pg-note" data-note></p>
+    <p class="pg-note">Assumptions: 4 workers, requests arrive at random over 5 minutes (rate times 5 clients), 10% of create responses are lost so the client retries after 5 s, polling backoff multiplies the interval by 1.5 up to 30 s, a webhook arrives 0.2 s after the job ends, and an async client gives up after 5 minutes. Time-to-result counts only clients that got a result. Wasted means a finished job nobody received. The same seeded workload is used for all four styles.</p>
+  </div>
+</PlaygroundShell>
+<script>
+  // <core>
+  const SEC = 10; // ticks per second
+  const WORKERS = 4; const SYNC_TIMEOUT = 300; const GIVE_UP = 3000; const RETRY_AFTER = 50; const CRASH_AT = 600; const RESTART = 200; const LEASE = 300; const BACKOFF_CAP = 300; const HOOK_DELAY = 2; const WINDOW = 3000; const END = 12000;
+  function prng(seed: number) { let s = seed >>> 0; return () => { s = (s + 0x6d2b79f5) >>> 0; let t = s; t = Math.imul(t ^ (t >>> 15), t | 1); t ^= t + Math.imul(t ^ (t >>> 7), t | 61); return ((t ^ (t >>> 14)) >>> 0) / 4294967296; }; }
+  interface Client { submit: number; dur: number; lostReply: boolean }
+  function workload(seed: number, ratePerMin: number): Client[] {
+    const rnd = prng(seed); const n = ratePerMin * 5; const list: Client[] = [];
+    for (let i = 0; i < n; i++) {
+      const submit = Math.floor(rnd() * WINDOW);
+      const dur = Math.min(900, 50 + Math.floor(-Math.log(1 - rnd()) * 150));
+      list.push({ submit, dur, lostReply: rnd() < 0.1 });
+    }
+    return list.sort((a, b) => a.submit - b.submit);
+  }
+  interface Job { c: number; dur: number; state: 'queued' | 'running' | 'done' | 'lost' | 'orphan'; doneAt: number; delivered: boolean; runs: number }
+  interface Params { style: string; interval: number; crash: string; keys: boolean }
+  function run(p: Params, wl: Client[]) {
+    const n = wl.length; const jobs: Job[] = []; const jobsOf: Job[][] = wl.map(() => []);
+    const queue: Job[] = []; const requeues: { at: number; job: Job }[] = [];
+    const workers = Array.from({ length: WORKERS }, () => ({ job: null as Job | null, end: 0, downUntil: 0 }));
+    const cl = wl.map(() => ({ phase: 'idle', cur: null as Job | null, next: 0, interval: 0, attempt: 0, wait: 0, seenAt: -1, via: null as Job | null, failed: false }));
+    const buckets: number[] = new Array(Math.ceil(END / SEC / 10) + 1).fill(0);
+    let polls = 0; let pollWait = 0; let lastResolve = 0; let open = n; let nextClient = 0;
+    const base = p.interval * SEC;
+    const create = (c: number) => {
+      if (p.keys && jobsOf[c].length) return jobsOf[c][0];
+      const j: Job = { c, dur: wl[c].dur, state: 'queued', doneAt: -1, delivered: false, runs: 0 };
+      jobs.push(j); jobsOf[c].push(j); queue.push(j); return j;
+    };
+    const finish = (c: number, t: number, via: Job | null, failed: boolean) => {
+      const k = cl[c]; k.phase = 'done'; k.failed = failed; open--; lastResolve = t;
+      if (!failed) { k.seenAt = t; k.via = via; if (via) via.delivered = true; }
+    };
+    for (let t = 0; t < END; t++) {
+      if (p.crash !== 'none' && t === CRASH_AT) {
+        const w = workers.find((x) => x.job); const target = w ?? workers[0];
+        target.downUntil = t + RESTART;
+        if (target.job) {
+          const j = target.job; target.job = null;
+          if (p.crash === 'lost') j.state = 'lost'; else { j.state = 'orphan'; requeues.push({ at: t + LEASE, job: j }); }
+        }
+      }
+      for (let i = requeues.length - 1; i >= 0; i--) if (requeues[i].at === t) { requeues[i].job.state = 'queued'; queue.unshift(requeues[i].job); requeues.splice(i, 1); }
+      for (const w of workers) if (w.job && w.end === t) { w.job.state = 'done'; w.job.doneAt = t; w.job = null; }
+      while (nextClient < n && wl[nextClient].submit === t) {
+        const c = nextClient++; const k = cl[c];
+        const j = create(c); k.cur = j;
+        if (p.style === 'sync') { k.phase = 'sync'; k.next = t + SYNC_TIMEOUT; }
+        else if (p.style === 'hook') { k.phase = 'hook'; }
+        else if (wl[c].lostReply) { k.phase = 'retry'; k.next = t + RETRY_AFTER; }
+        else { k.phase = 'poll'; k.interval = base; k.next = t + base; }
+      }
+      for (let c = 0; c < n; c++) {
+        const k = cl[c]; if (k.phase === 'idle' || k.phase === 'done') continue;
+        if (k.phase === 'sync') {
+          if (k.cur!.state === 'done') finish(c, k.cur!.doneAt, k.cur, false);
+          else if (t >= k.next) {
+            if (k.attempt === 0) { k.attempt = 1; k.cur = create(c); k.next = t + SYNC_TIMEOUT; } else finish(c, t, null, true);
+          }
+        } else if (k.phase === 'hook') {
+          const d = jobsOf[c].find((j) => j.state === 'done' && j.doneAt + HOOK_DELAY <= t);
+          if (d) finish(c, t, d, false);
+          else if (wl[c].lostReply && k.attempt === 0 && t >= wl[c].submit + RETRY_AFTER) { k.attempt = 1; create(c); }
+          if (k.phase === 'hook' && t - wl[c].submit >= GIVE_UP) finish(c, t, null, true);
+        } else if (k.phase === 'retry') {
+          if (t >= k.next) { k.cur = create(c); k.phase = 'poll'; k.interval = base; k.next = t + base; }
+        } else if (k.phase === 'poll') {
+          if (t >= k.next) {
+            polls++; buckets[Math.floor(t / SEC / 10)]++;
+            if (k.cur!.state === 'done') finish(c, t, k.cur, false);
+            else {
+              k.wait += k.interval; pollWait += k.interval;
+              if (p.style === 'backoff') k.interval = Math.min(BACKOFF_CAP, Math.floor((k.interval * 3) / 2));
+              k.next = t + k.interval;
+              if (t - wl[c].submit >= GIVE_UP) finish(c, t, null, true);
+            }
+          }
+        }
+      }
+      for (const w of workers) {
+        if (!w.job && t >= w.downUntil && queue.length) { const j = queue.shift()!; j.state = 'running'; j.runs++; w.job = j; w.end = t + j.dur; }
+      }
+      if (open === 0 && !queue.length && !requeues.length && !workers.some((w) => w.job)) break;
+    }
+    let ok = 0; let sumT = 0; let sumAdded = 0;
+    for (let c = 0; c < n; c++) {
+      const k = cl[c]; if (k.phase !== 'done' || k.failed) continue;
+      ok++; sumT += k.seenAt - wl[c].submit; sumAdded += k.seenAt - k.via!.doneAt;
+    }
+    const span = Math.max(SEC, lastResolve - (wl.length ? wl[0].submit : 0)) / SEC;
+    const wasted = jobs.filter((j) => j.state === 'done' && !j.delivered);
+    return {
+      n, ok, failed: n - ok, polls, avgPolls: polls / span, peak: Math.max(0, ...buckets) / 10, buckets,
+      avgSeen: ok ? sumT / ok / SEC : 0, avgAdded: ok ? sumAdded / ok / SEC : 0,
+      dups: jobs.length - n, wasted: wasted.length, wastedSec: wasted.reduce((a, j) => a + j.dur, 0) / SEC,
+      lost: jobs.filter((j) => j.state === 'lost').length, reran: jobs.filter((j) => j.runs > 1).length,
+      avgIntervalSec: polls ? pollWait / polls / SEC : 0,
+    };
+  }
+  // </core>
+
+  const STYLE_LIST = [
+    { id: 'sync', label: 'Synchronous, 30 s timeout' },
+    { id: 'poll', label: 'Async, fixed polling' },
+    { id: 'backoff', label: 'Async, polling with backoff' },
+    { id: 'hook', label: 'Async, webhook callback' },
+  ];
+  const fmt = (x: number, d = 1) => x.toFixed(d);
+  const big = (x: number) => (x >= 1e6 ? `${fmt(x / 1e6, 1)} million` : Math.round(x).toLocaleString('en-US'));
+  document.querySelectorAll<HTMLElement>('[data-aa]').forEach((root) => {
+    const q = <T extends HTMLElement>(s: string) => root.querySelector<T>(s)!;
+    const val = (s: string) => Number(q<HTMLInputElement>(s).value);
+    let seed = 1; let frame = 0;
+    const defs = [
+      { k: 'ok', title: 'Clients that got a result', c: 'var(--role-2)' },
+      { k: 'cost', title: 'Status requests per second', c: 'var(--role-3)' },
+      { k: 'lat', title: 'Average time to result', c: 'var(--role-1)' },
+      { k: 'dup', title: 'Duplicate jobs', c: 'var(--role-4)' },
+      { k: 'loss', title: 'Work lost or wasted', c: 'var(--bad)' },
+    ];
+    const boxes: Record<string, { main: HTMLElement; sub: HTMLElement }> = {};
+    defs.forEach((d) => {
+      const box = document.createElement('div'); box.className = 'pg-box'; box.style.setProperty('--c', d.c);
+      box.innerHTML = '<h3></h3><span class="pg-mono aa-main"></span><span class="pg-note"></span>';
+      box.querySelector('h3')!.textContent = d.title;
+      q('[data-boxes]').appendChild(box);
+      boxes[d.k] = { main: box.querySelector('.aa-main')!, sub: box.querySelector('.pg-note')! };
+    });
+    const BARS = 80; const bars: HTMLElement[] = [];
+    for (let i = 0; i < BARS; i++) { const b = document.createElement('i'); q('[data-chart]').appendChild(b); bars.push(b); }
+    const rowEls = STYLE_LIST.map((s) => {
+      const tr = document.createElement('tr'); tr.innerHTML = '<th scope="row"></th><td></td><td></td><td></td><td></td><td></td><td></td>';
+      tr.querySelector('th')!.textContent = s.label; q('[data-rows]').appendChild(tr);
+      return { tr, cells: Array.from(tr.querySelectorAll('td')) };
+    });
+
+    function draw() {
+      frame = 0;
+      q('[data-intervalval]').textContent = String(val('[data-interval]')); q('[data-rateval]').textContent = String(val('[data-rate]'));
+      const style = q<HTMLSelectElement>('[data-style]').value; const crash = q<HTMLSelectElement>('[data-crash]').value;
+      const keys = q<HTMLInputElement>('[data-keys]').checked;
+      const wl = workload(seed, val('[data-rate]'));
+      const results = STYLE_LIST.map((s) => run({ style: s.id, interval: val('[data-interval]'), crash, keys }, wl));
+      const idx = STYLE_LIST.findIndex((s) => s.id === style); const r = results[idx];
+      boxes.ok.main.textContent = `${r.ok} of ${r.n} (${fmt((100 * r.ok) / r.n, 0)}%)`;
+      boxes.ok.sub.textContent = `${r.failed} timed out, gave up or lost their job`;
+      if (style === 'poll' || style === 'backoff') {
+        boxes.cost.main.textContent = `${fmt(r.avgPolls, 1)} avg · ${fmt(r.peak, 1)} peak`;
+        boxes.cost.sub.textContent = `${r.polls.toLocaleString('en-US')} polls. At 1,000,000 waiting clients this cadence is about ${big(1e6 / Math.max(0.001, r.avgIntervalSec))} requests per second`;
+      } else {
+        boxes.cost.main.textContent = '0';
+        boxes.cost.sub.textContent = style === 'hook' ? 'the server calls the client once, when the job ends' : 'one long-held connection per client, no status calls';
+      }
+      boxes.lat.main.textContent = r.ok ? `${fmt(r.avgSeen, 1)} s` : 'n/a';
+      boxes.lat.sub.textContent = r.ok ? `of which ${fmt(r.avgAdded, 1)} s is added by polling or delivery after the job was done` : 'nobody got a result';
+      boxes.dup.main.textContent = String(r.dups);
+      boxes.dup.sub.textContent = r.dups ? 'extra jobs started by client retries of the same request' : keys ? 'retries hit the same job through the key' : 'no client had to retry';
+      boxes.loss.main.textContent = `${r.wasted} wasted · ${r.lost} lost`;
+      boxes.loss.sub.textContent = `${fmt(r.wastedSec, 0)} worker-seconds spent on results nobody received${r.reran ? ` · ${r.reran} job ran twice after the crash` : ''}`;
+      const peak = Math.max(1, r.peak); const chart = q('[data-chart]');
+      bars.forEach((b, i) => { const v = (r.buckets[i] ?? 0) / 10; b.style.height = `${Math.min(100, (v / peak) * 100)}%`; });
+      chart.setAttribute('aria-label', style === 'poll' || style === 'backoff' ? `Status requests per second over time, peak ${fmt(r.peak, 1)}` : 'No status requests for this client style');
+      rowEls.forEach((row, i) => {
+        const x = results[i]; const c = row.cells;
+        c[0].textContent = `${x.ok} of ${x.n}`; c[1].textContent = STYLE_LIST[i].id === 'poll' || STYLE_LIST[i].id === 'backoff' ? fmt(x.avgPolls, 1) : '0';
+        c[2].textContent = x.ok ? `${fmt(x.avgSeen, 1)} s` : 'n/a'; c[3].textContent = String(x.dups); c[4].textContent = String(x.wasted); c[5].textContent = String(x.lost);
+        row.tr.classList.toggle('sel', i === idx);
+      });
+      q('[data-note]').textContent = `Workload: ${wl.length} requests, seed ${seed}. Highlighted row is the selected style.`;
+    }
+    const schedule = () => { if (!frame) frame = requestAnimationFrame(draw); };
+    ['[data-style]', '[data-interval]', '[data-rate]', '[data-crash]', '[data-keys]'].forEach((s) => { q(s).addEventListener('input', schedule); q(s).addEventListener('change', schedule); });
+    q('[data-reroll]').addEventListener('click', () => { seed++; schedule(); });
+    draw();
+  });
+</script>
+<style is:global>
+  .playground .aa-check { display: inline-flex; align-items: center; gap: 6px; }
+  .playground .aa-h { margin: 12px 0 4px; font-size: .95rem; }
+  .playground .aa-chart { height: 64px; display: flex; align-items: flex-end; gap: 1px; background: var(--surface-2); border-radius: 6px; padding: 2px; }
+  .playground .aa-chart i { flex: 1 1 0; min-width: 0; background: var(--role-3); min-height: 0; }
+  .playground .aa-scroll { overflow-x: auto; margin-top: 12px; }
+  .playground .aa-table { border-collapse: collapse; width: 100%; font-size: .85rem; }
+  .playground .aa-table th, .playground .aa-table td { padding: 5px 8px; border-bottom: 1px solid var(--border); text-align: left; white-space: nowrap; }
+  .playground .aa-table tr.sel { background: var(--accent-soft); font-weight: 600; }
+</style>

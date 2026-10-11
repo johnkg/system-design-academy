@@ -1,0 +1,66 @@
+{
+  "name": "Load Shedding",
+  "area": "reliability",
+  "difficulty": "intermediate",
+  "intent": "Survive overload by deliberately refusing some work early and cheaply, so the work you accept finishes in time and is still useful.",
+  "scenario": "A service that can finish 100 requests per second normally receives 60. A spike sends 300 per second for 15 seconds. Clients give up after 2 seconds. With an unbounded queue the service stays 100% busy but almost nothing it finishes is still wanted, and it takes over a minute after the spike to recover.",
+  "problem": "When arrivals exceed capacity, the excess has to go somewhere. A queue only turns missing capacity into delay. Once the delay exceeds the clients' timeout, the server spends all its capacity on requests whose callers have already left and retried, so throughput stays at 100% while goodput (answers delivered in time) falls towards zero. The collapse also outlasts the spike, because the backlog has to drain before fresh requests are served on time.",
+  "howItWorks": [
+    { "title": "Separate throughput from goodput", "text": "Throughput is requests the server finishes; goodput is the ones whose caller was still waiting. Overload makes the two diverge. A queue of N requests adds N / capacity seconds of delay, so with capacity 100 per second and a 2 second timeout, any queue longer than about 200 produces answers nobody receives. Watch queue delay and goodput, not CPU, which sits at 100% in both the healthy and the collapsed state." },
+    { "title": "Refuse at the front when a limit is exceeded", "text": "Count requests in the system (queued plus running) and reject the next one above a limit with 503 Service Unavailable, or 429 Too Many Requests when you are pushing back on a specific caller, ideally with a Retry-After header. Rejecting is fast and cheap, the caller learns immediately and can fail over, and everything admitted still finishes in time. By Little's law the limit should be about capacity x acceptable latency: 100 req/s x 0.3 s gives roughly 30." },
+    { "title": "Let the limit find itself", "text": "A hand-picked limit goes stale when the service gets slower or faster. Adaptive limiters measure and adjust: AIMD like TCP (add a little while latency is fine, cut by a factor such as 0.7 to 0.9 when it rises), or gradient limiters that compare the current latency with the best latency seen (Netflix concurrency-limits, Envoy adaptive concurrency). CoDel-style controllers watch queue delay instead and drop when it stays above a target (for example 5 ms in CoDel, a few hundred ms for an RPC service) for a whole interval." },
+    { "title": "Serve what is still useful, and what matters most", "text": "Under overload serve the newest request first (LIFO, or adaptive LIFO that switches only when the queue is long): the oldest are the ones about to time out. Drop the oldest when the queue is full, and skip any request whose propagated deadline has passed instead of doing the work. Shed by priority: health checks, paying customers and writes that cannot be retried last; batch, prefetch and anonymous traffic first." },
+    { "title": "Shed as early and as cheaply as possible", "text": "Rejecting is not free: parsing, TLS and authentication cost CPU. Shed at the edge (load balancer, API gateway, the first middleware) before expensive work, and give each client a quota so one tenant cannot use all the capacity. This is different from rate limiting, which enforces a fair share all the time, and from backpressure, which slows the producer: load shedding is the emergency decision to drop work when the system as a whole has more than it can do." }
+  ],
+  "pros": [
+    "Keeps goodput near capacity during overload instead of letting it collapse",
+    "Bounds latency for the work you accept, because the queue is short",
+    "Recovery is immediate when the spike ends: there is no backlog of stale work to drain",
+    "Cheap rejections give callers an early, honest signal they can use to fail over or back off"
+  ],
+  "cons": [
+    "Some users get errors even though the system is up: you chose who loses",
+    "A static limit needs tuning and goes stale when the service or its dependencies change speed",
+    "Rejections still cost CPU, and with retrying clients they can themselves become the overload",
+    "Priority rules need classification at the edge and a policy someone owns, and can starve low priority traffic",
+    "Does not create capacity: sustained overload still needs scaling or a bigger service"
+  ],
+  "whenToUse": [
+    "Services with a hard capacity limit and clients with timeouts, which is nearly every request/response service",
+    "Traffic that can spike beyond what autoscaling can follow in time (it typically needs minutes)",
+    "Systems where some traffic is clearly more important than the rest, such as health checks, checkout or paid tiers"
+  ],
+  "whenNotToUse": [
+    "As a substitute for capacity planning or autoscaling: shedding for hours is an outage you chose",
+    "Where every request must eventually be processed and callers can wait: use a durable queue and backpressure instead",
+    "Where clients have no timeout and no way to handle a rejection, so a refusal is as bad as the delay it avoids",
+    "A service that never gets near its capacity and is not in a call chain with one that does"
+  ],
+  "pitfalls": [
+    "Limit set above capacity x client timeout (for example a queue of 400 at 100 req/s against a 2 s timeout), so accepted requests still time out",
+    "Clients that retry rejected requests at once, three tries each, turn 300 req/s into 700+ req/s and the rejections eat the capacity; honour Retry-After, use backoff with jitter and a retry budget",
+    "Shedding late, after authentication and parsing, so each rejection costs 20% of a request instead of about 1%",
+    "Returning 500 instead of 503 or 429, so clients and load balancers cannot tell overload from a bug, and breakers or alerts react wrongly",
+    "Shedding the health check, so the orchestrator restarts a healthy but busy instance and removes even more capacity",
+    "Serving requests whose deadline has already passed because the deadline is not propagated or checked",
+    "Critical traffic with no ceiling of its own, so it alone can fill the capacity, and no metric for how much was shed"
+  ],
+  "related": [
+    { "kind": "concept", "slug": "backpressure" },
+    { "kind": "concept", "slug": "rate-limiting" },
+    { "kind": "concept", "slug": "retries-and-backoff" },
+    { "kind": "concept", "slug": "circuit-breaker" },
+    { "kind": "concept", "slug": "bulkhead" },
+    { "kind": "concept", "slug": "autoscaling" },
+    { "kind": "concept", "slug": "health-checks" },
+    { "kind": "concept", "slug": "timeouts-and-deadlines" },
+    { "kind": "concept", "slug": "queueing-theory-and-littles-law" },
+    { "kind": "concept", "slug": "graceful-degradation" }
+  ],
+  "roles": [
+    { "id": "client", "label": "Clients", "description": "Callers with a timeout. They give up after a deadline and may retry." },
+    { "id": "shedder", "label": "Edge shedder", "description": "Counts work in the system and rejects with 503 or 429 and Retry-After above the limit." },
+    { "id": "queue", "label": "Queue", "description": "Holds admitted requests. Its length divided by capacity is the delay." },
+    { "id": "service", "label": "Service", "description": "Does the work at a fixed capacity, 100 requests per second here." }
+  ]
+}

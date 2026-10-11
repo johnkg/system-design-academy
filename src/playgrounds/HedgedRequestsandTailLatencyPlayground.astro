@@ -1,0 +1,184 @@
+---
+import PlaygroundShell from '../components/PlaygroundShell.astro';
+---
+<PlaygroundShell title="Simulate it" hint="A search request fans out to N shards in parallel and waits for the slowest. Each backend answers in about 10 ms, but 1% of calls take 200 to 1000 ms. Every setting re-runs 2,000 seeded user requests.">
+  <ol class="how">
+    <li>With the defaults (50 shards, <b>no hedging</b>, 50% load) <b>41.5% of user requests</b> hit at least one slow backend (theory: 1 - 0.99^50 = 39.5%). The typical request is fine (p50 14 ms) but <b>p99 is 983 ms</b>. Change the fan-out to 1, 10, 50 and 100 to see the tail take over: at 100 shards the median itself is 462 ms.</li>
+    <li>Set hedging to <b>after p95</b>. A second replica is asked if the first has not answered within 13 ms (the p95 of one backend). <b>p99 falls from 983 to 27 ms</b> for only <b>5.0% extra load</b>. At fan-out 1 the same hedge turns a 499 ms p99 into 21 ms.</li>
+    <li>Set hedging to <b>after p50</b>. Half of all calls now hedge, utilisation climbs, every backend slows down, and so more calls pass the delay: the extra load runs to <b>100%</b>, the backends are <b>overloaded</b> and hedging makes p50 and p99 far worse than not hedging.</li>
+    <li>Set load to <b>High (70%)</b> with <b>after p95</b>: a delay frozen at 13 ms is now shorter than a loaded backend's normal answer, so the same overload appears (extra load 100%, p50 365 ms). Tick <b>Adaptive delay</b>: the delay is re-measured under load, extra load returns to 5.0% and p99 to 27 ms. Tick <b>Hedge budget</b> instead (static delay): the extra load is capped at 5% and the system survives, but most tail calls go unhedged, so p99 stays near 976 ms.</li>
+  </ol>
+  <div class="pg hr" data-hr>
+    <div class="pg-row">
+      <label>Fan-out (shards per request) <select class="pg-in" data-fan><option value="1">1</option><option value="10">10</option><option value="50" selected>50</option><option value="100">100</option></select></label>
+      <label>Hedging <select class="pg-in" data-hedge><option value="0" selected>Off</option><option value="50">After p50 of one backend</option><option value="95">After p95</option><option value="99">After p99</option></select></label>
+      <label>Replicas per shard <select class="pg-in" data-rep><option value="2" selected>2 (one hedge)</option><option value="3">3 (up to two hedges)</option></select></label>
+      <label>Load before hedging <select class="pg-in" data-load><option value="30">Low (30%)</option><option value="50" selected>Medium (50%)</option><option value="70">High (70%)</option><option value="85">Very high (85%)</option></select></label>
+    </div>
+    <div class="pg-row">
+      <label class="hr-check"><input type="checkbox" data-adaptive /> Adaptive delay (re-measure the percentile under load)</label>
+      <label class="hr-check"><input type="checkbox" data-budget /> Hedge budget (shed hedges beyond 5% of calls)</label>
+    </div>
+    <p class="pg-note" data-policy></p>
+    <div class="pg-grid">
+      <div class="pg-box" style="--c: var(--role-1)"><h3>User latency p50 / p95 / p99</h3><span class="pg-mono hr-big" data-lat>-</span><span class="pg-note" data-latnote></span></div>
+      <div class="pg-box" style="--c: var(--role-3)"><h3>Hit a slow backend</h3><span class="pg-mono hr-big" data-hit>-</span><span class="pg-note" data-hitnote></span></div>
+      <div class="pg-box" style="--c: var(--role-2)"><h3>Still slow after hedging</h3><span class="pg-mono hr-big" data-still>-</span><span class="pg-note">user requests that took 200 ms or more</span></div>
+      <div class="pg-box" style="--c: var(--role-4)" data-extrabox><h3>Extra load from hedges</h3><span class="pg-mono hr-big" data-extra>-</span><span class="pg-note" data-extranote></span></div>
+      <div class="pg-box" style="--c: var(--role-5)"><h3>Hedge delay</h3><span class="pg-mono hr-big" data-delay>-</span><span class="pg-note" data-delaynote></span></div>
+    </div>
+    <p class="pg-out" data-verdict role="status"></p>
+    <h3>User latency histogram (share of the 2,000 user requests)</h3>
+    <div class="hr-hist" data-hist role="img" aria-label="Histogram of user request latency"></div>
+    <p class="pg-note"><span class="hr-sw" style="--c: var(--role-3)"></span> no hedging <span class="hr-sw" style="--c: var(--role-2)"></span> with the selected hedging. Both runs use the same random draws, so the difference is caused by hedging alone.</p>
+    <p class="pg-note">Assumptions: a backend answers in 6 to 14 ms (mean 10) 99% of the time and in 200 to 1000 ms 1% of the time. Load follows an M/M/1-style rule: latency scales by (1 - load) / (1 - load with hedges), and the slow fraction scales with it, capped at 98% utilisation. Cancellation is free and the hedge is sent on a different replica with independent latency. Real tails are correlated (a shared dependency, a bad deploy), which makes hedging less effective than shown here.</p>
+  </div>
+</PlaygroundShell>
+<script>
+  // ---- Pure model: seeded LCG, integer milliseconds, no DOM ----
+  const TAIL_BP = 100; // 1% in basis points
+  const N_REQ = 2000;
+  const EDGES = [20, 50, 100, 200, 400, 700];
+  const BUCKETS = ['under 20 ms', '20 to 49 ms', '50 to 99 ms', '100 to 199 ms', '200 to 399 ms', '400 to 699 ms', '700 ms and up'];
+
+  interface Opts { adaptive: boolean; budget: boolean }
+  interface Run { p50: number; p95: number; p99: number; delay: number; s: number; extraPm: number; hit: number; still: number; hist: number[]; eff: number }
+  interface Pair { base: Run; hedged: Run; overloaded: boolean }
+
+  const lcg = (seed: number) => { let s = seed >>> 0; return () => { s = (Math.imul(s, 1664525) + 1013904223) >>> 0; return s >>> 8; }; };
+  const tailBp = (s: number) => Math.min(5000, Math.floor((TAIL_BP * s) / 1000));
+  const isTail = (r1: number, s: number) => r1 % 10000 < tailBp(s);
+  const latency = (r1: number, r2: number, r3: number, s: number) => isTail(r1, s) ? 200 + (r2 % 801) : Math.max(1, Math.floor(((6 + (r2 % 5) + (r3 % 5)) * s) / 1000));
+
+  function delayFor(pct: number, s: number): number {
+    const tb = tailBp(s); const pts: [number, number][] = [];
+    for (let a = 0; a < 5; a++) for (let b = 0; b < 5; b++) pts.push([Math.floor(((6 + a + b) * s) / 1000), (10000 - tb) * 801]);
+    for (let k = 0; k < 801; k++) pts.push([200 + k, tb * 25]);
+    pts.sort((x, y) => x[0] - y[0]);
+    const total = 25 * 801 * 10000; let cum = 0;
+    for (const [v, w] of pts) { cum += w; if (cum * 100 >= pct * total) return Math.max(1, v); }
+    return pts[pts.length - 1][0];
+  }
+
+  interface St { tokens: number; budget: boolean }
+  function shardCall(next: () => number, st: St, delay: number, R: number, s: number): [number, number, boolean] {
+    const t: number[] = []; let tail1 = false;
+    for (let k = 0; k < 3; k++) { const r1 = next(); const r2 = next(); const r3 = next(); if (k === 0) tail1 = isTail(r1, s); t.push(latency(r1, r2, r3, s)); }
+    let done = t[0]; let hedges = 0;
+    st.tokens = Math.min(10000, st.tokens + 50);
+    for (let k = 1; k < R && delay > 0 && done > k * delay; k++) {
+      if (st.budget && st.tokens < 1000) break;
+      if (st.budget) st.tokens -= 1000;
+      hedges++; done = Math.min(done, k * delay + t[k]);
+    }
+    return [done, hedges, tail1];
+  }
+
+  function solve(pct: number, o: Opts, R: number, rho: number) {
+    let s = 1000; let extra = 0; let eff = rho * 10;
+    if (pct === 0) return { s, delay: 0, extra, eff };
+    const d0 = delayFor(pct, 1000);
+    for (let it = 0; it < 8; it++) {
+      const d = o.adaptive ? delayFor(pct, s) : d0; const next = lcg(777); const st: St = { tokens: 0, budget: o.budget }; let h = 0;
+      for (let i = 0; i < 20000; i++) h += shardCall(next, st, d, R, s)[1];
+      extra = Math.floor((h * 1000) / 20000);
+      eff = Math.min(980, Math.floor((rho * (1000 + extra)) / 100));
+      s = Math.floor(((1000 - rho * 10) * 1000) / (1000 - eff));
+    }
+    return { s, delay: o.adaptive ? delayFor(pct, s) : d0, extra, eff };
+  }
+
+  function run(fanout: number, pct: number, R: number, rho: number, o: Opts): Run {
+    const { s, delay, eff } = solve(pct, o, R, rho);
+    const next = lcg(12345); const st: St = { tokens: 0, budget: o.budget }; const lat: number[] = []; const hist = BUCKETS.map(() => 0);
+    let hedges = 0; let hit = 0; let still = 0;
+    for (let i = 0; i < N_REQ; i++) {
+      let worst = 0; let slow = false;
+      for (let j = 0; j < fanout; j++) { const [l, h, t] = shardCall(next, st, delay, R, s); if (l > worst) worst = l; hedges += h; if (t) slow = true; }
+      lat.push(worst); if (slow) hit++; if (worst >= 200) still++;
+      let b = 0; while (b < EDGES.length && worst >= EDGES[b]) b++;
+      hist[b]++;
+    }
+    lat.sort((a, b) => a - b);
+    const p = (q: number) => lat[Math.floor((q * N_REQ + 99) / 100) - 1];
+    return { p50: p(50), p95: p(95), p99: p(99), delay, s, extraPm: Math.floor((hedges * 1000) / (N_REQ * fanout)), hit: Math.floor((hit * 1000) / N_REQ), still: Math.floor((still * 1000) / N_REQ), hist, eff };
+  }
+
+  function simulate(fanout: number, pct: number, R: number, rho: number, o: Opts): Pair {
+    const base = run(fanout, 0, R, rho, o);
+    const hedged = pct === 0 ? base : run(fanout, pct, R, rho, o);
+    return { base, hedged, overloaded: pct > 0 && hedged.s >= 3000 };
+  }
+  const theoryPm = (f: number) => Math.round((1 - Math.pow(0.99, f)) * 1000);
+  const pm = (v: number) => `${Math.floor(v / 10)}.${v % 10}%`;
+  const pctText = (n: number) => (n * 100 / N_REQ).toFixed(1) + '%';
+
+  // ---- UI: build the DOM once, then only update it ----
+  document.querySelectorAll<HTMLElement>('[data-hr]').forEach((root) => {
+    const q = <T extends HTMLElement>(s: string) => root.querySelector<T>(s)!;
+    const num = (s: string) => Number(q<HTMLSelectElement>(s).value);
+    const hist = q('[data-hist]');
+    const rows = BUCKETS.map((label) => {
+      const row = document.createElement('div'); row.className = 'hr-row';
+      const name = document.createElement('div'); name.className = 'hr-label'; name.textContent = label;
+      const mk = (colour: string) => {
+        const line = document.createElement('div'); line.className = 'hr-line';
+        const bar = document.createElement('span'); bar.className = 'hr-bar'; bar.style.setProperty('--c', colour);
+        const val = document.createElement('span'); val.className = 'hr-val';
+        line.appendChild(bar); line.appendChild(val); return { line, bar, val };
+      };
+      const a = mk('var(--role-3)'); const b = mk('var(--role-2)');
+      row.appendChild(name); row.appendChild(a.line); row.appendChild(b.line); hist.appendChild(row);
+      return { a, b };
+    });
+
+    function draw() {
+      const fan = num('[data-fan]'); const pct = num('[data-hedge]'); const R = num('[data-rep]'); const rho = num('[data-load]');
+      const o: Opts = { adaptive: q<HTMLInputElement>('[data-adaptive]').checked, budget: q<HTMLInputElement>('[data-budget]').checked };
+      const { base, hedged, overloaded } = simulate(fan, pct, R, rho, o);
+      const on = pct > 0;
+      q('[data-policy]').textContent = on
+        ? `Send the request to a second replica if the first has not answered after ${hedged.delay} ms${R === 3 ? ' (and a third after twice that)' : ''}; take the first answer. The delay is the p${pct} of one backend, ${o.adaptive ? 're-measured under the current load' : 'measured once at nominal load and then frozen'}${o.budget ? '; hedges beyond 5% of calls are shed' : ''}.`
+        : 'No hedging: every shard call goes to one replica and the user request waits for the slowest of the shards.';
+      q('[data-lat]').textContent = `${hedged.p50} / ${hedged.p95} / ${hedged.p99} ms`;
+      q('[data-latnote]').textContent = on ? `no hedging: ${base.p50} / ${base.p95} / ${base.p99} ms` : 'hedging is off';
+      q('[data-hit]').textContent = pm(hedged.hit);
+      q('[data-hitnote]').textContent = `theory 1 - 0.99^${fan} = ${pm(theoryPm(fan))}${on ? ` · no hedging: ${pm(base.hit)}` : ''}`;
+      q('[data-still]').textContent = pm(hedged.still);
+      q('[data-extra]').textContent = on ? `+${pm(hedged.extraPm)}` : '+0.0%';
+      q('[data-extranote]').textContent = on ? `backend utilisation ${Math.floor(hedged.eff / 10)}% (was ${rho}%)` : 'one call per shard';
+      q('[data-delay]').textContent = on ? `${hedged.delay} ms` : 'none';
+      q('[data-delaynote]').textContent = on ? `backends ${(hedged.s / 1000).toFixed(2)}x slower than nominal` : 'no second request is sent';
+      q<HTMLElement>('[data-extrabox]').style.setProperty('--c', overloaded ? 'var(--bad)' : 'var(--role-4)');
+      const verdict = q('[data-verdict]');
+      let text: string; let bad = false;
+      if (!on) text = `No hedging: ${pm(base.hit)} of user requests touched a slow backend and waited for it. The more shards a request waits for, the more often the slowest one is a tail call.`;
+      else if (overloaded) { bad = true; text = `Overloaded: the hedges add ${pm(hedged.extraPm)} load, utilisation reaches ${Math.floor(hedged.eff / 10)}%, every backend slows ${(hedged.s / 1000).toFixed(1)}x, so even more calls pass the delay and hedge too. p99 went from ${base.p99} to ${hedged.p99} ms: hedging made it worse.`; }
+      else if (hedged.p99 * 2 > base.p99) { bad = true; text = `Hedging barely helped: p99 is ${hedged.p99} ms against ${base.p99} ms for ${pm(hedged.extraPm)} extra load. ${o.budget ? 'The 5% budget ran out before most tail calls could be hedged, so the tail is mostly still there.' : 'The delay is too long for this tail.'}`; }
+      else if (hedged.p99 < base.p99) text = `Hedging cut p99 from ${base.p99} to ${hedged.p99} ms for ${pm(hedged.extraPm)} extra load.`;
+      else { bad = true; text = `Hedging did not help here: p99 is ${hedged.p99} ms against ${base.p99} ms. ${o.budget ? 'The 5% budget ran out before most tail calls could be hedged.' : 'The delay is too long or the backends are saturated.'}`; }
+      verdict.textContent = text; verdict.classList.toggle('bad', bad);
+      rows.forEach((r, i) => {
+        const fa = base.hist[i] * 100 / N_REQ; const fb = hedged.hist[i] * 100 / N_REQ;
+        r.a.bar.style.width = fa > 0 ? `calc((100% - 9.5rem) * ${Math.max(fa, 0.6) / 100})` : '0'; r.a.val.textContent = `${fa.toFixed(1)}% no hedging`;
+        r.b.bar.style.width = fb > 0 ? `calc((100% - 9.5rem) * ${Math.max(fb, 0.6) / 100})` : '0'; r.b.val.textContent = `${fb.toFixed(1)}% hedged`;
+      });
+      hist.setAttribute('aria-label', `Histogram of user request latency. No hedging: ${base.hist.map((c, i) => `${BUCKETS[i]} ${pctText(c)}`).join(', ')}. With the selected hedging: ${hedged.hist.map((c, i) => `${BUCKETS[i]} ${pctText(c)}`).join(', ')}.`);
+    }
+    let queued = false;
+    const schedule = () => { if (queued) return; queued = true; requestAnimationFrame(() => { queued = false; draw(); }); };
+    root.querySelectorAll('select, input').forEach((el) => el.addEventListener('change', schedule));
+    draw();
+  });
+</script>
+<style is:global>
+  .playground .hr-check { display: inline-flex; align-items: center; gap: 6px; }
+  .playground .hr-big { font-size: 1.05rem; font-weight: 600; overflow-wrap: anywhere; }
+  .playground .hr-hist { display: grid; gap: 8px; margin: 8px 0 12px; }
+  .playground .hr-row { display: grid; gap: 2px; }
+  .playground .hr-label { font-size: .82rem; font-weight: 600; white-space: nowrap; }
+  .playground .hr-line { display: flex; align-items: center; gap: 8px; min-height: 14px; }
+  .playground .hr-bar { display: block; height: 10px; border-radius: 3px; background: var(--c); flex: 0 0 auto; }
+  .playground .hr-val { font: .78rem ui-monospace, monospace; color: var(--muted); white-space: nowrap; }
+  .playground .hr-sw { display: inline-block; width: 12px; height: 12px; border-radius: 3px; background: var(--c); vertical-align: -1px; margin: 0 4px 0 8px; }
+</style>

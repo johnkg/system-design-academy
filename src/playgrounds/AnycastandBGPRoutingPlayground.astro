@@ -1,0 +1,392 @@
+---
+import PlaygroundShell from '../components/PlaygroundShell.astro';
+---
+<PlaygroundShell title="Simulate it" hint="One /23 announced from five cities to nine client networks. Withdraw sites, hijack the prefix, or flood it, and see which site each network reaches.">
+  <ol class="how">
+    <li>At the defaults every network reaches a site chosen by BGP policy, not distance. The <b>Seattle ISP</b> goes to <b>New York at 63 ms</b>, 35 ms worse than Los Angeles, because its provider holds New York as a customer route.</li>
+    <li>Untick <b>Singapore</b>. Mumbai and Tokyo move to London (115 ms and 151 ms instead of 64 and 86), 400 long-lived connections are reset, and the last network switches after about 32 s. Choose <b>Site dies, 90 s hold timer</b> and all 2,000 connections reset and the black-hole lasts about 122 s.</li>
+    <li>Switch on the <b>hijack</b>. With RPKI on <b>Nobody</b> all 9 networks send traffic to the rogue AS, with <b>Tier-1s only</b> 4 of 9, with <b>Everyone</b> none. Tick <b>We also announce the /24s</b> and it falls to the 2 networks nearest the rogue AS.</li>
+    <li>Set the attack to <b>240 Gbps</b>. Spread over every network, all sites absorb it (busiest: New York, 104 of 150 Gbps). Make it <b>Concentrated in Asia</b>: Singapore is flooded (260 of 80 Gbps). Withdrawing Singapore only moves the flood to London.</li>
+  </ol>
+  <div class="pg acs" data-acs>
+    <fieldset class="acs-set">
+      <legend>Sites announcing the prefix</legend>
+      <div class="pg-row" data-sitechecks></div>
+    </fieldset>
+    <div class="pg-row">
+      <label>When a site is withdrawn <select class="pg-in" data-mode>
+        <option value="graceful" selected>Graceful: withdraw, site keeps answering</option>
+        <option value="bfd">Site dies, BFD detects in 1 s</option>
+        <option value="hold">Site dies, 90 s hold timer</option>
+      </select></label>
+      <label>BGP convergence (s) <input type="range" min="10" max="120" step="5" value="45" data-conv /> <b data-convval>45</b></label>
+      <label>Long-lived flows (%) <input type="range" min="0" max="60" step="5" value="20" data-long /> <b data-longval>20</b></label>
+    </div>
+    <div class="pg-row">
+      <label>Rogue AS 64499 <select class="pg-in" data-hijack>
+        <option value="off" selected>Not announcing</option>
+        <option value="on">Announces 192.0.2.0/24</option>
+      </select></label>
+      <label>RPKI validation by <select class="pg-in" data-rov>
+        <option value="none" selected>Nobody</option>
+        <option value="tier1">Tier-1s only</option>
+        <option value="all">Everyone</option>
+      </select></label>
+      <label class="acs-check"><input type="checkbox" data-deagg /> We also announce the /24s</label>
+    </div>
+    <div class="pg-row">
+      <label>Attack (Gbps) <input type="range" min="0" max="600" step="20" value="0" data-attack /> <b data-attackval>0</b></label>
+      <label>Botnet <select class="pg-in" data-botnet>
+        <option value="even" selected>Spread over every network</option>
+        <option value="asia">Concentrated in Asia</option>
+      </select></label>
+      <button class="btn" type="button" data-reset>Reset</button>
+    </div>
+    <svg class="acs-map" viewBox="0 0 400 190" role="img" aria-label="Stylised world map: lines from each client network to the anycast site it reaches" data-map></svg>
+    <div class="pg-grid" data-sites></div>
+    <div class="acs-scroll" tabindex="0" role="region" aria-label="Per-network routing table, scrolls sideways on narrow screens">
+      <table class="acs-table">
+        <thead><tr><th scope="col">Network</th><th scope="col">Reaches</th><th scope="col">AS path</th><th scope="col">Why</th><th scope="col">RTT</th><th scope="col">vs closest</th></tr></thead>
+        <tbody data-rows></tbody>
+      </table>
+    </div>
+    <div class="pg-box" style="--c: var(--role-3)">
+      <h3>Route change timeline</h3>
+      <div data-timeline></div>
+      <span class="pg-note" data-timelinenote></span>
+    </div>
+    <p class="pg-out" data-routing aria-live="polite"></p>
+    <p class="pg-out" data-withdraw aria-live="polite"></p>
+    <p class="pg-out" data-hijackout aria-live="polite"></p>
+    <p class="pg-out" data-ddos aria-live="polite"></p>
+    <p class="pg-note">Model assumptions: local-pref customer 200, peer 100, provider 50, then shortest AS path, then lowest neighbour AS; no MED, IGP cost or ECMP; routes follow the usual export rules (customer routes to everyone, others only to customers). RTT = 4 ms + great-circle distance / 65 km per ms. Each network holds 400 to 1,100 connections (100 per Gbps) and opens new ones at 10 % of that per second. Each network switches 35 % to 100 % of the convergence slider after the withdrawal (seeded, fixed). Site capacities are 120, 150, 100, 80 and 60 Gbps. The hijacker sits behind the Asia-Pacific transit.</p>
+  </div>
+</PlaygroundShell>
+<script>
+  interface Site { id: string; name: string; lon: number; lat: number; cap: number; up: string }
+  interface Client { id: string; name: string; asn: number; lon: number; lat: number; flows: number; ups: string[] }
+  interface Route { origin: string; path: number[]; pref: number; via: string | null }
+  interface Cfg { sites: Record<string, boolean>; hijack: boolean; rov: string; deagg: boolean }
+  interface Params { convSec: number; mode: string; longPct: number; attack: number; botnet: string }
+
+  const SITES: Site[] = [
+    { id: 'LAX', name: 'Los Angeles', lon: -118.2, lat: 34.0, cap: 120, up: 'RW' },
+    { id: 'NYC', name: 'New York', lon: -74.0, lat: 40.7, cap: 150, up: 'RE' },
+    { id: 'LON', name: 'London', lon: -0.1, lat: 51.5, cap: 100, up: 'RU' },
+    { id: 'SIN', name: 'Singapore', lon: 103.8, lat: 1.35, cap: 80, up: 'RA' },
+    { id: 'GRU', name: 'Sao Paulo', lon: -46.6, lat: -23.5, cap: 60, up: 'RS' },
+  ];
+  const CLIENTS: Client[] = [
+    { id: 'SEA', name: 'Seattle ISP', asn: 3001, lon: -122.3, lat: 47.6, flows: 900, ups: ['RE'] },
+    { id: 'DAL', name: 'Dallas ISP', asn: 3002, lon: -96.8, lat: 32.8, flows: 700, ups: ['RE'] },
+    { id: 'MEX', name: 'Mexico City ISP', asn: 3003, lon: -99.1, lat: 19.4, flows: 500, ups: ['RW', 'RS'] },
+    { id: 'BOS', name: 'Boston ISP', asn: 3004, lon: -71.1, lat: 42.4, flows: 800, ups: ['RE'] },
+    { id: 'LIM', name: 'Lima ISP', asn: 3005, lon: -77.0, lat: -12.0, flows: 500, ups: ['RS'] },
+    { id: 'PAR', name: 'Paris ISP', asn: 3006, lon: 2.3, lat: 48.9, flows: 1000, ups: ['RU'] },
+    { id: 'CAI', name: 'Cairo ISP', asn: 3007, lon: 31.2, lat: 30.0, flows: 400, ups: ['RU'] },
+    { id: 'BOM', name: 'Mumbai ISP', asn: 3008, lon: 72.9, lat: 19.0, flows: 900, ups: ['RA'] },
+    { id: 'TYO', name: 'Tokyo ISP', asn: 3009, lon: 139.7, lat: 35.7, flows: 1100, ups: ['RA'] },
+  ];
+  const HIJACKER = { id: 'HJK', asn: 64499, lon: 128, lat: 8, ups: ['RA'] };
+  const ORIGIN_ASN = 64500;
+  const TRANSIT: Record<string, number> = { T1: 1001, T2: 1002, RW: 2001, RE: 2002, RU: 2003, RA: 2004, RS: 2005 };
+  const P2C: [string, string][] = [['T1', 'RW'], ['T1', 'RU'], ['T1', 'RA'], ['T2', 'RE'], ['T2', 'RS'], ['T2', 'RU']];
+  const P2P: [string, string][] = [['T1', 'T2'], ['RW', 'RE'], ['RE', 'RU'], ['RA', 'RU']];
+  const PREF: Record<string, number> = { customer: 200, peer: 100, provider: 50 };
+
+  const ASN: Record<string, number> = { ...TRANSIT };
+  const NB: Record<string, { id: string; rel: string }[]> = {};
+  const link = (a: string, b: string, ra: string, rb: string) => { (NB[a] ||= []).push({ id: b, rel: ra }); (NB[b] ||= []).push({ id: a, rel: rb }); };
+  P2C.forEach(([p, c]) => link(p, c, 'customer', 'provider'));
+  P2P.forEach(([a, b]) => link(a, b, 'peer', 'peer'));
+  SITES.forEach((s) => { ASN['S' + s.id] = ORIGIN_ASN; link(s.up, 'S' + s.id, 'customer', 'provider'); });
+  CLIENTS.forEach((c) => { ASN[c.id] = c.asn; c.ups.forEach((u) => link(u, c.id, 'customer', 'provider')); });
+  ASN.HJK = HIJACKER.asn; HIJACKER.ups.forEach((u) => link(u, 'HJK', 'customer', 'provider'));
+  const NODES = Object.keys(NB);
+
+  // ROA for 192.0.2.0/23: origin AS 64500 only, up to maxLength.
+  const roaValid = (origin: number, len: number, maxLen: number) => origin === ORIGIN_ASN && len <= maxLen;
+  const rank = (r: Route): number[] => [-r.pref, r.path.length, r.via == null ? 0 : ASN[r.via]];
+  const better = (a: Route, b: Route) => { const x = rank(a), y = rank(b); for (let i = 0; i < 3; i++) if (x[i] !== y[i]) return x[i] < y[i]; return false; };
+
+  function propagate(origins: string[], len: number, maxLen: number, rov: (n: string) => boolean) {
+    const best: Record<string, Route> = {}; const alts: Record<string, Route[]> = {};
+    origins.forEach((o) => { best[o] = { origin: o, path: [], pref: 1000, via: null }; });
+    for (let it = 0; it < 60; it++) {
+      let changed = false;
+      for (const node of NODES) {
+        if (origins.includes(node)) continue;
+        const cands: Route[] = [];
+        for (const n of NB[node]) {
+          const r = best[n.id]; if (!r) continue;
+          const fromCustomer = r.via == null || NB[n.id].find((x) => x.id === r.via)!.rel === 'customer';
+          if (!fromCustomer && n.rel !== 'provider') continue; // neighbours export non-customer routes only to their customers
+          const path = [ASN[n.id], ...r.path];
+          if (path.includes(ASN[node])) continue; // loop prevention
+          if (rov(node) && !roaValid(ASN[r.origin], len, maxLen)) continue; // RPKI route-origin validation
+          cands.push({ origin: r.origin, path, pref: PREF[n.rel], via: n.id });
+        }
+        alts[node] = cands;
+        let b: Route | null = null; cands.forEach((c) => { if (!b || better(c, b)) b = c; });
+        const old = best[node];
+        const same = (!b && !old) || (b && old && b.via === old.via && b.path.join() === old.path.join());
+        if (!same) { if (b) best[node] = b; else delete best[node]; changed = true; }
+      }
+      if (!changed) break;
+    }
+    return { best, alts };
+  }
+  const km = (a: { lat: number; lon: number }, b: { lat: number; lon: number }) => {
+    const d = Math.PI / 180; const dl = (b.lat - a.lat) * d, dn = (b.lon - a.lon) * d;
+    const h = Math.sin(dl / 2) ** 2 + Math.cos(a.lat * d) * Math.cos(b.lat * d) * Math.sin(dn / 2) ** 2;
+    return 2 * 6371 * Math.asin(Math.sqrt(h));
+  };
+  const rtt = (c: Client, s: Site) => Math.round(4 + km(c, s) / 65);
+  function why(alts: Route[]) {
+    if (alts.length < 2) return 'only route';
+    const [x, y] = alts.slice().sort((a, b) => (better(a, b) ? -1 : better(b, a) ? 1 : 0));
+    if (x.pref !== y.pref) return `local-pref ${x.pref} over ${y.pref}`;
+    if (x.path.length !== y.path.length) return 'shorter AS path';
+    return 'tie: lowest neighbour AS';
+  }
+  const defaults = (): Cfg => ({ sites: { LAX: true, NYC: true, LON: true, SIN: true, GRU: true }, hijack: false, rov: 'none', deagg: false });
+  interface Routed { c: Client; none?: boolean; hijacked?: boolean; site?: string; len?: number; path?: number[]; reason?: string }
+  function routeAll(cfg: Cfg): Routed[] {
+    const up = SITES.filter((s) => cfg.sites[s.id]).map((s) => 'S' + s.id);
+    const rov = cfg.rov === 'all' ? () => true : cfg.rov === 'tier1' ? (n: string) => n === 'T1' || n === 'T2' : () => false;
+    const maxLen = cfg.deagg ? 24 : 23;
+    const p23 = propagate(up, 23, maxLen, rov);
+    const p24 = propagate([...(cfg.hijack ? ['HJK'] : []), ...(cfg.deagg ? up : [])], 24, maxLen, rov);
+    return CLIENTS.map((c) => {
+      const r24 = p24.best[c.id], r23 = p23.best[c.id]; const r = r24 || r23;
+      if (!r) return { c, none: true };
+      const src = r24 ? p24 : p23;
+      return { c, hijacked: r.origin === 'HJK', site: r.origin === 'HJK' ? undefined : r.origin.slice(1), len: r24 ? 24 : 23, path: r.path,
+        reason: r24 && r23 ? 'longest prefix: /24 beats /23' : why(src.alts[c.id]) };
+    });
+  }
+  function mulberry32(a: number) { return () => { a |= 0; a = (a + 0x6d2b79f5) | 0; let t = Math.imul(a ^ (a >>> 15), 1 | a); t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t; return ((t ^ (t >>> 14)) >>> 0) / 4294967296; }; }
+  interface Row { c: Client; r: Routed; base: Routed; rtt: number | null; delta: number; moved: boolean; delay: number; blackout: number; broken: number; failed: number }
+  function analyze(cfg: Cfg, p: Params) {
+    const base = routeAll(defaults()); const cur = routeAll(cfg);
+    const rnd = mulberry32(7); const detect = p.mode === 'hold' ? 90 : p.mode === 'bfd' ? 1 : 0;
+    const upSites = SITES.filter((s) => cfg.sites[s.id]);
+    const rows: Row[] = cur.map((r, i) => {
+      const f = 0.35 + 0.65 * rnd(); const c = r.c; const b = base[i];
+      const row: Row = { c, r, base: b, rtt: null, delta: 0, moved: false, delay: 0, blackout: 0, broken: 0, failed: 0 };
+      if (r.none || r.hijacked) return row;
+      const mine = SITES.find((s) => s.id === r.site)!;
+      row.rtt = rtt(c, mine);
+      row.delta = row.rtt - Math.min(...upSites.map((s) => rtt(c, s)));
+      if (r.site !== b.site) {
+        row.moved = true; row.delay = Math.max(1, Math.round(p.convSec * f));
+        const crash = detect > 0 && !cfg.sites[b.site!];
+        row.broken = crash ? c.flows : Math.round((c.flows * p.longPct) / 100);
+        row.blackout = crash ? detect + row.delay : 0;
+        row.failed = Math.round((c.flows / 10) * row.blackout);
+      }
+      return row;
+    });
+    const load: Record<string, number> = {}; SITES.forEach((s) => (load[s.id] = 0));
+    const atk = (c: Client) => (p.botnet === 'asia' ? (c.id === 'BOM' || c.id === 'TYO' ? p.attack / 2 : 0) : p.attack / CLIENTS.length);
+    rows.forEach((w) => { if (w.r.site) load[w.r.site] += w.c.flows / 100 + atk(w.c); });
+    let served = 0, total = 0;
+    rows.forEach((w) => { const g = w.c.flows / 100; total += g; if (w.r.site) served += g * Math.min(1, SITES.find((s) => s.id === w.r.site)!.cap / load[w.r.site]); });
+    const captured = rows.filter((w) => w.r.hijacked);
+    const flowsAll = rows.reduce((a, w) => a + w.c.flows, 0);
+    return {
+      rows, load, servedPct: Math.floor((100 * served) / total + 0.5),
+      moved: rows.filter((w) => w.moved).length, broken: rows.reduce((a, w) => a + w.broken, 0), failed: rows.reduce((a, w) => a + w.failed, 0),
+      converge: rows.reduce((a, w) => Math.max(a, w.blackout || w.delay), 0),
+      capturedN: captured.length, capturedPct: Math.floor((100 * captured.reduce((a, w) => a + w.c.flows, 0)) / flowsAll + 0.5),
+      saturated: SITES.filter((s) => load[s.id] > s.cap).map((s) => s.id),
+    };
+  }
+
+  // ---- UI ----
+  const SITE_COLOUR: Record<string, string> = { LAX: 'var(--role-1)', NYC: 'var(--role-2)', LON: 'var(--role-3)', SIN: 'var(--role-4)', GRU: 'var(--role-5)' };
+  const NS = 'http://www.w3.org/2000/svg';
+  const fmt = (x: number) => (Math.round(x * 10) / 10).toFixed(1);
+  const num = (x: number) => String(Math.round(x)).replace(/\B(?=(\d{3})+(?!\d))/g, ',');
+  const mx = (lon: number) => 10 + (lon + 135) * 1.34;
+  const my = (lat: number) => 10 + (58 - lat) * 2.1;
+
+  document.querySelectorAll<HTMLElement>('[data-acs]').forEach((root) => {
+    const q = <T extends Element>(s: string) => root.querySelector<T>(s)!;
+    const sv = (s: string) => q<HTMLInputElement | HTMLSelectElement>(s).value;
+    const siteBoxes: Record<string, HTMLInputElement> = {};
+    const checks = q<HTMLElement>('[data-sitechecks]');
+    SITES.forEach((s) => {
+      const lab = document.createElement('label'); lab.className = 'acs-check';
+      const cb = document.createElement('input'); cb.type = 'checkbox'; cb.checked = true; cb.addEventListener('change', schedule);
+      lab.append(cb, ' ' + s.name); checks.appendChild(lab); siteBoxes[s.id] = cb;
+    });
+
+    // Map, built once.
+    const map = q<SVGSVGElement>('[data-map]');
+    const mk = (tag: string, attrs: Record<string, string>, parent: Element = map) => { const e = document.createElementNS(NS, tag); Object.entries(attrs).forEach(([k, v]) => e.setAttribute(k, v)); parent.appendChild(e); return e; };
+    [-120, -60, 0, 60, 120].forEach((lon) => mk('line', { x1: String(mx(lon)), x2: String(mx(lon)), y1: '10', y2: '180', class: 'acs-grid' }));
+    [-20, 0, 20, 40].forEach((lat) => mk('line', { x1: '10', x2: '390', y1: String(my(lat)), y2: String(my(lat)), class: 'acs-grid' }));
+    const lines: Record<string, SVGElement> = {};
+    CLIENTS.forEach((c) => { lines[c.id] = mk('line', { x1: String(mx(c.lon)), y1: String(my(c.lat)), x2: String(mx(c.lon)), y2: String(my(c.lat)), class: 'acs-line' }); });
+    CLIENTS.forEach((c) => {
+      mk('circle', { cx: String(mx(c.lon)), cy: String(my(c.lat)), r: '2.6', class: 'acs-client' });
+      const t = mk('text', { x: String(mx(c.lon) + 4), y: String(my(c.lat) - 3), class: 'acs-label' }); t.textContent = c.id;
+    });
+    const siteMarks: Record<string, SVGElement> = {};
+    SITES.forEach((s) => {
+      siteMarks[s.id] = mk('rect', { x: String(mx(s.lon) - 5), y: String(my(s.lat) - 5), width: '10', height: '10', class: 'acs-site', style: `fill:${SITE_COLOUR[s.id]}` });
+      const t = mk('text', { x: String(mx(s.lon) - 6), y: String(my(s.lat) + 15), class: 'acs-label acs-strong' }); t.textContent = s.id;
+    });
+    const hjMark = mk('rect', { x: String(mx(HIJACKER.lon) - 5), y: String(my(HIJACKER.lat) - 5), width: '10', height: '10', class: 'acs-rogue' });
+    const hjText = mk('text', { x: String(mx(HIJACKER.lon) - 14), y: String(my(HIJACKER.lat) - 8), class: 'acs-label acs-strong' }); hjText.textContent = 'rogue AS';
+
+    // Site cards, built once.
+    const cards: Record<string, { box: HTMLElement; fill: HTMLElement; meter: HTMLElement; load: HTMLElement; who: HTMLElement }> = {};
+    SITES.forEach((s) => {
+      const box = document.createElement('div'); box.className = 'pg-box'; box.style.setProperty('--c', SITE_COLOUR[s.id]);
+      box.innerHTML = '<h3></h3><div class="acs-meter" role="img"><div class="acs-fill"></div></div><span class="pg-mono" data-load></span><span class="pg-note" data-who></span>';
+      box.querySelector('h3')!.textContent = `${s.name} (${s.id})`;
+      q('[data-sites]').appendChild(box);
+      cards[s.id] = { box, fill: box.querySelector('.acs-fill')!, meter: box.querySelector('.acs-meter')!, load: box.querySelector('[data-load]')!, who: box.querySelector('[data-who]')! };
+    });
+
+    // Table and timeline rows, built once.
+    const cells: Record<string, HTMLElement[]> = {};
+    CLIENTS.forEach((c) => {
+      const tr = document.createElement('tr'); const tds: HTMLElement[] = [];
+      for (let i = 0; i < 6; i++) { const td = document.createElement('td'); tr.appendChild(td); tds.push(td); }
+      tds[0].textContent = `${c.name} (AS ${c.asn})`; q('[data-rows]').appendChild(tr); cells[c.id] = tds;
+    });
+    const tl: Record<string, { row: HTMLElement; bar: HTMLElement; txt: HTMLElement }> = {};
+    CLIENTS.forEach((c) => {
+      const row = document.createElement('div'); row.className = 'acs-tl'; row.hidden = true;
+      row.innerHTML = '<span class="acs-tlname"></span><span class="acs-track"><span class="acs-bar"></span></span><span class="pg-mono acs-tltxt"></span>';
+      row.querySelector('.acs-tlname')!.textContent = c.id; q('[data-timeline]').appendChild(row);
+      tl[c.id] = { row, bar: row.querySelector('.acs-bar')!, txt: row.querySelector('.acs-tltxt')! };
+    });
+
+    function render() {
+      const cfg: Cfg = { sites: {}, hijack: sv('[data-hijack]') === 'on', rov: sv('[data-rov]'), deagg: q<HTMLInputElement>('[data-deagg]').checked };
+      SITES.forEach((s) => { cfg.sites[s.id] = siteBoxes[s.id].checked; });
+      const p: Params = { convSec: Number(sv('[data-conv]')), mode: sv('[data-mode]'), longPct: Number(sv('[data-long]')), attack: Number(sv('[data-attack]')), botnet: sv('[data-botnet]') };
+      q('[data-convval]').textContent = String(p.convSec); q('[data-longval]').textContent = String(p.longPct); q('[data-attackval]').textContent = String(p.attack);
+      const a = analyze(cfg, p);
+      const withdrawn = SITES.filter((s) => !cfg.sites[s.id]);
+
+      // map
+      SITES.forEach((s) => { siteMarks[s.id].classList.toggle('acs-dim', !cfg.sites[s.id]); });
+      hjMark.classList.toggle('acs-dim', !cfg.hijack); hjText.classList.toggle('acs-dim', !cfg.hijack);
+      a.rows.forEach((w) => {
+        const ln = lines[w.c.id];
+        const target = w.r.hijacked ? HIJACKER : w.r.site ? SITES.find((s) => s.id === w.r.site)! : null;
+        if (!target) { ln.setAttribute('x2', ln.getAttribute('x1')!); ln.setAttribute('y2', ln.getAttribute('y1')!); return; }
+        ln.setAttribute('x2', String(mx(target.lon))); ln.setAttribute('y2', String(my(target.lat)));
+        ln.setAttribute('style', w.r.hijacked ? 'stroke:var(--bad);stroke-dasharray:4 3' : `stroke:${SITE_COLOUR[w.r.site!]}`);
+      });
+
+      // cards
+      SITES.forEach((s) => {
+        const cd = cards[s.id]; const l = a.load[s.id]; const sat = l > s.cap;
+        cd.box.classList.toggle('off', !cfg.sites[s.id]);
+        cd.fill.style.width = Math.min(100, (l / s.cap) * 100) + '%';
+        cd.fill.style.background = sat ? 'var(--bad)' : SITE_COLOUR[s.id];
+        cd.meter.setAttribute('aria-label', `${s.name} load ${fmt(l)} of ${s.cap} Gbps`);
+        cd.load.textContent = cfg.sites[s.id] ? `${fmt(l)} / ${s.cap} Gbps${sat ? ' SATURATED' : ''}` : 'withdrawn';
+        const who = a.rows.filter((w) => w.r.site === s.id).map((w) => w.c.id);
+        cd.who.textContent = who.length ? `catchment: ${who.join(' ')}` : cfg.sites[s.id] ? 'catchment: none' : 'no route announced';
+      });
+
+      // table
+      a.rows.forEach((w) => {
+        const t = cells[w.c.id]; const r = w.r;
+        if (r.none) { t[1].textContent = 'no route'; t[2].textContent = '-'; t[3].textContent = '-'; t[4].textContent = '-'; t[5].textContent = '-'; return; }
+        t[1].textContent = r.hijacked ? 'ROGUE AS (hijacked)' : SITES.find((s) => s.id === r.site)!.name;
+        t[2].textContent = r.path!.join(' '); t[3].textContent = r.reason!;
+        t[4].textContent = w.rtt == null ? '-' : w.rtt + ' ms';
+        t[5].textContent = w.rtt == null ? '-' : w.delta > 0 ? '+' + w.delta + ' ms' : 'closest';
+        t[1].className = r.hijacked ? 'acs-bad' : ''; t[5].className = w.delta > 0 ? 'acs-bad' : '';
+      });
+
+      // timeline: seconds since the withdrawal, scale 0..240 s
+      const scale = 240;
+      CLIENTS.forEach((c) => {
+        const w = a.rows.find((x) => x.c.id === c.id)!; const e = tl[c.id];
+        e.row.hidden = !w.moved; if (!w.moved) return;
+        const span = w.blackout || w.delay;
+        e.bar.style.width = (span / scale) * 100 + '%'; e.bar.style.background = w.blackout ? 'var(--bad)' : 'var(--role-3)';
+        e.txt.textContent = `${span} s: ${w.blackout ? 'black-holed, ' + num(w.failed) + ' attempts failed, ' : 'still served by old site, '}${num(w.broken)} flows reset`;
+      });
+      q('[data-timelinenote]').textContent = a.moved ? 'Bar length = seconds from the withdrawal until that network is on its new site. Red = packets are black-holed, blue = the old site still answers.' : 'Withdraw a site that has clients to see when each network switches.';
+
+      // summaries
+      const noRoute = a.rows.every((w) => w.r.none);
+      const nonClosest = a.rows.filter((w) => w.delta > 0);
+      const worst = nonClosest.reduce((m, w) => Math.max(m, w.delta), 0);
+      if (noRoute) {
+        q('[data-routing]').textContent = 'No site announces the prefix, so no network has a route and nothing is served.';
+        q('[data-withdraw]').textContent = 'All five routes are withdrawn. Tick a site to announce again.';
+        q('[data-hijackout]').textContent = ''; q('[data-ddos]').textContent = ''; q('[data-hijackout]').classList.toggle('bad', false); q('[data-ddos]').classList.toggle('bad', false);
+        return;
+      }
+      q('[data-routing]').textContent = `Catchments: ${SITES.map((s) => `${s.id} ${a.rows.filter((w) => w.r.site === s.id).length}`).join(' · ')} networks. ` +
+        (nonClosest.length ? `${nonClosest.length} of ${a.rows.length} networks are not sent to their closest announcing site (worst +${worst} ms): BGP policy, not distance, decides.` : 'Every network reaches its closest announcing site.');
+      const crash = p.mode !== 'graceful' && withdrawn.length > 0;
+      q('[data-withdraw]').textContent = !withdrawn.length ? 'All five sites announce. Untick a site to withdraw its route.'
+        : !a.moved ? `Withdrawn: ${withdrawn.map((s) => s.id).join(', ')}. No network was using it, so nothing moved.`
+        : `Withdrawn: ${withdrawn.map((s) => s.id).join(', ')}. ${a.moved} networks re-routed; the last one switched ${a.converge} s after the event. ` +
+          (crash ? `The site died: ${num(a.broken)} connections reset at once and ${num(a.failed)} new connection attempts failed while packets were black-holed.`
+            : `The site kept answering until routes moved, so no attempts failed, but ${num(a.broken)} long-lived connections (${p.longPct}% of flows) were reset on the new site.`);
+      const hjOut = q<HTMLElement>('[data-hijackout]');
+      hjOut.textContent = !cfg.hijack ? 'No hijack. Rogue AS 64499 is not announcing.'
+        : `Rogue AS 64499 announces 192.0.2.0/24: ${a.capturedN} of ${a.rows.length} networks (${a.capturedPct}% of connections) send traffic to it. ` +
+          (cfg.rov === 'all' ? 'Every AS validates RPKI, so the invalid /24 is dropped.' : cfg.rov === 'tier1' ? 'Only the tier-1s validate: the rogue AS\'s own transit and its peers still accept the route.' : 'Nobody validates, so the more specific /24 wins wherever it is heard.') +
+          (cfg.deagg ? ' Our own /24s tie on length, so path length and tie-breakers decide.' : '');
+      hjOut.classList.toggle('bad', a.capturedN > 0);
+      const ddos = q<HTMLElement>('[data-ddos]');
+      const busiest = SITES.reduce((m, s) => (a.load[s.id] > a.load[m.id] ? s : m), SITES[0]);
+      ddos.textContent = p.attack === 0 ? `No attack. Busiest site: ${busiest.id}, ${fmt(a.load[busiest.id])} of ${busiest.cap} Gbps.`
+        : `${p.attack} Gbps flood, ${p.botnet === 'asia' ? 'concentrated in Mumbai and Tokyo' : 'spread over all 9 networks'}. Busiest site: ${busiest.id}, ${fmt(a.load[busiest.id])} of ${busiest.cap} Gbps. ` +
+          (a.saturated.length ? `Saturated: ${a.saturated.join(', ')}. ` : 'No site saturated. ') + `Legitimate traffic served: ${a.servedPct}%.`;
+      ddos.classList.toggle('bad', a.saturated.length > 0);
+    }
+
+    let queued = false;
+    function schedule() { if (queued) return; queued = true; requestAnimationFrame(() => { queued = false; render(); }); }
+    root.querySelectorAll('input, select').forEach((el) => { el.addEventListener('input', schedule); el.addEventListener('change', schedule); });
+    q('[data-reset]').addEventListener('click', () => {
+      Object.values(siteBoxes).forEach((cb) => { cb.checked = true; });
+      const set = (s: string, v: string) => { q<HTMLInputElement | HTMLSelectElement>(s).value = v; };
+      set('[data-mode]', 'graceful'); set('[data-conv]', '45'); set('[data-long]', '20'); set('[data-hijack]', 'off'); set('[data-rov]', 'none'); set('[data-attack]', '0'); set('[data-botnet]', 'even');
+      q<HTMLInputElement>('[data-deagg]').checked = false; render();
+    });
+    render();
+  });
+</script>
+<style is:global>
+  .playground .acs-set { border: 1px solid var(--border); border-radius: 10px; padding: 8px 12px; margin: 0; min-width: 0; }
+  .playground .acs-set legend { padding: 0 6px; font-size: .9rem; color: var(--muted); }
+  .playground .acs-check { display: inline-flex; align-items: center; gap: 6px; }
+  .playground .acs-map { width: 100%; height: auto; border: 1px solid var(--border); border-radius: 10px; background: var(--surface); }
+  .playground .acs-grid { stroke: var(--border); stroke-width: .5; }
+  .playground .acs-line { stroke-width: 1.4; stroke: var(--muted); opacity: .85; }
+  .playground .acs-client { fill: var(--text); }
+  .playground .acs-site { stroke: var(--text); stroke-width: 1; }
+  .playground .acs-rogue { fill: var(--bad); stroke: var(--text); stroke-width: 1; }
+  .playground .acs-dim { opacity: .25; }
+  .playground .acs-label { font-size: 7px; fill: var(--text); }
+  .playground .acs-strong { font-weight: 700; }
+  .playground .acs-meter { height: 10px; border-radius: 5px; background: var(--surface-2); border: 1px solid var(--border); overflow: hidden; }
+  .playground .acs-fill { height: 100%; width: 0; transition: width .25s; }
+  .playground .acs-scroll { overflow-x: auto; border: 1px solid var(--border); border-radius: 10px; }
+  .playground .acs-table { border-collapse: collapse; width: 100%; min-width: 640px; font-size: .85rem; }
+  .playground .acs-table th, .playground .acs-table td { padding: 5px 10px; text-align: left; border-bottom: 1px solid var(--border); white-space: nowrap; }
+  .playground .acs-table th { background: var(--surface-2); font-weight: 600; }
+  .playground .acs-bad { color: var(--bad-text); font-weight: 600; }
+  .playground .acs-tl { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; margin-top: 6px; }
+  .playground .acs-tlname { width: 3ch; font: .82rem ui-monospace, monospace; }
+  .playground .acs-track { flex: 1 1 120px; min-width: 120px; height: 12px; background: var(--surface-2); border: 1px solid var(--border); border-radius: 6px; overflow: hidden; display: block; }
+  .playground .acs-bar { display: block; height: 100%; }
+  .playground .acs-tltxt { flex: 1 1 100%; }
+  @media (prefers-reduced-motion: reduce) { .playground .acs-fill { transition: none; } }
+</style>

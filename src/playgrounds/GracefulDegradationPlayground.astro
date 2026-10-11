@@ -1,0 +1,169 @@
+---
+import PlaygroundShell from '../components/PlaygroundShell.astro';
+---
+<PlaygroundShell title="Simulate it" hint="A product page fans out to 5 dependencies. Break one, choose which are critical, and see whether the page survives.">
+  <ol class="how">
+    <li>Start state: <b>Recommendations slow</b>, fallbacks on, optional timeout <b>300 ms</b>. Every page is served as <b>degraded</b> (generic bestsellers instead of recommendations) in about a third of a second, so every user gets a usable page and almost none of the degradation is visible to them. Now drag the timeout to <b>2000 ms</b>: the page waits for the slow call and no page is usable (all take over 1 s).</li>
+    <li>Switch the scenario to <b>Reviews down</b>, then tick <b>Reviews</b> as critical. A non-critical failure never fails the page, but a dependency you mark critical does: errors jump to 100% for a dependency that only decorates the page.</li>
+    <li>Untick <b>Fallbacks</b> on <b>Reviews down</b>: pages now show a gap where reviews should be (user-visible). With fallbacks on, 9 in 10 get stale reviews silently. Switch <b>Degraded signal</b> on and the silent count moves to zero and the alert fires.</li>
+    <li>Pick <b>Product service down</b>: whatever you set, every request fails. No fallback can replace the thing the page is about.</li>
+  </ol>
+  <div class="pg gd" data-gd>
+    <div class="pg-row">
+      <label>Failure scenario <select class="pg-in" data-sc></select></label>
+      <label>Optional-call timeout <input type="range" min="100" max="2000" step="50" value="300" data-to aria-label="Optional call timeout in milliseconds" /> <b data-toval>300 ms</b></label>
+    </div>
+    <fieldset class="gd-set">
+      <legend>Mark as critical (a failure fails the whole page)</legend>
+      <label class="gd-check"><input type="checkbox" checked disabled /> Product service (always)</label>
+      <label class="gd-check"><input type="checkbox" data-crit="reviews" /> Reviews</label>
+      <label class="gd-check"><input type="checkbox" data-crit="recs" /> Recommendations</label>
+      <label class="gd-check"><input type="checkbox" data-crit="inventory" /> Inventory</label>
+      <label class="gd-check"><input type="checkbox" data-crit="personal" /> Personalisation</label>
+    </fieldset>
+    <div class="pg-row">
+      <label class="gd-check"><input type="checkbox" checked data-fb /> Fallbacks (stale cache, default, generic)</label>
+      <label class="gd-check"><input type="checkbox" data-sig /> Degraded signal (banner + metric)</label>
+      <button class="btn" type="button" data-reset>Reset</button>
+    </div>
+    <div class="pg-out" data-verdict aria-live="polite"></div>
+    <div class="pg-grid">
+      <div class="pg-box" style="--c: var(--role-2)"><h3>Usable page</h3><span class="pg-mono" data-usable></span><span class="pg-note">not an error and under 1 s</span></div>
+      <div class="pg-box" style="--c: var(--role-3)"><h3>Page latency</h3><span class="pg-mono" data-lat></span><span class="pg-note">fan-out waits for the slowest call</span></div>
+      <div class="pg-box" style="--c: var(--role-4)"><h3>User-visible</h3><span class="pg-mono" data-vis></span><span class="pg-note">a part is missing, or a banner shows</span></div>
+      <div class="pg-box" style="--c: var(--role-5)"><h3>Silent</h3><span class="pg-mono" data-sil></span><span class="pg-note">substituted, nobody told</span></div>
+    </div>
+    <div class="gd-scroll" tabindex="0" role="region" aria-label="Per-dependency results for the selected scenario">
+      <table class="gd-table"><thead><tr><th scope="col">Dependency (served pages)</th><th scope="col">live</th><th scope="col">fallback</th><th scope="col">missing</th></tr></thead><tbody data-dep></tbody></table>
+    </div>
+    <div class="gd-scroll" tabindex="0" role="region" aria-label="Results for every failure scenario with the current settings">
+      <table class="gd-table"><thead><tr><th scope="col">Scenario</th><th scope="col">full</th><th scope="col">degraded</th><th scope="col">error</th><th scope="col">p50 ms</th><th scope="col">p95 ms</th><th scope="col">usable</th></tr></thead><tbody data-all></tbody></table>
+    </div>
+    <p class="pg-note">Assumptions: 300 seeded requests per scenario; calls run in parallel; critical calls time out at 2000 ms; healthy latency is 0.6 to 1.5 times the base (product 80, reviews 60, recs 120, inventory 40, personalisation 70 ms) with a 4% tail 8 times slower; 2% background failures on optional calls (none on the product service); "down" fails in 15 to 40 ms; "slow" takes 1500 to 2500 ms. Fallback hit rates: stale reviews 90%, cached stock 70%, generic bestsellers and the default view 100%. A miss leaves the part missing.</p>
+  </div>
+</PlaygroundShell>
+<script>
+  // CORE START
+  const N = 300; const CRIT_TIMEOUT = 2000; const USABLE_MS = 1000; const ALERT_RATE = 0.05;
+  const DEPS = [
+    { id: 'product', label: 'Product service', base: 80, hit: 0, bg: 0 },
+    { id: 'reviews', label: 'Reviews', base: 60, hit: 0.9, bg: 0.02 },
+    { id: 'recs', label: 'Recommendations', base: 120, hit: 1, bg: 0.02 },
+    { id: 'inventory', label: 'Inventory', base: 40, hit: 0.7, bg: 0.02 },
+    { id: 'personal', label: 'Personalisation', base: 70, hit: 1, bg: 0.02 },
+  ];
+  const SCENARIOS = [
+    { id: 'healthy', label: 'Healthy', modes: {} as Record<string, string> },
+    { id: 'reviews', label: 'Reviews down', modes: { reviews: 'down' } },
+    { id: 'recs', label: 'Recommendations slow', modes: { recs: 'slow' } },
+    { id: 'inventory', label: 'Inventory down', modes: { inventory: 'down' } },
+    { id: 'personal', label: 'Personalisation down', modes: { personal: 'down' } },
+    { id: 'optional', label: 'All optional down', modes: { reviews: 'down', recs: 'down', inventory: 'down', personal: 'down' } },
+    { id: 'product', label: 'Product service down', modes: { product: 'down' } },
+  ];
+  function mulberry32(a: number) {
+    return () => { a = (a + 0x6d2b79f5) | 0; let t = Math.imul(a ^ (a >>> 15), 1 | a); t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t; return ((t ^ (t >>> 14)) >>> 0) / 4294967296; };
+  }
+  const DRAWS: number[][][] = (() => { const r = mulberry32(7); const out: number[][][] = []; for (let i = 0; i < N; i++) { const row: number[][] = []; for (let d = 0; d < DEPS.length; d++) row.push([r(), r(), r(), r()]); out.push(row); } return out; })();
+  interface Cfg { crit: Record<string, boolean>; fallbacks: boolean; timeout: number; signal: boolean }
+  function callDep(d: number, mode: string, u: number[]) {
+    const dep = DEPS[d];
+    if (mode === 'down') return { ok: false, ms: 15 + Math.floor(u[0] * 25) };
+    if (mode === 'slow') return { ok: true, ms: 1500 + Math.floor(u[0] * 1000) };
+    if (u[2] < dep.bg) return { ok: false, ms: 15 + Math.floor(u[0] * 25) };
+    let ms = dep.base * (0.6 + 0.9 * u[0]); if (u[1] < 0.04) ms *= 8;
+    return { ok: true, ms: Math.floor(ms) };
+  }
+  function assemble(cfg: Cfg, sc: typeof SCENARIOS[number], draws: number[][]) {
+    let slowest = 0; let errAt = -1; let anyFallback = false; let anyMissing = false;
+    const status: string[] = [];
+    for (let d = 0; d < DEPS.length; d++) {
+      const critical = d === 0 || !!cfg.crit[DEPS[d].id];
+      const limit = critical ? CRIT_TIMEOUT : cfg.timeout;
+      let r = callDep(d, sc.modes[DEPS[d].id] || 'up', draws[d]);
+      if (r.ok && r.ms > limit) r = { ok: false, ms: limit };
+      if (r.ok) { status.push('live'); slowest = Math.max(slowest, r.ms); continue; }
+      if (critical) { status.push('failed'); errAt = errAt < 0 ? r.ms : Math.min(errAt, r.ms); continue; }
+      slowest = Math.max(slowest, r.ms);
+      if (cfg.fallbacks && draws[d][3] < DEPS[d].hit) { status.push('fallback'); anyFallback = true; }
+      else { status.push('missing'); anyMissing = true; }
+    }
+    if (errAt >= 0) return { outcome: 'error', ms: errAt + 15, status, anyFallback, anyMissing };
+    return { outcome: anyFallback || anyMissing ? 'degraded' : 'full', ms: slowest + (anyFallback ? 5 : 0) + 15, status, anyFallback, anyMissing };
+  }
+  function runScenario(cfg: Cfg, sc: typeof SCENARIOS[number]) {
+    const lats: number[] = []; const per = DEPS.map(() => ({ live: 0, fallback: 0, missing: 0 }));
+    let full = 0; let degraded = 0; let error = 0; let usable = 0; let visible = 0; let silent = 0;
+    for (let i = 0; i < N; i++) {
+      const p = assemble(cfg, sc, DRAWS[i]); lats.push(p.ms);
+      if (p.outcome === 'error') { error++; continue; }
+      if (p.outcome === 'full') full++; else degraded++;
+      if (p.ms <= USABLE_MS) usable++;
+      p.status.forEach((s, d) => { if (s === 'live' || s === 'fallback' || s === 'missing') per[d][s]++; });
+      if (p.anyMissing || (p.anyFallback && cfg.signal)) visible++; else if (p.anyFallback) silent++;
+    }
+    lats.sort((a, b) => a - b);
+    return { full, degraded, error, usable, visible, silent, p50: lats[Math.floor(N * 0.5)], p95: lats[Math.floor(N * 0.95)], per, degradedRate: (degraded) / N };
+  }
+  // CORE END
+  document.querySelectorAll<HTMLElement>('[data-gd]').forEach((root) => {
+    const q = <T extends HTMLElement>(s: string) => root.querySelector<T>(s)!;
+    const sel = q<HTMLSelectElement>('[data-sc]');
+    SCENARIOS.forEach((s) => { const o = document.createElement('option'); o.value = s.id; o.textContent = s.label; sel.appendChild(o); });
+    const depRows = DEPS.map((d) => { const tr = document.createElement('tr'); const cells = [d.label, '', '', ''].map((t) => { const td = document.createElement('td'); td.textContent = t; tr.appendChild(td); return td; }); q('[data-dep]').appendChild(tr); return cells; });
+    const allRows = SCENARIOS.map((s) => { const tr = document.createElement('tr'); const cells = [s.label, '', '', '', '', '', ''].map((t) => { const td = document.createElement('td'); td.textContent = t; tr.appendChild(td); return td; }); q('[data-all]').appendChild(tr); return { tr, cells }; });
+    const pct = (n: number) => `${Math.round((n / N) * 100)}%`;
+    function cfg(): Cfg {
+      const crit: Record<string, boolean> = {};
+      root.querySelectorAll<HTMLInputElement>('[data-crit]').forEach((c) => { crit[c.dataset.crit!] = c.checked; });
+      return { crit, fallbacks: q<HTMLInputElement>('[data-fb]').checked, timeout: Number(q<HTMLInputElement>('[data-to]').value), signal: q<HTMLInputElement>('[data-sig]').checked };
+    }
+    function verdict(c: Cfg, sc: typeof SCENARIOS[number], r: ReturnType<typeof runScenario>) {
+      const served = N - r.error;
+      if (r.error === N) return 'Every request fails. A critical dependency is down, and no fallback can stand in for it.';
+      if (r.error > 0) return `${pct(r.error)} of requests fail because a dependency marked critical is unhealthy. An optional part was promoted to a hard requirement.`;
+      if (r.usable < served * 0.5) return `Pages are served, but only ${pct(r.usable)} come back within 1 s: the page waits for the slowest optional call. Shorten the optional-call timeout.`;
+      if (r.degraded === 0) return 'Every page is complete and fast. Degradation costs nothing when nothing is broken.';
+      const alert = c.signal && r.degradedRate > ALERT_RATE;
+      if (r.silent > 0 && !c.signal) return `${pct(r.degraded)} of pages are degraded and ${pct(r.silent)} of them are silent: no banner, no metric. This is how an outage hides for hours.`;
+      const gap = r.visible > 0 && !c.signal ? ` ${pct(r.visible)} of pages visibly lack a part.` : '';
+      return `${pct(r.degraded)} of pages are degraded but served fast.${gap}${alert ? ' The degraded-rate metric is above 5%, so the alert fires.' : ''}`;
+    }
+    let raf = 0;
+    function draw() {
+      raf = 0; const c = cfg(); const sc = SCENARIOS.find((s) => s.id === sel.value)!;
+      q('[data-toval]').textContent = `${c.timeout} ms`;
+      const r = runScenario(c, sc);
+      q('[data-usable]').textContent = `${pct(r.usable)} of users`;
+      q('[data-lat]').textContent = `p50 ${r.p50} ms · p95 ${r.p95} ms`;
+      q('[data-vis]').textContent = `${r.visible} pages (${pct(r.visible)})`;
+      q('[data-sil]').textContent = `${r.silent} pages (${pct(r.silent)})`;
+      const v = q('[data-verdict]'); v.textContent = verdict(c, sc, r); v.classList.toggle('bad', r.error > 0 || r.usable < (N - r.error) * 0.5);
+      DEPS.forEach((d, i) => { depRows[i][1].textContent = String(r.per[i].live); depRows[i][2].textContent = String(r.per[i].fallback); depRows[i][3].textContent = String(r.per[i].missing); });
+      SCENARIOS.forEach((s, i) => {
+        const x = runScenario(c, s); const cells = allRows[i].cells;
+        cells[1].textContent = pct(x.full); cells[2].textContent = pct(x.degraded); cells[3].textContent = pct(x.error);
+        cells[4].textContent = String(x.p50); cells[5].textContent = String(x.p95); cells[6].textContent = pct(x.usable);
+        allRows[i].tr.classList.toggle('sel', s.id === sc.id);
+      });
+    }
+    function queue() { if (!raf) raf = requestAnimationFrame(draw); }
+    function reset() {
+      sel.value = 'recs'; q<HTMLInputElement>('[data-to]').value = '300'; q<HTMLInputElement>('[data-fb]').checked = true; q<HTMLInputElement>('[data-sig]').checked = false;
+      root.querySelectorAll<HTMLInputElement>('[data-crit]').forEach((x) => { x.checked = false; }); draw();
+    }
+    root.querySelectorAll('input, select').forEach((el) => { el.addEventListener('input', queue); el.addEventListener('change', queue); });
+    q('[data-reset]').addEventListener('click', reset);
+    reset();
+  });
+</script>
+<style is:global>
+  .playground .gd-check { display: inline-flex; align-items: center; gap: 6px; }
+  .playground .gd-set { border: 1px solid var(--border); border-radius: 8px; padding: 8px 12px; display: flex; flex-wrap: wrap; gap: 6px 16px; margin: 0; min-width: 0; }
+  .playground .gd-set legend { padding: 0 6px; color: var(--muted); font-size: .85rem; }
+  .playground .gd-scroll { overflow-x: auto; max-width: 100%; }
+  .playground .gd-table { border-collapse: collapse; font: .82rem ui-monospace, monospace; width: 100%; }
+  .playground .gd-table th, .playground .gd-table td { padding: 4px 10px; border-bottom: 1px solid var(--border); text-align: right; white-space: nowrap; }
+  .playground .gd-table th:first-child, .playground .gd-table td:first-child { text-align: left; }
+  .playground .gd-table tr.sel td { background: var(--accent-soft); font-weight: 600; }
+</style>

@@ -1,0 +1,234 @@
+---
+import PlaygroundShell from '../components/PlaygroundShell.astro';
+---
+<PlaygroundShell title="Pause a lease holder" hint="Worker A holds a lease to write a shared file and is frozen by a garbage collection pause from t=3. Worker B waits for the lease. Change the settings and see whether the file survives.">
+  <ol class="how">
+    <li>At the defaults (10 second lease, 15 second pause, renewals on, no fencing) A's lease expires while it sleeps, B is granted it and writes, then A wakes and its stale write is <b>accepted</b>: the verdict is <b>corrupted</b> and the chart below is red for any pause of 7 seconds or more at this lease length.</li>
+    <li>Tick <b>Lease service issues fencing tokens</b> and <b>Storage rejects stale tokens</b>. The same pause is now harmless: storage rejects A's write because token 1 is lower than the 2 it has seen, and the whole chart turns green. Tokens issued but not checked (only the first box) change nothing.</li>
+    <li>Without fencing, make the lease longer (30 s) or the pause shorter (5 s): the pause fits inside the lease and A is still the owner when it wakes. Safety by timing alone only holds in that region, and it needs you to know your worst pause.</li>
+    <li>Tick <b>A re-checks its own clock when it wakes</b>: if the pause happened <b>before the check</b> this saves the day, but set the pause to <b>after the check</b> (or a delayed write) and the corruption is back. Only the storage can close that gap.</li>
+  </ol>
+  <div class="pg lf" data-lf>
+    <div class="pg-row">
+      <label>Lease length (s) <input type="range" min="3" max="30" value="10" data-len /> <b data-lenval>10</b></label>
+      <label>Pause of Worker A (s) <input type="range" min="0" max="40" value="15" data-pause /> <b data-pauseval>15</b></label>
+    </div>
+    <div class="pg-row">
+      <label class="lf-check"><input type="checkbox" checked data-renew /> Holders renew their lease</label>
+      <label class="lf-check"><input type="checkbox" data-issue /> Lease service issues fencing tokens</label>
+      <label class="lf-check"><input type="checkbox" data-check disabled /> Storage rejects stale tokens</label>
+      <label class="lf-check"><input type="checkbox" data-recheck /> A re-checks its own clock when it wakes</label>
+      <label>Pause happens <select class="pg-in" data-where disabled><option value="before">before A's lease check</option><option value="after" selected>after A's check (or write delayed in the network)</option></select></label>
+    </div>
+    <div class="pg-row">
+      <button class="btn" type="button" data-act="reset">Reset</button>
+      <button class="btn pg-primary" type="button" data-act="step">Step</button>
+      <button class="btn" type="button" data-act="run">Show all</button>
+      <span class="pg-mono" data-count></span>
+    </div>
+    <div class="lf-tl" role="group" aria-label="Timeline of the lease, the beliefs of both workers and the storage writes">
+      <div class="lf-lane"><span class="pg-note">Lease service says the owner is</span><div class="lf-track"><div class="lf-seg lf-a" data-s="svcA"></div><div class="lf-seg lf-b" data-s="svcB"></div></div></div>
+      <div class="lf-lane"><span class="pg-note">Worker A believes it owns</span><div class="lf-track"><div class="lf-seg lf-pause" data-s="pause"></div><div class="lf-seg lf-a" data-s="belA"></div></div></div>
+      <div class="lf-lane"><span class="pg-note">Worker B believes it owns</span><div class="lf-track"><div class="lf-seg lf-b" data-s="belB"></div></div></div>
+      <div class="lf-lane"><span class="pg-note">Writes reaching the storage</span><div class="lf-track lf-store" data-store></div></div>
+      <div class="lf-axis" data-axis aria-hidden="true"></div>
+      <div class="lf-overlap" data-overlap hidden></div>
+    </div>
+    <ol class="lf-log" data-log aria-live="polite"></ol>
+    <div class="pg-grid">
+      <div class="pg-box" data-verdictbox><h3>Verdict</h3><span class="pg-mono" data-verdict></span><span class="pg-note" data-why></span></div>
+      <div class="pg-box" style="--c: var(--role-3)"><h3>Costs of this lease length</h3><span class="pg-mono" data-costs></span><span class="pg-note">Failover wait is how long B would wait if A had crashed at t=3 instead of pausing.</span></div>
+    </div>
+    <h3 class="lf-h">Safe region for these settings</h3>
+    <p class="pg-note" data-chartnote></p>
+    <svg class="lf-chart" data-chart viewBox="0 0 340 190" role="img" aria-label="Chart of lease length against pause length"></svg>
+    <p class="pg-note lf-legend"><span class="lf-sw lf-sw-safe"></span> safe <span class="lf-sw lf-sw-bad"></span> stale write accepted (corrupted) <span class="lf-sw lf-sw-cut"></span> A cut off, no progress. White ring: the current settings.</p>
+    <p class="pg-note">Model assumptions: A starts at t=0, writes A1 at t=1, passes its lease check at t=3 and then pauses. With renewals A renews every floor(length/3) seconds (never during the pause); a lease is valid while the clock is below its expiry. B polls constantly, is granted the lease the instant A's expires, and writes at once. Clocks do not drift: drift would only shift the expiry by milliseconds, while pauses shift it by seconds. A holder that wakes before its lease expires is simply still the owner.</p>
+  </div>
+</PlaygroundShell>
+<script>
+  // --- model ---
+  type Opts = { len: number; pause: number; renew: boolean; issue: boolean; check: boolean; recheck: boolean; where: string };
+  type Ev = { t: number; text: string; kind: 'info' | 'ok' | 'bad' };
+  type Result = {
+    kind: 'valid' | 'cutoff' | 'fenced' | 'recheck' | 'corrupt'; events: Ev[]; expA: number; wake: number; grantB: number | null;
+    renewals: number; interval: number; endA: number; overlap: number; aWrite: 'ok' | 'rejected' | 'stale' | 'none';
+    keepsLease: boolean; failover: number;
+  };
+  const PAUSE_AT = 3;
+  function simulate(o: Opts): Result {
+    const L = o.len; const R = Math.max(1, Math.floor(L / 3));
+    let renewals = 0; let last = 0;
+    if (o.renew) for (let t = R; t < PAUSE_AT; t += R) { last = t; renewals++; }
+    const expA = last + L; const wake = PAUSE_AT + o.pause;
+    const ev: Ev[] = [];
+    const tok = (n: number) => (o.issue ? `token ${n}` : 'no token');
+    ev.push({ t: 0, kind: 'info', text: `Lease service grants A the lease (${tok(1)}), expires at t=${L}.` });
+    for (let k = 1; k <= renewals; k++) ev.push({ t: k * R, kind: 'info', text: `A renews: the lease now expires at t=${k * R + L}.` });
+    ev.push({ t: 1, kind: 'ok', text: `A writes A1 (${tok(1)}). Storage accepts.` });
+    const base = { events: ev, expA, wake, renewals, interval: R, failover: expA - PAUSE_AT };
+    if (expA <= PAUSE_AT) {
+      ev.push({ t: expA, kind: 'info', text: `A's lease expires at t=${expA}, before A finished. A sees it, stops, and B takes over. Without renewals the whole job must fit in one lease.` });
+      ev.push({ t: expA, kind: 'info', text: `B is granted the lease (${tok(2)}) and writes B1. Storage accepts.` });
+      ev.sort((x, y) => x.t - y.t);
+      return { ...base, kind: 'cutoff', grantB: expA, endA: expA, overlap: 0, aWrite: 'none', keepsLease: false };
+    }
+    const pre = o.recheck && o.where === 'before' ? 'A is frozen before it can check its lease' : 'A passes its lease check';
+    if (o.pause > 0) ev.push({ t: PAUSE_AT, kind: 'info', text: `${pre}, then a GC pause freezes A for ${o.pause} s (until t=${wake}). It cannot renew.` });
+    else ev.push({ t: PAUSE_AT, kind: 'info', text: 'A passes its lease check and carries on without a pause.' });
+    const keeps = wake < expA && o.renew;
+    if (keeps) {
+      ev.push({ t: wake, kind: 'ok', text: `A wakes at t=${wake}, its lease (until t=${expA}) is still valid: it writes A2 (${tok(1)}) and renews. B never gets the lease.` });
+      ev.sort((x, y) => x.t - y.t);
+      return { ...base, kind: 'valid', grantB: null, endA: Infinity, overlap: 0, aWrite: 'ok', keepsLease: true };
+    }
+    if (wake < expA) {
+      ev.push({ t: wake, kind: 'ok', text: `A wakes at t=${wake}, still inside its lease (until t=${expA}), and writes A2 (${tok(1)}). Storage accepts. Valid: A really is the owner.` });
+      ev.push({ t: expA, kind: 'info', text: `The lease expires at t=${expA} and is not renewed. B is granted it (${tok(2)}).` });
+      ev.push({ t: expA, kind: 'ok', text: `B writes B1 (${tok(2)}). Storage accepts.` });
+      ev.sort((x, y) => x.t - y.t);
+      return { ...base, kind: 'valid', grantB: expA, endA: expA, overlap: 0, aWrite: 'ok', keepsLease: false };
+    }
+    ev.push({ t: expA, kind: 'info', text: `A's lease expires at t=${expA}. The service cannot tell a frozen holder from a dead one and grants B the lease (${tok(2)}).` });
+    ev.push({ t: expA, kind: 'ok', text: `B writes B1 (${tok(2)}). Storage accepts${o.issue ? ' and records 2 as the highest token' : ''}.` });
+    const overlap = wake - expA;
+    ev.push({ t: wake, kind: 'info', text: `A wakes at t=${wake}. Its local view still says it owns the lease, so two workers believe they own the file.` });
+    let kind: Result['kind']; let aWrite: Result['aWrite'];
+    if (o.recheck && o.where === 'before') {
+      ev.push({ t: wake, kind: 'ok', text: 'A re-checks its clock, sees the lease expired and does not write.' });
+      kind = 'recheck'; aWrite = 'none';
+    } else if (o.issue && o.check) {
+      ev.push({ t: wake, kind: 'ok', text: 'A sends A2 (token 1). Storage REJECTS it: 1 is lower than the highest token seen, 2.' });
+      kind = 'fenced'; aWrite = 'rejected';
+    } else {
+      ev.push({ t: wake, kind: 'bad', text: `A sends A2 (${tok(1)}). Storage accepts it${o.issue ? ' because it never checks tokens' : ' because there is no token to check'}: B's B1 is overwritten.` });
+      kind = 'corrupt'; aWrite = 'stale';
+    }
+    ev.sort((x, y) => x.t - y.t);
+    return { ...base, kind, grantB: expA, endA: wake, overlap, aWrite, keepsLease: false };
+  }
+  function bestPause(o: Opts): number {
+    let best = -1;
+    for (let p = 0; p <= 60; p++) { if (simulate({ ...o, pause: p }).kind === 'corrupt') break; best = p; }
+    return best;
+  }
+  // --- end model ---
+  document.querySelectorAll<HTMLElement>('[data-lf]').forEach((root) => {
+    const q = <T extends Element>(s: string) => root.querySelector<T>(s)!;
+    const num = (s: string) => Number(q<HTMLInputElement>(s).value);
+    const on = (s: string) => q<HTMLInputElement>(s).checked;
+    const SVGNS = 'http://www.w3.org/2000/svg';
+    const COLS = 28; const ROWS = 21; const CW = 11; const CH = 7; const X0 = 32; const Y0 = 6; // cell grid: lease 3..30, pause 0..40 step 2
+    const cells: SVGRectElement[] = [];
+    const chart = q<SVGSVGElement>('[data-chart]');
+    const mk = (n: string, a: Record<string, string>, txt?: string) => { const e = document.createElementNS(SVGNS, n); for (const k in a) e.setAttribute(k, a[k]); if (txt) e.textContent = txt; chart.appendChild(e); return e; };
+    for (let r = 0; r < ROWS; r++) for (let c = 0; c < COLS; c++) cells.push(mk('rect', { x: String(X0 + c * CW), y: String(Y0 + (ROWS - 1 - r) * CH), width: String(CW - 1), height: String(CH - 1), rx: '1' }) as SVGRectElement);
+    for (const l of [3, 10, 20, 30]) mk('text', { x: String(X0 + (l - 3) * CW + CW / 2), y: String(Y0 + ROWS * CH + 11), 'text-anchor': 'middle', class: 'lf-tx' }, String(l));
+    for (const p of [0, 10, 20, 30, 40]) mk('text', { x: String(X0 - 5), y: String(Y0 + (ROWS - 1 - p / 2) * CH + 6), 'text-anchor': 'end', class: 'lf-tx' }, String(p));
+    mk('text', { x: String(X0 + (COLS * CW) / 2), y: String(Y0 + ROWS * CH + 24), 'text-anchor': 'middle', class: 'lf-tx' }, 'lease length (s)');
+    mk('text', { x: '8', y: String(Y0 + 40), 'text-anchor': 'middle', class: 'lf-tx', transform: `rotate(-90 8 ${Y0 + 40})` }, 'pause (s)');
+    const dot = mk('circle', { r: '4.5', class: 'lf-dot' });
+
+    const store = q<HTMLElement>('[data-store]'); const markers: Record<string, HTMLElement> = {};
+    for (const id of ['A1', 'B1', 'A2']) { const m = document.createElement('span'); m.className = 'lf-mark'; m.hidden = true; store.appendChild(m); markers[id] = m; }
+    const axis = q<HTMLElement>('[data-axis]'); const ticks: HTMLElement[] = [];
+    for (let i = 0; i < 6; i++) { const s = document.createElement('span'); axis.appendChild(s); ticks.push(s); }
+    const logEl = q<HTMLElement>('[data-log]'); const items: HTMLElement[] = [];
+    for (let i = 0; i < 12; i++) { const li = document.createElement('li'); li.hidden = true; logEl.appendChild(li); items.push(li); }
+
+    let res: Result; let shown = 0; let queued = false;
+    const opts = (): Opts => ({ len: num('[data-len]'), pause: num('[data-pause]'), renew: on('[data-renew]'), issue: on('[data-issue]'), check: on('[data-issue]') && on('[data-check]'), recheck: on('[data-recheck]'), where: q<HTMLSelectElement>('[data-where]').value });
+    const seg = (id: string, a: number, b: number, T: number, tNow: number) => {
+      const el = q<HTMLElement>(`[data-s="${id}"]`); const end = Math.min(b, tNow);
+      if (!(a <= tNow) || end <= a) { el.hidden = true; return; }
+      el.hidden = false; el.style.left = `${(a / T) * 100}%`; el.style.width = `${((end - a) / T) * 100}%`;
+    };
+    function verdictText(r: Result, o: Opts): [string, string, string] {
+      if (r.kind === 'corrupt') return ['CORRUPTED', 'var(--bad)', `A's stale write A2 landed at t=${r.wake}, ${r.overlap} s after B was granted the lease, and overwrote B's B1. Two owners were believed for ${r.overlap} s. ${o.issue ? 'The tokens were issued but nobody checked them.' : 'There was no token for the storage to check.'}`];
+      if (r.kind === 'fenced') return ['SAFE: stale write rejected', 'var(--good)', `Storage refused A2 (token 1 < 2) and the file still holds B1. A was wrong about owning the lease for ${r.overlap} s and it did not matter. Safety no longer depends on the pause length.`];
+      if (r.kind === 'recheck') return ['SAFE this time', 'var(--good)', `A re-checked its clock after waking and saw the expiry. That only works because the pause came before the check. Pick "after A's check" and the stale write goes through again.`];
+      if (r.kind === 'cutoff') return ['SAFE, but A got nowhere', 'var(--role-3)', `With no renewals the lease (${o.len} s) ended at t=${r.expA}, before A's job did. Safe, but the job must fit inside one lease or the holder must renew.`];
+      return ['SAFE: A still owned the lease', 'var(--good)', r.keepsLease ? `A woke at t=${r.wake} with its lease valid until t=${r.expA}, wrote, and renewed. The pause fitted inside the lease. This is safety by luck of timing, not by construction.` : `A woke at t=${r.wake}, before its lease ran out at t=${r.expA}, so its write was legitimate. A longer pause would break this.`];
+    }
+    function draw() {
+      queued = false;
+      const o = opts(); res = simulate(o); const r = res;
+      q('[data-lenval]').textContent = String(o.len); q('[data-pauseval]').textContent = String(o.pause);
+      const chk = q<HTMLInputElement>('[data-check]'); chk.disabled = !o.issue; if (!o.issue) chk.checked = false;
+      q<HTMLSelectElement>('[data-where]').disabled = !o.recheck;
+      const total = r.events.length; if (shown > total) shown = total;
+      const T = Math.max(20, r.wake, r.grantB ?? 0, r.expA) + 3;
+      const tNow = shown >= total ? T : shown === 0 ? 0 : r.events[shown - 1].t;
+      seg('svcA', 0, r.keepsLease ? T : r.expA, T, tNow); seg('svcB', r.grantB ?? 0, r.grantB === null ? 0 : T, T, tNow);
+      seg('pause', PAUSE_AT, r.wake, T, tNow); seg('belA', 0, r.endA === Infinity ? T : r.endA, T, tNow);
+      seg('belB', r.grantB ?? 0, r.grantB === null ? 0 : T, T, tNow);
+      const ov = q<HTMLElement>('[data-overlap]'); const ovShow = r.overlap > 0 && tNow > (r.grantB ?? 0);
+      ov.hidden = !ovShow; if (ovShow) { ov.textContent = `two believed owners for ${r.overlap} s`; }
+      const put = (id: string, t: number, lane: number, state: 'ok' | 'rejected' | 'stale', visible: boolean) => {
+        const m = markers[id]; m.hidden = !visible || t > tNow; if (m.hidden) return;
+        const pct = (t / T) * 100; m.style.left = `${pct}%`; m.style.top = lane === 0 ? '2px' : '24px';
+        m.style.transform = pct < 12 ? 'none' : pct > 88 ? 'translateX(-100%)' : 'translateX(-50%)';
+        m.textContent = `${id} ${state === 'ok' ? 'ok' : state === 'rejected' ? 'rejected' : 'STALE'}`; m.className = `lf-mark lf-${state}`;
+      };
+      put('A1', 1, 0, 'ok', true); put('B1', r.grantB ?? 0, 1, 'ok', r.grantB !== null);
+      put('A2', r.wake, 0, r.aWrite === 'rejected' ? 'rejected' : r.aWrite === 'stale' ? 'stale' : 'ok', r.aWrite !== 'none');
+      ticks.forEach((s, i) => { const t = Math.round((T * i) / 5); s.textContent = `t=${t}`; s.style.left = `${(t / T) * 100}%`; });
+      items.forEach((li, i) => {
+        const e = r.events[i]; li.hidden = !e || i >= shown && shown < total; if (!e) return;
+        li.textContent = `t=${e.t}: ${e.text}`; li.className = e.kind === 'bad' ? 'lf-bad' : '';
+      });
+      q('[data-count]').textContent = shown >= total ? 'All events shown' : `Event ${shown} of ${total}`;
+      q<HTMLElement>('[data-act="step"]').setAttribute('aria-disabled', String(shown >= total));
+      const v = shown >= total ? verdictText(r, o) : ['(step to the end)', 'var(--border)', 'The verdict appears after the last event.'];
+      q('[data-verdict]').textContent = v[0]; q('[data-why]').textContent = v[2]; q<HTMLElement>('[data-verdictbox]').style.setProperty('--c', v[1]);
+      q('[data-costs]').textContent = `failover wait ${r.failover} s · ${r.renewals} renewals before the pause · one every ${r.interval} s (${Math.floor(60 / r.interval)}/min)`;
+      // chart
+      for (let p = 0; p <= 40; p += 2) for (let l = 3; l <= 30; l++) { const k = simulate({ ...o, len: l, pause: p }).kind; cells[(p / 2) * COLS + (l - 3)].setAttribute('class', k === 'corrupt' ? 'lf-cb' : k === 'cutoff' ? 'lf-cc' : 'lf-cs'); }
+      dot.setAttribute('cx', String(X0 + (o.len - 3) * CW + CW / 2 - 0.5)); dot.setAttribute('cy', String(Y0 + (ROWS - 1 - o.pause / 2) * CH + CH / 2 - 0.5));
+      const best = bestPause(o);
+      const note = best >= 60 ? `At a lease length of ${o.len} s no pause up to 60 s corrupts the file.` : best < 0 ? `At a lease length of ${o.len} s even a zero pause corrupts the file.` : `At a lease length of ${o.len} s the file survives pauses up to ${best} s; a pause of ${best + 1} s corrupts it.`;
+      q('[data-chartnote]').textContent = note;
+      chart.setAttribute('aria-label', `Safe region chart, lease length 3 to 30 seconds against pause 0 to 40 seconds. ${note}`);
+    }
+    function schedule() { if (!queued) { queued = true; requestAnimationFrame(draw); } }
+    root.querySelectorAll('input, select').forEach((el) => el.addEventListener('input', () => { shown = 1e9; schedule(); }));
+    q('[data-where]').addEventListener('change', () => { shown = 1e9; schedule(); });
+    q('[data-act="reset"]').addEventListener('click', () => { shown = 0; schedule(); });
+    q('[data-act="step"]').addEventListener('click', () => { if (shown < res.events.length) { shown++; schedule(); } });
+    q('[data-act="run"]').addEventListener('click', () => { shown = 1e9; schedule(); });
+    shown = 1e9; draw();
+  });
+</script>
+<style is:global>
+  .playground .lf-check { display: inline-flex; align-items: center; gap: 6px; }
+  .playground .lf-tl { position: relative; display: flex; flex-direction: column; gap: 8px; margin: 12px 0; }
+  .playground .lf-lane { display: flex; flex-direction: column; gap: 2px; }
+  .playground .lf-track { position: relative; height: 22px; background: var(--surface-2); border: 1px solid var(--border); border-radius: 4px; overflow: hidden; }
+  .playground .lf-store { height: 48px; overflow: visible; }
+  .playground .lf-seg { position: absolute; top: 0; bottom: 0; }
+  .playground .lf-a { background: var(--role-1); opacity: .75; }
+  .playground .lf-b { background: var(--role-2); opacity: .75; }
+  .playground .lf-pause { background: repeating-linear-gradient(45deg, var(--muted) 0 3px, transparent 3px 7px); opacity: .6; }
+  .playground .lf-mark { position: absolute; font-size: .72rem; line-height: 1; padding: 3px 5px; border-radius: 4px; border: 2px solid var(--good); background: var(--surface); color: var(--text); white-space: nowrap; }
+  .playground .lf-mark.lf-rejected { border-color: var(--bad); border-style: dashed; text-decoration: line-through; }
+  .playground .lf-mark.lf-stale { border-color: #b91c1c; background: #b91c1c; color: #fff; font-weight: 700; }
+  .playground .lf-axis { position: relative; height: 16px; font-size: .72rem; color: var(--muted); }
+  .playground .lf-axis span { position: absolute; transform: translateX(-30%); white-space: nowrap; }
+  .playground .lf-overlap { font-size: .85rem; font-weight: 700; color: var(--bad-text, var(--text)); }
+  .playground .lf-overlap[hidden] { display: none; }
+  .playground .lf-log { margin: 0 0 12px; padding-left: 1.4em; font-size: .9rem; }
+  .playground .lf-log li[hidden] { display: none; }
+  .playground .lf-log li.lf-bad { font-weight: 700; color: var(--bad-text, var(--text)); }
+  .playground .lf-h { margin: 16px 0 4px; font-size: 1rem; }
+  .playground .lf-chart { width: 100%; max-width: 520px; height: auto; display: block; }
+  .playground .lf-cs { fill: var(--good); opacity: .55; }
+  .playground .lf-cb { fill: var(--bad); opacity: .75; }
+  .playground .lf-cc { fill: var(--role-3); opacity: .75; }
+  .playground .lf-tx { fill: var(--muted); font-size: 8px; }
+  .playground .lf-dot { fill: none; stroke: var(--text); stroke-width: 2.5; }
+  .playground .lf-sw { display: inline-block; width: 12px; height: 12px; border-radius: 2px; vertical-align: -1px; margin: 0 4px 0 8px; border: 1px solid var(--border); }
+  .playground .lf-sw-safe { background: var(--good); }
+  .playground .lf-sw-bad { background: var(--bad); }
+  .playground .lf-sw-cut { background: var(--role-3); }
+  .playground .lf-legend { line-height: 1.8; }
+</style>

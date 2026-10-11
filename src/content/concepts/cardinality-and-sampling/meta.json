@@ -1,0 +1,66 @@
+{
+  "name": "Cardinality and Sampling",
+  "area": "observability",
+  "difficulty": "intermediate",
+  "intent": "Understand what observability data costs (one metric series per label combination, one stored trace per request) and how to cut that cost without lying to yourself: bounded labels, sampling, and reweighting.",
+  "scenario": "A checkout service handles 50,000 requests per second. Someone adds customer_id to the request counter and the metrics store runs out of memory; tracing every request would cost about 21 TB a day, but sampling 1% at random throws away 99% of the rare error traces.",
+  "problem": "Metrics are cheap only while their labels are bounded: the store keeps one time series for every distinct combination of label values, so one unbounded label multiplies memory, index size and bill by millions. Traces and logs are per request, so at 50,000 requests per second keeping everything is unaffordable. Sampling fixes the cost, but a naive 1% sample loses most rare errors, breaks traces that cross services, and silently biases counts and percentiles unless you know the sampling rate and correct for it.",
+  "howItWorks": [
+    { "title": "Cardinality is a product, and memory follows it", "text": "A counter http_requests_total{route,status,region} creates one series per combination that actually occurs. With 20 routes, 5 status codes and 6 regions that is at most 20 x 5 x 6 = 600 series, a trivial 2 MB at roughly 3 KB of head memory per active series (Prometheus-style stores land between 2 and 8 KB). Add customer_id with a million values and the bound becomes 600 million series. Each series also costs index entries, scrape time, query time and, on hosted vendors, money per series. Histograms multiply it again: a 12-bucket latency histogram is 14 series per label set (buckets, sum, count)." },
+    { "title": "Choose labels with bounded values, and watch for churn", "text": "A label belongs on a metric only if its set of values is small, known in advance and useful in an alert or a dashboard split: route template (not the raw URL), status class, region, deployment version. User ids, request ids, email addresses, raw paths and timestamps do not. Also watch series churn: labels such as pod name or build id create new series on every deploy, and the old ones stay in the index until they age out, so the number of series ever created in a window can be far above the number currently live." },
+    { "title": "Move high-cardinality detail to logs and traces, and link back with exemplars", "text": "Per-request detail (customer id, cart id, full URL) belongs in a structured log line or a span attribute, where cost scales with events and you query by search, not by aggregation. To get from a metric to such an example, attach an exemplar: a sample value in a histogram bucket that carries a trace id. You see the p99 bucket spike on the dashboard and click through to one actual slow trace." },
+    { "title": "Head sampling: decide at the start, by hashing the trace id", "text": "Head-based probabilistic sampling decides when the root span starts: keep the trace if hash(trace_id) is below rate x 2^32. It is cheap (no buffering) and, because it is a pure function of the trace id, every service reaches the same decision with no coordination, so kept traces are complete. Independent coin flips per service would keep a trace at rate^n, mostly broken fragments. The weakness is that the decision is made before you know whether the request will fail: at 1% you keep 1% of the error traces too." },
+    { "title": "Tail sampling: decide after the trace completes", "text": "A collector buffers all spans of a trace until it looks finished (a decision wait of 10 to 60 seconds), then applies policies: keep every trace with an error, keep every trace slower than a threshold, keep a probabilistic share of the rest. It keeps what you need, but it must hold every in-flight trace in memory (50,000 req/s x 30 s x about 5 KB is roughly 7.5 GB), all spans of a trace must reach the same collector instance (route by trace id), and a late span after the decision is lost. Rate-limited and adaptive variants cap kept traces per second or raise the rate on quiet routes and lower it on hot ones." },
+    { "title": "Reweight, or your numbers are wrong", "text": "Each kept event stands for 1/rate events. With head rate 1/100, the estimated request count is 100 x kept, with relative standard error sqrt((1 - r) / (N r)): about 3% at 1,000 kept traces and 32% at 10. When the sampling rate differs by class (tail sampling keeps all errors at weight 1 and the rest at weight 100) every event carries its own weight, and counts, rates and percentiles must be computed with those weights. A percentile computed from raw kept traces after tail sampling is badly biased upward because slow traces were over-kept. For rates, compute them from exact metric counters and use traces only for examples." }
+  ],
+  "pros": [
+    "Bounded labels keep metrics cheap, fast to query and safe to alert on",
+    "Sampling cuts trace storage by 10x to 1000x while still giving representative examples",
+    "Tail sampling keeps every error and slow trace, which are the ones you actually debug",
+    "Consistent sampling by trace id keeps traces complete across services without coordination",
+    "Exemplars connect an aggregate graph to a concrete trace in one click"
+  ],
+  "cons": [
+    "Dropping a label such as customer_id means a metric can no longer answer per-customer questions",
+    "Head sampling loses rare events in proportion to the rate, and tiny kept samples give noisy estimates",
+    "Tail sampling needs a stateful, memory-heavy collector tier and trace-id-aware routing",
+    "Every statistic built from sampled data must be reweighted, and percentiles from sampled latency stay noisy",
+    "Sampling rates that change over time make historical comparisons hard unless the rate is stored with each trace"
+  ],
+  "whenToUse": [
+    "Any metric: decide the label set up front and review the series count per metric",
+    "Services with enough traffic that keeping every trace costs more than the questions it answers",
+    "Tail sampling when errors and slow requests are rare but must always be inspectable",
+    "Head sampling when you want the cheapest, simplest setup and traffic is high enough for a small share to be representative"
+  ],
+  "whenNotToUse": [
+    "Do not sample low-traffic services or internal tools: at 5 requests per second, keep everything, since storage is trivial and every trace matters",
+    "Do not sample audit or security logs and billing events: they must be complete, and sampling belongs to diagnostics only",
+    "Do not run tail sampling for a small system: the buffering tier is more operational burden than the savings are worth",
+    "Do not use a trace sample to answer counting questions that an exact counter metric already answers"
+  ],
+  "pitfalls": [
+    "Putting user_id, request_id, raw URL or error message text in a label: one deploy of that line can OOM the metrics server",
+    "Labels that change every deploy or restart (pod name, build id), which cause churn and a growing index",
+    "Head sampling at 0.1% and concluding that an incident was small because no error traces were kept",
+    "Each service sampling with its own random coin instead of hashing the trace id, which leaves mostly incomplete traces",
+    "Computing counts or percentiles from kept traces without weights, or averaging percentiles from differently sampled sources",
+    "Tail sampling collectors behind a plain load balancer, so the spans of one trace land on different instances and no instance can see the whole trace",
+    "Forgetting the sampling rate on the span, so no one can reweight later when the rate changes"
+  ],
+  "related": [
+    { "kind": "concept", "slug": "metrics" },
+    { "kind": "concept", "slug": "distributed-tracing" },
+    { "kind": "concept", "slug": "structured-logging" },
+    { "kind": "concept", "slug": "slos-and-error-budgets" },
+    { "kind": "concept", "slug": "alerting" },
+    { "kind": "concept", "slug": "red-use-and-golden-signals" },
+    { "kind": "concept", "slug": "hedged-requests-and-tail-latency" }
+  ],
+  "roles": [
+    { "id": "service", "label": "Service", "description": "Emits metrics, spans and logs for every request." },
+    { "id": "collector", "label": "Sampler", "description": "Decides which traces to keep, by head rule or after buffering the whole trace." },
+    { "id": "tsdb", "label": "Metrics store", "description": "Keeps one time series per label combination in memory and on disk." },
+    { "id": "traces", "label": "Trace store", "description": "Stores the kept traces and serves the waterfall view." }
+  ]
+}

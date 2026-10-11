@@ -1,0 +1,249 @@
+---
+import PlaygroundShell from '../components/PlaygroundShell.astro';
+---
+<PlaygroundShell title="Simulate it" hint="400 requests (20 per second) go through A, B, C and a database. The user waits 2 seconds. The database is sometimes slow. Pick how each hop times out.">
+  <ol class="how">
+    <li>Start with <b>Fixed 5 s everywhere</b>, no retries, no cancellation. About 90% of requests succeed within 2 s, but the p99 is about 5 s and 119 calls keep running after their caller gave up, holding up to 65 threads and connections at once.</li>
+    <li>Switch to <b>Propagated deadline</b>. Success stays at 90% (a timeout does not make a slow query fast), but orphaned calls drop to 0, the peak falls to 24 and the p99 to about 1.6 s. Then set <b>C retries</b> to 2: success rises to 100% because the retries fit in the budget.</li>
+    <li>Go back to <b>Fixed 5 s</b> with 2 retries: success does not improve, since one 5 s attempt already outlasts the user. Choose <b>Fixed, tuned</b> instead: it succeeds, but still leaves 47 orphans until you tick <b>Cancel work when the caller leaves</b>.</li>
+    <li>Raise <b>Slow database share</b> to 25% on Fixed 5 s: the peak at C goes past its pool of 30 workers, the point where healthy requests would start to queue. Use <b>Next problem request</b> to see one on the timeline: red is work still running after its caller left.</li>
+  </ol>
+  <div class="pg td" data-td>
+    <div class="pg-row">
+      <label>Timeouts
+        <select class="pg-in" data-mode>
+          <option value="uniform" selected>Fixed 5 s everywhere</option>
+          <option value="inverted">Fixed, inner longer than outer (1.5 / 2.5 / 3.5 s)</option>
+          <option value="tuned">Fixed, tuned shorter at depth (1.8 / 1.2 / 0.4 s)</option>
+          <option value="deadline">Propagated deadline (2 s from the edge)</option>
+        </select>
+      </label>
+      <label>C retries on the database
+        <select class="pg-in" data-retries>
+          <option value="0" selected>0 (no retries)</option>
+          <option value="1">1</option>
+          <option value="2">2</option>
+        </select>
+      </label>
+    </div>
+    <div class="pg-row">
+      <label>Slow database share <input type="range" min="0" max="30" value="10" data-slow /> <b data-slowval>10</b>%</label>
+      <label>B slow share (1 to 1.5 s of its own work) <input type="range" min="0" max="15" value="5" data-bslow /> <b data-bslowval>5</b>%</label>
+    </div>
+    <div class="pg-row">
+      <label class="td-check"><input type="checkbox" data-cancel /> Cancel work when the caller leaves</label>
+      <button class="btn" type="button" data-reset>Reset</button>
+    </div>
+    <p class="pg-note" data-cancelnote></p>
+    <div class="pg-grid">
+      <div class="pg-box" data-boxgood style="--c: var(--role-2)"><h3>Succeeded within 2 s</h3><span class="pg-mono" data-good></span><span class="pg-note" data-goodnote></span></div>
+      <div class="pg-box" data-boxorph style="--c: var(--role-3)"><h3>Orphaned calls</h3><span class="pg-mono" data-orph></span><span class="pg-note" data-orphnote></span></div>
+      <div class="pg-box" data-boxpeak style="--c: var(--role-4)"><h3>Held at once (peak)</h3><span class="pg-mono" data-peak></span><span class="pg-note" data-peaknote></span></div>
+      <div class="pg-box" style="--c: var(--role-1)"><h3>p99 time at A</h3><span class="pg-mono" data-p99></span><span class="pg-note" data-p99note></span></div>
+    </div>
+    <div class="td-scroll" tabindex="0" role="region" aria-label="Comparison of the four timeout policies with the current settings">
+      <table class="td-table">
+        <thead><tr><th scope="col">Policy</th><th scope="col">Within 2 s</th><th scope="col">Orphaned calls</th><th scope="col">Peak held</th><th scope="col">p99</th></tr></thead>
+        <tbody data-cmp></tbody>
+      </table>
+    </div>
+    <div class="pg-row">
+      <label>Request <input type="range" min="0" max="399" value="0" data-req /> <b data-reqval>0</b></label>
+      <button class="btn" type="button" data-next>Next problem request</button>
+    </div>
+    <div class="td-gantt" role="img" aria-label="Timeline of the selected request through A, B, C and the database" data-gantt></div>
+    <div class="td-axis pg-note"><span>0 ms</span><span data-axis></span></div>
+    <p class="pg-out" data-verdict aria-live="polite"></p>
+    <p class="pg-code" data-spans></p>
+    <p class="pg-note">Assumptions: 20 requests per second, 400 requests, seed fixed. Healthy database latency 20 to 80 ms, slow 2.5 to 9 s, each attempt independently slow. Each hop adds 10 ms before and 5 ms after its call, retries wait 25 ms, cancellation reaches every callee instantly (real cancellation takes at least one network hop). Held counts one thread per hop plus one database connection per attempt. Nothing is shed or queued here: past C's pool of 30 workers a real service would queue and slow down further.</p>
+  </div>
+</PlaygroundShell>
+<script>
+  type ModeId = 'uniform' | 'inverted' | 'tuned' | 'deadline';
+  interface Mode { label: string; t: number[]; dl: boolean }
+  interface Cfg { mode: ModeId; retries: number; cancel: boolean; slowShare: number; bSlowShare: number }
+  interface Attempt { s: number; fast: number; slow: number }
+  interface Req { id: number; t0: number; bSlow: number; bExtra: number; at: Attempt[] }
+  interface Iv { hop: number; start: number; end: number; callerLeft: number; ok: boolean }
+
+  const MODES: Record<ModeId, Mode> = {
+    uniform: { label: 'Fixed 5 s everywhere', t: [5000, 5000, 5000], dl: false },
+    inverted: { label: 'Fixed, inner longer than outer', t: [1500, 2500, 3500], dl: false },
+    tuned: { label: 'Fixed, tuned shorter at depth', t: [1800, 1200, 400], dl: false },
+    deadline: { label: 'Propagated deadline', t: [0, 0, 400], dl: true },
+  };
+  const PRE = [10, 10, 10]; const POST = 5; const BACKOFF = 25; const USER = 2000; const MIN_LEFT = 50; const RETRY_MIN = 100;
+  const N = 400; const GAP = 50; const SEED = 7; const POOL_C = 30;
+
+  function makeRequests(n: number, gap: number, seed: number): Req[] {
+    let x = seed; const r = () => (x = (x * 48271) % 2147483647) / 2147483647; const out: Req[] = [];
+    for (let i = 0; i < n; i++) {
+      const bSlow = r(); const bExtra = 900 + Math.floor(r() * 600); const at: Attempt[] = [];
+      for (let k = 0; k < 3; k++) { const s = r(); const a = r(); at.push({ s, fast: 20 + Math.floor(a * 60), slow: 2500 + Math.floor(a * 6500) }); }
+      out.push({ id: i, t0: i * gap, bSlow, bExtra, at });
+    }
+    return out;
+  }
+  function simulate(cfg: Cfg, req: Req) {
+    const m = MODES[cfg.mode]; const dl = m.dl; const ivs: Iv[] = []; const D = req.t0 + USER;
+    const bExtra = req.bSlow < cfg.bSlowShare ? req.bExtra : 0;
+    const mk = (hop: number, start: number): Iv => { const iv = { hop, start, end: start, callerLeft: Infinity, ok: false }; ivs.push(iv); return iv; };
+    const cutFor = (giveUp: number) => (dl || cfg.cancel ? giveUp : Infinity);
+    function run(h: number, start: number, cutoffIn: number): Iv {
+      const iv = mk(h, start); const cutoff = dl ? Math.min(cutoffIn, D) : cutoffIn;
+      if (dl && D - start < MIN_LEFT) { iv.end = start; return iv; }
+      let t = start + PRE[h] + (h === 1 ? bExtra : 0);
+      if (t > cutoff) { iv.end = cutoff; return iv; }
+      let ok = false;
+      if (h < 2) {
+        const giveUp = Math.min(dl ? D : t + m.t[h], cutoff);
+        const c = run(h + 1, t, cutFor(giveUp));
+        if (c.ok && c.end <= giveUp) { ok = true; t = c.end; } else { if (c.end > giveUp) c.callerLeft = giveUp; t = Math.min(c.end, giveUp); }
+      } else {
+        for (let i = 0; i <= cfg.retries; i++) {
+          const s = t; const giveUp = Math.min(dl ? Math.min(s + m.t[2], D) : s + m.t[2], cutoff);
+          const a = req.at[i]; const nat = s + (a.s < cfg.slowShare ? a.slow : a.fast);
+          const db = mk(3, s); db.end = Math.min(nat, cutFor(giveUp));
+          if (nat <= giveUp) { db.ok = true; ok = true; t = nat; break; }
+          if (db.end > giveUp) db.callerLeft = giveUp;
+          t = giveUp;
+          if (t >= cutoff || i === cfg.retries) break;
+          if (dl && D - t - BACKOFF < RETRY_MIN) break;
+          t += BACKOFF; if (t > cutoff) { t = cutoff; break; }
+        }
+      }
+      if (ok) { if (t + POST > cutoff) { t = cutoff; ok = false; } else t += POST; }
+      iv.end = t; iv.ok = ok; return iv;
+    }
+    const top = run(0, req.t0, cfg.cancel || dl ? D : Infinity);
+    if (top.end > D) top.callerLeft = D;
+    const good = top.ok && top.end <= D;
+    return { ivs, good, late: top.ok && !good, resp: top.end - req.t0, top, D };
+  }
+  type Sim = ReturnType<typeof simulate>;
+  function peakOf(e: number[][]) { e.sort((a, b) => a[0] - b[0] || a[1] - b[1]); let c = 0; let p = 0; for (const [, d] of e) { c += d; if (c > p) p = c; } return p; }
+  function isProblem(r: Sim) { return !r.good || r.ivs.some((iv) => iv.end - iv.callerLeft > 0); }
+  function runAll(cfg: Cfg, reqs: Req[]) {
+    const res = reqs.map((r) => simulate(cfg, r));
+    let good = 0; let orphanCalls = 0; let orphanMs = 0; const ev: number[][] = []; const evC: number[][] = [];
+    for (const r of res) {
+      if (r.good) good++;
+      for (const iv of r.ivs) {
+        const o = Math.max(0, iv.end - iv.callerLeft); if (o > 0) { orphanCalls++; orphanMs += o; }
+        if (iv.end > iv.start) { ev.push([iv.start, 1], [iv.end, -1]); if (iv.hop === 2) evC.push([iv.start, 1], [iv.end, -1]); }
+      }
+    }
+    const rs = res.map((r) => r.resp).sort((a, b) => a - b);
+    return { res, n: res.length, good, orphanCalls, orphanMs, peak: peakOf(ev), peakC: peakOf(evC), p99: rs[Math.ceil(0.99 * rs.length) - 1] };
+  }
+
+  const REQS = makeRequests(N, GAP, SEED);
+  const fmtMs = (v: number) => (v >= 1000 ? `${(v / 1000).toFixed(2)} s` : `${Math.round(v)} ms`);
+  const HOPNAME = ['A', 'B', 'C', 'DB'];
+  const HOPCOL = ['var(--role-1)', 'var(--role-2)', 'var(--role-3)', 'var(--role-4)'];
+  const DEFAULTS = { mode: 'uniform', retries: '0', slow: '10', bslow: '5' };
+
+  document.querySelectorAll<HTMLElement>('[data-td]').forEach((root) => {
+    const q = <T extends HTMLElement>(s: string) => root.querySelector<T>(s)!;
+    const num = (s: string) => Number(q<HTMLInputElement>(s).value);
+    const cmpBody = q('[data-cmp]'); const gantt = q('[data-gantt]');
+    // build the comparison rows and the six timeline rows once
+    const cmpCells: Record<string, HTMLElement[]> = {};
+    (Object.keys(MODES) as ModeId[]).forEach((id) => {
+      const tr = document.createElement('tr'); const th = document.createElement('th'); th.scope = 'row'; th.textContent = MODES[id].label; tr.append(th);
+      cmpCells[id] = [0, 1, 2, 3].map(() => { const td = document.createElement('td'); tr.append(td); return td; }); tr.dataset.mode = id; cmpBody.append(tr);
+    });
+    const rows = Array.from({ length: 6 }, () => {
+      const row = document.createElement('div'); row.className = 'td-row';
+      const label = document.createElement('span'); label.className = 'pg-mono td-label';
+      const track = document.createElement('div'); track.className = 'td-track';
+      const ok = document.createElement('span'); ok.className = 'td-bar';
+      const bad = document.createElement('span'); bad.className = 'td-bar td-orphan';
+      const mark = document.createElement('span'); mark.className = 'td-mark';
+      track.append(ok, bad, mark); row.append(label, track); gantt.append(row);
+      return { row, label, ok, bad, mark };
+    });
+    let selected = 0; let frame = 0; let first = true;
+
+    function cfg(): Cfg {
+      return { mode: q<HTMLSelectElement>('[data-mode]').value as ModeId, retries: num('[data-retries]'), cancel: q<HTMLInputElement>('[data-cancel]').checked, slowShare: num('[data-slow]') / 100, bSlowShare: num('[data-bslow]') / 100 };
+    }
+    function draw() {
+      frame = 0; const c = cfg(); const all = runAll(c, REQS); const dl = MODES[c.mode].dl;
+      q('[data-slowval]').textContent = String(num('[data-slow]')); q('[data-bslowval]').textContent = String(num('[data-bslow]'));
+      q<HTMLInputElement>('[data-cancel]').disabled = dl;
+      q('[data-cancelnote]').textContent = dl ? 'With a propagated deadline every hop stops itself at the deadline, so the cancellation setting has no effect here.' : c.cancel ? 'Cancellation on: when a caller gives up, everything below it stops at that instant.' : 'Cancellation off: a callee never learns that its caller left, so it keeps working until its own timeout or its natural end.';
+      if (first) { const p = all.res.find(isProblem); selected = p ? all.res.indexOf(p) : 0; first = false; q<HTMLInputElement>('[data-req]').value = String(selected); }
+      q('[data-reqval]').textContent = String(selected);
+      q('[data-good]').textContent = `${((100 * all.good) / all.n).toFixed(1)}% (${all.good} of ${all.n})`;
+      q('[data-goodnote]').textContent = `${all.n - all.good} missed the user's 2 s`;
+      q('[data-orph]').textContent = String(all.orphanCalls);
+      q('[data-orphnote]').textContent = `${(all.orphanMs / 1000).toFixed(1)} thread-seconds spent after the caller left`;
+      q('[data-peak]').textContent = String(all.peak);
+      const full = all.peakC >= POOL_C;
+      q('[data-peaknote]').textContent = `threads and connections; C alone peaks at ${all.peakC} of ${POOL_C} workers${full ? ': pool exhausted' : ''}`;
+      q<HTMLElement>('[data-boxpeak]').style.setProperty('--c', full ? 'var(--bad)' : 'var(--role-4)');
+      q('[data-p99]').textContent = fmtMs(all.p99);
+      q('[data-p99note]').textContent = 'until A answers or errors';
+      (Object.keys(MODES) as ModeId[]).forEach((id) => {
+        const r = runAll({ ...c, mode: id }, REQS); const cells = cmpCells[id];
+        cells[0].textContent = `${((100 * r.good) / r.n).toFixed(1)}%`; cells[1].textContent = String(r.orphanCalls); cells[2].textContent = String(r.peak); cells[3].textContent = fmtMs(r.p99);
+        (cells[0].parentElement as HTMLElement).classList.toggle('td-cur', id === c.mode);
+      });
+      drawGantt(c);
+    }
+    function drawGantt(c: Cfg) {
+      const r = simulate(c, REQS[selected]); const t0 = REQS[selected].t0;
+      const maxEnd = Math.max(...r.ivs.map((iv) => iv.end)) - t0; const scale = Math.max(2500, Math.ceil(maxEnd / 500) * 500);
+      q('[data-axis]').textContent = `${scale} ms from arrival; the line marks the user leaving at 2000 ms`;
+      const pct = (v: number) => `${Math.max(0, Math.min(100, ((v - t0) / scale) * 100)).toFixed(2)}%`;
+      const lines: string[] = []; let dbn = 0;
+      rows.forEach((rw, i) => {
+        const iv = r.ivs[i]; rw.row.hidden = !iv; if (!iv) return;
+        const name = iv.hop === 3 ? `DB try ${++dbn}` : HOPNAME[iv.hop]; rw.label.textContent = name;
+        const splitAt = Math.min(iv.end, iv.callerLeft); const orph = Math.max(0, iv.end - iv.callerLeft);
+        const ok = rw.ok; ok.style.left = pct(iv.start); ok.style.width = `calc(${pct(splitAt)} - ${pct(iv.start)})`; ok.style.background = HOPCOL[iv.hop];
+        rw.bad.style.left = pct(Math.max(iv.start, splitAt)); rw.bad.style.width = `calc(${pct(iv.end)} - ${pct(Math.max(iv.start, splitAt))})`; rw.bad.hidden = orph <= 0;
+        rw.mark.style.left = pct(r.D);
+        lines.push(`${name}: ${fmtMs(iv.start - t0)} to ${fmtMs(iv.end - t0)}${orph > 0 ? `, ${fmtMs(orph)} after its caller left` : ''}`);
+      });
+      const v = q('[data-verdict]');
+      v.classList.toggle('bad', !r.good);
+      v.textContent = r.good ? `Request ${selected}: answered in ${fmtMs(r.resp)}, inside the user's 2 s.` : r.late ? `Request ${selected}: A answered at ${fmtMs(r.resp)}, but the user left at 2 s. The whole chain's work was wasted.` : `Request ${selected}: failed at ${fmtMs(r.resp)} ${r.resp >= USER ? '(the user already left)' : '(an error or degraded answer reached the user in time)'}.`;
+      q('[data-spans]').textContent = lines.join('\n');
+      gantt.setAttribute('aria-label', `Timeline of request ${selected}: ${lines.join('; ')}`);
+    }
+    function schedule() { if (!frame) frame = requestAnimationFrame(draw); }
+    ['[data-mode]', '[data-retries]', '[data-slow]', '[data-bslow]', '[data-cancel]'].forEach((s) => { q(s).addEventListener('input', schedule); q(s).addEventListener('change', schedule); });
+    q('[data-req]').addEventListener('input', () => { selected = num('[data-req]'); schedule(); });
+    q('[data-next]').addEventListener('click', () => {
+      const c = cfg();
+      for (let k = 1; k <= N; k++) { const id = (selected + k) % N; if (isProblem(simulate(c, REQS[id]))) { selected = id; break; } }
+      q<HTMLInputElement>('[data-req]').value = String(selected); schedule();
+    });
+    q('[data-reset]').addEventListener('click', () => {
+      q<HTMLSelectElement>('[data-mode]').value = DEFAULTS.mode; q<HTMLSelectElement>('[data-retries]').value = DEFAULTS.retries;
+      q<HTMLInputElement>('[data-slow]').value = DEFAULTS.slow; q<HTMLInputElement>('[data-bslow]').value = DEFAULTS.bslow; q<HTMLInputElement>('[data-cancel]').checked = false;
+      first = true; schedule();
+    });
+    draw();
+  });
+</script>
+<style is:global>
+  .playground .td-check { display: inline-flex; align-items: center; gap: 6px; }
+  .playground .td-scroll { overflow-x: auto; }
+  .playground .td-table { border-collapse: collapse; width: 100%; font-size: .88rem; }
+  .playground .td-table th, .playground .td-table td { padding: 5px 10px; border-bottom: 1px solid var(--border); text-align: left; white-space: nowrap; }
+  .playground .td-table thead th { color: var(--muted); font-weight: 600; }
+  .playground .td-table tr.td-cur th, .playground .td-table tr.td-cur td { background: var(--accent-soft); font-weight: 600; }
+  .playground .td-gantt { display: grid; gap: 4px; }
+  .playground .td-row { display: grid; grid-template-columns: 5rem minmax(0, 1fr); gap: 8px; align-items: center; }
+  .playground .td-row[hidden] { display: none; }
+  .playground .td-label { white-space: nowrap; }
+  .playground .td-track { position: relative; height: 18px; background: var(--surface-2); border-radius: 4px; overflow: hidden; }
+  .playground .td-bar { position: absolute; top: 0; bottom: 0; min-width: 2px; }
+  .playground .td-bar[hidden] { display: none; }
+  .playground .td-orphan { background: var(--bad); }
+  .playground .td-mark { position: absolute; top: 0; bottom: 0; width: 2px; background: var(--text); }
+  .playground .td-axis { display: flex; justify-content: space-between; gap: 8px; flex-wrap: wrap; }
+</style>

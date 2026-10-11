@@ -1,0 +1,66 @@
+{
+  "name": "Hedged Requests and Tail Latency",
+  "area": "reliability",
+  "difficulty": "advanced",
+  "intent": "Cut the slowest requests at scale: send a duplicate to a second replica when the first is slow, and take whichever answers first.",
+  "scenario": "A search request queries 50 shards in parallel and waits for all of them. Each shard answers in about 10 ms, but 1% of calls take 200 ms to a second. About 40% of searches now include one slow shard, so the user-visible p99 is the shards' rare worst case, not their typical case.",
+  "problem": "Averages hide the tail, and fan-out multiplies it. If one backend is slow 1% of the time and a user request waits for N of them, the chance that at least one is slow is 1 - 0.99^N: 9.6% for 10, 39.5% for 50, 63.4% for 100. Each cause is ordinary (a GC pause, a compaction, a noisy neighbour, a cold cache, a deep queue, a retry), cannot be fixed everywhere, and a timeout does not help because the request is slow, not failed. The latency users feel is the maximum over many calls, so it is set by the rarest delays.",
+  "howItWorks": [
+    { "title": "Measure the tail per backend and per user request", "text": "Record p50, p95, p99 and p99.9 of each backend call and of the whole fan-out request. Averages and p50 look healthy while the user request is dominated by the slowest of N calls. The per-backend p99 is the number that gets amplified." },
+    { "title": "Send a backup request after a delay", "text": "Send the call to one replica. If it has not answered within a hedge delay, typically the backend's p95, send the same call to a second replica and use whichever answer arrives first, then cancel the loser. Only about 5% of calls ever get a second copy, but those are exactly the calls that were headed for the tail. Dean and Barroso (The Tail at Scale) report a Bigtable read benchmark where hedging after 10 ms cut the 99.9th percentile by about 96% for around 2% more requests." },
+    { "title": "Tie requests to cancel cheaply", "text": "A tied request goes to two replicas at once, each carrying the identity of the other. When one starts executing it tells the other to drop the request. The duplicate costs a queue slot but almost no CPU, and it removes the hedge delay for the wait-in-queue part of the tail. It needs a cancel path that is faster than the work and replicas that can see each other." },
+    { "title": "Make the delay adaptive and budget the extra load", "text": "Keep a rolling latency histogram per backend and set the delay to its current p95 (or p90 to p99), so the delay rises when the backend is genuinely slower. Cap hedges at a fraction of traffic (a token bucket refilled at 5% of calls) and drop hedges when the backends are overloaded. A fixed 13 ms delay that was right yesterday becomes a load amplifier when latencies drift." },
+    { "title": "Hedge only what is safe, and shorten the tail at the source", "text": "A hedged request executes twice, so hedge reads or idempotent operations, or make the write idempotent with a key. Then attack the causes: break work into small units, spread hot data over micro-partitions, replicate hot items selectively, send canary requests to one or two servers before the full fan-out, remove GC and background-job stalls, and shed load before queues build." }
+  ],
+  "pros": [
+    "Attacks the actual cause of a bad p99 at scale: the maximum over many calls",
+    "Cheap when tuned: a p95 delay hedges about 5% of calls (the Bigtable benchmark above needed roughly 2% extra requests) and the tail can shrink by an order of magnitude",
+    "Works against transient, uncorrelated slowness (GC, noisy neighbour, a busy queue) that you cannot remove everywhere",
+    "Needs no knowledge of why a replica was slow"
+  ],
+  "cons": [
+    "Adds load, and load is what makes tails worse; mistuned hedging is a self-inflicted overload",
+    "Requires replicas that can serve the request, and idempotent or read-only operations",
+    "Does not help when the slowness is correlated: a bad deploy, a shared database, a saturated network or a hot key slows every replica together",
+    "Hides unhealthy replicas: hedging masks a slow node, so latency stays good until the node is bad enough to matter",
+    "Needs good per-backend latency metrics and a working cancellation path"
+  ],
+  "whenToUse": [
+    "Wide fan-out reads (search, feeds, scatter-gather, multi-shard lookups) where p99 of the user request matters",
+    "Read paths with several replicas of the same data and latency that is variable but not saturated",
+    "Systems that already track latency percentiles per backend and have spare capacity (10 to 30%)"
+  ],
+  "whenNotToUse": [
+    "Backends that are already near saturation: the extra requests make everything slower",
+    "Non-idempotent writes, or any call with side effects you cannot deduplicate",
+    "Fan-out of 1 or 2 where the p99 of a single backend is already acceptable and a timeout plus retry is enough",
+    "When the slowness is the whole service (an overloaded dependency): use load shedding, backpressure and a circuit breaker instead"
+  ],
+  "pitfalls": [
+    "Hedging after the p50: about half of all calls are duplicated, utilisation jumps and the cluster tips over (the simulation shows 100% extra load)",
+    "A static delay that was measured once: when load rises the normal latency passes the delay, almost everything hedges, and the extra load keeps the latency high",
+    "Not cancelling the loser, so slow requests keep consuming CPU on the replica that was already slow",
+    "Hedging non-idempotent operations such as a payment or an order, which then happens twice",
+    "Using the same connection, thread pool or replica for both copies, so the hedge shares the cause of the slowness",
+    "Mixing this up with retries: a retry waits for a failure and backs off, a hedge fires while the first call is still in flight and does not wait"
+  ],
+  "related": [
+    { "kind": "concept", "slug": "retries-and-backoff" },
+    { "kind": "concept", "slug": "idempotency" },
+    { "kind": "concept", "slug": "circuit-breaker" },
+    { "kind": "concept", "slug": "backpressure" },
+    { "kind": "concept", "slug": "bulkhead" },
+    { "kind": "concept", "slug": "load-balancing" },
+    { "kind": "concept", "slug": "metrics" },
+    { "kind": "concept", "slug": "slos-and-error-budgets" },
+    { "kind": "concept", "slug": "latency-and-round-trips" },
+    { "kind": "concept", "slug": "timeouts-and-deadlines" },
+    { "kind": "concept", "slug": "load-shedding" },
+    { "kind": "concept", "slug": "queueing-theory-and-littles-law" }
+  ],
+  "roles": [
+    { "id": "client", "label": "Search service", "description": "Fans a user request out to the shards and waits for all of them." },
+    { "id": "shard", "label": "Shard replica", "description": "One copy of a data partition that answers part of the query; usually fast, occasionally slow." },
+    { "id": "hedger", "label": "Hedge logic", "description": "Tracks the latency percentile, fires the backup after the delay, takes the first answer and cancels the other." }
+  ]
+}

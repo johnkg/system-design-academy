@@ -1,0 +1,156 @@
+---
+import PlaygroundShell from '../components/PlaygroundShell.astro';
+---
+<PlaygroundShell title="Simulate it" hint="Two replicas of a 1,000,000 key store have drifted. Choose how many keys differ, the tree shape and the method, then watch how much work it takes to find and repair them.">
+  <ol class="how">
+    <li>Default: <b>5 differing keys</b>, 256 leaf ranges, fanout 2, <b>Merkle descent</b>. Press <b>Step</b> to walk down one level at a time: only the red subtrees are opened, 59 hash comparisons in total (about 2 KB) against 1,000,000 keys to compare directly.</li>
+    <li>Switch the method to <b>Compare everything</b> or <b>Flat list of range hashes</b>: the first reads and streams the whole store (about 100 MB), the second sends all 256 range hashes (about 8 KB) whatever the number of differences.</li>
+    <li>Raise the differing keys to <b>1000</b>. About 252 of the 256 ranges now differ, so the descent opens almost the whole tree (511 hashes) and sends more than the flat list (256), and the repair copies nearly the whole store. Merkle only wins while the differences are few.</li>
+    <li>Raise the leaf ranges to 1024: a few more hashes (79 instead of 59) to find the ranges, but each range is four times smaller, so the repair drops from 2.0 MB to about 0.5 MB. That is the depth against repair-granularity trade-off.</li>
+  </ol>
+  <div class="pg mk" data-mk>
+    <div class="pg-row">
+      <label>Differing keys <input type="range" min="1" max="2000" value="5" data-diffs aria-label="Number of differing keys" /> <b data-diffsval>5</b></label>
+      <label>Leaf ranges <select class="pg-in" data-leaves aria-label="Number of leaf ranges"><option value="64">64</option><option value="256" selected>256</option><option value="1024">1024</option></select></label>
+      <label>Fanout <select class="pg-in" data-fanout aria-label="Tree fanout"><option value="2" selected>2 (binary)</option><option value="4">4</option><option value="16">16</option></select></label>
+      <label>Method <select class="pg-in" data-method aria-label="Comparison method"><option value="merkle" selected>Merkle descent</option><option value="flat">Flat list of range hashes</option><option value="all">Compare everything</option></select></label>
+    </div>
+    <div class="pg-row">
+      <button class="btn" type="button" data-step>Step</button>
+      <button class="btn" type="button" data-run>Run all</button>
+      <button class="btn" type="button" data-reset>Reset</button>
+      <label>Seed <input class="pg-in mk-seed" type="number" min="1" max="9999" value="7" data-seed aria-label="Random seed" /></label>
+    </div>
+    <canvas class="mk-canvas" data-canvas role="img" aria-label="The Merkle tree, one row per level with the root at the top. Red cells are subtrees whose hashes differ, green cells matched, grey cells were never compared."></canvas>
+    <p class="pg-note mk-legend"><span class="mk-sw" style="--c: var(--bad)"></span> hashes differ (descend) <span class="mk-sw" style="--c: var(--role-2)"></span> hashes match (pruned) <span class="mk-sw" style="--c: var(--surface-2)"></span> not compared</p>
+    <div class="pg-grid">
+      <div class="pg-box" style="--c: var(--role-1)"><h3>Hash comparisons</h3><span class="pg-mono" data-comps>0</span><span class="pg-note" data-compsnote></span></div>
+      <div class="pg-box" style="--c: var(--role-3)"><h3>Ranges found differing</h3><span class="pg-mono" data-ranges>0</span><span class="pg-note" data-rangesnote></span></div>
+      <div class="pg-box" style="--c: var(--role-2)"><h3>Bytes to find them</h3><span class="pg-mono" data-findbytes>0</span><span class="pg-note">hashes (32 B) or data read</span></div>
+      <div class="pg-box" style="--c: var(--role-4)"><h3>Bytes to repair</h3><span class="pg-mono" data-fixbytes>0</span><span class="pg-note" data-fixnote></span></div>
+    </div>
+    <p class="pg-out" data-verdict aria-live="polite"></p>
+    <p class="pg-note">Assumptions: 1,000,000 keys, about 100 bytes per key and value, a 32 byte SHA-256 hash, both trees already built. The cost of building or updating the trees is not counted here. Differing keys are placed uniformly at random, so several may share a range.</p>
+  </div>
+</PlaygroundShell>
+<script>
+  // core:start
+  const KEYS = 1000000; const ENTRY = 100; const HASH = 32;
+  function mulberry32(a: number) {
+    return () => { a = (a + 0x6d2b79f5) | 0; let t = Math.imul(a ^ (a >>> 15), 1 | a); t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t; return ((t ^ (t >>> 14)) >>> 0) / 4294967296; };
+  }
+  function levelSizes(leaves: number, fanout: number) {
+    const sizes = [leaves];
+    while (sizes[0] > 1) sizes.unshift(Math.ceil(sizes[0] / fanout));
+    return sizes; // sizes[0] = 1 (root) .. sizes[last] = leaves
+  }
+  function model(diffs: number, leaves: number, fanout: number, method: string, seed: number) {
+    const rnd = mulberry32(seed);
+    const keys = new Set<number>();
+    while (keys.size < diffs) keys.add(Math.floor(rnd() * KEYS));
+    const diffLeaf = new Set<number>();
+    keys.forEach((k) => diffLeaf.add(Math.floor((k * leaves) / KEYS)));
+    const sizes = levelSizes(leaves, fanout);
+    const depth = sizes.length;
+    // differing[l] = set of node indexes at level l whose hash differs; compared[l] = nodes whose hash was compared
+    const differing: Set<number>[] = sizes.map(() => new Set<number>());
+    diffLeaf.forEach((i) => { let idx = i; for (let l = depth - 1; l >= 0; l--) { differing[l].add(idx); idx = Math.floor(idx / fanout); } });
+    const compared: Set<number>[] = sizes.map(() => new Set<number>());
+    compared[0].add(0);
+    for (let l = 1; l < depth; l++) {
+      differing[l - 1].forEach((p) => { for (let c = p * fanout; c < Math.min(sizes[l], (p + 1) * fanout); c++) compared[l].add(c); });
+    }
+    const perLevel = compared.map((s) => s.size); // comparisons made when descending to each level
+    const keysPerRange = KEYS / leaves;
+    const ranges = diffLeaf.size;
+    let comparisons: number; let findBytes: number; let fixBytes: number; let fixKeys: number;
+    if (method === 'all') { comparisons = KEYS; findBytes = KEYS * ENTRY; fixKeys = diffs; }
+    else if (method === 'flat') { comparisons = leaves; findBytes = leaves * HASH; fixKeys = Math.round(ranges * keysPerRange); }
+    else { comparisons = perLevel.reduce((a, b) => a + b, 0); findBytes = comparisons * HASH; fixKeys = Math.round(ranges * keysPerRange); }
+    fixBytes = fixKeys * ENTRY;
+    return { sizes, depth, differing, compared, perLevel, ranges, comparisons, findBytes, fixBytes, fixKeys, keysPerRange };
+  }
+  function human(n: number) {
+    if (n >= 1e6) return (n / 1e6).toFixed(n >= 1e8 ? 0 : 1) + ' MB';
+    if (n >= 1e3) return (n / 1e3).toFixed(n >= 1e5 ? 0 : 1) + ' KB';
+    return n + ' B';
+  }
+  function verdict(m: ReturnType<typeof model>, method: string, diffs: number, leaves: number) {
+    const total = m.findBytes + m.fixBytes;
+    const all = KEYS * ENTRY + diffs * ENTRY;
+    if (method === 'all') return `Compare everything: ${KEYS.toLocaleString('en-US')} keys read and streamed, ${human(total)} on the wire, to repair ${diffs} key${diffs === 1 ? '' : 's'}. Exact repair, but the cost does not depend on how few keys differ.`;
+    const factor = Math.round(all / total); const gain = factor >= 2 ? `about ${factor}x less than comparing everything` : 'barely less than comparing everything';
+    if (method === 'flat') return `Flat list: always ${leaves} hashes (${human(leaves * HASH)}) however few keys differ, then ${m.ranges} range${m.ranges === 1 ? '' : 's'} are copied. ${human(total)} in all, ${gain}.`;
+    const worse = m.comparisons > leaves;
+    return `Merkle descent: ${m.comparisons} hash comparisons, ${m.ranges} range${m.ranges === 1 ? '' : 's'} to copy, ${human(total)} in all, ${gain}.` + (worse ? ` Most ranges differ now, so the descent sent more hashes (${m.comparisons}) than the flat list (${leaves}): the tree stopped paying for itself.` : '');
+  }
+  // core:end
+
+  document.querySelectorAll<HTMLElement>('[data-mk]').forEach((root) => {
+    const q = <T extends HTMLElement>(s: string) => root.querySelector<T>(s)!;
+    const sel = (s: string) => q<HTMLSelectElement>(s).value;
+    const num = (s: string) => Number(q<HTMLInputElement>(s).value);
+    const canvas = q<HTMLCanvasElement>('[data-canvas]');
+    const ctx = canvas.getContext('2d')!;
+    let shown = 0; // number of levels revealed (1 = root only)
+    let m = model(5, 256, 2, 'merkle', 7);
+    let raf = 0;
+
+    function token(name: string) { return getComputedStyle(root).getPropertyValue(name).trim() || '#888'; }
+    function paint() {
+      raf = 0;
+      const ROW = 16; const GAP = 3;
+      const w = Math.max(200, canvas.clientWidth); const dpr = window.devicePixelRatio || 1;
+      const h = m.depth * (ROW + GAP);
+      canvas.width = Math.floor(w * dpr); canvas.height = Math.floor(h * dpr); canvas.style.height = h + 'px';
+      ctx.setTransform(dpr, 0, 0, dpr, 0, 0); ctx.clearRect(0, 0, w, h);
+      const bad = token('--bad'); const good = token('--role-2'); const idle = token('--surface-2'); const border = token('--border');
+      const merkle = sel('[data-method]') === 'merkle';
+      for (let l = 0; l < m.depth; l++) {
+        const n = m.sizes[l]; const cw = w / n; const y = l * (ROW + GAP);
+        for (let i = 0; i < n; i++) {
+          const visible = merkle ? l < shown && m.compared[l].has(i) : l === m.depth - 1 && shown > 0;
+          ctx.fillStyle = !visible ? idle : m.differing[l].has(i) ? bad : good;
+          const pad = cw > 3 ? 1 : 0;
+          ctx.fillRect(i * cw + pad / 2, y, Math.max(1, cw - pad), ROW);
+        }
+        ctx.strokeStyle = border; ctx.strokeRect(0.5, y + 0.5, w - 1, ROW - 1);
+      }
+    }
+    function schedule() { if (!raf) raf = requestAnimationFrame(paint); }
+    function draw() {
+      const diffs = num('[data-diffs]'); q('[data-diffsval]').textContent = String(diffs);
+      const method = sel('[data-method]');
+      const merkle = method === 'merkle';
+      const upto = merkle ? Math.min(shown, m.depth) : m.depth;
+      const full = !merkle || shown >= m.depth;
+      let comps = m.comparisons; let bytes = m.findBytes;
+      if (merkle && !full) { comps = 0; for (let l = 0; l < upto; l++) comps += m.perLevel[l]; bytes = comps * HASH; }
+      q('[data-comps]').textContent = comps.toLocaleString('en-US');
+      q('[data-compsnote]').textContent = merkle ? `levels opened: ${upto} of ${m.depth}` : method === 'flat' ? 'one per leaf range' : 'one per key';
+      q('[data-ranges]').textContent = full ? String(m.ranges) : '?';
+      q('[data-rangesnote]').textContent = full ? `about ${Math.round(m.keysPerRange).toLocaleString('en-US')} keys each, ${diffs} actually differ` : 'still descending';
+      q('[data-findbytes]').textContent = human(bytes);
+      q('[data-fixbytes]').textContent = full ? human(m.fixBytes) : '-';
+      q('[data-fixnote]').textContent = full ? `${m.fixKeys.toLocaleString('en-US')} keys copied` : 'after the descent ends';
+      q('[data-verdict]').textContent = full ? verdict(m, method, diffs, num_leaves()) : `Level ${upto} of ${m.depth}: ${comps} hash comparisons so far. Press Step to open the red subtrees.`;
+      schedule();
+    }
+    function num_leaves() { return Number(sel('[data-leaves]')); }
+    function recompute() { m = model(num('[data-diffs]'), num_leaves(), Number(sel('[data-fanout]')), sel('[data-method]'), num('[data-seed]')); shown = Math.min(shown, m.depth); }
+    function reset() { recompute(); shown = 1; draw(); }
+    function change() { recompute(); shown = sel('[data-method]') === 'merkle' ? 1 : m.depth; draw(); }
+    q('[data-step]').addEventListener('click', () => { if (shown < m.depth) shown++; draw(); });
+    q('[data-run]').addEventListener('click', () => { shown = m.depth; draw(); });
+    q('[data-reset]').addEventListener('click', reset);
+    ['[data-diffs]', '[data-leaves]', '[data-fanout]', '[data-method]', '[data-seed]'].forEach((s) => q(s).addEventListener('input', change));
+    window.addEventListener('resize', schedule);
+    change(); shown = m.depth; draw();
+  });
+</script>
+<style is:global>
+  .playground .mk-canvas { display: block; width: 100%; margin: 8px 0; }
+  .playground .mk-seed { width: 5em; }
+  .playground .mk-legend { display: flex; flex-wrap: wrap; gap: 4px 14px; align-items: center; }
+  .playground .mk-sw { display: inline-block; width: 12px; height: 12px; background: var(--c); border: 1px solid var(--border); vertical-align: middle; margin-right: 4px; }
+</style>

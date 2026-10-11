@@ -1,0 +1,65 @@
+{
+  "name": "Message Ordering and Partitioning",
+  "area": "messaging",
+  "difficulty": "intermediate",
+  "intent": "Keep the order that matters (per account, per order) while still scaling out consumers, by partitioning messages on a key instead of promising a global order.",
+  "scenario": "Account events (deposit, withdraw) for many accounts flow through one topic. A withdrawal must never be processed before the deposit that funds it, but the topic must also scale past one consumer, and a few busy accounts send most of the traffic.",
+  "problem": "A single queue with a single consumer is perfectly ordered but is capped at what one consumer can process. Adding competing consumers scales throughput but a later message can finish first, and a retried message arrives after its successors, so a withdrawal can run before its deposit. Total order across everything cannot be scaled; the real question is which order is actually needed, and how to keep exactly that.",
+  "howItWorks": [
+    { "title": "Competing consumers trade order for throughput", "text": "N workers pull from one queue and each message goes to one of them. Two messages for the same account can be in flight at once on different workers with different processing times, so the later one can finish first. A failed message that is redelivered after a visibility timeout also lands behind messages that were sent after it. Standard SQS and RabbitMQ with several consumers behave like this; the ordering you get is 'roughly FIFO'." },
+    { "title": "Partition by the entity that must stay ordered", "text": "A partitioned log (Kafka, Kinesis, Pulsar) splits a topic into partitions. The producer picks the partition from the message key, typically hash(key) mod partitionCount (Kafka's default partitioner uses murmur2). Each partition is an append-only log with increasing offsets, so order holds inside a partition and nowhere across partitions. Pick the key as the unit of ordering: the account id or order id, not a random id and not the event type." },
+    { "title": "A consumer group owns whole partitions", "text": "In a consumer group each partition is assigned to exactly one consumer, which reads it in offset order. That is the guarantee that keeps per-key order. It also means useful parallelism is at most the partition count: with 8 partitions the ninth consumer is idle. Several partitions can share one consumer, but one partition is never split across consumers." },
+    { "title": "Hot keys make hot partitions", "text": "Partitioning balances keys, not load. If one account sends 30% of the events, its partition and its consumer carry at least 30% of the work no matter how many other partitions or consumers exist, so the slowest partition sets the throughput of the whole topic. Options are salting a key (which gives up order for that key), a dedicated topic for known hot keys, or making the handler faster." },
+    { "title": "Retries and resizing are where order silently breaks", "text": "A failed message sent to a retry topic or put back at the tail is applied after its successors. To keep order you either retry in place (the partition is blocked, so one poison message stalls its whole partition) or make the consumer order-tolerant. Changing the partition count changes hash(key) mod n, so a key moves to another partition while its old events may still be queued on the previous one, and a new event can overtake them." },
+    { "title": "Make consumers tolerate disorder", "text": "Give each entity a per-key sequence number or version. The consumer stores the last applied version and ignores anything not newer (version-aware, idempotent), or holds back an event that skips ahead until the gap is filled (gap detection, a reorder buffer). This is the same idea as the sequence numbers behind causal order: you only need order between events that are related, not between everything." }
+  ],
+  "pros": [
+    "Per-key order is preserved while consumers run in parallel across keys",
+    "Throughput scales with partitions and consumers, with no coordination on the hot path",
+    "A partition is a simple, replayable log, so a consumer can re-read from an offset",
+    "Order-tolerant consumers make retries, redelivery and replays safe"
+  ],
+  "cons": [
+    "No order across partitions: 'all events in the system' is not available at scale",
+    "Parallelism is capped by the partition count, and adding partitions later breaks key placement",
+    "Hot keys create hot partitions, and the slowest partition limits the whole topic",
+    "Strict order and retries conflict: blocking a partition for one bad message costs latency for every key on it"
+  ],
+  "whenToUse": [
+    "Events about an entity (account, order, device) that must be applied in order, such as ledgers, state machines and change feeds",
+    "High-volume topics that must scale past one consumer",
+    "Pipelines that rebuild state from a log and need the same result on every replay"
+  ],
+  "whenNotToUse": [
+    "Independent tasks (emails, thumbnails) where order does not matter: plain competing consumers are simpler and balance load better",
+    "When you truly need one global total order at high rate: a single partition or a sequencer is a throughput ceiling, so reconsider the requirement first",
+    "When a very small number of keys carries most of the traffic and each must be both ordered and fast: partitioning cannot help"
+  ],
+  "pitfalls": [
+    "Keying by something other than the entity, such as a random message id or the event type, silently gives no useful order",
+    "Adding partitions to a live topic: hash(key) mod n changes, so keys move while old events are still queued and order breaks during the transition (and compacted topics see one key in two places)",
+    "Retry topics and dead-letter queues that re-publish a failed message behind its successors, reordering the key",
+    "Calling async handlers inside a consumer without awaiting them, or processing a batch on a thread pool, which throws away the order the partition gave you",
+    "Over-provisioning partitions: the guarantee does not need thousands, and each partition costs file handles, replication and rebalance time",
+    "Assuming the producer preserves order: with several in-flight requests and retries the client can reorder unless idempotent or ordered sending is enabled"
+  ],
+  "related": [
+    { "kind": "concept", "slug": "message-queues" },
+    { "kind": "concept", "slug": "pub-sub" },
+    { "kind": "concept", "slug": "logical-clocks" },
+    { "kind": "concept", "slug": "idempotency" },
+    { "kind": "concept", "slug": "retries-and-backoff" },
+    { "kind": "concept", "slug": "consistent-hashing" },
+    { "kind": "concept", "slug": "database-sharding" },
+    { "kind": "concept", "slug": "event-sourcing" },
+    { "kind": "concept", "slug": "delivery-guarantees" },
+    { "kind": "concept", "slug": "dead-letter-queues-and-poison-messages" },
+    { "kind": "concept", "slug": "optimistic-concurrency-and-etags" },
+    { "kind": "concept", "slug": "queueing-theory-and-littles-law" }
+  ],
+  "roles": [
+    { "id": "producer", "label": "Producer", "description": "Sends events and chooses the partition, usually from the message key." },
+    { "id": "partition", "label": "Partition", "description": "An append-only log. Order holds inside one partition and nowhere across partitions." },
+    { "id": "consumer", "label": "Consumer", "description": "A member of a consumer group that owns whole partitions and applies their events." }
+  ]
+}

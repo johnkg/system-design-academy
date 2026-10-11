@@ -1,0 +1,67 @@
+{
+  "name": "JWTs and Session Tokens",
+  "area": "security",
+  "difficulty": "intermediate",
+  "intent": "Choose between an opaque session id looked up on every request and a signed, self-contained token any service can verify, and know exactly what each choice costs in revocation, lookups and attack surface.",
+  "scenario": "An API made of many microservices (orders, billing, ...) must authenticate users. A user's access token is stolen by a script injected into the web app. How long can the thief keep calling the API, and how many auth lookups does the platform pay to find out?",
+  "problem": "HTTP is stateless, so every request must carry proof of who is calling. A server-side session id is trivially revocable but forces a store lookup on every request in every service. A signed token (JWT) is verified locally with no lookup, but it is valid until it expires: you cannot take it back. Add the many ways to verify a JWT incorrectly (alg none, algorithm confusion, no audience check) and the choice is as much about operational risk as about performance.",
+  "howItWorks": [
+    { "title": "Server-side session: an opaque id and a lookup", "text": "After login the server stores the session (user id, created, last seen, device) under a random id of at least 128 bits from a CSPRNG and sets it in a cookie such as __Host-sid with HttpOnly, Secure and SameSite=Lax. Every request does a lookup in Redis or a database. Revocation is a delete: the next request fails. The price is a network round trip per request, and a store every service must reach or share." },
+    { "title": "JWT: header.payload.signature, verified locally", "text": "A JWT is three base64url parts joined by dots. The header names the algorithm and key id (alg, kid), the payload holds claims (iss, sub, aud, exp, nbf, iat, jti, plus your own), and the signature covers header.payload. Any service holding the verification key checks it with no call to the issuer. The payload is only encoded, not encrypted: anyone holding the token can read it, so no secrets in it." },
+    { "title": "Verify the right things, in the right order", "text": "A verifier must (1) pin the expected algorithm from its own configuration instead of trusting the header, (2) pick the key by kid from a trusted set, (3) verify the signature, then (4) check exp and nbf with a small clock skew allowance (30 to 60 seconds), iss equals the expected issuer, and aud contains this service. Skipping any of these is a known vulnerability, not a style choice." },
+    { "title": "HS256 versus RS256 and ES256, and key rotation", "text": "HS256 is an HMAC with one shared secret: every verifier can also forge tokens, so it only suits one service or one trust domain. RS256 and ES256 sign with a private key held only by the issuer; verifiers fetch public keys from a JWKS endpoint (/.well-known/jwks.json). To rotate, publish the new key in the JWKS first, start signing with it (new kid), and remove the old key only after every token it signed has expired." },
+    { "title": "Short access tokens plus rotating refresh tokens", "text": "Because a JWT cannot be revoked, keep its lifetime to 5 to 15 minutes. A longer-lived refresh token (days to weeks) buys new access tokens from the auth server, which can check its state on each refresh. With rotation every refresh returns a new refresh token and invalidates the old one; if an old one is ever presented again, someone copied it, so the server revokes the whole token family and forces a new login." },
+    { "title": "Revocation, logout and where to keep the token", "text": "For urgent revocation you add state back: a deny list of jti values (kept only until exp), a per-user 'tokens issued before T are invalid' timestamp, or token introspection (RFC 7662) at the cost of a call. In a browser, prefer an HttpOnly Secure SameSite cookie that scripts cannot read; localStorage tokens are one XSS away from theft. Cookies bring CSRF concerns, which SameSite and anti-CSRF tokens address." }
+  ],
+  "pros": [
+    "Session ids give instant, certain revocation: logout, password change and 'sign out everywhere' take effect on the next request",
+    "JWTs are verified with no network call, so many services can authenticate independently and the auth server is off the hot path",
+    "Asymmetric signing (RS256, ES256) lets any service verify without being able to mint tokens",
+    "Claims such as sub, scope and tenant travel with the request, so downstream services need no user lookup to make a coarse decision",
+    "Short access tokens plus refresh rotation bound the damage of a leak and detect token theft"
+  ],
+  "cons": [
+    "A JWT stays valid until exp: revoking it early needs a deny list or introspection, which reintroduces the lookup you wanted to avoid",
+    "A session store is on the critical path of every request: its latency, availability and capacity become yours",
+    "A JWT rides on every request: 300 bytes to over 1 KB per call, and big role lists can exceed header limits (often 8 KB at proxies)",
+    "Claims go stale: a user demoted at 10:00 still carries 'admin' in a token issued at 09:58",
+    "Verification has many sharp edges (algorithm, key selection, audience), and a library default or a missed check silently disables security"
+  ],
+  "whenToUse": [
+    "Session cookies and a store for a classic first-party web app: revocation and logout matter more than avoiding one Redis hit",
+    "Short-lived signed access tokens when many independent services or several organisations must authenticate without sharing a session store",
+    "Service-to-service calls where the caller needs a verifiable identity for a few minutes",
+    "A token minted by an identity provider (OAuth 2.0 / OpenID Connect) that your APIs only need to validate"
+  ],
+  "whenNotToUse": [
+    "A single monolith or a few services behind one gateway: a signed cookie or a session in Redis is simpler, safer and revocable",
+    "Using JWTs as long-lived sessions (hours or days) and calling it stateless: you will end up bolting on a deny list that is a session store with extra steps",
+    "Stuffing permissions, profile data or anything secret into claims",
+    "Rolling your own verification: use a maintained library and pin algorithm, issuer and audience explicitly"
+  ],
+  "pitfalls": [
+    "Accepting whatever alg the header says: alg=none skips the signature, and handing an RS256 public key to a library that also accepts HS256 lets an attacker sign with the public key as the HMAC secret",
+    "No audience check, so a token minted for the low-risk reporting API is accepted by the billing API; likewise no issuer check in multi-tenant setups with shared keys",
+    "Treating a 24 hour token as 'logged out' after deleting the cookie: the stolen copy still works, and with no deny list nothing can stop it",
+    "Unbounded refresh tokens that are neither rotated nor bound to a device, so a leaked one grants access for months",
+    "Comparing signatures with == instead of a constant-time comparison, or using a short or guessable HS256 secret that can be cracked offline",
+    "Trusting jku, jwk or x5u header fields, or fetching the JWKS for any kid on demand with no rate limit, so an attacker steers key selection or causes fetch storms"
+  ],
+  "related": [
+    { "kind": "concept", "slug": "authentication-and-authorization" },
+    { "kind": "concept", "slug": "oauth-and-openid-connect" },
+    { "kind": "concept", "slug": "access-control-models" },
+    { "kind": "concept", "slug": "csrf-and-cors" },
+    { "kind": "concept", "slug": "injection-and-xss" },
+    { "kind": "concept", "slug": "encryption" },
+    { "kind": "concept", "slug": "secrets-management" },
+    { "kind": "concept", "slug": "api-gateway" },
+    { "kind": "concept", "slug": "caching" }
+  ],
+  "roles": [
+    { "id": "client", "label": "Client", "description": "The user's browser or app, holding the access and refresh tokens." },
+    { "id": "auth", "label": "Auth server", "description": "Authenticates users, issues and rotates tokens, publishes public keys (JWKS)." },
+    { "id": "service", "label": "Microservice", "description": "Verifies the token locally with the issuer's public key and serves the request." },
+    { "id": "attacker", "label": "Attacker", "description": "Holds a copy of a stolen token." }
+  ]
+}

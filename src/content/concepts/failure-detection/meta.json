@@ -1,0 +1,68 @@
+{
+  "name": "Failure Detection",
+  "area": "distributed",
+  "difficulty": "advanced",
+  "intent": "Decide that a node is dead when all you can observe is messages arriving or not, and accept that every answer is a guess.",
+  "scenario": "A monitoring node watches an orders service that sends a heartbeat every second over a jittery network. Over a few minutes the service suffers a 6 second GC pause, a short network blip that eats most heartbeats, and finally a real crash. The monitor has to catch the crash quickly without crying wolf about the other two.",
+  "problem": "In an asynchronous network a node that is slow and a node that is dead look identical: in both cases nothing arrives. FLP shows that you cannot build a failure detector that is both always right and always timely in that model, so every real detector is a timeout in disguise, and every timeout trades detection time against false positives. Declare too early and you evict healthy nodes, trigger failovers and rebalances, and risk two nodes both believing they own the same job. Declare too late and users wait on a corpse.",
+  "howItWorks": [
+    { "title": "You only see silence, never death", "text": "The monitor's only input is the arrival times of messages. A crash, a stop-the-world GC pause of several seconds, a VM that was descheduled, a congested link and a dropped route all produce the same observation: no heartbeat. FLP and the asynchronous model make this formal. A detector can be complete (every dead node is eventually suspected) or accurate (no live node is suspected), and in practice you get completeness plus eventual, probabilistic accuracy at best. Failure detection is a statement about the monitor's evidence, not about the node." },
+    { "title": "Fixed timeout: simple, with a single knob", "text": "Suspect the node when the time since the last heartbeat exceeds T. It is easy to reason about and easy to alert on. But T has to be longer than the worst delay you want to tolerate (network jitter, GC, a retransmit after loss costs 200 ms to a few seconds) and shorter than the outage you can afford. With a 1 s heartbeat, T of 2 s flags on a single retransmit, 5 s tolerates most blips and detects in about 5 s, and 10 s is quiet but slow. The right T also differs per link, per region and per hour, so one global constant is always wrong somewhere." },
+    { "title": "Phi accrual: output suspicion, let the application choose", "text": "Instead of a yes or no, keep a sliding window of recent heartbeat inter-arrival times (Cassandra and Akka use about 1000 and 1000 samples), estimate their mean and standard deviation, and compute phi = -log10(P(a heartbeat arrives later than now)). Phi 1 means a 10% chance the node is merely late, phi 8 means 1 in 10^8. The application picks a threshold (Cassandra's phi_convict_threshold defaults to 8; Akka's example is 8-12 on noisy clouds). Because the distribution is learned, the same threshold means 'about 2.6 s of silence' on a link with 300 ms std deviation and 'about 1.6 s' on a quiet one. A floor on the standard deviation (Akka: 100 ms) avoids absurdly twitchy detection on a clean LAN." },
+    { "title": "Indirect probing: ask someone else", "text": "Silence on one path proves little. SWIM (and its descendants, HashiCorp memberlist, Consul, Serf) pings the target every protocol period (about 1 s); if no ack arrives within the probe timeout (about 500 ms) the prober asks k other members (k=3) to ping it on its behalf and relay the ack. Only if none of those succeed is the target suspect. This removes the false positives caused by one bad link, and it spreads probing load evenly (each member is probed by about one peer per period) instead of every node heartbeating every other node." },
+    { "title": "Suspicion with a grace period and incarnation numbers", "text": "SWIM does not kill a suspect at once. It marks the member suspect, gossips that fact, and starts a timer (memberlist: suspicion multiplier 4 times log10(N+1) times the probe interval, about 4 s for 10 nodes). A suspected node that is alive and hears the rumour refutes it by broadcasting 'alive' with an incarnation number higher than the one in the rumour; higher incarnation beats lower, so the refutation overrides the suspicion. If the timer expires with no refutation the verdict is 'dead' and is gossiped. The grace period costs detection time (about 6 to 7 s end to end here) and buys back most false positives from pauses shorter than the timer." },
+    { "title": "A verdict is a belief: fence, and pick the layer", "text": "A node declared dead may still be running: paused, partitioned, or just slow. Whatever acts on the verdict (promote a replica, reassign a shard, release a lock) must therefore be safe if the verdict is wrong: leases that expire on the holder's own clock, and fencing tokens that make the storage layer reject writes from the old owner (see leases and fencing tokens). Also choose the layer deliberately: TCP keepalive defaults to 2 hours before the first probe on Linux and only proves the kernel is alive; an application heartbeat proves the event loop runs; a lease or a health check on a real request proves the work path is healthy. Each layer answers a different question." }
+  ],
+  "pros": [
+    "A heartbeat plus a timeout is trivial to build and works as a coarse safety net everywhere",
+    "Phi accrual adapts to each link's measured jitter and gives the application a single meaningful knob instead of a magic number in seconds",
+    "SWIM-style indirect probes and suspicion remove most false positives from a single bad link or short pause, at constant load per node",
+    "A suspicion state with refutation makes eviction reversible instead of a one-way door"
+  ],
+  "cons": [
+    "No detector escapes the trade-off: faster detection always means more false positives, and the numbers depend on a distribution that is not stationary",
+    "Phi assumes roughly normal inter-arrival times; real tails are heavy, and one long outlier inflates the learned standard deviation, making the detector sluggish for the next window of samples",
+    "A cold start (first minutes, or after a restart) has no history, so thresholds are guessed and early false alarms are common",
+    "Grace periods and indirect probes add seconds to detection of a genuine crash, and SWIM needs a gossip layer and per-member state",
+    "A verdict still needs a safe response; the detector can be perfect and the system still wrong if a zombie keeps writing"
+  ],
+  "whenToUse": [
+    "Cluster membership, replica failover and shard reassignment where a dead node must be replaced automatically",
+    "Many nodes with different network paths, where one global timeout would be wrong for most of them (phi accrual, or SWIM)",
+    "Large clusters where all-to-all heartbeating would cost O(n^2) messages (SWIM, randomised probing)",
+    "Any time the cost of a wrong verdict is lower or higher than the cost of waiting, and you can express that as a threshold"
+  ],
+  "whenNotToUse": [
+    "Three nodes behind one load balancer with a health check: a plain timeout with a few consecutive failures is enough, a statistical detector adds nothing you can reason about",
+    "When the action on a verdict is not safe against a false positive (a destructive failover with no fencing): fix that first, no threshold makes it safe",
+    "When a consensus system already owns the question: use its leader lease and membership instead of running a second, disagreeing detector",
+    "As the only defence against slowness: a node that is alive but too slow to serve is a health, timeout and load-shedding problem, not a membership problem"
+  ],
+  "pitfalls": [
+    "Putting the heartbeat on a separate thread or port from the real work, so the node reports healthy while its request path is wedged",
+    "Setting the timeout below the worst GC or stop-the-world pause, so every collection causes an eviction and a rebalance storm that makes the next pause longer",
+    "Treating a verdict as fact: promoting a new primary while the old one is merely paused, then letting both write (split brain) because nothing is fenced",
+    "Relying on TCP keepalive or connection resets for detection: defaults are hours, and a half-open connection can look established forever",
+    "Running the detector on a monitor that is itself overloaded or paused, so it sees everyone as late at once; correlated suspicion across many nodes means look at the monitor and the network first",
+    "Heartbeats sharing a queue with bulk traffic, so congestion delays the very signal that is supposed to measure congestion",
+    "Forgetting incarnation numbers or equivalent: a suspected node that cannot refute is evicted for good even though it recovers a second later",
+    "Using wall-clock timestamps from the sender to measure delay across machines; clock skew makes that meaningless, use the receiver's own clock and inter-arrival times"
+  ],
+  "related": [
+    { "kind": "concept", "slug": "gossip-protocol" },
+    { "kind": "concept", "slug": "leader-election" },
+    { "kind": "concept", "slug": "health-checks" },
+    { "kind": "concept", "slug": "consensus" },
+    { "kind": "concept", "slug": "timeouts-and-deadlines" },
+    { "kind": "concept", "slug": "leases-and-fencing-tokens" },
+    { "kind": "concept", "slug": "multi-region-failover" },
+    { "kind": "concept", "slug": "circuit-breaker" },
+    { "kind": "concept", "slug": "logical-clocks" }
+  ],
+  "roles": [
+    { "id": "target", "label": "Monitored service", "description": "Sends a heartbeat every second and answers probes. Can pause, lose packets or crash." },
+    { "id": "monitor", "label": "Failure detector", "description": "Sees only arrival times, keeps the window of inter-arrival times, and turns silence into a suspicion level or a verdict." },
+    { "id": "peer", "label": "Probe peer", "description": "Another member that pings the suspect on the monitor's behalf (SWIM ping-req)." },
+    { "id": "store", "label": "Storage", "description": "The resource the dead node used to write to. Rejects writes carrying a stale fencing token." }
+  ]
+}

@@ -1,0 +1,190 @@
+---
+import PlaygroundShell from '../components/PlaygroundShell.astro';
+---
+<PlaygroundShell title="Simulate it" hint="A seeded discrete-event queue. Requests arrive at random, wait for a free worker, and are served. Sweep the load and watch the hockey stick.">
+  <ol class="how">
+    <li>Click <b>Single server</b> (15 requests per second, 50 ms, 1 worker, 75% busy). The chart shows mean wait staying flat, then bending up around 80 to 85% busy, with <b>p99</b> far above the mean. Compare with the theory line in the readout: <code>rho/(1-rho)</code> service times.</li>
+    <li>Click <b>Scenario</b> (1,000 requests per second, 50 ms, 64 workers, one shared queue, about 78% busy). Waits are tiny because many workers share one queue. Now switch <b>Queue discipline</b> to <b>One queue per worker</b>: the same hardware at the same load now waits many times longer, because one worker can sit idle while another has a line.</li>
+    <li>Back on <b>Single server</b>, change <b>Service time variability</b> from Exponential to <b>Fixed</b> (waits roughly halve) and to <b>Heavy-tailed</b> (waits several times longer). Same average service time, same load: only the variability changed (Kingman's formula).</li>
+    <li>In every case the <b>Little's law</b> box shows L (time-averaged number in the system) equal to the arrival rate times the mean time in system. The <b>Pool sizing</b> box turns rate times latency into a pool size for your headroom target.</li>
+  </ol>
+  <div class="pg qt" data-qt>
+    <div class="pg-row">
+      <button class="btn" type="button" data-preset="scenario">Scenario: 1,000 rps, 50 ms, 64 workers</button>
+      <button class="btn" type="button" data-preset="single">Single server: 15 rps, 50 ms</button>
+    </div>
+    <div class="pg-row">
+      <label>Arrival rate (requests per second) <input class="pg-in qt-num" type="number" min="1" max="20000" step="1" value="1000" data-rate /></label>
+      <label>Mean service time (ms) <input class="pg-in qt-num" type="number" min="1" max="2000" step="1" value="50" data-svc /></label>
+      <label>Workers (servers) <input class="pg-in qt-num" type="number" min="1" max="200" step="1" value="64" data-servers /></label>
+    </div>
+    <div class="pg-row">
+      <label>Service time variability
+        <select class="pg-in" data-dist>
+          <option value="fixed">Fixed (CV 0)</option>
+          <option value="exp" selected>Exponential (CV 1)</option>
+          <option value="heavy">Heavy-tailed (CV 3)</option>
+        </select>
+      </label>
+      <label>Queue discipline
+        <select class="pg-in" data-disc>
+          <option value="shared" selected>One shared queue</option>
+          <option value="split">One queue per worker (random)</option>
+        </select>
+      </label>
+      <label>Headroom target (max busy) <input type="range" min="50" max="95" step="5" value="70" data-head /> <b data-headval>70%</b></label>
+    </div>
+    <div class="pg-grid">
+      <div class="pg-box" data-utilbox><h3>Utilisation</h3><span class="pg-mono" data-util></span><span class="pg-note" data-utilnote></span></div>
+      <div class="pg-box" style="--c: var(--role-1)"><h3>Wait in queue</h3><span class="pg-mono" data-wait></span><span class="pg-note" data-waitnote></span></div>
+      <div class="pg-box" style="--c: var(--role-3)"><h3>Little's law</h3><span class="pg-mono" data-little></span><span class="pg-note" data-littlenote></span></div>
+      <div class="pg-box" style="--c: var(--role-2)"><h3>Pool sizing</h3><span class="pg-mono" data-size></span><span class="pg-note" data-sizenote></span></div>
+    </div>
+    <svg class="qt-chart" viewBox="0 0 640 300" role="img" aria-label="Line chart of mean and 99th percentile queue wait, in multiples of the service time, against utilisation from 0 to 100 percent" data-chart>
+      <g data-grid></g>
+      <path data-p99 fill="none" stroke="var(--role-4)" stroke-width="2.5" />
+      <path data-mean fill="none" stroke="var(--role-1)" stroke-width="2.5" />
+      <line data-cur stroke="var(--accent)" stroke-width="2" stroke-dasharray="5 4" />
+      <circle data-knee r="6" fill="var(--bad)" stroke="var(--surface)" stroke-width="2" />
+      <text data-kneetext font-size="12" fill="var(--text)"></text>
+      <text data-curtext font-size="12" fill="var(--text)"></text>
+      <text x="14" y="150" font-size="12" fill="var(--muted)" transform="rotate(-90 14 150)" text-anchor="middle">wait / mean service time</text>
+      <text x="347" y="294" font-size="12" fill="var(--muted)" text-anchor="middle">utilisation (how busy the workers are)</text>
+    </svg>
+    <p class="pg-note"><span class="qt-key" style="--k: var(--role-1)"></span> mean wait <span class="qt-key" style="--k: var(--role-4)"></span> p99 wait <span class="qt-key" style="--k: var(--accent)"></span> your load <span class="qt-key" style="--k: var(--bad)"></span> mean wait passes 4 service times (latency 5x)</p>
+    <p class="pg-out" data-verdict aria-live="polite"></p>
+    <p class="pg-note" data-foot></p>
+  </div>
+</PlaygroundShell>
+<script>
+  type Dist = 'fixed' | 'exp' | 'heavy';
+  interface Cfg { rho: number; servers: number; dist: Dist; shared: boolean; n: number }
+  interface Res { meanWait: number; p99Wait: number; L: number; lambda: number; W: number; util: number }
+
+  // ---- pure simulation core (time unit = mean service time) ----
+  const lcg = (seed: number) => { let s = seed >>> 0; return () => { s = (Math.imul(s, 1664525) + 1013904223) >>> 0; return (s + 1) / 4294967296; }; };
+  const CV2: Record<Dist, number> = { fixed: 0, exp: 1, heavy: 9 };
+  const P1 = 0.5 * (1 + Math.sqrt((CV2.heavy - 1) / (CV2.heavy + 1))); // balanced two-phase hyperexponential, mean 1, CV 3
+  const M1 = 1 / (2 * P1); const M2 = 1 / (2 * (1 - P1));
+  function service(u: number, v: number, dist: Dist): number {
+    if (dist === 'fixed') return 1;
+    if (dist === 'exp') return -Math.log(u);
+    return (u < P1 ? M1 : M2) * -Math.log(v);
+  }
+  function simulate(c: Cfg): Res {
+    const arr = lcg(12345); const svc = lcg(67890); const pick = lcg(424242);
+    const lam = c.rho * c.servers; // arrivals per mean service time
+    const free = new Float64Array(c.servers);
+    const arrive = new Float64Array(c.n); const depart = new Float64Array(c.n); const waits = new Float64Array(c.n);
+    let t = 0; let busy = 0; let waitSum = 0; let sojourn = 0;
+    for (let i = 0; i < c.n; i++) {
+      t += -Math.log(arr()) / lam;
+      const u = svc(); const v = svc(); const r = pick();
+      const s = service(u, v, c.dist);
+      let k = 0;
+      if (c.shared) { for (let j = 1; j < c.servers; j++) if (free[j] < free[k]) k = j; } else k = Math.min(c.servers - 1, Math.floor(r * c.servers));
+      const start = Math.max(t, free[k]);
+      free[k] = start + s; busy += s;
+      arrive[i] = t; depart[i] = free[k]; waits[i] = start - t; waitSum += start - t; sojourn += free[k] - t;
+    }
+    const sorted = Float64Array.from(depart).sort();
+    let area = 0; let inSys = 0; let last = 0; let a = 0; let d = 0;
+    while (d < c.n) {
+      const isArr = a < c.n && arrive[a] <= sorted[d];
+      const now = isArr ? arrive[a] : sorted[d];
+      area += inSys * (now - last); last = now;
+      if (isArr) { inSys++; a++; } else { inSys--; d++; }
+    }
+    const w = Float64Array.from(waits).sort();
+    return { meanWait: waitSum / c.n, p99Wait: w[Math.floor(0.99 * (c.n - 1))], L: area / last, lambda: c.n / last, W: sojourn / c.n, util: busy / (c.servers * last) };
+  }
+  function erlangC(servers: number, a: number): number { // probability an arrival has to wait in M/M/c
+    let b = 1; for (let k = 1; k <= servers; k++) b = (a * b) / (k + a * b);
+    const rho = a / servers; return b / (1 - rho * (1 - b));
+  }
+  function theoryWait(rho: number, servers: number, dist: Dist, shared: boolean): number { // Allen-Cunneen approximation, in service times
+    const cv = (1 + CV2[dist]) / 2;
+    return shared ? (erlangC(servers, rho * servers) / (servers * (1 - rho))) * cv : (rho / (1 - rho)) * cv;
+  }
+  const GRID = [0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.85, 0.9, 0.93, 0.96, 0.98];
+  const KNEE = 4;
+  function sweep(servers: number, dist: Dist, shared: boolean, n: number): Res[] { return GRID.map((rho) => simulate({ rho, servers, dist, shared, n })); }
+  function poolSize(rate: number, svcMs: number, head: number): number { return Math.ceil((rate * svcMs) / 1000 / head - 1e-9); }
+  const fmt = (x: number) => (x >= 100 ? x.toFixed(0) : x >= 10 ? x.toFixed(1) : x.toFixed(2));
+  function niceMax(x: number): number { const p = Math.pow(10, Math.floor(Math.log10(x))); const m = x / p; return (m <= 1 ? 1 : m <= 2 ? 2 : m <= 5 ? 5 : 10) * p; }
+  (window as unknown as Record<string, unknown>).__qt = { simulate, sweep, theoryWait, erlangC, poolSize };
+
+  // ---- UI ----
+  const NS = 'http://www.w3.org/2000/svg';
+  document.querySelectorAll<HTMLElement>('[data-qt]').forEach((root) => {
+    const q = <T extends Element>(s: string) => root.querySelector<T>(s)!;
+    const num = (s: string, lo: number, hi: number, def: number) => { const v = Math.round(Number(q<HTMLInputElement>(s).value)); return Number.isFinite(v) ? Math.min(hi, Math.max(lo, v)) : def; };
+    const L = 54; const R = 626; const T = 14; const B = 258; const gx = (r: number) => L + r * (R - L);
+    const grid = q<SVGGElement>('[data-grid]');
+    const gridLines: SVGLineElement[] = []; const gridTexts: SVGTextElement[] = [];
+    for (let i = 0; i <= 4; i++) { const l = document.createElementNS(NS, 'line'); l.setAttribute('stroke', 'var(--border)'); grid.appendChild(l); gridLines.push(l); const t = document.createElementNS(NS, 'text'); t.setAttribute('font-size', '11'); t.setAttribute('fill', 'var(--muted)'); t.setAttribute('text-anchor', 'end'); grid.appendChild(t); gridTexts.push(t); }
+    const xTexts: SVGTextElement[] = [];
+    for (let i = 0; i <= 5; i++) { const t = document.createElementNS(NS, 'text'); t.setAttribute('font-size', '11'); t.setAttribute('fill', 'var(--muted)'); t.setAttribute('text-anchor', 'middle'); t.setAttribute('x', String(gx(i / 5))); t.setAttribute('y', String(B + 16)); t.textContent = `${i * 20}%`; grid.appendChild(t); xTexts.push(t); }
+
+    function update() {
+      const rate = num('[data-rate]', 1, 20000, 1000); const svcMs = num('[data-svc]', 1, 2000, 50); const servers = num('[data-servers]', 1, 200, 64);
+      const dist = q<HTMLSelectElement>('[data-dist]').value as Dist;
+      const shared = q<HTMLSelectElement>('[data-disc]').value === 'shared';
+      const head = num('[data-head]', 50, 95, 70) / 100;
+      q('[data-headval]').textContent = `${Math.round(head * 100)}%`;
+      const n = 6000 + 100 * servers;
+      const rho = (rate * svcMs) / 1000 / servers;
+      const pts = sweep(servers, dist, shared, n);
+      const means = pts.map((p) => p.meanWait); const p99s = pts.map((p) => p.p99Wait);
+      const ymax = niceMax(Math.max(1, ...p99s) * 1.05);
+      const gy = (v: number) => B - Math.min(v, ymax) / ymax * (B - T);
+      for (let i = 0; i <= 4; i++) { const v = (ymax * i) / 4; gridLines[i].setAttribute('x1', String(L)); gridLines[i].setAttribute('x2', String(R)); gridLines[i].setAttribute('y1', String(gy(v))); gridLines[i].setAttribute('y2', String(gy(v))); gridTexts[i].setAttribute('x', String(L - 6)); gridTexts[i].setAttribute('y', String(gy(v) + 4)); gridTexts[i].textContent = fmt(v); }
+      const line = (vals: number[]) => vals.map((v, i) => `${i ? 'L' : 'M'}${gx(GRID[i]).toFixed(1)} ${gy(v).toFixed(1)}`).join(' ');
+      q('[data-mean]').setAttribute('d', line(means)); q('[data-p99]').setAttribute('d', line(p99s));
+      const kneeIdx = means.findIndex((m) => m >= KNEE);
+      const knee = q<SVGCircleElement>('[data-knee]'); const kt = q('[data-kneetext]');
+      if (kneeIdx >= 0) { const kx = gx(GRID[kneeIdx]); knee.setAttribute('cx', String(kx)); knee.setAttribute('cy', String(gy(means[kneeIdx]))); knee.setAttribute('visibility', 'visible'); kt.textContent = `knee at ${Math.round(GRID[kneeIdx] * 100)}%`; kt.setAttribute('x', String(Math.min(kx - 8, R - 70))); kt.setAttribute('y', String(Math.min(gy(means[kneeIdx]) + 22, B - 6))); kt.setAttribute('text-anchor', kx > 400 ? 'end' : 'start'); }
+      else { knee.setAttribute('visibility', 'hidden'); kt.textContent = ''; }
+      const cur = q('[data-cur]'); const ct = q('[data-curtext]'); const cr = Math.min(rho, 1);
+      cur.setAttribute('x1', String(gx(cr))); cur.setAttribute('x2', String(gx(cr))); cur.setAttribute('y1', String(T)); cur.setAttribute('y2', String(B));
+      ct.textContent = rho >= 1 ? 'overloaded' : `you: ${Math.round(rho * 100)}%`; ct.setAttribute('x', String(gx(cr) + (cr > 0.8 ? -6 : 6))); ct.setAttribute('y', String(T + 12)); ct.setAttribute('text-anchor', cr > 0.8 ? 'end' : 'start');
+
+      const op = simulate({ rho: Math.min(rho, 3), servers, dist, shared, n });
+      const th = rho < 1 ? theoryWait(rho, servers, dist, shared) : Infinity;
+      const ub = q('[data-utilbox]'); ub.style.setProperty('--c', rho >= 1 ? 'var(--bad)' : rho > 0.8 ? 'var(--role-3)' : 'var(--role-2)');
+      q('[data-util]').textContent = `${(rho * 100).toFixed(1)}% busy`;
+      q('[data-utilnote]').textContent = `${rate} req/s x ${svcMs} ms = ${((rate * svcMs) / 1000).toFixed(2)} workers busy on average, of ${servers}`;
+      const sM = svcMs;
+      q('[data-wait]').textContent = rho >= 1 ? 'grows without bound' : `mean ${fmt(op.meanWait * sM)} ms, p99 ${fmt(op.p99Wait * sM)} ms`;
+      q('[data-waitnote]').textContent = rho >= 1 ? 'arrivals exceed capacity, so the queue only gets longer' : `formula says about ${fmt(th * sM)} ms (finite run of ${n} requests)`;
+      const lamS = op.lambda / sM * 1000; const wS = op.W * sM / 1000;
+      q('[data-little]').textContent = `L ${op.L.toFixed(2)} = ${lamS.toFixed(1)}/s x ${(wS * 1000).toFixed(1)} ms`;
+      q('[data-littlenote]').textContent = `L measured by integrating the number in the system over time; lambda x W = ${(lamS * wS).toFixed(2)}`;
+      const need = poolSize(rate, svcMs, head); const flight = (rate * svcMs) / 1000;
+      q('[data-size]').textContent = `${flight.toFixed(1)} in flight, pool of ${need}`;
+      q('[data-sizenote]').textContent = `rate x latency = ${flight.toFixed(1)}; to stay under ${Math.round(head * 100)}% busy use ${need} workers (you have ${servers})`;
+      const v = q('[data-verdict]');
+      const bad = rho >= 1 || servers < need;
+      v.classList.toggle('bad', bad);
+      v.textContent = rho >= 1 ? `At ${Math.round(rho * 100)}% of capacity the system is unstable: the queue grows for as long as the load lasts. Add workers or shed load.`
+        : kneeIdx >= 0 && rho >= GRID[kneeIdx] ? `You are past the knee (${Math.round(GRID[kneeIdx] * 100)}%): a small load increase now costs a large latency increase. Latency is about ${fmt(((op.meanWait + 1) * sM))} ms against a ${svcMs} ms service time.`
+        : `Below the knee: mean latency is about ${fmt((op.meanWait + 1) * sM)} ms against a ${svcMs} ms service time.${servers < need ? ' You are above your headroom target, so a burst will hurt.' : ''}`;
+      q('[data-foot]').textContent = `Assumptions: Poisson arrivals, FIFO, ${shared ? 'a shared queue (each request takes the first worker to free up)' : 'each request is sent to a random worker and queues there'}, service time mean ${svcMs} ms with ${dist === 'fixed' ? 'no' : dist === 'exp' ? 'exponential' : 'heavy-tailed (CV 3)'} variability, ${n} requests per run starting from empty, seeded so results repeat. The p99 of a short run is noisy near saturation.`;
+    }
+    let raf = 0;
+    const schedule = () => { if (raf) return; raf = requestAnimationFrame(() => { raf = 0; update(); }); };
+    root.querySelectorAll('input,select').forEach((el) => el.addEventListener('input', schedule));
+    root.querySelectorAll<HTMLElement>('[data-preset]').forEach((b) => b.addEventListener('click', () => {
+      const single = b.dataset.preset === 'single';
+      q<HTMLInputElement>('[data-rate]').value = single ? '15' : '1000'; q<HTMLInputElement>('[data-svc]').value = '50'; q<HTMLInputElement>('[data-servers]').value = single ? '1' : '64';
+      q<HTMLSelectElement>('[data-dist]').value = 'exp'; q<HTMLSelectElement>('[data-disc]').value = 'shared'; update();
+    }));
+    update();
+  });
+</script>
+<style is:global>
+  .playground .qt-num { width: 7.5em; }
+  .playground .qt-chart { width: 100%; height: auto; max-width: 720px; display: block; }
+  .playground .qt-key { display: inline-block; width: 12px; height: 12px; border-radius: 3px; background: var(--k); vertical-align: -1px; margin: 0 4px 0 8px; }
+  .playground .qt-key:first-child { margin-left: 0; }
+</style>

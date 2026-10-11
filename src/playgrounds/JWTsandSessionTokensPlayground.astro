@@ -1,0 +1,238 @@
+---
+import PlaygroundShell from '../components/PlaygroundShell.astro';
+---
+<PlaygroundShell title="Simulate it" hint="A token is stolen and the user revokes access. Compare a server-side session with a JWT, then see which forged tokens a verifier accepts.">
+  <ol class="how">
+    <li>Part 1, defaults (JWT, 1 hour, no revocation list, revoked 30 minutes after issue): the thief keeps access for <b>30 min</b> after the revoke, with <b>0</b> lookups per request. Switch to <b>Server-side session</b>: <b>0 s</b> of exposure but <b>20,000</b> store lookups per second.</li>
+    <li>Set the TTL to <b>24 hours</b>: the same revoke leaves the thief <b>23 h 30 min</b>. Tick <b>Revocation list</b> and exposure drops to 0, but the JWT now costs a lookup per request, the same as a session. Try <b>5 min</b>: the 30-minute revoke finds the token already expired, but the auth server sees <b>333</b> refreshes per second.</li>
+    <li>Part 2, defaults (signature and expiry checked only): <b>4 of 7</b> forged tokens are accepted: alg=none, the HS256 key-confusion token, the wrong-audience token and the other-tenant token. Tick <b>Pin the algorithm</b>, <b>Check aud</b> and <b>Check iss</b> (or press <b>Strict</b>) and every forgery is rejected while the real token still passes. Press <b>No checks</b> to see all 7 accepted.</li>
+  </ol>
+  <div class="pg jt" data-jt>
+    <h3 class="jt-h">1. Stolen token, then revoked</h3>
+    <div class="pg-row">
+      <label>Mechanism
+        <select class="pg-in" data-mech>
+          <option value="session">Server-side session (opaque id)</option>
+          <option value="jwt" selected>JWT access token</option>
+        </select>
+      </label>
+      <label>JWT lifetime (TTL)
+        <select class="pg-in" data-ttl>
+          <option value="5">5 minutes</option>
+          <option value="60" selected>1 hour</option>
+          <option value="1440">24 hours</option>
+        </select>
+      </label>
+      <label class="jt-check"><input type="checkbox" data-list /> Revocation list (deny jti until exp)</label>
+    </div>
+    <div class="pg-row">
+      <label>Revoked after
+        <select class="pg-in" data-revoke>
+          <option value="2">2 minutes</option>
+          <option value="30" selected>30 minutes</option>
+          <option value="360">6 hours</option>
+        </select>
+        <span class="pg-note">(time between token issue and the user hitting revoke)</span>
+      </label>
+      <label>API requests per second <input type="range" min="100" max="20000" step="100" value="5000" data-rps /> <b data-rpsval>5000</b></label>
+      <label>Services verifying each request <input type="range" min="1" max="8" value="4" data-hops /> <b data-hopsval>4</b></label>
+      <label>Claims in the JWT
+        <select class="pg-in" data-claims>
+          <option value="min" selected>5 basic claims</option>
+          <option value="rich">with roles and scopes</option>
+        </select>
+      </label>
+      <label>Signing
+        <select class="pg-in" data-alg>
+          <option value="HS256">HS256 (shared secret)</option>
+          <option value="RS256" selected>RS256 (2048-bit)</option>
+          <option value="ES256">ES256 (P-256)</option>
+        </select>
+      </label>
+    </div>
+    <div class="pg-grid">
+      <div class="pg-box" data-expbox><h3>Thief still has access</h3><span class="pg-mono jt-big" data-exposure>-</span><span class="pg-note" data-exposurenote></span></div>
+      <div class="pg-box" style="--c: var(--role-2)"><h3>Store lookups per second</h3><span class="pg-mono jt-big" data-lookups>-</span><span class="pg-note" data-lookupsnote></span></div>
+      <div class="pg-box" style="--c: var(--role-3)"><h3>Token size per request</h3><span class="pg-mono jt-big" data-size>-</span><span class="pg-note" data-sizenote></span></div>
+      <div class="pg-box" style="--c: var(--role-4)"><h3>Auth server refreshes per second</h3><span class="pg-mono jt-big" data-refresh>-</span><span class="pg-note" data-refreshnote></span></div>
+    </div>
+
+    <h3 class="jt-h">2. Which forged tokens does the verifier accept?</h3>
+    <p class="pg-note">The service expects RS256 tokens from <span class="pg-mono">auth.shop</span> for audience <span class="pg-mono">orders-api</span>.</p>
+    <div class="pg-row">
+      <label class="jt-check"><input type="checkbox" data-c-sig checked /> Verify signature</label>
+      <label class="jt-check"><input type="checkbox" data-c-pin /> Pin the algorithm (RS256 only)</label>
+      <label class="jt-check"><input type="checkbox" data-c-exp checked /> Check exp / nbf</label>
+      <label class="jt-check"><input type="checkbox" data-c-aud /> Check aud</label>
+      <label class="jt-check"><input type="checkbox" data-c-iss /> Check iss</label>
+    </div>
+    <div class="pg-row">
+      <button class="btn" type="button" data-strict>Strict</button>
+      <button class="btn" type="button" data-none>No checks</button>
+      <button class="btn" type="button" data-reset>Reset</button>
+    </div>
+    <ul class="jt-list" data-tokens aria-label="Forged tokens and the verifier verdict for each"></ul>
+    <p class="pg-out" data-summary role="status"></p>
+    <p class="pg-note">Assumptions: the token was issued at t=0 and stolen right after; 100,000 active users each get a new access token every TTL; a session lookup is one store read per service per request; a JWT with a revocation list needs the same read. Sizes are computed from the real header, payload and signature lengths (base64url). A real deny list kept in a local cache would add its refresh delay to the exposure.</p>
+  </div>
+</PlaygroundShell>
+<script>
+  // ---------- pure core ----------
+  type Mech = 'session' | 'jwt';
+  type Alg = 'HS256' | 'RS256' | 'ES256';
+  const ACTIVE_USERS = 100000;
+  const SIG_BYTES: Record<Alg, number> = { HS256: 32, RS256: 256, ES256: 64 };
+  const SESSION_ID_BYTES = 32; // 256-bit random id, base64url
+  const PAYLOADS = {
+    min: '{"iss":"https://auth.shop.example","sub":"u_8123","aud":"orders-api","exp":1790000300,"iat":1790000000}',
+    rich: '{"iss":"https://auth.shop.example","sub":"u_8123","aud":["orders-api","billing-api"],"exp":1790000300,"iat":1790000000,"jti":"7b1f0c2e-9a44-4e0d-8d55-3c1a6f0e2b19","tenant":"t_42","roles":["customer","beta-tester","support-viewer"],"scope":"orders:read orders:write billing:read profile:read profile:write"}',
+  };
+  const b64len = (n: number) => Math.floor((n * 4 + 2) / 3);
+
+  function exposureMinutes(mech: Mech, ttl: number, list: boolean, revokeAt: number): number {
+    if (mech === 'session') return 0;
+    if (list) return 0;
+    return Math.max(0, ttl - revokeAt);
+  }
+  function lookupsPerRequest(mech: Mech, list: boolean): number { return mech === 'session' ? 1 : list ? 1 : 0; }
+  function tokenBytes(mech: Mech, alg: Alg, claims: 'min' | 'rich'): number {
+    if (mech === 'session') return b64len(SESSION_ID_BYTES);
+    const header = `{"alg":"${alg}","typ":"JWT","kid":"k-2026-10"}`;
+    return b64len(header.length) + 1 + b64len(PAYLOADS[claims].length) + 1 + b64len(SIG_BYTES[alg]);
+  }
+  function refreshesPerSecond(mech: Mech, ttl: number): number { return mech === 'session' ? 0 : ACTIVE_USERS / (ttl * 60); }
+  function fmtDuration(min: number): string {
+    if (min <= 0) return '0 s';
+    const h = Math.floor(min / 60); const m = min % 60;
+    if (h === 0) return `${m} min`;
+    return m === 0 ? `${h} h` : `${h} h ${m} min`;
+  }
+  const fmtInt = (n: number) => Math.round(n).toLocaleString('en-US');
+
+  type Sig = 'valid' | 'none' | 'wrongkey' | 'tampered' | 'pubkeyhmac';
+  interface Tok { id: string; label: string; note: string; alg: 'RS256' | 'HS256' | 'none'; sig: Sig; expired: boolean; audOk: boolean; issOk: boolean; legit: boolean }
+  const TOKENS: Tok[] = [
+    { id: 'real', label: 'Real token', note: 'RS256, signed by auth.shop, for orders-api, not expired', alg: 'RS256', sig: 'valid', expired: false, audOk: true, issOk: true, legit: true },
+    { id: 'none', label: 'alg = none', note: 'header says unsigned, signature part empty', alg: 'none', sig: 'none', expired: false, audOk: true, issOk: true, legit: false },
+    { id: 'wrongkey', label: 'Signed with the wrong key', note: 'attacker signs RS256 with their own private key', alg: 'RS256', sig: 'wrongkey', expired: false, audOk: true, issOk: true, legit: false },
+    { id: 'tampered', label: 'Tampered payload', note: 'sub changed to admin, original signature kept', alg: 'RS256', sig: 'tampered', expired: false, audOk: true, issOk: true, legit: false },
+    { id: 'confusion', label: 'Algorithm confusion', note: 'header HS256, HMAC keyed with the public RS256 key', alg: 'HS256', sig: 'pubkeyhmac', expired: false, audOk: true, issOk: true, legit: false },
+    { id: 'aud', label: 'Wrong audience', note: 'genuine token minted for the reporting API', alg: 'RS256', sig: 'valid', expired: false, audOk: false, issOk: true, legit: false },
+    { id: 'exp', label: 'Expired', note: 'genuine token, exp was 10 minutes ago', alg: 'RS256', sig: 'valid', expired: true, audOk: true, issOk: true, legit: false },
+    { id: 'iss', label: 'Other tenant issuer', note: 'genuine signature from a shared key set, iss is another tenant', alg: 'RS256', sig: 'valid', expired: false, audOk: true, issOk: false, legit: false },
+  ];
+  interface Checks { sig: boolean; pin: boolean; exp: boolean; aud: boolean; iss: boolean }
+  function verifyToken(t: Tok, c: Checks): { accepted: boolean; why: string } {
+    if (c.sig) {
+      if (c.pin) {
+        if (t.alg !== 'RS256') return { accepted: false, why: 'rejected: alg is not RS256' };
+        if (t.sig !== 'valid') return { accepted: false, why: 'rejected: bad signature' };
+      } else if (t.alg === 'none') {
+        // library trusts the header: nothing to verify, token accepted as unsigned
+      } else if (t.alg === 'HS256') {
+        // library verifies HMAC with the key it was given, which is the public key
+        if (t.sig !== 'pubkeyhmac') return { accepted: false, why: 'rejected: bad signature' };
+      } else if (t.sig !== 'valid') {
+        return { accepted: false, why: 'rejected: bad signature' };
+      }
+    }
+    if (c.exp && t.expired) return { accepted: false, why: 'rejected: expired' };
+    if (c.aud && !t.audOk) return { accepted: false, why: 'rejected: wrong audience' };
+    if (c.iss && !t.issOk) return { accepted: false, why: 'rejected: wrong issuer' };
+    return { accepted: true, why: 'accepted' };
+  }
+  function summarize(c: Checks) {
+    let forged = 0; let legit = false;
+    for (const t of TOKENS) { const r = verifyToken(t, c); if (t.legit) legit = r.accepted; else if (r.accepted) forged++; }
+    return { forged, total: TOKENS.length - 1, legit };
+  }
+
+  // ---------- DOM ----------
+  document.querySelectorAll<HTMLElement>('[data-jt]').forEach((root) => {
+    const q = <T extends HTMLElement>(s: string) => root.querySelector<T>(s)!;
+    const sel = (s: string) => q<HTMLSelectElement>(s).value;
+    const num = (s: string) => Number(q<HTMLInputElement>(s).value);
+    const on = (s: string) => q<HTMLInputElement>(s).checked;
+    const rows = new Map<string, { li: HTMLElement; verdict: HTMLElement }>();
+    const list = q('[data-tokens]');
+    for (const t of TOKENS) {
+      const li = document.createElement('li'); li.className = 'jt-row';
+      const name = document.createElement('span'); name.className = 'jt-name';
+      const b = document.createElement('b'); b.textContent = t.label;
+      const note = document.createElement('span'); note.className = 'pg-note'; note.textContent = t.note;
+      name.append(b, note);
+      const verdict = document.createElement('span'); verdict.className = 'jt-verdict';
+      li.append(name, verdict); list.append(li); rows.set(t.id, { li, verdict });
+    }
+    let raf = 0;
+    function draw() {
+      raf = 0;
+      const mech = sel('[data-mech]') as Mech; const ttl = Number(sel('[data-ttl]')); const useList = on('[data-list]');
+      const revokeAt = Number(sel('[data-revoke]')); const rps = num('[data-rps]'); const hops = num('[data-hops]');
+      const claims = sel('[data-claims]') as 'min' | 'rich'; const alg = sel('[data-alg]') as Alg;
+      const isJwt = mech === 'jwt';
+      q<HTMLSelectElement>('[data-ttl]').disabled = !isJwt; q<HTMLInputElement>('[data-list]').disabled = !isJwt;
+      q<HTMLSelectElement>('[data-claims]').disabled = !isJwt; q<HTMLSelectElement>('[data-alg]').disabled = !isJwt;
+      q('[data-rpsval]').textContent = String(rps); q('[data-hopsval]').textContent = String(hops);
+
+      const exp = exposureMinutes(mech, ttl, useList, revokeAt);
+      q('[data-exposure]').textContent = fmtDuration(exp);
+      q<HTMLElement>('[data-expbox]').style.setProperty('--c', exp === 0 ? 'var(--role-2)' : 'var(--bad)');
+      q('[data-exposurenote]').textContent = !isJwt ? 'deleting the session ends access on the next request'
+        : useList ? 'the jti is on the deny list, rejected on the next request'
+        : exp === 0 ? `the token had already expired (TTL ${fmtDuration(ttl)} < ${fmtDuration(revokeAt)}); the refresh token was revoked`
+        : `valid until exp: ${fmtDuration(ttl)} minus ${fmtDuration(revokeAt)}; the refresh token was revoked`;
+
+      const per = lookupsPerRequest(mech, useList);
+      q('[data-lookups]').textContent = fmtInt(rps * hops * per);
+      q('[data-lookupsnote]').textContent = per === 0 ? 'signature check only, done in memory by each service'
+        : `${fmtInt(rps)} req/s x ${hops} services x 1 read`;
+
+      const bytes = tokenBytes(mech, alg, claims);
+      q('[data-size]').textContent = `${fmtInt(bytes)} bytes`;
+      q('[data-sizenote]').textContent = isJwt ? `header + payload + ${alg} signature, base64url` : '256-bit random id in a cookie, data stays on the server';
+
+      const ref = refreshesPerSecond(mech, ttl);
+      q('[data-refresh]').textContent = isJwt ? ref.toFixed(1) : '0.0';
+      q('[data-refreshnote]').textContent = isJwt ? `${fmtInt(ACTIVE_USERS)} active users / ${ttl * 60} s` : 'no tokens to renew; sessions slide on use';
+
+      const c: Checks = { sig: on('[data-c-sig]'), pin: on('[data-c-pin]'), exp: on('[data-c-exp]'), aud: on('[data-c-aud]'), iss: on('[data-c-iss]') };
+      for (const t of TOKENS) {
+        const r = verifyToken(t, c); const row = rows.get(t.id)!;
+        const bad = r.accepted !== t.legit; // accepted forgery or rejected real token
+        row.verdict.textContent = (r.accepted ? 'ACCEPTED' : 'REJECTED') + (bad ? (r.accepted ? ' (forgery!)' : ' (wrong!)') : '') + (r.accepted ? '' : ' - ' + r.why.replace('rejected: ', ''));
+        row.li.classList.toggle('bad', bad);
+      }
+      const s = summarize(c);
+      const out = q('[data-summary]');
+      out.textContent = `Forged tokens accepted: ${s.forged} of ${s.total}. Real token accepted: ${s.legit ? 'yes' : 'no'}.`;
+      out.classList.toggle('bad', s.forged > 0 || !s.legit);
+    }
+    const schedule = () => { if (!raf) raf = requestAnimationFrame(draw); };
+    function setChecks(v: Checks) {
+      q<HTMLInputElement>('[data-c-sig]').checked = v.sig; q<HTMLInputElement>('[data-c-pin]').checked = v.pin;
+      q<HTMLInputElement>('[data-c-exp]').checked = v.exp; q<HTMLInputElement>('[data-c-aud]').checked = v.aud;
+      q<HTMLInputElement>('[data-c-iss]').checked = v.iss; draw();
+    }
+    root.addEventListener('input', schedule); root.addEventListener('change', schedule);
+    q('[data-strict]').addEventListener('click', () => setChecks({ sig: true, pin: true, exp: true, aud: true, iss: true }));
+    q('[data-none]').addEventListener('click', () => setChecks({ sig: false, pin: false, exp: false, aud: false, iss: false }));
+    q('[data-reset]').addEventListener('click', () => {
+      q<HTMLSelectElement>('[data-mech]').value = 'jwt'; q<HTMLSelectElement>('[data-ttl]').value = '60'; q<HTMLInputElement>('[data-list]').checked = false;
+      q<HTMLSelectElement>('[data-revoke]').value = '30'; q<HTMLInputElement>('[data-rps]').value = '5000'; q<HTMLInputElement>('[data-hops]').value = '4';
+      q<HTMLSelectElement>('[data-claims]').value = 'min'; q<HTMLSelectElement>('[data-alg]').value = 'RS256';
+      setChecks({ sig: true, pin: false, exp: true, aud: false, iss: false });
+    });
+    draw();
+  });
+</script>
+<style is:global>
+  .playground .jt-h { margin: 14px 0 8px; font-size: 1.05rem; }
+  .playground .jt-check { display: inline-flex; align-items: center; gap: 6px; }
+  .playground .jt-big { font-size: 1.25rem; font-weight: 700; }
+  .playground .jt-list { list-style: none; margin: 8px 0; padding: 0; display: grid; gap: 6px; }
+  .playground .jt-row { display: flex; flex-wrap: wrap; gap: 4px 12px; justify-content: space-between; align-items: baseline; padding: 8px 10px; border: 1px solid var(--border); border-radius: 8px; background: var(--surface); }
+  .playground .jt-row.bad { border-color: var(--bad); background: color-mix(in srgb, var(--bad) 10%, var(--surface)); }
+  .playground .jt-name { display: grid; gap: 2px; min-width: 0; flex: 1 1 220px; }
+  .playground .jt-verdict { font: .85rem ui-monospace, monospace; flex: 0 1 auto; overflow-wrap: anywhere; }
+</style>

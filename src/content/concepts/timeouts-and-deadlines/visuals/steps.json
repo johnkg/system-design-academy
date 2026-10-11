@@ -1,0 +1,242 @@
+{
+  "actors": [
+    {
+      "id": "user",
+      "label": "User",
+      "role": "user",
+      "x": 18,
+      "y": 38
+    },
+    {
+      "id": "a",
+      "label": "A: edge",
+      "role": "service",
+      "x": 18,
+      "y": 62
+    },
+    {
+      "id": "b",
+      "label": "B: orders",
+      "role": "service",
+      "x": 18,
+      "y": 86
+    },
+    {
+      "id": "c",
+      "label": "C: pricing",
+      "role": "service",
+      "x": 50,
+      "y": 86
+    },
+    {
+      "id": "db",
+      "label": "Database",
+      "role": "database",
+      "x": 50,
+      "y": 62
+    }
+  ],
+  "frames": [
+    {
+      "narration": "t=0. A user request enters A and fans down A, B, C to the database. The user will give up after 2 s. Every hop uses the same 5 s timeout.",
+      "messages": [
+        {
+          "from": "user",
+          "to": "a",
+          "label": "GET"
+        },
+        {
+          "from": "a",
+          "to": "b",
+          "label": "call"
+        },
+        {
+          "from": "b",
+          "to": "c",
+          "label": "call"
+        },
+        {
+          "from": "c",
+          "to": "db",
+          "label": "query"
+        }
+      ],
+      "states": {
+        "user": "patience 2 s",
+        "a": "waits up to 5 s",
+        "b": "waits up to 5 s",
+        "c": "waits up to 5 s"
+      }
+    },
+    {
+      "narration": "The query is slow and needs 4 s. At t=2 s the user leaves, but nothing tells A, B, C or the database. All four keep holding a thread or connection.",
+      "states": {
+        "user": "left at 2 s",
+        "a": "still waiting",
+        "b": "still waiting",
+        "c": "still waiting",
+        "db": "query running"
+      },
+      "highlight": [
+        "db"
+      ]
+    },
+    {
+      "narration": "At t=4 s the database answers and the result climbs back to A, where nobody is listening. That is 4 holds for 4 s each: 16 thread-seconds spent on an answer no one reads.",
+      "messages": [
+        {
+          "from": "db",
+          "to": "c",
+          "label": "rows"
+        },
+        {
+          "from": "c",
+          "to": "b",
+          "label": "result"
+        },
+        {
+          "from": "b",
+          "to": "a",
+          "label": "result"
+        }
+      ],
+      "states": {
+        "user": "gone",
+        "a": "wasted 4 s",
+        "b": "wasted 4 s",
+        "c": "wasted 4 s",
+        "db": "wasted 4 s"
+      },
+      "highlight": [
+        "a",
+        "b",
+        "c",
+        "db"
+      ]
+    },
+    {
+      "narration": "At 20 requests/s with 10% slow, about 8 slow requests are always in flight (Little's law: 2/s x 4 s). That is 32 holds, so C's pool fills and healthy requests start to queue.",
+      "states": {
+        "c": "pool filling: 32 holds",
+        "a": "queueing",
+        "b": "queueing"
+      },
+      "highlight": [
+        "c"
+      ]
+    },
+    {
+      "narration": "Fix 1: nest the timeouts, shortest inside. A waits 1.8 s on B, B 1.2 s on C, C only 0.4 s per database attempt. C gives up at 0.4 s, waits 25 ms and retries; the retry takes 50 ms. Total 0.475 s.",
+      "messages": [
+        {
+          "from": "c",
+          "to": "db",
+          "label": "attempt 1"
+        },
+        {
+          "from": "c",
+          "to": "db",
+          "label": "retry, 50 ms"
+        },
+        {
+          "from": "db",
+          "to": "c",
+          "label": "ok"
+        }
+      ],
+      "states": {
+        "a": "1.8 s",
+        "b": "1.2 s",
+        "c": "0.4 s x 3 fits",
+        "db": "attempt 1 still runs"
+      },
+      "highlight": [
+        "c"
+      ]
+    },
+    {
+      "narration": "Fix 2: A stamps an absolute deadline, t0 + 2000 ms, and passes it down (gRPC sends the remaining time in the grpc-timeout header). Every hop can compute how much budget is left.",
+      "messages": [
+        {
+          "from": "a",
+          "to": "b",
+          "label": "left 1990 ms"
+        },
+        {
+          "from": "b",
+          "to": "c",
+          "label": "left 1980 ms"
+        },
+        {
+          "from": "c",
+          "to": "db",
+          "label": "left 1970 ms"
+        }
+      ],
+      "states": {
+        "a": "deadline t0+2000",
+        "b": "budget 1980 ms",
+        "c": "budget 1970 ms"
+      },
+      "highlight": [
+        "a"
+      ]
+    },
+    {
+      "narration": "C waits min(0.4 s, budget left) per attempt. Attempt 1 times out at 0.4 s and 1.57 s remain, so C cancels it and retries. Cancelling frees the database now instead of 4 s later: 0 orphaned calls.",
+      "messages": [
+        {
+          "from": "c",
+          "to": "db",
+          "label": "cancel 1"
+        },
+        {
+          "from": "c",
+          "to": "db",
+          "label": "retry"
+        },
+        {
+          "from": "db",
+          "to": "c",
+          "label": "ok"
+        }
+      ],
+      "states": {
+        "c": "left 1.57 s: retry",
+        "db": "attempt 1 cancelled"
+      },
+      "highlight": [
+        "db"
+      ]
+    },
+    {
+      "narration": "Now B burns 1.95 s on its own work (a cold cache). C sees 30 ms left, less than a database call needs, so it fails fast without touching the database, and A returns a degraded answer at t=2 s.",
+      "messages": [
+        {
+          "from": "c",
+          "to": "b",
+          "label": "no budget"
+        },
+        {
+          "from": "b",
+          "to": "a",
+          "label": "fail fast"
+        },
+        {
+          "from": "a",
+          "to": "user",
+          "label": "degraded"
+        }
+      ],
+      "states": {
+        "b": "spent 1.95 s",
+        "c": "30 ms left: skip",
+        "db": "never called",
+        "user": "answered at 2 s"
+      },
+      "highlight": [
+        "c"
+      ]
+    }
+  ]
+}

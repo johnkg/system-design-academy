@@ -1,0 +1,65 @@
+{
+  "name": "Schema Evolution and Compatibility",
+  "area": "api",
+  "difficulty": "intermediate",
+  "intent": "Change the shape of messages and payloads while old and new code run side by side, without crashing readers or silently corrupting data.",
+  "scenario": "The Orders service publishes an order event to a queue read by Billing, Shipping and Analytics, each deployed on its own schedule. Over a quarter the team adds a currency field, renames amount_cents, removes discount_cents and then reuses its field number for tip_cents. The queue holds two days of old events, so old and new versions of both writers and readers are always in flight.",
+  "problem": "A rolling deploy means that for minutes or days two versions of the code are alive at once, and queued or stored data outlives every deploy. A change that is fine in a single process becomes a distributed break: a new reader meets old bytes, or an old reader meets bytes it has never seen. Some breaks are loud (a crash, a poison message). The dangerous ones are silent: a reused field number or a renamed key makes a reader accept the data and compute with the wrong value.",
+  "howItWorks": [
+    { "title": "Two directions of compatibility", "text": "Backward compatible means a new reader can read data written by an old writer (needed for queues, logs and databases that hold old data). Forward compatible means an old reader can read data written by a new writer (needed when the producer deploys first or a slow consumer lags). Full compatibility is both. Which one you need follows from rollout order: consumers first needs backward, producer first needs forward, and any stored or queued data needs backward no matter what." },
+    { "title": "Protobuf: the field number is the identity", "text": "On the wire each field is a tag (number << 3 | wire type) followed by the value; the name never appears. A reader skips tags it does not know, so adding a field with a new number is safe both ways, and renaming a field is safe on the wire (only generated code and the JSON mapping change). Never change a type, never reuse a number (declare reserved), and remember a missing field reads as the zero value, so 0, empty string and false are indistinguishable from absent unless you use optional presence." },
+    { "title": "Avro and JSON: names and resolution rules", "text": "Avro data carries no tags, so the reader needs the exact writer schema, normally fetched from a schema registry by an id in the message header. The reader resolves writer schema against reader schema by field name (or alias): extra writer fields are skipped, reader fields missing from the writer need a default, numeric types may promote (int to long) but nothing else converts. Plain JSON has no schema at all: readers match by key, so a rename is a remove plus an add, and a strict deserializer that rejects unknown properties makes every added field a break." },
+    { "title": "Tolerant reader: be liberal in what you accept", "text": "Readers should ignore unknown fields, take only what they use, apply defaults for missing optional fields, and route unknown enum values to a default branch instead of throwing. This turns most forward-compatibility problems into non-events. Enums are the classic trap: adding a value is a breaking change for every reader whose switch is exhaustive, so give readers an explicit unknown case (or an Avro enum default symbol) before any writer emits the new value." },
+    { "title": "Expand, migrate, contract", "text": "Breaking intents are done as a sequence of compatible steps. Rename: add the new field and write both for a deprecation window (typically one to several release cycles, longer than the longest queue retention or client upgrade lag), move readers, stop writing the old field, then reserve it. Required field: ship it optional with a default, make all writers fill it, enforce it last. Type change: add a new field with the new type next to the old one." },
+    { "title": "Enforce it in CI, not in review", "text": "Schemas live in version control or a registry, and every change is checked against the previous one. buf breaking (Protobuf) compares against a git ref with rule sets FILE, PACKAGE, WIRE_JSON and WIRE. A Confluent-style schema registry enforces a per-subject mode: BACKWARD (default; new schema can read data from the last one), FORWARD, FULL, and the TRANSITIVE variants that check against every earlier version, which matters when old data lives for years. Pick the mode that matches your rollout order and retention." }
+  ],
+  "pros": [
+    "Producers and consumers deploy independently, with no lockstep release across teams",
+    "Old data in queues, logs and storage stays readable without rewriting it",
+    "Compatibility rules are mechanical, so CI can reject unsafe changes before they ship",
+    "Expand/contract turns a risky breaking change into a series of boring safe ones"
+  ],
+  "cons": [
+    "Every breaking intent takes several releases, and the deprecation window means dual-writing and cleanup you must remember to finish",
+    "Schemas accumulate dead and deprecated fields; reserved numbers and aliases are permanent",
+    "Tolerant readers can mask real bugs: an unknown field or enum value silently ignored is still lost information",
+    "Compatibility checks verify structure, not meaning: a field whose unit or semantics changes passes every check"
+  ],
+  "whenToUse": [
+    "Events and messages on queues, logs or topics, where old messages outlive deploys",
+    "Any API or RPC where clients and servers upgrade independently, including mobile apps you cannot force-update",
+    "Data written to files or databases that will be read by future versions of the code"
+  ],
+  "whenNotToUse": [
+    "A payload private to one deployable that is always shipped and rolled back atomically: a plain version bump is enough",
+    "Short-lived data that is never persisted or queued and has one producer and one consumer deployed together",
+    "As a replacement for versioning when the meaning changes: a new semantic contract deserves a new event type or API version, not a stretched schema"
+  ],
+  "pitfalls": [
+    "Reusing a protobuf field number after deleting a field: old bytes decode into the new field with no error (declare reserved and let buf breaking enforce it)",
+    "Treating a rename as harmless: safe in protobuf on the wire, but a break for every JSON consumer, every Avro reader without an alias and every dashboard that selects by column name",
+    "Adding an enum value before readers handle unknown values: exhaustive switches throw on the first event carrying it, often as a poison message that blocks a partition",
+    "Making a field required later: new readers crash on old queued data, so enforce presence only after the old data has aged out",
+    "Relying on the zero value: in proto3 an absent discount_cents and a real zero look identical, which hides missing data; use optional presence or a wrapper when the difference matters",
+    "Checking only against the previous version: a consumer that replays a year of events needs a TRANSITIVE mode, not plain BACKWARD",
+    "Deserializers that fail on unknown properties (Jackson FAIL_ON_UNKNOWN_PROPERTIES defaults to true), which turn every additive change into an outage"
+  ],
+  "related": [
+    { "kind": "concept", "slug": "api-versioning" },
+    { "kind": "concept", "slug": "online-schema-migrations" },
+    { "kind": "concept", "slug": "message-queues" },
+    { "kind": "concept", "slug": "pub-sub" },
+    { "kind": "concept", "slug": "blue-green-and-rolling-deployments" },
+    { "kind": "concept", "slug": "event-sourcing" },
+    { "kind": "concept", "slug": "api-styles" },
+    { "kind": "concept", "slug": "delivery-guarantees" },
+    { "kind": "concept", "slug": "dead-letter-queues-and-poison-messages" },
+    { "kind": "pattern", "slug": "adapter" }
+  ],
+  "roles": [
+    { "id": "producer", "label": "Producer", "description": "Writes events with the newest schema it knows." },
+    { "id": "registry", "label": "Schema checks", "description": "Schema registry or buf breaking in CI: compares a new schema with earlier versions under a compatibility mode." },
+    { "id": "broker", "label": "Queue", "description": "Holds events written by writers of many versions, so readers meet old bytes." },
+    { "id": "consumer", "label": "Consumer", "description": "Reads events with whatever schema version it was deployed with." }
+  ]
+}

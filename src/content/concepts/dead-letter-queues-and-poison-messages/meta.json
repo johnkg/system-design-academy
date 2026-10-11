@@ -1,0 +1,67 @@
+{
+  "name": "Dead-Letter Queues and Poison Messages",
+  "area": "messaging",
+  "difficulty": "beginner",
+  "intent": "Give messages that can never be processed a bounded number of retries and then a place to wait for a human, so one bad message cannot block or burn the queue.",
+  "scenario": "An order-processing queue where 2% of messages have a bad address field. The worker cannot build a shipping label for them, so each one fails every time it is delivered, and the orders behind it in the same partition wait.",
+  "problem": "A queue with at-least-once delivery redelivers any message that is not acknowledged. That is exactly right for a crashed worker or a timeout, and exactly wrong for a poison message: a malformed payload, a bug triggered by one input, or a reference to something that no longer exists. It fails on every attempt, so it is redelivered forever. In an ordered queue or a partition it blocks everything behind it (head-of-line blocking); in an unordered queue it keeps a worker busy for nothing. Four poison messages in a 4-worker pool can stop the whole pool while healthy messages age.",
+  "howItWorks": [
+    { "title": "Count deliveries and set a limit", "text": "The broker or the consumer counts how many times a message was delivered (SQS ApproximateReceiveCount with a redrive policy maxReceiveCount, RabbitMQ x-delivery-count on quorum queues, a retry counter in a header for Kafka). When the count passes the limit, typically 3 to 10, the message is no longer retried in place. Without a limit, retry forever is the default behaviour of most brokers." },
+    { "title": "Park it in a dead-letter queue with its context", "text": "The message goes to a separate queue or topic (the DLQ) that no worker reads automatically. Keep the original body plus metadata: the last error and stack trace, attempt count, original queue or topic, partition and offset, first-failed and last-failed timestamps. A bare payload with no error is hard to diagnose. Kafka has no built-in DLQ: the consumer publishes to a dead-letter topic itself." },
+    { "title": "Separate transient from permanent errors", "text": "Retry a timeout, a 503 or a lock conflict, because trying again can work. Do not retry a validation error, a failed deserialisation or a 404 for a referenced row, because it cannot. Sending permanent errors straight to the DLQ on the first attempt saves the wasted retries and gets the queue moving sooner. When unsure, retry a few times and then park." },
+    { "title": "Retry transient failures with delays", "text": "Instant retries just hammer a dependency that is down. Retry with growing delays (for example 1 s, 10 s, 1 min) using delay features (SQS delay or visibility timeout, RabbitMQ dead-letter exchange with TTL) or retry topics with increasing delays in Kafka. This frees the main queue, but the message now re-enters later and may be processed after messages that came after it." },
+    { "title": "Alarm on the DLQ, then fix and redrive", "text": "A DLQ nobody watches is a silent data-loss mechanism. Alarm on depth above 0 and on the age of the oldest message, and set retention longer than the on-call response time (SQS allows up to 14 days). After fixing the bug or the data, redrive the messages back to the source queue (SQS has a redrive-to-source action). Redriven messages can run a second time or out of order, so the handler must be idempotent." }
+  ],
+  "pros": [
+    "One bad message can no longer block a partition or burn all the workers",
+    "Failed messages are kept with their error, so a fix can be followed by a replay instead of data loss",
+    "Retry limits bound the wasted work and the load on a struggling dependency",
+    "Depth and age of the DLQ give a clear, cheap signal that something is wrong with the data or the code"
+  ],
+  "cons": [
+    "Someone must own the DLQ: alarms, triage, redrive, and a decision about messages that can never be fixed",
+    "Parking a message in an ordered stream lets later messages for the same key overtake it, so per-key order can break",
+    "A limit set too low parks healthy messages during a short outage; too high wastes work and delays the queue",
+    "The DLQ holds raw payloads, often personal data, with its own retention and access needs",
+    "Redriving needs idempotent handlers and care not to loop a still-broken message back into the DLQ"
+  ],
+  "whenToUse": [
+    "Any queue or topic with at-least-once delivery and a consumer that can fail on specific inputs",
+    "Pipelines where losing a message is worse than delaying it: orders, payments, events that update other systems",
+    "Ordered partitions where one bad record would otherwise stall every record behind it",
+    "Systems with input you do not fully control, such as user data, third-party webhooks or old messages in a schema that has since changed"
+  ],
+  "whenNotToUse": [
+    "Best-effort or disposable messages (metrics samples, cache invalidations) where dropping after a few tries is fine and a DLQ nobody reads is just clutter",
+    "As a replacement for validating input at the producer: bad data should be rejected at the edge when possible",
+    "As a place to hide an outage: if every message is landing in the DLQ the dependency is down, which is a circuit breaker or backpressure problem",
+    "Strictly ordered pipelines that cannot tolerate a gap; there you block the key and page someone rather than skip the message"
+  ],
+  "pitfalls": [
+    "An ignored DLQ: messages pile up with no alarm until retention deletes them, which is silent data loss with extra steps",
+    "Retrying permanent errors (a 400, a deserialisation exception) up to the limit, wasting attempts and delaying the whole queue",
+    "A retry limit of 1 or 2 during a brief outage parks thousands of healthy messages at once; count only errors you know are the message's fault, or make the limit generous",
+    "Setting the queue's message retention shorter than the DLQ alarm response time, so messages expire in the DLQ before anyone looks",
+    "Redriving without idempotency: a message that half-succeeded before failing is applied twice",
+    "Redriving everything at full speed into a system that has just recovered, which causes a second outage; throttle the redrive",
+    "Putting full payloads with personal data (names, addresses, card fragments) in a DLQ with wider access or longer retention than the source queue",
+    "Skipping a poison message in a keyed stream and moving on, so a later update for the same order is applied before the earlier one that is now in the DLQ"
+  ],
+  "related": [
+    { "kind": "concept", "slug": "message-queues" },
+    { "kind": "concept", "slug": "retries-and-backoff" },
+    { "kind": "concept", "slug": "backpressure" },
+    { "kind": "concept", "slug": "idempotency" },
+    { "kind": "concept", "slug": "alerting" },
+    { "kind": "concept", "slug": "circuit-breaker" },
+    { "kind": "concept", "slug": "delivery-guarantees" },
+    { "kind": "concept", "slug": "ordering-and-partitioning" }
+  ],
+  "roles": [
+    { "id": "producer", "label": "Producer", "description": "Publishes orders to the queue." },
+    { "id": "queue", "label": "Queue", "description": "Stores messages, counts deliveries and redelivers anything not acknowledged." },
+    { "id": "worker", "label": "Consumer", "description": "Processes one message at a time and acknowledges it on success." },
+    { "id": "dlq", "label": "Dead-letter queue", "description": "Holds messages that exceeded the retry limit, with their error and attempt count." },
+    { "id": "operator", "label": "Operator", "description": "Gets the alarm, inspects parked messages, fixes the cause and redrives." }
+  ]
+}

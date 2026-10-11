@@ -1,0 +1,89 @@
+{
+  "name": "Anycast and BGP Routing",
+  "area": "networking",
+  "difficulty": "advanced",
+  "intent": "Announce one IP prefix from many sites and let BGP carry each client to a site, then understand what that does to latency, failover, hijacks and DDoS.",
+  "scenario": "A service announces the same /23 (192.0.2.0/23, origin AS 64500) from five cities: Los Angeles, New York, London, Singapore and Sao Paulo. Each client network is sent to whichever site its own ISP's BGP routers prefer. Then a site is withdrawn for maintenance, a rogue AS announces a more specific /24, and a flood arrives from a botnet.",
+  "problem": "DNS-based geo routing steers users with a guess about where the resolver is, and it fails over only as fast as TTLs and resolver caches allow. For services that must be reachable at one address from everywhere (public DNS, CDN edges, DDoS scrubbing) you want the network itself to pick the nearest healthy site. But BGP is a policy protocol, not a latency optimiser: it does not know geography or RTT, a route change can move a client to another site in the middle of a TCP connection, withdrawing a route takes tens of seconds to propagate, and anyone who can announce a more specific prefix can steal your traffic.",
+  "howItWorks": [
+    {
+      "title": "Autonomous systems announce prefixes",
+      "text": "The internet is about 75,000 autonomous systems (AS), each with a number such as AS 64500. Neighbouring ASes run BGP over TCP port 179 and send UPDATE messages: a prefix (192.0.2.0/23) plus attributes, notably the AS_PATH, the list of ASes the announcement has crossed. Each AS prepends its own number when it passes the route on, which also lets it detect loops (it rejects any path containing its own AS). A router forwards each packet by longest-prefix match against the routes it chose."
+    },
+    {
+      "title": "Anycast: the same prefix from many sites",
+      "text": "Anycast is not a protocol, only a deployment: every site announces the same prefix with the same origin AS, usually through a local transit provider or an internet exchange. Each remote router now holds several paths to that prefix and keeps the best one (next step). Every ISP therefore ends up with a catchment of sites it sends to. A client does not choose, and nothing measures RTT: 'nearest' means 'preferred by BGP policy', which usually, but not always, correlates with geography."
+    },
+    {
+      "title": "Best-path selection decides the site",
+      "text": "A router compares routes in a fixed order: highest local preference first (operators set it to prefer customer routes, which earn money, over peers, which are free, over paid transit: for example 200, 100, 50), then shortest AS_PATH, then lower origin type and MED, then eBGP over iBGP, then lowest IGP cost to the exit, and finally lowest router ID as the last tie-breaker. Because local preference comes before path length, a Seattle ISP whose upstream has New York as a customer route can be sent to New York although Los Angeles is 1,500 km closer."
+    },
+    {
+      "title": "Withdraw a route to drain or fail over a site",
+      "text": "To take a site out, the site (or a health-checking agent next to it) withdraws the prefix, or the BGP session drops when the site dies. Neighbours then recompute and propagate, with path exploration and the 30 s or so MinRouteAdvertisementInterval pacing eBGP updates, so the whole internet settles in tens of seconds to a few minutes. If the box just dies with no BFD, the hold timer (90 s or 180 s by default) must expire first, and packets are black-holed meanwhile. Withdraw before maintenance, keep the site serving until traffic has left, then stop it."
+    },
+    {
+      "title": "Long connections are the cost",
+      "text": "Routers are stateless about flows. When a route change moves a client to another site, its next TCP segment lands on a server that has never seen the connection and gets a RST. DNS over UDP and 100 ms HTTP requests simply retry, which is why anycast suits them. Long downloads, WebSockets and video sessions suffer, so operators keep routing stable (no flapping, avoid unnecessary path changes), use ECMP with consistent or resilient hashing inside a site so adding a server does not remap flows, drain by withdrawing and waiting, and increasingly use QUIC connection IDs or application reconnect logic."
+    },
+    {
+      "title": "Protect the announcement and absorb attacks",
+      "text": "A more specific prefix always wins: a rogue AS announcing 192.0.2.0/24 captures traffic from every network that accepts it, whatever the AS_PATH. Defences are RPKI route-origin validation (a signed ROA states that AS 64500 may originate 192.0.2.0/23 up to a maxLength; validating routers drop invalid announcements), IRR-based prefix filters on customer sessions and your own /24 deaggregation where you can. The same catchment mechanics spread a DDoS: each botnet source reaches its own nearest site, so a widely distributed flood is split across all sites, while a concentrated one overwhelms a single site."
+    }
+  ],
+  "pros": [
+    "One address works everywhere, with no DNS TTL or resolver-caching delay on failover",
+    "Usually sends clients to a topologically close site, and the network does it with no per-request logic",
+    "Spreads DDoS traffic across all sites by catchment, and each site has its own capacity",
+    "Single-packet protocols such as DNS survive route changes with no special handling",
+    "Failing a site is an operational act: withdraw the route and traffic moves"
+  ],
+  "cons": [
+    "BGP policy, not latency or geography, decides: some clients land on a far site and you cannot see it without measurement",
+    "Convergence takes tens of seconds to minutes, and a dead site with a slow hold timer black-holes traffic",
+    "Route changes can break established TCP connections mid-flow",
+    "Hard to control load: you steer with prepends, communities and selective announcements, and results differ per ISP",
+    "Needs your own AS and IP space (at least a /24 for IPv4), peering or transit at every site, and BGP expertise"
+  ],
+  "whenToUse": [
+    "Authoritative and recursive DNS, NTP and other UDP or short-request services",
+    "CDN and edge proxy fleets that terminate connections close to users",
+    "DDoS scrubbing and mitigation networks that need many sites sharing one address",
+    "Global entry points where DNS failover delay is unacceptable"
+  ],
+  "whenNotToUse": [
+    "A single region or a few servers: a regular load balancer and health checks are far simpler",
+    "Services with long-lived stateful connections and no reconnect or session-migration logic",
+    "When you need precise control over which user reaches which site: use DNS geo routing, latency-based routing or a global load balancer",
+    "When you cannot run a real BGP presence (own AS, prefix, multiple upstreams): then rent anycast from a CDN or cloud provider"
+  ],
+  "pitfalls": [
+    "Assuming anycast gives lowest latency: a customer route with a high local preference can send a user across an ocean",
+    "Announcing the prefix from a site whose service is down, because the BGP agent has no health check tied to the application, so traffic is black-holed",
+    "Withdrawing a route and stopping the service at the same instant: traffic keeps arriving for the convergence time",
+    "Flapping routes (a health check that toggles the announcement) causing repeated connection resets and route-flap damping at upstreams",
+    "Announcing a /24 from one site only and a /23 from the rest, so more-specific routing quietly defeats the anycast design",
+    "Not publishing ROAs, or setting maxLength too low or too high: too low makes your own deaggregated /24s invalid, too high lets a forged-origin hijack of a /24 stay RPKI-valid",
+    "A small site with a large catchment: it is the first to saturate in an attack, and withdrawing it just moves the flood to the next site"
+  ],
+  "related": [
+    { "kind": "concept", "slug": "dns" },
+    { "kind": "concept", "slug": "cdn" },
+    { "kind": "concept", "slug": "proxies" },
+    { "kind": "concept", "slug": "load-balancing" },
+    { "kind": "concept", "slug": "tcp-vs-udp" },
+    { "kind": "concept", "slug": "multi-region-failover" },
+    { "kind": "concept", "slug": "health-checks" },
+    { "kind": "concept", "slug": "cidr-and-subnetting" },
+    { "kind": "concept", "slug": "tcp-congestion-control" },
+    { "kind": "concept", "slug": "latency-and-round-trips" },
+    { "kind": "pattern", "slug": "proxy" }
+  ],
+  "roles": [
+    { "id": "client", "label": "Client network", "description": "An ISP or eyeball network whose users send packets to the anycast address." },
+    { "id": "router", "label": "BGP router / AS", "description": "A network that learns routes, applies local preference and path length, and forwards by longest-prefix match." },
+    { "id": "site", "label": "Anycast site", "description": "A city where the service announces the shared prefix and serves traffic." },
+    { "id": "operator", "label": "Operator", "description": "The team that withdraws and restores announcements." },
+    { "id": "attacker", "label": "Rogue AS / botnet", "description": "A network that announces a stolen prefix or sends flood traffic." }
+  ]
+}

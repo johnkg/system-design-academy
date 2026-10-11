@@ -1,0 +1,82 @@
+{
+  "name": "TCP Congestion Control",
+  "area": "networking",
+  "difficulty": "advanced",
+  "intent": "How a TCP sender decides how fast to send: probe for bandwidth, back off when the network signals overload, and share the link fairly.",
+  "scenario": "A client downloads a 5 MB file over a 100 Mbit/s link with an 80 ms round trip, first on a clean path and then with random packet loss. The link needs about 684 segments in flight (1 MB) to be full, but the sender starts with 10.",
+  "problem": "A sender has no idea how much bandwidth the path has, and the answer changes every second as other flows come and go. Send too slowly and the link sits idle. Send too fast and routers drop packets (or queue them for hundreds of milliseconds), every flow slows down, and retransmissions waste even more capacity. This is what congestion collapse looked like in 1986 and why TCP got congestion control in 1988. The sender must find the right rate by itself, using only ACKs.",
+  "howItWorks": [
+    {
+      "title": "Two windows limit what is in flight",
+      "text": "The sender may have at most min(cwnd, rwnd) unacknowledged bytes outstanding. rwnd is the receiver window advertised in every ACK (flow control: do not overrun the receiver's buffer; with window scaling it can reach about 1 GB, Linux autotunes it up to a few MB). cwnd is the congestion window, kept only by the sender and never sent on the wire (congestion control: do not overrun the network). A 64 KB rwnd on an 80 ms path caps you at 64 KB / 80 ms, about 6.5 Mbit/s, no matter how fast the link is."
+    },
+    {
+      "title": "Slow start: double every round trip",
+      "text": "A new connection starts with cwnd = the initial window (10 segments, about 14.6 KB, since RFC 6928 and Linux 3.0) and adds one segment per ACK, which doubles cwnd every RTT: 10, 20, 40, 80 and so on. It is exponential, but it starts small: reaching a 684 segment BDP takes about 7 round trips. Slow start ends at the slow-start threshold (ssthresh) or at the first loss. Short transfers finish before ever leaving it."
+    },
+    {
+      "title": "Congestion avoidance: additive increase, multiplicative decrease",
+      "text": "Past ssthresh, Reno-style control adds one segment per round trip (additive increase) and, on a loss event, halves cwnd (multiplicative decrease). The result is the AIMD sawtooth: a slow linear climb until the queue overflows, a sudden halving, climb again. Chiu and Jain showed AIMD is the combination that converges competing flows to an equal share."
+    },
+    {
+      "title": "Loss is the signal, and two kinds of loss differ",
+      "text": "Three duplicate ACKs mean later segments are arriving, so only that one segment was lost: fast retransmit resends it immediately and fast recovery sets cwnd to half (ssthresh = cwnd/2) and carries on. If ACKs stop altogether, the retransmission timer fires (RTO, at least 200 ms on Linux, estimated from SRTT and RTTVAR) and cwnd collapses to 1 segment, back into slow start. Timeouts are far more costly than fast retransmits, and they are what tiny windows and tail losses produce."
+    },
+    {
+      "title": "CUBIC: the Linux default, window as a function of time",
+      "text": "Reno grows by one segment per RTT, so a 10 Gbit/s long-fat path needs thousands of RTTs to recover from a halving. CUBIC (RFC 9438) remembers the window at the last loss, Wmax, cuts to 0.7 x Wmax (not 0.5) and then grows along a cubic curve in real time: fast at first, flat around Wmax (where it last saw trouble), then probing upward faster again. Because growth depends on elapsed time, not on RTT, flows with different RTTs are treated more evenly."
+    },
+    {
+      "title": "BBR: model the path instead of reacting to loss",
+      "text": "BBR (Google, 2016) estimates the bottleneck bandwidth (the maximum recent delivery rate) and the minimum RTT, and paces at about bandwidth with an in-flight cap near 2 x BDP. It periodically probes: 1.25x the rate for a round to look for more bandwidth, then 0.75x to drain any queue it created. Loss is not the trigger, so random loss barely slows it and buffers stay near-empty. The cost: BBRv1 can be unfair to loss-based flows and retransmit heavily into shallow buffers, which BBRv2/v3 try to fix."
+    }
+  ],
+  "pros": [
+    "Lets millions of flows share links with no central coordination, using only ACKs",
+    "AIMD converges to a fair share; the network never has to know who is sending what",
+    "CUBIC fills long fat paths far better than Reno and is already the default on Linux",
+    "BBR keeps latency low on large buffers and tolerates random loss (wireless, long haul)"
+  ],
+  "cons": [
+    "Loss-based control must fill the buffer to find the limit, so big buffers mean big queues (bufferbloat)",
+    "Treating every loss as congestion wastes capacity on lossy wireless and long haul paths",
+    "Slow start makes short transfers latency-bound: a connection pays several round trips before it reaches line rate",
+    "Mixed algorithms are not automatically fair: BBRv1 vs CUBIC shares depend on buffer size",
+    "A new connection forgets everything it learned about the path"
+  ],
+  "whenToUse": [
+    "Understanding why a transfer is slower than the link rate: check RTT, loss and rwnd before blaming bandwidth",
+    "Choosing the sender-side algorithm (net.ipv4.tcp_congestion_control) for long fat paths, lossy last miles or large buffers",
+    "Sizing socket buffers and the initial window for bulk transfer and CDN edge servers",
+    "Reasoning about connection reuse, HTTP/2 multiplexing and QUIC for web performance"
+  ],
+  "whenNotToUse": [
+    "Tuning the algorithm for small web responses: they end inside slow start, so the initial window, connection reuse and fewer round trips matter far more than CUBIC vs BBR",
+    "Switching to BBR everywhere without measuring: on shallow-buffered shared links it can crowd out neighbours and retransmit a lot",
+    "Blaming congestion control for latency that is really queueing at the server or application (see queueing theory)",
+    "Rolling your own rate control on UDP unless you are building a transport such as QUIC; unthrottled UDP is a congestion-collapse risk"
+  ],
+  "pitfalls": [
+    "Testing with a short transfer and concluding the link is slow: a 1 MB download on this path finishes in 7 round trips, never reaching 100 Mbit/s",
+    "Forgetting rwnd: an old 64 KB window or a small SO_RCVBUF caps throughput at window/RTT, whatever cwnd says",
+    "Ignoring bufferbloat: a 16 x BDP buffer on a home router lets one upload add a second of latency to every other flow",
+    "Reading sawtooth throughput as a bug: a cwnd that rises, halves and rises again is the algorithm working",
+    "Idle connections: after an idle period the window is reset (slow-start-after-idle, on by default in Linux), so a keep-alive connection that sat idle for a few hundred milliseconds can restart slowly",
+    "Treating random loss as congestion: 1% loss holds Reno to about 1.7 Mbit/s on an 80 ms path, per the Mathis formula MSS/RTT x 1.22/sqrt(p)"
+  ],
+  "related": [
+    { "kind": "concept", "slug": "tcp-vs-udp" },
+    { "kind": "concept", "slug": "latency-and-round-trips" },
+    { "kind": "concept", "slug": "http-versions" },
+    { "kind": "concept", "slug": "backpressure" },
+    { "kind": "concept", "slug": "cdn" },
+    { "kind": "concept", "slug": "queueing-theory-and-littles-law" },
+    { "kind": "concept", "slug": "timeouts-and-deadlines" }
+  ],
+  "roles": [
+    { "id": "sender", "label": "Sender", "description": "The server pushing data; it owns the congestion window and the retransmission timer." },
+    { "id": "controller", "label": "Congestion control", "description": "The algorithm (Reno, CUBIC, BBR) that sets cwnd or the pacing rate from ACKs, loss and RTT samples." },
+    { "id": "bottleneck", "label": "Bottleneck queue", "description": "The slowest link and its buffer: it sets capacity, adds queueing delay and drops packets when full." },
+    { "id": "receiver", "label": "Receiver", "description": "The client; ACKs data and advertises its own receive window (rwnd)." }
+  ]
+}

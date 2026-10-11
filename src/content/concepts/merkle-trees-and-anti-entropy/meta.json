@@ -1,0 +1,64 @@
+{
+  "name": "Merkle Trees and Anti-Entropy",
+  "area": "distributed",
+  "difficulty": "advanced",
+  "intent": "Let replicas find which key ranges differ by comparing hashes top-down, so repair costs a few hashes and the differing ranges instead of a scan of everything.",
+  "scenario": "Two replicas of a 1,000,000 key store missed a handful of writes while one node was down, and the hinted handoff for them was lost. Five keys differ. Each replica has a Merkle tree over 1,024 key ranges (about 977 keys each). The repair job compares roots, descends only into differing subtrees, finds 5 ranges with 79 hash comparisons, and copies those ranges instead of streaming 100 MB.",
+  "problem": "Replicas drift: a node is down during writes, a hint is dropped, a disk loses a block, a write times out on one replica. Read repair only fixes keys that are read, and hinted handoff is best effort and expires. Eventually you must compare two copies of a huge dataset and fix the differences, but reading and shipping every key (or even a hash per key) costs about as much as the data itself, and the cost does not shrink when only five keys are wrong.",
+  "howItWorks": [
+    { "title": "Hash key ranges into leaves", "text": "Split the key space (or token range) into fixed ranges, for example 1,024. Each leaf holds the hash, usually SHA-256, of the sorted key and value pairs in its range. Both replicas must use the same boundaries, the same serialisation and the same hash, or equal data will not produce equal hashes." },
+    { "title": "Hash upward to one root", "text": "Each parent hashes the concatenation of its children's hashes, up to a single root. Equal roots mean the whole range is identical, up to hash collisions, which are negligible with SHA-256. One 32 byte comparison can therefore prove that a million keys agree." },
+    { "title": "Descend only where hashes differ", "text": "If the roots differ, exchange the children's hashes. Equal children are pruned and never opened; differing ones are descended. With k differing leaves in a binary tree of depth d this takes at most about 2*k*d comparisons, which is O(k log n), not O(n)." },
+    { "title": "Stream only the differing ranges", "text": "At the leaves you have a list of key ranges that differ. Those ranges are exchanged (keys, values, versions or timestamps) and reconciled by the store's normal rules, such as last write wins, vector clocks or a CRDT merge. Everything outside those ranges is untouched." },
+    { "title": "Keep the trees cheap to obtain", "text": "Building a tree means reading the data. Cassandra builds it in a validation compaction pass at repair time; Riak keeps a persistent hash tree on disk and updates it as writes arrive. Either way you pay for the build, so repair is scheduled range by range and throttled so it does not starve foreground traffic." }
+  ],
+  "pros": [
+    "Cost grows with the number of differences, not with the size of the dataset, when differences are few",
+    "One root comparison proves two big replicas identical, so the common healthy case is nearly free",
+    "Finds drift that no read ever touched, including silent corruption and lost hints",
+    "Wire cost is tiny: hashes are 32 bytes, and only differing ranges move",
+    "The same structure gives inclusion proofs of O(log n) hashes (Git, certificate transparency, Bitcoin)"
+  ],
+  "cons": [
+    "Building the tree reads all the data, so disk and CPU cost is O(n) per repair even if the network cost is tiny",
+    "Granularity is a whole leaf range: one bad key makes you stream about 977 keys in the example",
+    "Trees must be rebuilt or incrementally updated, and a tree built while writes continue is already slightly stale",
+    "When most ranges differ the tree is overhead; it sends more hashes than a flat list of range hashes would",
+    "Ordinary repair is background work that competes with foreground traffic and needs scheduling"
+  ],
+  "whenToUse": [
+    "Large replicated stores (Dynamo-style, wide-column, object stores) where full comparison is prohibitive",
+    "Replicas that should be nearly identical and drift by only a few keys or ranges",
+    "Detecting divergence nobody reads: cold data, tombstones, bit rot",
+    "File and directory sync, or any content-addressed store where subtree hashes already exist"
+  ],
+  "whenNotToUse": [
+    "Small datasets where streaming everything is cheaper than building trees",
+    "Replicas that diverge massively (a node restored from an old backup or freshly added): just stream the data",
+    "Systems with a replicated log (Raft, Paxos) where followers catch up from a log position instead of comparing state",
+    "As a replacement for read repair and hinted handoff: those fix most drift cheaply and quickly, anti-entropy is the safety net"
+  ],
+  "pitfalls": [
+    "Tree depth that is too small gives huge leaf ranges, so one bad key streams thousands; too large and the tree itself costs memory and hashes",
+    "Hash input that is not canonical (different serialisation, ordering, timestamps or tombstone handling) makes equal data look different and repairs everything every time",
+    "Building the tree from live data: concurrent writes mean the two trees describe different moments, so recent writes show up as false differences. Compare snapshots or accept re-checking recent ranges",
+    "Running full repair on every node at once on a busy cluster, saturating disks and network; repair one range at a time with a throttle",
+    "Not repairing within the tombstone grace period (gc_grace_seconds in Cassandra, 10 days by default), so a deleted key is purged on one replica and resurrected from another",
+    "Using a weak or truncated hash for adversarial settings: for accidental drift anything decent works, but proofs in Git or transparency logs need a collision-resistant hash like SHA-256"
+  ],
+  "related": [
+    { "kind": "concept", "slug": "gossip-protocol" },
+    { "kind": "concept", "slug": "database-replication" },
+    { "kind": "concept", "slug": "quorums" },
+    { "kind": "concept", "slug": "consistency-models" },
+    { "kind": "concept", "slug": "consistent-hashing" },
+    { "kind": "concept", "slug": "logical-clocks" },
+    { "kind": "concept", "slug": "failure-detection" },
+    { "kind": "concept", "slug": "crdts" }
+  ],
+  "roles": [
+    { "id": "writer", "label": "Writer", "description": "A client that writes through a coordinator; some writes miss a replica." },
+    { "id": "replica", "label": "Replica", "description": "Holds the data and its Merkle tree over key ranges." },
+    { "id": "repair", "label": "Repair job", "description": "Compares trees, descends differing subtrees and streams the differing ranges." }
+  ]
+}

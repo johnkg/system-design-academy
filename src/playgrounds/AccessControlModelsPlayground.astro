@@ -1,0 +1,302 @@
+---
+import PlaygroundShell from '../components/PlaygroundShell.astro';
+---
+<PlaygroundShell title="Simulate it" hint="A shared documents app: teams, folders, documents, one contractor and one private note. Pick a model, see the evidence for each question, and count what it takes to say the same thing.">
+  <ol class="how">
+    <li>Start with <b>ReBAC</b> (default: 4 teams, 6 documents each). Every answer comes with a path of tuples: <b>bob views eng/plan</b> is document, parent folder, group, user (3 tuples), and <b>dan views finance/spec</b> needs 4. Lower <b>Max traversal depth</b> to 3: <b>dan can no longer view finance/spec</b> (4 hops) while <b>alice can still edit eng/spec</b> (3 hops), and the card shows 20 under-grants. A bounded walk fails closed.</li>
+    <li>Compare the cards. Raise <b>Teams</b> to 12: <b>RBAC roles grow from 10 to 26</b> (two per team plus two exceptions) while ABAC stays at 4 rules and ReBAC at 4 rewrite rules. Switch to <b>RBAC, 2 coarse roles</b> to keep the role count at 2: it over-grants 250 of 450 pairs at the defaults, because roles cannot say &quot;this team only&quot;. Note that ACL needs 6 writes (one per document) to make a new teammate an editor, the others 1 or 2.</li>
+    <li>Tick <b>Add one mistaken broad rule</b> (default sizes). Each model gets a one-line slip with a different blast radius: ACL shares one document with everyone (7 over-grants), RBAC widens one role (19), ReBAC makes a folder public so every document under it inherits (41), and ABAC&apos;s bad OR exposes every document (175).</li>
+  </ol>
+  <div class="pg acm" data-acm>
+    <div class="pg-row">
+      <label>Model <select class="pg-in" data-model>
+        <option value="acl">ACL (list per document)</option>
+        <option value="rbac">RBAC, scoped roles</option>
+        <option value="rbacc">RBAC, 2 coarse roles</option>
+        <option value="abac">ABAC (4 rules)</option>
+        <option value="rebac" selected>ReBAC (tuples + inheritance)</option>
+      </select></label>
+      <label class="acm-check"><input type="checkbox" data-mistake /> Add one mistaken broad rule</label>
+      <button class="btn" type="button" data-reset>Reset</button>
+    </div>
+    <div class="pg-row">
+      <label>Teams <input type="range" min="2" max="12" value="4" data-teams /> <b data-teamsval>4</b></label>
+      <label>Documents per team <input type="range" min="2" max="30" value="6" data-docs /> <b data-docsval>6</b></label>
+      <label>Max traversal depth (ReBAC only) <input type="range" min="1" max="8" value="8" data-depth /> <b data-depthval>8</b></label>
+    </div>
+    <p class="pg-note" data-orginfo></p>
+    <div class="pg-grid acm-cards" data-cards></div>
+    <h3 class="acm-h" data-qhead>Eight access questions</h3>
+    <div class="acm-qs" data-qs></div>
+    <p class="pg-note">Assumptions: the intent is fixed. Every team member may view their team&apos;s documents, the team lead may edit them, the contractor dave may view only eng/spec, and alice&apos;s note is private. &quot;Wrong answers&quot; compares each model with that intent over every (user, document, action) pair. Policy items and data items are counted from the structures this page builds, not estimated. ACL entries name a user or group per document and there is no folder inheritance. Folders are only a listing aid there.</p>
+  </div>
+</PlaygroundShell>
+<script>
+  // ---------------- pure model core ----------------
+  type Act = 'view' | 'edit';
+  interface User { id: string; team: string | null; title: string }
+  interface Doc { id: string; folder: string | null; team: string | null }
+  interface Folder { id: string; parent: string | null; team: string }
+  interface Org { users: User[]; docs: Doc[]; folders: Folder[]; teams: string[] }
+  interface Result { allow: boolean; evidence: string; steps: number; limited?: boolean }
+  interface Model { id: string; name: string; policyLabel: string; policy: number; dataLabel: string; data: number; onboard: number; check: (u: string, a: Act, d: string) => Result }
+  interface Tuple { obj: string; rel: string; sub: string }
+
+  const TEAMS = ['eng', 'finance', 'sales', 'support', 'legal', 'hr', 'ops', 'data', 'growth', 'infra', 'design', 'qa'];
+  const PEOPLE = [['alice', 'bob'], ['carol', 'dan'], ['erin', 'frank'], ['gina', 'hank'], ['ivy', 'jack'], ['kim', 'leo'], ['mia', 'ned'], ['olga', 'pete'], ['quinn', 'ray'], ['sam', 'tia'], ['uma', 'vic'], ['wes', 'xena']];
+
+  function makeOrg(T: number, D: number): Org {
+    const teams = TEAMS.slice(0, T); const users: User[] = []; const docs: Doc[] = []; const folders: Folder[] = [];
+    teams.forEach((n, i) => {
+      users.push({ id: PEOPLE[i][0], team: n, title: 'lead' }, { id: PEOPLE[i][1], team: n, title: 'member' });
+      folders.push({ id: n, parent: null, team: n }, { id: n + '/specs', parent: n, team: n });
+      docs.push({ id: n + '/plan', folder: n, team: n });
+      for (let k = 2; k <= D; k++) docs.push({ id: k === 2 ? n + '/spec' : n + '/doc' + k, folder: n + '/specs', team: n });
+    });
+    users.push({ id: 'dave', team: null, title: 'contractor' });
+    docs.push({ id: 'alice-notes', folder: null, team: null });
+    return { users, docs, folders, teams };
+  }
+
+  function intended(org: Org, uid: string, a: Act, d: Doc): boolean {
+    const u = org.users.find((x) => x.id === uid)!;
+    if (d.id === 'alice-notes') return uid === 'alice';
+    if (u.team !== null && u.team === d.team) return a === 'view' || u.title === 'lead';
+    return uid === 'dave' && d.id === 'eng/spec' && a === 'view';
+  }
+
+  const leadOf = (org: Org, team: string) => org.users.find((u) => u.team === team && u.title === 'lead')!.id;
+  const membersOf = (org: Org, team: string) => org.users.filter((u) => u.team === team).map((u) => u.id);
+
+  // ACL: a list of (principal, permission) per document, checked one document at a time.
+  function buildACL(org: Org, mistake: boolean): Model {
+    const acl = new Map<string, { who: string; perm: Act }[]>(); const groups = new Map<string, string[]>();
+    org.teams.forEach((n) => groups.set('group:' + n, membersOf(org, n)));
+    org.docs.forEach((d) => {
+      acl.set(d.id, d.team ? [{ who: 'group:' + d.team, perm: 'view' }, { who: 'user:' + leadOf(org, d.team), perm: 'edit' }] : []);
+    });
+    acl.get('eng/spec')!.push({ who: 'user:dave', perm: 'view' });
+    acl.get('alice-notes')!.push({ who: 'user:alice', perm: 'edit' });
+    if (mistake) acl.get('eng/plan')!.push({ who: 'user:*', perm: 'view' });
+    let policy = 0; acl.forEach((l) => { policy += l.length; });
+    const team = org.teams[0]; const docsInTeam = org.docs.filter((d) => d.team === team).length;
+    return {
+      id: 'acl', name: 'ACL', policyLabel: 'ACL entries', policy, dataLabel: 'group members', data: org.users.length - 1, onboard: docsInTeam,
+      check(uid, a, did) {
+        const list = acl.get(did) || [];
+        for (let i = 0; i < list.length; i++) {
+          const e = list[i];
+          const hit = e.who === 'user:*' || e.who === 'user:' + uid || (e.who.startsWith('group:') && (groups.get(e.who) || []).includes(uid));
+          if (hit && (e.perm === 'edit' || a === 'view')) return { allow: true, evidence: `ACL on ${did}: ${e.who} ${e.perm}`, steps: i + 1 };
+        }
+        return { allow: false, evidence: `no entry in the ${list.length} on ${did} matches ${uid}`, steps: list.length };
+      },
+    };
+  }
+
+  // RBAC: users hold roles, roles hold (action, resource pattern) permissions.
+  function matches(pattern: string, doc: string) { return pattern === '*' || (pattern.endsWith('/*') ? doc.startsWith(pattern.slice(0, -1)) : pattern === doc); }
+  function buildRBAC(org: Org, mistake: boolean, coarse: boolean): Model {
+    const roles = new Map<string, { act: Act; pattern: string }>(); const held = new Map<string, string[]>();
+    const give = (u: string, r: string) => { held.set(u, [...(held.get(u) || []), r]); };
+    let assignments = 0;
+    if (coarse) {
+      roles.set('viewer', { act: 'view', pattern: '*' }); roles.set('editor', { act: 'edit', pattern: '*' });
+      org.users.forEach((u) => { give(u.id, u.title === 'lead' ? 'editor' : 'viewer'); assignments++; });
+    } else {
+      org.teams.forEach((n) => {
+        roles.set(n + '-viewer', { act: 'view', pattern: mistake && n === 'eng' ? '*' : n + '/*' });
+        roles.set(n + '-editor', { act: 'edit', pattern: n + '/*' });
+        membersOf(org, n).forEach((u) => { give(u, u === leadOf(org, n) ? n + '-editor' : n + '-viewer'); assignments++; });
+      });
+      roles.set('eng-spec-viewer', { act: 'view', pattern: 'eng/spec' }); give('dave', 'eng-spec-viewer');
+      roles.set('alice-notes-owner', { act: 'edit', pattern: 'alice-notes' }); give('alice', 'alice-notes-owner');
+      assignments += 2;
+    }
+    return {
+      id: coarse ? 'rbacc' : 'rbac', name: coarse ? 'RBAC, 2 coarse roles' : 'RBAC, scoped roles', policyLabel: 'roles', policy: roles.size, dataLabel: 'role assignments', data: assignments, onboard: 1,
+      check(uid, a, did) {
+        const mine = held.get(uid) || [];
+        for (let i = 0; i < mine.length; i++) {
+          const r = roles.get(mine[i])!;
+          if ((r.act === 'edit' || a === 'view') && matches(r.pattern, did)) return { allow: true, evidence: `role ${mine[i]} (${r.act} ${r.pattern}) held by ${uid}`, steps: i + 1 };
+        }
+        return { allow: false, evidence: `${uid} holds ${mine.length ? mine.join(', ') : 'no roles'}: none grants ${a} on ${did}`, steps: mine.length };
+      },
+    };
+  }
+
+  // ABAC: rules over attributes of user and resource.
+  function buildABAC(org: Org, mistake: boolean): Model {
+    const U = new Map(org.users.map((u) => [u.id, u])); const Dm = new Map(org.docs.map((d) => [d.id, d]));
+    const rules: { id: string; text: string; fn: (u: User, d: Doc, a: Act) => boolean }[] = [
+      { id: 'R1', text: mistake ? 'view if user.team == doc.team OR doc.kind == "doc"' : 'view if user.team == doc.team', fn: (u, d, a) => a === 'view' && ((u.team !== null && u.team === d.team) || mistake) },
+      { id: 'R2', text: 'edit if user.team == doc.team and user.title == lead', fn: (u, d, a) => a === 'edit' && u.team !== null && u.team === d.team && u.title === 'lead' },
+      { id: 'R3', text: 'view if user.id in doc.sharedWith', fn: (u, d, a) => a === 'view' && d.id === 'eng/spec' && u.id === 'dave' },
+      { id: 'R4', text: 'any if doc.owner == user.id', fn: (u, d) => d.id === 'alice-notes' && u.id === 'alice' },
+    ];
+    const userAttrs = org.users.filter((u) => u.team !== null).length * 2;
+    const docAttrs = org.docs.filter((d) => d.team !== null).length + 2;
+    return {
+      id: 'abac', name: 'ABAC', policyLabel: 'rules', policy: rules.length, dataLabel: 'attribute values', data: userAttrs + docAttrs, onboard: 2,
+      check(uid, a, did) {
+        const u = U.get(uid)!; const d = Dm.get(did)!;
+        for (let i = 0; i < rules.length; i++) if (rules[i].fn(u, d, a)) return { allow: true, evidence: `${rules[i].id}: ${rules[i].text}`, steps: i + 1 };
+        return { allow: false, evidence: `none of ${rules.length} rules matches (${uid}.team=${u.team}, ${did}.team=${d.team})`, steps: rules.length };
+      },
+    };
+  }
+
+  // ReBAC: relation tuples plus userset rewrites, evaluated by a bounded graph walk.
+  // doc/folder: viewer = direct + editor + parent->viewer; editor = direct + parent->editor; group: member = direct.
+  function buildReBAC(org: Org, mistake: boolean, maxDepth: number): Model {
+    const tuples: Tuple[] = []; const add = (obj: string, rel: string, sub: string) => tuples.push({ obj, rel, sub });
+    org.teams.forEach((n) => {
+      membersOf(org, n).forEach((u) => add('group:' + n, 'member', 'user:' + u));
+      add('folder:' + n, 'editor', 'user:' + leadOf(org, n)); add('folder:' + n, 'viewer', 'group:' + n + '#member');
+    });
+    org.folders.forEach((f) => { if (f.parent) add('folder:' + f.id, 'parent', 'folder:' + f.parent); });
+    org.docs.forEach((d) => { if (d.folder) add('doc:' + d.id, 'parent', 'folder:' + d.folder); });
+    add('doc:eng/spec', 'viewer', 'user:dave'); add('doc:alice-notes', 'editor', 'user:alice');
+    if (mistake) add('folder:eng', 'viewer', 'user:*');
+    const idx = new Map<string, Tuple[]>(); tuples.forEach((t) => { const k = t.obj + '#' + t.rel; idx.set(k, [...(idx.get(k) || []), t]); });
+    const fmt = (t: Tuple) => `${t.obj}#${t.rel}@${t.sub}`;
+    return {
+      id: 'rebac', name: 'ReBAC', policyLabel: 'rewrite rules', policy: 4, dataLabel: 'relation tuples', data: tuples.length, onboard: 1,
+      check(uid, a, did) {
+        let reads = 0; let limited = false;
+        // walk returns the list of tuples (edges) that prove obj#rel for the user, or null. `used` counts edges already followed.
+        const walk = (obj: string, rel: string, used: number): string[] | null => {
+          const group = obj.startsWith('group:');
+          reads++;
+          const own = idx.get(obj + '#' + rel) || [];
+          for (const t of own) {
+            if (t.sub === 'user:' + uid || t.sub === 'user:*') { if (used + 1 > maxDepth) { limited = true; continue; } return [fmt(t)]; }
+          }
+          for (const t of own) {
+            if (!t.sub.includes('#')) continue;
+            if (used + 1 > maxDepth) { limited = true; continue; }
+            const [g, r] = t.sub.split('#'); const sub = walk(g, r, used + 1); if (sub) return [fmt(t), ...sub];
+          }
+          if (group) return null;
+          if (rel === 'viewer') { const sub = walk(obj, 'editor', used); if (sub) return sub; }
+          for (const p of idx.get(obj + '#parent') || []) {
+            if (used + 1 > maxDepth) { limited = true; continue; }
+            const sub = walk(p.sub, rel, used + 1); if (sub) return [fmt(p), ...sub];
+          }
+          return null;
+        };
+        const path = walk('doc:' + did, a === 'edit' ? 'editor' : 'viewer', 0);
+        if (path) return { allow: true, evidence: path.join('  >  '), steps: path.length };
+        return { allow: false, evidence: limited ? `walk hit the depth limit of ${maxDepth} (${reads} reads): denied, fail closed` : `no path from user:${uid} to doc:${did}#${a === 'edit' ? 'editor' : 'viewer'} (${reads} reads)`, steps: 0, limited };
+      },
+    };
+  }
+
+  function buildModel(id: string, org: Org, mistake: boolean, maxDepth: number): Model {
+    if (id === 'acl') return buildACL(org, mistake);
+    if (id === 'rbac') return buildRBAC(org, mistake, false);
+    if (id === 'rbacc') return buildRBAC(org, mistake, true);
+    if (id === 'abac') return buildABAC(org, mistake);
+    return buildReBAC(org, mistake, maxDepth);
+  }
+
+  function grade(org: Org, m: Model) {
+    let over = 0; let under = 0; let pairs = 0;
+    for (const u of org.users) for (const d of org.docs) for (const a of ['view', 'edit'] as Act[]) {
+      pairs++; const want = intended(org, u.id, a, d); const got = m.check(u.id, a, d.id).allow;
+      if (got && !want) over++; else if (!got && want) under++;
+    }
+    return { over, under, pairs };
+  }
+
+  const QUESTIONS: { u: string; a: Act; d: string; why: string }[] = [
+    { u: 'alice', a: 'edit', d: 'eng/spec', why: 'the lead edits her team\'s docs' },
+    { u: 'bob', a: 'view', d: 'eng/plan', why: 'a member reads team docs' },
+    { u: 'bob', a: 'edit', d: 'eng/plan', why: 'a member may not edit' },
+    { u: 'dan', a: 'view', d: 'finance/spec', why: 'finance member reads finance docs' },
+    { u: 'dan', a: 'view', d: 'eng/plan', why: 'other teams are shut out' },
+    { u: 'dave', a: 'view', d: 'eng/spec', why: 'contractor shared one document' },
+    { u: 'dave', a: 'view', d: 'eng/plan', why: 'contractor sees nothing else' },
+    { u: 'bob', a: 'view', d: 'alice-notes', why: 'a private note stays private' },
+  ];
+
+  // ---------------- DOM ----------------
+  const MODELS = ['acl', 'rbac', 'rbacc', 'abac', 'rebac'];
+  document.querySelectorAll<HTMLElement>('[data-acm]').forEach((root) => {
+    const q = <T extends HTMLElement>(s: string) => root.querySelector<T>(s)!;
+    const num = (s: string) => Number(q<HTMLInputElement>(s).value);
+    const cards = q('[data-cards]'); const qs = q('[data-qs]');
+    const cardEls = new Map<string, { box: HTMLElement; policy: HTMLElement; data: HTMLElement; onboard: HTMLElement; wrong: HTMLElement }>();
+    MODELS.forEach((id) => {
+      const box = document.createElement('div'); box.className = 'pg-box';
+      const h = document.createElement('h3'); const policy = document.createElement('span'); const data = document.createElement('span'); const onboard = document.createElement('span'); const wrong = document.createElement('span');
+      [policy, data, onboard].forEach((e) => { e.className = 'pg-note'; }); wrong.className = 'pg-mono';
+      box.append(h, policy, data, onboard, wrong); cards.append(box);
+      cardEls.set(id, { box, policy, data, onboard, wrong }); (box as any)._h = h;
+    });
+    const rows = QUESTIONS.map(() => {
+      const row = document.createElement('div'); row.className = 'acm-q';
+      const head = document.createElement('div'); head.className = 'acm-qh';
+      const ask = document.createElement('b'); const intent = document.createElement('span'); const dec = document.createElement('span'); dec.className = 'pg-mono acm-dec';
+      head.append(ask, intent, dec);
+      const ev = document.createElement('div'); ev.className = 'pg-mono acm-ev';
+      row.append(head, ev); qs.append(row);
+      return { row, ask, intent, dec, ev };
+    });
+    let frame = 0;
+
+    function draw() {
+      frame = 0;
+      const T = num('[data-teams]'); const D = num('[data-docs]'); const depth = num('[data-depth]'); const mistake = q<HTMLInputElement>('[data-mistake]').checked;
+      const sel = q<HTMLSelectElement>('[data-model]').value;
+      q('[data-teamsval]').textContent = String(T); q('[data-docsval]').textContent = String(D); q('[data-depthval]').textContent = String(depth);
+      q<HTMLInputElement>('[data-depth]').disabled = sel !== 'rebac';
+      const org = makeOrg(T, D);
+      q('[data-orginfo]').textContent = `Org: ${org.users.length} users, ${org.teams.length} groups, ${org.folders.length} folders, ${org.docs.length} documents.`;
+      let chosen: Model | null = null;
+      MODELS.forEach((id) => {
+        const m = buildModel(id, org, mistake, depth); const g = grade(org, m); const c = cardEls.get(id)!;
+        (c.box as any)._h.textContent = m.name;
+        c.policy.textContent = `${m.policy} ${m.policyLabel}`;
+        c.data.textContent = `${m.data} ${m.dataLabel}`;
+        c.onboard.textContent = `${m.onboard} write${m.onboard === 1 ? '' : 's'} to make a new teammate an editor`;
+        c.wrong.textContent = `${g.over} over-grants, ${g.under} under-grants of ${g.pairs} pairs`;
+        c.box.style.setProperty('--c', g.over > 0 ? 'var(--bad)' : 'var(--border)');
+        c.box.classList.toggle('lit', id === sel);
+        if (id === sel) chosen = m;
+      });
+      const m = chosen as Model | null; if (!m) return;
+      q('[data-qhead]').textContent = `Eight access questions under ${m.name}`;
+      QUESTIONS.forEach((qq, i) => {
+        const r = rows[i]; const res = m.check(qq.u, qq.a, qq.d); const want = intended(org, qq.u, qq.a, org.docs.find((d) => d.id === qq.d)!);
+        const verdict = res.allow === want ? 'correct' : res.allow ? 'OVER-GRANT' : 'UNDER-GRANT';
+        r.ask.textContent = `${qq.u} ${qq.a}s ${qq.d}`;
+        r.intent.textContent = `intent: ${want ? 'allow' : 'deny'} (${qq.why})`;
+        r.dec.textContent = `${res.allow ? 'ALLOW' : 'DENY'} - ${verdict}${res.allow && sel === 'rebac' ? `, ${res.steps} tuples` : ''}`;
+        r.ev.textContent = res.evidence;
+        r.row.style.setProperty('--c', verdict === 'correct' ? 'var(--border)' : 'var(--bad)');
+        r.row.classList.toggle('acm-wrong', verdict !== 'correct');
+      });
+    }
+    const schedule = () => { if (!frame) frame = requestAnimationFrame(draw); };
+    ['[data-model]', '[data-teams]', '[data-docs]', '[data-depth]', '[data-mistake]'].forEach((s) => { q(s).addEventListener('input', schedule); q(s).addEventListener('change', schedule); });
+    q('[data-reset]').addEventListener('click', () => {
+      q<HTMLSelectElement>('[data-model]').value = 'rebac'; q<HTMLInputElement>('[data-teams]').value = '4'; q<HTMLInputElement>('[data-docs]').value = '6';
+      q<HTMLInputElement>('[data-depth]').value = '8'; q<HTMLInputElement>('[data-mistake]').checked = false; draw();
+    });
+    draw();
+  });
+</script>
+<style is:global>
+  .playground .acm-check { display: inline-flex; align-items: center; gap: 6px; }
+  .playground .acm-cards { grid-template-columns: repeat(auto-fit, minmax(210px, 1fr)); }
+  .playground .acm-h { margin: 4px 0 0; font-size: 1rem; }
+  .playground .acm-qs { display: grid; gap: 8px; }
+  .playground .acm-q { border: 1px solid var(--border); border-left: 4px solid var(--c, var(--border)); border-radius: 8px; padding: 8px 10px; background: var(--surface); display: grid; gap: 4px; }
+  .playground .acm-q.acm-wrong { background: color-mix(in srgb, var(--bad) 10%, var(--surface)); }
+  .playground .acm-qh { display: flex; flex-wrap: wrap; gap: 2px 12px; align-items: baseline; }
+  .playground .acm-dec { font-weight: 600; }
+  .playground .acm-q.acm-wrong .acm-dec { color: var(--bad-text); }
+  .playground .acm-ev { color: var(--muted); white-space: pre-wrap; overflow-wrap: anywhere; }
+</style>

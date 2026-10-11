@@ -1,0 +1,196 @@
+---
+import PlaygroundShell from '../components/PlaygroundShell.astro';
+---
+<PlaygroundShell title="Simulate it" hint="Checkout at 50,000 requests per second. First choose metric labels and see the series count, then sample a seeded stream of 100,000 requests with 0.2% errors.">
+  <ol class="how">
+    <li>With <b>route, status, region</b> ticked the request counter has <b>600 series</b> (about 1.8 MB). Tick <b>customer id</b>: <b>600,000,000 series</b>, about 1.8 TB, far more than one metrics server can hold. Tick the <b>latency histogram</b> as well and it grows 14 times more.</li>
+    <li>In the sampling part, the default is <b>head 1%, tail off</b>: about 1,000 of 100,000 traces are kept and the request count is within a few percent, but only <b>2 of 213 error traces</b> survive. Choose <b>0.1%</b>: no error trace at all, and the error rate estimate is <b>0% with a 95% interval up to about 4%</b>.</li>
+    <li>Tick <b>Tail sampling</b>: <b>all 213 error traces</b> are kept at any head rate, and at 1% the weighted p99 is 1209 ms against a true 1191 ms, while the unweighted p99 of the kept traces is 3674 ms, about 3 times too high. Press <b>New seed</b> to see head numbers wobble while tail still keeps every error.</li>
+  </ol>
+  <div class="pg cs" data-cs>
+    <h3 class="cs-h">1. Labels on the request counter</h3>
+    <div class="pg-row" role="group" aria-label="Labels on the request counter">
+      <label class="cs-check"><input type="checkbox" checked data-lab="route" /> route (20)</label>
+      <label class="cs-check"><input type="checkbox" checked data-lab="status" /> status (5)</label>
+      <label class="cs-check"><input type="checkbox" checked data-lab="region" /> region (6)</label>
+      <label class="cs-check"><input type="checkbox" data-lab="customer" /> customer id (1,000,000)</label>
+      <label class="cs-check"><input type="checkbox" data-lab="hist" /> latency histogram (14 series per label set)</label>
+    </div>
+    <div class="pg-grid">
+      <div class="pg-box" data-box="series"><h3>Series (upper bound)</h3><span class="pg-mono" data-out="series"></span><span class="pg-note" data-out="formula"></span></div>
+      <div class="pg-box" data-box="mem"><h3>Memory at 3 KB per series</h3><span class="pg-mono" data-out="mem"></span><span class="pg-note" data-out="memnote"></span></div>
+    </div>
+    <p class="pg-out" data-out="labverdict" aria-live="polite"></p>
+
+    <h3 class="cs-h">2. Sample 100,000 requests (2 seconds of traffic)</h3>
+    <div class="pg-row">
+      <label>Head sampling rate
+        <select class="pg-in" data-head>
+          <option value="1">100% (keep all)</option><option value="10">10%</option><option value="100" selected>1%</option><option value="1000">0.1%</option>
+        </select>
+      </label>
+      <label class="cs-check"><input type="checkbox" data-tail /> Tail sampling (keep errors and slow)</label>
+      <button class="btn" type="button" data-seed>New seed</button>
+      <span class="pg-note">seed <b data-out="seed"></b></span>
+    </div>
+    <div class="pg-grid">
+      <div class="pg-box" style="--c: var(--role-1)"><h3>Traces kept</h3><span class="pg-mono" data-out="kept"></span><span class="pg-note" data-out="keptnote"></span></div>
+      <div class="pg-box" data-box="errs"><h3>Error traces kept</h3><span class="pg-mono" data-out="errs"></span><span class="pg-note" data-out="errsnote"></span></div>
+      <div class="pg-box" style="--c: var(--role-2)"><h3>Request count estimate</h3><span class="pg-mono" data-out="count"></span><span class="pg-note" data-out="countnote"></span></div>
+      <div class="pg-box" style="--c: var(--role-3)"><h3>Error rate estimate</h3><span class="pg-mono" data-out="rate"></span><span class="pg-note" data-out="ratenote"></span></div>
+      <div class="pg-box" style="--c: var(--role-4)"><h3>p99 latency</h3><span class="pg-mono" data-out="p99"></span><span class="pg-note" data-out="p99note"></span></div>
+      <div class="pg-box" style="--c: var(--role-5)"><h3>Complete traces, 3 services</h3><span class="pg-mono" data-out="complete"></span><span class="pg-note" data-out="completenote"></span></div>
+      <div class="pg-box" style="--c: var(--role-6)"><h3>Storage at 50,000 req/s</h3><span class="pg-mono" data-out="cost"></span><span class="pg-note" data-out="costnote"></span></div>
+    </div>
+    <p class="pg-out" data-out="verdict" aria-live="polite"></p>
+    <p class="pg-note">Assumptions: 3 KB of memory per active series; 5 KB per stored trace; $0.30 per GB ingested; tail sampling buffers 30 s of traces; errors are timeouts of 1.5 to 4 s; 1% of successes are slow (0.8 to 3 s) and tail sampling keeps those too. Intervals are 95%; the count interval uses the normal approximation.</p>
+  </div>
+</PlaygroundShell>
+<script>
+  // ---- pure core (same algorithm as the code samples) ----
+  const N = 100000; const SLOW_MS = 800; const RPS = 50000; const TRACE_KB = 5; const SERIES_BYTES = 3072; const USD_PER_GB = 0.3; const WAIT_S = 30;
+  const LABELS: Record<string, number> = { route: 20, status: 5, region: 6, customer: 1000000 };
+  const SERVER_SERIES = 20000000; // roughly what a 64 GB metrics server holds at 3 KB per series
+
+  function mix(x: number): number {
+    x = Math.imul(x ^ (x >>> 16), 0x85ebca6b); x = Math.imul(x ^ (x >>> 13), 0xc2b2ae35);
+    return (x ^ (x >>> 16)) >>> 0;
+  }
+  function mulberry32(seed: number): () => number {
+    let a = seed >>> 0;
+    return () => {
+      a = (a + 0x6d2b79f5) >>> 0;
+      let t = Math.imul(a ^ (a >>> 15), 1 | a);
+      t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+      return (t ^ (t >>> 14)) >>> 0;
+    };
+  }
+  interface Ev { id: number; err: boolean; ms: number }
+  function makeStream(n: number, seed: number): Ev[] {
+    const rng = mulberry32(seed); const out: Ev[] = [];
+    for (let i = 0; i < n; i++) {
+      const id = rng(); const u = rng() % 100000; let ms: number; let err = false;
+      if (u < 200) { err = true; ms = 1500 + (rng() % 2500); }
+      else if (u < 1200) ms = SLOW_MS + (rng() % 2200);
+      else ms = 20 + (rng() % 60) + (rng() % 60) + (rng() % 60);
+      out.push({ id, err, ms });
+    }
+    return out;
+  }
+  const headKeep = (id: number, d: number, salt = 0x9e3779b9) => mix((id ^ salt) >>> 0) < Math.floor(4294967296 / d);
+  const interesting = (e: Ev) => e.err || e.ms >= SLOW_MS;
+  function weightedQuantile(items: [number, number][], pct: number): number {
+    const s = items.slice().sort((a, b) => a[0] - b[0]);
+    let total = 0; for (const x of s) total += x[1];
+    let cum = 0;
+    for (const [ms, w] of s) { cum += w; if (cum * 100 >= pct * total) return ms; }
+    return 0;
+  }
+  function wilson(k: number, n: number): [number, number] {
+    if (n === 0) return [0, 1];
+    const z = 1.96; const p = k / n; const d = 1 + (z * z) / n;
+    const c = (p + (z * z) / (2 * n)) / d; const h = (z * Math.sqrt((p * (1 - p)) / n + (z * z) / (4 * n * n))) / d;
+    return [Math.max(0, c - h), c + h];
+  }
+  interface Result { kept: number; errsKept: number; trueErrors: number; est: number; se: number; rate: number; lo: number; hi: number; p99: number; naive: number; trueP99: number; consistent: number; independent: number }
+  function sample(stream: Ev[], d: number, tail: boolean): Result {
+    const kept = stream.filter((e) => headKeep(e.id, d) || (tail && interesting(e)));
+    const wOf = (e: Ev) => (tail && interesting(e) ? 1 : d);
+    const errsKept = kept.filter((e) => e.err).length;
+    let est = 0; let normal = 0;
+    for (const e of kept) { est += wOf(e); if (!(tail && interesting(e))) normal++; }
+    const se = Math.sqrt(normal * d * (d - 1));
+    let rate: number; let lo: number; let hi: number;
+    if (tail) { rate = est ? errsKept / est : 0; lo = errsKept / (est + 1.96 * se); hi = est - 1.96 * se > 0 ? errsKept / (est - 1.96 * se) : 1; }
+    else { rate = kept.length ? errsKept / kept.length : 0; [lo, hi] = wilson(errsKept, kept.length); }
+    const three = (s1: number, s2: number, s3: number) => stream.filter((e) => headKeep(e.id, d, s1) && headKeep(e.id, d, s2) && headKeep(e.id, d, s3)).length;
+    return {
+      kept: kept.length, errsKept, trueErrors: stream.filter((e) => e.err).length, est, se, rate, lo, hi,
+      p99: weightedQuantile(kept.map((e) => [e.ms, wOf(e)]), 99), naive: weightedQuantile(kept.map((e) => [e.ms, 1]), 99),
+      trueP99: weightedQuantile(stream.map((e) => [e.ms, 1]), 99),
+      consistent: stream.filter((e) => headKeep(e.id, d) && headKeep(e.id, d) && headKeep(e.id, d)).length,
+      independent: three(1, 2, 3),
+    };
+  }
+  function seriesFor(on: Record<string, boolean>): { total: number; parts: string[] } {
+    let total = 1; const parts: string[] = [];
+    for (const k of Object.keys(LABELS)) if (on[k]) { total *= LABELS[k]; parts.push(LABELS[k].toLocaleString('en-US')); }
+    if (on.hist) { total *= 14; parts.push('14'); }
+    return { total, parts };
+  }
+  function bytes(n: number): string {
+    const u = ['B', 'KB', 'MB', 'GB', 'TB', 'PB']; let i = 0; let v = n;
+    while (v >= 1000 && i < u.length - 1) { v /= 1000; i++; }
+    return `${v >= 100 ? v.toFixed(0) : v.toFixed(1)} ${u[i]}`;
+  }
+  const pct = (x: number, dp = 2) => `${(x * 100).toFixed(dp)}%`;
+  const fmt = (n: number) => Math.round(n).toLocaleString('en-US');
+
+  // ---- DOM ----
+  document.querySelectorAll<HTMLElement>('[data-cs]').forEach((root) => {
+    const q = <T extends HTMLElement>(s: string) => root.querySelector<T>(s)!;
+    const out = (k: string) => q(`[data-out="${k}"]`);
+    const box = (k: string) => q(`[data-box="${k}"]`);
+    let seeds = [5, 1, 2, 3, 4, 11, 42]; let seedIdx = 0;
+    let cache: { seed: number; stream: Ev[] } | null = null; let raf = 0;
+
+    function drawLabels() {
+      const on: Record<string, boolean> = {};
+      root.querySelectorAll<HTMLInputElement>('[data-lab]').forEach((c) => { on[c.dataset.lab!] = c.checked; });
+      const { total, parts } = seriesFor(on);
+      const mem = total * SERIES_BYTES;
+      out('series').textContent = fmt(total);
+      out('formula').textContent = parts.length ? parts.join(' x ') : 'no labels: a single series';
+      out('mem').textContent = bytes(mem);
+      out('memnote').textContent = `${(mem / 64e9 * 100).toFixed(mem / 64e9 < 0.01 ? 3 : 1)}% of a 64 GB server`;
+      const bad = total > SERVER_SERIES; const warn = total > SERVER_SERIES / 20;
+      box('series').style.setProperty('--c', bad ? 'var(--bad)' : warn ? 'var(--role-3)' : 'var(--role-2)');
+      box('mem').style.setProperty('--c', bad ? 'var(--bad)' : warn ? 'var(--role-3)' : 'var(--role-2)');
+      const el = out('labverdict'); el.classList.toggle('bad', bad);
+      el.textContent = bad ? `Too many: about ${fmt(total / SERVER_SERIES)} times what one 64 GB metrics server holds (${fmt(SERVER_SERIES)} series). A single unbounded label did this.`
+        : warn ? 'Heavy: this is over 1 million series. Check every label earns its place.'
+        : 'Fine: bounded labels, small memory, fast queries.';
+    }
+    function drawSampling() {
+      raf = 0;
+      const seed = seeds[seedIdx];
+      if (!cache || cache.seed !== seed) cache = { seed, stream: makeStream(N, seed) };
+      const d = Number(q<HTMLSelectElement>('[data-head]').value); const tail = q<HTMLInputElement>('[data-tail]').checked;
+      const r = sample(cache.stream, d, tail);
+      out('seed').textContent = String(seed);
+      out('kept').textContent = `${fmt(r.kept)} of ${fmt(N)}`;
+      out('keptnote').textContent = `${pct(r.kept / N, 2)} of traces`;
+      out('errs').textContent = `${r.errsKept} of ${r.trueErrors}`;
+      out('errsnote').textContent = `${pct(r.errsKept / r.trueErrors, 1)} of error traces`;
+      box('errs').style.setProperty('--c', r.errsKept === r.trueErrors ? 'var(--role-2)' : 'var(--bad)');
+      out('count').textContent = `${fmt(r.est)} (${r.est >= N ? '+' : ''}${(((r.est - N) / N) * 100).toFixed(2)}%)`;
+      out('countnote').textContent = d === 1 ? 'exact: every event has weight 1' : `95% interval ${fmt(r.est - 1.96 * r.se)} to ${fmt(r.est + 1.96 * r.se)}; truth is ${fmt(N)}`;
+      out('rate').textContent = pct(r.rate, 3);
+      out('ratenote').textContent = `95% interval ${pct(r.lo, 3)} to ${pct(r.hi, 3)}; truth ${pct(r.trueErrors / N, 3)}`;
+      out('p99').textContent = `${r.p99} ms weighted`;
+      out('p99note').textContent = `true ${r.trueP99} ms; unweighted kept traces ${r.naive} ms`;
+      out('complete').textContent = tail ? fmt(r.kept) : `${fmt(r.consistent)} by trace id`;
+      out('completenote').textContent = tail ? 'the collector sees whole traces and decides once' : `${fmt(r.independent)} if each service flips its own coin`;
+      const frac = r.kept / N; const gbDay = RPS * 86400 * TRACE_KB * frac / 1e6;
+      out('cost').textContent = `${fmt(gbDay)} GB/day, $${fmt(gbDay * USD_PER_GB)}/day`;
+      out('costnote').textContent = tail ? `plus about ${(RPS * WAIT_S * TRACE_KB / 1e6).toFixed(1)} GB of collector memory to buffer ${WAIT_S} s` : 'no buffering needed: decided at the start';
+      const el = out('verdict'); let bad = false; let msg: string;
+      if (tail) msg = `Tail sampling kept all ${r.errsKept} error traces. Counts are rebuilt from weights (1 for interesting traces, ${d} for the rest). The unweighted p99 would be ${r.naive} ms against a true ${r.trueP99} ms.`;
+      else if (d === 1) msg = 'Everything is kept: exact numbers and every error, at the full storage cost.';
+      else if (r.errsKept === 0) { bad = true; msg = `No error trace survived. The data suggests there were no errors, but there were ${r.trueErrors}: a rare-event blind spot. The error rate interval runs up to ${pct(r.hi, 1)}.`; }
+      else { bad = r.errsKept / r.trueErrors < 0.5; msg = `Only ${r.errsKept} of ${r.trueErrors} error traces kept: about ${pct(r.errsKept / r.trueErrors, 1)}, the same as the sampling rate. The request count is fine (${(((r.est - N) / N) * 100).toFixed(2)}% off) but the error rate interval is wide.`; }
+      out('verdict').classList.toggle('bad', bad); el.textContent = msg;
+    }
+    const schedule = () => { if (!raf) raf = requestAnimationFrame(drawSampling); };
+    root.querySelectorAll('[data-lab]').forEach((c) => c.addEventListener('change', drawLabels));
+    q('[data-head]').addEventListener('change', schedule);
+    q('[data-tail]').addEventListener('change', schedule);
+    q('[data-seed]').addEventListener('click', () => { seedIdx = (seedIdx + 1) % seeds.length; schedule(); });
+    drawLabels(); drawSampling();
+  });
+</script>
+<style is:global>
+  .playground .cs-check { display: inline-flex; align-items: center; gap: 6px; }
+  .playground .cs-h { margin: 14px 0 8px; font-size: 1rem; }
+  .playground .cs-h:first-child { margin-top: 0; }
+</style>

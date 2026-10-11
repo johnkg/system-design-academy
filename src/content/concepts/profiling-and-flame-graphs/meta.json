@@ -1,0 +1,87 @@
+{
+  "name": "Profiling and Flame Graphs",
+  "area": "observability",
+  "difficulty": "intermediate",
+  "intent": "Find which functions inside one process burn the CPU, wait on locks or IO, or allocate the memory, by sampling stack traces and merging them into a flame graph.",
+  "scenario": "After release 412 the GET /orders handler got twice as slow: CPU per request went from 1.0 ms to 2.0 ms. Metrics and traces say the handler is slow but not why. A 60 second profile shows one function, encode_loop inside json_encode, as 58% of all samples because of an accidental O(n^2) loop.",
+  "problem": "Metrics tell you that a service is slow and distributed traces tell you which service, but neither can say which line of code inside the process is responsible. Guessing and adding timers by hand is slow and changes what you measure. You need a way to attribute time, memory or blocking to functions in a running program with a cost small enough to leave on in production.",
+  "howItWorks": [
+    {
+      "title": "Sample the stack instead of timing every call",
+      "text": "A sampling profiler interrupts the process on a timer (perf at 99 Hz, async-profiler at 10 ms or every N CPU cycles, pprof at 100 Hz) and records the current call stack. It does not need to know when functions start or end. An instrumenting profiler (tracing hooks, sys.setprofile, gprof's mcount) records every call and return: exact call counts and durations, but the hooks cost more than the tiny functions they measure and distort the result, so it is usually kept for debugging, not production."
+    },
+    {
+      "title": "Merge identical stacks into a collapsed list",
+      "text": "Each sample is a stack such as handler;serialize;json_encode;encode_loop. Samples with the same stack are counted: the collapsed format is one line per distinct stack, 'a;b;c 3510'. Over N samples, the share of a stack estimates the share of time spent there, with a standard error of about sqrt(p(1-p)/N). A function at 3% needs a few thousand samples before its estimate is tight."
+    },
+    {
+      "title": "Draw the merged tree as a flame graph",
+      "text": "The stacks are merged into a call tree: the root is at the bottom, callees stack on top. Box width is the share of samples that include that frame. The x axis is NOT time: siblings are sorted alphabetically, so left to right means nothing. Self time is the part of a box not covered by its children (the exposed top edge); total (inclusive) time is the whole width. A wide plateau at the top is a function burning time itself; a tall narrow tower is just deep call nesting and costs little."
+    },
+    {
+      "title": "Choose what you sample: CPU, wall clock, allocations",
+      "text": "A CPU profile only samples threads that are running, so it never shows time spent waiting. A wall-clock (off-CPU) profile also samples blocked threads: time in a mutex, a socket read, a sleep or a disk wait shows up as frames like futex_wait or read. Allocation and heap profiles sample by bytes allocated (every ~512 KiB in Go's pprof, TLAB-based in async-profiler) and show who allocates or who still holds memory. Pick the mode that matches the symptom: high CPU, slow but idle, or growing memory."
+    },
+    {
+      "title": "Compare profiles before and after",
+      "text": "A differential flame graph subtracts two profiles (normalized to the same total) and colours frames by growth or shrinkage. It answers 'what changed in this release' directly. Run continuous profiling in production (Parca, Pyroscope, Grafana Phlare, Google Cloud Profiler, Datadog) at about 100 Hz per process, which costs roughly 1 to 2 percent CPU, and keep profiles tagged by version so the before and after exist when you need them."
+    },
+    {
+      "title": "Read it with the pitfalls in mind",
+      "text": "Frames need symbols: stripped binaries and JIT code show addresses until symbolized, and frame-pointer-less builds need DWARF or ORC unwinding. The optimizer inlines small functions, so their time is attributed to the caller unless inline debug info is used. Safepoint-biased JVM profilers only see stacks at safepoints and mislead on tight loops. Too low a rate or too short a window misses small functions, and a rate that locks step with a periodic task aliases."
+    }
+  ],
+  "pros": [
+    "Points at a function and often a line, which metrics and traces cannot do",
+    "Sampling cost is proportional to the rate, not to the number of calls: about 1% CPU at 100 Hz",
+    "Works on a running production process with no code changes in most runtimes",
+    "Differential profiles show exactly what a release changed",
+    "One picture shows the whole distribution of time, so surprises (a 3% logger, a 60% regex) stand out"
+  ],
+  "cons": [
+    "Statistical: small functions need many samples, and results vary run to run",
+    "Says where time goes, not why: an O(n^2) loop and a legitimately heavy function look the same",
+    "CPU profiles are blind to waiting; wall-clock profiles are noisier and need thread filtering (idle threads dominate)",
+    "Needs symbols, unwinding info and sometimes runtime flags; inlining and JIT complicate attribution",
+    "Flame graphs are easy to misread (the x axis is not time)"
+  ],
+  "whenToUse": [
+    "A CPU spike or a handler that got slower and the cause is not obvious from metrics and traces",
+    "Capacity work: find the top few functions worth optimizing before buying more machines",
+    "Comparing two releases, builds or configs with a differential profile",
+    "Memory growth or GC pressure: allocation and heap profiles",
+    "Always-on continuous profiling for services where regressions are costly"
+  ],
+  "whenNotToUse": [
+    "The time is spent in other services or the network: use distributed tracing first",
+    "The code runs for a few milliseconds per hour: there are too few samples to mean anything",
+    "You need exact call counts or exact durations of one call: use an instrumenting profiler or a benchmark",
+    "A micro-optimization question on one function: a benchmark with statistics is more precise than a profile"
+  ],
+  "pitfalls": [
+    "Reading the x axis as time: left to right is alphabetical, and width is share of samples, not chronology",
+    "Confusing self and total: a wide box with a thin top edge is a caller, the real cost is in its callees",
+    "Sampling a CPU profile of a service that is slow because it waits (locks, database, IO): the profile looks healthy and flat",
+    "Too few samples: 100 Hz for 10 seconds is 1,000 samples, and a 3% function gets about 30 of them, plus or minus 10 at 95% confidence",
+    "Safepoint bias on the JVM and other runtimes that only sample at safe points, which attributes time to the wrong frame",
+    "Missing inline frames: the optimizer folded the hot helper into its caller, so the caller looks guilty",
+    "Profiling a debug or differently flagged build, so the profile does not match production",
+    "Comparing two flame graphs of different total width: normalize or compare absolute per-request time"
+  ],
+  "related": [
+    { "kind": "concept", "slug": "metrics" },
+    { "kind": "concept", "slug": "distributed-tracing" },
+    { "kind": "concept", "slug": "structured-logging" },
+    { "kind": "concept", "slug": "alerting" },
+    { "kind": "concept", "slug": "slos-and-error-budgets" },
+    { "kind": "concept", "slug": "latency-and-round-trips" },
+    { "kind": "concept", "slug": "cardinality-and-sampling" },
+    { "kind": "concept", "slug": "queueing-theory-and-littles-law" }
+  ],
+  "roles": [
+    { "id": "service", "label": "Service process", "description": "The running program whose stacks are sampled." },
+    { "id": "sampler", "label": "Sampler", "description": "The profiler: a timer or hardware counter that captures stacks at a fixed rate." },
+    { "id": "store", "label": "Profile store", "description": "Aggregates collapsed stacks per service and version." },
+    { "id": "viewer", "label": "Flame graph", "description": "Renders the merged call tree so widths show the share of samples." }
+  ]
+}

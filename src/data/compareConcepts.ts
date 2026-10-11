@@ -169,6 +169,50 @@ export const problems: Problem[] = [
   { text: 'Get my data back after a bad deploy, an accidental DELETE or a lost server', patterns: [
     { slug: 'backups-and-point-in-time-recovery', why: 'Restore a base backup and replay the archived log up to just before the mistake.' },
     { slug: 'database-replication', why: 'A replica is not a backup: it copies the mistake within a second.' } ] },
+  { text: 'Let users sign in with another account, or let an app act for them with limited access', patterns: [
+    { slug: 'oauth-and-openid-connect', why: 'The authorization code flow with PKCE hands out tokens without sharing passwords.' },
+    { slug: 'jwt-and-session-tokens', why: 'Choose between server-side sessions and signed tokens, and decide how revocation works.' } ] },
+  { text: 'Decide who may see or edit what in an app with teams, folders and sharing', patterns: [
+    { slug: 'access-control-models', why: 'Compare ACLs, roles, attribute rules and relationship-based checks, and how each grows.' } ] },
+  { text: 'Keep a bad dependency or build step from reaching production', patterns: [
+    { slug: 'supply-chain-security', why: 'Lockfiles, integrity hashes, scoped registries and release-age gates limit the damage of a malicious update.' } ] },
+  { text: 'Find out why one service is slow, starting from nothing', patterns: [
+    { slug: 'red-use-and-golden-signals', why: 'A short checklist of request and resource signals that points at the failing component.' },
+    { slug: 'profiling-and-flame-graphs', why: 'Once you know which process, a profile shows which function burns the time.' },
+    { slug: 'synthetic-monitoring-and-rum', why: 'Probes and real-user data tell you whether users, in each region, feel it.' } ] },
+  { text: 'Cut the cost of metrics, logs and traces without losing the errors', patterns: [
+    { slug: 'cardinality-and-sampling', why: 'Bound the labels, and sample so that errors and slow requests are always kept.' } ] },
+  { text: 'Make pages and API responses load faster by caching them correctly', patterns: [
+    { slug: 'http-caching-headers', why: 'Cache-Control, ETag and hashed file names decide what browsers and CDNs may reuse.' },
+    { slug: 'cdn', why: 'Shared caches near users serve what the headers allow.' } ] },
+  { text: 'Understand why downloads are slow on a long or lossy link, or why a route changes', patterns: [
+    { slug: 'tcp-congestion-control', why: 'The congestion window, slow start and loss recovery set how fast a transfer can go.' },
+    { slug: 'anycast-and-bgp-routing', why: 'Routing picks the nearest site by network path, and withdrawals move traffic.' },
+    { slug: 'cidr-and-subnetting', why: 'Address plans and route tables decide what can reach what.' } ] },
+  { text: 'Keep a service up when traffic spikes or a dependency gets slow', patterns: [
+    { slug: 'timeouts-and-deadlines', why: 'Bound every wait, and pass the remaining time down the call chain.' },
+    { slug: 'load-shedding', why: 'Refuse some work early so the rest finishes in time.' },
+    { slug: 'graceful-degradation', why: 'Serve a simpler page instead of an error when an optional part fails.' },
+    { slug: 'queueing-theory-and-littles-law', why: 'Explains why latency explodes near full utilisation and how to size pools.' } ] },
+  { text: 'Cut the slowest requests when one user request fans out to many servers', patterns: [
+    { slug: 'hedged-requests-and-tail-latency', why: 'Send a second copy after the p95 delay and take the first answer.' } ] },
+  { text: 'Stop two users or services from silently overwriting each other', patterns: [
+    { slug: 'optimistic-concurrency-and-etags', why: 'Send the version you read, and reject the write if it changed.' },
+    { slug: 'crdts', why: 'For offline or multi-master data, merge instead of rejecting.' } ] },
+  { text: 'Change a message or API format without breaking older producers and consumers', patterns: [
+    { slug: 'schema-evolution-and-compatibility', why: 'Know which changes are backward and forward compatible, and never reuse a field number.' },
+    { slug: 'api-versioning', why: 'Version the contract itself when a change cannot be made compatible.' } ] },
+  { text: 'Offer an API for work that takes longer than a request should wait', patterns: [
+    { slug: 'async-apis-and-long-running-operations', why: 'Return 202 with a status resource, poll with backoff, or call back.' },
+    { slug: 'graphql-n-plus-one-and-dataloader', why: 'Batch the lookups behind a nested query so one request does not become hundreds.' } ] },
+  { text: 'Make sure each message is handled once, in order, and bad ones do not block the rest', patterns: [
+    { slug: 'delivery-guarantees', why: 'At-least-once delivery plus idempotent processing gives effectively once.' },
+    { slug: 'ordering-and-partitioning', why: 'Order holds per key within a partition, and parallelism is capped by the partition count.' },
+    { slug: 'dead-letter-queues-and-poison-messages', why: 'Park messages that always fail so they stop blocking healthy ones.' } ] },
+  { text: 'Decide that a machine is dead, and make sure it cannot do harm if it is wrong', patterns: [
+    { slug: 'failure-detection', why: 'Heartbeats and phi accrual trade detection speed against false alarms.' },
+    { slug: 'leases-and-fencing-tokens', why: 'Fencing tokens make a stale owner harmless when the lease moved on.' },
+    { slug: 'merkle-trees-and-anti-entropy', why: 'Replicas find and repair their differences by comparing hash trees.' } ] },
 ];
 
 export const confusions: Confusion[] = [

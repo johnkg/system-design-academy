@@ -1,0 +1,286 @@
+---
+import PlaygroundShell from '../components/PlaygroundShell.astro';
+---
+<PlaygroundShell title="Simulate it" hint="PrintShop asks the photo service for read access to a user's photos. Pick an attack and a set of defences, then read every message.">
+  <ol class="how">
+    <li>The default is <b>code theft on a phone</b> with <b>PKCE on</b>: a malicious app registered for the same <code>printshop://</code> URL scheme steals the code, but the token request is refused because it cannot produce the <b>code_verifier</b>. Untick <b>PKCE</b>: the attacker gets tokens (public client).</li>
+    <li>Choose <b>Forged redirect_uri</b>. With <b>Exact match</b> the authorization server refuses the request before any code exists. Switch to <b>Prefix match</b>: the code leaks through an open redirect and the attacker gets tokens <b>even with PKCE on</b>, because the attacker started that flow and chose the challenge. Switch the client to <b>Confidential</b> and client authentication stops it.</li>
+    <li>Choose <b>Missing state (login CSRF)</b>. With <b>state</b> on, PrintShop rejects the callback. Untick state and PKCE still stops it as a side effect. Untick both and the victim's session is silently bound to the attacker's account.</li>
+    <li>Use <b>Step</b> to walk the messages one at a time, and look at the three boxes at the bottom: they re-evaluate all three attacks for the current defences.</li>
+  </ol>
+  <div class="pg oa" data-oa>
+    <div class="pg-row">
+      <label>Attack
+        <select class="pg-in" data-attack>
+          <option value="none">None (normal sign-in)</option>
+          <option value="theft" selected>Code theft on a phone</option>
+          <option value="forged">Forged redirect_uri</option>
+          <option value="csrf">Missing state (login CSRF)</option>
+        </select>
+      </label>
+      <label>Client type
+        <select class="pg-in" data-client>
+          <option value="public" selected>Public (mobile app, no secret)</option>
+          <option value="confidential">Confidential (server, has a secret)</option>
+        </select>
+      </label>
+      <label>Redirect matching
+        <select class="pg-in" data-redirect>
+          <option value="exact" selected>Exact match</option>
+          <option value="prefix">Prefix match</option>
+        </select>
+      </label>
+    </div>
+    <div class="pg-row">
+      <label class="oa-check"><input type="checkbox" checked data-pkce /> PKCE (S256), required by the server</label>
+      <label class="oa-check"><input type="checkbox" checked data-state /> Client checks <code>state</code></label>
+    </div>
+    <div class="pg-row">
+      <button class="btn pg-primary" type="button" data-step>Step</button>
+      <button class="btn" type="button" data-run>Run all</button>
+      <button class="btn" type="button" data-reset>Reset</button>
+      <span class="pg-note" data-progress></span>
+    </div>
+    <ol class="oa-trace" data-trace aria-label="Messages in this scenario, in order" aria-live="polite"></ol>
+    <div class="pg-grid">
+      <div class="pg-box" data-b1><h3>Attacker obtains tokens?</h3><span class="pg-mono" data-v1></span><span class="pg-note" data-n1></span></div>
+      <div class="pg-box" data-b2><h3>Stopped by</h3><span class="pg-mono" data-v2></span><span class="pg-note" data-n2></span></div>
+      <div class="pg-box" data-b3><h3>Real user's sign-in</h3><span class="pg-mono" data-v3></span><span class="pg-note" data-n3></span></div>
+    </div>
+    <div class="pg-grid" data-matrix></div>
+    <p class="pg-note">Assumptions: authorization codes are single use and expire in 60 seconds; the server enforces PKCE when the box is ticked (a server that merely accepts a challenge can be downgraded by omitting it); a prefix-matching server has <code>https://print.example/</code> and <code>printshop://</code> registered, and print.example has an open redirect at <code>/out</code>; the phone cannot keep a client secret, so only the confidential client sends one. Random values come from a fixed seed, and SHA-256 is computed for real.</p>
+  </div>
+</PlaygroundShell>
+<script>
+  type Attack = 'none' | 'theft' | 'forged' | 'csrf';
+  interface Cfg { attack: Attack; client: 'public' | 'confidential'; pkce: boolean; redirect: 'exact' | 'prefix'; state: boolean }
+  interface Step { from: string; to: string; title: string; fields: [string, string][]; verdict: 'info' | 'ok' | 'blocked' | 'attacker'; check?: string }
+  interface Result { steps: Step[]; attackerTokens: boolean; harm: string; stoppedBy: string; legit: string }
+
+  // ---- simulation core (pure) ----
+  function mulberry32(seed: number) {
+    let a = seed >>> 0;
+    return () => { a = (a + 0x6d2b79f5) >>> 0; let t = a; t = Math.imul(t ^ (t >>> 15), t | 1); t ^= t + Math.imul(t ^ (t >>> 7), t | 61); return ((t ^ (t >>> 14)) >>> 0) / 4294967296; };
+  }
+  const primes: number[] = [];
+  for (let n = 2; primes.length < 64; n++) if (primes.every((p) => n % p !== 0)) primes.push(n);
+  const frac32 = (x: number) => Math.floor((x - Math.floor(x)) * 4294967296) >>> 0;
+  const K = primes.map((p) => frac32(Math.cbrt(p)));
+  const H0 = primes.slice(0, 8).map((p) => frac32(Math.sqrt(p)));
+  const rotr = (x: number, n: number) => ((x >>> n) | (x << (32 - n))) >>> 0;
+
+  function sha256(bytes: number[]): number[] {
+    const h = H0.slice(); const m = bytes.slice(); const bits = bytes.length * 8;
+    m.push(0x80); while (m.length % 64 !== 56) m.push(0);
+    for (let i = 7; i >= 0; i--) m.push(i >= 4 ? 0 : (bits >>> (i * 8)) & 255);
+    for (let off = 0; off < m.length; off += 64) {
+      const w: number[] = [];
+      for (let i = 0; i < 16; i++) w[i] = ((m[off + 4 * i] << 24) | (m[off + 4 * i + 1] << 16) | (m[off + 4 * i + 2] << 8) | m[off + 4 * i + 3]) >>> 0;
+      for (let i = 16; i < 64; i++) {
+        const s0 = rotr(w[i - 15], 7) ^ rotr(w[i - 15], 18) ^ (w[i - 15] >>> 3);
+        const s1 = rotr(w[i - 2], 17) ^ rotr(w[i - 2], 19) ^ (w[i - 2] >>> 10);
+        w[i] = (w[i - 16] + s0 + w[i - 7] + s1) >>> 0;
+      }
+      let [a, b, c, d, e, f, g, hh] = h;
+      for (let i = 0; i < 64; i++) {
+        const t1 = (hh + (rotr(e, 6) ^ rotr(e, 11) ^ rotr(e, 25)) + ((e & f) ^ (~e & g)) + K[i] + w[i]) >>> 0;
+        const t2 = ((rotr(a, 2) ^ rotr(a, 13) ^ rotr(a, 22)) + ((a & b) ^ (a & c) ^ (b & c))) >>> 0;
+        hh = g; g = f; f = e; e = (d + t1) >>> 0; d = c; c = b; b = a; a = (t1 + t2) >>> 0;
+      }
+      [a, b, c, d, e, f, g, hh].forEach((v, i) => { h[i] = (h[i] + v) >>> 0; });
+    }
+    const out: number[] = [];
+    h.forEach((v) => out.push(v >>> 24, (v >>> 16) & 255, (v >>> 8) & 255, v & 255));
+    return out;
+  }
+  const ALPHA = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_';
+  function b64url(bytes: number[]): string {
+    let s = '';
+    for (let i = 0; i < bytes.length; i += 3) {
+      const n = (bytes[i] << 16) | ((bytes[i + 1] ?? 0) << 8) | (bytes[i + 2] ?? 0);
+      s += ALPHA[(n >>> 18) & 63] + ALPHA[(n >>> 12) & 63];
+      if (i + 1 < bytes.length) s += ALPHA[(n >>> 6) & 63];
+      if (i + 2 < bytes.length) s += ALPHA[n & 63];
+    }
+    return s;
+  }
+  const s256 = (verifier: string) => b64url(sha256(Array.from(verifier, (ch) => ch.charCodeAt(0))));
+
+  interface CodeRec { clientId: string; redirect: string; challenge: string | null; used: boolean }
+  interface Reply { ok: boolean; error: string; stoppedBy: string; code: string }
+  function makeServer(rnd: () => string, cfg: Cfg, registered: string, secret: string | null) {
+    const codes = new Map<string, CodeRec>();
+    const redirectOk = (uri: string) => (cfg.redirect === 'exact' ? uri === registered : uri.startsWith(registered));
+    return {
+      authorize(q: { redirect_uri: string; code_challenge: string | null }): Reply {
+        if (!redirectOk(q.redirect_uri)) return { ok: false, error: 'invalid_request: redirect_uri is not registered', stoppedBy: cfg.redirect === 'exact' ? 'Exact redirect_uri match' : 'Redirect matching', code: '' };
+        if (cfg.pkce && !q.code_challenge) return { ok: false, error: 'invalid_request: code_challenge required', stoppedBy: 'PKCE required', code: '' };
+        const code = rnd(); codes.set(code, { clientId: 'printshop', redirect: q.redirect_uri, challenge: q.code_challenge, used: false });
+        return { ok: true, error: '', stoppedBy: '', code };
+      },
+      token(q: { code: string; redirect_uri: string; code_verifier: string | null; client_secret: string | null }): Reply {
+        const rec = codes.get(q.code);
+        if (!rec || rec.used) return { ok: false, error: 'invalid_grant: code unknown or already used', stoppedBy: 'Single-use code', code: '' };
+        if (secret !== null && q.client_secret !== secret) return { ok: false, error: 'invalid_client: client authentication failed', stoppedBy: 'Client authentication', code: '' };
+        if (q.redirect_uri !== rec.redirect) return { ok: false, error: 'invalid_grant: redirect_uri differs from the authorization request', stoppedBy: 'redirect_uri binding', code: '' };
+        if (rec.challenge !== null && (q.code_verifier === null || s256(q.code_verifier) !== rec.challenge)) return { ok: false, error: 'invalid_grant: code_verifier does not match code_challenge', stoppedBy: 'PKCE (S256)', code: '' };
+        rec.used = true;
+        return { ok: true, error: '', stoppedBy: '', code: q.code };
+      },
+    };
+  }
+
+  const NAMES: Record<string, string> = { user: 'User browser', client: 'PrintShop', as: 'Auth server', api: 'Photo API', evil: 'Attacker' };
+  const kv = (o: Record<string, string>): [string, string][] => Object.entries(o);
+  const TOKENS: [string, string][] = [['access_token', 'at_9Lk2…  (opaque, 3600 s, scope photos.read)'], ['refresh_token', 'rt_Qm41…  (rotated on use)'], ['id_token', 'JWT: iss=photos.example sub=u-1842 aud=printshop nonce=n-0S6 exp=+300 s'], ['token_type', 'Bearer']];
+
+  function simulate(cfg: Cfg): Result {
+    const rng = mulberry32(20260611);
+    const rnd = (n = 16) => b64url(Array.from({ length: n }, () => Math.floor(rng() * 256)));
+    const mobile = cfg.attack === 'theft';
+    const base = mobile ? 'printshop://cb' : 'https://print.example/cb';
+    const registered = cfg.redirect === 'exact' ? base : mobile ? 'printshop://' : 'https://print.example/';
+    const secret = cfg.client === 'confidential' ? 'cs_' + rnd(12) : null;
+    const srv = makeServer(() => rnd(16), cfg, registered, secret);
+    const steps: Step[] = []; const push = (from: string, to: string, title: string, fields: [string, string][], verdict: Step['verdict'] = 'info', check?: string) => steps.push({ from, to, title, fields, verdict, check });
+    const res: Result = { steps, attackerTokens: false, harm: '', stoppedBy: '', legit: '' };
+    const verifier = rnd(32); const challenge = s256(verifier); const state = rnd(12);
+    const authFields = (redirect: string, st: string, ch: string): [string, string][] => kv({ response_type: 'code', client_id: 'printshop', redirect_uri: redirect, scope: 'openid photos.read', state: st, nonce: 'n-0S6' }).concat(cfg.pkce ? kv({ code_challenge: ch, code_challenge_method: 'S256' }) : []);
+    const tokenFields = (code: string, redirect: string, ver: string | null, withSecret: boolean): [string, string][] => kv({ grant_type: 'authorization_code', code, redirect_uri: redirect, client_id: 'printshop' }).concat(ver !== null ? kv({ code_verifier: ver }) : [], withSecret && secret ? kv({ client_secret: secret }) : []);
+    const note = (r: Reply) => (r.ok ? 'passed' : r.stoppedBy);
+
+    // The honest sign-in (also the start of the code theft scenario).
+    function legitStart(): string {
+      push('client', 'as', 'GET /authorize (via the browser)', authFields(base, state, challenge));
+      const a = srv.authorize({ redirect_uri: base, code_challenge: cfg.pkce ? challenge : null });
+      steps[steps.length - 1].check = 'redirect_uri ' + (cfg.redirect === 'exact' ? 'equals' : 'starts with') + ' the registered value: ' + note(a);
+      push('as', 'user', 'Login and consent screen', kv({ shows: 'PrintShop wants to read your photos and know who you are', password: 'typed into the auth server only, never into PrintShop' }));
+      push('as', 'client', 'Redirect back with the code', kv({ Location: base + '?code=' + a.code + '&state=' + state }));
+      return a.code;
+    }
+    function legitFinish(code: string) {
+      const t = srv.token({ code, redirect_uri: base, code_verifier: cfg.pkce ? verifier : null, client_secret: secret });
+      push('client', 'as', 'POST /token (back channel)', tokenFields(code, base, cfg.pkce ? verifier : null, true), t.ok ? 'ok' : 'blocked', t.ok ? 'client, code, redirect_uri and verifier all check out' : t.stoppedBy);
+      res.legit = t.ok ? 'completes' : 'fails: ' + t.error;
+      if (!t.ok) return;
+      push('as', 'client', '200 token response', TOKENS, 'ok');
+      push('client', 'api', 'GET /photos', kv({ Authorization: 'Bearer at_9Lk2…' }), 'ok');
+      push('api', 'client', '200 photos', kv({ checks: 'token valid, aud=photo-api, scope photos.read', identity: 'PrintShop learns who signed in from the id_token, not from the access token' }), 'ok');
+    }
+
+    if (cfg.attack === 'none') {
+      const code = legitStart();
+      if (cfg.state) steps[steps.length - 1].check = 'state in the callback equals the stored state: passed';
+      legitFinish(code);
+    } else if (cfg.attack === 'theft') {
+      const code = legitStart();
+      steps[steps.length - 1].verdict = 'attacker';
+      steps[steps.length - 1].check = 'the phone gives the URL to every app registered for printshop://, so the malicious app gets code and state too';
+      const t = srv.token({ code, redirect_uri: base, code_verifier: null, client_secret: null });
+      push('evil', 'as', 'POST /token with the stolen code', tokenFields(code, base, null, false), t.ok ? 'attacker' : 'blocked', t.ok ? 'no check fails: the attacker now holds the code, nothing more is needed' : t.stoppedBy + ': ' + t.error);
+      if (t.ok) {
+        res.attackerTokens = true; push('as', 'evil', '200 token response', TOKENS, 'attacker');
+        legitFinish(code);
+      } else { res.stoppedBy = t.stoppedBy; legitFinish(code); }
+    } else if (cfg.attack === 'forged') {
+      const forged = 'https://print.example/out?u=https://evil.test/c';
+      const aV = rnd(32); const aC = s256(aV);
+      push('evil', 'user', 'Phishing link', kv({ href: 'https://auth.photos.example/authorize?client_id=printshop&redirect_uri=' + forged + '&…' }), 'attacker');
+      const a = srv.authorize({ redirect_uri: forged, code_challenge: cfg.pkce ? aC : null });
+      push('user', 'as', 'GET /authorize (attacker-built)', authFields(forged, rnd(12), aC), a.ok ? 'info' : 'blocked', 'redirect_uri ' + (cfg.redirect === 'exact' ? 'must equal' : 'must start with') + ' ' + registered + ': ' + (a.ok ? 'passed' : a.stoppedBy));
+      if (!a.ok) { push('as', 'user', 'Error page, no redirect', kv({ error: a.error, note: 'the user is never sent to the forged address and no code exists' }), 'blocked'); res.stoppedBy = a.stoppedBy; res.legit = 'not involved'; }
+      else {
+        push('as', 'user', 'Login and consent screen', kv({ shows: 'the genuine consent screen for PrintShop', user: 'clicks Allow' }));
+        push('as', 'evil', '302 to print.example/out, which redirects on to evil.test', kv({ Location: forged + '&code=' + a.code }), 'attacker', 'print.example/out is an open redirect, so the code ends up in the attacker\'s hands');
+        const t = srv.token({ code: a.code, redirect_uri: forged, code_verifier: cfg.pkce ? aV : null, client_secret: null });
+        push('evil', 'as', 'POST /token with the stolen code', tokenFields(a.code, forged, cfg.pkce ? aV : null, false), t.ok ? 'attacker' : 'blocked', t.ok ? 'redirect_uri matches the request, and the verifier is the attacker\'s own' + (cfg.pkce ? ': PKCE cannot help here' : '') : t.stoppedBy + ': ' + t.error);
+        if (t.ok) { res.attackerTokens = true; push('as', 'evil', '200 token response', TOKENS, 'attacker'); } else res.stoppedBy = t.stoppedBy;
+        res.legit = 'not involved';
+      }
+    } else {
+      const aV = rnd(32); const aC = s256(aV); const aState = rnd(12);
+      const a = srv.authorize({ redirect_uri: base, code_challenge: cfg.pkce ? aC : null });
+      push('evil', 'as', 'Attacker signs in with their own account', authFields(base, aState, aC), 'attacker');
+      push('as', 'evil', 'Redirect with the attacker\'s code (not redeemed)', kv({ Location: base + '?code=' + a.code + '&state=' + aState }), 'attacker');
+      push('evil', 'user', 'Link or hidden image', kv({ href: base + '?code=' + a.code + '&state=' + aState }), 'attacker', 'the victim\'s browser sends its PrintShop session cookie along with it');
+      if (cfg.state) {
+        push('user', 'client', 'GET callback', kv({ code: a.code, state: aState }), 'blocked', 'state differs from the one stored in the victim\'s session: rejected');
+        res.stoppedBy = 'State check'; res.legit = 'not involved';
+      } else {
+        push('user', 'client', 'GET callback', kv({ code: a.code, state: aState }), 'info', 'state is not checked, so PrintShop accepts a code it never asked for');
+        const t = srv.token({ code: a.code, redirect_uri: base, code_verifier: cfg.pkce ? verifier : null, client_secret: secret });
+        push('client', 'as', 'POST /token (with the victim\'s own verifier)', tokenFields(a.code, base, cfg.pkce ? verifier : null, true), t.ok ? 'attacker' : 'blocked', t.ok ? 'the code is valid for PrintShop, so tokens are issued' : t.stoppedBy + ': ' + t.error);
+        if (t.ok) { push('as', 'client', '200 token response for the attacker\'s account', TOKENS, 'attacker'); res.harm = 'PrintShop now acts on the attacker\'s account: the victim\'s uploads land where the attacker can read them'; }
+        else res.stoppedBy = t.stoppedBy + ' (as a side effect)';
+        res.legit = 'not involved';
+      }
+    }
+    return res;
+  }
+  // ---- end of core ----
+
+  document.querySelectorAll<HTMLElement>('[data-oa]').forEach((root) => {
+    const q = <T extends HTMLElement>(s: string) => root.querySelector<T>(s)!;
+    const cfg = (attack?: Attack): Cfg => ({ attack: attack ?? (q<HTMLSelectElement>('[data-attack]').value as Attack), client: q<HTMLSelectElement>('[data-client]').value as Cfg['client'], redirect: q<HTMLSelectElement>('[data-redirect]').value as Cfg['redirect'], pkce: q<HTMLInputElement>('[data-pkce]').checked, state: q<HTMLInputElement>('[data-state]').checked });
+    let result: Result = simulate(cfg()); let shown = 0;
+    const matrix = q('[data-matrix]'); const trace = q('[data-trace]');
+    const cells: { box: HTMLElement; title: HTMLElement; val: HTMLElement; note: HTMLElement }[] = [];
+    const labels: [Attack, string][] = [['theft', 'Code theft on a phone'], ['forged', 'Forged redirect_uri'], ['csrf', 'Missing state']];
+    labels.forEach(([, label]) => {
+      const box = document.createElement('div'); box.className = 'pg-box';
+      const title = document.createElement('h3'); title.textContent = label;
+      const val = document.createElement('span'); val.className = 'pg-mono'; const note = document.createElement('span'); note.className = 'pg-note';
+      box.append(title, val, note); matrix.appendChild(box); cells.push({ box, title, val, note });
+    });
+    const outcome = (r: Result) => (r.attackerTokens ? 'SUCCEEDS: attacker gets tokens' : r.harm ? 'SUCCEEDS: account confusion' : 'BLOCKED');
+
+    function draw() {
+      trace.textContent = '';
+      result.steps.slice(0, shown).forEach((s, i) => {
+        const li = document.createElement('li'); li.className = 'oa-step ' + s.verdict;
+        const head = document.createElement('b'); head.textContent = `${NAMES[s.from]} → ${NAMES[s.to]}: ${s.title}`;
+        li.appendChild(head);
+        if (s.fields.length) { const pre = document.createElement('div'); pre.className = 'pg-mono oa-fields'; pre.textContent = s.fields.map(([k, v]) => `${k}=${v}`).join('\n'); li.appendChild(pre); }
+        if (s.check) { const c = document.createElement('div'); c.className = 'pg-note'; c.textContent = (s.verdict === 'blocked' ? 'Refused. ' : '') + s.check; li.appendChild(c); }
+        if (i === shown - 1) li.setAttribute('aria-current', 'step');
+        trace.appendChild(li);
+      });
+      q('[data-progress]').textContent = `${shown} of ${result.steps.length} messages`;
+      q<HTMLButtonElement>('[data-step]').disabled = shown >= result.steps.length;
+      const done = shown >= result.steps.length; const a = q<HTMLSelectElement>('[data-attack]').value as Attack;
+      const bad = result.attackerTokens || !!result.harm;
+      q('[data-v1]').textContent = !done ? '…' : a === 'none' ? 'no attacker' : result.attackerTokens ? 'YES' : 'no';
+      q('[data-n1]').textContent = !done ? 'step through or press Run all' : result.harm || (result.attackerTokens ? 'the attacker can call the Photo API as the user' : a === 'none' ? 'normal sign-in' : 'the attacker holds a code at most');
+      q('[data-v2]').textContent = !done ? '…' : result.stoppedBy || (bad ? 'nothing' : 'n/a');
+      q('[data-n2]').textContent = !done ? '' : bad ? 'no defence in the current settings applies' : result.stoppedBy ? 'the first check that failed' : '';
+      q('[data-v3]').textContent = !done ? '…' : result.legit || 'completes';
+      q('[data-n3]').textContent = !done ? '' : result.legit.startsWith('fails') ? 'the code was already redeemed by the attacker' : '';
+      q<HTMLElement>('[data-b1]').style.setProperty('--c', done && bad ? 'var(--bad)' : 'var(--border)');
+      q<HTMLElement>('[data-b2]').style.setProperty('--c', done && !bad && result.stoppedBy ? 'var(--good)' : 'var(--border)');
+      q<HTMLElement>('[data-b3]').style.setProperty('--c', 'var(--border)');
+    }
+    function drawMatrix() {
+      labels.forEach(([atk], i) => {
+        const r = simulate(cfg(atk)); const bad = r.attackerTokens || !!r.harm;
+        cells[i].val.textContent = outcome(r); cells[i].note.textContent = bad ? 'no check applies' : 'stopped by: ' + r.stoppedBy;
+        cells[i].box.style.setProperty('--c', bad ? 'var(--bad)' : 'var(--good)');
+      });
+    }
+    function recompute(full: boolean) { result = simulate(cfg()); shown = full ? result.steps.length : 0; draw(); drawMatrix(); }
+    ['[data-attack]', '[data-client]', '[data-redirect]', '[data-pkce]', '[data-state]'].forEach((s) => q(s).addEventListener('change', () => recompute(true)));
+    q('[data-step]').addEventListener('click', () => { if (shown < result.steps.length) { shown++; draw(); } });
+    q('[data-run]').addEventListener('click', () => { shown = result.steps.length; draw(); });
+    q('[data-reset]').addEventListener('click', () => { shown = 0; draw(); });
+    recompute(true);
+  });
+</script>
+<style is:global>
+  .playground .oa-check { display: inline-flex; align-items: center; gap: 6px; }
+  .playground .oa-trace { list-style: none; margin: 12px 0; padding: 0; display: grid; gap: 8px; }
+  .playground .oa-step { border: 1px solid var(--border); border-left: 4px solid var(--role-1); border-radius: 8px; padding: 8px 12px; background: var(--surface); display: grid; gap: 4px; overflow-wrap: anywhere; }
+  .playground .oa-step.ok { border-left-color: var(--good); }
+  .playground .oa-step.blocked { border-left-color: var(--bad); background: color-mix(in srgb, var(--bad) 8%, var(--surface)); }
+  .playground .oa-step.attacker { border-left-color: var(--role-3); background: color-mix(in srgb, var(--role-3) 10%, var(--surface)); }
+  .playground .oa-step[aria-current] { box-shadow: 0 0 0 3px color-mix(in srgb, var(--accent) 30%, transparent); }
+  .playground .oa-fields { white-space: pre-wrap; background: var(--surface-2); border-radius: 6px; padding: 6px 8px; }
+</style>

@@ -1,0 +1,66 @@
+{
+  "name": "Queueing Theory and Little's Law",
+  "area": "reliability",
+  "difficulty": "intermediate",
+  "intent": "Use a little queueing mathematics to predict why latency explodes near full utilisation and to size pools, threads and servers before an outage does it for you.",
+  "scenario": "A service handles 1,000 requests per second and each takes 50 ms on average. How many requests are in flight, how many workers does it need, and why does a traffic bump from 90% to 99% busy turn 50 ms responses into 5 second ones?",
+  "problem": "Teams size systems by average load and are then surprised that a modest traffic increase makes latency jump by 10x or 100x, timeouts fire, clients retry, and the retries add load. The behaviour is not a bug in any one component. It is arithmetic: any resource with random arrivals and a queue has a latency curve that is flat at low utilisation and nearly vertical close to 100%, and variability makes it bend earlier.",
+  "howItWorks": [
+    { "title": "Little's law: L = lambda x W", "text": "For any stable system, the average number of items inside it (L) equals the average arrival rate (lambda) times the average time each item spends inside (W). It needs no assumption about arrival or service distributions. At 1,000 requests per second and 50 ms, L = 1,000 x 0.05 = 50 requests in flight on average. Apply it to anything: a thread pool, a connection pool, a queue, a whole service. It also works on the queue alone (waiting items = arrival rate x mean wait)." },
+    { "title": "Utilisation sets the shape of the latency curve", "text": "Utilisation is rho = lambda / (servers x service rate), the fraction of capacity in use. For one server with random (Poisson) arrivals and exponential service times (M/M/1), the mean time in the system is S / (1 - rho) where S is the service time, so the mean wait is S x rho / (1 - rho). At 50% busy the response time is 2x the service time, at 90% it is 10x, at 99% it is 100x. Doubling the load from 45% to 90% does not double latency, it multiplies it by 10 / 1.8, about 5.5x. Beyond 100% there is no steady state: the queue grows for as long as the overload lasts." },
+    { "title": "Variability bends the curve earlier (Kingman)", "text": "Kingman's approximation for one server says the mean wait is about (rho / (1 - rho)) x ((ca^2 + cs^2) / 2) x S, where ca and cs are the coefficients of variation (standard deviation / mean) of inter-arrival and service times. Exponential service has cs = 1. Perfectly regular service (cs = 0) halves the wait. Heavy-tailed service (cs = 3, a few slow requests among many fast ones) multiplies it by 5. Real request latencies are often heavy-tailed, so real knees arrive earlier than the textbook M/M/1 curve." },
+    { "title": "Pooling: one shared queue beats separate queues", "text": "With c servers fed from one queue (M/M/c), a request waits only when all c servers are busy, and the probability of that is given by the Erlang C formula. The knee moves to the right as c grows: 64 workers on one queue can run at 78% busy and still show a mean wait of about 0.1 ms on 50 ms work. The same 64 workers each with a private queue behave like 64 separate M/M/1 systems, and a request can wait behind a long job while another worker is idle. This is why one shared queue (or a work-stealing scheduler) beats sharding requests to workers up front. The catch: pooling does not remove the knee, it only moves it, and a bigger pool means a bigger cliff when something shared (a database) saturates." },
+    { "title": "Size pools with Little's law, then add headroom", "text": "Concurrency needed = throughput x latency. 1,000 requests per second at 50 ms needs 50 requests in flight; a pool of exactly 50 is 100% busy and unstable. Pick a target utilisation (60 to 80% is common, lower for spiky traffic or heavy-tailed service) and divide: 50 / 0.7 = 72 workers. Use the p99 service time, not the mean, when you want to cover bad moments. The same arithmetic converts a concurrency limit into a throughput ceiling: a pool of 20 connections with 40 ms queries tops out at 20 / 0.040 = 500 queries per second." },
+    { "title": "Near saturation, small changes and retries compound", "text": "Because the curve is almost vertical, a 10% rise in load at 90% busy pushes the system to 99% and latency from 10x to 100x. Clients time out, retry, and each retry is extra arrival rate: a 10% retry rate takes 90% busy to 99% busy, which causes more timeouts. Defences all work on the arrival side or the queue: bounded queues that reject early, load shedding, retries with backoff and budgets, and autoscaling that adds capacity before the knee." }
+  ],
+  "pros": [
+    "Back-of-the-envelope numbers (in flight, pool size, headroom) that match what production systems do",
+    "Little's law holds for any stable system whatever the distributions, so it is a safe sanity check on your own metrics",
+    "Explains hockey-stick latency, so the 70 to 80% utilisation guideline stops being folklore",
+    "Shows where more capacity pays off (before the knee) and where it does not (variability, a shared bottleneck)"
+  ],
+  "cons": [
+    "Closed-form results assume Poisson arrivals and steady state; real traffic is bursty, diurnal and correlated, which makes real queues worse",
+    "Needs the right definition of the system boundary and server: a pool, a CPU, a database and a lock each queue differently",
+    "Averages hide tails; the mean can look fine while p99 is 10x or more worse",
+    "Closed systems (a fixed number of users who wait for replies) behave differently from open ones, and the textbook formulas are for the open case"
+  ],
+  "whenToUse": [
+    "Sizing thread pools, connection pools, worker fleets and concurrency limits",
+    "Deciding how much headroom a service needs before autoscaling or load shedding must kick in",
+    "Explaining or predicting a latency cliff during a capacity review or an incident",
+    "Choosing between one shared queue and per-worker queues or sharding"
+  ],
+  "whenNotToUse": [
+    "As a precise predictor of production latency: use it for shape and order of magnitude, then load test",
+    "For systems with strongly bursty or self-similar traffic without measuring the real arrival variability first",
+    "When the bottleneck is not a queue at all (a fixed network round trip or a cold cache dominates)"
+  ],
+  "pitfalls": [
+    "Sizing for average load: at 100% average utilisation the queue is unstable, and even 90% gives a 10x response time",
+    "Treating 70 to 80% as a target to hit instead of a ceiling; the right number is lower for spiky or heavy-tailed workloads",
+    "Mixing units in Little's law (requests per second x milliseconds), or applying it with arrival rate and time measured over different windows or to different boundaries",
+    "Counting only successful requests in lambda or W; failures and timeouts occupy the system too",
+    "Splitting one pool into many small ones (per tenant, per endpoint, per worker) and losing the pooling benefit without isolating failures on purpose",
+    "Adding retries without a budget: a client timeout shorter than the queueing delay turns every slow response into extra load",
+    "Using the mean service time for heavy-tailed work; a few 2 second requests among 20 ms ones can dominate the wait"
+  ],
+  "related": [
+    { "kind": "concept", "slug": "backpressure" },
+    { "kind": "concept", "slug": "autoscaling" },
+    { "kind": "concept", "slug": "retries-and-backoff" },
+    { "kind": "concept", "slug": "load-balancing" },
+    { "kind": "concept", "slug": "bulkhead" },
+    { "kind": "concept", "slug": "slos-and-error-budgets" },
+    { "kind": "concept", "slug": "latency-and-round-trips" },
+    { "kind": "concept", "slug": "message-queues" },
+    { "kind": "concept", "slug": "timeouts-and-deadlines" },
+    { "kind": "concept", "slug": "load-shedding" },
+    { "kind": "concept", "slug": "hedged-requests-and-tail-latency" }
+  ],
+  "roles": [
+    { "id": "arrivals", "label": "Clients", "description": "Send requests at some average rate lambda, randomly spaced." },
+    { "id": "queue", "label": "Queue", "description": "Holds requests that arrived while every worker was busy. Its length is the hockey stick." },
+    { "id": "pool", "label": "Worker pool", "description": "Threads, connections or servers that serve one request each at a time." }
+  ]
+}

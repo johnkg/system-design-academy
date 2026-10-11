@@ -1,0 +1,72 @@
+{
+  "name": "Async APIs and Long-Running Operations",
+  "area": "api",
+  "difficulty": "intermediate",
+  "intent": "Expose work that takes longer than a request should wait as a job: accept it with 202, hand back a status resource, and let the client collect the result later.",
+  "scenario": "A reporting API generates a large report that takes about 45 seconds to build. Holding the connection open for it fails at the first proxy that has a 30 or 60 second idle timeout, so the API instead returns an operation id immediately, the client polls with a growing interval, and the result is fetched from a link when the operation succeeds.",
+  "problem": "A synchronous call that holds a connection for 60 seconds fails in ways the client cannot fix. Load balancers, API gateways and mobile networks cut idle connections at 30 to 120 seconds, the client gives up and retries, and the server keeps burning a worker on an answer nobody is waiting for. The retry then starts the same expensive job a second time. Long work needs a different shape: the request creates the work, and a separate resource reports on it.",
+  "howItWorks": [
+    { "title": "Create the job and answer at once", "text": "POST /reports validates the request, stores a job record (state pending), puts it on a queue and returns 202 Accepted within milliseconds. The Location header points at the status resource, for example /operations/op_42, and the body can repeat the id. 202 means accepted for processing, not done. The client sends an Idempotency-Key so a retried POST finds the same operation instead of creating a second one." },
+    { "title": "Model the operation as a resource with states", "text": "GET /operations/op_42 returns a small document: state (pending, running, succeeded, failed, cancelled), optional progress, timestamps, and on success a link to the result (or a 303 See Other to it). Failed carries a machine-readable error. The terminal states are final, which lets clients and caches treat them as stable. Google's long-running operation resource and the Microsoft REST guidelines both use this shape." },
+    { "title": "Poll with a growing interval and a Retry-After hint", "text": "The server sends Retry-After on each pending response, and the client waits at least that long, then lengthens its own interval (for example 2, 4, 8, 16 seconds up to a cap). Backoff keeps the polling cost low while the job is far from done, at the price of seeing the result up to one interval late. A fixed 1 second poll costs about 45 requests for a 45 second job; backoff costs about 5." },
+    { "title": "Workers run at least once, so jobs must be idempotent", "text": "A worker leases a job, runs it and acknowledges at the end. If it crashes, the lease expires and the job is handed to another worker, so a job can run twice. Make the work repeatable: write the result under a key derived from the job id (a put, not an append), and check the job's state before starting. Without a lease, a crash leaves the operation stuck in running forever." },
+    { "title": "Protect the queue, and expire the results", "text": "When the queue is full, reject new creates with 429 or 503 and a Retry-After instead of accepting work you cannot finish. Support DELETE or POST :cancel on the operation (workers check a cancel flag between steps). Keep results and operation records for a stated time such as 24 hours, then answer 410 Gone, so storage does not grow without bound." },
+    { "title": "Choose how the client learns about completion", "text": "Polling is simplest and works for browsers, scripts and mobile apps with no inbound connectivity. A webhook callback removes the polling cost for server-to-server clients that can expose an endpoint, but needs signing, retries and a fallback status resource anyway. Server-sent events or a websocket suit a user watching live progress, and cost a held connection each. Many APIs offer polling as the baseline and a callback as an option." }
+  ],
+  "pros": [
+    "Requests return in milliseconds, so no proxy, gateway or client timeout can break them",
+    "Retries are safe when creation is idempotent, and the client can reconnect later and still find its result",
+    "The queue absorbs bursts and the worker pool is sized for average load instead of peak concurrency",
+    "Progress, cancellation and partial failure have a natural place to live",
+    "Failures of a worker are invisible to the client when jobs are leased and re-run"
+  ],
+  "cons": [
+    "More moving parts: a queue, workers, a job store, a status endpoint and a retention policy",
+    "Clients must handle a two-step flow, which is harder than a single call",
+    "Polling adds latency (up to one interval) and load (clients divided by interval, per second)",
+    "At-least-once execution forces idempotent workers",
+    "Results need an expiry and a cleanup, and clients must fetch them in time"
+  ],
+  "whenToUse": [
+    "Work that regularly takes more than a few seconds: report generation, video transcoding, bulk import or export, ML inference batches",
+    "Operations that settle later, such as a payment that clears after minutes or days",
+    "Work whose duration varies a lot, so a fixed timeout would sometimes cut it off",
+    "Clients that may disconnect and come back, such as mobile apps and browsers"
+  ],
+  "whenNotToUse": [
+    "Work that reliably finishes in well under a second: a plain synchronous call is simpler and faster",
+    "Cases where the client cannot proceed without the answer and the work is cheap enough to hold a connection for 2 to 5 seconds",
+    "Internal calls between services in one trust domain that already share a queue or a workflow engine, where a message is enough",
+    "When you cannot afford a job store and a retention policy: the design leaks storage if nobody cleans it"
+  ],
+  "pitfalls": [
+    "Returning 200 with a body saying pending, which tells every cache and client the request is complete",
+    "A create endpoint without an idempotency key: a retry after a lost 202 starts the job twice",
+    "Polling with a fixed 1 second interval at scale: a million waiting clients is a million requests per second against the status endpoint",
+    "No Retry-After, so clients invent their own interval and all poll in lockstep",
+    "Jobs stuck in running after a worker crash, because there is no lease or heartbeat to detect it",
+    "Treating a status 404 as failure when the operation has simply expired, or deleting results before the client could fetch them",
+    "Cancellation that only flips a flag nobody reads, so the expensive work continues",
+    "Accepting every create and building an unbounded queue instead of rejecting with 429 or 503"
+  ],
+  "related": [
+    { "kind": "concept", "slug": "idempotency" },
+    { "kind": "concept", "slug": "webhooks" },
+    { "kind": "concept", "slug": "message-queues" },
+    { "kind": "concept", "slug": "backpressure" },
+    { "kind": "concept", "slug": "retries-and-backoff" },
+    { "kind": "concept", "slug": "real-time-communication" },
+    { "kind": "concept", "slug": "rate-limiting" },
+    { "kind": "concept", "slug": "timeouts-and-deadlines" },
+    { "kind": "concept", "slug": "delivery-guarantees" },
+    { "kind": "concept", "slug": "queueing-theory-and-littles-law" },
+    { "kind": "pattern", "slug": "command" }
+  ],
+  "roles": [
+    { "id": "client", "label": "Client", "description": "Creates the job, then polls or waits for a callback." },
+    { "id": "api", "label": "API", "description": "Accepts the request, stores the operation record and answers status queries." },
+    { "id": "queue", "label": "Job queue", "description": "Holds pending jobs and leases them to workers." },
+    { "id": "worker", "label": "Worker", "description": "Runs the long job and reports progress and the final state." },
+    { "id": "store", "label": "Result store", "description": "Keeps the finished result until it expires." }
+  ]
+}

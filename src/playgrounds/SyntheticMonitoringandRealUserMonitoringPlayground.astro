@@ -1,0 +1,224 @@
+---
+import PlaygroundShell from '../components/PlaygroundShell.astro';
+---
+<PlaygroundShell title="Simulate it" hint="One simulated day. From 03:00 to 06:00 UTC a CDN fault makes the site slow for users in Brazil. Choose what watches the site and see who notices, and when.">
+  <ol class="how">
+    <li>At the defaults (probe every 5 min from 3 locations, alert if any 1 fails, RUM at 10%) the synthetic checks <b>never</b> alert about the outage, because no probe runs in Brazil, and they raise 4 to 5 false alarms from single-probe blips. RUM alerts about 9 to 10 minutes after the start, but 500 to 600 Brazilian page views were already slow by then.</li>
+    <li>Set <b>Probe locations</b> to 5 (the fifth is in Brazil): the probe sees the fault within 4 to 9 minutes. Now set <b>Failure rule</b> to 2 of 3: false alarms fall to 0, but only one location can fail, so the alert comes 18 to 120 minutes late (an unrelated blip has to join it) or never. Switch <b>Fault scope</b> to everywhere and the same rule alerts within 1 minute.</li>
+    <li>With 5 locations and any 1 failing, compare intervals: every 1 min alerts at once but raises 22 to 26 false alarms in the day, every 15 min raises only 2 to 4 but alerts 12 minutes in.</li>
+    <li>Set <b>RUM sampling</b> to 1%: RUM never alerts, because it cannot gather the 20 samples it needs in 15 minutes from a quiet night. Untick <b>Real user monitoring</b> with the defaults and nobody is alerted: all 7,170 slow page views happen before anyone knows.</li>
+  </ol>
+  <div class="pg sm" data-sm>
+    <div class="pg-row">
+      <label>Probe interval <select class="pg-in" data-interval><option value="1">every 1 min</option><option value="5" selected>every 5 min</option><option value="15">every 15 min</option></select></label>
+      <label>Probe locations <input type="range" min="1" max="5" value="3" data-locs /> <b data-locsval>3</b></label>
+      <label>Failure rule <select class="pg-in" data-rule><option value="1" selected>any 1 location</option><option value="2">2 of 3 locations</option><option value="3">3 of 5 locations</option></select></label>
+      <label>Fault scope <select class="pg-in" data-scope><option value="brazil" selected>Brazil only</option><option value="global">everywhere</option></select></label>
+    </div>
+    <p class="pg-note sm-locs" data-locnames></p>
+    <div class="pg-row">
+      <label class="sm-check"><input type="checkbox" checked data-rumon /> Real user monitoring</label>
+      <label>RUM sampling <select class="pg-in" data-sampling><option value="1">100% of page views</option><option value="0.25">25%</option><option value="0.1" selected>10%</option><option value="0.01">1%</option></select></label>
+      <label>Day <select class="pg-in" data-seed><option value="1" selected>A</option><option value="2">B</option><option value="3">C</option></select></label>
+      <button class="btn" type="button" data-reset>Reset</button>
+    </div>
+    <div class="pg-grid">
+      <div class="pg-box" style="--c: var(--role-1)"><h3>Synthetic probes</h3><span class="pg-mono" data-sdet></span><span class="pg-note" data-sfa></span><span class="pg-note" data-schecks></span></div>
+      <div class="pg-box" style="--c: var(--role-2)"><h3>Real user monitoring</h3><span class="pg-mono" data-rdet></span><span class="pg-note" data-rfa></span><span class="pg-note" data-rp75></span></div>
+      <div class="pg-box" style="--c: var(--bad)"><h3>Users hurt</h3><span class="pg-mono" data-hurt></span><span class="pg-note" data-hurtnote></span></div>
+    </div>
+    <div class="sm-chart" tabindex="0" role="group" aria-label="Timeline of the simulated day with the outage band and alert markers">
+      <svg class="sm-svg" viewBox="0 0 720 96" role="img" aria-label="Timeline from 00:00 to 24:00 UTC. A band marks the outage; filled dots are alerts that caught it, hollow dots are false alarms." data-svg></svg>
+    </div>
+    <p class="pg-note sm-legend"><span class="sm-key sm-k1"></span> synthetic <span class="sm-key sm-k2"></span> RUM &nbsp; filled dot = caught the outage, hollow dot = false alarm, red band = outage</p>
+    <p class="pg-out" data-verdict aria-live="polite"></p>
+    <p class="pg-note">Assumptions: a probe in a faulted region fails 90% of the time; any probe also fails 0.4% of the time from a network blip; locations are staggered and the rule counts locations whose latest check failed. 12% of users block the RUM beacon. LCP is log-normal with a 1.7 s median (about 5.1 s during the fault); RUM alerts when the 15-minute p75 LCP of a region passes 4 s for 3 minutes in a row, needs 20 samples, and sees data 3 minutes late.</p>
+  </div>
+</PlaygroundShell>
+<script>
+const DAY = 1440, FAULT_START = 180, FAULT_END = 360, BRAZIL = 4;
+interface Params { seed: number; interval: number; locations: number; n: number; scope: string; rumOn: boolean; sampling: number }
+  interface World { seed: number; blip: number[][]; fail: number[][] }
+  interface Mark { t: number; kind: string }
+  const REGIONS = [
+  { id: 'us-east', name: 'US East', tz: -5, peak: 140 },
+  { id: 'eu-west', name: 'EU West', tz: 0, peak: 120 },
+  { id: 'ap-northeast', name: 'Tokyo', tz: 9, peak: 90 },
+  { id: 'us-west', name: 'US West', tz: -8, peak: 80 },
+  { id: 'sa-east', name: 'Brazil', tz: -3, peak: 100 },
+];
+const P_BLIP = 0.004, P_FAIL = 0.9, BLOCK = 0.12;
+const LCP_MEDIAN = 1700, LCP_SIGMA = 0.45, FAULT_FACTOR = 3, POOR = 4000;
+const RUM_WINDOW = 15, RUM_LAG = 3, RUM_MIN = 20, RUM_HOLD = 3;
+
+function mulberry32(a: number) {
+  return function () {
+    a |= 0; a = (a + 0x6d2b79f5) | 0;
+    let t = Math.imul(a ^ (a >>> 15), 1 | a);
+    t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+    return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+  };
+}
+function views(r: number, t: number) {
+  const hour = (((t / 60 + REGIONS[r].tz) % 24) + 24) % 24;
+  const c = (1 + Math.cos((2 * Math.PI * (hour - 20)) / 24)) / 2;
+  return Math.round(REGIONS[r].peak * (0.1 + 0.9 * c * c));
+}
+const faulted = (scope: string, r: number, t: number) => t >= FAULT_START && t < FAULT_END && (scope === 'global' || r === BRAZIL);
+function p75(a: number[]) { const s = [...a].sort((x, y) => x - y); return s[Math.ceil(0.75 * s.length) - 1]; }
+
+function world(seed: number) {
+  const g = mulberry32(seed * 977 + 13); const blip: number[][] = [], fail: number[][] = [];
+  for (let r = 0; r < 5; r++) { blip.push([]); fail.push([]); for (let t = 0; t < DAY; t++) { blip[r].push(g()); fail[r].push(g()); } }
+  return { seed, blip, fail };
+}
+function synthetic(w: World, p: Params) {
+  const L = p.locations, effN = Math.min(p.n, L), I = p.interval;
+  const last: ({ bad: boolean; real: boolean } | null)[] = []; for (let k = 0; k < L; k++) last.push(null);
+  let detect = -1, falseAlarms = 0, wasFalse = false, checks = 0; const marks: Mark[] = [];
+  for (let t = 0; t < DAY; t++) {
+    let ran = false;
+    for (let k = 0; k < L; k++) {
+      const off = Math.floor((k * I) / L);
+      if (t >= off && (t - off) % I === 0) {
+        ran = true; checks++;
+        const real = faulted(p.scope, k, t) && w.fail[k][t] < P_FAIL;
+        last[k] = { bad: real || w.blip[k][t] < P_BLIP, real };
+      }
+    }
+    if (!ran) continue;
+    let bad = 0, real = false;
+    for (const s of last) if (s && s.bad) { bad++; if (s.real) real = true; }
+    const cond = bad >= effN;
+    if (cond && real && detect < 0 && t >= FAULT_START && t < FAULT_END) { detect = t; marks.push({ t, kind: 'hit' }); }
+    const fa = cond && !real;
+    if (fa && !wasFalse) { falseAlarms++; marks.push({ t, kind: 'false' }); }
+    wasFalse = fa;
+  }
+  return { detect, falseAlarms, checks, marks };
+}
+function lcpSample(g: () => number, slow: boolean) {
+  const z = ((g() + g() + g() + g() - 2) / 0.5774);
+  return LCP_MEDIAN * (slow ? FAULT_FACTOR : 1) * Math.exp(LCP_SIGMA * z);
+}
+function rum(w: World, p: Params) {
+  if (!p.rumOn) return { detect: -1, falseAlarms: 0, samples: 0, faultSamples: [], base: [], marks: [] };
+  const rate = p.sampling; const perMin: number[][][] = []; let samples = 0; const faultSamples: number[] = [], base: number[] = [];
+  for (let r = 0; r < 5; r++) {
+    perMin.push([]);
+    for (let t = 0; t < DAY; t++) {
+      const g = mulberry32(w.seed * 100003 + r * 1447 + t * 7 + 1);
+      const n = Math.floor(views(r, t) * rate * (1 - BLOCK) + g());
+      const slow = faulted(p.scope, r, t); const a: number[] = [];
+      for (let i = 0; i < n; i++) a.push(lcpSample(g, slow));
+      perMin[r].push(a); samples += n;
+      if (r === BRAZIL) (slow ? faultSamples : (t < FAULT_START ? base : [])).push(...a);
+    }
+  }
+  let detect = -1, falseAlarms = 0; const marks: Mark[] = [];
+  for (let r = 0; r < 5; r++) {
+    let run = 0, open = false;
+    for (let t = 0; t < DAY; t++) {
+      const hi = t - RUM_LAG, lo = hi - RUM_WINDOW + 1; let all: number[] = [];
+      if (hi >= 0) for (let u = Math.max(0, lo); u <= hi; u++) all = all.concat(perMin[r][u]);
+      const cond = all.length >= RUM_MIN && p75(all) > POOR;
+      run = cond ? run + 1 : 0;
+      const fire = run >= RUM_HOLD;
+      if (fire && !open) {
+        if (faulted(p.scope, r, t)) { if (detect < 0) { detect = t; marks.push({ t, kind: 'hit' }); } }
+        else { falseAlarms++; marks.push({ t, kind: 'false' }); }
+      }
+      open = fire;
+    }
+  }
+  return { detect, falseAlarms, samples, faultSamples, base, marks };
+}
+function simulate(p: Params) {
+  const w = world(p.seed); const s = synthetic(w, p); const u = rum(w, p);
+  const dets = [s.detect, u.detect].filter((x) => x >= 0); const first = dets.length ? Math.min(...dets) : -1;
+  let before = 0, total = 0;
+  for (let t = FAULT_START; t < FAULT_END; t++) for (let r = 0; r < 5; r++) if (faulted(p.scope, r, t)) {
+    total += views(r, t); if (first < 0 || t < first) before += views(r, t);
+  }
+  return { s, u, first, before, total };
+}
+
+  // ---- DOM ----
+  const SVGNS = 'http://www.w3.org/2000/svg';
+  const hhmm = (t: number) => String(Math.floor(t / 60)).padStart(2, '0') + ':' + String(t % 60).padStart(2, '0');
+  const fmt = (n: number) => n.toLocaleString('en-US');
+  document.querySelectorAll<HTMLElement>('[data-sm]').forEach((root) => {
+    const q = <T extends Element>(s: string) => root.querySelector<T>(s)!;
+    const val = (s: string) => Number(q<HTMLInputElement | HTMLSelectElement>(s).value);
+    const mark = (svg: SVGElement, tag: string, attrs: Record<string, string>, text?: string) => {
+      const e = document.createElementNS(SVGNS, tag);
+      for (const k in attrs) e.setAttribute(k, attrs[k]);
+      if (text !== undefined) e.textContent = text;
+      svg.appendChild(e);
+    };
+    let frame = 0;
+    function params() {
+      return { seed: val('[data-seed]'), interval: val('[data-interval]'), locations: val('[data-locs]'), n: val('[data-rule]'), scope: q<HTMLSelectElement>('[data-scope]').value, rumOn: q<HTMLInputElement>('[data-rumon]').checked, sampling: val('[data-sampling]') };
+    }
+    function draw() {
+      frame = 0;
+      const p = params(); const r = simulate(p);
+      q('[data-locsval]').textContent = String(p.locations);
+      q('[data-locnames]').textContent = 'Probing from: ' + REGIONS.slice(0, p.locations).map((x) => x.name).join(', ') + (p.locations < 5 ? ' (none in Brazil)' : '') + '. Needs ' + Math.min(p.n, p.locations) + ' failing location' + (Math.min(p.n, p.locations) > 1 ? 's' : '') + ' to alert.';
+      q<HTMLInputElement | HTMLSelectElement>('[data-sampling]').disabled = !p.rumOn;
+      const after = (t: number) => '+' + (t - FAULT_START) + ' min (' + hhmm(t) + ')';
+      q('[data-sdet]').textContent = r.s.detect < 0 ? 'outage never detected' : 'detected ' + after(r.s.detect);
+      q('[data-sfa]').textContent = r.s.falseAlarms + ' false alarm' + (r.s.falseAlarms === 1 ? '' : 's') + ' from blips';
+      q('[data-schecks]').textContent = fmt(r.s.checks) + ' probe checks in the day';
+      q('[data-rdet]').textContent = !p.rumOn ? 'off' : r.u.detect < 0 ? 'outage never detected' : 'detected ' + after(r.u.detect);
+      q('[data-rfa]').textContent = !p.rumOn ? 'no beacons collected' : r.u.falseAlarms + ' false alarms · ' + fmt(r.u.samples) + ' samples in the day';
+      const fs = r.u.faultSamples;
+      q('[data-rp75]').textContent = !p.rumOn ? 'no data' : fs.length ? 'Brazil p75 LCP in the outage: ' + fmt(Math.round(p75(fs))) + ' ms from ' + fmt(fs.length) + ' samples (good is 2,500 ms or less)' : 'no samples from the outage';
+      q('[data-hurt]').textContent = fmt(r.before) + ' of ' + fmt(r.total);
+      q('[data-hurtnote]').textContent = 'slow page views before the first alert' + (r.first < 0 ? ' (never alerted)' : ', ' + Math.round((100 * r.before) / r.total) + '%');
+      const parts: string[] = [];
+      if (r.first < 0) parts.push('Nobody was alerted. Users found out from support tickets, after the whole outage.');
+      else parts.push('First alert came from ' + (r.u.detect < 0 || (r.s.detect >= 0 && r.s.detect <= r.u.detect) ? 'the synthetic probes' : 'RUM') + ' ' + (r.first - FAULT_START) + (r.first - FAULT_START === 1 ? ' minute' : ' minutes') + ' in.');
+      if (p.scope === 'brazil' && r.s.detect < 0) {
+        if (p.locations < 5) parts.push('No probe runs in Brazil, so every synthetic check passed.');
+        else if (Math.min(p.n, p.locations) > 1) parts.push('Only the Brazil probe fails, and the rule needs ' + Math.min(p.n, p.locations) + ' locations, so it stays quiet.');
+      }
+      if (p.scope === 'brazil' && r.s.detect > FAULT_START + 15 && Math.min(p.n, p.locations) > 1) parts.push('The synthetic alert only fired when an unrelated blip joined the Brazil failure.');
+      if (p.rumOn && r.u.detect < 0 && p.scope === 'brazil') parts.push('RUM stayed silent: too few sampled page views from Brazil at night to reach 20 in the window.');
+      if (r.s.falseAlarms > 0) parts.push(r.s.falseAlarms + ' false alarm' + (r.s.falseAlarms === 1 ? '' : 's') + ' would have woken someone for nothing.');
+      q('[data-verdict]').textContent = parts.join(' ');
+      const svg = q<SVGElement>('[data-svg]'); svg.replaceChildren();
+      const X = (t: number) => 10 + (t / DAY) * 700;
+      mark(svg, 'rect', { class: 'sm-band', x: String(X(FAULT_START)), y: '4', width: String(X(FAULT_END) - X(FAULT_START)), height: '66' });
+      for (let h = 0; h <= 24; h += 3) { mark(svg, 'line', { class: 'sm-tick', x1: String(X(h * 60)), x2: String(X(h * 60)), y1: '70', y2: '75' }); mark(svg, 'text', { class: 'sm-lbl', x: String(X(h * 60)), y: '90', 'text-anchor': 'middle' }, String(h).padStart(2, '0')); }
+      mark(svg, 'line', { class: 'sm-row', x1: '10', x2: '710', y1: '22', y2: '22' });
+      mark(svg, 'line', { class: 'sm-row', x1: '10', x2: '710', y1: '52', y2: '52' });
+      const dots = (marks: { t: number; kind: string }[], y: number, cls: string) => marks.forEach((m) => mark(svg, 'circle', { class: 'sm-dot ' + cls + (m.kind === 'hit' ? ' hit' : ' miss'), cx: String(X(m.t)), cy: String(y), r: m.kind === 'hit' ? '6' : '3.5' }));
+      dots(r.s.marks, 22, 'sm-s'); dots(r.u.marks, 52, 'sm-r');
+    }
+    const schedule = () => { if (!frame) frame = requestAnimationFrame(draw); };
+    root.querySelectorAll('select, input[type="range"], input[type="checkbox"]').forEach((el) => { el.addEventListener('input', schedule); el.addEventListener('change', schedule); });
+    q('[data-reset]').addEventListener('click', () => {
+      q<HTMLSelectElement>('[data-interval]').value = '5'; q<HTMLInputElement>('[data-locs]').value = '3'; q<HTMLSelectElement>('[data-rule]').value = '1';
+      q<HTMLSelectElement>('[data-scope]').value = 'brazil'; q<HTMLInputElement>('[data-rumon]').checked = true; q<HTMLSelectElement>('[data-sampling]').value = '0.1'; q<HTMLSelectElement>('[data-seed]').value = '1';
+      schedule();
+    });
+    draw();
+  });
+</script>
+<style is:global>
+  .playground .sm-check { display: inline-flex; align-items: center; gap: 6px; }
+  .playground .sm-chart { overflow-x: auto; }
+  .playground .sm-svg { width: 100%; min-width: 420px; height: auto; display: block; }
+  .playground .sm-band { fill: color-mix(in srgb, var(--bad) 16%, transparent); stroke: var(--bad); stroke-width: 1; }
+  .playground .sm-row { stroke: var(--border); stroke-width: 1; }
+  .playground .sm-tick { stroke: var(--muted); stroke-width: 1; }
+  .playground .sm-lbl { fill: var(--muted); font-size: 11px; }
+  .playground .sm-s { stroke: var(--role-1); fill: var(--role-1); }
+  .playground .sm-r { stroke: var(--role-2); fill: var(--role-2); }
+  .playground .sm-dot { stroke-width: 2; }
+  .playground .sm-dot.miss { fill: var(--surface); }
+  .playground .sm-key { display: inline-block; width: 10px; height: 10px; border-radius: 50%; vertical-align: middle; }
+  .playground .sm-k1 { background: var(--role-1); }
+  .playground .sm-k2 { background: var(--role-2); }
+</style>

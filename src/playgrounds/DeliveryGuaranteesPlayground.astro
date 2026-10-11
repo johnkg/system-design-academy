@@ -1,0 +1,213 @@
+---
+import PlaygroundShell from '../components/PlaygroundShell.astro';
+---
+<PlaygroundShell title="Simulate it" hint="12 payment events, one consumer that crashes at seeded moments. Pick how it acknowledges and compare what is lost, repeated and charged.">
+  <ol class="how">
+    <li>With the defaults (25 % of attempts fail, schedule 1) <b>Ack before processing</b> loses 2 payments, <b>Ack after processing</b> writes 9 extra ledger rows, and the <b>dedupe</b> consumer ends with the exact ledger ($282) but the card is still charged $378, because the card call is outside its transaction.</li>
+    <li>Tick <b>Card API honours an idempotency key</b>: the card total drops to $282 for dedupe and transactional. The <b>Transactional</b> style still has 4 extra ledger rows, because the producer sent duplicate copies of some events. Tick <b>Idempotent producer</b> and it reaches $282 and $282 too.</li>
+    <li>With <b>Idempotent producer</b> unticked, set <b>Dedupe memory</b> to Last 3 ids: in the <b>Ack after + dedupe</b> row one late duplicate arrives after its id was forgotten and costs 1 extra ledger row ($320 instead of $282). Set the failure rate to 0 and all four styles become identical.</li>
+    <li>Use <b>Step</b> to walk the event trace of the selected style one delivery attempt at a time.</li>
+  </ol>
+  <div class="pg dg" data-dg>
+    <div class="pg-row" role="group" aria-label="Consumer style" data-styles></div>
+    <div class="pg-row">
+      <label>Failure rate <input type="range" min="0" max="50" step="5" value="25" data-rate /> <b data-rateval>25</b> %</label>
+      <label>Failure schedule <select class="pg-in" data-seed><option value="1" selected>Schedule 1</option><option value="2">Schedule 2</option><option value="3">Schedule 3</option><option value="4">Schedule 4</option></select></label>
+      <label>Dedupe memory <select class="pg-in" data-window><option value="3">Last 3 ids</option><option value="8">Last 8 ids</option><option value="all" selected>All ids</option></select></label>
+    </div>
+    <div class="pg-row">
+      <label class="dg-check"><input type="checkbox" data-key /> Card API honours an idempotency key</label>
+      <label class="dg-check"><input type="checkbox" data-idem /> Idempotent producer</label>
+    </div>
+    <div class="pg-row">
+      <button class="btn pg-primary" type="button" data-step>Step</button>
+      <button class="btn" type="button" data-all>Show all</button>
+      <button class="btn" type="button" data-rewind>Rewind</button>
+      <span class="pg-mono" data-pos aria-live="polite"></span>
+    </div>
+    <div class="pg-grid">
+      <div class="pg-box" data-b-lost><h3>Payments lost</h3><span class="pg-mono" data-lost>0</span><span class="pg-note">no ledger row, will never get one</span></div>
+      <div class="pg-box" data-b-dupl><h3>Extra ledger rows</h3><span class="pg-mono" data-dupl>0</span><span class="pg-note">a payment recorded more than once</span></div>
+      <div class="pg-box" data-b-dupc><h3>Extra card charges</h3><span class="pg-mono" data-dupc>0</span><span class="pg-note">side effects outside the database</span></div>
+      <div class="pg-box" data-b-tot><h3>Money</h3><span class="pg-mono" data-money></span><span class="pg-note">ledger and card, against intended</span></div>
+    </div>
+    <ol class="dg-trace" tabindex="0" aria-label="Event trace for the selected style" data-trace></ol>
+    <div class="dg-scroll" tabindex="0" role="region" aria-label="All four styles, same failures, final state" data-tablewrap>
+      <table class="dg-table pg-mono">
+        <thead><tr><th scope="col">Style</th><th scope="col">Lost</th><th scope="col">Extra ledger rows</th><th scope="col">Extra card charges</th><th scope="col">Ledger $</th><th scope="col">Card $</th><th scope="col">Verdict</th></tr></thead>
+        <tbody data-rows></tbody>
+      </table>
+    </div>
+    <p class="pg-note">Model assumptions: 12 payments, intended total $282. Each delivery attempt crashes before processing (30 % of failures), after the card call and before the commit (25 %), after the commit and before the ack (25 %), or loses the ack (20 %). Redelivery is immediate. Every style sees the same fault for the same log position and attempt. The producer, when not idempotent, appends a second copy of an event with probability equal to the failure rate, 1 to 6 positions later. The card call happens before the database commit. Offset and ledger live in one database for the transactional style.</p>
+  </div>
+</PlaygroundShell>
+<script>
+  type Style = 'ack-before' | 'ack-after' | 'ack-after+dedupe' | 'transactional';
+  type Kind = 'ok' | 'warn' | 'bad' | 'info';
+  interface Ev { text: string; kind: Kind; lost: number; dupL: number; dupC: number; lt: number; ct: number }
+  interface Opts { seed: number; rate: number; window: number; cardKey: boolean; idemProducer: boolean }
+
+  const N = 12;
+  const amountOf = (id: number) => 10 + ((id * 7) % 30);
+  const INTENDED = Array.from({ length: N }, (_, i) => amountOf(i)).reduce((a, b) => a + b, 0);
+  const STYLES: { id: Style; label: string }[] = [
+    { id: 'ack-before', label: 'Ack before processing' },
+    { id: 'ack-after', label: 'Ack after processing' },
+    { id: 'ack-after+dedupe', label: 'Ack after + dedupe' },
+    { id: 'transactional', label: 'Transactional (offset in DB)' },
+  ];
+
+  function hash(seed: number, a: number, b: number): number {
+    let x = (Math.imul(seed, 7919) + Math.imul(a, 104729) + Math.imul(b, 1299709) + 12345) >>> 0;
+    for (let i = 0; i < 3; i++) x = (Math.imul(x, 1664525) + 1013904223) >>> 0;
+    return x;
+  }
+  function fault(seed: number, pos: number, attempt: number, rate: number): string {
+    const x = hash(seed, pos, attempt);
+    if ((x >>> 16) % 1000 >= rate) return 'ok';
+    const s = (x >>> 8) % 100;
+    return s < 30 ? 'crashBefore' : s < 55 ? 'crashMid' : s < 80 ? 'crashAfter' : 'lostAck';
+  }
+  // The log the broker holds: the producer may append a second copy of an event when its send ack is lost.
+  function buildLog(seed: number, rate: number, idemProducer: boolean): number[] {
+    const log = Array.from({ length: N }, (_, i) => i);
+    if (idemProducer) return log;
+    for (let i = 0; i < N; i++) {
+      if (((hash(seed, i, 1000) >>> 16) % 1000) < rate) {
+        const at = log.indexOf(i) + 1 + ((hash(seed, i, 1001) >>> 8) % 6);
+        log.splice(Math.min(at, log.length), 0, i);
+      }
+    }
+    return log;
+  }
+  function simulate(style: Style, o: Opts): Ev[] {
+    const log = buildLog(o.seed, o.rate, o.idemProducer);
+    const ledger: number[] = new Array(N).fill(0); const card: number[] = new Array(N).fill(0);
+    const settled = new Set<number>(); const dedupe: number[] = []; const events: Ev[] = [];
+    const snap = (text: string, kind: Kind) => {
+      let lost = 0, dupL = 0, dupC = 0, lt = 0, ct = 0;
+      for (let i = 0; i < N; i++) {
+        if (settled.has(i) && ledger[i] === 0) lost++;
+        dupL += Math.max(0, ledger[i] - 1); dupC += Math.max(0, card[i] - 1);
+        lt += ledger[i] * amountOf(i); ct += card[i] * amountOf(i);
+      }
+      events.push({ text, kind, lost, dupL, dupC, lt, ct });
+    };
+    const charge = (id: number) => { if (!(o.cardKey && card[id] > 0)) card[id]++; };
+    for (let pos = 0; pos < log.length; pos++) {
+      const id = log[pos]; const tag = `#${pos} pay-${id} ($${amountOf(id)})`;
+      if (style === 'ack-before') {
+        const f = fault(o.seed, pos, 0, o.rate);
+        if (f === 'crashBefore') { settled.add(id); snap(`${tag}: offset committed first, then the consumer crashed before processing. Lost, the broker will not redeliver.`, 'bad'); continue; }
+        charge(id);
+        if (f === 'crashMid') { settled.add(id); snap(`${tag}: card charged, crashed before the ledger write. Charged but unrecorded, and no retry.`, 'bad'); continue; }
+        ledger[id]++; settled.add(id);
+        snap(`${tag}: charged and recorded${f === 'ok' ? '' : '; the later crash or lost ack changes nothing, the offset was already committed'}.`, 'ok');
+        continue;
+      }
+      for (let attempt = 0; attempt < 50; attempt++) {
+        const f = fault(o.seed, pos, attempt, o.rate); const a = attempt ? `, retry ${attempt}` : '';
+        if (f === 'crashBefore') { snap(`${tag}${a}: crashed before processing, redelivered.`, 'warn'); continue; }
+        if (style === 'ack-after+dedupe' && dedupe.includes(id)) {
+          snap(`${tag}${a}: id already in the dedupe table, skipped and acked.`, 'ok'); break;
+        }
+        const repeat = ledger[id] > 0;
+        charge(id);
+        if (f === 'crashMid') { snap(`${tag}${a}: card called, crashed before the commit. Rolled back, redelivered.`, 'warn'); continue; }
+        ledger[id]++;
+        if (style === 'ack-after+dedupe') { dedupe.push(id); if (dedupe.length > o.window) dedupe.shift(); }
+        const dup = repeat ? ' This payment is now recorded twice.' : '';
+        if (style === 'transactional') { snap(`${tag}${a}: ledger row and offset committed in one transaction.${dup}`, repeat ? 'bad' : 'ok'); break; }
+        if (f === 'ok') { snap(`${tag}${a}: processed and acked.${dup}`, repeat ? 'bad' : 'ok'); break; }
+        snap(`${tag}${a}: processed, but ${f === 'crashAfter' ? 'crashed before the ack' : 'the ack was lost'}. Redelivered.${dup}`, repeat ? 'bad' : 'warn');
+      }
+      settled.add(id);
+    }
+    return events;
+  }
+  const verdict = (e: Ev): string => {
+    const parts: string[] = [];
+    if (e.lost) parts.push('loses payments');
+    if (e.dupL) parts.push('duplicates ledger rows');
+    if (e.dupC) parts.push('repeats card charges');
+    if (!parts.length) return e.lt === INTENDED && e.ct === INTENDED ? 'exactly the intended state' : 'ledger and card disagree';
+    return parts.join(', ');
+  };
+
+  document.querySelectorAll<HTMLElement>('[data-dg]').forEach((root) => {
+    const q = <T extends HTMLElement>(s: string) => root.querySelector<T>(s)!;
+    let style: Style = 'ack-before'; let shown = 0; let events: Ev[] = []; let raf = 0;
+    const lis: HTMLLIElement[] = []; const chips: HTMLButtonElement[] = [];
+    const rowCells = new Map<Style, HTMLTableRowElement>();
+    const opts = (): Opts => ({
+      seed: Number(q<HTMLSelectElement>('[data-seed]').value), rate: Number(q<HTMLInputElement>('[data-rate]').value) * 10,
+      window: q<HTMLSelectElement>('[data-window]').value === 'all' ? Infinity : Number(q<HTMLSelectElement>('[data-window]').value),
+      cardKey: q<HTMLInputElement>('[data-key]').checked, idemProducer: q<HTMLInputElement>('[data-idem]').checked,
+    });
+    const money = (n: number) => `$${n}`;
+
+    // Build the trace list and the comparison table rows for the current settings, then draw.
+    function recompute(showAll: boolean) {
+      const o = opts(); events = simulate(style, o);
+      const trace = q('[data-trace]'); trace.innerHTML = ''; lis.length = 0;
+      events.forEach((e) => { const li = document.createElement('li'); li.className = `dg-${e.kind}`; li.textContent = e.text; trace.appendChild(li); lis.push(li); });
+      STYLES.forEach((s) => {
+        const ev = simulate(s.id, o); const f = ev[ev.length - 1]; const tr = rowCells.get(s.id)!;
+        const c = tr.children;
+        c[1].textContent = String(f.lost); c[2].textContent = String(f.dupL); c[3].textContent = String(f.dupC);
+        c[4].textContent = money(f.lt); c[5].textContent = money(f.ct); c[6].textContent = verdict(f);
+        tr.classList.toggle('dg-sel', s.id === style);
+      });
+      shown = showAll ? events.length : 0; draw();
+    }
+    function draw() {
+      q('[data-rateval]').textContent = q<HTMLInputElement>('[data-rate]').value;
+      lis.forEach((li, i) => { li.hidden = i >= shown; if (i === shown - 1) li.setAttribute('aria-current', 'step'); else li.removeAttribute('aria-current'); });
+      const cur = shown ? events[shown - 1] : { lost: 0, dupL: 0, dupC: 0, lt: 0, ct: 0 };
+      q('[data-lost]').textContent = String(cur.lost); q('[data-dupl]').textContent = String(cur.dupL); q('[data-dupc]').textContent = String(cur.dupC);
+      q('[data-money]').textContent = `ledger ${money(cur.lt)} · card ${money(cur.ct)} · intended ${money(INTENDED)}`;
+      q<HTMLElement>('[data-b-lost]').style.setProperty('--c', cur.lost ? 'var(--bad)' : 'var(--border)');
+      q<HTMLElement>('[data-b-dupl]').style.setProperty('--c', cur.dupL ? 'var(--bad)' : 'var(--border)');
+      q<HTMLElement>('[data-b-dupc]').style.setProperty('--c', cur.dupC ? 'var(--bad)' : 'var(--border)');
+      const exact = shown === events.length && cur.lt === INTENDED && cur.ct === INTENDED;
+      q<HTMLElement>('[data-b-tot]').style.setProperty('--c', exact ? 'var(--good)' : 'var(--role-3)');
+      q('[data-pos]').textContent = `event ${shown} of ${events.length}`;
+      q<HTMLButtonElement>('[data-step]').disabled = shown >= events.length;
+      chips.forEach((b, i) => b.setAttribute('aria-pressed', String(STYLES[i].id === style)));
+      if (shown) lis[shown - 1].scrollIntoView({ block: 'nearest' });
+    }
+    const schedule = () => { cancelAnimationFrame(raf); raf = requestAnimationFrame(() => recompute(true)); };
+
+    // Controls and table skeleton are built once; later changes only update text and state.
+    const sw = q('[data-styles]');
+    STYLES.forEach((s) => {
+      const b = document.createElement('button'); b.type = 'button'; b.className = 'btn'; b.textContent = s.label;
+      b.addEventListener('click', () => { style = s.id; recompute(true); });
+      sw.appendChild(b); chips.push(b);
+      const tr = document.createElement('tr');
+      const th = document.createElement('th'); th.scope = 'row'; th.textContent = s.label; tr.appendChild(th);
+      for (let i = 0; i < 6; i++) tr.appendChild(document.createElement('td'));
+      q('[data-rows]').appendChild(tr); rowCells.set(s.id, tr);
+    });
+    ['[data-rate]', '[data-seed]', '[data-window]', '[data-key]', '[data-idem]'].forEach((s) => { q(s).addEventListener('input', schedule); q(s).addEventListener('change', schedule); });
+    q('[data-step]').addEventListener('click', () => { if (shown < events.length) { shown++; draw(); } });
+    q('[data-all]').addEventListener('click', () => { shown = events.length; draw(); });
+    q('[data-rewind]').addEventListener('click', () => { shown = 0; draw(); });
+    recompute(true);
+  });
+</script>
+<style is:global>
+  .playground .dg-check { display: inline-flex; align-items: center; gap: 6px; }
+  .playground .dg-trace { list-style: decimal; margin: 12px 0 0; padding: 8px 8px 8px 2rem; max-height: 15rem; overflow-y: auto; border: 1px solid var(--border); border-radius: 8px; background: var(--surface); font-size: .88rem; }
+  .playground .dg-trace li { padding: 3px 8px; margin: 2px 0; border-left: 4px solid var(--border); }
+  .playground .dg-trace li.dg-ok { border-left-color: var(--good); }
+  .playground .dg-trace li.dg-warn { border-left-color: var(--role-3); }
+  .playground .dg-trace li.dg-bad { border-left-color: var(--bad); }
+  .playground .dg-trace li[aria-current="step"] { background: var(--surface-2); font-weight: 600; }
+  .playground .dg-trace li[hidden] { display: none; }
+  .playground .dg-scroll { margin-top: 12px; overflow-x: auto; border: 1px solid var(--border); border-radius: 8px; }
+  .playground .dg-table { border-collapse: collapse; width: 100%; font-size: .82rem; }
+  .playground .dg-table th, .playground .dg-table td { padding: 6px 10px; text-align: left; white-space: nowrap; border-bottom: 1px solid var(--border); }
+  .playground .dg-table thead th { background: var(--surface-2); }
+  .playground .dg-table tr.dg-sel { background: var(--accent-soft); }
+</style>
