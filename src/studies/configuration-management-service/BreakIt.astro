@@ -1,0 +1,96 @@
+---
+import PlaygroundShell from '../../components/PlaygroundShell.astro';
+---
+<PlaygroundShell title="Ship a bad config to 1,000 instances" hint="Pick the kind of bad change and the safeguards in place. The model releases it at second 0 and counts how many instances are failing every 30 seconds.">
+  <ol class="how">
+    <li>By default the change is <b>valid but harmful</b> (a 60 ms timeout), released <b>all at once</b> with <b>no health gate</b>: schema checks and client checks do not help, <b>all 1,000 instances fail</b> for about 5 minutes until a person rolls it back.</li>
+    <li>Switch the rollout to <b>staged</b> and turn on the <b>health gate</b>: only the first 5% see it (<b>52 instances</b>) and it is undone after about 90 seconds.</li>
+    <li>Choose the <b>typo (retries = 9)</b> instead: with the <b>schema check on</b>, it is never published. Turn the schema check off and also the client check, and it takes everything down. The client check alone keeps the last-known-good copy.</li>
+  </ol>
+  <div class="pg cmb" data-cmb>
+    <div class="pg-row">
+      <label>The bad change <select class="pg-in" data-type>
+        <option value="harm" selected>valid but harmful (timeout 60 ms)</option>
+        <option value="typo">schema violation (retries = 9)</option>
+      </select></label>
+      <label>Rollout <select class="pg-in" data-rollout>
+        <option value="all" selected>all at once</option>
+        <option value="staged">staged: 5%, 25%, 100% (60 s each)</option>
+      </select></label>
+      <label><input type="checkbox" data-gate /> Health gate (rolls back after 60 s)</label>
+      <label><input type="checkbox" data-schema checked /> Schema check when saving</label>
+      <label><input type="checkbox" data-client checked /> Client checks and keeps last-known-good</label>
+    </div>
+    <div class="pg-grid">
+      <div class="pg-box" data-b1><h3>Peak failing instances</h3><span class="pg-mono" data-o1></span><span class="pg-note" data-n1></span></div>
+      <div class="pg-box" data-b2><h3>Instances that received it</h3><span class="pg-mono" data-o2></span><span class="pg-note" data-n2></span></div>
+      <div class="pg-box" data-b3><h3>Instance-minutes of failure</h3><span class="pg-mono" data-o3></span><span class="pg-note" data-n3></span></div>
+    </div>
+    <div class="cmb-chart" role="img" aria-label="Failing instances over 15 minutes, one bar per 30 seconds" data-chart></div>
+    <p class="pg-note cmb-axis"><span>0 min</span><span>15 min</span></p>
+    <p class="pg-out" data-verdict aria-live="polite"></p>
+    <p class="pg-note">Model: 1,000 instances poll every 30 seconds at fixed random offsets, and each belongs to a stable bucket from 0 to 99. The change is released at second 0. Without the health gate a person notices and rolls back at 5 minutes; with it the controller rolls back at 60 seconds. The harmful change fails every instance that holds it. The typo fails only instances that apply it without checking.</p>
+  </div>
+</PlaygroundShell>
+<style is:global>
+  .playground .cmb-chart { display: grid; grid-template-columns: repeat(30, 1fr); gap: 2px; align-items: end; height: 90px; margin: 10px 0 2px; border-bottom: 1px solid var(--border); }
+  .playground .cmb-chart i { display: block; background: var(--bad); min-height: 1px; border-radius: 2px 2px 0 0; }
+  .playground .cmb-chart i[data-zero] { background: var(--good); opacity: .5; }
+  .playground .cmb-axis { display: flex; justify-content: space-between; margin: 0 0 8px; }
+  @media (prefers-reduced-motion: no-preference) { .playground .cmb-chart i { transition: height .2s; } }
+</style>
+<script>
+  document.querySelectorAll<HTMLElement>('[data-cmb]').forEach((root) => {
+    const q = <T extends HTMLElement>(s: string) => root.querySelector<T>(s)!;
+    const N = 1000; const T = 900; const POLL = 30;
+    let seed = 11; const rnd = (n: number) => { seed = (seed * 1664525 + 1013904223) % 4294967296; return Math.floor(seed / 65536) % n; };
+    const phase: number[] = []; const bucket: number[] = [];
+    for (let i = 0; i < N; i++) { phase.push(rnd(POLL)); bucket.push(rnd(100)); }
+    const bars = Array.from({ length: T / POLL }, () => { const b = document.createElement('i'); q('[data-chart]').append(b); return b; });
+    function simulate(type: string, schema: boolean, rollout: string, gate: boolean, client: boolean) {
+      const blocked = type === 'typo' && schema;
+      const rollbackAt = gate ? 60 : 300;
+      const pct = (t: number) => (t >= rollbackAt ? 0 : rollout === 'all' ? 100 : t < 60 ? 5 : t < 120 ? 25 : 100);
+      const harmful = type === 'harm' || !client;
+      const bad = new Array(N).fill(false); const ever = new Array(N).fill(false);
+      const series: number[] = []; let peak = 0; let sum = 0; let last = 0;
+      for (let t = 0; t < T; t++) {
+        for (let i = 0; i < N; i++) {
+          if (t >= phase[i] && (t - phase[i]) % POLL === 0) {
+            const wants = !blocked && bucket[i] < pct(t);
+            bad[i] = wants && harmful; if (wants) ever[i] = true;
+          }
+        }
+        const f = bad.filter(Boolean).length; series.push(f); peak = Math.max(peak, f); sum += f; if (f > 0) last = t + 1;
+      }
+      return { series, peak, minutes: Math.round(sum / 60), last, reached: ever.filter(Boolean).length, blocked };
+    }
+    function draw() {
+      const type = q<HTMLSelectElement>('[data-type]').value; const rollout = q<HTMLSelectElement>('[data-rollout]').value;
+      const gate = q<HTMLInputElement>('[data-gate]').checked; const schema = q<HTMLInputElement>('[data-schema]').checked; const client = q<HTMLInputElement>('[data-client]').checked;
+      const r = simulate(type, schema, rollout, gate, client);
+      q('[data-o1]').textContent = `${r.peak} of ${N}`;
+      q('[data-n1]').textContent = r.peak === 0 ? 'no instance ever failed' : `back to normal after about ${Math.ceil(r.last / 30) * 30} s`;
+      q('[data-o2]').textContent = r.blocked ? '0 (rejected on save)' : `${r.reached} of ${N}`;
+      q('[data-n2]').textContent = r.blocked ? 'it never became a version' : r.peak === 0 && r.reached > 0 ? 'clients refused it and kept the old copy' : 'including those that rejected it';
+      q('[data-o3]').textContent = String(r.minutes);
+      q('[data-n3]').textContent = 'the sum of every failing instance over time';
+      q<HTMLElement>('[data-b1]').style.setProperty('--c', r.peak === 0 ? 'var(--good)' : 'var(--bad)');
+      q<HTMLElement>('[data-b2]').style.setProperty('--c', 'var(--accent)');
+      q<HTMLElement>('[data-b3]').style.setProperty('--c', r.minutes === 0 ? 'var(--good)' : 'var(--bad)');
+      bars.forEach((b, i) => {
+        const f = r.series[i * POLL + POLL - 1]; b.style.height = `${Math.max(1, (f / N) * 100)}%`;
+        if (f === 0) b.setAttribute('data-zero', ''); else b.removeAttribute('data-zero');
+      });
+      const out = q('[data-verdict]'); out.classList.toggle('bad', r.peak > 0);
+      let text: string;
+      if (r.blocked) text = 'The schema check refused the save, so the typo was never a version. Nothing reached any instance.';
+      else if (type === 'typo' && r.peak === 0) text = `The schema was not enforced on save, but the client checked it and kept the last-known-good copy. ${r.reached} instances were offered the change and none applied it.`;
+      else if (type === 'harm') text = `The value was valid, so no schema or client check can see the problem. ${rollout === 'staged' && gate ? `The staged rollout limited it to ${r.peak} instances, and the gate undid it after about 90 seconds.` : gate ? `The gate rolled back after 60 seconds, but the change had gone to everyone at once, so all ${r.peak} failed in that time. Combine it with a staged rollout.` : `Without a gate a person had to notice it, so ${r.peak} instances failed until about ${Math.ceil(r.last / 30) * 30} seconds.`}`;
+      else text = `With no check on save and none in the client, the typo was applied by ${r.peak} instances. ${gate ? 'The gate rolled it back after 60 seconds.' : 'It stayed until a person rolled it back.'}`;
+      out.textContent = text;
+    }
+    root.addEventListener('input', draw); root.addEventListener('change', draw);
+    draw();
+  });
+</script>

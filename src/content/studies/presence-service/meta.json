@@ -1,0 +1,177 @@
+{
+  "name": "Design an Online Presence Service",
+  "difficulty": "intermediate",
+  "intent": "Show which friends are online, away or typing for hundreds of millions of users on several devices each, without drowning the system in heartbeats and status messages.",
+  "codeTitle": "heartbeats with a TTL, sessions per device, and fan-out only on change",
+  "finalIntro": "One user coming online on a phone, opening a laptop, and later going away.",
+  "prompt": "Design the presence feature of a chat app with 500 million users. Each user sees a green dot next to friends who are online, a 'last seen' time for those who are not, and a 'typing...' indicator inside a conversation. Users are signed in on a phone, a laptop and sometimes a tablet at once, and phones lose their connection all the time.",
+  "functional": [
+    "Show whether each friend is online or offline, and when they were last seen",
+    "Treat a user as online if any of their devices is connected",
+    "Show 'typing...' to the other people in a conversation",
+    "Let a user appear offline or away on purpose",
+    "Tell the people who are looking when a friend's status changes"
+  ],
+  "nonFunctional": [
+    "A status change reaches interested friends within a few seconds",
+    "A crashed or disconnected device is noticed within about 30 seconds without any goodbye message",
+    "Tens of millions of users are connected at the peak, each sending a heartbeat every 30 seconds",
+    "A brief network blip must not make a user flicker offline and back online",
+    "Presence may be slightly stale, but it must heal itself and never stay wrong for long",
+    "A mass reconnect after an outage must not take the service down again"
+  ],
+  "firstAttempt": {
+    "text": "One SQL table: user id, status and last_seen. Each client sends 'I am here' every few seconds, and the server updates the row. A cron job marks users offline when last_seen is too old. A client shows a friend list by querying the rows of all its friends, and refreshes every few seconds.",
+    "limits": [
+      "Millions of heartbeats per second become millions of row updates per second on one table",
+      "Polling by every client turns the friend list into a flood of reads for rows that rarely change",
+      "A user on two devices is overwritten by whichever device last wrote, so one device going offline hides the other",
+      "The cron job marks users offline late and in big bursts, and a crashed phone looks online for minutes",
+      "There is no way to tell friends about a change, and typing indicators are far too fast for a database"
+    ]
+  },
+  "nodes": [
+    { "id": "phones", "label": "Devices", "kind": "client", "x": 12, "y": 63 },
+    { "id": "single", "label": "SQL table with last_seen", "kind": "data", "x": 62, "y": 63, "at": 0, "until": 1 },
+    { "id": "gateway", "label": "Connection gateway", "kind": "edge", "x": 37, "y": 63, "at": 1 },
+    { "id": "store", "label": "Session store with TTL", "kind": "data", "x": 62, "y": 63, "at": 1 },
+    { "id": "presence", "label": "Presence service", "kind": "compute", "x": 62, "y": 37, "at": 2 },
+    { "id": "stream", "label": "Status change stream", "kind": "async", "x": 87, "y": 63, "at": 3 },
+    { "id": "fanout", "label": "Fan-out workers", "kind": "compute", "x": 87, "y": 37, "at": 3 },
+    { "id": "friends", "label": "Friend lists", "kind": "data", "x": 87, "y": 12, "at": 3 },
+    { "id": "typing", "label": "Typing relay", "kind": "compute", "x": 37, "y": 37, "at": 4 },
+    { "id": "admission", "label": "Reconnect throttle", "kind": "edge", "x": 12, "y": 37, "at": 5 },
+    { "id": "cache", "label": "Status cache", "kind": "data", "x": 62, "y": 12, "at": 6 }
+  ],
+  "edges": [
+    { "from": "phones", "to": "single", "at": 0, "until": 1 },
+    { "from": "phones", "to": "gateway", "at": 1, "until": 5 },
+    { "from": "gateway", "to": "store", "at": 1, "until": 2 },
+    { "from": "gateway", "to": "presence", "at": 2 },
+    { "from": "presence", "to": "store", "at": 2 },
+    { "from": "presence", "to": "stream", "at": 3 },
+    { "from": "stream", "to": "fanout", "at": 3 },
+    { "from": "friends", "to": "fanout", "at": 3 },
+    { "from": "fanout", "to": "gateway", "at": 3, "until": 6 },
+    { "from": "gateway", "to": "typing", "at": 4 },
+    { "from": "phones", "to": "admission", "at": 5 },
+    { "from": "admission", "to": "gateway", "at": 5 },
+    { "from": "fanout", "to": "cache", "at": 6 },
+    { "from": "cache", "to": "gateway", "at": 6 }
+  ],
+  "steps": [
+    {
+      "title": "Use heartbeats and a key that expires",
+      "problem": "A phone that loses signal or dies cannot say goodbye, so 'offline' cannot depend on a message the device sends. And a database row per user cannot absorb millions of writes per second.",
+      "fix": "Clients hold a connection to a gateway and send a small heartbeat every 10 to 30 seconds. Each heartbeat renews a key in an in-memory store with a time to live of about three heartbeat intervals. If the key is still there, the user is online. If heartbeats stop, the key expires by itself and the user becomes offline without anyone having to notice. Missed beats are tolerated, because one or two lost packets do not reach the TTL.",
+      "tradeoff": "Crashes are detected automatically and the write is one cheap in-memory operation. Detection is never instant, since it takes up to the TTL, and a short TTL detects faster but flickers on a bad network, while a long TTL is steady but slow to notice that someone left.",
+      "concepts": [{ "slug": "caching" }, { "slug": "health-checks" }, { "slug": "tcp-vs-udp" }, { "slug": "real-time-communication" }]
+    },
+    {
+      "title": "Track each device session, and derive the user",
+      "problem": "A user is on a phone and a laptop. If presence is one value per user, the phone going to sleep makes the user look offline while they are typing on the laptop.",
+      "fix": "The key is per session (user and device), not per user. A presence service counts the live sessions of each user: the first session makes the user online, and only the loss of the last one makes them offline. The status is the best across devices, so active beats idle beats offline. Each session carries the gateway and device it lives on, which is also how a message finds the right connection.",
+      "tradeoff": "The status is correct with any number of devices, and a single device can be dropped and re-added safely. There are several keys per user, and the count needs care: a lost expiry or a race between two sessions can leave a count wrong, so it is recomputed from the keys, which are the truth, rather than kept as a separate counter.",
+      "concepts": [{ "slug": "consistency-models" }, { "slug": "idempotency" }, { "slug": "logical-clocks" }, { "slug": "consistent-hashing" }]
+    },
+    {
+      "title": "Publish changes only, and fan out to interested friends",
+      "problem": "If every heartbeat were sent to every friend, 2.5 million heartbeats per second times hundreds of friends would be an impossible load, and almost all of it would say 'still online'.",
+      "fix": "Heartbeats never leave the presence service. Only a change of status (offline to online, online to offline, or a manual away) is published to a stream. Fan-out workers read the user's friend list and send the change to friends who are connected and currently looking at that user, such as an open contact list or conversation, rather than to all hundreds of friends. A client that opens a screen subscribes to its visible users and gets their current status at once.",
+      "tradeoff": "Traffic is proportional to changes, which are rare, instead of heartbeats, and offline friends cost nothing. A popular user with millions of followers is a very large fan-out, and subscribing to only what is on screen adds some bookkeeping on every scroll.",
+      "concepts": [{ "slug": "pub-sub" }, { "slug": "message-queues" }, { "slug": "backpressure" }, { "slug": "database-sharding" }]
+    },
+    {
+      "title": "Send typing indicators as ephemeral events",
+      "problem": "'Typing...' changes every second or two and only matters to the one other person, so it is too fast and too small to deserve storage or fan-out to a whole friend list.",
+      "fix": "A typing event goes from the client over its connection to a relay, which forwards it straight to the other members' connections in that conversation. Nothing is stored. The sender repeats it at most every few seconds while the user types, and the receiving app hides the indicator after about 5 seconds without a refresh, so a lost 'stopped typing' message cannot leave it stuck. Group chats are capped, and in very large channels the indicator is dropped or sampled.",
+      "tradeoff": "It is very cheap, and a missed event only means the indicator is a little late. It is best effort and can be missed on a flaky connection, so nothing that matters can depend on it, and without a cap on events per user a client could flood a room.",
+      "concepts": [{ "slug": "real-time-communication" }, { "slug": "rate-limiting" }, { "slug": "pub-sub" }]
+    },
+    {
+      "title": "Survive a mass reconnect",
+      "problem": "When a gateway fails or a network recovers, millions of clients reconnect in the same moment. Each reconnect writes sessions, flips statuses and fans out, so the recovery itself can knock the service down again.",
+      "fix": "Clients reconnect with exponential backoff and random jitter, so that arrivals spread over many seconds instead of one. A reconnect throttle in front of the gateways admits connections at a rate the backend can take and tells the rest to retry later. After a gateway failure, the presence service does not publish a wave of offline events immediately: sessions simply get a grace period of one TTL, and clients that reconnect to another gateway renew their keys before they would have expired. Extra gateways can be added by autoscaling as load grows.",
+      "tradeoff": "The recovery is smooth and the backend stays within its limits. Some users wait a few extra seconds to be connected, and during the grace period a user who really left looks online a little longer.",
+      "concepts": [{ "slug": "retries-and-backoff" }, { "slug": "backpressure" }, { "slug": "rate-limiting" }, { "slug": "load-balancing" }, { "slug": "autoscaling" }]
+    },
+    {
+      "title": "Accept approximate presence where exactness is not worth it",
+      "problem": "Being exactly right everywhere costs a great deal, and nobody can tell whether a friend came online 3 seconds ago or 8 seconds ago. Some cases, such as a channel with a million members, cannot afford per-person updates at all.",
+      "fix": "Presence is eventually consistent by design. Reads come from a cache that is updated by the fan-out stream and refreshed by a short TTL, so a late update fixes itself. Large groups show only a count, such as '12,400 online', refreshed every few seconds, or the presence of a small sample, instead of an individual dot for each member. 'Last seen' is rounded to a coarse time, and may be written no more than once a minute.",
+      "tradeoff": "Cost drops by orders of magnitude and the system stays simple to scale. A friend can appear online for a few seconds after leaving, and anything that needs an exact answer, such as deciding whether to send a push notification, should check the live sessions directly rather than rely on the cached dot.",
+      "concepts": [{ "slug": "caching" }, { "slug": "cap-theorem" }, { "slug": "consistency-models" }, { "slug": "pub-sub" }]
+    }
+  ],
+  "failures": [
+    {
+      "scenario": "A phone goes through a tunnel and misses three heartbeats",
+      "impact": "With a TTL equal to one interval, the user flickers offline and back, and every friend gets two notifications.",
+      "answer": "The TTL is set to about three intervals, so a couple of lost heartbeats do not expire the session. Clients also resend on reconnect, and the presence service can wait a few seconds before publishing 'offline' so that a quick return cancels the change.",
+      "concepts": [{ "slug": "retries-and-backoff" }, { "slug": "health-checks" }, { "slug": "idempotency" }]
+    },
+    {
+      "scenario": "A gateway machine crashes with 200,000 connections on it",
+      "impact": "All of those sessions stop renewing at once, and without care a flood of offline events and reconnects would follow.",
+      "answer": "Clients reconnect to other gateways with jittered backoff and renew their keys. Sessions that do not come back expire after the TTL, and only then do their users go offline. The throttle keeps the reconnect rate within what the backend takes.",
+      "concepts": [{ "slug": "load-balancing" }, { "slug": "retries-and-backoff" }, { "slug": "backpressure" }, { "slug": "rate-limiting" }]
+    },
+    {
+      "scenario": "The presence store loses a shard",
+      "impact": "Thousands of sessions vanish, so users look offline although they are connected.",
+      "answer": "A replica takes over, and connected clients notice nothing and renew their sessions with the next heartbeat, which rebuilds the lost state within one interval. Statuses are therefore wrong for about 10 to 30 seconds at worst, and nothing needs to be restored from a backup.",
+      "concepts": [{ "slug": "database-replication" }, { "slug": "consistency-models" }, { "slug": "health-checks" }]
+    },
+    {
+      "scenario": "A celebrity with 20 million followers comes online",
+      "impact": "One status change would become 20 million messages in the same second.",
+      "answer": "Fan-out reaches only followers who are connected and watching, and large accounts are handled with a lazy, pull-based path: followers see the status when they open the profile, from the cache. Updates are batched and spread over a few seconds, and celebrities are not shown a live dot at all.",
+      "concepts": [{ "slug": "pub-sub" }, { "slug": "caching" }, { "slug": "backpressure" }]
+    }
+  ],
+  "alternatives": [
+    {
+      "title": "How to detect that a user left",
+      "options": [
+        { "name": "Heartbeat with a TTL", "pro": "Handles crashes and lost networks, and needs nothing from the dying client", "con": "Detection is delayed by up to the TTL, and heartbeats cost traffic" },
+        { "name": "Connection close events", "pro": "Instant when a connection closes cleanly", "con": "Half-open connections can stay for minutes, and a failed machine reports nothing" },
+        { "name": "Both together", "pro": "Instant when the close is seen, and the TTL is the safety net", "con": "Two sources of truth to reconcile" }
+      ],
+      "pick": "Use a TTL as the truth, and treat a clean close as a hint that lets the user go offline sooner."
+    },
+    {
+      "title": "How to tell friends",
+      "options": [
+        { "name": "Clients poll", "pro": "Simple, with nothing to keep on the server", "con": "Wasteful, slow, and enormous for hundreds of millions of users" },
+        { "name": "Push on change to those watching", "pro": "Traffic follows real changes and real viewers", "con": "Needs subscriptions and a fan-out service" },
+        { "name": "Push every change to every friend", "pro": "Nothing to track on the client", "con": "Most of the messages go to people who are not looking" }
+      ],
+      "pick": "Push changes to friends who are watching, with a fetch from the cache when a screen opens."
+    },
+    {
+      "title": "Where presence is kept",
+      "options": [
+        { "name": "Relational database", "pro": "Durable, familiar", "con": "Presence is high-churn and disposable, so durability buys nothing" },
+        { "name": "In-memory store with TTL keys", "pro": "Fast, with expiry built in, and it rebuilds from the next heartbeats", "con": "Memory-bound and it forgets on a crash, which is acceptable here" },
+        { "name": "State held in the gateway", "pro": "No separate store at all", "con": "Other services cannot see it, and it is lost with the machine" }
+      ],
+      "pick": "A sharded in-memory store with TTL keys, rebuilt from heartbeats."
+    },
+    {
+      "title": "How exact presence should be",
+      "options": [
+        { "name": "Exact for everyone", "pro": "Always right", "con": "Costs a message per change for every observer, and it still lags the network anyway" },
+        { "name": "Approximate, within a few seconds", "pro": "Cheap, caches well, and heals by itself", "con": "A friend can look online for a moment after leaving" },
+        { "name": "Counts for big groups", "pro": "Constant cost however large the room", "con": "No individual dots" }
+      ],
+      "pick": "Approximate by default, with counts for large groups, and exact checks only for decisions such as notifications."
+    }
+  ],
+  "roles": [
+    { "id": "client", "label": "Devices", "description": "Phones, laptops and tablets that send heartbeats and show the dots." },
+    { "id": "edge", "label": "Entry points", "description": "The connection gateways and the reconnect throttle." },
+    { "id": "async", "label": "Change stream", "description": "Status changes on their way to the friends who are watching." },
+    { "id": "compute", "label": "Services", "description": "Presence logic, fan-out workers and the typing relay." },
+    { "id": "data", "label": "State", "description": "Session keys, friend lists and the status cache." }
+  ]
+}

@@ -1,0 +1,184 @@
+{
+  "name": "Design a Usage Metering and Billing System",
+  "difficulty": "advanced",
+  "intent": "Count what each customer uses, from billions of events that arrive late and twice, and turn it into correct invoices and quota limits.",
+  "codeTitle": "a usage meter with dedup, late events and invoices",
+  "finalIntro": "One usage event, and then the invoice that is built from it.",
+  "prompt": "Design the usage metering and billing system for a cloud platform with 50,000 customers. Services report usage such as API calls, gigabytes stored and compute minutes. Customers are charged by tiered prices at the end of each month, have quotas that must be enforced during the month, and can ask why an invoice says what it says. Money must be right.",
+  "functional": [
+    "Accept usage events from many internal services",
+    "Count each event exactly once, even when it is sent again",
+    "Total usage per customer, metric and time window",
+    "Warn or block a customer who passes a quota",
+    "Produce an invoice with tiered prices at the end of the period",
+    "Correct invoices when usage arrives late, and explain every line"
+  ],
+  "nonFunctional": [
+    "Handle about 75,000 events per second at the peak without losing one",
+    "Usage on a dashboard is fresh to within a minute, and a quota check takes under 10 ms",
+    "Invoices are exact: no double charge and no missing usage",
+    "Every number on an invoice can be traced back to the raw events",
+    "Late events (up to several days) and replays do not break the totals",
+    "Keep the raw events for months for audit and disputes"
+  ],
+  "firstAttempt": {
+    "text": "Each service writes a row to one billing table for every event, and a nightly job runs a SQL query that sums the rows per customer. The invoice is produced from that sum on the first day of the month.",
+    "limits": [
+      "Billions of rows a day make one table a bottleneck for both writes and the nightly sum",
+      "A service that retries after a timeout writes the same usage twice, and the customer pays twice",
+      "A row written late, after the invoice was produced, silently goes missing",
+      "Quotas can only be checked a day late, so a customer can overspend for hours",
+      "Nobody can show why an invoice has a given total, once rows are summed and changed"
+    ]
+  },
+  "nodes": [
+    { "id": "apps", "label": "Metered services", "kind": "client", "x": 12, "y": 37 },
+    { "id": "single", "label": "One billing table", "kind": "data", "x": 62, "y": 37, "at": 0, "until": 1 },
+    { "id": "ingest", "label": "Ingest API", "kind": "edge", "x": 37, "y": 37, "at": 1 },
+    { "id": "log", "label": "Event log", "kind": "async", "x": 62, "y": 37, "at": 1 },
+    { "id": "dedup", "label": "Deduplicator", "kind": "compute", "x": 62, "y": 12, "at": 2 },
+    { "id": "usage", "label": "Usage store", "kind": "data", "x": 87, "y": 63, "at": 2 },
+    { "id": "agg", "label": "Window aggregator", "kind": "compute", "x": 87, "y": 37, "at": 3 },
+    { "id": "archive", "label": "Event archive", "kind": "data", "x": 87, "y": 12, "at": 4 },
+    { "id": "quota", "label": "Quota gate", "kind": "compute", "x": 37, "y": 63, "at": 5 },
+    { "id": "invoice", "label": "Invoice engine", "kind": "compute", "x": 62, "y": 88, "at": 5 },
+    { "id": "recon", "label": "Reconciler", "kind": "compute", "x": 37, "y": 88, "at": 6 }
+  ],
+  "edges": [
+    { "from": "apps", "to": "single", "at": 0, "until": 1 },
+    { "from": "apps", "to": "ingest", "at": 1 },
+    { "from": "ingest", "to": "log", "at": 1 },
+    { "from": "log", "to": "dedup", "at": 2 },
+    { "from": "dedup", "to": "usage", "at": 2, "until": 3 },
+    { "from": "dedup", "to": "agg", "at": 3 },
+    { "from": "agg", "to": "usage", "at": 3 },
+    { "from": "log", "to": "archive", "at": 4 },
+    { "from": "archive", "to": "agg", "at": 4 },
+    { "from": "usage", "to": "quota", "at": 5 },
+    { "from": "quota", "to": "ingest", "at": 5 },
+    { "from": "usage", "to": "invoice", "at": 5 },
+    { "from": "invoice", "to": "recon", "at": 6 },
+    { "from": "usage", "to": "recon", "at": 6 }
+  ],
+  "steps": [
+    {
+      "title": "Take events through an ingest API into a durable log",
+      "problem": "Services write straight into a billing table. If the table is slow or down, the services are slowed or lose the usage, and nothing says what a valid event is.",
+      "fix": "Services send events to an ingest API, which checks them and appends them to a partitioned log (a message queue) before saying 'accepted'. An event has a unique id made by the producer, a customer id, a metric name, a quantity and the time it happened, which is the event time. The partition key is the customer id, so one customer's events stay in order and are processed by one consumer. Everything after this point reads from the log.",
+      "tradeoff": "The services are decoupled from billing, a billing outage only builds up a backlog, and the log can be replayed. There is one more system to run, and an event is not counted until the consumers catch up, so totals trail by seconds.",
+      "concepts": [{ "slug": "message-queues" }, { "slug": "ordering-and-partitioning" }, { "slug": "delivery-guarantees" }, { "slug": "backpressure" }]
+    },
+    {
+      "title": "Deduplicate by event id",
+      "problem": "Producers retry when they do not get an answer, and the log gives at-least-once delivery, so the same event can arrive two or three times. Counting each copy charges the customer too much.",
+      "fix": "The producer creates the event id once, and the id is reused on every retry. A deduplicator checks each id against a store of recently seen ids and drops repeats, and it records the id in the same atomic step as the usage it adds, so a crash cannot count an event without remembering it. Ids are kept for longer than any retry can take, such as 24 hours or more, and the stream is partitioned by customer so each id is checked in only one place.",
+      "tradeoff": "Retries become safe, so the producers can retry without fear, and billing is effectively exactly-once. The id store costs memory, about 70 GB for a day of events at this scale, and a retry that comes after the window would be counted again unless a later check catches it.",
+      "concepts": [{ "slug": "idempotency" }, { "slug": "delivery-guarantees" }, { "slug": "retries-and-backoff" }, { "slug": "dead-letter-queues-and-poison-messages" }]
+    },
+    {
+      "title": "Aggregate by event time in windows",
+      "problem": "Summing billions of raw events when someone opens the dashboard or the invoice is slow, and grouping by the time an event arrived puts usage in the wrong period when the event was delayed.",
+      "fix": "A stream aggregator adds each unique event to a counter for its customer, metric and hourly window, using the event time, not the arrival time. A watermark tracks how far event time has progressed, and a window is final once the watermark passes its end plus an allowed lateness. Counters are small rows in the usage store, and a month is the sum of its hourly rows. Gauges such as gigabytes stored are measured with periodic samples and charged by the average over the window.",
+      "tradeoff": "Reads become cheap, and usage lands in the right hour even when late. The system must decide when a window is final, and a short lateness bound gives fresh numbers but more late corrections.",
+      "concepts": [{ "slug": "windowing-and-watermarks" }, { "slug": "stateful-stream-processing" }, { "slug": "batch-vs-stream-processing" }, { "slug": "cardinality-and-sampling" }]
+    },
+    {
+      "title": "Keep the raw events, and handle late ones as corrections",
+      "problem": "Some events arrive days late, because a service was offline or a queue was stuck, and the window or even the invoice was already closed. Dropping them loses revenue, and editing a sent invoice is not allowed.",
+      "fix": "Every event is also written to an immutable archive in cheap storage, partitioned by event time. A late event for an open window just adds to it. For a closed window the aggregator applies the change as a signed correction row with a new version, and the invoice engine bills the difference on the next invoice as a separate line (an adjustment). The archive can also rebuild any window from scratch by replay, which is how a bug in the aggregator is repaired.",
+      "tradeoff": "No usage is lost and past invoices are never rewritten, so the audit trail stays clean. Customers can see an adjustment line they did not expect, and the archive costs storage, about 19 TB for 90 days at this scale.",
+      "concepts": [{ "slug": "event-sourcing" }, { "slug": "windowing-and-watermarks" }, { "slug": "table-formats-and-the-lakehouse" }, { "slug": "backups-and-point-in-time-recovery" }]
+    },
+    {
+      "title": "Rate usage into invoices, and enforce quotas",
+      "problem": "Prices have tiers, free allowances and discounts, and they change over time. A customer who passes a quota in the middle of the month needs to be told or limited at once, not at the invoice.",
+      "fix": "At the end of a period the invoice engine reads the final usage rows, applies the price plan that was in force for each window, and writes an invoice with one line per metric and tier. Totals are integers in the smallest currency unit, and the invoice records the plan version it used. In parallel a quota gate reads the running totals from the usage store, and when a customer approaches or passes a limit it notifies them or sets a flag that the ingest API and the product use to throttle or reject requests. The check is cached, so it is an eventual limit and a small overshoot is expected.",
+      "tradeoff": "Prices can change without changing the usage data, and customers get early warnings. A quota based on near-real-time totals can be overshot by whatever arrives before the next refresh, so hard limits need a local counter in the service itself.",
+      "concepts": [{ "slug": "rate-limiting" }, { "slug": "caching" }, { "slug": "schema-evolution-and-compatibility" }, { "slug": "graceful-degradation" }]
+    },
+    {
+      "title": "Reconcile continuously and make invoices explainable",
+      "problem": "Even with all of that, a bug, a lost partition or a producer that forgot to report would show up only as an angry customer, and the support team cannot say why a number is what it is.",
+      "fix": "A reconciler runs daily and compares independent counts: the usage store against a fresh count from the archive, the invoice lines against the usage rows, and each producer's own counter against what the meter received. Differences beyond a tolerance raise an alert and block the invoice run for the affected customers. Every invoice line stores the window, the unit count, the plan version and a pointer to the rows that made it, so support can drill from a total down to events.",
+      "tradeoff": "Errors are found before customers see them, and disputes are answered with evidence. Reconciliation costs compute and needs a defined tolerance, and an invoice run can be delayed for a few customers while a difference is investigated.",
+      "concepts": [{ "slug": "alerting" }, { "slug": "merkle-trees-and-anti-entropy" }, { "slug": "structured-logging" }, { "slug": "slos-and-error-budgets" }]
+    }
+  ],
+  "failures": [
+    {
+      "scenario": "A producer retries every event after a timeout",
+      "impact": "Without protection each retried event is counted twice and the customer is overcharged.",
+      "answer": "The event id is created once and reused on every retry, so the deduplicator drops the copy. The id store is kept longer than the longest retry delay, and a duplicate count metric shows a producer that suddenly retries too much.",
+      "concepts": [{ "slug": "idempotency" }, { "slug": "retries-and-backoff" }, { "slug": "metrics" }]
+    },
+    {
+      "scenario": "A service reports a day of usage three days late",
+      "impact": "The windows are final and the invoice was sent, so a naive system drops the usage or rewrites the invoice.",
+      "answer": "The event goes to the archive and the aggregator writes a correction to the closed windows. The next invoice has an adjustment line for the difference, priced with the plan of the original period.",
+      "concepts": [{ "slug": "windowing-and-watermarks" }, { "slug": "event-sourcing" }, { "slug": "idempotency" }]
+    },
+    {
+      "scenario": "The aggregator has a bug that undercounts for two days",
+      "impact": "The usage store is wrong, and invoices run on it would undercharge.",
+      "answer": "The reconciler sees the usage store differ from the archive count and blocks the invoice run. The fix is deployed, and the affected windows are rebuilt from the archive by replay into new versions, then compared again.",
+      "concepts": [{ "slug": "event-sourcing" }, { "slug": "alerting" }, { "slug": "backups-and-point-in-time-recovery" }]
+    },
+    {
+      "scenario": "One huge customer sends half of all events",
+      "impact": "Their partition is hot, the consumer falls behind and the quota check for them goes stale.",
+      "answer": "Hot customers are split over several partitions by adding a sub-key such as the metric, and each partial count is merged in the aggregator. Lag per partition is monitored, and the ingest API sheds or batches non-critical metrics first.",
+      "concepts": [{ "slug": "ordering-and-partitioning" }, { "slug": "backpressure" }, { "slug": "load-shedding" }]
+    },
+    {
+      "scenario": "The usage store is unavailable when the invoice run starts",
+      "impact": "Invoices could be late or, worse, built from partial data.",
+      "answer": "The run reads from a replica or rebuilds from the archive, and checks that every customer's windows are final and reconciled before it issues anything. If not, the run waits for those customers, and only those, instead of issuing wrong invoices.",
+      "concepts": [{ "slug": "database-replication" }, { "slug": "health-checks" }, { "slug": "graceful-degradation" }]
+    }
+  ],
+  "alternatives": [
+    {
+      "title": "How events are delivered",
+      "options": [
+        { "name": "At-least-once plus dedup by id", "pro": "Simple, robust and the standard choice, since retries are safe", "con": "Needs an id store and a retention window" },
+        { "name": "Exactly-once transactions in the pipeline", "pro": "No separate id store in the pipeline", "con": "Only covers the pipeline, not the producer's retries, and ties you to one engine" },
+        { "name": "At-most-once", "pro": "No duplicates", "con": "Lost events mean lost revenue" }
+      ],
+      "pick": "At-least-once with dedup by a producer-made event id."
+    },
+    {
+      "title": "When a billing period closes",
+      "options": [
+        { "name": "Wait for the watermark, then close", "pro": "Most events are in, so few adjustments", "con": "Invoices are delayed by the allowed lateness" },
+        { "name": "Close on time and adjust later", "pro": "Invoices are on time and the past never changes", "con": "Customers see adjustment lines" },
+        { "name": "Reopen the invoice", "pro": "A single clean invoice", "con": "Changes numbers a customer has already seen, and breaks the accounting" }
+      ],
+      "pick": "Close after a short allowed lateness, then bill anything later as an adjustment."
+    },
+    {
+      "title": "Streaming or batch aggregation",
+      "options": [
+        { "name": "Stream aggregator", "pro": "Fresh dashboards and quotas within seconds", "con": "State management and late data logic" },
+        { "name": "Batch job over the archive", "pro": "Simple, repeatable and easy to audit", "con": "Totals only as fresh as the last run" },
+        { "name": "Both: stream for freshness, batch to verify", "pro": "Fast numbers and an independent check", "con": "Two code paths that must agree" }
+      ],
+      "pick": "Stream for dashboards and quotas, and a batch recount from the archive as the reconciliation and the source for invoices."
+    },
+    {
+      "title": "How quotas are enforced",
+      "options": [
+        { "name": "From the aggregated totals", "pro": "Accurate across all services", "con": "Delayed by seconds to minutes, so it can overshoot" },
+        { "name": "A local counter in the gateway", "pro": "Immediate and hard", "con": "Each node sees part of the usage unless counters are shared" },
+        { "name": "Alert only", "pro": "Never blocks a good customer", "con": "No protection from runaway spending" }
+      ],
+      "pick": "Soft limits and alerts from the aggregated totals, and a hard cap in the gateway only where overspending is expensive."
+    }
+  ],
+  "roles": [
+    { "id": "client", "label": "Metered services", "description": "Internal services that report what customers use." },
+    { "id": "edge", "label": "Ingest API", "description": "Validates events and appends them to the log." },
+    { "id": "async", "label": "Event log", "description": "Durable, partitioned stream of usage events." },
+    { "id": "compute", "label": "Processing", "description": "Deduplication, aggregation, quota checks, invoicing and reconciliation." },
+    { "id": "data", "label": "State", "description": "The usage store, and the immutable event archive." }
+  ]
+}

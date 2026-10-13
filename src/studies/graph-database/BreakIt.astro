@@ -1,0 +1,88 @@
+---
+import PlaygroundShell from '../../components/PlaygroundShell.astro';
+---
+<PlaygroundShell title="A walk through a supernode" hint="A small social graph of 1,200 people in 8 communities, where one celebrity is connected to everyone. Start from one person and walk outwards. Change how the supernode is handled, how the nodes are split over shards, and how many hops you walk.">
+  <ol class="how">
+    <li>The start setting is <b>4 shards by hash, expand everything, 3 hops</b>: the walk opens the celebrity's list of 1,199 edges and reads <b>16,308 edges</b>, 76% of them on another shard, and the busiest shard reads 4,989. It takes about <b>28 ms</b>, which is over the 20 ms budget.</li>
+    <li>Choose <b>skip the supernode</b>: the walk reads <b>1,506 edges</b> and takes about <b>5 ms</b>. The price is an incomplete answer, because only 608 of the 1,200 people are reached.</li>
+    <li>Now spread the nodes <b>by community</b>: remote reads drop from <b>75% to 19%</b>, but one shard holds the starting person's whole community and reads <b>68%</b> of all the edges, against 29% with the hash. Less network traffic, and a hot shard.</li>
+  </ol>
+  <div class="pg gdb" data-gdb>
+    <div class="pg-row">
+      <label>Shards <select class="pg-in" data-s><option value="1">1</option><option value="4" selected>4</option><option value="8">8</option></select></label>
+      <label>Nodes are split <select class="pg-in" data-how>
+        <option value="hash" selected>by a hash of the id</option>
+        <option value="cluster">by community</option>
+      </select></label>
+      <label>The supernode (1,199 edges) is <select class="pg-in" data-sup>
+        <option value="all" selected>expanded like any node</option>
+        <option value="skip">reached but not opened</option>
+        <option value="sample">sampled (50 edges)</option>
+      </select></label>
+      <label>Hops <input type="range" min="1" max="4" value="3" data-h /> <b data-hval></b></label>
+    </div>
+    <div class="pg-grid">
+      <div class="pg-box" data-b1><h3>Edges read</h3><span class="pg-mono" data-o1></span><span class="pg-note" data-n1></span></div>
+      <div class="pg-box" data-b2><h3>Reads on another shard</h3><span class="pg-mono" data-o2></span><span class="pg-note" data-n2></span></div>
+      <div class="pg-box" data-b3><h3>Busiest shard</h3><span class="pg-mono" data-o3></span><span class="pg-note" data-n3></span></div>
+      <div class="pg-box" data-b4><h3>Estimated time</h3><span class="pg-mono" data-o4></span><span class="pg-note" data-n4></span></div>
+    </div>
+    <p class="pg-out" data-verdict aria-live="polite"></p>
+    <p class="pg-note">Model: the walk is breadth first from person 53 and counts every adjacency entry it reads. Time is the busiest shard's reads at 5 microseconds each, plus 1 ms for every hop that has to go to another shard, and the budget is 20 ms. By community means that shards hold whole communities (community modulo the number of shards). The graph is built from a fixed seed: about 14 friends per person, mostly within their own community.</p>
+  </div>
+</PlaygroundShell>
+<script>
+  document.querySelectorAll<HTMLElement>('[data-gdb]').forEach((root) => {
+    const q = <T extends HTMLElement>(s: string) => root.querySelector<T>(s)!;
+    const N = 1200; const COMMUNITIES = 8; const PER = N / COMMUNITIES; const START = 53; const CAP = 100; const BUDGET = 20;
+    let seed = 11; const rnd = (n: number) => { seed = (seed * 1664525 + 1013904223) % 4294967296; return Math.floor(seed / 65536) % n; };
+    const adj: number[][] = Array.from({ length: N }, () => []);
+    const comm = (i: number) => i % COMMUNITIES;
+    const link = (a: number, b: number) => { if (a !== b && !adj[a].includes(b)) { adj[a].push(b); adj[b].push(a); } };
+    for (let i = 1; i < N; i++) {
+      for (let j = 0; j < 5; j++) { const t = rnd(PER) * COMMUNITIES + comm(i); if (t > 0) link(i, t); }
+      link(i, 1 + rnd(N - 1));
+    }
+    for (let i = 1; i < N; i++) link(0, i); // node 0 is the celebrity
+    const mix = (id: number) => { let h = Math.imul(id, 2654435761) >>> 0; h ^= h >>> 15; h = Math.imul(h, 2246822519) >>> 0; h ^= h >>> 13; return h >>> 0; };
+    const shardOf = (id: number, s: number, how: string) => (how === 'cluster' ? comm(id) % s : mix(id) % s);
+    function run(s: number, how: string, sup: string, hops: number) {
+      const seen = new Set<number>([START]); let frontier = [START]; let reads = 0; let remote = 0; let rounds = 0; const load = new Array(s).fill(0);
+      for (let h = 0; h < hops; h++) {
+        const next: number[] = []; let anyRemote = false;
+        for (const u of frontier) {
+          let list = adj[u];
+          if (list.length > CAP) { if (sup === 'skip') continue; if (sup === 'sample') list = list.filter((_, i) => i % Math.floor(list.length / 50) === 0).slice(0, 50); }
+          load[shardOf(u, s, how)] += list.length;
+          for (const v of list) { reads++; if (shardOf(u, s, how) !== shardOf(v, s, how)) { remote++; anyRemote = true; } if (!seen.has(v)) { seen.add(v); next.push(v); } }
+        }
+        if (anyRemote) rounds++;
+        frontier = next;
+      }
+      const max = Math.max(...load);
+      return { reads, reached: seen.size, remote, rounds, max, ms: max * 0.005 + rounds };
+    }
+    const fmt = (n: number) => n.toLocaleString('en-US');
+    const pct = (a: number, b: number) => (b === 0 ? 0 : Math.round((100 * a) / b));
+    function draw() {
+      const s = Number(q<HTMLSelectElement>('[data-s]').value); const how = q<HTMLSelectElement>('[data-how]').value; const sup = q<HTMLSelectElement>('[data-sup]').value; const h = Number(q<HTMLInputElement>('[data-h]').value);
+      q('[data-hval]').textContent = String(h);
+      const r = run(s, how, sup, h); const full = run(s, how, 'all', h); const slow = r.ms > BUDGET;
+      q('[data-o1]').textContent = `${fmt(r.reads)} edges`; q('[data-n1]').textContent = `${fmt(r.reached)} people reached, ${fmt(full.reached)} with nothing skipped`;
+      q('[data-o2]').textContent = `${pct(r.remote, r.reads)}%`; q('[data-n2]').textContent = s === 1 ? 'one shard, so no network' : `${fmt(r.remote)} reads, ${r.rounds} network round${r.rounds === 1 ? '' : 's'}`;
+      q('[data-o3]').textContent = `${pct(r.max, r.reads)}% of the reads`; q('[data-n3]').textContent = `${fmt(r.max)} edges on one of ${s} shard${s === 1 ? '' : 's'}`;
+      q('[data-o4]').textContent = `${r.ms.toFixed(1)} ms`; q('[data-n4]').textContent = `budget ${BUDGET} ms`;
+      q<HTMLElement>('[data-b1]').style.setProperty('--c', 'var(--accent)');
+      q<HTMLElement>('[data-b2]').style.setProperty('--c', 'var(--accent)');
+      q<HTMLElement>('[data-b3]').style.setProperty('--c', pct(r.max, r.reads) > 60 && s > 1 ? 'var(--bad)' : 'var(--accent)');
+      q<HTMLElement>('[data-b4]').style.setProperty('--c', slow ? 'var(--bad)' : 'var(--good)');
+      const out = q('[data-verdict]'); out.classList.toggle('bad', slow);
+      const incomplete = r.reached < full.reached;
+      const hot = s > 1 && pct(r.max, r.reads) > 60;
+      if (slow) out.textContent = sup === 'all' ? `Too slow: ${r.ms.toFixed(1)} ms against a budget of ${BUDGET} ms. Opening the celebrity's list adds its 1,199 edges to every hop that reaches it, so the walk reads ${fmt(r.reads)} edges. Skipping or sampling the supernode cuts this to ${fmt(run(s, how, 'skip', h).reads)} or ${fmt(run(s, how, 'sample', h).reads)}.` : `Still too slow at ${r.ms.toFixed(1)} ms: even without the supernode, ${h} hops read ${fmt(r.reads)} edges because the number of paths multiplies at each hop. Lower the depth or add shards.`;
+      else out.textContent = `Within the budget at ${r.ms.toFixed(1)} ms with ${fmt(r.reads)} edges read.` + (incomplete ? ` The answer is incomplete: ${fmt(r.reached)} people are reached instead of ${fmt(full.reached)}, because the people who are only connected through the supernode are missed.` : ' Nothing was left out.') + (hot ? ` One shard does ${pct(r.max, r.reads)}% of the reading, because by community keeps the whole community of the starting person on it, so it would become a hot spot under real traffic.` : '');
+    }
+    root.addEventListener('input', draw); root.addEventListener('change', draw);
+    draw();
+  });
+</script>

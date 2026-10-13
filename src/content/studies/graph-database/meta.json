@@ -1,0 +1,175 @@
+{
+  "name": "Design a Graph Database",
+  "difficulty": "advanced",
+  "intent": "Store billions of connected entities and answer questions that follow relationships several hops deep, in milliseconds, even when one node has millions of connections.",
+  "codeTitle": "adjacency lists, k-hop traversal and a supernode cap",
+  "finalIntro": "One 'people you may know' query walking two hops out from a user.",
+  "prompt": "Design a graph database for a social network with 500 million users and about 50 billion relationships. Nodes and edges carry properties. Applications ask for a user's friends, friends of friends, the shortest path between two people, and recommendations based on shared connections. Some accounts have tens of millions of followers.",
+  "functional": [
+    "Create, update and delete nodes and edges, each with properties and a type",
+    "Fetch a node's neighbours, filtered by edge type and direction",
+    "Run multi-hop queries such as friends of friends, up to a depth of about four",
+    "Find the shortest path between two nodes",
+    "Look up nodes by a property, such as an email or a name",
+    "Run heavy whole-graph analysis, such as ranking, without hurting live queries"
+  ],
+  "nonFunctional": [
+    "A two-hop query returns in under 50 ms at the 99th percentile",
+    "Cost of a hop depends on the neighbours touched, not on the size of the whole graph",
+    "Handle hundreds of thousands of edge writes per second",
+    "A node with 50 million edges must not slow down the queries that pass near it",
+    "Survive the loss of a machine and a data centre without losing a committed write",
+    "An edge must be visible from both of its ends, or from neither"
+  ],
+  "firstAttempt": {
+    "text": "Relational tables: a nodes table and an edges table with source, target and type columns, and an index on each of source and target. A friends-of-friends query is a self-join of the edges table with itself, and deeper queries add one more join per hop.",
+    "limits": [
+      "Every hop is an index lookup and a join, and the cost of a join grows with the size of the table, not just the neighbours that matter",
+      "Three or four hops produce a join with millions of intermediate rows, which takes seconds or minutes",
+      "A user with 20 million followers makes any query through that user explode",
+      "One machine cannot hold 50 billion edge rows and their two indexes",
+      "Joins across machines are slow, and a shortest-path query has no good relational form"
+    ]
+  },
+  "nodes": [
+    { "id": "clients", "label": "Applications", "kind": "client", "x": 12, "y": 37 },
+    { "id": "sql", "label": "Edge table with joins", "kind": "compute", "x": 37, "y": 37, "at": 0, "until": 1 },
+    { "id": "api", "label": "Query API", "kind": "edge", "x": 37, "y": 37, "at": 1 },
+    { "id": "store", "label": "Adjacency-list store", "kind": "data", "x": 87, "y": 37, "at": 1, "until": 4 },
+    { "id": "engine", "label": "Traversal engine", "kind": "compute", "x": 62, "y": 37, "at": 2 },
+    { "id": "guard", "label": "Supernode guard", "kind": "compute", "x": 62, "y": 12, "at": 3 },
+    { "id": "router", "label": "Shard router", "kind": "edge", "x": 62, "y": 63, "at": 4 },
+    { "id": "shards", "label": "Graph shards", "kind": "data", "x": 87, "y": 37, "at": 4 },
+    { "id": "log", "label": "Replicated write log", "kind": "async", "x": 62, "y": 88, "at": 5 },
+    { "id": "replicas", "label": "Shard replicas", "kind": "data", "x": 87, "y": 63, "at": 5 },
+    { "id": "index", "label": "Property index", "kind": "data", "x": 37, "y": 12, "at": 6 },
+    { "id": "analytics", "label": "Analytics copy", "kind": "compute", "x": 12, "y": 88, "at": 6 }
+  ],
+  "edges": [
+    { "from": "clients", "to": "sql", "at": 0, "until": 1 },
+    { "from": "clients", "to": "api", "at": 1 },
+    { "from": "api", "to": "store", "at": 1, "until": 2 },
+    { "from": "api", "to": "engine", "at": 2 },
+    { "from": "engine", "to": "store", "at": 2, "until": 4 },
+    { "from": "engine", "to": "guard", "at": 3 },
+    { "from": "engine", "to": "router", "at": 4 },
+    { "from": "router", "to": "shards", "at": 4 },
+    { "from": "shards", "to": "log", "at": 5 },
+    { "from": "log", "to": "replicas", "at": 5 },
+    { "from": "engine", "to": "index", "at": 6 },
+    { "from": "log", "to": "analytics", "at": 6 }
+  ],
+  "steps": [
+    {
+      "title": "Store each node's neighbours next to the node",
+      "problem": "A join looks up every edge through an index, and the cost of finding one node's friends depends on how big the whole edges table is.",
+      "fix": "Use a property graph with native storage. A node record holds its properties and a direct pointer to its list of edges, the adjacency list, and each edge record holds its type, its properties and a pointer to the node at the other end. To read a node's friends the engine follows the pointer and reads the list, with no index lookup and no join. This is called index-free adjacency: the cost of a hop is the number of edges read, not the size of the graph. Edges are stored on both ends, and grouped by type so that 'friends' can be read without skipping over 'likes'.",
+      "tradeoff": "A hop costs a handful of memory or page reads, whether the graph holds a million or fifty billion edges. Every edge is stored twice, and a query that scans all nodes with a given property still needs an index.",
+      "concepts": [{ "slug": "database-indexing" }, { "slug": "sql-vs-nosql" }, { "slug": "query-planning-and-joins" }, { "slug": "lsm-trees-vs-b-trees" }]
+    },
+    {
+      "title": "Walk the graph breadth first, with limits",
+      "problem": "Friends of friends of friends can reach millions of nodes, and a query that expands everything runs out of time or memory.",
+      "fix": "A traversal engine runs a breadth-first walk: it reads the adjacency lists of the current frontier, removes nodes it has seen already, and the new nodes become the next frontier. Each query carries limits for depth, for the number of nodes and edges visited, and for time. For shortest path it walks from both ends at once and stops when the two frontiers meet, which touches about 2 times d^(k/2) nodes instead of d^k. Results are streamed in the order they are found, so 'the first 20' can stop early.",
+      "tradeoff": "A deep query becomes a bounded and predictable job, and the shortest path becomes cheap. The cost still grows with the fan-out to the power of the depth, so a limit can cut an answer short, and users are told that results are partial when it did.",
+      "concepts": [{ "slug": "timeouts-and-deadlines" }, { "slug": "backpressure" }, { "slug": "latency-and-round-trips" }, { "slug": "pagination" }]
+    },
+    {
+      "title": "Do not walk through a supernode",
+      "problem": "One celebrity with 30 million followers sits inside millions of other people's two-hop neighbourhoods, and opening that single list reads more edges than the rest of the query combined.",
+      "fix": "Detect supernodes by their degree, which is stored on the node. Their edges are kept in blocks sorted by type and by time, so a query reads only the blocks it needs, such as the newest 1,000 followers. The engine does not expand a node over a threshold during a multi-hop walk: it reaches the node but does not open it, or it samples a fixed number of its edges. Counts of edges, such as the follower total, are kept as numbers that are updated on write rather than counted on read.",
+      "tradeoff": "One hot node can no longer dominate the cost of a query. Results through a supernode are incomplete by design, and which queries may sample is a product decision. Updating counters on every write adds a little to the cost of a write.",
+      "concepts": [{ "slug": "bulkhead" }, { "slug": "graceful-degradation" }, { "slug": "load-shedding" }, { "slug": "cardinality-and-sampling" }]
+    },
+    {
+      "title": "Shard the graph, and keep neighbours together when you can",
+      "problem": "Fifty billion edges and their properties are more than one machine can store, and the load is more than one machine can serve.",
+      "fix": "A shard router splits the nodes across machines, and each node's adjacency list lives on the shard that owns the node. A hash of the node id spreads the load evenly, and the engine then batches the reads for each hop into one request per shard instead of one per node. A graph partitioner can also place densely connected nodes, such as a community or a city, on the same shard so that most hops stay local. Edges that cross shards are stored on both ends, so each shard can answer 'who are my neighbours' alone.",
+      "tradeoff": "Storage and traffic scale out, and a hop costs one parallel round trip per hop rather than one per node. A multi-hop query on a hash-partitioned graph still crosses shards on most hops, and a locality-based layout reduces network traffic but can leave one shard hotter than the rest and has to be recomputed as the graph changes.",
+      "concepts": [{ "slug": "database-sharding" }, { "slug": "consistent-hashing" }, { "slug": "load-balancing" }, { "slug": "proxies" }, { "slug": "horizontal-vs-vertical-scaling" }]
+    },
+    {
+      "title": "Make an edge write atomic and replicated",
+      "problem": "Adding the friendship between two people changes two adjacency lists that may be on different machines, and a crash in between leaves a one-way edge.",
+      "fix": "Every write goes to a replicated log first, using a consensus protocol, and a write is acknowledged once a majority has it. A single-shard write is applied as one transaction. A write that touches two shards is applied with a two-phase commit, or as two idempotent steps driven from the log, so that both ends are written or neither is. Each shard has replicas that apply the log. Queries read a snapshot at a point in time, so a reader sees all of an edge or none of it.",
+      "tradeoff": "No committed write is lost, and an edge is never visible from only one side. A write across shards costs more round trips and a coordinator, and reading from a replica can be a few milliseconds behind.",
+      "concepts": [{ "slug": "consensus" }, { "slug": "two-phase-commit" }, { "slug": "database-replication" }, { "slug": "write-ahead-log" }, { "slug": "mvcc-and-isolation-levels" }, { "slug": "idempotency" }]
+    },
+    {
+      "title": "Index properties and run analytics on a copy",
+      "problem": "Queries need a starting point, such as the user with a given email, and whole-graph jobs such as ranking would slow the live traffic.",
+      "fix": "Property indexes map a value, such as an email or a name, to the node ids that have it, so a query finds its starting nodes and then switches to following pointers. The replicated log also feeds an analytics copy of the graph, which is laid out for batch work and used for jobs such as PageRank, community detection and similarity scores. Their results are written back as properties or edges, so the live path only has to read them.",
+      "tradeoff": "Starting points are found quickly and heavy jobs cannot affect live latency. Indexes add cost to writes and storage, and the analytics results are as old as the last run.",
+      "concepts": [{ "slug": "database-indexing" }, { "slug": "batch-vs-stream-processing" }, { "slug": "mapreduce-and-shuffles" }, { "slug": "cqrs" }]
+    }
+  ],
+  "failures": [
+    {
+      "scenario": "A celebrity with 30 million followers posts and millions of queries pass through them",
+      "impact": "Each query that opens the celebrity's list reads millions of edges, the shard that owns the node saturates, and every other query on that shard slows down.",
+      "answer": "The supernode guard stops multi-hop walks from expanding the node, reading only a bounded sample or recent block. Hot lists are served from replicas, and counts come from a stored counter. The owning shard sees reads of only a few thousand edges per query instead of millions.",
+      "concepts": [{ "slug": "bulkhead" }, { "slug": "load-shedding" }, { "slug": "caching" }]
+    },
+    {
+      "scenario": "A shard fails halfway through writing a friendship",
+      "impact": "One side of the edge is stored and the other is not, so the two people disagree about whether they are friends.",
+      "answer": "The write was recorded in the replicated log before either shard was changed. When the shard is back (or its replica takes over), the unfinished step is replayed from the log, and the step is idempotent, so applying it twice is harmless. Readers use a snapshot that does not include a half-applied edge.",
+      "concepts": [{ "slug": "write-ahead-log" }, { "slug": "idempotency" }, { "slug": "two-phase-commit" }]
+    },
+    {
+      "scenario": "A query asks for six hops",
+      "impact": "With about 200 friends each, six hops is 64 trillion paths, and the query would run forever and fill the memory.",
+      "answer": "The limits on depth, visited edges and time stop it, and the user gets a partial answer and a flag. Expensive patterns are rejected by the query planner or must be run on the analytics copy.",
+      "concepts": [{ "slug": "timeouts-and-deadlines" }, { "slug": "rate-limiting" }, { "slug": "backpressure" }]
+    },
+    {
+      "scenario": "A data centre is lost",
+      "impact": "Shards and their replicas in that site are gone, and writes that were waiting for a majority cannot be acknowledged.",
+      "answer": "Each shard's replicas are spread over three sites, so a majority remains. Leaders on the lost site are re-elected within seconds, queries continue from the surviving replicas, and the lost replicas are rebuilt from the log and a snapshot.",
+      "concepts": [{ "slug": "multi-region-failover" }, { "slug": "leader-election" }, { "slug": "quorums" }]
+    }
+  ],
+  "alternatives": [
+    {
+      "title": "How the graph is stored",
+      "options": [
+        { "name": "Relational edge table with joins", "pro": "Familiar tools, strong guarantees, fine for one or two hops", "con": "Each extra hop adds a join over a huge table" },
+        { "name": "Native adjacency lists", "pro": "A hop costs only the neighbours read, so deep queries stay fast", "con": "A specialised engine with fewer tools, and every edge is stored twice" },
+        { "name": "Graph layer over a key-value store", "pro": "Reuses a scalable store, with each node's list under one key", "con": "A supernode's list is one huge value, and traversal logic lives in the application" }
+      ],
+      "pick": "Native adjacency lists, with edges grouped by type and time."
+    },
+    {
+      "title": "How to partition",
+      "options": [
+        { "name": "Hash of the node id", "pro": "Even load, and trivial routing", "con": "Most hops of a multi-hop query leave the shard" },
+        { "name": "Graph partitioning by community", "pro": "Most hops stay local, and cross-shard traffic drops sharply", "con": "A shard can become hot, and the layout has to be recomputed as the graph changes" }
+      ],
+      "pick": "Hash first. Add locality for communities that are clearly dense once cross-shard traffic dominates."
+    },
+    {
+      "title": "What to do with a supernode in a walk",
+      "options": [
+        { "name": "Expand it fully", "pro": "Exact answers", "con": "One query can read tens of millions of edges" },
+        { "name": "Reach it but do not open it", "pro": "Cheap and predictable", "con": "Misses the people reached only through it" },
+        { "name": "Sample a fixed number of its edges", "pro": "Bounded cost with a still useful variety", "con": "Answers are approximate and can differ between runs" }
+      ],
+      "pick": "Skip or sample above a degree threshold, and read the full list only for queries that ask for the node directly."
+    },
+    {
+      "title": "Consistency across the two ends of an edge",
+      "options": [
+        { "name": "Two-phase commit across shards", "pro": "An edge appears on both ends together", "con": "More round trips and a coordinator that can block" },
+        { "name": "Write one end, repair the other later", "pro": "Fast writes", "con": "Readers can briefly see a one-way edge" }
+      ],
+      "pick": "Atomic across shards for the relationships users see as mutual, and eventual repair for derived edges such as recommendations."
+    }
+  ],
+  "roles": [
+    { "id": "client", "label": "Applications", "description": "Services that ask questions about the graph." },
+    { "id": "edge", "label": "Entry points", "description": "The query API and the shard router." },
+    { "id": "async", "label": "Write log", "description": "The replicated log of every change." },
+    { "id": "compute", "label": "Traversal", "description": "The traversal engine, the supernode guard and analytics." },
+    { "id": "data", "label": "State", "description": "Adjacency lists, shards, replicas and indexes." }
+  ]
+}

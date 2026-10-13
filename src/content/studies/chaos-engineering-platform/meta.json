@@ -1,0 +1,176 @@
+{
+  "name": "Design a Chaos Engineering Platform",
+  "difficulty": "advanced",
+  "intent": "Let teams break small parts of production on purpose, to test a stated hypothesis about steady state, with limits on how much can break and an automatic stop the moment a guardrail is crossed.",
+  "codeTitle": "a chaos experiment runner with blast-radius and abort guardrails",
+  "finalIntro": "One experiment, from hypothesis to report, and one that is stopped by its guardrail.",
+  "prompt": "Design a platform that lets engineering teams run chaos experiments on a production fleet of thousands of instances. Teams state a steady-state hypothesis, inject faults such as latency, errors, killed processes and network partitions, and learn whether the system holds. The platform must keep customers safe, stop by itself when things go wrong, schedule game days and report what was found.",
+  "functional": [
+    "Define an experiment as a steady-state hypothesis plus a fault, a target and a duration",
+    "Inject latency, errors, process kills and network partitions",
+    "Limit the blast radius by percentage, by cell or zone, and by service",
+    "Abort automatically and roll the fault back when a guardrail metric is breached",
+    "Schedule game days and recurring small experiments, with owners and approvals",
+    "Report the timeline, the verdict on the hypothesis and the follow-up actions"
+  ],
+  "nonFunctional": [
+    "Every fault is reversible, and is removed within 10 seconds of an abort",
+    "A guardrail breach is detected within about 10 seconds, even if the control plane is down",
+    "A failure of the chaos platform itself must never leave a fault behind",
+    "Thousands of instances and hundreds of experiments per month",
+    "Experiments never run during an incident, a deploy freeze or when the error budget is spent",
+    "Every start, abort and result is audited"
+  ],
+  "firstAttempt": {
+    "text": "An engineer logs in to a few production servers and kills processes or adds network delay by hand, while watching a dashboard. Nobody wrote down what was expected, and the experiment ends when the engineer decides it should.",
+    "limits": [
+      "There is no hypothesis, so nobody can say what counts as passing or failing",
+      "Nothing limits how much breaks, and one wrong command can take down a whole service",
+      "If the engineer looks away or loses their connection, the fault stays in place",
+      "Nothing is recorded, so results cannot be repeated or compared",
+      "It happens whenever someone feels like it, including during a real incident"
+    ]
+  },
+  "nodes": [
+    { "id": "eng", "label": "Engineers", "kind": "client", "x": 12, "y": 63 },
+    { "id": "manual", "label": "Servers, by hand", "kind": "compute", "x": 62, "y": 63, "at": 0, "until": 2 },
+    { "id": "api", "label": "Experiment API", "kind": "edge", "x": 37, "y": 63, "at": 1 },
+    { "id": "store", "label": "Experiment store", "kind": "data", "x": 37, "y": 88, "at": 1 },
+    { "id": "metrics", "label": "Metrics and SLIs", "kind": "data", "x": 87, "y": 63, "at": 1 },
+    { "id": "agents", "label": "Fault agents", "kind": "compute", "x": 62, "y": 63, "at": 2 },
+    { "id": "fleet", "label": "Target services", "kind": "compute", "x": 87, "y": 88, "at": 2 },
+    { "id": "planner", "label": "Blast-radius planner", "kind": "compute", "x": 62, "y": 37, "at": 3 },
+    { "id": "watchdog", "label": "Abort watchdog", "kind": "compute", "x": 87, "y": 37, "at": 4 },
+    { "id": "sched", "label": "Game day scheduler", "kind": "async", "x": 12, "y": 37, "at": 5 },
+    { "id": "report", "label": "Reports", "kind": "data", "x": 12, "y": 88, "at": 6 }
+  ],
+  "edges": [
+    { "from": "eng", "to": "manual", "at": 0, "until": 2 },
+    { "from": "eng", "to": "api", "at": 1 },
+    { "from": "api", "to": "store", "at": 1 },
+    { "from": "store", "to": "metrics", "at": 1 },
+    { "from": "api", "to": "agents", "at": 2 },
+    { "from": "agents", "to": "fleet", "at": 2 },
+    { "from": "fleet", "to": "metrics", "at": 2 },
+    { "from": "api", "to": "planner", "at": 3 },
+    { "from": "planner", "to": "agents", "at": 3 },
+    { "from": "metrics", "to": "watchdog", "at": 4 },
+    { "from": "watchdog", "to": "agents", "at": 4 },
+    { "from": "eng", "to": "sched", "at": 5 },
+    { "from": "sched", "to": "api", "at": 5 },
+    { "from": "store", "to": "report", "at": 6 },
+    { "from": "report", "to": "eng", "at": 6 }
+  ],
+  "steps": [
+    {
+      "title": "State the hypothesis in measurable terms",
+      "problem": "Breaking things without saying what should happen teaches nothing, because nobody can tell a pass from a fail, or a real problem from normal noise.",
+      "fix": "Every experiment is a record in the experiment store, created through the API. It names a steady-state metric taken from the service's golden signals, such as the checkout success rate or the 99th percentile latency, the baseline measured over the previous hour, and the hypothesis: 'with two of ten instances returning errors, the success rate stays above 95%'. The platform reads the metrics system to compute the baseline, and refuses to start if the baseline is already unhealthy.",
+      "tradeoff": "Results become a clear yes or no, and repeatable. Choosing a good steady-state metric takes real thought, a noisy metric gives false verdicts, and a hypothesis that is too loose passes everything.",
+      "concepts": [{ "slug": "slos-and-error-budgets" }, { "slug": "red-use-and-golden-signals" }, { "slug": "metrics" }, { "slug": "alerting" }]
+    },
+    {
+      "title": "Inject faults through agents that can always undo them",
+      "problem": "Real failures come in a few shapes: slow responses, errors, dead processes and cut networks. Each needs a safe way to be created on demand and to be removed again.",
+      "fix": "A fault agent runs on every host, or as a sidecar proxy next to each service. The control plane sends it a fault: add 300 ms of latency, return HTTP 500 for 30% of requests, kill the process, or drop packets to a named set of addresses to make a partition. Every fault carries a time to live, so the agent removes it by itself when the time runs out, even if the control plane never speaks to it again. Agents only accept faults signed by the control plane.",
+      "tradeoff": "The four kinds of failure cover most real outages, and the time to live means a lost connection cannot leave a fault behind. Agents have privileges that could do harm, so they need strong authentication, and a fault injected in a proxy is only an approximation of a real failure deep in the network.",
+      "concepts": [{ "slug": "proxies" }, { "slug": "timeouts-and-deadlines" }, { "slug": "retries-and-backoff" }, { "slug": "circuit-breaker" }, { "slug": "failure-detection" }]
+    },
+    {
+      "title": "Limit the blast radius before anything starts",
+      "problem": "An experiment that is allowed to touch everything is just an outage with a good name.",
+      "fix": "Before it starts, a planner checks the request against limits: at most a set percentage of a service's instances, at most one cell or zone, and a list of services that are never targeted. It also checks the world around: no open incident, no deploy in progress, enough error budget left. The experiment then ramps up in stages, for example 1%, 5% and 20% of the allowed targets, and each stage must stay healthy before the next begins. The first run of a new experiment always uses a tiny slice.",
+      "tradeoff": "A mistake can only hurt a small part of the fleet, and teams gain confidence step by step. Small slices may not reveal problems that only appear at scale, so the limits are raised gradually as trust grows, and some tests of whole-region failure need a dedicated event.",
+      "concepts": [{ "slug": "bulkhead" }, { "slug": "canary-deployments" }, { "slug": "feature-flags" }, { "slug": "slos-and-error-budgets" }]
+    },
+    {
+      "title": "Abort automatically when a guardrail is breached",
+      "problem": "A person watching a dashboard reacts in minutes, but a bad experiment can hurt customers in seconds, and the person may not be watching at all.",
+      "fix": "A watchdog reads the guardrail metrics every few seconds, for example the success rate of the whole service, which must stay above 90% even though the hypothesis allows 95% in the target slice. A breach, or a missing reading, makes it send an abort to every agent, which removes the faults and reports back. The watchdog runs as a separate service from the control plane, so it works even if the API is down. If agents stop hearing from it, their time to live ends the fault anyway.",
+      "tradeoff": "Customers see at most a few seconds of impact, and abort needs no human. A too-sensitive guardrail aborts on ordinary noise and teams learn nothing, a too-loose one hurts users first, and treating missing data as a breach will sometimes abort a healthy experiment.",
+      "concepts": [{ "slug": "alerting" }, { "slug": "health-checks" }, { "slug": "metrics" }, { "slug": "leases-and-fencing-tokens" }, { "slug": "graceful-degradation" }]
+    },
+    {
+      "title": "Schedule game days and keep small experiments running",
+      "problem": "Experiments run once and forgotten prove nothing about next month's code, and big team exercises need preparation and people.",
+      "fix": "A scheduler holds two kinds of runs. Game days are booked on a calendar with an owner, a list of attendees, an approval from the service's on-call, and a notification in the team channel before and after. Recurring experiments, such as 'kill one instance of each stateless service every weekday morning', run on their own during working hours, when people are present to respond. Freeze windows, holidays and busy periods block all runs.",
+      "tradeoff": "People are ready when something unexpected happens, and regressions are caught continuously. Approvals add friction, and experiments in working hours are only safe because the blast radius and the abort are already in place.",
+      "concepts": [{ "slug": "authentication-and-authorization" }, { "slug": "canary-deployments" }, { "slug": "blue-green-and-rolling-deployments" }, { "slug": "alerting" }]
+    },
+    {
+      "title": "Report the verdict and follow the findings",
+      "problem": "If the learning stays in the heads of those who attended, the same weakness is found again next year.",
+      "fix": "When an experiment ends, or aborts, the platform assembles a report from the store: the hypothesis, the faults with their exact start and stop times, the metric graphs with the fault window marked, the verdict (held, disproved or aborted) and a link to traces of the failed requests. Findings become tickets owned by the team, and a dashboard tracks which services have been tested, which hypotheses failed and how long fixes take.",
+      "tradeoff": "Each experiment leaves evidence, and resilience becomes something that can be measured over time. Reports need curation to stay useful, and counting the experiments run rewards the wrong behaviour if it is not tied to fixes.",
+      "concepts": [{ "slug": "structured-logging" }, { "slug": "distributed-tracing" }, { "slug": "metrics" }, { "slug": "event-sourcing" }]
+    }
+  ],
+  "failures": [
+    {
+      "scenario": "The metrics pipeline goes blind during an experiment",
+      "impact": "The watchdog cannot see the guardrail, so a harmful fault could run unnoticed.",
+      "answer": "Missing data counts as a breach, so the watchdog aborts and the experiment is marked inconclusive. Independently, every fault has a short time to live that the control plane must renew while readings are healthy, so a blind platform loses its faults within seconds.",
+      "concepts": [{ "slug": "alerting" }, { "slug": "leases-and-fencing-tokens" }, { "slug": "health-checks" }]
+    },
+    {
+      "scenario": "A fault agent crashes while a fault is active",
+      "impact": "A rule that drops packets or delays requests could stay on the host with no one to remove it.",
+      "answer": "Faults are installed so they expire by themselves: a rule carries a deadline, and the host cleans up expired rules at start-up. A supervisor restarts the agent, which first removes every fault it cannot match to a live experiment. A periodic audit compares the faults on hosts with the experiments in the store and raises an alert for any stray.",
+      "concepts": [{ "slug": "failure-detection" }, { "slug": "leases-and-fencing-tokens" }, { "slug": "alerting" }]
+    },
+    {
+      "scenario": "Retries turn a small fault into a wider outage",
+      "impact": "Two failing instances cause clients to retry, and the extra load pushes the healthy instances past their capacity, so the damage is far larger than the planned slice.",
+      "answer": "The guardrail watches the whole service, not only the target slice, so the spread is caught and the experiment aborts. The finding itself is valuable: it shows missing retry limits or too little headroom, and the report links to the traces that show the amplification.",
+      "concepts": [{ "slug": "retries-and-backoff" }, { "slug": "backpressure" }, { "slug": "load-shedding" }, { "slug": "circuit-breaker" }]
+    },
+    {
+      "scenario": "An experiment passes only because the metric is too noisy to show harm",
+      "impact": "The team believes the system is resilient, but a real failure later proves otherwise.",
+      "answer": "Each experiment compares the fault window with a control group of untouched instances and with the baseline, and requires enough requests in the window for a meaningful result. A result with too little traffic is reported as inconclusive, not as a pass, and the hypothesis is tightened.",
+      "concepts": [{ "slug": "metrics" }, { "slug": "slos-and-error-budgets" }, { "slug": "red-use-and-golden-signals" }]
+    }
+  ],
+  "alternatives": [
+    {
+      "title": "Where faults are injected",
+      "options": [
+        { "name": "In the application with a library", "pro": "Precise: it can fail one particular call", "con": "Every language needs a library, and the test code ships with the product" },
+        { "name": "In a sidecar or proxy", "pro": "Works for any language, and easy to turn on and off", "con": "Cannot imitate a dying process or a full disk" },
+        { "name": "On the host or cloud, with a node agent or provider API", "pro": "Real failures: kills, packet loss, whole zones", "con": "Broad privileges and a bigger blast if misused" }
+      ],
+      "pick": "A sidecar for latency and errors, and a signed host agent for kills and partitions."
+    },
+    {
+      "title": "Where experiments run",
+      "options": [
+        { "name": "Only in staging", "pro": "No risk to customers", "con": "Different traffic, data and scale, so it misses real weaknesses" },
+        { "name": "In production, with limits and automatic abort", "pro": "Real traffic and real dependencies", "con": "Needs the safety machinery and organizational trust" }
+      ],
+      "pick": "Start in staging to debug the experiment, then production with a tiny blast radius."
+    },
+    {
+      "title": "When experiments happen",
+      "options": [
+        { "name": "Occasional game days", "pro": "Whole-team learning and room for big scenarios", "con": "Between events, regressions go unnoticed" },
+        { "name": "Continuous small experiments", "pro": "Catches regressions soon after they are shipped", "con": "Less dramatic, and needs the automation to be trusted" }
+      ],
+      "pick": "Both: continuous small experiments, and a quarterly game day for large scenarios."
+    },
+    {
+      "title": "Who stops a bad experiment",
+      "options": [
+        { "name": "A person with a stop button", "pro": "Judgement, and easy to build", "con": "Takes minutes, and requires attention" },
+        { "name": "An automatic watchdog", "pro": "Seconds, and always on", "con": "Needs well-chosen thresholds, and can abort on noise" }
+      ],
+      "pick": "Automatic abort as the main protection, with a manual stop button as well."
+    }
+  ],
+  "roles": [
+    { "id": "client", "label": "Engineers", "description": "Teams that write and review experiments." },
+    { "id": "edge", "label": "Control plane", "description": "The API that accepts, validates and starts experiments." },
+    { "id": "async", "label": "Scheduler", "description": "Game days and recurring runs." },
+    { "id": "compute", "label": "Safety and faults", "description": "The planner, fault agents, target services and the abort watchdog." },
+    { "id": "data", "label": "State", "description": "Experiment records, metrics and reports." }
+  ]
+}

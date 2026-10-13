@@ -1,0 +1,103 @@
+---
+import PlaygroundShell from '../../components/PlaygroundShell.astro';
+---
+<PlaygroundShell title="Survive an alert storm" hint="90 minutes with one on-call engineer. A database fails at minute 20 and 90 service alerts fire. A separate, real payments incident starts at minute 30. Change how alerts are handled and see whether the payments page gets through.">
+  <ol class="how">
+    <li>With the defaults, nothing is tuned: <b>188 alerts</b> become <b>188 pages</b>, 96 of them from flapping CPU alerts. One engineer needs 376 minutes to read them, so the payments page is reached at <b>minute 246</b>, 216 minutes after the fault and long after it ended.</li>
+    <li>Choose <b>group by service</b>: <b>55 pages</b>. The payments page is still <b>8 minutes</b> late, because the CPU noise keeps the pager busy. Now also choose <b>only critical alerts page</b>: <b>5 pages</b> and the payments page is handled <b>at once</b>.</li>
+    <li>Starting again from the defaults, set <b>wait before firing</b> to 3 minutes, switch <b>inhibition</b> on and group by service and alert name: <b>3 pages</b> and a delay of <b>5 minutes</b>. At 5 minutes of waiting only <b>2 pages</b> remain, and still 5 minutes. At <b>6 or more</b> the page is late again, because the wait itself is the delay.</li>
+  </ol>
+  <div class="pg asb" data-asb>
+    <div class="pg-row">
+      <label>Wait before firing, minutes <input type="range" min="0" max="10" value="0" data-for /> <b data-forval></b></label>
+      <label>Grouping <select class="pg-in" data-group>
+        <option value="none" selected>none, one page per alert</option>
+        <option value="service">by service</option>
+        <option value="service+alert">by service and alert name</option>
+      </select></label>
+      <label>Routing <select class="pg-in" data-route>
+        <option value="all" selected>every alert pages</option>
+        <option value="critical">only critical alerts page</option>
+      </select></label>
+      <label><input type="checkbox" data-inhibit /> Inhibition: when the database is down, hide its symptom alerts</label>
+    </div>
+    <div class="pg-grid">
+      <div class="pg-box" data-b1><h3>Alerts that fired</h3><span class="pg-mono" data-o1></span><span class="pg-note" data-n1></span></div>
+      <div class="pg-box" data-b2><h3>Pages to the on-call</h3><span class="pg-mono" data-o2></span><span class="pg-note" data-n2></span></div>
+      <div class="pg-box" data-b3><h3>Time the engineer needs</h3><span class="pg-mono" data-o3></span><span class="pg-note" data-n3></span></div>
+      <div class="pg-box" data-b4><h3>The payments incident (minute 30)</h3><span class="pg-mono" data-o4></span><span class="pg-note" data-n4></span></div>
+    </div>
+    <p class="pg-out" data-verdict aria-live="polite"></p>
+    <p class="pg-note">Model: 6 CPU alerts flap, each above its threshold in a random 25% of the minutes. The database alert and 90 symptom alerts (30 hosts, 3 alert names, 30 of them critical) are true from minute 20 to 49. The payments alert is true from minute 30 to 44. A rule fires after its condition has held for the wait. A group sends its first notification at once and later ones at least 5 minutes apart. One engineer reads pages in order and needs 2 minutes for each. The goal is to reach the payments page within 5 minutes of the fault, with at most 10 pages.</p>
+  </div>
+</PlaygroundShell>
+<script>
+  document.querySelectorAll<HTMLElement>('[data-asb]').forEach((root) => {
+    const q = <T extends HTMLElement>(s: string) => root.querySelector<T>(s)!;
+    const T = 90; const SERVICES = ['checkout', 'search', 'batch'];
+    type Alert = { name: string; service: string; sev: string; cond: boolean[] };
+    // The alert conditions are built once, so every setting is judged on the same minute-by-minute data.
+    const alerts: Alert[] = [];
+    let seed = 11; const rnd = () => ((seed = (seed * 1664525 + 1013904223) % 4294967296) / 4294967296);
+    const add = (name: string, service: string, sev: string, from: number, to: number) => alerts.push({ name, service, sev, cond: Array.from({ length: T }, (_, m) => m >= from && m <= to) });
+    for (let i = 0; i < 6; i++) alerts.push({ name: 'cpu-high', service: SERVICES[i % 3], sev: 'warning', cond: Array.from({ length: T }, () => rnd() < 0.25) });
+    add('db-down', 'database', 'critical', 20, 49);
+    for (let h = 0; h < 30; h++) { add('latency', SERVICES[h % 3], 'warning', 20, 49); add('errors', SERVICES[h % 3], 'critical', 20, 49); add('timeouts', SERVICES[h % 3], 'warning', 20, 49); }
+    add('payments-errors', 'payments', 'critical', 30, 44);
+    const SYMPTOMS = ['latency', 'errors', 'timeouts'];
+    type Fire = { m: number; idx: number; a: Alert };
+    type Note = { t: number; pay: boolean; noise: boolean };
+    function simulate(wait: number, grouping: string, inhibit: boolean, routing: string) {
+      const fires: Fire[] = [];
+      alerts.forEach((a, idx) => { let c = 0; a.cond.forEach((on, m) => { c = on ? c + 1 : 0; if (c === wait + 1) fires.push({ m, idx, a }); }); });
+      fires.sort((x, y) => x.m - y.m || x.idx - y.idx);
+      const db = fires.find((f) => f.a.name === 'db-down');
+      let kept = fires; let inhibited = 0;
+      if (inhibit && db) kept = fires.filter((f) => { const hide = SYMPTOMS.includes(f.a.name) && f.m >= db.m && f.m <= 49; if (hide) inhibited++; return !hide; });
+      const paged = routing === 'critical' ? kept.filter((f) => f.a.sev === 'critical') : kept;
+      const chat = kept.length - paged.length;
+      let notes: Note[] = [];
+      if (grouping === 'none') notes = paged.map((f) => ({ t: f.m, pay: f.a.name === 'payments-errors', noise: f.a.name === 'cpu-high' }));
+      else {
+        const groups = new Map<string, Fire[]>();
+        paged.forEach((f) => { const k = grouping === 'service' ? f.a.service : `${f.a.service}|${f.a.name}`; if (!groups.has(k)) groups.set(k, []); groups.get(k)!.push(f); });
+        groups.forEach((evs) => {
+          let last: number | null = null; let i = 0;
+          while (i < evs.length) {
+            const t: number = last === null ? evs[i].m : Math.max(evs[i].m, last + 5);
+            const batch: Fire[] = []; while (i < evs.length && evs[i].m <= t) batch.push(evs[i++]);
+            notes.push({ t, pay: batch.some((f) => f.a.name === 'payments-errors'), noise: batch.every((f) => f.a.name === 'cpu-high') }); last = t;
+          }
+        });
+      }
+      notes.sort((a, b) => a.t - b.t);
+      let free = 0; let payStart = -1; let payNote = -1;
+      notes.forEach((n) => { const s = Math.max(n.t, free); free = s + 2; if (n.pay && payStart < 0) { payStart = s; payNote = n.t; } });
+      return { raw: fires.length, inhibited, chat, pages: notes.length, noise: notes.filter((n) => n.noise).length, need: notes.length * 2, payStart, payNote };
+    }
+    const paint = (sel: string, color: string) => q<HTMLElement>(sel).style.setProperty('--c', color);
+    function draw() {
+      const wait = Number(q<HTMLInputElement>('[data-for]').value); const grouping = q<HTMLSelectElement>('[data-group]').value;
+      const routing = q<HTMLSelectElement>('[data-route]').value; const inhibit = q<HTMLInputElement>('[data-inhibit]').checked;
+      q('[data-forval]').textContent = String(wait);
+      const r = simulate(wait, grouping, inhibit, routing);
+      const delay = r.payStart - 30; const queueWait = r.payStart - r.payNote; const groupWait = r.payNote - (30 + wait);
+      q('[data-o1]').textContent = `${r.raw} alerts`; q('[data-n1]').textContent = `${r.inhibited} hidden by inhibition`;
+      q('[data-o2]').textContent = `${r.pages} pages`; q('[data-n2]').textContent = `${r.noise} only from CPU noise, ${r.chat} sent to chat instead`;
+      q('[data-o3]').textContent = `${r.need} minutes`; q('[data-n3]').textContent = r.need > T ? `more than the ${T} minutes there are` : `of the ${T} minutes`;
+      q('[data-o4]').textContent = delay === 0 ? 'handled at once' : `handled ${delay} min after the fault`;
+      q('[data-n4]').textContent = `${wait} waiting to fire, ${groupWait} in grouping, ${queueWait} behind other pages`;
+      const inTime = delay <= 5; const calm = r.pages <= 10;
+      paint('[data-b1]', 'var(--accent)'); paint('[data-b2]', calm ? 'var(--good)' : 'var(--bad)'); paint('[data-b3]', r.need <= T / 2 ? 'var(--good)' : 'var(--bad)'); paint('[data-b4]', inTime ? 'var(--good)' : 'var(--bad)');
+      const out = q('[data-verdict]'); out.classList.toggle('bad', !(inTime && calm));
+      let text: string;
+      if (inTime && calm) text = `Good: the payments page was handled ${delay === 0 ? 'at once' : `${delay} minutes after the fault`} and the engineer received only ${r.pages} pages in the 90 minutes.`;
+      else if (inTime) text = `The payments page was in time (${delay} minutes), but ${r.pages} pages in 90 minutes is more than a person can act on. It worked only because the pager was not yet full.`;
+      else if (queueWait >= 2) text = `Missed: the payments page was handled ${delay} minutes after the fault${r.payStart > 44 ? ', after the incident was already over' : ''}. It waited ${queueWait} minutes behind other pages${r.noise > 0 ? `, ${r.noise} of which were only CPU noise` : ''}. This is alert fatigue: the real page is one among many.`;
+      else text = `Late: the payments page took ${delay} minutes, and ${wait} of them were spent waiting before the rule fired. A long wait removes noise but delays real pages, so it has to stay below the detection goal.`;
+      out.textContent = text;
+    }
+    root.addEventListener('input', draw); root.addEventListener('change', draw);
+    draw();
+  });
+</script>

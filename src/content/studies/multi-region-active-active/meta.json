@@ -1,0 +1,181 @@
+{
+  "name": "Design a Multi-Region Active-Active System",
+  "difficulty": "advanced",
+  "intent": "Serve users from the nearest of several regions that all accept writes, keep the copies converging, survive the loss of a whole region, and keep each country's data where the law says it must stay.",
+  "codeTitle": "last-writer-wins against a counter CRDT across three regions",
+  "finalIntro": "One user liking a post from Frankfurt, and the like reaching the other regions.",
+  "prompt": "Design the backend of a social app with 200 million users in North America, Europe and Asia. Every region must accept reads and writes so that users get fast responses everywhere. If a region fails, its users move to another one without data loss they can notice. European accounts must be stored in Europe.",
+  "functional": [
+    "Route each user to a nearby region for reads and writes",
+    "Replicate every write to the other regions",
+    "Resolve two regions changing the same data at the same time",
+    "Fail over to another region when one is lost, and fail back later",
+    "Keep data of regulated users inside their region",
+    "Let a user see their own change right after making it"
+  ],
+  "nonFunctional": [
+    "Reads and writes complete in under 100 ms from the user's nearest region",
+    "Survive the loss of one full region with an availability of 99.99%",
+    "Replication lag between regions stays under about a second at the 99th percentile",
+    "No acknowledged write is silently lost, apart from the narrow window of an unreplicated tail at a region crash",
+    "All regions converge to the same state once the network heals",
+    "European personal data is never stored outside Europe"
+  ],
+  "firstAttempt": {
+    "text": "One region, in the US, with an application tier and a primary database. Every user in the world connects to it. A second region holds a read-only copy for backup, to be switched on by hand if the first one fails.",
+    "limits": [
+      "A user in Singapore pays about 200 ms of round trip for every request, and a page of five requests takes a second",
+      "The backup region sits idle, so half the money buys nothing until a disaster, and the switch has never been tested",
+      "When the US region fails, every user is down until someone promotes the backup, and the last seconds of writes are gone",
+      "European data lives in a US database, which breaks the data residency rules",
+      "The one primary is a single bottleneck for all write traffic in the world"
+    ]
+  },
+  "nodes": [
+    { "id": "users", "label": "Users worldwide", "kind": "client", "x": 12, "y": 37 },
+    { "id": "single", "label": "One US stack", "kind": "data", "x": 62, "y": 37, "at": 0, "until": 1 },
+    { "id": "router", "label": "Global routing", "kind": "edge", "x": 37, "y": 37, "at": 1 },
+    { "id": "us", "label": "US region", "kind": "data", "x": 62, "y": 12, "at": 1 },
+    { "id": "eu", "label": "EU region", "kind": "data", "x": 62, "y": 37, "at": 1 },
+    { "id": "ap", "label": "Asia region", "kind": "data", "x": 62, "y": 63, "at": 1 },
+    { "id": "stream", "label": "Replication streams", "kind": "async", "x": 87, "y": 37, "at": 2 },
+    { "id": "merge", "label": "Conflict merge", "kind": "compute", "x": 87, "y": 12, "at": 3 },
+    { "id": "health", "label": "Health and failover", "kind": "edge", "x": 37, "y": 12, "at": 4 },
+    { "id": "policy", "label": "Residency policy", "kind": "compute", "x": 37, "y": 88, "at": 5 },
+    { "id": "vault", "label": "EU-only store", "kind": "data", "x": 62, "y": 88, "at": 5 },
+    { "id": "monitor", "label": "Lag monitor", "kind": "compute", "x": 87, "y": 63, "at": 6 }
+  ],
+  "edges": [
+    { "from": "users", "to": "single", "at": 0, "until": 1 },
+    { "from": "users", "to": "router", "at": 1 },
+    { "from": "router", "to": "us", "at": 1 },
+    { "from": "router", "to": "eu", "at": 1 },
+    { "from": "router", "to": "ap", "at": 1 },
+    { "from": "us", "to": "stream", "at": 2 },
+    { "from": "eu", "to": "stream", "at": 2 },
+    { "from": "ap", "to": "stream", "at": 2 },
+    { "from": "stream", "to": "merge", "at": 3 },
+    { "from": "health", "to": "router", "at": 4 },
+    { "from": "health", "to": "us", "at": 4 },
+    { "from": "health", "to": "eu", "at": 4 },
+    { "from": "router", "to": "policy", "at": 5 },
+    { "from": "policy", "to": "vault", "at": 5 },
+    { "from": "stream", "to": "monitor", "at": 6 },
+    { "from": "monitor", "to": "router", "at": 6 }
+  ],
+  "steps": [
+    {
+      "title": "Put a full stack in each region and route users to the nearest",
+      "problem": "Light in fibre needs about 70 ms to cross the Atlantic one way and about 100 ms to reach Asia from the US, so no amount of tuning makes a single-region service fast for the whole world.",
+      "fix": "Run an independent copy of the whole stack, the application servers and a database, in each region, all serving live traffic. A global routing layer sends each user to the closest healthy region, using latency-based DNS or an anycast address that the network steers to the nearest point of presence. Within a region the usual load balancers spread the work, and every region is sized to be able to take over some of the others' load.",
+      "tradeoff": "Users get local latency and every region does useful work all the time, so there is no idle standby. Each region now has its own copy of the data, and the rest of the design is about keeping those copies consistent.",
+      "concepts": [{ "slug": "dns" }, { "slug": "anycast-and-bgp-routing" }, { "slug": "load-balancing" }, { "slug": "latency-and-round-trips" }, { "slug": "multi-region-failover" }]
+    },
+    {
+      "title": "Replicate every write to the other regions, asynchronously",
+      "problem": "A write accepted in Frankfurt must eventually be visible in Virginia and Singapore, but waiting for both to confirm would put an intercontinental round trip of 100 to 200 ms into every write.",
+      "fix": "A write is committed in the local region's database and acknowledged to the user at once. Its change record then goes onto a replication stream, with a sequence number per source region, to every other region, where it is applied in order. Each region remembers how far it has applied each peer's stream, so after an outage it resumes from that position and nothing is skipped or applied twice. Applying a record is made idempotent.",
+      "tradeoff": "Writes stay as fast as a single-region write, and a slow or broken link does not stop the other regions. The price is replication lag, typically between 50 ms and a second, during which regions disagree, and a window of recent writes that exist only in one region if that region is destroyed.",
+      "concepts": [{ "slug": "database-replication" }, { "slug": "message-queues" }, { "slug": "idempotency" }, { "slug": "delivery-guarantees" }, { "slug": "consistency-models" }]
+    },
+    {
+      "title": "Decide what happens when two regions write the same data",
+      "problem": "If a user edits a profile in Paris while their phone, on a different route, edits it in Virginia, each region accepts its own write, and the two changes meet only later, with no way to tell which one is right.",
+      "fix": "Pick the rule per kind of data. The simplest is last-writer-wins, where each write carries a timestamp from a hybrid logical clock and the higher one survives, with the region id breaking ties. Counters, sets and collaborative lists use CRDTs, whose merge function combines both changes without losing either, so two likes become two likes. Data that cannot be merged, such as a bank balance or a unique username, is given a home region that handles all writes for it, and other regions forward their writes there.",
+      "tradeoff": "Local writes always succeed and the regions converge without coordination. Last-writer-wins silently throws away one of two concurrent writes, and a wall clock that is slow by 100 ms can make an older write win, which is why a hybrid logical clock is used. CRDTs lose nothing but need a data model made for them, and a home region adds a cross-ocean hop for the users who are far from it.",
+      "concepts": [{ "slug": "crdts" }, { "slug": "logical-clocks" }, { "slug": "consistency-models" }, { "slug": "cap-theorem" }, { "slug": "optimistic-concurrency-and-etags" }]
+    },
+    {
+      "title": "Detect a regional failure and fail over automatically",
+      "problem": "When a region dies, its users keep sending requests to it until something notices, and a person deciding at three in the morning whether to switch takes minutes to hours.",
+      "fix": "Health checks run from several outside locations against each region's public endpoints, and the routing layer takes a region out of rotation only when most checkers agree, which avoids reacting to one broken link. Users of the failed region are sent to the nearest remaining one, which already holds a copy of their data. The failed region is kept out of rotation, and the writes it had not yet replicated are recovered from its logs after it returns. Failing back is done gradually, after the region has caught up, with a small share of traffic first.",
+      "tradeoff": "Recovery takes tens of seconds instead of hours, and the failover path is used often enough to stay trusted. The surviving regions need spare capacity, roughly one extra region's worth spread across the others, and a mistaken failover under a flaky network can move load onto regions that cannot carry it.",
+      "concepts": [{ "slug": "health-checks" }, { "slug": "multi-region-failover" }, { "slug": "failure-detection" }, { "slug": "graceful-degradation" }, { "slug": "slos-and-error-budgets" }]
+    },
+    {
+      "title": "Keep regulated data in its home jurisdiction",
+      "problem": "Replicating every record everywhere would copy a European user's personal data to the US and Asia, which laws such as the GDPR and national data localisation rules can forbid.",
+      "fix": "Every record has a residency label taken from the account, such as 'EU'. A policy layer decides, per label, which regions may hold the record. EU-labelled personal data is written only to EU regions and its replication stream never leaves them, while a small pseudonymous reference, such as an opaque id, is all that the other regions store. The routing layer sends an EU user to an EU region even when a US one is closer, and failover for that user stays inside Europe, with at least two EU regions to fail between.",
+      "tradeoff": "The company can show where each piece of data lives and meet legal requirements. Some features, such as a global search over profiles, become harder, an EU user abroad sees extra latency for personal data, and a region pair must exist inside each regulated area, which raises cost.",
+      "concepts": [{ "slug": "encryption" }, { "slug": "access-control-models" }, { "slug": "database-sharding" }, { "slug": "api-gateway" }]
+    },
+    {
+      "title": "Show users their own writes despite replication lag",
+      "problem": "A user posts a comment in Frankfurt, and the next request is routed, after a network change, to a region the comment has not reached. The comment appears to have vanished, so the user posts it again.",
+      "fix": "Each write returns a version token, the per-region sequence numbers it depends on, which the client sends back with later reads. A region serves the read only if it has applied at least those positions, and otherwise it waits briefly, reads from the region that took the write, or redirects the user there. Users are normally kept on one region by session stickiness, and a lag monitor measures how far each region is behind so that the router can avoid a region whose lag is too large.",
+      "tradeoff": "Users never see their own changes disappear, while other people's changes can still arrive a moment late, which they cannot notice. A few reads wait or travel further, the tokens must be carried by every client, and the lag monitor has to be trusted.",
+      "concepts": [{ "slug": "consistency-models" }, { "slug": "logical-clocks" }, { "slug": "quorums" }, { "slug": "metrics" }, { "slug": "timeouts-and-deadlines" }]
+    }
+  ],
+  "failures": [
+    {
+      "scenario": "A whole region goes dark",
+      "impact": "A third of the users get errors, and the last second or so of writes accepted in that region has not left it.",
+      "answer": "Outside health checks agree it is down and the router moves its users to the next nearest region within tens of seconds, as the other regions already have the replicated data. The unreplicated tail stays in the failed region's logs and is merged back after it recovers, using the same conflict rules. Because the surviving regions run with spare capacity, they absorb the extra load, and the dashboards report the exact lag at the time of failure so the possible loss is known.",
+      "concepts": [{ "slug": "multi-region-failover" }, { "slug": "health-checks" }, { "slug": "autoscaling" }, { "slug": "database-replication" }]
+    },
+    {
+      "scenario": "The link between two regions is cut but both are up",
+      "impact": "Each side keeps accepting writes and the same data is changed on both sides, a split brain for everything without a single owner.",
+      "answer": "Active-active chooses availability: both sides keep serving, and the conflict rules merge the changes once the link returns. Data with a home region stops accepting writes where the home region cannot be reached, because a unique name or a balance must not be given out twice. The replication streams resume from the saved positions, and a background comparison of the regions' data finds and repairs any difference that remains.",
+      "concepts": [{ "slug": "cap-theorem" }, { "slug": "crdts" }, { "slug": "merkle-trees-and-anti-entropy" }, { "slug": "consensus" }]
+    },
+    {
+      "scenario": "A region's clock runs 200 ms slow",
+      "impact": "With plain wall-clock last-writer-wins, a write made there loses to an older write from another region, so a user's newer edit is undone.",
+      "answer": "Timestamps come from a hybrid logical clock, which never moves backwards and jumps ahead to any timestamp it has seen, so a write made after seeing another always sorts after it. Clock offset is monitored and alarmed, and a server whose offset passes a limit is taken out of service. Data that cannot tolerate even this uses a home region instead.",
+      "concepts": [{ "slug": "logical-clocks" }, { "slug": "alerting" }, { "slug": "failure-detection" }]
+    },
+    {
+      "scenario": "A bad write or a bug replicates everywhere",
+      "impact": "Active-active copies mistakes just as faithfully as good data, so a deleted table is deleted in every region within a second.",
+      "answer": "Replication is not a backup. Point-in-time backups and a delayed copy let the data be restored to before the mistake, and dangerous operations are rolled out region by region with a pause between them, so the first region can be stopped before the rest receive it.",
+      "concepts": [{ "slug": "backups-and-point-in-time-recovery" }, { "slug": "canary-deployments" }, { "slug": "feature-flags" }, { "slug": "event-sourcing" }]
+    }
+  ],
+  "alternatives": [
+    {
+      "title": "How regions share the work",
+      "options": [
+        { "name": "Active-passive", "pro": "One writer, so no conflicts, and the simplest to reason about", "con": "The standby is idle, far users stay slow, and failover is slow and rarely tested" },
+        { "name": "Active-active for reads, one write region", "pro": "Fast reads everywhere with no write conflicts", "con": "Every write crosses an ocean for far users, and failover of the writer is still needed" },
+        { "name": "Active-active with writes everywhere", "pro": "Local latency for reads and writes and no idle capacity", "con": "Needs conflict rules, and lag is visible to users" }
+      ],
+      "pick": "Active-active everywhere, with a home region for the few kinds of data that cannot be merged."
+    },
+    {
+      "title": "How conflicts are resolved",
+      "options": [
+        { "name": "Last-writer-wins by wall clock", "pro": "Trivial to build", "con": "Drops concurrent writes and obeys skewed clocks" },
+        { "name": "Last-writer-wins by hybrid logical clock", "pro": "Respects cause and effect and survives clock skew", "con": "Still drops one of two concurrent writes" },
+        { "name": "CRDTs", "pro": "Merges without loss and without coordination", "con": "Needs data types designed for it, and history can grow" },
+        { "name": "Home region per record", "pro": "Strong rules, no conflicts, and works for balances and unique names", "con": "Remote users pay a round trip, and the home region is a dependency" }
+      ],
+      "pick": "A hybrid logical clock by default, CRDTs for counters and sets, and a home region for money and unique keys."
+    },
+    {
+      "title": "How replicas agree",
+      "options": [
+        { "name": "Asynchronous replication", "pro": "Fast writes and independent regions", "con": "A lag window and a possible small loss at a crash" },
+        { "name": "Synchronous replication to a quorum of regions", "pro": "No loss and a single order of writes", "con": "Every write pays a cross-region round trip, and losing two regions stops writes" }
+      ],
+      "pick": "Asynchronous replication for most data, and a quorum across regions only for the small set of records where loss is unacceptable."
+    },
+    {
+      "title": "How routing finds the region",
+      "options": [
+        { "name": "Latency-based DNS", "pro": "Simple and works with any client", "con": "Cached answers delay a failover by the time to live" },
+        { "name": "Anycast", "pro": "Fast reroute when a region disappears, with no caches in the way", "con": "Needs a network provider and can split one user's traffic between regions" },
+        { "name": "A smart client with a region list", "pro": "The client can retry elsewhere at once", "con": "Only works for apps you control and need updating" }
+      ],
+      "pick": "Anycast or low-TTL DNS at the edge, with the app retrying another region on error."
+    }
+  ],
+  "roles": [
+    { "id": "client", "label": "Users", "description": "Phones and browsers anywhere in the world." },
+    { "id": "edge", "label": "Routing and failover", "description": "Global routing, health checks and the failover decision." },
+    { "id": "async", "label": "Replication", "description": "The streams that carry writes between regions." },
+    { "id": "compute", "label": "Rules", "description": "Conflict merging, residency policy and lag monitoring." },
+    { "id": "data", "label": "Regions and stores", "description": "Each region's application and database, and the regional-only stores." }
+  ]
+}

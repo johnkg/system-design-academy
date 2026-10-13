@@ -1,0 +1,176 @@
+{
+  "name": "Design a Vector Database",
+  "difficulty": "advanced",
+  "intent": "Store a hundred million embeddings and return the nearest ones to a query vector in a few milliseconds, with metadata filters, while vectors are added and deleted all the time.",
+  "codeTitle": "an inverted-file index with recall and filters",
+  "finalIntro": "One search for products similar to a photo, restricted to those in stock.",
+  "prompt": "Design a vector database for a product search and recommendation service. Each item has a 768-number embedding and some attributes, such as category, price and in-stock. Given a query vector, return the 10 most similar items that match a filter, quickly, while items are added, changed and removed all day.",
+  "functional": [
+    "Insert, update and delete vectors with an id and attributes",
+    "Return the k nearest vectors to a query vector",
+    "Restrict the search with filters on attributes, such as category or in-stock",
+    "Support several collections, and more than one distance measure",
+    "Fetch a vector and its attributes by id"
+  ],
+  "nonFunctional": [
+    "A search over 100 million vectors takes under 20 ms at the 99th percentile",
+    "Recall of 95% or better, where recall is the share of the true nearest neighbours that are found",
+    "Thousands of searches per second, and a few thousand writes per second",
+    "A new or deleted vector is reflected in searches within a few seconds",
+    "No acknowledged write is lost, and a machine failure does not stop searches",
+    "Memory cost under control, since the raw vectors alone are over 300 GB"
+  ],
+  "firstAttempt": {
+    "text": "A table with the vector in a column and the attributes beside it. A search computes the distance from the query to every row, sorts them and returns the first 10. The filter is a WHERE clause.",
+    "limits": [
+      "An exact scan of 100 million 768-number vectors reads over 300 GB per query, which takes seconds on one machine",
+      "The cost grows linearly with the number of vectors, so doubling the data doubles the latency",
+      "Ordinary B-tree indexes do not work for distances in hundreds of dimensions",
+      "Hundreds of queries per second would need hundreds of full scans running at the same time",
+      "All of it sits on one machine with one copy"
+    ]
+  },
+  "nodes": [
+    { "id": "clients", "label": "Applications", "kind": "client", "x": 12, "y": 63 },
+    { "id": "flat", "label": "Table with full scan", "kind": "data", "x": 37, "y": 63, "at": 0, "until": 1 },
+    { "id": "api", "label": "Query API", "kind": "edge", "x": 37, "y": 63, "at": 1 },
+    { "id": "index", "label": "Graph index", "kind": "data", "x": 62, "y": 63, "at": 1, "until": 4 },
+    { "id": "vecs", "label": "Compressed vectors", "kind": "data", "x": 87, "y": 63, "at": 2 },
+    { "id": "filter", "label": "Filter planner", "kind": "compute", "x": 37, "y": 37, "at": 3 },
+    { "id": "meta", "label": "Attribute index", "kind": "data", "x": 12, "y": 37, "at": 3 },
+    { "id": "shards", "label": "Index shards", "kind": "data", "x": 62, "y": 63, "at": 4 },
+    { "id": "log", "label": "Update log", "kind": "async", "x": 62, "y": 12, "at": 5 },
+    { "id": "embed", "label": "Embedding service", "kind": "compute", "x": 12, "y": 12, "at": 6 },
+    { "id": "mon", "label": "Recall monitor", "kind": "compute", "x": 87, "y": 12, "at": 6 }
+  ],
+  "edges": [
+    { "from": "clients", "to": "flat", "at": 0, "until": 1 },
+    { "from": "clients", "to": "api", "at": 1 },
+    { "from": "api", "to": "index", "at": 1, "until": 4 },
+    { "from": "index", "to": "vecs", "at": 2, "until": 4 },
+    { "from": "api", "to": "filter", "at": 3 },
+    { "from": "filter", "to": "meta", "at": 3 },
+    { "from": "filter", "to": "index", "at": 3, "until": 4 },
+    { "from": "api", "to": "shards", "at": 4 },
+    { "from": "filter", "to": "shards", "at": 4 },
+    { "from": "shards", "to": "vecs", "at": 4 },
+    { "from": "api", "to": "log", "at": 5 },
+    { "from": "log", "to": "shards", "at": 5 },
+    { "from": "embed", "to": "api", "at": 6 },
+    { "from": "shards", "to": "mon", "at": 6 }
+  ],
+  "steps": [
+    {
+      "title": "Search a graph index instead of scanning everything",
+      "problem": "Comparing the query with every vector costs time proportional to the data, and no ordinary index can order points by distance in 768 dimensions.",
+      "fix": "Build an approximate nearest-neighbour index. HNSW links every vector to a few dozen near neighbours and stacks sparser layers on top, like a skip list over a graph. A search enters at the top layer, hops greedily towards the query and descends, then explores the bottom layer with a beam of ef candidates. It computes a few thousand distances instead of 100 million, so it takes about a millisecond. The alternative is an inverted-file (IVF) index, which groups vectors into lists around k-means centroids and scans only the nearest few lists.",
+      "tradeoff": "Latency becomes nearly flat as the data grows, but the answer is approximate: the true neighbour is sometimes missed. Recall is the dial, and raising ef (or the lists probed in IVF) buys recall with more distance computations. The graph also costs memory, about 2 x M links of 4 bytes per vector, and building it is slow.",
+      "concepts": [{ "slug": "database-indexing" }, { "slug": "latency-and-round-trips" }, { "slug": "caching" }]
+    },
+    {
+      "title": "Compress the vectors so the index fits in memory",
+      "problem": "At 4 bytes a number, 100 million vectors of 768 numbers take 307 GB, and a graph walk needs random access to them, so they must be in memory to be fast.",
+      "fix": "Store a compressed copy for the search. Scalar quantization turns each 32-bit number into 8 bits and cuts the size by 4. Product quantization splits a vector into 96 pieces of 8 numbers and stores, for each piece, the id of its nearest entry in a 256-entry codebook, so a vector takes 96 bytes, about 32 times smaller, and distances come from small lookup tables. The search finds a wider set of candidates with the compressed distances, then reranks the best few hundred with the full-precision vectors read from SSD.",
+      "tradeoff": "Memory drops from over 300 GB to about 10 GB of codes plus the graph, so a few machines are enough. Compressed distances are noisy, which costs some recall that the rerank step wins back, at the price of a few random reads from SSD per query.",
+      "concepts": [{ "slug": "caching" }, { "slug": "horizontal-vs-vertical-scaling" }, { "slug": "columnar-formats-and-partitioning" }]
+    },
+    {
+      "title": "Plan filtered search, because filters break the index",
+      "problem": "A search for the 10 nearest items that are in stock, filtered after the index returns its answer, may find that none of its 10 neighbours match, and a filter that is too strict leaves the graph with no path to the few matching vectors.",
+      "fix": "Keep an index on the attributes and let a planner choose from its estimate of how many vectors match. If very few match, find the matching ids and compute exact distances to just those. If many match, search the graph and skip non-matching vectors while traversing, but still walk through them to keep the path open, and keep going until k matches are found. For moderate filters, ef is raised in proportion to the inverse of the match rate. Filters that are used all the time, such as the tenant, can have a separate index each.",
+      "tradeoff": "Results are complete and the recall holds, whatever the filter. The planner needs good statistics, a mid-range filter is the slowest case because it is too big for brute force and too sparse for a cheap traversal, and each extra attribute index costs memory and write time.",
+      "concepts": [{ "slug": "query-planning-and-joins" }, { "slug": "database-indexing" }, { "slug": "sql-vs-nosql" }]
+    },
+    {
+      "title": "Shard the index and merge the top results",
+      "problem": "Even with compression, a billion vectors or thousands of queries per second exceed one machine's memory and CPU, and one copy cannot survive its failure.",
+      "fix": "Split the vectors across shards by a hash of the id, and build a graph in each shard. A query goes to every shard, each returns its own top k with distances, and the coordinator merges them, so any vector in the global top k is in the top k of its own shard. Every shard has replicas that share the read load and take over on a failure. Queries are sent to the faster replica, and a slow shard is retried on its replica.",
+      "tradeoff": "Capacity and throughput scale by adding shards and replicas. Every query now visits all shards, so cost per query rises with the shard count and the slowest shard sets the latency. Splitting by a property such as the tenant lets a query visit one shard, but sizes then become uneven.",
+      "concepts": [{ "slug": "database-sharding" }, { "slug": "consistent-hashing" }, { "slug": "database-replication" }, { "slug": "hedged-requests-and-tail-latency" }]
+    },
+    {
+      "title": "Absorb writes into segments, and merge them in the background",
+      "problem": "Inserting into a large graph in place is slow and contended, and a deletion leaves holes that make the graph worse over time, but writes must be durable and visible in seconds.",
+      "fix": "Append every write to a log first. A shard keeps a small in-memory segment that is searched by brute force, plus immutable segments with a built index. When the small segment is full it is turned into an indexed segment, and a search queries all segments and merges them. A delete only marks the id with a tombstone that hides it from results. A background job merges small segments and drops tombstoned vectors into one new index, then swaps it in.",
+      "tradeoff": "Writes are cheap and durable, and a new vector can be found within seconds. Each search has to look at several segments, deleted data takes space until a merge, and merging uses a lot of CPU and I/O, so it must be paced to leave room for queries.",
+      "concepts": [{ "slug": "write-ahead-log" }, { "slug": "lsm-trees-vs-b-trees" }, { "slug": "message-queues" }, { "slug": "backpressure" }]
+    },
+    {
+      "title": "Version the embeddings, and watch recall in production",
+      "problem": "A new embedding model produces vectors that cannot be compared with the old ones, and nobody notices when settings or data drift lower recall, since the service still returns answers.",
+      "fix": "An embedding service turns text or images into vectors for both writes and queries, and every collection records the model version. A new model builds a second collection in the background and the traffic is switched over when it is ready. A recall monitor sends a sample of real queries to an exact search on a replica and compares it with the answer of the index, then alerts when recall falls under the target. The same job suggests ef, M and the lists probed.",
+      "tradeoff": "Model upgrades are safe and can be rolled back, and a drop in quality is seen early. A second copy doubles storage during a migration, and sampling exact searches takes a share of the capacity.",
+      "concepts": [{ "slug": "canary-deployments" }, { "slug": "slos-and-error-budgets" }, { "slug": "metrics" }, { "slug": "alerting" }]
+    }
+  ],
+  "failures": [
+    {
+      "scenario": "A shard replica dies in the middle of a query",
+      "impact": "The query is missing the results held by that shard, so the top 10 may be wrong or the request fails.",
+      "answer": "The coordinator has a deadline and sends the request to another replica of the same shard, or sends a duplicate to a second replica if the first is slow. A health check removes the dead machine, and a new replica loads the segments from object storage and catches up from the update log.",
+      "concepts": [{ "slug": "health-checks" }, { "slug": "hedged-requests-and-tail-latency" }, { "slug": "timeouts-and-deadlines" }, { "slug": "database-replication" }]
+    },
+    {
+      "scenario": "A filter matches almost nothing, such as one seller's 20 items",
+      "impact": "A graph search with a filter may end up with only a handful of results or walk a huge part of the graph before finding them.",
+      "answer": "The planner sees from the attribute index that only 20 vectors match and does not use the graph at all. It computes exact distances to those 20 and returns the true top 10 at a cost of 20 distances.",
+      "concepts": [{ "slug": "query-planning-and-joins" }, { "slug": "database-indexing" }, { "slug": "graceful-degradation" }]
+    },
+    {
+      "scenario": "Many items are deleted at once",
+      "impact": "Tombstones pile up, searches keep walking through dead nodes, and recall and latency both get worse.",
+      "answer": "Deleted ids are hidden at query time so results are always correct. Compaction rebuilds the affected segments without them and swaps in the new index. When the share of deleted vectors in a segment passes a threshold, such as 20%, the merge is started at once.",
+      "concepts": [{ "slug": "lsm-trees-vs-b-trees" }, { "slug": "write-ahead-log" }, { "slug": "backpressure" }]
+    },
+    {
+      "scenario": "A bulk import of 50 million vectors arrives",
+      "impact": "Building the graph uses all the CPU, so live searches slow down and the update log grows.",
+      "answer": "Imports are written to the log and indexed by separate builder machines that make complete segments, which are attached to the shards when they are ready. Search machines are not asked to build. The import is paced, so that the log cannot grow without limit.",
+      "concepts": [{ "slug": "bulkhead" }, { "slug": "backpressure" }, { "slug": "autoscaling" }, { "slug": "message-queues" }]
+    }
+  ],
+  "alternatives": [
+    {
+      "title": "Which index",
+      "options": [
+        { "name": "HNSW graph", "pro": "High recall at low latency, and inserts are supported", "con": "Memory hungry, and slow to build and to compact" },
+        { "name": "IVF with product quantization", "pro": "Small, fast to build, and the lists suit disk and filters", "con": "Lower recall unless many lists are probed and reranked" },
+        { "name": "Graph on disk (such as Vamana)", "pro": "Billions of vectors on SSD with little memory", "con": "More random reads per query, and more complex updates" },
+        { "name": "Exact scan", "pro": "100% recall and no index to build", "con": "Linear cost, which is fine only for small collections or very selective filters" }
+      ],
+      "pick": "HNSW in memory with compressed vectors for hot collections, and an IVF-PQ or disk graph for the largest, coldest ones."
+    },
+    {
+      "title": "Where vectors live",
+      "options": [
+        { "name": "An extension in the main database", "pro": "One system, transactions, and joins with other data", "con": "The vectors compete with the transactional load, and scale has a ceiling" },
+        { "name": "A dedicated vector database", "pro": "Built for the index, sharding and filters", "con": "Another system to run and to keep in sync with the source of truth" }
+      ],
+      "pick": "An extension up to a few million vectors, and a dedicated system beyond that, fed from the source database."
+    },
+    {
+      "title": "How to filter",
+      "options": [
+        { "name": "After the search", "pro": "Trivial to build", "con": "Returns fewer than k results, or none, for selective filters" },
+        { "name": "During the traversal", "pro": "Stays fast for moderate filters", "con": "Recall suffers when the filter is very strict" },
+        { "name": "First, then exact distances", "pro": "Perfect recall when few vectors match", "con": "Too slow when many vectors match" }
+      ],
+      "pick": "A planner that picks between the last two by the estimated match rate."
+    },
+    {
+      "title": "How to shard",
+      "options": [
+        { "name": "By hash of the id", "pro": "Even load, and one simple write path", "con": "Every query visits every shard" },
+        { "name": "By tenant or by cluster", "pro": "A query visits one or a few shards", "con": "Uneven shards, and a hot tenant needs splitting" }
+      ],
+      "pick": "Hash for one big collection, and by tenant for many separate ones."
+    }
+  ],
+  "roles": [
+    { "id": "client", "label": "Applications", "description": "Services that send queries and writes." },
+    { "id": "edge", "label": "Query API", "description": "Takes requests and merges the answers of the shards." },
+    { "id": "async", "label": "Update log", "description": "Durable writes waiting to be indexed." },
+    { "id": "compute", "label": "Planning and checks", "description": "The filter planner, the embedder and the recall monitor." },
+    { "id": "data", "label": "State", "description": "Indexes, vectors, attributes and shards." }
+  ]
+}

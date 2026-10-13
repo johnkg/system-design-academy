@@ -1,0 +1,114 @@
+---
+import PlaygroundShell from '../../components/PlaygroundShell.astro';
+---
+<PlaygroundShell title="Tamper with the log, and see who notices" hint="A log of 230 records is attacked by someone who can write to the storage. Pick how the log is protected and what the attacker does, then see whether a verifier finds out.">
+  <ol class="how">
+    <li>Start with <b>a hash chain</b> and an attacker who <b>rewrites the log from record 120 and recomputes every hash</b>: the verifier finds <b>nothing</b>, because the chain is consistent with itself.</li>
+    <li>Switch to <b>a chain plus signed checkpoints</b>: the same rewrite is <b>caught at checkpoint 150</b>, since a checkpoint kept outside the log remembers the old head hash.</li>
+    <li>Move the attack to <b>record 215</b>: with a checkpoint every <b>50</b> records it is <b>missed</b>, because the last checkpoint is at 200. Set the interval to <b>25</b> and it is caught at checkpoint 225.</li>
+    <li>Try <b>delete one record</b> or <b>cut off the end</b>: a plain hash per record cannot see either, and a chain sees only the deletion.</li>
+  </ol>
+  <div class="pg alb" data-alb>
+    <div class="pg-row">
+      <label>Protection <select class="pg-in" data-scheme>
+        <option value="none">nothing: plain rows</option>
+        <option value="rows">a hash of each record</option>
+        <option value="chain" selected>a hash chain</option>
+        <option value="sealed">a chain plus signed checkpoints</option>
+      </select></label>
+      <label>The attacker will <select class="pg-in" data-attack>
+        <option value="edit">edit one record</option>
+        <option value="delete">delete one record</option>
+        <option value="rewrite" selected>edit one record and recompute every later hash</option>
+        <option value="truncate">cut off the end of the log</option>
+      </select></label>
+      <label>Checkpoint every <select class="pg-in" data-k>
+        <option value="25">25 records</option>
+        <option value="50" selected>50 records</option>
+        <option value="100">100 records</option>
+      </select></label>
+      <label>Position in the log (record number) <input type="range" min="1" max="228" value="120" data-pos /> <b data-posval></b></label>
+    </div>
+    <div class="pg-grid">
+      <div class="pg-box" data-b1><h3>The verifier</h3><span class="pg-mono" data-o1></span><span class="pg-note" data-n1></span></div>
+      <div class="pg-box" data-b2><h3>Where it noticed</h3><span class="pg-mono" data-o2></span><span class="pg-note" data-n2></span></div>
+      <div class="pg-box" data-b3><h3>Unsealed tail</h3><span class="pg-mono" data-o3></span><span class="pg-note" data-n3></span></div>
+    </div>
+    <p class="pg-out" data-verdict aria-live="polite"></p>
+    <p class="pg-note">Model: 230 records, each with a sequence number, an actor and an action, hashed with FNV-1a (a stand-in for SHA-256). The attacker can change the stored log but not the checkpoints, which live in a separate system. Checkpoints cover the first 25, 50 or 100 records, and then each further block of the same size. A per-record hash covers only that record, and truncation keeps the first N records, where N is the position.</p>
+  </div>
+</PlaygroundShell>
+<script>
+  document.querySelectorAll<HTMLElement>('[data-alb]').forEach((root) => {
+    const q = <T extends HTMLElement>(s: string) => root.querySelector<T>(s)!;
+    const N = 230;
+    const fnv = (t: string) => { let h = 2166136261; for (let i = 0; i < t.length; i++) h = Math.imul(h ^ t.charCodeAt(i), 16777619) >>> 0; return h.toString(16).padStart(8, '0'); };
+    type Rec = { seq: number; who: string; act: string; own: string; hash: string };
+    const dataOf = (r: Rec) => r.seq + '|' + r.who + '|' + r.act;
+    const WHO = ['alice', 'bob', 'carol', 'dan']; const ACT = ['login', 'read', 'update', 'export'];
+    let seed = 11; const rnd = (n: number) => { seed = (Math.imul(seed, 1664525) + 1013904223) >>> 0; return (seed >>> 8) % n; };
+    const log: Rec[] = []; let prev0 = '00000000';
+    for (let i = 0; i < N; i++) { const r: Rec = { seq: i, who: WHO[rnd(4)], act: ACT[rnd(4)], own: '', hash: '' }; r.own = fnv(dataOf(r)); r.hash = fnv(prev0 + '|' + dataOf(r)); prev0 = r.hash; log.push(r); }
+
+    function simulate(scheme: string, attack: string, pos: number, k: number) {
+      const cps: { end: number; head: string }[] = [];
+      for (let end = k; end <= N; end += k) cps.push({ end, head: log[end - 1].hash });
+      const lastSeal = cps.length ? cps[cps.length - 1].end : 0;
+      const t = log.map((r) => ({ ...r })); let work = t;
+      if (attack === 'edit') t[pos].who = 'mallory';
+      if (attack === 'delete') work = t.filter((_, i) => i !== pos);
+      if (attack === 'rewrite') {
+        t[pos].who = 'mallory'; let p = pos > 0 ? t[pos - 1].hash : '00000000';
+        for (let i = pos; i < t.length; i++) { t[i].own = fnv(dataOf(t[i])); t[i].hash = fnv(p + '|' + dataOf(t[i])); p = t[i].hash; }
+      }
+      if (attack === 'truncate') work = t.slice(0, pos);
+      let found = ''; let by = '';
+      if (scheme === 'rows') { for (const r of work) if (r.own !== fnv(dataOf(r))) { found = 'record ' + r.seq; by = 'record'; break; } }
+      if (scheme === 'chain' || scheme === 'sealed') {
+        let p = '00000000';
+        for (const r of work) { if (r.hash !== fnv(p + '|' + dataOf(r))) { found = 'record ' + r.seq; by = 'chain'; break; } p = r.hash; }
+      }
+      if (!found && scheme === 'sealed') {
+        for (const c of cps) { if (work.length < c.end || work[c.end - 1].hash !== c.head) { found = 'checkpoint at ' + c.end; by = 'checkpoint'; break; } }
+      }
+      return { found, by, lastSeal, tail: N - lastSeal };
+    }
+
+    function draw() {
+      const scheme = q<HTMLSelectElement>('[data-scheme]').value; const attack = q<HTMLSelectElement>('[data-attack]').value;
+      const k = Number(q<HTMLSelectElement>('[data-k]').value); const pos = Number(q<HTMLInputElement>('[data-pos]').value);
+      q('[data-posval]').textContent = String(pos);
+      const sealed = scheme === 'sealed';
+      q<HTMLSelectElement>('[data-k]').disabled = !sealed;
+      const r = simulate(scheme, attack, pos, k);
+      const caught = r.found !== '';
+      q('[data-o1]').textContent = caught ? 'tampering found' : 'nothing found';
+      q('[data-n1]').textContent = caught ? 'the stored log disagrees with what it should be' : 'every check passes, so the log looks genuine';
+      q('[data-o2]').textContent = caught ? r.found : 'not noticed';
+      q('[data-n2]').textContent = r.by === 'checkpoint' ? 'the chain was consistent; the outside checkpoint was not' : r.by === 'chain' ? 'the chain link to the previous record failed' : r.by === 'record' ? 'the record no longer matches its own hash' : 'no check could see it';
+      q('[data-o3]').textContent = sealed ? `${r.tail} records after record ${r.lastSeal}` : 'no checkpoints';
+      q('[data-n3]').textContent = sealed ? 'protected by the chain only, until the next checkpoint' : 'nothing is sealed outside the log';
+      q<HTMLElement>('[data-b1]').style.setProperty('--c', caught ? 'var(--good)' : 'var(--bad)');
+      q<HTMLElement>('[data-b2]').style.setProperty('--c', caught ? 'var(--good)' : 'var(--bad)');
+      q<HTMLElement>('[data-b3]').style.setProperty('--c', 'var(--accent)');
+      const out = q('[data-verdict]'); out.classList.toggle('bad', !caught);
+      let text: string;
+      if (caught) {
+        text = r.by === 'checkpoint' ? `Caught at ${r.found}: the attacker made the chain consistent again, but the signed checkpoint kept outside the log still holds the old hash, so the rewrite of sealed history is exposed.`
+          : r.by === 'chain' ? `Caught at ${r.found}: the chain no longer links to the record before it, which shows where history was changed.`
+          : `Caught at ${r.found}: the record's content no longer matches the hash stored with it.`;
+      } else if (scheme === 'none') {
+        text = 'Missed: with plain rows, a changed log looks exactly like an unchanged one.';
+      } else if (scheme === 'rows') {
+        text = attack === 'rewrite' ? 'Missed: the attacker recomputed the record hash along with the edit, and a per-record hash proves nothing about the other records.' : `Missed: a hash on each record cannot see ${attack === 'delete' ? 'a missing record' : 'a shorter log'}, because every remaining record is still intact.`;
+      } else if (scheme === 'chain') {
+        text = attack === 'rewrite' ? 'Missed: the attacker recomputed every hash after the edit, so the chain is perfectly consistent. Only something outside the log can reveal this.' : 'Missed: a chain is checked from the start, and nothing after the last remaining record says that more records existed. A signed checkpoint remembers the length.';
+      } else {
+        text = `Missed: the change sits after the last checkpoint (record ${r.lastSeal}), in the ${r.tail}-record tail that is protected only by the chain. A shorter interval makes this window smaller.`;
+      }
+      out.textContent = text;
+    }
+    root.addEventListener('input', draw); root.addEventListener('change', draw);
+    draw();
+  });
+</script>

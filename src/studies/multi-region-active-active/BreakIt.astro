@@ -1,0 +1,84 @@
+---
+import PlaygroundShell from '../../components/PlaygroundShell.astro';
+---
+<PlaygroundShell title="Three regions, one hot set of keys" hint="600 writes arrive in three regions over about 2.7 seconds and are spread over a set of keys. Pick how conflicts are resolved and watch which writes are lost, which blocked and how slow a write is.">
+  <ol class="how">
+    <li>With <b>last-writer-wins by wall clock</b> (the default: 60 ms lag, clocks 100 ms off, 20 keys), <b>234 of 600</b> acknowledged writes are silently lost. 179 were concurrent and 55 were <b>newer writes that lost to older ones</b>, because of clock error.</li>
+    <li>Switch to <b>a hybrid logical clock</b>: the 55 wrong-order losses disappear, as cause and effect are respected, but the <b>179 concurrent writes</b> are still dropped. Then try <b>a CRDT merge</b>: 0 are lost and 179 conflicts are merged, at 5 ms per write.</li>
+    <li>Switch to <b>a home region</b>: 0 lost and 0 conflicts, but a write costs <b>85 ms on average</b>, since 2 in 3 writes cross the ocean. Tick <b>Cut off region 3</b> and <b>86 writes are rejected</b>, because their key's owner cannot be reached.</li>
+  </ol>
+  <div class="pg mrb" data-mrb>
+    <div class="pg-row">
+      <label>Conflict rule <select class="pg-in" data-policy>
+        <option value="wall" selected>Last-writer-wins, wall clock</option>
+        <option value="hlc">Last-writer-wins, hybrid logical clock</option>
+        <option value="crdt">CRDT merge</option>
+        <option value="home">Home region per key</option>
+      </select></label>
+      <label>Replication lag (ms) <input type="range" min="20" max="400" step="10" value="60" data-lag /> <b data-lagval></b></label>
+      <label>Clock error between regions (ms) <input type="range" min="0" max="300" step="10" value="100" data-skew /> <b data-skewval></b></label>
+      <label>Distinct keys <input type="range" min="2" max="200" value="20" data-keys /> <b data-keysval></b></label>
+      <label><input type="checkbox" data-part /> Cut off region 3 for the middle third of the run</label>
+    </div>
+    <div class="pg-grid">
+      <div class="pg-box" data-b1><h3>Acknowledged writes lost</h3><span class="pg-mono" data-o1></span><span class="pg-note" data-n1></span></div>
+      <div class="pg-box" data-b2><h3>Newer write lost to an older one</h3><span class="pg-mono" data-o2></span><span class="pg-note" data-n2></span></div>
+      <div class="pg-box" data-b3><h3>Writes rejected</h3><span class="pg-mono" data-o3></span><span class="pg-note" data-n3></span></div>
+      <div class="pg-box" data-b4><h3>Average write latency</h3><span class="pg-mono" data-o4></span><span class="pg-note" data-n4></span></div>
+    </div>
+    <p class="pg-out" data-verdict aria-live="polite"></p>
+    <p class="pg-note">Model: 600 writes, gaps of 1 to 8 ms, each in a random region on a random key. Two consecutive writes to a key from different regions are concurrent if they are closer than the replication lag, or if they are on opposite sides of the cut. A wall-clock write made after the previous one still loses if the clock error exceeds the gap. A local write takes 5 ms, and a forwarded one adds a 120 ms round trip. Key k belongs to region k mod 3. Every rule converges once the network heals.</p>
+  </div>
+</PlaygroundShell>
+<script>
+  document.querySelectorAll<HTMLElement>('[data-mrb]').forEach((root) => {
+    const q = <T extends HTMLElement>(s: string) => root.querySelector<T>(s)!;
+    const sim = (policy: string, lag: number, skew: number, keys: number, part: boolean) => {
+      let seed = 11; const rnd = (n: number) => { seed = (Math.imul(seed, 1664525) + 1013904223) >>> 0; return (seed >>> 16) % n; };
+      const N = 600; const RTT = 120; const LOCAL = 5; const off = [0, skew, -skew];
+      const w: { t: number; r: number; k: number }[] = []; let t = 0;
+      for (let i = 0; i < N; i++) { t += 1 + rnd(8); w.push({ t, r: rnd(3), k: rnd(keys) }); }
+      const ps = t / 3; const pe = (2 * t) / 3;
+      const inPart = (x: { t: number }) => part && x.t >= ps && x.t < pe;
+      let rejected = 0; let latency = 0; let accepted = 0; const ok: typeof w = [];
+      for (const x of w) {
+        let reject = false; let lat = LOCAL;
+        if (policy === 'home') { const home = x.k % 3; if (home !== x.r) { lat = LOCAL + RTT; if (inPart(x) && (x.r === 2 || home === 2)) reject = true; } }
+        if (reject) { rejected++; continue; }
+        accepted++; latency += lat; ok.push(x);
+      }
+      const last = new Map<number, { t: number; r: number; k: number }>(); let concurrent = 0; let wrongOrder = 0; let merged = 0;
+      for (const x of ok) {
+        const p = last.get(x.k); last.set(x.k, x);
+        if (!p || p.r === x.r || policy === 'home') continue;
+        const gap = x.t - p.t;
+        const cut = inPart(x) && inPart(p) && (x.r === 2) !== (p.r === 2);
+        if (cut || gap < lag) { if (policy === 'crdt') merged++; else concurrent++; }
+        else if (policy === 'wall' && gap + off[x.r] - off[p.r] < 0) wrongOrder++;
+      }
+      return { accepted, rejected, concurrent, wrongOrder, merged, lat: Math.round(latency / accepted) };
+    };
+    function draw() {
+      const policy = q<HTMLSelectElement>('[data-policy]').value; const lag = Number(q<HTMLInputElement>('[data-lag]').value);
+      const skew = Number(q<HTMLInputElement>('[data-skew]').value); const keys = Number(q<HTMLInputElement>('[data-keys]').value); const part = q<HTMLInputElement>('[data-part]').checked;
+      q('[data-lagval]').textContent = String(lag); q('[data-skewval]').textContent = String(skew); q('[data-keysval]').textContent = String(keys);
+      const s = sim(policy, lag, skew, keys, part); const lost = s.concurrent + s.wrongOrder;
+      q('[data-o1]').textContent = `${lost} of ${s.accepted}`; q('[data-n1]').textContent = policy === 'crdt' ? `${s.merged} conflicts merged without loss` : `${s.concurrent} concurrent, ${s.wrongOrder} out of order`;
+      q('[data-o2]').textContent = String(s.wrongOrder); q('[data-n2]').textContent = policy === 'wall' ? `clock error of ${skew} ms beats gaps shorter than ${2 * skew} ms` : 'ordering does not depend on wall clocks';
+      q('[data-o3]').textContent = String(s.rejected); q('[data-n3]').textContent = policy === 'home' ? (part ? 'the key owner could not be reached' : 'every key owner was reachable') : 'every region keeps accepting writes';
+      q('[data-o4]').textContent = `${s.lat} ms`; q('[data-n4]').textContent = policy === 'home' ? 'two in three writes cross the ocean' : 'every write commits locally';
+      q<HTMLElement>('[data-b1]').style.setProperty('--c', lost === 0 ? 'var(--good)' : 'var(--bad)');
+      q<HTMLElement>('[data-b2]').style.setProperty('--c', s.wrongOrder === 0 ? 'var(--good)' : 'var(--bad)');
+      q<HTMLElement>('[data-b3]').style.setProperty('--c', s.rejected === 0 ? 'var(--good)' : 'var(--bad)');
+      q<HTMLElement>('[data-b4]').style.setProperty('--c', s.lat > 20 ? 'var(--bad)' : 'var(--good)');
+      const out = q('[data-verdict]'); const bad = lost > 0 || s.rejected > 0; out.classList.toggle('bad', bad);
+      out.textContent = policy === 'wall' ? `${lost} writes silently vanish. ${s.wrongOrder} of them are newer edits that lost because a region's clock was wrong, and ${s.concurrent} were overwritten by a concurrent write in another region.`
+        : policy === 'hlc' ? `${s.concurrent} concurrent writes are still dropped, but a write made after seeing another always wins, so clock error no longer matters.`
+        : policy === 'crdt' ? `Nothing is lost: ${s.merged} concurrent writes were merged, at local speed. This only works for data with a merge function, such as counters and sets.`
+        : s.rejected > 0 ? `No conflicts, but ${s.rejected} writes were refused because their key's home region was unreachable, and a write averages ${s.lat} ms.`
+        : `No conflicts and nothing lost, but a write averages ${s.lat} ms because most writes travel to the key's home region.`;
+    }
+    root.addEventListener('input', draw); root.addEventListener('change', draw);
+    draw();
+  });
+</script>

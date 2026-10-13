@@ -1,0 +1,194 @@
+{
+  "name": "Design an Alerting and On-Call System",
+  "difficulty": "intermediate",
+  "intent": "Watch metrics from thousands of services, and wake the right person within minutes when something is really wrong, without burying them in noise when a thousand things fail at once.",
+  "codeTitle": "an alert pipeline with dedupe, grouping and escalation",
+  "finalIntro": "One failing service, from the first bad metric to a person acknowledging the page.",
+  "prompt": "Design the alerting and on-call system for a company with 2,000 services and 50 teams. Teams write rules over metrics. When a rule fires, the right on-call engineer must be notified quickly. Duplicates must be merged, planned work must not page anyone, and if the first person does not respond the page must go on to someone else.",
+  "functional": [
+    "Teams define alert rules over metrics, with a threshold and a time it must hold for",
+    "Evaluate every rule on a regular schedule and track firing and resolved alerts",
+    "Merge duplicate alerts and group related ones into one notification",
+    "Route each alert to the right team by its labels, and find who is on call now",
+    "Escalate to the next person if nobody acknowledges within a set time",
+    "Silence alerts for planned work, and suppress downstream alerts when a root cause is firing",
+    "Deliver notifications by push, SMS, phone call and chat, and record who acknowledged"
+  ],
+  "nonFunctional": [
+    "From the start of a real fault to the first notification in under 5 minutes",
+    "Evaluate tens of thousands of rules every 15 to 60 seconds",
+    "The alerting system must keep working when the systems it watches are failing",
+    "A notification is never lost, and may arrive twice but not as two different pages",
+    "A big outage produces tens of notifications, not thousands",
+    "Keep the pages per on-call shift low enough that a human can act on each one",
+    "Every page, acknowledgement and silence is recorded and can be reviewed"
+  ],
+  "firstAttempt": {
+    "text": "Each service owner writes a cron script that checks a metric every minute and sends an email to the team's mailing list if it crosses a threshold. The email goes out every minute until the problem is fixed.",
+    "limits": [
+      "A metric that flaps around the threshold sends an email for every flap, so people learn to ignore them",
+      "When a database fails, every service that uses it sends its own emails, and a hundred arrive at once",
+      "Nobody knows who is responsible at 3 am, because a mailing list is read by whoever happens to look",
+      "If the person does not answer, nothing happens next",
+      "Planned work and deployments cause false alarms, and the only fix is to turn the script off",
+      "If the machine running the scripts dies, there is silence, which looks just like health"
+    ]
+  },
+  "nodes": [
+    { "id": "svc", "label": "Services", "kind": "edge", "x": 12, "y": 12 },
+    { "id": "checks", "label": "Cron check scripts", "kind": "compute", "x": 37, "y": 12, "at": 0, "until": 1 },
+    { "id": "list", "label": "Team email list", "kind": "client", "x": 62, "y": 12, "at": 0, "until": 1 },
+    { "id": "metrics", "label": "Metrics store", "kind": "data", "x": 37, "y": 12, "at": 1 },
+    { "id": "rules", "label": "Rule evaluator", "kind": "compute", "x": 62, "y": 12, "at": 1 },
+    { "id": "responders", "label": "On-call phones", "kind": "client", "x": 12, "y": 88, "at": 1 },
+    { "id": "groups", "label": "Dedupe and group", "kind": "compute", "x": 87, "y": 12, "at": 2 },
+    { "id": "router", "label": "Routing tree", "kind": "compute", "x": 87, "y": 37, "at": 3 },
+    { "id": "sched", "label": "On-call schedule", "kind": "data", "x": 62, "y": 63, "at": 3 },
+    { "id": "escal", "label": "Escalation timer", "kind": "compute", "x": 87, "y": 63, "at": 3 },
+    { "id": "silences", "label": "Silences", "kind": "data", "x": 62, "y": 37, "at": 4 },
+    { "id": "queue", "label": "Notification queue", "kind": "async", "x": 87, "y": 88, "at": 5 },
+    { "id": "notifier", "label": "Notifier", "kind": "edge", "x": 62, "y": 88, "at": 5 },
+    { "id": "providers", "label": "SMS and call providers", "kind": "edge", "x": 37, "y": 88, "at": 5 },
+    { "id": "watchdog", "label": "Watchdog", "kind": "compute", "x": 37, "y": 37, "at": 5 },
+    { "id": "history", "label": "Incident history", "kind": "data", "x": 12, "y": 63, "at": 6 }
+  ],
+  "edges": [
+    { "from": "svc", "to": "checks", "at": 0, "until": 1 },
+    { "from": "checks", "to": "list", "at": 0, "until": 1 },
+    { "from": "svc", "to": "metrics", "at": 1 },
+    { "from": "metrics", "to": "rules", "at": 1 },
+    { "from": "rules", "to": "responders", "at": 1, "until": 2 },
+    { "from": "rules", "to": "groups", "at": 2 },
+    { "from": "groups", "to": "responders", "at": 2, "until": 3 },
+    { "from": "groups", "to": "router", "at": 3 },
+    { "from": "router", "to": "escal", "at": 3 },
+    { "from": "sched", "to": "escal", "at": 3 },
+    { "from": "escal", "to": "responders", "at": 3, "until": 5 },
+    { "from": "silences", "to": "router", "at": 4 },
+    { "from": "escal", "to": "queue", "at": 5 },
+    { "from": "queue", "to": "notifier", "at": 5 },
+    { "from": "notifier", "to": "providers", "at": 5 },
+    { "from": "providers", "to": "responders", "at": 5 },
+    { "from": "rules", "to": "watchdog", "at": 5 },
+    { "from": "watchdog", "to": "providers", "at": 5 },
+    { "from": "responders", "to": "history", "at": 6 }
+  ],
+  "steps": [
+    {
+      "title": "Evaluate rules centrally, and fire only after a condition holds",
+      "problem": "Scripts that each check a threshold once a minute fire on every blip, are written in different ways by every team, and cannot be reviewed or tested together.",
+      "fix": "Teams write rules in a common form: a query over the metrics store, a threshold, and a 'for' duration, such as 'error rate above 5% for 2 minutes'. A central evaluator runs every rule on a schedule, every 15 to 60 seconds, and keeps a state for each alert: inactive, pending while the condition holds but the time has not passed, and firing once it has held long enough. Rules carry labels such as service and severity, which later steps use for routing. Where possible, rules are written on symptoms users feel, such as errors and latency, and on how fast the error budget is being used, rather than on every internal cause.",
+      "tradeoff": "A blip of a few seconds no longer wakes anyone, and all rules can be linted, tested and versioned in one place. The 'for' wait adds to the time before the first alert, so it is a direct trade between noise and detection delay, and a rule that is evaluated every minute can notice a fault up to a minute late.",
+      "concepts": [{ "slug": "alerting" }, { "slug": "metrics" }, { "slug": "red-use-and-golden-signals" }, { "slug": "slos-and-error-budgets" }]
+    },
+    {
+      "title": "Deduplicate alerts and group them into one notification",
+      "problem": "A failing dependency makes hundreds of instances fire the same rule, and the evaluator repeats each firing alert every 30 seconds, so one fault becomes a flood.",
+      "fix": "Every alert has a fingerprint, a hash of its labels, so the same alert sent again is recognised and merged instead of notified again. The alert manager groups alerts by labels such as service and alert name. It waits a short group wait, such as 30 seconds, for related alerts to arrive and then sends one notification that lists all of them. New alerts joining an open group are sent at a slower group interval, and a still-firing group is repeated only as a reminder every few hours.",
+      "tradeoff": "One page can describe 200 failing pods, and a repeat of the same alert does not make the phone ring again. The group wait delays the first page slightly, and grouping by the wrong labels can hide an unrelated problem inside a big group, or split one outage into many.",
+      "concepts": [{ "slug": "alerting" }, { "slug": "idempotency" }, { "slug": "backpressure" }, { "slug": "cardinality-and-sampling" }]
+    },
+    {
+      "title": "Route by labels, find who is on call, and escalate",
+      "problem": "A mailing list does not know who is awake, and a page that nobody answers is the same as no page at all.",
+      "fix": "A routing tree matches the labels of a group, such as team and severity, to a receiver: critical alerts of the payments team page the payments on-call, warnings go to a chat channel or a ticket. The on-call schedule, a rota of shifts and overrides stored per team, tells the router who is primary and who is secondary at this moment, in the person's own time zone. The page starts an escalation policy: notify the primary, and if there is no acknowledgement within 5 minutes, notify the secondary, then the team lead, then repeat. An acknowledgement stops the timer; it is stored with a lease so it expires if the person goes silent without resolving.",
+      "tradeoff": "Every alert reaches an accountable person, and a missed page always has a next step. The schedule is critical data, with overrides for holidays and swaps, and a wrong label means the page goes to the wrong team, so there must always be a catch-all route to a default owner rather than dropping alerts.",
+      "concepts": [{ "slug": "alerting" }, { "slug": "timeouts-and-deadlines" }, { "slug": "leases-and-fencing-tokens" }, { "slug": "retries-and-backoff" }]
+    },
+    {
+      "title": "Silence planned work and suppress symptoms of a known cause",
+      "problem": "Deployments and maintenance cause alerts on purpose, and when a database is down, the 40 services that depend on it all page at once for the same reason.",
+      "fix": "A silence is a matcher on labels with a start time, an end time, an author and a comment. Alerts that match are still evaluated and recorded but are not notified, and the silence expires by itself so it cannot be forgotten. Maintenance windows are silences created from the deploy pipeline or the change calendar. Inhibition rules say that while a high-level alert such as 'database down' is firing, matching lower-level alerts, such as 'high latency' with the same cluster label, are suppressed, so only the cause pages.",
+      "tradeoff": "Planned work is quiet and a single root cause produces a single page. A silence that is too broad or forgotten can hide a real incident, so every silence needs an owner and an expiry, should be visible on the dashboard, and should be scoped as narrowly as possible. Inhibition depends on labels being consistent between teams.",
+      "concepts": [{ "slug": "alerting" }, { "slug": "canary-deployments" }, { "slug": "blue-green-and-rolling-deployments" }, { "slug": "health-checks" }]
+    },
+    {
+      "title": "Deliver reliably, over several channels, and watch the watcher",
+      "problem": "An SMS provider can be down, a phone can be off, and the alerting system itself can fail silently at the worst moment, which is exactly when the monitored system is failing too.",
+      "fix": "Pages are written to a durable queue with an idempotency key, and notifier workers deliver them by push, SMS, phone call and chat, retrying with backoff. At least two providers are configured for SMS and voice, and delivery receipts feed back to the escalation timer. The alerting system runs on separate infrastructure from the services it watches, in more than one zone, with a replicated alert manager cluster that shares state. A watchdog alert that always fires is sent through the whole path to an external dead man's switch, which pages if the heartbeat stops.",
+      "tradeoff": "A page survives a provider outage and a crashed worker, and silence from the system itself becomes a signal. Delivery is at least once, so a person might get two copies, which is better than none, and running independent infrastructure and several providers costs money and needs its own testing.",
+      "concepts": [{ "slug": "message-queues" }, { "slug": "delivery-guarantees" }, { "slug": "retries-and-backoff" }, { "slug": "dead-letter-queues-and-poison-messages" }, { "slug": "multi-region-failover" }]
+    },
+    {
+      "title": "Measure alert fatigue and keep every page actionable",
+      "problem": "Over time the number of rules grows and every incident adds one more, until engineers ignore the pager, which is how real incidents get missed.",
+      "fix": "Every page, acknowledgement and resolution is stored in an incident history. Reports show, for each rule, how often it paged, how often someone had to act, how long it took to acknowledge and how many pages hit nights and weekends per person. Rules that page without action are fixed, moved to a ticket, or deleted in a regular review, and each page needs a runbook link. Paging is restricted to symptoms that threaten an SLO, using multi-window burn-rate rules, and everything else goes to dashboards and tickets. Teams have a target, such as at most two pages per 12-hour shift.",
+      "tradeoff": "On-call stays sustainable, and trust in the pager is what makes a page urgent. The cost is discipline: reviews take time, moving an alert from page to ticket is a risk someone has to own, and a symptom-based approach can tell you that users are hurt without telling you why.",
+      "concepts": [{ "slug": "slos-and-error-budgets" }, { "slug": "alerting" }, { "slug": "metrics" }, { "slug": "synthetic-monitoring-and-rum" }]
+    }
+  ],
+  "failures": [
+    {
+      "scenario": "The alerting system itself stops working",
+      "impact": "No alerts arrive, and because nothing is wrong on the dashboard of a dead system, the silence looks like health.",
+      "answer": "A watchdog alert that is always firing is routed through the same path as every other alert, to an outside service that expects it every minute or so. If the heartbeat stops, that service pages the on-call through its own channel. The evaluators and alert managers run in more than one zone, and each alert manager replica gossips its state to the others so that one failure does not lose silences or notifications.",
+      "concepts": [{ "slug": "health-checks" }, { "slug": "failure-detection" }, { "slug": "multi-region-failover" }]
+    },
+    {
+      "scenario": "The primary on-call does not answer",
+      "impact": "The phone is off or in a tunnel, and a critical page sits unseen while users are affected.",
+      "answer": "Each page starts an acknowledgement timer. After 5 minutes with no acknowledgement the policy pages the secondary, with a phone call as well as a push, and then the team lead. Delivery receipts show if the first message never reached the phone, so the escalation can start earlier. The routing tree always ends in a catch-all receiver.",
+      "concepts": [{ "slug": "timeouts-and-deadlines" }, { "slug": "retries-and-backoff" }, { "slug": "leases-and-fencing-tokens" }]
+    },
+    {
+      "scenario": "A database fails and 800 alerts fire at once",
+      "impact": "The pager rings hundreds of times, the real cause is buried, and a different, unrelated incident is hidden among the noise.",
+      "answer": "Deduplication merges repeats, grouping collapses alerts of the same service into a few notifications, and an inhibition rule keeps all symptom alerts quiet while 'database down' is firing. The notifier applies a rate limit per receiver as a last guard, and anything over the limit is sent as a single summary page, so a separate unrelated critical alert still gets through.",
+      "concepts": [{ "slug": "backpressure" }, { "slug": "load-shedding" }, { "slug": "graceful-degradation" }, { "slug": "rate-limiting" }]
+    },
+    {
+      "scenario": "The SMS provider has an outage",
+      "impact": "Text messages are accepted but never delivered, so pages seem sent but nobody sees them.",
+      "answer": "Delivery receipts are tracked, and a message with no receipt in a minute counts as failed. A circuit breaker for the provider opens after repeated failures, and the notifier switches to the second provider and to phone calls. Because the escalation timer does not stop until a human acknowledges, a missed channel does not stop the escalation.",
+      "concepts": [{ "slug": "circuit-breaker" }, { "slug": "retries-and-backoff" }, { "slug": "delivery-guarantees" }]
+    },
+    {
+      "scenario": "A silence is too broad and hides a real incident",
+      "impact": "Someone silenced every alert with env=prod for a day to stop a noisy deploy, and a payment outage during the window never pages.",
+      "answer": "Silences need an author, an end time and a comment, and have a maximum length. A matcher that covers more than a set number of services needs a second approval. Silenced alerts are still evaluated and shown, a dashboard lists active silences, and a summary page is sent when a silenced alert has stayed critical for longer than a threshold.",
+      "concepts": [{ "slug": "alerting" }, { "slug": "authentication-and-authorization" }, { "slug": "structured-logging" }]
+    }
+  ],
+  "alternatives": [
+    {
+      "title": "What triggers an alert",
+      "options": [
+        { "name": "Static thresholds on causes, such as CPU above 90%", "pro": "Simple to write and to explain", "con": "Pages for things users never notice, and misses problems that do not move that metric" },
+        { "name": "SLO burn rate on symptoms", "pro": "Pages only when the error budget is being used fast, and ties urgency to user impact", "con": "Needs good SLIs and a team that has agreed an SLO" },
+        { "name": "Anomaly detection", "pro": "Needs no threshold and can catch unexpected changes", "con": "Hard to explain, noisy, and a person cannot tell what to do from the page alone" }
+      ],
+      "pick": "Burn-rate rules for paging, simple thresholds for tickets, and anomaly detection only as a hint on dashboards."
+    },
+    {
+      "title": "How rules are evaluated",
+      "options": [
+        { "name": "Poll the metrics store on a schedule", "pro": "Simple, and the rule is just a query that can be tried by hand", "con": "Detection waits for the next evaluation, and the store sees a steady query load" },
+        { "name": "Evaluate on the stream as data arrives", "pro": "Detection in seconds and no query load on the store", "con": "Needs a stream engine with windowing and state, and rules are harder to test" }
+      ],
+      "pick": "Scheduled queries for almost everything, with streaming reserved for the few signals that need seconds."
+    },
+    {
+      "title": "Where grouping and routing happen",
+      "options": [
+        { "name": "Each team runs its own alert manager", "pro": "Teams have full control and a failure is isolated", "con": "Rules for silences, schedules and escalation are repeated and drift apart" },
+        { "name": "One shared, replicated alert manager cluster", "pro": "One place for schedules, silences and inhibition, and a global view", "con": "A critical shared service that must be highly available and fairly shared" }
+      ],
+      "pick": "A shared cluster with per-team routing configuration kept in version control."
+    },
+    {
+      "title": "Build the paging part or buy it",
+      "options": [
+        { "name": "Build notifiers, schedules and escalation", "pro": "Full control over data and cost at large scale", "con": "You must run and test phone and SMS delivery on several carriers, forever" },
+        { "name": "Use an on-call vendor behind the alert manager", "pro": "Mature mobile apps, carrier relationships and fallback channels", "con": "Cost per user, an outside dependency, and less control over escalation logic" }
+      ],
+      "pick": "Own the rules, grouping and routing, and use a vendor, or at least two providers, for the last mile of delivery."
+    }
+  ],
+  "roles": [
+    { "id": "client", "label": "People", "description": "The on-call phones and the team email list." },
+    { "id": "edge", "label": "Sources and channels", "description": "The services being watched, the notifier and the SMS and call providers." },
+    { "id": "async", "label": "Notification queue", "description": "Pages waiting for delivery, with retries." },
+    { "id": "compute", "label": "Evaluation and routing", "description": "The rule evaluator, grouping, routing, escalation and the watchdog." },
+    { "id": "data", "label": "State", "description": "Metrics, the on-call schedule, silences and the incident history." }
+  ]
+}

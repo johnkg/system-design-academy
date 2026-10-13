@@ -1,0 +1,105 @@
+---
+import PlaygroundShell from '../../components/PlaygroundShell.astro';
+---
+<PlaygroundShell title="Break 10 instances, safely" hint="A 10-instance service takes 100 requests per second. Pick a fault, how much of the fleet it hits, the blast-radius limit and who stops a bad experiment. The same seeded run is replayed each time.">
+  <ol class="how">
+    <li>By default <b>5 instances are killed</b>, the limit allows it, and <b>a person is watching</b>. The survivors cannot carry the traffic, and the person needs 30 seconds, so <b>783 of 3,100 requests fail</b> (25%).</li>
+    <li>Switch the abort to the <b>watchdog</b>: the same fault is stopped after 1 second and only <b>30 of 100 requests</b> fail. With <b>no abort</b> the fault runs the full minute and <b>1,508 of 6,000</b> fail.</li>
+    <li>Lower the <b>blast-radius limit to 3</b> while 5 are targeted: the planner <b>rejects</b> the run and nothing fails at all. Switch the fault to <b>errors on 2 instances</b> and the hypothesis holds (worst 40 per thousand), because clients retry on another instance.</li>
+  </ol>
+  <div class="pg cxb" data-cxb>
+    <div class="pg-row">
+      <label>Fault <select class="pg-in" data-fault>
+        <option value="kill" selected>kill the process</option>
+        <option value="errors">30% errors</option>
+        <option value="slow">slow (serves 5 per second)</option>
+      </select></label>
+      <label>Instances hit <input type="range" min="1" max="8" value="5" data-n /> <b data-nval></b></label>
+      <label>Blast-radius limit <input type="range" min="1" max="8" value="5" data-lim /> <b data-limval></b></label>
+      <label>Who stops a bad experiment <select class="pg-in" data-policy>
+        <option value="none">nobody (runs the full 60 s)</option>
+        <option value="human" selected>a person watching a dashboard (30 s)</option>
+        <option value="auto">the watchdog (checks every 5 s)</option>
+      </select></label>
+    </div>
+    <div class="pg-grid">
+      <div class="pg-box" data-b1><h3>Requests that failed</h3><span class="pg-mono" data-o1></span><span class="pg-note" data-n1></span></div>
+      <div class="pg-box" data-b2><h3>Fault was on for</h3><span class="pg-mono" data-o2></span><span class="pg-note" data-n2></span></div>
+      <div class="pg-box" data-b3><h3>Worst reading</h3><span class="pg-mono" data-o3></span><span class="pg-note" data-n3></span></div>
+    </div>
+    <div class="cx-strip" data-strip role="img" aria-label="Failures per thousand for each second"></div>
+    <p class="pg-out" data-verdict aria-live="polite"></p>
+    <p class="pg-note">Model: 100 requests per second spread round-robin over the instances that the load balancer still lists, each instance serves at most 15 per second, and a failed request is retried once. A killed instance is dropped from the list after 2 seconds. The hypothesis is at most 50 failures per thousand, the guardrail is 100 per thousand, and the fault lasts 60 seconds unless stopped. The bar strip shows each second (green: within the hypothesis, blue: above it, red: above the guardrail).</p>
+  </div>
+</PlaygroundShell>
+<style is:global>
+  .playground .cx-strip { display: flex; align-items: flex-end; gap: 1px; height: 56px; margin: 12px 0; }
+  .playground .cx-strip span { flex: 1 1 0; min-width: 2px; background: var(--border); border-radius: 1px; height: 4%; }
+</style>
+<script>
+  document.querySelectorAll<HTMLElement>('[data-cxb]').forEach((root) => {
+    const q = <T extends HTMLElement>(s: string) => root.querySelector<T>(s)!;
+    const N = 10; const REQ = 100; const CAP = 15; const START = 5; const DUR = 60; const STEADY = 50; const GUARD = 100; const DETECT = 2; const HUMAN = 30; const CHECK = 5;
+    const SHOWN = START + DUR + 4;
+    type Out = { failed: number; sent: number; secondsOn: number; worst: number; abortAt: number; series: number[] };
+    // One seeded run of the fleet, second by second.
+    function sim(kind: string, targets: number, policy: string): Out {
+      let seed = 7; const rnd = (n: number) => { seed = (seed * 1664525 + 1013904223) % 4294967296; return Math.floor(seed / 65536) % n; };
+      const dead = new Array<boolean>(N).fill(false); const eject = new Array<number>(N).fill(0); const err = new Array<number>(N).fill(0); const cap = new Array<number>(N).fill(CAP);
+      let cursor = 0; let failed = 0; let sent = 0; let secondsOn = 0; let worst = 0; let abortAt = -1; let firstBreach = -1;
+      const series: number[] = []; const end = START + DUR;
+      for (let t = 0; t < SHOWN; t++) {
+        if (t === START) for (let i = 0; i < targets; i++) { if (kind === 'kill') { dead[i] = true; eject[i] = t + DETECT; } else if (kind === 'errors') err[i] = 30; else cap[i] = 5; }
+        if (t === end || t === abortAt) { dead.fill(false); err.fill(0); cap.fill(CAP); }
+        const rot = Array.from({ length: N }, (_, i) => i).filter((i) => !(dead[i] && t >= eject[i]));
+        const load = new Array<number>(N).fill(0);
+        const attempt = (i: number) => { if (dead[i] || load[i] >= cap[i]) return false; load[i]++; return !(err[i] > 0 && rnd(100) < err[i]); };
+        let e = 0;
+        for (let r = 0; r < REQ; r++) { let ok = attempt(rot[cursor++ % rot.length]); if (!ok) ok = attempt(rot[cursor++ % rot.length]); if (!ok) e++; }
+        const pm = e * 10; const active = t >= START && t < end && (abortAt < 0 || t < abortAt);
+        series.push(active ? pm : -1);
+        if (active) {
+          sent += REQ; failed += e; secondsOn++; worst = Math.max(worst, pm);
+          if (pm > GUARD && firstBreach < 0) firstBreach = t;
+          if (abortAt < 0) {
+            if (policy === 'auto' && pm > GUARD && (t - START) % CHECK === 0) abortAt = t + 1;
+            else if (policy === 'human' && firstBreach >= 0 && t - firstBreach >= HUMAN) abortAt = t + 1;
+          }
+        }
+      }
+      return { failed, sent, secondsOn, worst, abortAt, series };
+    }
+    const strip = q('[data-strip]'); const bars = Array.from({ length: SHOWN }, () => strip.appendChild(document.createElement('span')));
+    const fmt = (n: number) => n.toLocaleString('en-US');
+    function draw() {
+      const kind = q<HTMLSelectElement>('[data-fault]').value; const n = Number(q<HTMLInputElement>('[data-n]').value); const lim = Number(q<HTMLInputElement>('[data-lim]').value); const policy = q<HTMLSelectElement>('[data-policy]').value;
+      q('[data-nval]').textContent = String(n); q('[data-limval]').textContent = String(lim);
+      const rejected = n > lim;
+      const r: Out = rejected ? { failed: 0, sent: 0, secondsOn: 0, worst: 0, abortAt: -1, series: new Array<number>(SHOWN).fill(-1) } : sim(kind, n, policy);
+      const pct = r.sent ? (r.failed * 100) / r.sent : 0;
+      q('[data-o1]').textContent = rejected ? '0 of 0' : `${fmt(r.failed)} of ${fmt(r.sent)}`;
+      q('[data-n1]').textContent = rejected ? 'the planner refused to start' : `${pct.toFixed(1)}% of the requests while the fault was on`;
+      q('[data-o2]').textContent = `${r.secondsOn} s`;
+      q('[data-n2]').textContent = rejected ? 'never started' : r.abortAt >= 0 ? `stopped at second ${r.abortAt - START} of the fault` : 'ran to its planned end (60 s)';
+      q('[data-o3]').textContent = `${r.worst} per thousand`;
+      q('[data-n3]').textContent = rejected ? 'no reading' : r.worst > GUARD ? 'above the 100 guardrail' : r.worst > STEADY ? 'above the hypothesis of 50, below the guardrail' : 'within the hypothesis of 50';
+      q<HTMLElement>('[data-b1]').style.setProperty('--c', pct > 10 ? 'var(--bad)' : 'var(--good)');
+      q<HTMLElement>('[data-b2]').style.setProperty('--c', 'var(--accent)');
+      q<HTMLElement>('[data-b3]').style.setProperty('--c', r.worst > GUARD ? 'var(--bad)' : r.worst > STEADY ? 'var(--accent)' : 'var(--good)');
+      bars.forEach((b, i) => {
+        const v = r.series[i];
+        b.style.height = v < 0 ? '4%' : `${Math.max(6, Math.min(100, v / 7))}%`;
+        b.style.background = v < 0 ? 'var(--border)' : v > GUARD ? 'var(--bad)' : v > STEADY ? 'var(--accent)' : 'var(--good)';
+      });
+      strip.setAttribute('aria-label', rejected ? 'No fault was injected' : `Failures per thousand for each second, worst ${r.worst}`);
+      const out = q('[data-verdict]'); out.classList.toggle('bad', !rejected && pct > 10);
+      if (rejected) out.textContent = `Rejected before it started: ${n} instances is above the blast-radius limit of ${lim}. Nothing was touched and no customer saw a failure.`;
+      else if (r.abortAt >= 0) out.textContent = `Aborted by ${policy === 'auto' ? 'the watchdog' : 'a person'} after ${r.abortAt - START} s of fault, with ${fmt(r.failed)} failed requests (${pct.toFixed(1)}%). ${policy === 'human' ? 'A person needs about 30 s to notice and act, and every second of the breach keeps failing requests.' : 'The watchdog saw the breach at its first check and stopped the fault within a second.'}`;
+      else if (r.worst > GUARD) out.textContent = `Nobody stopped it: the fault ran all ${r.secondsOn} s and failed ${fmt(r.failed)} requests (${pct.toFixed(1)}%).${pct < 2 ? ' Here the guardrail was crossed only for a moment while the load balancer noticed the dead instances, so waiting cost little.' : ' The breach was sustained, so this is a real outage.'}`;
+      else if (r.worst > STEADY) out.textContent = `Hypothesis disproved, but the guardrail held: the worst second was ${r.worst} per thousand, above the 50 allowed. The experiment found a weakness without hurting many users.`;
+      else out.textContent = `Hypothesis held: the worst second was ${r.worst} per thousand, within the 50 allowed. Retries on other instances hid the fault.`;
+    }
+    root.addEventListener('input', draw); root.addEventListener('change', draw);
+    draw();
+  });
+</script>

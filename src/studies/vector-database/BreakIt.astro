@@ -1,0 +1,102 @@
+---
+import PlaygroundShell from '../../components/PlaygroundShell.astro';
+---
+<PlaygroundShell title="Filtered vector search" hint="Ask for the 10 nearest vectors that also match a filter, such as 'in stock'. When does the filter ruin an approximate index? Each result is averaged over 50 queries on a real index of 2,000 vectors in 16 lists.">
+  <ol class="how">
+    <li>The default filters <b>after</b> the search and keeps <b>10%</b> of the vectors: only <b>1.0 of 10</b> results come back and recall is <b>10%</b>, because the index returned the 10 nearest vectors overall and about 9 of them failed the filter.</li>
+    <li>Choose <b>during the scan</b>: all <b>10</b> results come back with <b>94%</b> recall at 4 lists probed, scanning 533 vectors. Raising the lists probed to 16 makes it exact but scans all 2,000.</li>
+    <li>Now keep only <b>1%</b>: during the scan, 4 lists give only <b>5.5</b> results and <b>49%</b> recall, since the matches are scattered. <b>Filter first</b> and scan just the 20 matches: exact, in 20 distance computations.</li>
+  </ol>
+  <div class="pg vdb" data-vdb>
+    <div class="pg-row">
+      <label>Apply the filter <select class="pg-in" data-st>
+        <option value="post" selected>after the index search</option>
+        <option value="during">during the index scan</option>
+        <option value="pre">first, then scan the matches</option>
+      </select></label>
+      <label>Vectors that match the filter <select class="pg-in" data-sel>
+        <option value="2">50%</option>
+        <option value="10" selected>10%</option>
+        <option value="100">1%</option>
+      </select></label>
+      <label>Lists probed (of 16) <input type="range" min="1" max="16" value="4" data-np /> <b data-npval></b></label>
+    </div>
+    <div class="pg-grid">
+      <div class="pg-box" data-b1><h3>Results returned (wanted 10)</h3><span class="pg-mono" data-o1></span><span class="pg-note" data-n1></span></div>
+      <div class="pg-box" data-b2><h3>Recall of the filtered top 10</h3><span class="pg-mono" data-o2></span><span class="pg-note" data-n2></span></div>
+      <div class="pg-box" data-b3><h3>Distances computed per query</h3><span class="pg-mono" data-o3></span><span class="pg-note" data-n3></span></div>
+    </div>
+    <p class="pg-out" data-verdict aria-live="polite"></p>
+    <p class="pg-note">Model: 2,000 vectors with 8 dimensions in 24 loose clusters, an inverted-file index with 16 lists trained by k-means, and a filter on an attribute unrelated to the position of the vector. Recall is measured against an exact filtered search. Filtering first assumes a metadata index finds the matching ids without scanning the rest.</p>
+  </div>
+</PlaygroundShell>
+<script>
+  document.querySelectorAll<HTMLElement>('[data-vdb]').forEach((root) => {
+    const q = <T extends HTMLElement>(s: string) => root.querySelector<T>(s)!;
+    const DIM = 8; const N = 2000; const LISTS = 16; const K = 10; const QUERIES = 50;
+    let seed = 7; const rand = (n: number) => { seed = (Math.imul(seed, 1664525) + 1013904223) >>> 0; return (seed >>> 8) % n; };
+    const dist = (a: number[], b: number[]) => { let s = 0; for (let i = 0; i < DIM; i++) s += (a[i] - b[i]) ** 2; return s; };
+    const near = (c: number[]) => c.map((x) => Math.min(255, Math.max(0, x + rand(121) - 60)));
+    const centers = Array.from({ length: 24 }, () => Array.from({ length: DIM }, () => rand(256)));
+    const vectors = Array.from({ length: N }, () => near(centers[rand(24)]));
+    let cents = Array.from({ length: LISTS }, (_, i) => vectors[i * (N / LISTS)].slice());
+    const closest = (v: number[], list: number[][]) => list.reduce((best, c, i) => (dist(v, c) < dist(v, list[best]) ? i : best), 0);
+    for (let round = 0; round < 5; round++) {
+      const sums = cents.map(() => new Array(DIM).fill(0)); const counts = new Array(LISTS).fill(0);
+      for (const v of vectors) { const c = closest(v, cents); counts[c]++; v.forEach((x, i) => (sums[c][i] += x)); }
+      cents = cents.map((old, c) => (counts[c] ? sums[c].map((s: number) => Math.floor(s / counts[c])) : old));
+    }
+    const lists: number[][] = Array.from({ length: LISTS }, () => []);
+    vectors.forEach((v, id) => lists[closest(v, cents)].push(id));
+    const queries = Array.from({ length: QUERIES }, () => near(vectors[rand(N)]));
+    const by = (a: number[], b: number[]) => a[0] - b[0] || a[1] - b[1];
+    const order = queries.map((qq) => cents.map((c, i) => [dist(qq, c), i]).sort(by).map((e) => e[1]));
+    const truthCache = new Map<number, number[][]>();
+    const truth = (every: number) => {
+      if (!truthCache.has(every)) truthCache.set(every, queries.map((qq) => vectors.map((v, id) => [dist(qq, v), id]).filter((e) => e[1] % every === 0).sort(by).slice(0, K).map((e) => e[1])));
+      return truthCache.get(every)!;
+    };
+    function run(strategy: string, nprobe: number, every: number) {
+      const tr = truth(every); let results = 0; let hits = 0; let wanted = 0; let scanned = 0;
+      queries.forEach((qq, qi) => {
+        let ids: number[] = [];
+        if (strategy === 'pre') {
+          const m: number[][] = []; for (let id = 0; id < N; id += every) m.push([dist(qq, vectors[id]), id]);
+          scanned += m.length; ids = m.sort(by).slice(0, K).map((e) => e[1]);
+        } else {
+          const hs: number[][] = [];
+          for (const l of order[qi].slice(0, nprobe)) for (const id of lists[l]) { scanned++; if (strategy === 'during' ? id % every === 0 : true) hs.push([dist(qq, vectors[id]), id]); }
+          ids = hs.sort(by).slice(0, K).map((e) => e[1]);
+          if (strategy === 'post') ids = ids.filter((id) => id % every === 0);
+        }
+        results += ids.length; wanted += tr[qi].length; hits += ids.filter((id) => tr[qi].includes(id)).length;
+      });
+      return { results: Math.floor((results * 10) / QUERIES) / 10, recall: Math.floor((hits * 100) / wanted), scanned: Math.floor(scanned / QUERIES) };
+    }
+    const pct = (every: number) => (every === 2 ? '50%' : every === 10 ? '10%' : '1%');
+    const fmt1 = (n: number) => (Number.isInteger(n) ? `${n}.0` : String(n));
+    const NAMES: Record<string, string> = { post: 'after the search', during: 'during the scan', pre: 'first, then scan the matches' };
+    let queued = false;
+    function draw() {
+      queued = false;
+      const st = q<HTMLSelectElement>('[data-st]').value; const every = Number(q<HTMLSelectElement>('[data-sel]').value); const np = Number(q<HTMLInputElement>('[data-np]').value);
+      q('[data-npval]').textContent = String(np);
+      q<HTMLInputElement>('[data-np]').disabled = st === 'pre';
+      const r = run(st, np, every);
+      q('[data-o1]').textContent = `${fmt1(r.results)} of ${K}`; q('[data-n1]').textContent = `average over ${QUERIES} queries`;
+      q('[data-o2]').textContent = `${r.recall}%`; q('[data-n2]').textContent = `filter ${NAMES[st]}, ${pct(every)} match`;
+      q('[data-o3]').textContent = r.scanned.toLocaleString('en-US'); q('[data-n3]').textContent = `of ${N.toLocaleString('en-US')} vectors${st === 'pre' ? ' (only the matches)' : ''}`;
+      q<HTMLElement>('[data-b1]').style.setProperty('--c', r.results >= K ? 'var(--good)' : 'var(--bad)');
+      q<HTMLElement>('[data-b2]').style.setProperty('--c', r.recall >= 95 ? 'var(--good)' : 'var(--bad)');
+      q<HTMLElement>('[data-b3]').style.setProperty('--c', 'var(--accent)');
+      const out = q('[data-verdict]'); const bad = r.recall < 95 || r.results < K; out.classList.toggle('bad', bad);
+      if (st === 'pre') out.textContent = `Exact: ${r.recall}% recall by computing distances to just the ${r.scanned} matching vectors. This is the cheapest and exact when few vectors match, but with ${pct(every)} matching it costs ${r.scanned} distances where an index probe of a few lists would be enough.`;
+      else if (st === 'post') out.textContent = `Only ${fmt1(r.results)} of ${K} results survive, because the index returned the nearest ${K} vectors overall and most of them fail the filter. Probing more lists does not help, so a filter applied after the search is wrong, not just slow.`;
+      else if (bad) out.textContent = `The filter is applied while scanning, so results can fill up, but with ${pct(every)} matching only ${fmt1(r.results)} of ${K} come back and recall is ${r.recall}% at ${np} lists. The matches are scattered over many lists. Probe more lists or filter first.`;
+      else out.textContent = `Filtering during the scan returns ${fmt1(r.results)} of ${K} results with ${r.recall}% recall, scanning ${r.scanned} of ${N} vectors. Recall rises with the lists probed, and so does the work.`;
+    }
+    const schedule = () => { if (!queued) { queued = true; requestAnimationFrame(draw); } };
+    root.addEventListener('input', schedule); root.addEventListener('change', schedule);
+    draw();
+  });
+</script>

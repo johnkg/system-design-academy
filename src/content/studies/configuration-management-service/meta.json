@@ -1,0 +1,182 @@
+{
+  "name": "Design a Configuration Management Service",
+  "difficulty": "intermediate",
+  "intent": "Change settings for tens of thousands of running services without redeploying them, roll the change out in stages, and make a bad value easy to undo and impossible to turn into an outage of the whole fleet.",
+  "codeTitle": "versioned config with staged rollout and a last-known-good cache",
+  "finalIntro": "One timeout change moving through review, validation, a staged rollout and a restart during an outage.",
+  "prompt": "Design a configuration service for a company with 2,000 services running on 50,000 instances in several environments. Teams change settings such as timeouts, limits and feature switches. A change should reach production within minutes, be validated before it goes out, be rolled out gradually, be undone quickly, and never stop the services from starting.",
+  "functional": [
+    "Store configuration as versions, and read the current version of a service's configuration",
+    "Validate a change against a schema before it is accepted",
+    "Roll a change out to a growing share of instances, and roll it back",
+    "Deliver changes to running instances by polling or by push",
+    "Layer per-environment, per-region and per-service overrides on a shared base",
+    "Keep an audit trail of who changed what and when, with approvals"
+  ],
+  "nonFunctional": [
+    "A change reaches every instance within about a minute after its rollout is released",
+    "Services keep working and can restart while the config service is down",
+    "The config service handles tens of thousands of instances polling at once, cheaply",
+    "A bad value must be stopped by validation, or limited by the rollout to a few percent of instances",
+    "Rollback takes effect within one polling interval",
+    "Every change is attributed, reviewed and can be reproduced later"
+  ],
+  "firstAttempt": {
+    "text": "Config files live in each service's repository and are baked into the build, or set as environment variables by the deploy script. To change a timeout, a developer edits the file, merges it and redeploys the service. Production, staging and development have their own copies of the file.",
+    "limits": [
+      "Every config change needs a full build and deploy, so a simple fix takes an hour instead of a minute",
+      "The change reaches all instances at once, so one typo is an outage of the whole service",
+      "Nothing checks the value: a timeout of 0 or the text 'fast' is only found when the process starts or fails",
+      "Rolling back means another full deploy, and nobody can say which value was live at a given time",
+      "Copies per environment drift apart, and a secret in a file ends up in the repository"
+    ]
+  },
+  "nodes": [
+    { "id": "services", "label": "Service instances", "kind": "client", "x": 12, "y": 63, "at": 0 },
+    { "id": "files", "label": "Config baked into builds", "kind": "data", "x": 62, "y": 63, "at": 0, "until": 1 },
+    { "id": "api", "label": "Config API", "kind": "edge", "x": 37, "y": 63, "at": 1 },
+    { "id": "store", "label": "Versioned store", "kind": "data", "x": 62, "y": 63, "at": 1 },
+    { "id": "editors", "label": "Engineers", "kind": "client", "x": 12, "y": 12, "at": 2 },
+    { "id": "validator", "label": "Schema check", "kind": "compute", "x": 37, "y": 12, "at": 2 },
+    { "id": "rollout", "label": "Rollout controller", "kind": "compute", "x": 62, "y": 12, "at": 3 },
+    { "id": "health", "label": "Health metrics", "kind": "async", "x": 87, "y": 12, "at": 3 },
+    { "id": "push", "label": "Change notifier", "kind": "async", "x": 37, "y": 88, "at": 4 },
+    { "id": "cache", "label": "Local last-known-good", "kind": "data", "x": 12, "y": 88, "at": 4 },
+    { "id": "overrides", "label": "Env overrides", "kind": "data", "x": 87, "y": 37, "at": 5 },
+    { "id": "audit", "label": "Audit log", "kind": "data", "x": 87, "y": 63, "at": 6 }
+  ],
+  "edges": [
+    { "from": "services", "to": "files", "at": 0, "until": 1 },
+    { "from": "services", "to": "api", "at": 1 },
+    { "from": "api", "to": "store", "at": 1 },
+    { "from": "editors", "to": "validator", "at": 2 },
+    { "from": "validator", "to": "store", "at": 2 },
+    { "from": "rollout", "to": "api", "at": 3 },
+    { "from": "health", "to": "rollout", "at": 3 },
+    { "from": "services", "to": "health", "at": 3 },
+    { "from": "api", "to": "push", "at": 4 },
+    { "from": "push", "to": "cache", "at": 4 },
+    { "from": "cache", "to": "services", "at": 4 },
+    { "from": "overrides", "to": "store", "at": 5 },
+    { "from": "store", "to": "audit", "at": 6 }
+  ],
+  "steps": [
+    {
+      "title": "Serve versioned configuration from a central store",
+      "problem": "Configuration that is baked into builds can only change with a deploy, and nobody can say which value was live when.",
+      "fix": "Move configuration into a store where every change creates a new immutable version with an author, a time and a checksum. Instances ask a small config API for the current version of their configuration, sending the version they already have. If nothing changed the API answers 'not modified' without a body. Because a version never changes after it is written, the response can be cached by a CDN or a proxy, and going back to an earlier value just means pointing the 'stable' marker at an older version.",
+      "tradeoff": "Changes take effect in minutes without a build, and history comes for free. The config service becomes a dependency of every service, so it must be very reliable and must never be needed at the moment a service is starting.",
+      "concepts": [{ "slug": "http-caching-headers" }, { "slug": "caching" }, { "slug": "infrastructure-as-code" }, { "slug": "optimistic-concurrency-and-etags" }]
+    },
+    {
+      "title": "Validate every change before it can go live",
+      "problem": "A value of the wrong type, a negative timeout or a missing key is not noticed until a process fails, and the failure then happens on every instance at once.",
+      "fix": "Every key has a schema that gives its type, its allowed range and its default, and the service refuses to save a version that breaks it. Cross-field rules catch more, for example the retry budget must fit inside the timeout. Changes go through review, and the editor sees a diff against the live version and a dry-run result. The same schema is shipped to the client library, which checks again before it applies anything. Adding a key or widening a range must stay compatible with older clients that are still running.",
+      "tradeoff": "Typos and impossible values never reach production. A schema cannot know that a valid value is a bad choice, such as a 60 ms timeout on a slow dependency, so validation is the first layer and the rollout is the second.",
+      "concepts": [{ "slug": "schema-evolution-and-compatibility" }, { "slug": "api-versioning" }, { "slug": "access-control-models" }, { "slug": "infrastructure-as-code" }]
+    },
+    {
+      "title": "Roll out in stages with a health gate and an instant rollback",
+      "problem": "A valid but harmful change reaches every instance within one polling interval, and a person has to notice it and react.",
+      "fix": "A rollout controller releases a version to a growing share of instances: for example 1%, 5%, 25% and then 100%, with a bake time at each stage. Which instances are in a stage is decided by a stable hash of the instance id, so the same instances stay in the early group, and the first groups can be a canary region or low-risk services. Between stages the controller compares the error rate, latency and restarts of the new group with the old group. If the gate fails, it moves the candidate share back to 0%, and the instances return to the stable version at their next poll.",
+      "tradeoff": "A bad change hurts a few percent of the fleet for a minute or two instead of everything for half an hour. A full rollout is slower by the sum of the bake times, so urgent fixes need a fast path that is audited, and a gate is only as good as the metrics it watches.",
+      "concepts": [{ "slug": "canary-deployments" }, { "slug": "blue-green-and-rolling-deployments" }, { "slug": "feature-flags" }, { "slug": "health-checks" }, { "slug": "slos-and-error-budgets" }]
+    },
+    {
+      "title": "Poll with a push hint, and keep a last-known-good copy",
+      "problem": "Instances need new values quickly, but 50,000 instances should not hammer the config service, and a service must still start when the config service is down.",
+      "fix": "Instances poll every 30 seconds with a random offset, sending the version they hold, so almost every answer is a tiny 'not modified'. A change notifier adds a hint over a long-lived connection ('version 43 exists') so urgent changes arrive in a second or two, but the poll stays as the safety net when a hint is lost. A new version is verified by checksum and schema, written to local disk and only then applied. The library marks it last-known-good after the instance has been healthy for a while. At start-up the instance reads that file first, so it runs without the config service, and keeps retrying with backoff and jitter in the background.",
+      "tradeoff": "The config service is not on the critical path of a running service, and its load is a steady, cacheable trickle. Instances can run on slightly old values for a while during an outage, so a value that must change everywhere at the same instant is not a good fit.",
+      "concepts": [{ "slug": "pub-sub" }, { "slug": "real-time-communication" }, { "slug": "graceful-degradation" }, { "slug": "retries-and-backoff" }, { "slug": "caching" }]
+    },
+    {
+      "title": "Layer overrides for each environment, region and service",
+      "problem": "Production, staging and each region differ in a few values, and separate full copies drift apart.",
+      "fix": "Keep one base configuration and add small override layers that apply in a fixed order: base, then environment, then region, then cluster, then a single service or instance, where the most specific layer wins. The service computes the merged result for each instance when it is requested, and the version of the merged result is derived from the versions of the layers that went into it. Each layer has its own owner and its own permissions, and the diff shows exactly which layer set a value. Overrides go through the same schema and rollout as any other change.",
+      "tradeoff": "Environments differ only where they are meant to, and a new region starts from the base. Too many layers make it hard to see why an instance has a value, so the service must offer an 'explain this value' view and a limit on how deep the layers go.",
+      "concepts": [{ "slug": "infrastructure-as-code" }, { "slug": "feature-flags" }, { "slug": "access-control-models" }, { "slug": "schema-evolution-and-compatibility" }]
+    },
+    {
+      "title": "Audit every change, control who can make it, and keep secrets out",
+      "problem": "When something breaks, the first question is what changed. An answer of 'someone edited a file' is not enough, and config files have a habit of collecting passwords.",
+      "fix": "Every version, rollout stage, rollback and permission change is written to an append-only audit log with the actor, the diff, the approver and the reason. Permissions are per key and per environment, and production needs a second person to approve. Secrets are never stored as values: a key holds a reference such as 'secret:payments/db', and the instance resolves it at runtime from the secrets manager. The log is exported to dashboards, so a graph can show a marker at every config change and an incident can be traced back to the exact version.",
+      "tradeoff": "Incidents are easier to explain, and the blast radius of a stolen account is limited. Approvals slow down changes, so low-risk keys can be marked as self-service, and reading secrets at run time adds one more dependency.",
+      "concepts": [{ "slug": "structured-logging" }, { "slug": "event-sourcing" }, { "slug": "authentication-and-authorization" }, { "slug": "secrets-management" }, { "slug": "access-control-models" }]
+    }
+  ],
+  "failures": [
+    {
+      "scenario": "A change passes the schema but breaks the service",
+      "impact": "A timeout of 60 ms is a valid integer, but every call to a slow dependency now fails.",
+      "answer": "The rollout is staged, so only the first 5% of instances saw it. The gate compared error rates, saw the new group fail, and moved the candidate share back to 0%. Those instances went back to the stable version at their next poll, and the audit log shows the exact change for the follow-up.",
+      "concepts": [{ "slug": "canary-deployments" }, { "slug": "health-checks" }, { "slug": "alerting" }]
+    },
+    {
+      "scenario": "The config service is down while instances restart",
+      "impact": "If a service must fetch its configuration to start, a config outage turns into a restart that cannot finish, for every service at once.",
+      "answer": "Each instance starts from its last-known-good file on local disk, and the image carries safe defaults for a brand-new instance. Fetching happens in the background with backoff and jitter. The loss is that no changes are delivered while the service is down, which is acceptable.",
+      "concepts": [{ "slug": "graceful-degradation" }, { "slug": "retries-and-backoff" }, { "slug": "multi-region-failover" }]
+    },
+    {
+      "scenario": "All 50,000 instances poll the instant the service comes back",
+      "impact": "The first healthy second brings a wall of requests, the service falls over again, and the cycle repeats.",
+      "answer": "Polling uses a random offset and exponential backoff with jitter, so retries spread out. Conditional requests make most answers tiny, a CDN or regional proxy absorbs identical responses, and the API sheds load when it is overloaded instead of queueing it.",
+      "concepts": [{ "slug": "retries-and-backoff" }, { "slug": "backpressure" }, { "slug": "cdn" }, { "slug": "rate-limiting" }]
+    },
+    {
+      "scenario": "A push hint is lost or an instance misses a version",
+      "impact": "Some instances stay on an old value, and a half-applied rollout looks healthy.",
+      "answer": "The hint is only a shortcut. The next poll compares versions and fetches what is missing, and the controller reports how many instances are on each version, so a laggard is visible. The checksum also catches a damaged download, which is discarded in favour of the cached copy.",
+      "concepts": [{ "slug": "pub-sub" }, { "slug": "idempotency" }, { "slug": "health-checks" }]
+    },
+    {
+      "scenario": "Two engineers edit the same key at once",
+      "impact": "The second save silently overwrites the first, and a change vanishes without anyone noticing.",
+      "answer": "A save names the version it was based on. If the live version has moved on, the store rejects it with a conflict, and the editor shows a merge of both changes to review again.",
+      "concepts": [{ "slug": "optimistic-concurrency-and-etags" }, { "slug": "mvcc-and-isolation-levels" }, { "slug": "idempotency" }]
+    }
+  ],
+  "alternatives": [
+    {
+      "title": "How changes reach instances",
+      "options": [
+        { "name": "Polling with conditional requests", "pro": "Simple, robust and cacheable, and the load is steady and predictable", "con": "A change takes up to one interval to arrive" },
+        { "name": "Push over a persistent connection", "pro": "Changes arrive in about a second", "con": "Needs a connection per instance, reconnect handling and a fallback when a message is lost" },
+        { "name": "Poll plus a push hint", "pro": "Fast in the normal case, and correct even when the hint is lost", "con": "Two mechanisms to run" }
+      ],
+      "pick": "Poll as the base and add a push hint when seconds matter."
+    },
+    {
+      "title": "Where the configuration is stored",
+      "options": [
+        { "name": "Files in a Git repository", "pro": "Review, diff and history already exist", "con": "Not built for fast reads at scale, so it needs a service in front and a way to promote changes" },
+        { "name": "A key-value store with consensus", "pro": "Strongly consistent reads and watches, such as etcd or ZooKeeper", "con": "Poor fit for tens of thousands of clients and for large documents" },
+        { "name": "A database with a read-through cache", "pro": "Rich queries, versions and permissions", "con": "Needs care so the cache never shows two clients different data for long" }
+      ],
+      "pick": "Git or a database as the source of truth, served through a stateless, cacheable API."
+    },
+    {
+      "title": "Config at build time or at run time",
+      "options": [
+        { "name": "Baked into the build", "pro": "Reproducible and always available at start-up", "con": "Every change needs a deploy" },
+        { "name": "Fetched at run time", "pro": "Changes in minutes, with no deploy", "con": "A dependency, and a change can break a running service" }
+      ],
+      "pick": "Run time for settings that change often, build time for structure, and local defaults and a cache for safety."
+    },
+    {
+      "title": "How a rollout is targeted",
+      "options": [
+        { "name": "Random percentage of instances", "pro": "Easy to reason about and statistically even", "con": "May hit the same service's whole critical path at once" },
+        { "name": "By region, cluster or service tier", "pro": "Limits the blast radius to a known area", "con": "Early groups are not representative of the rest" }
+      ],
+      "pick": "Start with a low-risk region or tier, then a percentage within the rest."
+    }
+  ],
+  "roles": [
+    { "id": "client", "label": "Clients", "description": "Engineers who edit and the running service instances." },
+    { "id": "edge", "label": "Config API", "description": "The read path that instances poll." },
+    { "id": "async", "label": "Signals", "description": "Change hints going out and health metrics coming back." },
+    { "id": "compute", "label": "Checks", "description": "Schema validation and the rollout controller." },
+    { "id": "data", "label": "State", "description": "Versions, overrides, the local cache and the audit log." }
+  ]
+}
