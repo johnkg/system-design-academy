@@ -1,0 +1,515 @@
+{
+  "name": "Design a Real-Time OLAP Analytics Engine",
+  "difficulty": "advanced",
+  "intent": "Answer slice-and-dice questions over billions of fresh events in under a second, while the events are still arriving, and keep a year of history affordable.",
+  "codeTitle": "rolled-up segments with dictionary columns, bitmap filters and scatter-gather",
+  "finalIntro": "An event arriving, and a dashboard question answered a few seconds later.",
+  "prompt": "Design the analytics engine behind a product dashboard, in the style of Druid or ClickHouse. Hundreds of thousands of events arrive every second from a stream, and old data is also loaded in batches. Analysts filter and group by country, device, campaign and time, and expect results in under a second, including events from the last few seconds.",
+  "functional": [
+    "Ingest events from a stream and from batch files",
+    "Filter and group by dimensions such as country, device and campaign, and aggregate counts, sums and distinct counts",
+    "Query any time range, from the last minute to the last year",
+    "Make new events queryable within a few seconds",
+    "Keep recent data fast and older data cheap",
+    "Reload or correct a day of data from a batch job"
+  ],
+  "nonFunctional": [
+    "Most dashboard queries return in under a second, and the slowest ones in a few seconds",
+    "Ingest 500,000 events per second, and tens of dashboard queries per second",
+    "Storage for a year of history costs a small fraction of the raw data",
+    "Losing a machine loses no data and does not stop queries",
+    "No single query can slow everyone else down",
+    "Results are consistent: an event is counted once, even if the stream redelivers it"
+  ],
+  "firstAttempt": {
+    "text": "One SQL database with a row-oriented events table. Every event is inserted as a row, with indexes on time and the main dimensions. A dashboard query is a SELECT with a WHERE on the filters and a GROUP BY, scanning the matching rows.",
+    "limits": [
+      "A row store reads every column of every row, even though a query needs only two or three columns",
+      "Billions of rows per day make the table and its indexes enormous, and every insert updates several indexes",
+      "Each query scans billions of rows on one machine, so one dashboard takes minutes and a few dashboards stop the inserts",
+      "Raw events are kept forever on expensive disks, although almost nobody asks for per-event detail",
+      "There is one machine, so it is a single point of failure and has a hard size limit"
+    ]
+  },
+  "nodes": [
+    {
+      "id": "dash",
+      "label": "Dashboards",
+      "kind": "client",
+      "x": 62,
+      "y": 12
+    },
+    {
+      "id": "single",
+      "label": "Row-store SQL",
+      "kind": "data",
+      "x": 62,
+      "y": 37,
+      "at": 0,
+      "until": 1
+    },
+    {
+      "id": "broker",
+      "label": "Query broker",
+      "kind": "edge",
+      "x": 62,
+      "y": 37,
+      "at": 1
+    },
+    {
+      "id": "segs",
+      "label": "Columnar segments",
+      "kind": "data",
+      "x": 62,
+      "y": 63,
+      "at": 1,
+      "until": 4
+    },
+    {
+      "id": "stream",
+      "label": "Event stream",
+      "kind": "async",
+      "x": 12,
+      "y": 63,
+      "at": 2
+    },
+    {
+      "id": "ingest",
+      "label": "Ingest and rollup",
+      "kind": "compute",
+      "x": 37,
+      "y": 63,
+      "at": 2
+    },
+    {
+      "id": "batch",
+      "label": "Batch files",
+      "kind": "data",
+      "x": 37,
+      "y": 88,
+      "at": 3
+    },
+    {
+      "id": "catalog",
+      "label": "Segment catalog",
+      "kind": "data",
+      "x": 37,
+      "y": 37,
+      "at": 3
+    },
+    {
+      "id": "deep",
+      "label": "Deep storage",
+      "kind": "data",
+      "x": 87,
+      "y": 63,
+      "at": 3
+    },
+    {
+      "id": "hot",
+      "label": "Hot nodes",
+      "kind": "compute",
+      "x": 62,
+      "y": 63,
+      "at": 4
+    },
+    {
+      "id": "cold",
+      "label": "Cold nodes",
+      "kind": "compute",
+      "x": 87,
+      "y": 37,
+      "at": 5
+    },
+    {
+      "id": "guard",
+      "label": "Query limits",
+      "kind": "compute",
+      "x": 87,
+      "y": 12,
+      "at": 6
+    }
+  ],
+  "edges": [
+    {
+      "from": "dash",
+      "to": "single",
+      "at": 0,
+      "until": 1
+    },
+    {
+      "from": "dash",
+      "to": "broker",
+      "at": 1
+    },
+    {
+      "from": "broker",
+      "to": "segs",
+      "at": 1,
+      "until": 4
+    },
+    {
+      "from": "stream",
+      "to": "ingest",
+      "at": 2
+    },
+    {
+      "from": "ingest",
+      "to": "segs",
+      "at": 2,
+      "until": 4
+    },
+    {
+      "from": "batch",
+      "to": "ingest",
+      "at": 3
+    },
+    {
+      "from": "ingest",
+      "to": "catalog",
+      "at": 3
+    },
+    {
+      "from": "segs",
+      "to": "deep",
+      "at": 3,
+      "until": 4
+    },
+    {
+      "from": "broker",
+      "to": "hot",
+      "at": 4
+    },
+    {
+      "from": "ingest",
+      "to": "hot",
+      "at": 4
+    },
+    {
+      "from": "hot",
+      "to": "deep",
+      "at": 4
+    },
+    {
+      "from": "broker",
+      "to": "catalog",
+      "at": 4
+    },
+    {
+      "from": "deep",
+      "to": "cold",
+      "at": 5
+    },
+    {
+      "from": "broker",
+      "to": "cold",
+      "at": 5
+    },
+    {
+      "from": "guard",
+      "to": "broker",
+      "at": 6
+    }
+  ],
+  "steps": [
+    {
+      "title": "Store columns in immutable, time-partitioned segments",
+      "problem": "A query that sums one number grouped by country should not have to read every field of every event, and one giant table is slow to scan and to maintain.",
+      "fix": "Cut the data into segments, each covering a slice of time, such as one hour, and write each segment once and never change it. Inside a segment every column is stored on its own. A text column like country is dictionary-encoded: the distinct values are listed once and each row stores a small integer. For each dictionary value a bitmap marks the rows that hold it, so a filter such as country in (DE, FR) and device is ios becomes a bitwise OR and AND of a few bitmaps, and only the rows that remain are read. A query touches only the columns it names, and similar values next to each other compress very well.",
+      "tradeoff": "Scans are fast and the data is several times smaller. Rows cannot be updated in place, a single-row lookup is slow, and building a segment takes effort, so data is written in batches and corrections replace whole segments.",
+      "concepts": [
+        {
+          "slug": "columnar-formats-and-partitioning"
+        },
+        {
+          "slug": "database-indexing"
+        },
+        {
+          "slug": "lsm-trees-vs-b-trees"
+        },
+        {
+          "slug": "query-planning-and-joins"
+        }
+      ]
+    },
+    {
+      "title": "Roll events up while ingesting",
+      "problem": "Nobody asks about one click, but billions of them per day are stored, scanned and paid for, and most dashboards only need counts and sums per minute and per dimension.",
+      "fix": "A stream consumer reads the events and merges those that share the same time bucket and dimension values into one row holding a count, a sum and other aggregates. With a one-minute bucket and the dimensions country, device and campaign, thousands of events become a handful of rows, often 10 to 100 times fewer. Distinct counts and percentiles are kept as small mergeable sketches rather than as lists. Fresh rows are held in memory in a real-time segment, which is queryable at once and is written out as an immutable segment when its time window closes.",
+      "tradeoff": "Storage and scan work shrink by the rollup ratio and results arrive within seconds. The original events are gone, so a question that needs a dimension that was not kept cannot be answered, and a column with huge cardinality, such as the user id, destroys the ratio.",
+      "concepts": [
+        {
+          "slug": "stateful-stream-processing"
+        },
+        {
+          "slug": "windowing-and-watermarks"
+        },
+        {
+          "slug": "cardinality-and-sampling"
+        },
+        {
+          "slug": "batch-vs-stream-processing"
+        }
+      ]
+    },
+    {
+      "title": "Add batch loading, deep storage and a segment catalog",
+      "problem": "Real-time ingestion can miss or double count events, late events arrive after their window closed, and a year of history needs a durable home that does not depend on any one machine.",
+      "fix": "Every finished segment is uploaded to deep storage such as object storage, which is the durable copy, and recorded in a segment catalog with its time range and version. The stream consumer commits its offsets together with the segment it publishes, so after a crash it resumes from the stored offsets and an event is never counted twice. A batch job can rebuild a day from the raw files and publish new segments for the same interval with a higher version. The catalog switches queries to the new version atomically, and the old segments are dropped afterwards.",
+      "tradeoff": "History is durable, corrections and late data are possible, and any machine can be replaced by reloading its segments from deep storage. There is now a catalog to keep consistent and a set of versions to garbage-collect, and the freshest data can briefly be present in two forms.",
+      "concepts": [
+        {
+          "slug": "delivery-guarantees"
+        },
+        {
+          "slug": "idempotency"
+        },
+        {
+          "slug": "ordering-and-partitioning"
+        },
+        {
+          "slug": "table-formats-and-the-lakehouse"
+        },
+        {
+          "slug": "message-queues"
+        }
+      ]
+    },
+    {
+      "title": "Answer queries by scatter-gather over segments",
+      "problem": "A year of segments cannot be scanned by one process, and most queries only need a small part of it.",
+      "fix": "A broker receives the query and asks the catalog which segments overlap the requested time range, which prunes most of the year at once. It sends the query to the data nodes that hold those segments, and each node scans its own segments in parallel using the bitmaps and returns a small partial result: a group key with partial counts and sums. The broker merges the partials, adding counts and sums and combining sketches, applies the final sort and limit, and replies. Segments are spread over nodes and replicated, so one node dying only means its replicas answer.",
+      "tradeoff": "Latency is the slowest participant plus the merge, and capacity grows by adding nodes. Aggregates must be mergeable: counts, sums, minimum and maximum merge exactly, and distinct counts and percentiles merge only as approximate sketches. A few slow nodes dominate the tail, which hedged requests and replicas help to hide.",
+      "concepts": [
+        {
+          "slug": "mapreduce-and-shuffles"
+        },
+        {
+          "slug": "database-sharding"
+        },
+        {
+          "slug": "consistent-hashing"
+        },
+        {
+          "slug": "hedged-requests-and-tail-latency"
+        },
+        {
+          "slug": "database-replication"
+        }
+      ]
+    },
+    {
+      "title": "Tier hot and cold data",
+      "problem": "Almost all queries ask about the last few days, yet keeping a year of segments on fast local disks and in memory costs many times more than it brings in.",
+      "fix": "Place recent segments on hot nodes with fast SSDs and several replicas, and let a rule move older ones to cold nodes that have cheaper, larger disks and fewer replicas. Cold segments can be served from deep storage with the data fetched on demand and cached, and very old data can be merged into larger segments with a coarser rollup, such as hourly instead of by minute. Retention rules drop what nobody needs. The broker sends a query to the hot tier first and to the cold tier only if the time range reaches that far.",
+      "tradeoff": "Cost drops by a large factor and the common queries stay fast. A query over old data is slower, moving data between tiers uses bandwidth, and coarser rollups mean old data has less detail than new data.",
+      "concepts": [
+        {
+          "slug": "columnar-formats-and-partitioning"
+        },
+        {
+          "slug": "caching"
+        },
+        {
+          "slug": "autoscaling"
+        },
+        {
+          "slug": "backups-and-point-in-time-recovery"
+        }
+      ]
+    },
+    {
+      "title": "Limit cardinality and protect the cluster from heavy queries",
+      "problem": "A dimension with millions of distinct values, such as a user id, makes dictionaries huge and rollup useless, and a single group-by over it can use all the memory of the cluster.",
+      "fix": "Keep high-cardinality fields out of the rollup key and store them as sketches for distinct counts instead. Cap the number of distinct values a dimension may have, and bucket or truncate values such as raw URLs. At query time enforce a time limit, a cap on rows scanned and on groups returned, and return only the top groups, which is approximate when merging partial top lists. Give each team a quota and run slow reports in a separate pool, so one expensive query cannot starve the dashboards.",
+      "tradeoff": "The cluster stays predictable and cheap. Some questions are answered approximately or refused, analysts must learn which dimensions are queryable, and a limit set too low blocks legitimate work.",
+      "concepts": [
+        {
+          "slug": "cardinality-and-sampling"
+        },
+        {
+          "slug": "rate-limiting"
+        },
+        {
+          "slug": "bulkhead"
+        },
+        {
+          "slug": "load-shedding"
+        },
+        {
+          "slug": "timeouts-and-deadlines"
+        }
+      ]
+    }
+  ],
+  "failures": [
+    {
+      "scenario": "A data node dies during a query",
+      "impact": "Its partial results never arrive, so the totals would be too small.",
+      "answer": "Every segment has replicas on other nodes, and the broker retries the missing segments there, so the answer is complete. If a result is incomplete, the broker marks it as partial instead of presenting it as exact. The cluster then copies the lost replicas from deep storage to other nodes.",
+      "concepts": [
+        {
+          "slug": "health-checks"
+        },
+        {
+          "slug": "database-replication"
+        },
+        {
+          "slug": "retries-and-backoff"
+        },
+        {
+          "slug": "graceful-degradation"
+        }
+      ]
+    },
+    {
+      "scenario": "The ingest worker crashes and the stream redelivers events",
+      "impact": "Events may be counted twice, or lost if offsets were saved too early.",
+      "answer": "Offsets are stored in the same step that publishes the segment, so after a restart the worker resumes from the last published offsets. Events that were only in memory are read from the stream again, and a repeated segment of the same interval and version simply replaces itself.",
+      "concepts": [
+        {
+          "slug": "delivery-guarantees"
+        },
+        {
+          "slug": "idempotency"
+        },
+        {
+          "slug": "stateful-stream-processing"
+        }
+      ]
+    },
+    {
+      "scenario": "Someone adds the user id as a dimension",
+      "impact": "Rollup collapses to 1x, dictionaries and bitmaps for millions of values fill memory, and storage nearly equals the raw data.",
+      "answer": "Ingestion checks the cardinality of every dimension and rejects or truncates values beyond a cap. A distinct count of users is kept as a sketch in each row instead, which costs about a kilobyte per row, and per-user questions go to a different system built for lookups.",
+      "concepts": [
+        {
+          "slug": "cardinality-and-sampling"
+        },
+        {
+          "slug": "columnar-formats-and-partitioning"
+        },
+        {
+          "slug": "schema-evolution-and-compatibility"
+        }
+      ]
+    },
+    {
+      "scenario": "A group-by over a huge range floods the cluster",
+      "impact": "All nodes spend their time on one report, and the live dashboards time out.",
+      "answer": "The broker enforces a deadline and row limits, and runs the query in its own lane with a concurrency cap per team. The report is cancelled when the deadline passes, and its owner is told to narrow the range or use a coarser, pre-rolled table.",
+      "concepts": [
+        {
+          "slug": "timeouts-and-deadlines"
+        },
+        {
+          "slug": "load-shedding"
+        },
+        {
+          "slug": "bulkhead"
+        },
+        {
+          "slug": "rate-limiting"
+        }
+      ]
+    }
+  ],
+  "alternatives": [
+    {
+      "title": "What is stored",
+      "options": [
+        {
+          "name": "Raw events only",
+          "pro": "Any question can be answered, and nothing is lost",
+          "con": "Storage and scans are huge, and every query pays for detail it does not need"
+        },
+        {
+          "name": "Rolled-up rows",
+          "pro": "Tens of times smaller and faster, and dashboards come back in milliseconds",
+          "con": "Questions about dimensions that were dropped cannot be answered"
+        },
+        {
+          "name": "Both: rollup hot, raw in cheap storage",
+          "pro": "Fast dashboards and a way to reprocess",
+          "con": "Two copies and a job to keep them consistent"
+        }
+      ],
+      "pick": "Rolled-up rows for serving, with raw files kept in cheap object storage for backfills."
+    },
+    {
+      "title": "How new events become queryable",
+      "options": [
+        {
+          "name": "Micro-batches every few minutes",
+          "pro": "Simple, with fewer small segments",
+          "con": "Data is minutes old"
+        },
+        {
+          "name": "Streaming into in-memory segments",
+          "pro": "Seconds of freshness",
+          "con": "Needs offset handling and a memory-resident, queryable real-time part"
+        }
+      ],
+      "pick": "Streaming into a real-time segment, merged into immutable segments as windows close."
+    },
+    {
+      "title": "Exact or approximate distinct counts",
+      "options": [
+        {
+          "name": "Exact, with sets of ids",
+          "pro": "No error",
+          "con": "Memory grows with cardinality, and sets from many segments are expensive to merge"
+        },
+        {
+          "name": "Sketches (HyperLogLog)",
+          "pro": "A few kilobytes whatever the cardinality, and they merge by taking maxima",
+          "con": "An error of about 1 to 2%, and no way to list the members"
+        }
+      ],
+      "pick": "Sketches for dashboards, exact counts only for small, billing-grade questions on a slower path."
+    },
+    {
+      "title": "Where the data and compute live",
+      "options": [
+        {
+          "name": "Local disks on each node",
+          "pro": "The fastest scans, with no network fetches",
+          "con": "Scaling and replacing nodes means copying data"
+        },
+        {
+          "name": "Compute reading object storage with local caches",
+          "pro": "Compute scales independently, and nodes are disposable",
+          "con": "Cold queries pay network latency, and caches must be warm"
+        }
+      ],
+      "pick": "Local disks for the hot tier, and object storage with caching for the cold tier."
+    }
+  ],
+  "roles": [
+    {
+      "id": "client",
+      "label": "Dashboards",
+      "description": "Analysts and apps that run queries."
+    },
+    {
+      "id": "edge",
+      "label": "Query broker",
+      "description": "Receives queries, prunes segments and merges partial results."
+    },
+    {
+      "id": "async",
+      "label": "Event stream",
+      "description": "The log of incoming events."
+    },
+    {
+      "id": "compute",
+      "label": "Workers",
+      "description": "Ingest, rollup, hot and cold data nodes, and query limits."
+    },
+    {
+      "id": "data",
+      "label": "State",
+      "description": "Segments, the catalog, batch files and deep storage."
+    }
+  ]
+}

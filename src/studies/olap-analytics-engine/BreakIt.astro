@@ -1,0 +1,95 @@
+---
+import PlaygroundShell from '../../components/PlaygroundShell.astro';
+---
+<PlaygroundShell title="What goes in the rollup key" hint="300,000 events from one hour are rolled up into rows keyed by time bucket plus the dimensions you choose. A column with too many distinct values stops the rollup from shrinking anything.">
+  <ol class="how">
+    <li>The default keeps <b>user id in the key</b> with minute buckets: nearly every event is its own row, so there are <b>about as many rows as events</b> (299,997 of 300,000), the rollup is <b>1.0x</b>, and the dictionary and bitmaps for 42,921 distinct users add 5.2 MB to a 17.2 MB segment.</li>
+    <li>Change user id to <b>dropped</b>: rows fall only to 245,731 (<b>1.2x</b>), because campaign still has many values. Choose <b>a sketch</b> and the segment grows to <b>262 MB, bigger than the 90 MB of raw events</b>, since a 1 KB sketch is kept on every row. A sketch only pays when rows are few.</li>
+    <li>Then <b>untick campaign</b>: with minute buckets and the sketch kept, rows fall to 10,496 (<b>28.6x</b>) and the segment to 11 MB. With <b>hour buckets</b> there are 180 rows (<b>1,667x</b>). Untick country and the query can no longer group by it.</li>
+  </ol>
+  <div class="pg olapb" data-olapb>
+    <div class="pg-row">
+      <label><input type="checkbox" data-country checked /> Country in the key (30 values)</label>
+      <label><input type="checkbox" data-device checked /> Device in the key (6 values)</label>
+      <label><input type="checkbox" data-camp checked /> Campaign in the key (200 values)</label>
+      <label>User id (50,000 values) <select class="pg-in" data-user>
+        <option value="drop">dropped</option>
+        <option value="key" selected>in the key</option>
+        <option value="sketch">dropped, kept as a distinct-count sketch</option>
+      </select></label>
+      <label>Time bucket <select class="pg-in" data-gran>
+        <option value="1">1 second</option>
+        <option value="60" selected>1 minute</option>
+        <option value="3600">1 hour</option>
+      </select></label>
+    </div>
+    <div class="pg-grid">
+      <div class="pg-box" data-b1><h3>Rows after rollup</h3><span class="pg-mono" data-o1></span><span class="pg-note" data-n1></span></div>
+      <div class="pg-box" data-b2><h3>Stored size vs raw events</h3><span class="pg-mono" data-o2></span><span class="pg-note" data-n2></span></div>
+      <div class="pg-box" data-b3><h3>Dictionary and bitmap index</h3><span class="pg-mono" data-o3></span><span class="pg-note" data-n3></span></div>
+      <div class="pg-box" data-b4><h3>Query: events per country</h3><span class="pg-mono" data-o4></span><span class="pg-note" data-n4></span></div>
+    </div>
+    <p class="pg-out" data-verdict aria-live="polite"></p>
+    <p class="pg-note">Model: 300,000 seeded events in one hour, skewed so that some countries, campaigns and users are far more common. A raw event is 300 bytes. A rolled-up row is 8 bytes for the time bucket, 4 bytes per dictionary-encoded key column and 16 bytes for the count and sum, plus a 1 KB sketch if one is kept. A dictionary costs about 24 bytes per distinct value, and a bitmap index about 40 bytes per value plus 2 bytes per row. A scan reads 10 million rows per second on one core.</p>
+  </div>
+</PlaygroundShell>
+<script>
+  document.querySelectorAll<HTMLElement>('[data-olapb]').forEach((root) => {
+    const q = <T extends HTMLElement>(s: string) => root.querySelector<T>(s)!;
+    // SIM-START
+    const N = 300000; const CARD = { country: 30, device: 6, camp: 200, user: 50000 };
+    let seed = 11; const rnd = (n: number) => { seed = (Math.imul(seed, 1664525) + 1013904223) >>> 0; return (seed >>> 16) % n; };
+    const events = Array.from({ length: N }, () => ({ t: rnd(3600), country: Math.min(rnd(30), rnd(30)), device: Math.min(rnd(6), rnd(6)), camp: Math.min(rnd(200), rnd(200), rnd(200)), user: Math.min(rnd(50000), rnd(50000)) }));
+    const cache = new Map<string, any>();
+    function simulate(o: any): any {
+      const id = [o.country, o.device, o.camp, o.user, o.gran].join('|');
+      if (cache.has(id)) return cache.get(id);
+      const keys = new Set(); const distinct = { country: new Set(), device: new Set(), camp: new Set(), user: new Set() };
+      for (const e of events) {
+        let k = Math.floor(e.t / o.gran);
+        if (o.country) { k = k * CARD.country + e.country; distinct.country.add(e.country); }
+        if (o.device) { k = k * CARD.device + e.device; distinct.device.add(e.device); }
+        if (o.camp) { k = k * CARD.camp + e.camp; distinct.camp.add(e.camp); }
+        if (o.user === 'key') { k = k * CARD.user + e.user; distinct.user.add(e.user); }
+        keys.add(k);
+      }
+      const rows = keys.size; const cols = ['country', 'device', 'camp', 'user'].filter((c) => (c === 'user' ? o.user === 'key' : o[c]));
+      const rowBytes = 8 + 4 * cols.length + 16 + (o.user === 'sketch' ? 1024 : 0);
+      const dict = cols.reduce((s, c) => s + distinct[c].size * 24, 0);
+      const index = cols.reduce((s, c) => s + distinct[c].size * 40 + rows * 2, 0);
+      const out = { rows, ratio: N / rows, total: rows * rowBytes + dict + index, dict: dict + index, raw: N * 300, cols, distinct };
+      cache.set(id, out); return out;
+    }
+    // SIM-END
+    const fmt = (n: number) => Math.round(n).toLocaleString('en-US');
+    const size = (b: number) => (b >= 1e6 ? `${(b / 1e6).toFixed(1)} MB` : `${fmt(b / 1e3)} KB`);
+    const NAMES: Record<string, string> = { country: 'country', device: 'device', camp: 'campaign', user: 'user id' };
+    let frame = 0;
+    function draw() {
+      const o = { country: q<HTMLInputElement>('[data-country]').checked, device: q<HTMLInputElement>('[data-device]').checked, camp: q<HTMLInputElement>('[data-camp]').checked, user: q<HTMLSelectElement>('[data-user]').value, gran: Number(q<HTMLSelectElement>('[data-gran]').value) };
+      const r = simulate(o);
+      const ratioText = r.ratio >= 100 ? `${fmt(r.ratio)}x` : `${r.ratio.toFixed(1)}x`;
+      q('[data-o1]').textContent = `${fmt(r.rows)} rows`; q('[data-n1]').textContent = `${fmt(N)} events, so the rollup is ${ratioText}`;
+      q('[data-o2]').textContent = `${size(r.total)} vs ${size(r.raw)}`; q('[data-n2]').textContent = r.total > r.raw ? `${(r.total / r.raw).toFixed(2)}x the raw size: worse than not rolling up` : `${fmt(r.raw / r.total)}x smaller than the raw events`;
+      q('[data-o3]').textContent = size(r.dict); q('[data-n3]').textContent = r.cols.length ? r.cols.map((c) => `${NAMES[c]}: ${fmt(r.distinct[c].size)} values`).join(', ') : 'no key columns';
+      const canQuery = o.country;
+      q('[data-o4]').textContent = canQuery ? `${fmt(r.rows)} rows, ${fmt((r.rows / 10e6) * 1000)} ms` : 'cannot be answered';
+      q('[data-n4]').textContent = canQuery ? 'the query scans every rolled-up row of the hour on one core' : 'country was left out of the key, so its values were merged away';
+      const worst = r.cols.slice().sort((a, b) => r.distinct[b].size - r.distinct[a].size)[0];
+      const bad = r.ratio < 2 || !canQuery; const good = r.ratio >= 10 && canQuery;
+      const cl = (n: string, c: string) => q<HTMLElement>(n).style.setProperty('--c', c);
+      cl('[data-b1]', r.ratio < 2 ? 'var(--bad)' : r.ratio >= 10 ? 'var(--good)' : 'var(--accent)');
+      cl('[data-b2]', r.total > r.raw ? 'var(--bad)' : 'var(--good)');
+      cl('[data-b3]', o.user === 'key' ? 'var(--bad)' : 'var(--accent)');
+      cl('[data-b4]', canQuery ? 'var(--accent)' : 'var(--bad)');
+      const v = q('[data-verdict]'); v.classList.toggle('bad', bad);
+      v.textContent = !canQuery ? 'Country is not in the key, so no segment can answer a query that groups by it. Rollup throws away every dimension it does not keep.'
+        : r.ratio < 2 ? `The rollup is doing almost nothing: ${fmt(N)} events became ${fmt(r.rows)} rows. The key holds ${worst ? `${NAMES[worst]} (${fmt(r.distinct[worst].size)} distinct values) ` : ''}${o.gran === 1 ? 'with one-second buckets, ' : ''}and too many combinations occur, so almost every event is alone in its row. ${o.user === 'key' ? 'Move user id out of the key and keep it as a sketch.' : 'Drop a high-cardinality column from the key or use coarser time buckets.'}`
+        : good ? `The rollup works: ${fmt(N)} events became ${fmt(r.rows)} rows (${ratioText}). Every row stands for many events, so storage and scans shrink by about that factor.${o.user === 'sketch' ? ' Distinct users are still answerable, approximately, from the sketch.' : ''}`
+        : `A modest rollup of ${ratioText}. Fewer distinct values in the key, or coarser time buckets, would shrink it further.`;
+    }
+    const schedule = () => { if (frame) return; frame = requestAnimationFrame(() => { frame = 0; draw(); }); };
+    root.addEventListener('input', schedule); root.addEventListener('change', schedule);
+    draw();
+  });
+</script>

@@ -1,0 +1,516 @@
+{
+  "name": "Design a Double-Entry Ledger",
+  "difficulty": "advanced",
+  "intent": "Record every movement of money as an immutable, balanced journal entry, so that balances are always provable, retries never pay twice, and mistakes are fixed by adding entries and never by editing them.",
+  "codeTitle": "a journal with balanced entries, idempotent posting and reversals",
+  "finalIntro": "One payment posted, retried by mistake, shown on a balance, and later refunded.",
+  "prompt": "Design the ledger behind a payments product. Customers hold wallet balances, pay merchants, and are charged fees, with 50 million payments a day. Finance must be able to prove every balance, auditors must be able to see how any number came to be, and the books must stay correct when requests are retried, services crash and people make mistakes.",
+  "functional": [
+    "Post a transaction as one entry made of two or more lines, each a debit or a credit on an account",
+    "Reject any entry in which the debits and credits do not add up to zero",
+    "Show the current balance of an account, and its balance at any past time",
+    "List the entries that touched an account, in order",
+    "Correct a mistake or refund a payment without changing history",
+    "Reconcile the ledger against bank and partner statements"
+  ],
+  "nonFunctional": [
+    "Entries are immutable: nothing is updated or deleted once it is written",
+    "Posting the same request twice has the effect of posting it once",
+    "An entry is atomic, so all of its lines are recorded or none are",
+    "Handle about 3,000 entries per second at the peak, and 150 million lines a day",
+    "A single busy account, such as the fee account, must not limit throughput",
+    "Every balance can be rebuilt from the journal, and the books always sum to zero",
+    "Reads of balances take under 50 ms, and a posting is confirmed in under 200 ms"
+  ],
+  "firstAttempt": {
+    "text": "One accounts table with a balance column. A transfer is a transaction that subtracts the amount from one row and adds it to another. A second table holds a log of transfers for the history.",
+    "limits": [
+      "The balance is overwritten, so nobody can prove how it got to its current value",
+      "Nothing checks that the money subtracted equals the money added, and a bug can create or destroy money silently",
+      "A client that retries after a timeout moves the money twice",
+      "A fix is an UPDATE of history, which an auditor cannot trust",
+      "Every payment to the fee account updates the same row, and the row lock serialises them all",
+      "The log and the balances can disagree, and nothing says which is right"
+    ]
+  },
+  "nodes": [
+    {
+      "id": "services",
+      "label": "Payment services",
+      "kind": "client",
+      "x": 87,
+      "y": 63,
+      "at": 0
+    },
+    {
+      "id": "single",
+      "label": "Accounts table with balances",
+      "kind": "data",
+      "x": 87,
+      "y": 88,
+      "at": 0,
+      "until": 1
+    },
+    {
+      "id": "api",
+      "label": "Posting API",
+      "kind": "edge",
+      "x": 62,
+      "y": 63,
+      "at": 1
+    },
+    {
+      "id": "journal",
+      "label": "Journal",
+      "kind": "data",
+      "x": 37,
+      "y": 37,
+      "at": 1
+    },
+    {
+      "id": "dedupe",
+      "label": "Idempotency keys",
+      "kind": "data",
+      "x": 12,
+      "y": 37,
+      "at": 2
+    },
+    {
+      "id": "balances",
+      "label": "Balances",
+      "kind": "data",
+      "x": 62,
+      "y": 37,
+      "at": 3
+    },
+    {
+      "id": "stream",
+      "label": "Entry stream",
+      "kind": "async",
+      "x": 37,
+      "y": 12,
+      "at": 3
+    },
+    {
+      "id": "reports",
+      "label": "Statements and reports",
+      "kind": "compute",
+      "x": 12,
+      "y": 12,
+      "at": 3
+    },
+    {
+      "id": "router",
+      "label": "Sub-account picker",
+      "kind": "compute",
+      "x": 37,
+      "y": 63,
+      "at": 4
+    },
+    {
+      "id": "ops",
+      "label": "Finance console",
+      "kind": "client",
+      "x": 62,
+      "y": 88,
+      "at": 5
+    },
+    {
+      "id": "recon",
+      "label": "Reconciler",
+      "kind": "compute",
+      "x": 62,
+      "y": 12,
+      "at": 5
+    },
+    {
+      "id": "bank",
+      "label": "Bank statements",
+      "kind": "client",
+      "x": 87,
+      "y": 12,
+      "at": 5
+    }
+  ],
+  "edges": [
+    {
+      "from": "services",
+      "to": "single",
+      "at": 0,
+      "until": 1
+    },
+    {
+      "from": "services",
+      "to": "api",
+      "at": 1
+    },
+    {
+      "from": "api",
+      "to": "journal",
+      "at": 1,
+      "until": 4
+    },
+    {
+      "from": "journal",
+      "to": "dedupe",
+      "at": 2
+    },
+    {
+      "from": "journal",
+      "to": "balances",
+      "at": 3
+    },
+    {
+      "from": "journal",
+      "to": "stream",
+      "at": 3
+    },
+    {
+      "from": "stream",
+      "to": "reports",
+      "at": 3
+    },
+    {
+      "from": "api",
+      "to": "router",
+      "at": 4
+    },
+    {
+      "from": "router",
+      "to": "journal",
+      "at": 4
+    },
+    {
+      "from": "ops",
+      "to": "api",
+      "at": 5
+    },
+    {
+      "from": "bank",
+      "to": "recon",
+      "at": 5
+    },
+    {
+      "from": "recon",
+      "to": "journal",
+      "at": 5
+    }
+  ],
+  "steps": [
+    {
+      "title": "Write balanced entries to an append-only journal",
+      "problem": "A balance column that is overwritten keeps no history, and nothing stops money from being created or destroyed by a bug.",
+      "fix": "Record every movement as a journal entry made of lines. Each line names an account and an amount in integer minor units, such as cents, positive for a debit and negative for a credit, with the currency. The rule is that the lines of one entry add up to zero, per currency, and the posting API refuses an entry that does not. All lines of an entry are inserted in one database transaction, so an entry is whole or absent. Nothing in the journal is ever updated or deleted, and the database role used by the service has no permission to do either. A money amount is never a floating-point number.",
+      "tradeoff": "Money cannot appear from nowhere, because every credit has a matching debit, and the full history is kept. A simple payment now writes three or four rows instead of updating two, and a balance has to be computed or maintained rather than just read.",
+      "concepts": [
+        {
+          "slug": "acid-vs-base"
+        },
+        {
+          "slug": "event-sourcing"
+        },
+        {
+          "slug": "write-ahead-log"
+        },
+        {
+          "slug": "mvcc-and-isolation-levels"
+        }
+      ]
+    },
+    {
+      "title": "Make every posting idempotent",
+      "problem": "A client that times out retries, and a queue may deliver twice. Without protection the same payment is posted twice and a customer is charged twice.",
+      "fix": "Every posting request carries an idempotency key chosen by the caller, such as the payment id and the step. The key is stored in a column of the entry with a unique index, in the same transaction as the lines. A second request with the same key finds the existing entry and returns it without writing anything. If the same key arrives with different lines, the API rejects it as a conflict instead of guessing, because that is a bug in the caller.",
+      "tradeoff": "Retries become safe, so callers can use simple at-least-once delivery and the ledger gives an effect of exactly once. The caller must create stable keys, the index has to be kept for as long as retries are possible, and a key that was reused by mistake blocks a real payment.",
+      "concepts": [
+        {
+          "slug": "idempotency"
+        },
+        {
+          "slug": "delivery-guarantees"
+        },
+        {
+          "slug": "retries-and-backoff"
+        },
+        {
+          "slug": "database-indexing"
+        }
+      ]
+    },
+    {
+      "title": "Derive balances from the journal",
+      "problem": "Summing every line of an account on each read is too slow, but a stored balance that can be edited is the same weakness as before.",
+      "fix": "A balance is derived state: a projection of the journal. A balances table holds, for each account, the running total and the sequence number of the last entry applied, and it is updated in the same transaction that appends the lines. The journal is the truth and the table is a cache that can be thrown away and rebuilt by replaying the journal from a checkpoint. The same ordered stream of entries feeds statements, reports and a data warehouse. Balance at a past time is the last running total at or before that time.",
+      "tradeoff": "Reads are one row lookup and the balance can always be proved by replay. Keeping the projection in the same transaction adds write work, and a bug in the projection code is visible only if you compare it with a replay.",
+      "concepts": [
+        {
+          "slug": "cqrs"
+        },
+        {
+          "slug": "event-sourcing"
+        },
+        {
+          "slug": "transactional-outbox"
+        },
+        {
+          "slug": "ordering-and-partitioning"
+        }
+      ]
+    },
+    {
+      "title": "Split hot accounts into sub-accounts",
+      "problem": "The fee account, a large merchant or the bank cash account appears in a large share of entries, and one balance row can only be updated by one transaction at a time.",
+      "fix": "A hot account is stored as many sub-accounts, such as fees#0 to fees#15. A posting picks one sub-account, by a hash of the entry or by rotating, so the lines of different entries touch different rows. The account's balance is the sum of its sub-accounts, which a read computes or a periodic job rolls up. Where an account must never go below zero, such as a customer wallet, the check is done on that account's single row with a conditional update or a version number, and only accounts that are shared by thousands of entries are split.",
+      "tradeoff": "Throughput on a hot account grows with the number of sub-accounts, and the journal itself stays append only. An exact balance now takes a read of several rows, and a limit such as no overdraft cannot be checked cheaply on a split account.",
+      "concepts": [
+        {
+          "slug": "database-sharding"
+        },
+        {
+          "slug": "optimistic-concurrency-and-etags"
+        },
+        {
+          "slug": "mvcc-and-isolation-levels"
+        },
+        {
+          "slug": "consistent-hashing"
+        }
+      ]
+    },
+    {
+      "title": "Correct mistakes with reversals, never edits",
+      "problem": "A refund, a wrong amount or a payment to the wrong account has to be fixed, but changing a posted entry destroys the audit trail.",
+      "fix": "A correction is a new entry. A reversal copies the original with every line negated and a field that points to the original, and it gets its own idempotency key derived from the original's id, so a double click reverses only once. A wrong amount is fixed by a reversal followed by a new, correct entry. Entries have an effective date and a recorded time, so a late correction can say which period it belongs to without changing the one that has been closed.",
+      "tradeoff": "The history shows the mistake and the fix, and every number can still be explained as of any day. The journal grows with corrections, and people must learn that nothing is ever deleted, so a mistake has two entries and a reason.",
+      "concepts": [
+        {
+          "slug": "saga"
+        },
+        {
+          "slug": "idempotency"
+        },
+        {
+          "slug": "event-sourcing"
+        },
+        {
+          "slug": "backups-and-point-in-time-recovery"
+        }
+      ]
+    },
+    {
+      "title": "Reconcile continuously against the outside world",
+      "problem": "The ledger can be internally consistent and still disagree with the bank, a payment processor or a partner, and a projection bug or a missed event can go unseen for months.",
+      "fix": "A reconciler runs on a schedule. Internally it checks that all entries sum to zero, that every balance row equals a replay of the journal up to its sequence number, and that sequence numbers have no gaps. Externally it matches every line of the bank and partner statements to ledger entries by reference, amount and date, and reports the unmatched ones in both directions. Differences become tickets for people, and are fixed by new entries. At the end of a period the books are closed, and a snapshot of every balance is signed and stored.",
+      "tradeoff": "Errors are found in a day instead of at the audit, and the closing balance is provable. Reconciliation needs the matching rules of every partner, timing differences produce noise that people must triage, and it is a permanent operating cost.",
+      "concepts": [
+        {
+          "slug": "merkle-trees-and-anti-entropy"
+        },
+        {
+          "slug": "alerting"
+        },
+        {
+          "slug": "batch-vs-stream-processing"
+        },
+        {
+          "slug": "slos-and-error-budgets"
+        }
+      ]
+    }
+  ],
+  "failures": [
+    {
+      "scenario": "A client retries a payment after a timeout",
+      "impact": "Without protection the customer is charged twice, and the books are still balanced, so no check would notice.",
+      "answer": "The second request carries the same idempotency key. The unique index rejects the insert or the lookup finds the first entry, and the API returns the original result. The ledger shows one entry, and only a request with a different body under the same key is an error.",
+      "concepts": [
+        {
+          "slug": "idempotency"
+        },
+        {
+          "slug": "retries-and-backoff"
+        },
+        {
+          "slug": "delivery-guarantees"
+        }
+      ]
+    },
+    {
+      "scenario": "The service crashes in the middle of a posting",
+      "impact": "If lines were written one by one, one side of the movement could exist without the other, and the books would not balance.",
+      "answer": "All lines, the key and the balance updates are in one database transaction. Either the commit happened and the entry is whole, or it did not and nothing is visible. The client retries with the same key and learns which one happened.",
+      "concepts": [
+        {
+          "slug": "acid-vs-base"
+        },
+        {
+          "slug": "write-ahead-log"
+        },
+        {
+          "slug": "idempotency"
+        }
+      ]
+    },
+    {
+      "scenario": "A burst of payments hits the fee account",
+      "impact": "Every payment updates the same balance row, so they wait for each other and the whole product slows down.",
+      "answer": "The fee account is split into sub-accounts and each entry picks one, so the row locks are spread out. Total fees are the sum of the sub-accounts, and a nightly roll-up keeps that sum cheap to read.",
+      "concepts": [
+        {
+          "slug": "database-sharding"
+        },
+        {
+          "slug": "mvcc-and-isolation-levels"
+        },
+        {
+          "slug": "backpressure"
+        }
+      ]
+    },
+    {
+      "scenario": "The balances table disagrees with the journal",
+      "impact": "A bug in the projection or a bad manual change makes a customer see a wrong balance.",
+      "answer": "The reconciler replays the journal and compares. The journal wins, so the balance rows are rebuilt from the last good checkpoint. If the journal itself is wrong, it is fixed with correcting entries, never with an edit.",
+      "concepts": [
+        {
+          "slug": "event-sourcing"
+        },
+        {
+          "slug": "merkle-trees-and-anti-entropy"
+        },
+        {
+          "slug": "alerting"
+        }
+      ]
+    },
+    {
+      "scenario": "Finance finds a payment posted to the wrong merchant",
+      "impact": "The merchant has money that belongs to another, and the statement already went out.",
+      "answer": "A reversal entry removes the wrong posting and a new entry posts the right one, both with a reason and a reference to the original. The old statement stays true as of its date, and the next one shows both entries.",
+      "concepts": [
+        {
+          "slug": "event-sourcing"
+        },
+        {
+          "slug": "saga"
+        },
+        {
+          "slug": "idempotency"
+        }
+      ]
+    }
+  ],
+  "alternatives": [
+    {
+      "title": "How balances are kept",
+      "options": [
+        {
+          "name": "Sum the lines on every read",
+          "pro": "No second copy that can be wrong",
+          "con": "Cost grows with the age of the account, so it is too slow for busy ones"
+        },
+        {
+          "name": "Projection updated in the same transaction",
+          "pro": "Always consistent with the journal, and a read is one row",
+          "con": "Adds write work and row contention on hot accounts"
+        },
+        {
+          "name": "Projection built asynchronously from the stream",
+          "pro": "Keeps the write path small and scales independently",
+          "con": "Balances lag by a moment, so it cannot enforce a no-overdraft rule"
+        }
+      ],
+      "pick": "Same transaction for accounts with limits, and asynchronous for reports and for split hot accounts."
+    },
+    {
+      "title": "Where the journal lives",
+      "options": [
+        {
+          "name": "A relational database",
+          "pro": "Transactions, constraints and unique indexes do the hard parts",
+          "con": "One primary limits the write rate until it is sharded"
+        },
+        {
+          "name": "A log such as Kafka as the only store",
+          "pro": "Very high append rate and natural ordering",
+          "con": "No cross-entry constraints, and idempotency and balances need extra systems"
+        },
+        {
+          "name": "A purpose-built ledger database",
+          "pro": "Immutability, double entry and proofs are built in",
+          "con": "A newer product to operate and a harder exit"
+        }
+      ],
+      "pick": "A relational database, sharded by account group when one primary is not enough."
+    },
+    {
+      "title": "How to handle a hot account",
+      "options": [
+        {
+          "name": "Sub-accounts",
+          "pro": "Spreads the writes with no change to the journal",
+          "con": "Balance reads sum several rows, and limits are hard to check"
+        },
+        {
+          "name": "Batch the postings and apply the net",
+          "pro": "One update per batch, whatever the volume",
+          "con": "The balance lags by the length of a batch"
+        },
+        {
+          "name": "Accept contention and use a faster row",
+          "pro": "No new design",
+          "con": "The ceiling is about one over the lock time, a few hundred per second"
+        }
+      ],
+      "pick": "Sub-accounts for accounts that must be exact, batching for the fee and revenue accounts that only report."
+    },
+    {
+      "title": "How to fix a posted mistake",
+      "options": [
+        {
+          "name": "Edit or delete the entry",
+          "pro": "The ledger looks clean",
+          "con": "Destroys the audit trail, and any statement that was sent is now wrong"
+        },
+        {
+          "name": "Reverse and repost",
+          "pro": "Full history, and every past report can be reproduced",
+          "con": "Two more entries and a reason for each"
+        },
+        {
+          "name": "A compensating adjustment entry",
+          "pro": "A single entry for the difference",
+          "con": "The reason is less clear, and it hides the original error"
+        }
+      ],
+      "pick": "Reverse and repost; use adjustments only for small differences found in reconciliation."
+    }
+  ],
+  "roles": [
+    {
+      "id": "client",
+      "label": "Callers",
+      "description": "Payment services, finance staff and the bank."
+    },
+    {
+      "id": "edge",
+      "label": "Posting API",
+      "description": "Validates, checks keys and writes entries."
+    },
+    {
+      "id": "async",
+      "label": "Entry stream",
+      "description": "The ordered feed of entries to other systems."
+    },
+    {
+      "id": "compute",
+      "label": "Derived work",
+      "description": "Sub-account choice, reports and reconciliation."
+    },
+    {
+      "id": "data",
+      "label": "State",
+      "description": "The journal, idempotency keys and balances."
+    }
+  ]
+}

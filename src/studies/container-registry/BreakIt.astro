@@ -1,0 +1,72 @@
+---
+import PlaygroundShell from '../../components/PlaygroundShell.astro';
+---
+<PlaygroundShell title="Garbage collection against live pushes" hint="A registry deletes layers that no manifest points to. But a push uploads its layers first and commits the manifest last, so for a while its layers look unused. Change the safety rules and see how many of 400 pushes in one day are hurt by four collection runs.">
+  <ol class="how">
+    <li>With the defaults (no grace period, a HEAD hit does not refresh age, pushes take up to 30 minutes): <b>33 images are broken</b> and <b>16 pushes fail</b>. The collector swept layers that a push had uploaded, or had skipped uploading because the layer already existed.</li>
+    <li>Set the <b>grace period to 60</b> and tick <b>HEAD refreshes age</b>: <b>0 broken, 0 failed</b>. The grace period must be at least the longest push (30) plus the length of one collection run (30). Grace 60 <i>without</i> the tick still leaves <b>9 broken</b>, from old unused layers that a push reused.</li>
+    <li>Raise the longest push to <b>120</b> with grace 60: <b>18 broken</b> again. Now it needs about 150.</li>
+    <li>Choose <b>block pushes during collection</b>: <b>0 broken, 0 failed</b>, but <b>32 pushes are delayed</b> while the collector runs.</li>
+  </ol>
+  <div class="pg crb" data-crb>
+    <div class="pg-row">
+      <label>While collecting <select class="pg-in" data-mode>
+        <option value="live" selected>keep accepting pushes</option>
+        <option value="block">block pushes during collection</option>
+      </select></label>
+      <label>Grace period, minutes <input type="range" min="0" max="180" step="5" value="0" data-grace /> <b data-graceval></b></label>
+      <label>Longest push, minutes <input type="range" min="1" max="120" value="30" data-dur /> <b data-durval></b></label>
+      <label><input type="checkbox" data-touch /> A HEAD hit refreshes the layer's age</label>
+    </div>
+    <div class="pg-grid">
+      <div class="pg-box" data-b1><h3>Broken images</h3><span class="pg-mono" data-o1></span><span class="pg-note" data-n1></span></div>
+      <div class="pg-box" data-b2><h3>Failed pushes</h3><span class="pg-mono" data-o2></span><span class="pg-note" data-n2></span></div>
+      <div class="pg-box" data-b3><h3>Delayed pushes</h3><span class="pg-mono" data-o3></span><span class="pg-note" data-n3></span></div>
+    </div>
+    <p class="pg-out" data-verdict aria-live="polite"></p>
+    <p class="pg-note">Model: 400 pushes start at seeded random times in a day of 1,440 minutes, each lasting between 1 minute and the longest push. A quarter of them reuse an old unused layer (found by HEAD, so it is not uploaded again) whose age is up to 2,000 minutes. Collection runs at minutes 60, 420, 780 and 1,140. Each run marks at its start and sweeps 30 minutes later, and it sweeps a layer that no marked manifest names and that is older than the grace period. A push whose manifest committed after the mark but before the sweep leaves a broken image. One that commits after the sweep is refused by the registry and must be retried.</p>
+  </div>
+</PlaygroundShell>
+<script>
+  document.querySelectorAll<HTMLElement>('[data-crb]').forEach((root) => {
+    const q = <T extends HTMLElement>(s: string) => root.querySelector<T>(s)!;
+    const N = 400; const DAY = 1440; const EVERY = 360; const GCDUR = 30;
+    let seed = 11; const rnd = (n: number) => { seed = (seed * 1664525 + 1013904223) % 4294967296; return Math.floor(seed / 65536) % n; };
+    const pushes = Array.from({ length: N }, () => ({ start: rnd(DAY), u: rnd(10000), orphan: rnd(100) < 25, old: rnd(2000) }));
+    function sim(block: boolean, grace: number, maxD: number, touch: boolean) {
+      let broken = 0; let failed = 0; let delayed = 0;
+      for (const p of pushes) {
+        const commit = p.start + 1 + Math.floor((p.u * maxD) / 10000); let hit = false;
+        for (let k = 0; k < 4 && !hit; k++) {
+          const mark = 60 + EVERY * k; const sweep = mark + GCDUR;
+          if (block) { if (p.start >= mark && p.start < sweep) { delayed++; hit = true; } continue; }
+          if (commit > mark && p.start <= sweep) {
+            const age = (p.orphan && !touch ? p.old : 0) + sweep - p.start;
+            if (age > grace) { if (commit < sweep) broken++; else failed++; hit = true; }
+          }
+        }
+      }
+      return { broken, failed, delayed };
+    }
+    function draw() {
+      const block = q<HTMLSelectElement>('[data-mode]').value === 'block'; const grace = Number(q<HTMLInputElement>('[data-grace]').value);
+      const dur = Number(q<HTMLInputElement>('[data-dur]').value); const touch = q<HTMLInputElement>('[data-touch]').checked;
+      q('[data-graceval]').textContent = String(grace); q('[data-durval]').textContent = String(dur);
+      q<HTMLInputElement>('[data-grace]').disabled = block; q<HTMLInputElement>('[data-touch]').disabled = block;
+      const r = sim(block, grace, dur, touch);
+      q('[data-o1]').textContent = `${r.broken} of ${N}`; q('[data-n1]').textContent = 'a manifest was committed, then its layer was swept: pulling it fails';
+      q('[data-o2]').textContent = `${r.failed} of ${N}`; q('[data-n2]').textContent = 'the layer was swept before the manifest, so the registry refuses it and the client retries';
+      q('[data-o3]').textContent = `${r.delayed} of ${N}`; q('[data-n3]').textContent = 'told to wait because a collection was running';
+      q<HTMLElement>('[data-b1]').style.setProperty('--c', r.broken ? 'var(--bad)' : 'var(--good)');
+      q<HTMLElement>('[data-b2]').style.setProperty('--c', r.failed ? 'var(--bad)' : 'var(--good)');
+      q<HTMLElement>('[data-b3]').style.setProperty('--c', r.delayed ? 'var(--accent)' : 'var(--good)');
+      const out = q('[data-verdict]'); const bad = r.broken > 0 || r.failed > 0; out.classList.toggle('bad', bad);
+      const need = dur + GCDUR;
+      out.textContent = block ? `No layer is swept while a push is running, so nothing breaks, at the price of delaying ${r.delayed} pushes. Collection time becomes push downtime, which gets worse as the registry grows.`
+        : bad ? `${r.broken} broken images and ${r.failed} failed pushes. ${grace < need ? `The grace period of ${grace} minutes is shorter than the longest push plus one collection run (${need} minutes), so a layer can be old enough to sweep while its push is still going.` : `The grace period is long enough for new layers, but an old unused layer that a push reuses is already past it. Let a HEAD hit refresh the age.`}`
+        : `Safe: nothing was lost. A layer is only swept when it is unreferenced and older than ${grace} minutes, which is more than any push (${dur}) plus a collection run (${GCDUR}).`;
+    }
+    root.addEventListener('input', draw); root.addEventListener('change', draw);
+    draw();
+  });
+</script>

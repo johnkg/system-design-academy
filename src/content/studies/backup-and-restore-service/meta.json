@@ -1,0 +1,530 @@
+{
+  "name": "Design a Backup and Restore Service",
+  "difficulty": "advanced",
+  "intent": "Protect a fleet of hundreds of databases so that any of them can be brought back after a mistake, a failure or a ransomware attack, within known limits on lost data and recovery time, without slowing production.",
+  "codeTitle": "incremental backups, a locked vault and verified restores",
+  "finalIntro": "One night's backup of a database, then the day an attacker tries to delete it.",
+  "prompt": "Design a backup and restore service for a company with 500 databases, around 400 GB each, in one primary region. Teams must be able to restore any database to a recent point in time. The backups must survive the loss of a region and an attacker who steals administrator credentials. The service must show that restores work, meet recovery targets that differ by database, and never make the production databases slow.",
+  "functional": [
+    "Take a full backup regularly and cheaper incremental backups between them, plus a continuous log, for every database",
+    "Keep backups for a retention period that depends on the database's tier, and delete them afterwards",
+    "Copy every backup to a second region and keep that copy safe from deletion and tampering",
+    "Restore a database to a chosen point in time, into a new instance or in place",
+    "Test restores automatically and report which restore points are proven good",
+    "Show each database's recovery point and recovery time, against its target"
+  ],
+  "nonFunctional": [
+    "Recovery point objective (RPO, the most data we may lose): 1 minute for tier 0, 15 minutes for tier 1, 24 hours for tier 2",
+    "Recovery time objective (RTO, the longest outage): 1 hour for tier 0, 4 hours for tier 1, 24 hours for tier 2",
+    "A backup never adds more than a small, capped load to a production database, and never changes its query latency by more than a few percent",
+    "No one, including an administrator of the production account, can delete or alter a backup before its retention ends",
+    "Backups are encrypted, and a lost backup key must not lose the data in a way we cannot recover from",
+    "The service itself must be recoverable, including its catalog, when everything else is gone"
+  ],
+  "firstAttempt": {
+    "text": "A cron job on each database host runs a full dump every night, writes it to a disk on the same host or a shared file server, and deletes files older than seven days. Someone looks at the job's log if there is a complaint.",
+    "limits": [
+      "A full dump of 400 GB reads everything every night and competes with the live workload, even though only a few percent changed",
+      "Up to 24 hours of data can be lost, and a dump is a single point in time, so there is nothing between two nights",
+      "The backup sits next to the database, so a disk failure, a bad deploy or an attacker destroys both",
+      "Nobody has ever restored one, so nobody knows if it works, how long it takes, or whether it was already corrupt or encrypted",
+      "Retention is a hard-coded seven days, which is shorter than the time an attacker may stay unnoticed",
+      "All 500 hosts start at the same minute, which can overload shared storage and the network"
+    ]
+  },
+  "nodes": [
+    {
+      "id": "dbs",
+      "label": "Database fleet",
+      "kind": "client",
+      "x": 12,
+      "y": 63
+    },
+    {
+      "id": "single",
+      "label": "Nightly dump script",
+      "kind": "compute",
+      "x": 37,
+      "y": 63,
+      "at": 0,
+      "until": 1
+    },
+    {
+      "id": "agent",
+      "label": "Backup agents",
+      "kind": "edge",
+      "x": 37,
+      "y": 63,
+      "at": 1
+    },
+    {
+      "id": "store",
+      "label": "Backup storage",
+      "kind": "data",
+      "x": 62,
+      "y": 63,
+      "at": 1
+    },
+    {
+      "id": "sched",
+      "label": "Scheduler",
+      "kind": "compute",
+      "x": 37,
+      "y": 88,
+      "at": 2
+    },
+    {
+      "id": "catalog",
+      "label": "Catalog",
+      "kind": "data",
+      "x": 62,
+      "y": 88,
+      "at": 2
+    },
+    {
+      "id": "copyq",
+      "label": "Copy queue",
+      "kind": "async",
+      "x": 87,
+      "y": 63,
+      "at": 3
+    },
+    {
+      "id": "vault",
+      "label": "Locked vault",
+      "kind": "data",
+      "x": 87,
+      "y": 88,
+      "at": 3
+    },
+    {
+      "id": "verifier",
+      "label": "Restore tester",
+      "kind": "compute",
+      "x": 62,
+      "y": 37,
+      "at": 4
+    },
+    {
+      "id": "throttle",
+      "label": "Throttle",
+      "kind": "edge",
+      "x": 12,
+      "y": 88,
+      "at": 5
+    },
+    {
+      "id": "monitor",
+      "label": "RPO and RTO monitor",
+      "kind": "compute",
+      "x": 87,
+      "y": 37,
+      "at": 6
+    }
+  ],
+  "edges": [
+    {
+      "from": "dbs",
+      "to": "single",
+      "at": 0,
+      "until": 1
+    },
+    {
+      "from": "dbs",
+      "to": "agent",
+      "at": 1,
+      "until": 5
+    },
+    {
+      "from": "agent",
+      "to": "store",
+      "at": 1
+    },
+    {
+      "from": "sched",
+      "to": "agent",
+      "at": 2
+    },
+    {
+      "from": "agent",
+      "to": "catalog",
+      "at": 2
+    },
+    {
+      "from": "sched",
+      "to": "catalog",
+      "at": 2
+    },
+    {
+      "from": "store",
+      "to": "copyq",
+      "at": 3
+    },
+    {
+      "from": "copyq",
+      "to": "vault",
+      "at": 3
+    },
+    {
+      "from": "store",
+      "to": "verifier",
+      "at": 4
+    },
+    {
+      "from": "dbs",
+      "to": "throttle",
+      "at": 5
+    },
+    {
+      "from": "throttle",
+      "to": "agent",
+      "at": 5
+    },
+    {
+      "from": "verifier",
+      "to": "monitor",
+      "at": 6
+    }
+  ],
+  "steps": [
+    {
+      "title": "Take a full backup, then cheap incrementals and a log",
+      "problem": "Dumping 400 GB every night reads everything again although only a few percent changed, loads the live database, and leaves up to a day of data unprotected between two dumps.",
+      "fix": "A backup agent on each database host takes a full backup once a week from a consistent snapshot. On the other days it takes an incremental backup of only the blocks or rows changed since the previous backup, which for a 5% daily change is about a twentieth of the data before compression. Between backups the database archives its write-ahead log continuously, a few seconds at a time, so a restore can replay to any moment. Every file is compressed, encrypted with a key for that database, checksummed, and written to object storage with the checksum recorded.",
+      "tradeoff": "Traffic and storage drop to a fraction of daily fulls, and the log gives point-in-time recovery with an RPO of about a minute. A restore now needs a chain: the full backup, each incremental after it, then the log. A longer chain is slower to restore, and one damaged link breaks everything after it, so fulls are taken often enough to keep the chain short.",
+      "concepts": [
+        {
+          "slug": "backups-and-point-in-time-recovery"
+        },
+        {
+          "slug": "write-ahead-log"
+        },
+        {
+          "slug": "encryption"
+        },
+        {
+          "slug": "database-replication"
+        }
+      ]
+    },
+    {
+      "title": "Schedule centrally, track every backup, and expire safely",
+      "problem": "With 500 databases, nobody knows which ones are protected, when each full runs, or which files may be deleted. Deleting an old full backup would silently break the incrementals that depend on it.",
+      "fix": "A scheduler assigns each database a slot, staggers the weekly fulls over the week so that about one seventh of the fleet takes a full each day, and hands the work to the agents. A catalog records every backup: database, kind, chain it belongs to, size, checksum, region, time and expiry. Retention is a policy per tier written as configuration, for example daily points for 35 days, weekly for 12 weeks and monthly for a year. Expiry is computed from the catalog and deletes a backup only when no kept restore point still needs it. The scheduler runs as a single elected leader, and a job it repeats is safe because a backup is named by database and start time.",
+      "tradeoff": "One place answers what is protected, and retention is changed in a reviewed file instead of in 500 scripts. The catalog becomes critical, so it is copied to another region, and it can be rebuilt by listing the storage, because every backup file carries its own metadata. Long retention costs storage, which is why only some points are kept for a year.",
+      "concepts": [
+        {
+          "slug": "backups-and-point-in-time-recovery"
+        },
+        {
+          "slug": "leader-election"
+        },
+        {
+          "slug": "idempotency"
+        },
+        {
+          "slug": "infrastructure-as-code"
+        }
+      ]
+    },
+    {
+      "title": "Copy to another region, into a vault that cannot be emptied",
+      "problem": "Backups in the same account and region as the database are lost with it. Ransomware attackers go after the backups first, with the same stolen administrator credentials that let them encrypt the database.",
+      "fix": "A copy queue sends every new backup, and the catalog, to a vault in a second region. The vault is in a separate cloud account with its own identities, which no production role can assume. The copier has write-only rights. Objects are written with object lock in compliance mode, with a lock period of the retention time plus the length of a chain, so that no user, including the root user, can delete or shorten them until it expires. The copy is a copy and not a mirror: deletes in the primary are never replicated. Checksums are verified after the copy, and the most important tier also gets a copy at a different provider or offline.",
+      "tradeoff": "A regional outage or an attacker with admin rights cannot remove the last good copy, and the extra region satisfies the common rule of three copies on two kinds of storage with one kept apart. It roughly doubles storage and adds transfer cost, the copy lags by minutes so the remote RPO is slightly worse, and a locked mistake or data that must be erased cannot be deleted early. For erasure requests the usual answer is to delete the per-database encryption key, which makes the data unreadable.",
+      "concepts": [
+        {
+          "slug": "multi-region-failover"
+        },
+        {
+          "slug": "access-control-models"
+        },
+        {
+          "slug": "secrets-management"
+        },
+        {
+          "slug": "encryption"
+        },
+        {
+          "slug": "message-queues"
+        }
+      ]
+    },
+    {
+      "title": "Test restores all the time, and verify what comes back",
+      "problem": "A backup that has never been restored is only a hope. Jobs fail quietly, files corrupt, a backup may miss a table, or it may faithfully contain data that was already encrypted. The restore procedure also rots when software versions change.",
+      "fix": "A restore tester picks backups from the vault on a schedule: every tier 0 database weekly, and a rotating sample of the rest so that each database is restored at least once a quarter. It restores into a scratch instance, replays the log to a chosen moment, and runs checks: the checksum matches the catalog, the engine's own consistency check passes, row counts and table sizes are in the expected range, the newest data is recent, and a set of application queries return sane answers. It also looks for signs of ransomware, such as backup size jumping or content that no longer compresses. The result marks a restore point verified or suspect, and the time taken is recorded as the measured RTO.",
+      "tradeoff": "The team learns about a broken backup within days rather than during an emergency, and the real restore time is known. Restores use compute and read bandwidth, sampling can miss a fault in a database not chosen that week, and automated checks show that data is consistent, not that it is what the business expects.",
+      "concepts": [
+        {
+          "slug": "synthetic-monitoring-and-rum"
+        },
+        {
+          "slug": "alerting"
+        },
+        {
+          "slug": "merkle-trees-and-anti-entropy"
+        },
+        {
+          "slug": "backups-and-point-in-time-recovery"
+        }
+      ]
+    },
+    {
+      "title": "Throttle backups so production stays fast",
+      "problem": "A backup reads a lot of data. If hundreds start together, or a full backup lands on the busiest hour, they compete with queries for disk, CPU and network, and customers see slow pages.",
+      "fix": "Backups read from a replica where there is one. Each agent goes through a throttle: a token bucket that caps read throughput per host, for example 40 MB/s, and a fleet-wide limit on how many backups run at once. The throttle is adaptive: it watches the host's query latency and I/O wait, slows down additively when they rise, and pauses entirely above a limit, then speeds up again when the database recovers. Backups prefer the quiet hours. Backup traffic gets its own network class, so it cannot starve the database's own replication. A backup that cannot finish in its window is resumed instead of being killed.",
+      "tradeoff": "Production latency is protected by design, not by hope. A throttled backup takes longer, so a very large database may need its full to span a night, and the monitor must warn when a backup is late, because a slow backup quietly widens the RPO. A throttle at 40 MB/s reads 20 GB of changes in about 8 minutes but a 400 GB full in under 3 hours.",
+      "concepts": [
+        {
+          "slug": "rate-limiting"
+        },
+        {
+          "slug": "backpressure"
+        },
+        {
+          "slug": "load-shedding"
+        },
+        {
+          "slug": "bulkhead"
+        },
+        {
+          "slug": "queueing-theory-and-littles-law"
+        }
+      ]
+    },
+    {
+      "title": "Set RPO and RTO by tier, then measure them",
+      "problem": "Protecting every database like the most critical one costs too much, and protecting all like the least critical one is unsafe. Without measurements, the stated recovery targets are only guesses.",
+      "fix": "Each database belongs to a tier with targets. Tier 0 has RPO 1 minute and RTO 1 hour, using continuous log shipping and a warm standby in the second region. Tier 1 has RPO 15 minutes and RTO 4 hours. Tier 2 has RPO 24 hours and RTO 24 hours with daily backups only. A monitor computes the actual RPO as the age of the newest restore point in the vault that is marked verified, and the actual RTO from the restore tester: data size divided by measured restore throughput, plus log replay. It raises alerts when either exceeds its target, and reports an error budget per tier. A runbook sets the order of a fleet-wide restore by tier, because the downloads share one pipe.",
+      "tradeoff": "Money goes where the business needs it and the numbers are honest. Tight tiers cost real money, as they need standbys, continuous logging and more frequent tests, and a regional disaster is limited by bandwidth rather than by the number of workers. Restoring 200 TB at 40 Gbps takes hours, so the plan must prioritise.",
+      "concepts": [
+        {
+          "slug": "slos-and-error-budgets"
+        },
+        {
+          "slug": "alerting"
+        },
+        {
+          "slug": "metrics"
+        },
+        {
+          "slug": "multi-region-failover"
+        },
+        {
+          "slug": "backups-and-point-in-time-recovery"
+        }
+      ]
+    }
+  ],
+  "failures": [
+    {
+      "scenario": "A backup job has been failing for three weeks",
+      "impact": "The newest restore point is three weeks old. Nobody noticed because the job only logs an error, and the real RPO is far from the target.",
+      "answer": "The monitor does not alert on the job's exit code but on the age of the newest verified restore point per database, compared with its RPO. The catalog also knows which backups it expects, so a missing one is an alert by itself. The page goes to the owning team, and the scheduler retries with backoff while the age grows.",
+      "concepts": [
+        {
+          "slug": "alerting"
+        },
+        {
+          "slug": "slos-and-error-budgets"
+        },
+        {
+          "slug": "retries-and-backoff"
+        },
+        {
+          "slug": "metrics"
+        }
+      ]
+    },
+    {
+      "scenario": "An attacker with administrator credentials deletes every backup",
+      "impact": "If backups are in the production account, the attacker can encrypt the database and remove the way back, so the only choices are to pay or to lose the data.",
+      "answer": "The vault is in a separate account with object lock in compliance mode, so the delete calls are refused, even for the root user, and the copier can only write. The attempts raise an alarm. Recovery uses the newest verified point from the vault, replays the log up to just before the first encrypted write, and the stolen credentials are rotated before the database is brought back.",
+      "concepts": [
+        {
+          "slug": "access-control-models"
+        },
+        {
+          "slug": "secrets-management"
+        },
+        {
+          "slug": "alerting"
+        },
+        {
+          "slug": "multi-region-failover"
+        }
+      ]
+    },
+    {
+      "scenario": "The attacker stayed hidden for 40 days and the newer backups are encrypted",
+      "impact": "Every daily point in the 35-day window is encrypted, because the backups faithfully copied the damaged data, and the last clean one has already expired.",
+      "answer": "Retention for important tiers must be longer than the time an intrusion can plausibly stay hidden, so monthly and quarterly points are kept for a year. The restore tester's data checks and its search for changes in size or compressibility mark the first suspect point, and the service reports the newest clean one. Detection speed matters as much as retention, so the lock period is set from the tier, not from cost alone.",
+      "concepts": [
+        {
+          "slug": "synthetic-monitoring-and-rum"
+        },
+        {
+          "slug": "backups-and-point-in-time-recovery"
+        },
+        {
+          "slug": "alerting"
+        },
+        {
+          "slug": "merkle-trees-and-anti-entropy"
+        }
+      ]
+    },
+    {
+      "scenario": "A weekly full backup slows the checkout database during peak traffic",
+      "impact": "Disk reads from the backup push query latency up and customers see timeouts.",
+      "answer": "The agent's adaptive throttle sees the rise in latency and I/O wait and slows or pauses within seconds. Backups come from the replica when one exists, the fulls are staggered, and the backup resumes in the next quiet hours. The monitor warns that the backup is late rather than letting production pay.",
+      "concepts": [
+        {
+          "slug": "backpressure"
+        },
+        {
+          "slug": "rate-limiting"
+        },
+        {
+          "slug": "load-shedding"
+        },
+        {
+          "slug": "queueing-theory-and-littles-law"
+        }
+      ]
+    },
+    {
+      "scenario": "The primary region is lost and 200 databases must be restored at once",
+      "impact": "Every restore pulls data from the second region through the same network and storage, and restore time is limited by bandwidth, not by the number of servers.",
+      "answer": "The runbook restores by tier: tier 0 first, from standbys and the log, then tier 1, then tier 2. Restores read compressed data from the vault in parallel up to the measured bandwidth. The catalog copy in the second region says what exists and the estimated times come from the restore tester, so management gets a real schedule. The exercise is rehearsed in game days.",
+      "concepts": [
+        {
+          "slug": "multi-region-failover"
+        },
+        {
+          "slug": "load-shedding"
+        },
+        {
+          "slug": "queueing-theory-and-littles-law"
+        },
+        {
+          "slug": "slos-and-error-budgets"
+        }
+      ]
+    }
+  ],
+  "alternatives": [
+    {
+      "title": "How to take the backup",
+      "options": [
+        {
+          "name": "Logical dump (rows as SQL or CSV)",
+          "pro": "Portable across versions, and easy to restore one table",
+          "con": "Slow to take and slow to restore, with no incrementals or point in time on its own"
+        },
+        {
+          "name": "Physical full and incremental backups plus log archive",
+          "pro": "Fast, incremental, and gives point-in-time recovery",
+          "con": "Tied to the engine version, and restore needs the whole chain"
+        },
+        {
+          "name": "Storage or volume snapshots",
+          "pro": "Instant to take, and cheap for the changed blocks",
+          "con": "Needs care to be consistent, and snapshots often live in the same account and region"
+        }
+      ],
+      "pick": "Physical backups with a log archive for the fleet, with occasional logical exports for portability."
+    },
+    {
+      "title": "How backups are protected from deletion",
+      "options": [
+        {
+          "name": "Separate account only",
+          "pro": "Simple, and stops stolen production credentials",
+          "con": "An administrator of the backup account can still delete"
+        },
+        {
+          "name": "Object lock in governance mode",
+          "pro": "Prevents accidents and can be overridden by a few trusted people",
+          "con": "The override is also a target for an attacker"
+        },
+        {
+          "name": "Object lock in compliance mode in a separate account",
+          "pro": "No one can delete early, whatever their rights",
+          "con": "Mistakes and erasure requests have to wait, or use key deletion"
+        },
+        {
+          "name": "Offline copy such as tape or another provider",
+          "pro": "Out of reach of any online attacker",
+          "con": "Slow to restore, and more work to run"
+        }
+      ],
+      "pick": "Compliance-mode lock in a separate account for all tiers, and an offline or other-provider copy for tier 0."
+    },
+    {
+      "title": "How long to keep backups",
+      "options": [
+        {
+          "name": "A single window, such as 35 days",
+          "pro": "Simple, and easy to cost",
+          "con": "An intrusion unnoticed for longer than the window leaves no clean copy"
+        },
+        {
+          "name": "Grandfather-father-son tiers: daily, weekly, monthly",
+          "pro": "Recent points are dense and older points are sparse, so a year costs little extra",
+          "con": "Rules to maintain, and expiry has to respect chains"
+        }
+      ],
+      "pick": "Tiered retention: daily for 35 days, weekly for 12 weeks and monthly for a year, longer for regulated data."
+    },
+    {
+      "title": "How much to test",
+      "options": [
+        {
+          "name": "Checksums only",
+          "pro": "Cheap, and catches corruption in storage",
+          "con": "Does not prove that the backup is complete or restorable"
+        },
+        {
+          "name": "Restore a sample on a schedule",
+          "pro": "Proves the whole path at a moderate cost",
+          "con": "Some databases wait months between tests"
+        },
+        {
+          "name": "Restore everything every week",
+          "pro": "Every database has a recent proof",
+          "con": "Roughly the cost of re-reading and re-writing the whole fleet"
+        }
+      ],
+      "pick": "Checksums for all, weekly restores for tier 0, and a rotating sample of the rest so that each database is restored every quarter."
+    }
+  ],
+  "roles": [
+    {
+      "id": "client",
+      "label": "Databases",
+      "description": "The production fleet being protected, and the attacker's view of it."
+    },
+    {
+      "id": "edge",
+      "label": "Agents and throttle",
+      "description": "The code on each host that reads the data, and the cap on how fast it may read."
+    },
+    {
+      "id": "async",
+      "label": "Copy queue",
+      "description": "Backups waiting to be copied to the second region."
+    },
+    {
+      "id": "compute",
+      "label": "Scheduler and tester",
+      "description": "Scheduling, restore testing and the RPO and RTO monitor."
+    },
+    {
+      "id": "data",
+      "label": "Backup state",
+      "description": "Backup storage, the catalog and the locked vault."
+    }
+  ]
+}

@@ -1,0 +1,83 @@
+---
+import PlaygroundShell from '../../components/PlaygroundShell.astro';
+---
+<PlaygroundShell title="Tune the firewall" hint="Replay the same 1,000 requests (192 of them attacks) against different settings. Move the threshold, switch detection-only mode and turn the rate rule and the decoding step on or off.">
+  <ol class="how">
+    <li>At the default <b>threshold 4</b> the firewall blocks <b>185 attacks</b> but also <b>74 real users</b>, because a search such as 'select a plan--annual' scores exactly 4 from two weak words.</li>
+    <li>Raise it to <b>5</b>: real users blocked fall to <b>2</b>, and <b>32 attacks</b> now get through, the sneakier ones that score only 2 to 4.</li>
+    <li>Switch to <b>detection only</b>: <b>nothing is blocked</b>, but the box shows how many requests <i>would</i> be (162 at threshold 5), so you can tune safely before enforcing.</li>
+    <li>At threshold 5 turn <b>decoding off</b>: encoded payloads such as %3cscript and %2e%2e%2f hide from the rules and <b>169 attacks</b> pass.</li>
+  </ol>
+  <div class="pg wafb" data-wafb>
+    <div class="pg-row">
+      <label>Mode <select class="pg-in" data-mode><option value="block" selected>Block</option><option value="detect">Detection only (log, never block)</option></select></label>
+      <label>Block at score <input type="range" min="1" max="10" value="4" data-th /> <b data-thval></b></label>
+      <label><input type="checkbox" data-rate checked /> Rate rule (more than 3 requests from a client in a window adds 3)</label>
+      <label><input type="checkbox" data-dec checked /> Decode and normalise before matching</label>
+    </div>
+    <div class="pg-grid">
+      <div class="pg-box" data-b1><h3>Attacks blocked</h3><span class="pg-mono" data-o1></span><span class="pg-note" data-n1></span></div>
+      <div class="pg-box" data-b2><h3>Real users blocked</h3><span class="pg-mono" data-o2></span><span class="pg-note" data-n2></span></div>
+      <div class="pg-box" data-b3><h3>Attacks let through</h3><span class="pg-mono" data-o3></span><span class="pg-note" data-n3></span></div>
+    </div>
+    <p class="pg-out" data-verdict aria-live="polite"></p>
+    <p class="pg-note">Model: 1,000 seeded requests, 80% real users (about one in eight with harmless but suspicious-looking text), 20% attacks from 3 clients, half of them with a script user agent. Rules: 'union select', 'or 1=1' and '&lt;script' add 5, '../' adds 4, 'select ' and '--' add 2, user agent 'sqlmap' adds 5 and 'python-requests' adds 2. Clients are counted in windows of 50 requests.</p>
+  </div>
+</PlaygroundShell>
+<script>
+  document.querySelectorAll<HTMLElement>('[data-wafb]').forEach((root) => {
+    const q = <T extends HTMLElement>(s: string) => root.querySelector<T>(s)!;
+    const RULES: [string, number, 'u' | 'a'][] = [['union select', 5, 'u'], ['or 1=1', 5, 'u'], ['<script', 5, 'u'], ['../', 4, 'u'], ['select ', 2, 'u'], ['--', 2, 'u'], ['sqlmap', 5, 'a'], ['python-requests', 2, 'a']];
+    const NORMAL = ['/search?q=red+shoes', '/cart/add?id=42', '/products?page=3', '/account/orders'];
+    const TRICKY = ['/help?q=select+a+plan--annual', '/blog?q=how+to+select+a+laptop', '/search?q=a--b+select+size'];
+    const STRONG = ['/item?id=1+union+select+password+from+users--', '/c?q=%3cscript>alert(1)<\/script>', '/login?u=x%27+or+1=1'];
+    const EVASIVE = ['/item?id=1;select+sleep(5)', '/f?p=%2e%2e%2fetc/passwd', '/item?id=1+or+1=1'];
+    let seed = 77; const rnd = (n: number) => { seed = (Math.imul(seed, 1664525) + 1013904223) >>> 0; return (seed >>> 16) % n; };
+    const pick = (l: string[]) => l[rnd(l.length)];
+    const norm = (s: string) => s.toLowerCase().split('+').join(' ').split('%27').join("'").split('%3c').join('<').split('%2e%2e%2f').join('../');
+    type Req = { url: string; agent: string; attack: boolean; n: number; plain: string; decoded: string; ua: string };
+    const traffic: Req[] = []; const seen = new Map<number, number>();
+    for (let i = 0; i < 1000; i++) {
+      if (i % 50 === 0) seen.clear();
+      const r = rnd(100); const attack = r >= 80; let url: string; let agent: string; let client: number;
+      if (attack) { url = pick(r < 92 ? STRONG : EVASIVE); agent = rnd(2) ? 'python-requests/2.31' : 'Mozilla/5.0'; client = 1 + rnd(3); }
+      else { url = pick(r < 70 ? NORMAL : TRICKY); agent = 'Mozilla/5.0'; client = 10 + rnd(50); }
+      const n = (seen.get(client) ?? 0) + 1; seen.set(client, n);
+      traffic.push({ url, agent, attack, n, plain: url.toLowerCase(), decoded: norm(url), ua: agent.toLowerCase() });
+    }
+    const ATTACKS = traffic.filter((t) => t.attack).length;
+    function simulate(th: number, detect: boolean, rate: boolean, dec: boolean) {
+      let ba = 0; let bu = 0; let miss = 0; let would = 0;
+      for (const t of traffic) {
+        let p = 0; const u = dec ? t.decoded : t.plain;
+        for (const [find, pts, part] of RULES) if ((part === 'u' ? u : t.ua).includes(find)) p += pts;
+        if (rate && t.n > 3) p += 3;
+        const flagged = p >= th; const blocked = flagged && !detect;
+        if (flagged) would++;
+        if (blocked) { if (t.attack) ba++; else bu++; }
+        if (t.attack && !blocked) miss++;
+      }
+      return { ba, bu, miss, would };
+    }
+    function draw() {
+      const th = Number(q<HTMLInputElement>('[data-th]').value); const detect = q<HTMLSelectElement>('[data-mode]').value === 'detect';
+      const rate = q<HTMLInputElement>('[data-rate]').checked; const dec = q<HTMLInputElement>('[data-dec]').checked;
+      q('[data-thval]').textContent = String(th);
+      const o = simulate(th, detect, rate, dec);
+      q('[data-o1]').textContent = `${o.ba} of ${ATTACKS}`; q('[data-n1]').textContent = detect ? 'detection only: nothing is blocked' : 'attacks stopped at the edge';
+      q('[data-o2]').textContent = `${o.bu} of ${traffic.length - ATTACKS}`; q('[data-n2]').textContent = detect ? 'detection only: no customer is hurt' : 'customers who got a 403 by mistake';
+      q('[data-o3]').textContent = `${o.miss}`; q('[data-n3]').textContent = detect ? `${o.would} requests would have been blocked` : 'reached the application';
+      q<HTMLElement>('[data-b1]').style.setProperty('--c', 'var(--accent)');
+      q<HTMLElement>('[data-b2]').style.setProperty('--c', o.bu > 10 ? 'var(--bad)' : 'var(--good)');
+      q<HTMLElement>('[data-b3]').style.setProperty('--c', o.miss > 20 ? 'var(--bad)' : 'var(--good)');
+      const out = q('[data-verdict]'); const bad = !detect && (o.bu > 10 || o.miss > 20); out.classList.toggle('bad', bad);
+      const wb = o.would;
+      out.textContent = detect ? `Detection only: all ${traffic.length} requests pass and ${wb} would have been blocked at this threshold. This is how a new rule or threshold is tested on live traffic before enforcing.`
+        : o.bu > 10 ? `${o.bu} real users are blocked: weak signals such as the word 'select' and a comment marker add up to the threshold. Raise the threshold, lower the weights, or run in detection only first.`
+        : o.miss > 20 ? `${o.miss} attacks get through: ${dec ? 'the threshold is too high for attacks that match only one weak rule' : 'encoded payloads are not matched without decoding first'}${rate ? '' : ', and without the rate rule a repeat offender is not penalised'}.`
+        : `A good balance: ${o.ba} attacks blocked, ${o.bu} real users blocked, ${o.miss} attacks let through.`;
+    }
+    root.addEventListener('input', draw); root.addEventListener('change', draw);
+    draw();
+  });
+</script>

@@ -1,0 +1,83 @@
+---
+import PlaygroundShell from '../../components/PlaygroundShell.astro';
+---
+<PlaygroundShell title="One hot account, and a retry" hint="Ten seconds of payments all credit the fee account, and some clients retry a request that timed out. Compare three ways to keep that balance, and see what a missing idempotency key costs.">
+  <ol class="how">
+    <li>At <b>1,200 payments per second</b> with <b>4 sub-accounts</b>: one balance row can only update about 500 times a second, so it falls behind and the wait for a posting passes <b>13 seconds</b>. Four sub-accounts keep the wait at about <b>11 ms</b>, and batching shows the balance about <b>100 ms</b> late.</li>
+    <li>Lower the rate to <b>400 per second</b>: the single row copes, because one row can do about 500 a second. A single balance row is fine until one account is busy.</li>
+    <li>Set <b>2 sub-accounts</b> at 1,200: each row still has 600 a second, which is more than 500, so it is still overloaded. Add enough sub-accounts that each row runs below its limit.</li>
+    <li>Change <b>idempotency key</b> to <b>sent with every posting</b>: the retried requests are recognised, and the balance error drops from thousands of dollars to <b>zero</b>.</li>
+  </ol>
+  <div class="pg dlb" data-dlb>
+    <div class="pg-row">
+      <label>Payments per second to the fee account <input type="range" min="100" max="3000" step="100" value="1200" data-r /> <b data-rval></b></label>
+      <label>Sub-accounts <select class="pg-in" data-k><option value="2">2</option><option value="4" selected>4</option><option value="8">8</option><option value="16">16</option></select></label>
+      <label>Requests retried after a timeout (%) <input type="range" min="0" max="10" value="3" data-t /> <b data-tval></b></label>
+      <label>Idempotency key <select class="pg-in" data-key><option value="no" selected>not used</option><option value="yes">sent with every posting</option></select></label>
+    </div>
+    <div class="pg-grid">
+      <div class="pg-box" data-b1><h3>One balance row</h3><span class="pg-mono" data-o1></span><span class="pg-note" data-n1></span></div>
+      <div class="pg-box" data-b2><h3>Sub-accounts</h3><span class="pg-mono" data-o2></span><span class="pg-note" data-n2></span></div>
+      <div class="pg-box" data-b3><h3>Batched balance updates</h3><span class="pg-mono" data-o3></span><span class="pg-note" data-n3></span></div>
+      <div class="pg-box" data-b4><h3>Retried requests</h3><span class="pg-mono" data-o4></span><span class="pg-note" data-n4></span></div>
+    </div>
+    <p class="pg-out" data-verdict aria-live="polite"></p>
+    <p class="pg-note">Model: payments arrive at random for 10 seconds, always the same sequence for a given rate. Updating a balance row holds its lock for 2 ms and rows are served in order. The wait is the time from arrival until the balance is updated, and the figure shown is the 99th percentile. A sub-account is chosen at random for each posting. The batched design appends to the journal at once and applies the net change every 100 ms, taking 2 ms plus 0.02 ms per posting. Each retry is a copy of a request that was already posted, with an amount of 1.00 to 21.00.</p>
+  </div>
+</PlaygroundShell>
+<script>
+  document.querySelectorAll<HTMLElement>('[data-dlb]').forEach((root) => {
+    const q = <T extends HTMLElement>(s: string) => root.querySelector<T>(s)!;
+    const SERVICE = 2; const SPAN = 10000; const WINDOW = 100; const MAXN = 40000;
+    let seed = 7; const rnd = () => ((seed = (seed * 1664525 + 1013904223) % 4294967296) / 4294967296);
+    const gaps = Array.from({ length: MAXN }, () => -Math.log(1 - rnd()));
+    const picks = Array.from({ length: MAXN }, () => rnd());
+    const amounts = Array.from({ length: MAXN }, () => 100 + Math.floor(rnd() * 2000));
+    const retries = Array.from({ length: MAXN }, () => rnd());
+    function sim(rate: number, k: number, retry: number, key: boolean) {
+      const times: number[] = []; let t = 0;
+      for (let i = 0; i < MAXN; i++) { t += (gaps[i] * 1000) / rate; if (t > SPAN) break; times.push(t); }
+      const n = times.length;
+      const run = (rows: number) => {
+        const free = new Array(rows).fill(0); const waits: number[] = []; let done = 0;
+        times.forEach((a, i) => { const r = rows === 1 ? 0 : Math.floor(picks[i] * rows); const start = Math.max(a, free[r]); free[r] = start + SERVICE; waits.push(start + SERVICE - a); if (free[r] <= SPAN) done++; });
+        return { waits, done };
+      };
+      const p99 = (w: number[]) => [...w].sort((a, b) => a - b)[Math.floor(0.99 * (w.length - 1))];
+      const A = run(1); const B = run(k);
+      const cnt = new Map<number, number>();
+      times.forEach((a) => { const w = Math.floor(a / WINDOW); cnt.set(w, (cnt.get(w) ?? 0) + 1); });
+      const lag = times.map((a) => { const w = Math.floor(a / WINDOW); return (w + 1) * WINDOW - a + SERVICE + 0.02 * (cnt.get(w) ?? 0); });
+      let dups = 0; let wrong = 0;
+      for (let i = 0; i < n; i++) if (retries[i] < retry) { dups++; if (!key) wrong += amounts[i]; }
+      return { n, a: { p99: p99(A.waits), done: A.done }, b: { p99: p99(B.waits), done: B.done }, c: { p99: p99(lag), done: n }, dups, wrong };
+    }
+    const fmt = (n: number) => Math.round(n).toLocaleString('en-US');
+    const ms = (v: number) => (v >= 1000 ? `${(v / 1000).toFixed(1)} s` : `${Math.round(v)} ms`);
+    const dollars = (c: number) => `$${Math.floor(c / 100).toLocaleString('en-US')}.${String(c % 100).padStart(2, '0')}`;
+    let queued = false;
+    function draw() {
+      queued = false;
+      const rate = Number(q<HTMLInputElement>('[data-r]').value); const k = Number(q<HTMLSelectElement>('[data-k]').value);
+      const t = Number(q<HTMLInputElement>('[data-t]').value); const key = q<HTMLSelectElement>('[data-key]').value === 'yes';
+      q('[data-rval]').textContent = fmt(rate); q('[data-tval]').textContent = String(t);
+      const s = sim(rate, k, t / 100, key);
+      const set = (i: number, main: string, note: string, bad: boolean) => { q(`[data-o${i}]`).textContent = main; q(`[data-n${i}]`).textContent = note; q<HTMLElement>(`[data-b${i}]`).style.setProperty('--c', bad ? 'var(--bad)' : 'var(--good)'); };
+      const slow = (r: { p99: number; done: number }) => r.p99 > 1000 || r.done < s.n * 0.99;
+      set(1, `99% wait up to ${ms(s.a.p99)}`, `${fmt(s.a.done)} of ${fmt(s.n)} postings finished within the 10 seconds`, slow(s.a));
+      set(2, `99% wait up to ${ms(s.b.p99)}`, `${k} rows, ${fmt(s.b.done)} of ${fmt(s.n)} finished; each row gets about ${fmt(rate / k)} a second`, slow(s.b));
+      set(3, `balance up to date within ${ms(s.c.p99)}`, `${fmt(s.n)} postings accepted at once, applied in batches of about ${fmt(rate / 10)}`, false);
+      set(4, s.wrong > 0 ? `balance wrong by ${dollars(s.wrong)}` : s.dups > 0 ? 'balance exact' : 'no retries', `${fmt(s.dups)} retried requests, ${key ? 'all recognised by their key and ignored' : 'each one posted a second time'}`, s.wrong > 0);
+      const out = q('[data-verdict]'); const bad = slow(s.a) || s.wrong > 0; out.classList.toggle('bad', bad);
+      const parts: string[] = [];
+      if (slow(s.a)) parts.push(`One balance row cannot keep up with ${fmt(rate)} a second: it finished only ${fmt(s.a.done)} of ${fmt(s.n)}. ${slow(s.b) ? `${k} sub-accounts are not enough either, with ${fmt(rate / k)} a second on each row.` : `${k} sub-accounts bring the wait down to ${ms(s.b.p99)}.`}`);
+      else parts.push(`At ${fmt(rate)} a second one row copes, with a 99th percentile wait of ${ms(s.a.p99)}. Raise the rate above about 500 a second to see it fail.`);
+      if (s.wrong > 0) parts.push(`Without an idempotency key the ${fmt(s.dups)} retries moved the balance by ${dollars(s.wrong)}, and the books still add up to zero, so only the key can prevent it.`);
+      else if (s.dups > 0) parts.push(`The key made all ${fmt(s.dups)} retries harmless.`);
+      out.textContent = parts.join(' ');
+    }
+    const schedule = () => { if (!queued) { queued = true; requestAnimationFrame(draw); } };
+    root.addEventListener('input', schedule); root.addEventListener('change', schedule);
+    draw();
+  });
+</script>
