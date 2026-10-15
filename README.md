@@ -65,12 +65,15 @@ What is built in:
 
 How it was checked: axe-core was run on every page in both themes, including after stepping through each animation and pressing every playground control, plus manual keyboard checks (skip link, focus return, Next at the last step). To repeat it, `npm install --save-dev axe-core`, copy `node_modules/axe-core/axe.min.js` into `public/`, load it in a page and call `axe.run()`; remove the copy afterwards. Not yet covered: testing with a real screen reader, 200% zoom/reflow, and Windows high-contrast mode.
 
+## Levels
+Case studies are graded by what a reader needs to follow them, not by length: **beginner** is a familiar product built around one dominant idea (URL shortener, leaderboard, notifications); **intermediate** combines several standard techniques or has a real consistency or scale trade-off (news feed, chat, checkout); **advanced** needs consensus, distributed transactions, storage-engine internals or global-scale operation (distributed SQL database, ledger, wide-column store, stock exchange). Concepts follow the same idea at the level of a single technique.
+
 ## Learning features
 - **Progress:** every concept, pattern and case study page has a "Mark as done" button. Progress is stored in `localStorage` (key `sda-progress`) and never leaves the browser; cards show a "Done" flag and the case-study list can hide finished ones.
 - **Paths (`/paths/`):** curated sequences driven by `src/data/paths.ts` (concepts first, case studies last). Slugs are validated, so a typo fails the build. The page shows "n of m done" and highlights the next item.
 - **Practise first:** each case study opens with a collapsible panel for your own design notes and a checklist of the design moves in the solution. Notes and ticks are saved per study in `localStorage`.
 - **Case-study search:** `/case-studies/` has search, a level filter and a "hide finished" toggle (also in the URL: `?q=`, `?level=`, `?hide=done`).
-- **Checks:** `npm run check:samples` runs every JavaScript, Python and C# sample and, for concepts and studies, fails if the three languages print different output. `.github/workflows/check.yml` runs it and the build on every pull request.
+- **Checks:** `npm run check:samples` runs every JavaScript, Python and C# sample and, for concepts and studies, fails if the three languages print different output. `npm run check:pages` (after a build) opens every page in Chromium and fails on script errors, console errors, accessibility violations (axe), horizontal scroll at 375px, and any playground control that throws. CI installs Playwright with `npm install --no-save`, so it is not a dependency of the site. `.github/workflows/deploy.yml` runs both checks before deploying, and `check.yml` runs them on pull requests.
 
 ## Compare pages
 - `/compare/` (design patterns) is driven by `src/data/compare.ts`.
