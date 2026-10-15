@@ -1,0 +1,83 @@
+---
+import PlaygroundShell from '../../components/PlaygroundShell.astro';
+---
+<PlaygroundShell title="The sampler that sees the same moment every time" hint="A request loop repeats every 10 ms and the function render_json runs for the first 3 ms of it, so its true share is 30%. Change how and how often the profiler samples, then see how many of 20 repeated profiles get the share right.">
+  <ol class="how">
+    <li>The default is a <b>fixed 100 Hz</b> timer on <b>10 processes</b> for 10 seconds. The timer period is exactly one loop, so each process always lands on the same moment of the loop and reports 0% or 100%. Across the 20 trials the answers range from <b>10.0% to 60.0%</b> and only <b>2 of 20</b> are within 5 points of the truth.</li>
+    <li>Switch to <b>jittered</b> intervals, with the same average rate: all <b>20 of 20</b> are within 5 points (<b>28.9% to 30.9%</b>), with exactly the same overhead of 1.0% of a core.</li>
+    <li>A fixed rate that does not divide the loop, such as <b>97 Hz</b>, drifts across the loop and is also exact (20 of 20). Merging <b>100 processes</b> with random phases helps a fixed 100 Hz timer too (15 of 20), but it needs a hundred times the data to nearly fix what randomness fixes for free.</li>
+  </ol>
+  <div class="pg cpb" data-cpb>
+    <div class="pg-row">
+      <label>Sampling rate <select class="pg-in" data-hz>
+        <option value="19">19 Hz</option>
+        <option value="50">50 Hz</option>
+        <option value="97">97 Hz</option>
+        <option value="100" selected>100 Hz</option>
+        <option value="200">200 Hz</option>
+      </select></label>
+      <label>Timer <select class="pg-in" data-jit>
+        <option value="fixed" selected>fixed period</option>
+        <option value="jitter">random interval, same average</option>
+      </select></label>
+      <label>Processes merged <select class="pg-in" data-procs>
+        <option value="1">1</option>
+        <option value="10" selected>10</option>
+        <option value="100">100</option>
+      </select></label>
+      <label>Profile length <select class="pg-in" data-dur>
+        <option value="10" selected>10 seconds</option>
+        <option value="60">60 seconds</option>
+      </select></label>
+    </div>
+    <div class="pg-grid">
+      <div class="pg-box" data-b1><h3>Estimated share of render_json</h3><span class="pg-mono" data-o1></span><span class="pg-note" data-n1></span></div>
+      <div class="pg-box" data-b2><h3>Trials within 5 points of 30%</h3><span class="pg-mono" data-o2></span><span class="pg-note" data-n2></span></div>
+      <div class="pg-box" data-b3><h3>Profiler overhead</h3><span class="pg-mono" data-o3></span><span class="pg-note" data-n3></span></div>
+    </div>
+    <p class="pg-out" data-verdict aria-live="polite"></p>
+    <p class="pg-note">Model: the request loop repeats every 10,000 microseconds and render_json runs in the first 3,000 of them. Each process starts its timer at a random point in the loop. One sample costs 100 microseconds of CPU, and 20 independent profiles are taken for each setting. Stack walks are assumed to be instantaneous, which hides skew from the walk itself.</p>
+  </div>
+</PlaygroundShell>
+<script>
+  document.querySelectorAll<HTMLElement>('[data-cpb]').forEach((root) => {
+    const q = <T extends HTMLElement>(s: string) => root.querySelector<T>(s)!;
+    const TRIALS = 20; const LOOP = 10000; const HOT = 3000; const COST_US = 100;
+    // Runs the sampler and returns, for each trial, the estimated share of the hot function in tenths of a percent.
+    function run(hz: number, jitter: boolean, procs: number, dur: number): { est: number[]; samples: number } {
+      let seed = 11; const rnd = () => { seed = (Math.imul(seed, 1664525) + 1013904223) >>> 0; return seed / 4294967296; };
+      const period = Math.floor(1e6 / hz); const est: number[] = []; let samples = 0;
+      for (let t = 0; t < TRIALS; t++) {
+        let hot = 0; let n = 0;
+        for (let p = 0; p < procs; p++) {
+          let time = Math.floor(rnd() * LOOP); const end = time + dur * 1e6;
+          while (time < end) { n++; if (time % LOOP < HOT) hot++; time += jitter ? Math.floor(period / 2 + rnd() * period) : period; }
+        }
+        est.push(Math.floor((hot * 1000) / n)); if (t === 0) samples = n;
+      }
+      return { est, samples };
+    }
+    const pct = (v: number) => `${(v / 10).toFixed(1)}%`;
+    let queued = false;
+    function draw() {
+      queued = false;
+      const hz = Number(q<HTMLSelectElement>('[data-hz]').value); const jitter = q<HTMLSelectElement>('[data-jit]').value === 'jitter';
+      const procs = Number(q<HTMLSelectElement>('[data-procs]').value); const dur = Number(q<HTMLSelectElement>('[data-dur]').value);
+      const { est, samples } = run(hz, jitter, procs, dur);
+      const within = est.filter((e) => Math.abs(e - 300) <= 50).length; const lo = Math.min(...est); const hi = Math.max(...est);
+      const overhead = (hz * COST_US) / 1e4;
+      q('[data-o1]').textContent = `${pct(lo)} to ${pct(hi)}`; q('[data-n1]').textContent = `across ${TRIALS} profiles, the first reads ${pct(est[0])}; the truth is 30.0%`;
+      q('[data-o2]').textContent = `${within} of ${TRIALS}`; q('[data-n2]').textContent = `${samples.toLocaleString('en-US')} samples in each profile`;
+      q('[data-o3]').textContent = `${overhead.toFixed(1)}% of a core`; q('[data-n3]').textContent = `${hz} samples per second, 100 microseconds each, per process`;
+      q<HTMLElement>('[data-b1]').style.setProperty('--c', within === TRIALS ? 'var(--good)' : 'var(--bad)');
+      q<HTMLElement>('[data-b2]').style.setProperty('--c', within === TRIALS ? 'var(--good)' : 'var(--bad)');
+      q<HTMLElement>('[data-b3]').style.setProperty('--c', overhead <= 1 ? 'var(--good)' : 'var(--accent)');
+      const out = q('[data-verdict]'); const bad = within < TRIALS; out.classList.toggle('bad', bad);
+      out.textContent = !bad ? `Every profile is within 5 points of the truth. ${jitter ? 'Random intervals keep the sampler from locking onto the loop, so even one process is enough.' : `A period of ${Math.floor(1e6 / hz)} microseconds drifts across the 10,000 microsecond loop instead of landing on one moment.`}`
+        : `Only ${within} of ${TRIALS} profiles are close: a fixed period of ${Math.floor(1e6 / hz)} microseconds ${10000 % Math.floor(1e6 / hz) === 0 || Math.floor(1e6 / hz) % 10000 === 0 ? 'divides the loop evenly, so each process samples the same moment every time' : 'repeats too closely with the loop'}, and the share is off by up to ${Math.max(hi - 300, 300 - lo) / 10} points. More rate does not help; randomising the interval or merging many processes does.`;
+    }
+    const schedule = () => { if (!queued) { queued = true; requestAnimationFrame(draw); } };
+    root.addEventListener('change', schedule);
+    draw();
+  });
+</script>

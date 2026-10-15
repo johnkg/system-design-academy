@@ -1,0 +1,58 @@
+{
+  "actors": [
+    { "id": "app", "label": "Application", "role": "client", "x": 14, "y": 16 },
+    { "id": "coord", "label": "Coordinator (any node)", "role": "edge", "x": 50, "y": 16 },
+    { "id": "n2", "label": "Replica n2", "role": "data", "x": 86, "y": 16 },
+    { "id": "hints", "label": "Hint store", "role": "async", "x": 14, "y": 50 },
+    { "id": "n4", "label": "Replica n4", "role": "data", "x": 86, "y": 50 },
+    { "id": "compaction", "label": "Compaction on n2", "role": "compute", "x": 14, "y": 84 },
+    { "id": "n1", "label": "Replica n1", "role": "data", "x": 86, "y": 84 }
+  ],
+  "frames": [
+    {
+      "narration": "The application writes a reading for sensor 17: partition key (17, 2026-10-15), clustering key 10:42:07, value 21.4, at QUORUM. The coordinator hashes the partition key with FNV-1a to a token, finds that token on the ring, and walks clockwise to the next three distinct nodes: n2, n4 and n1.",
+      "messages": [{ "from": "app", "to": "coord", "label": "write QUORUM" }],
+      "states": { "coord": "replicas: n2, n4, n1" }
+    },
+    {
+      "narration": "The coordinator sends the write to all three replicas at once, with a timestamp. Gossip has already marked n1 as down, so that message gets no answer.",
+      "messages": [{ "from": "coord", "to": "n2", "label": "write, ts 10:42:07.114" }, { "from": "coord", "to": "n4", "label": "write, ts 10:42:07.114" }, { "from": "coord", "to": "n1", "label": "write (no answer)" }],
+      "states": { "n1": "down" }
+    },
+    {
+      "narration": "Each live replica appends the write to its commit log, one sequential disk write, and inserts it into its memtable, sorted by clustering key. No page is read and none is rewritten. Then it acknowledges.",
+      "messages": [{ "from": "n2", "to": "coord", "label": "ack" }, { "from": "n4", "to": "coord", "label": "ack" }],
+      "states": { "n2": "commit log + memtable", "n4": "commit log + memtable" }
+    },
+    {
+      "narration": "Two acknowledgements out of three make a QUORUM, so the coordinator answers the application now. It also keeps a hint for n1: the write itself, to be delivered when n1 is back.",
+      "messages": [{ "from": "coord", "to": "app", "label": "ok (2 of 3)" }, { "from": "coord", "to": "hints", "label": "hint for n1" }],
+      "states": { "hints": "1 hint for n1" }
+    },
+    {
+      "narration": "Later the memtable on n2 is full and is flushed to a sorted, immutable SSTable. Compaction merges four similar-sized SSTables into one, keeps the newest version of every cell and drops the overwritten ones, so a read has fewer files to check.",
+      "messages": [{ "from": "n2", "to": "compaction", "label": "flushed SSTable" }],
+      "states": { "compaction": "4 SSTables merged into 1" }
+    },
+    {
+      "narration": "n1 comes back after 40 minutes, which is inside the hint window of a few hours. The stored hint is replayed to it and it applies the write.",
+      "messages": [{ "from": "hints", "to": "n1", "label": "replay hint" }],
+      "states": { "n1": "caught up", "hints": "empty" }
+    },
+    {
+      "narration": "Another application reads the last 10 readings of sensor 17 for today at QUORUM. The coordinator asks n2 for the full rows and n4 for a digest, a hash of what it has.",
+      "messages": [{ "from": "app", "to": "coord", "label": "read last 10, QUORUM" }, { "from": "coord", "to": "n2", "label": "send rows" }, { "from": "coord", "to": "n4", "label": "send digest" }]
+    },
+    {
+      "narration": "The digests differ: n4 lost one earlier message, the reading from 10:41, when a packet timed out. The coordinator takes the newest version of every cell, returns the 10 rows to the application, and writes the missing reading to n4. This is read repair.",
+      "messages": [{ "from": "n2", "to": "coord", "label": "10 rows" }, { "from": "n4", "to": "coord", "label": "digest differs" }, { "from": "coord", "to": "app", "label": "10 rows, newest" }, { "from": "coord", "to": "n4", "label": "repair: 10:41 reading" }],
+      "states": { "n4": "repaired" },
+      "highlight": ["n4"]
+    },
+    {
+      "narration": "Much later the application deletes an old reading. The delete is a write of a tombstone with a timestamp, not an erase. It is kept for ten days (gc_grace_seconds) so that every replica learns about it, and repair must complete inside that window, or a replica that missed it could bring the old value back.",
+      "messages": [{ "from": "app", "to": "coord", "label": "delete, QUORUM" }, { "from": "coord", "to": "n2", "label": "tombstone" }],
+      "states": { "n2": "tombstone, kept 10 days" }
+    }
+  ]
+}

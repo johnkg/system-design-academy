@@ -1,0 +1,81 @@
+---
+import PlaygroundShell from '../../components/PlaygroundShell.astro';
+---
+<PlaygroundShell title="Cut the cluster in two" hint="A leader and its followers are split by a network partition, and a client on the old leader's side keeps reading. Does the cluster keep accepting writes, and what do reads return? Each result is 200 simulated steps, with the cut after step 100.">
+  <ol class="how">
+    <li>The default is <b>5 servers, 3 cut off from the leader, plain follower reads</b>: the 3 on the far side form a majority, elect a new leader and commit all <b>200 of 200</b> writes. The old leader's side has only 2 servers, so it can commit nothing. The client there reads from its followers and gets a <b>stale value on 131 of 200 reads</b>.</li>
+    <li>Choose <b>synchronised read</b> or <b>read from the leader</b>: <b>0 stale reads</b>, but the <b>100 reads after the cut are refused</b>. A cluster can be consistent or answer on the small side, and not both.</li>
+    <li>Set <b>cut off to 2</b>: the leader keeps 3 of 5, so a majority, and commits <b>200 of 200</b>. Plain reads are then stale on only <b>58</b>, because followers lag for a moment, and a synchronised read costs <b>200 extra round trips</b>.</li>
+    <li>Set <b>4 servers and 2 cut off</b>: neither side has the 3 needed, so only <b>100 of 200</b> writes commit. Four servers survive one failure, no better than three, and cost more.</li>
+  </ol>
+  <div class="pg csb" data-csb>
+    <div class="pg-row">
+      <label>Voting servers <select class="pg-in" data-n><option value="3">3</option><option value="4">4</option><option value="5" selected>5</option><option value="6">6</option><option value="7">7</option></select></label>
+      <label>Servers cut off from the leader <input type="range" min="0" max="6" value="3" data-k /> <b data-kval></b></label>
+      <label>The client on the leader's side reads <select class="pg-in" data-mode>
+        <option value="plain" selected>from a follower, plain read</option>
+        <option value="sync">from a follower, synchronised read</option>
+        <option value="leader">from the leader</option>
+      </select></label>
+    </div>
+    <div class="pg-grid">
+      <div class="pg-box" data-b1><h3>Leader's side</h3><span class="pg-mono" data-o1></span><span class="pg-note" data-n1></span></div>
+      <div class="pg-box" data-b2><h3>Writes committed</h3><span class="pg-mono" data-o2></span><span class="pg-note" data-n2></span></div>
+      <div class="pg-box" data-b3><h3>Reads by the client</h3><span class="pg-mono" data-o3></span><span class="pg-note" data-n3></span></div>
+    </div>
+    <p class="pg-out" data-verdict aria-live="polite"></p>
+    <p class="pg-note">Model: one write is attempted per step, and a write commits on a side that holds a majority of all voting servers. Before the cut, each follower on the leader's side catches up with probability 70 percent per step, so a plain follower read can be one or more writes behind. After the cut, an isolated side cannot commit. If the far side has a majority it elects a new leader and goes on committing, and the old side is frozen. A synchronised read or a leader read needs to confirm with a majority, so it is refused when the leader's side has none.</p>
+  </div>
+</PlaygroundShell>
+<script>
+  document.querySelectorAll<HTMLElement>('[data-csb]').forEach((root) => {
+    const q = <T extends HTMLElement>(s: string) => root.querySelector<T>(s)!;
+    const STEPS = 200; const CUT = 100;
+    function sim(n: number, k: number, mode: string) {
+      const quorum = Math.floor(n / 2) + 1; const sideA = n - k; const okA = sideA >= quorum; const okB = k >= quorum;
+      let seed = 7; const rnd = (m: number) => { seed = (Math.imul(seed, 1664525) + 1013904223) >>> 0; return Math.floor(seed / 65536) % m; };
+      const ver: number[] = new Array(Math.max(0, sideA - 1)).fill(0);
+      let latest = 0; let committed = 0; let stale = 0; let refused = 0; let trips = 0;
+      for (let t = 0; t < STEPS; t++) {
+        const part = t >= CUT;
+        if (!part || okA) { latest++; committed++; ver.forEach((_, i) => { if (rnd(100) < 70) ver[i] = latest; }); }
+        else if (okB) { latest++; committed++; }
+        const fresh = !part || okA;
+        if (mode === 'plain') {
+          if (ver.length === 0) { if (!fresh) stale++; }
+          else if (ver[rnd(ver.length)] < latest) stale++;
+        } else if (!fresh) refused++;
+        else if (mode === 'sync') trips++;
+      }
+      return { quorum, sideA, okA, okB, committed, stale, refused, trips };
+    }
+    let queued = false;
+    function draw() {
+      queued = false;
+      const n = Number(q<HTMLSelectElement>('[data-n]').value); const kIn = q<HTMLInputElement>('[data-k]');
+      kIn.max = String(n - 1); const k = Math.min(Number(kIn.value), n - 1); kIn.value = String(k);
+      q('[data-kval]').textContent = String(k);
+      const mode = q<HTMLSelectElement>('[data-mode]').value;
+      const r = sim(n, k, mode);
+      q('[data-o1]').textContent = `${r.sideA} of ${n} servers`;
+      q('[data-n1]').textContent = `a majority is ${r.quorum}: this side ${r.okA ? 'has one' : 'does not'}, the far side (${k}) ${r.okB ? 'has one and elects a new leader' : 'does not'}`;
+      q('[data-o2]').textContent = `${r.committed} of ${STEPS}`;
+      q('[data-n2]').textContent = r.okA ? 'the leader keeps its majority' : r.okB ? 'after the cut, on the far side' : 'after the cut nobody can commit';
+      q('[data-o3]').textContent = `${r.stale} stale, ${r.refused} refused`;
+      q('[data-n3]').textContent = mode === 'sync' ? `${r.trips} extra round trips to catch up` : mode === 'leader' ? 'every read is served by one server' : 'answered from whatever the follower has';
+      q<HTMLElement>('[data-b1]').style.setProperty('--c', r.okA ? 'var(--good)' : 'var(--bad)');
+      q<HTMLElement>('[data-b2]').style.setProperty('--c', r.committed === STEPS ? 'var(--good)' : 'var(--bad)');
+      q<HTMLElement>('[data-b3]').style.setProperty('--c', r.stale + r.refused === 0 ? 'var(--good)' : 'var(--bad)');
+      const out = q('[data-verdict]'); const bad = r.stale > 0 || r.refused > 0 || r.committed < STEPS; out.classList.toggle('bad', bad);
+      let msg: string;
+      if (k === 0) msg = `No partition after step 100. ${r.committed} of ${STEPS} writes commit.`;
+      else if (!r.okA && !r.okB) msg = `Neither side has ${r.quorum} servers, so writes stop at the cut: ${r.committed} of ${STEPS} committed. Consistency is kept by refusing to guess.`;
+      else if (!r.okA) msg = mode === 'plain' ? `The far side elected a new leader and committed everything, but the client on the old side read stale values ${r.stale} times, because its servers never saw the later writes.` : `${r.refused} reads were refused because the client's side cannot confirm it is current, and none were stale. That is the price of a strict read.`;
+      else msg = mode === 'plain' ? `The leader's side keeps a majority, so every write commits. ${r.stale} of ${STEPS} plain reads were behind, because a follower lags for a moment. A synchronised read removes that.` : mode === 'sync' ? `Never stale, at the price of ${r.trips} extra round trips.` : `Never stale, since the leader is always current, but it serves all ${STEPS} reads itself.`;
+      out.textContent = msg;
+    }
+    const queue = () => { if (!queued) { queued = true; requestAnimationFrame(draw); } };
+    root.addEventListener('input', queue); root.addEventListener('change', queue);
+    draw();
+  });
+</script>

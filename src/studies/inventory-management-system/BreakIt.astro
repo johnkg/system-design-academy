@@ -1,0 +1,90 @@
+---
+import PlaygroundShell from '../../components/PlaygroundShell.astro';
+---
+<PlaygroundShell title="Flash sale on one product" hint="2,000 units go on sale and shoppers arrive in a one-second burst. Each tick is 100 ms, and one counter row handles 100 updates per tick (1,000 per second). A request that waits more than 2 ticks times out. Compare four ways to protect the stock.">
+  <ol class="how">
+    <li>With the default <b>800 arrivals per tick</b> and <b>4 slices</b>, <b>check then update</b> sells <b>400 units that do not exist</b>, because every request in a tick reads the same remaining count.</li>
+    <li>The <b>single counter row</b> is correct but is the bottleneck: it answers only 100 requests per tick, so <b>6,800 of 8,000 shoppers time out</b>, and <b>800 units stay unsold</b> because the demand is gone before the row catches up.</li>
+    <li>Set <b>slices to 16</b>: there is room for 1,600 updates per tick, so nobody times out. Now lower the arrivals to <b>300</b>: the slices run dry unevenly and some shoppers are told <b>sold out</b> while stock remains elsewhere. The <b>sale queue</b> avoids timeouts with any setting, but it can make the sale last longer (34 ticks instead of 12 with one row).</li>
+  </ol>
+  <div class="pg imb" data-imb>
+    <div class="pg-row">
+      <label>Shoppers arriving per tick, for 10 ticks <input type="range" min="100" max="1500" step="100" value="800" data-a /> <b data-aval></b></label>
+      <label>Slices of the product's stock <select class="pg-in" data-k><option value="1">1 (one row)</option><option value="4" selected>4</option><option value="16">16</option></select></label>
+    </div>
+    <div class="pg-grid">
+      <div class="pg-box" data-b1><h3>Check, then update</h3><span class="pg-mono" data-o1></span><span class="pg-note" data-n1></span></div>
+      <div class="pg-box" data-b2><h3>Atomic update, one counter row</h3><span class="pg-mono" data-o2></span><span class="pg-note" data-n2></span></div>
+      <div class="pg-box" data-b3><h3>Atomic update, sliced counters</h3><span class="pg-mono" data-o3></span><span class="pg-note" data-n3></span></div>
+      <div class="pg-box" data-b4><h3>Sliced counters behind a sale queue</h3><span class="pg-mono" data-o4></span><span class="pg-note" data-n4></span></div>
+    </div>
+    <p class="pg-out" data-verdict aria-live="polite"></p>
+    <p class="pg-note">Model: 2,000 units, one unit per shopper, 10 ticks of arrivals. Each counter row processes 100 requests per tick, oldest first. On a slice with no stock a request tries one other random slice in the next tick, then is told it is sold out; if that happened while other slices still had stock, it is counted as a wrong sold-out answer. Once all stock is gone a cached flag answers the rest at no cost. The sale queue admits 60% of the total counter capacity per tick and its waiting shoppers never time out. A result is shown in red if units are oversold or left unsold, or if more than 1% of the shoppers got a timeout or a wrong sold-out answer.</p>
+  </div>
+</PlaygroundShell>
+<script>
+  document.querySelectorAll<HTMLElement>('[data-imb]').forEach((root) => {
+    const q = <T extends HTMLElement>(s: string) => root.querySelector<T>(s)!;
+    const UNITS = 2000; const CAP = 100; const TO = 2; const BURST = 10;
+    type R = { sold: number; over: number; timeouts: number; falseOut: number; ticks: number; left: number };
+    function sim(A: number, K: number, mode: string): R {
+      if (mode === 'naive') {
+        const sold = Math.min(A * BURST, A * Math.ceil(UNITS / A));
+        return { sold, over: Math.max(0, sold - UNITS), timeouts: 0, falseOut: 0, ticks: Math.min(BURST, Math.ceil(UNITS / A)), left: 0 };
+      }
+      let seed = 11; const rnd = (n: number) => { seed = (seed * 1664525 + 1013904223) % 4294967296; return Math.floor(seed / 65536) % n; };
+      const k = mode === 'single' ? 1 : K;
+      const stock: number[] = Array(k).fill(UNITS / k);
+      let q2: { t0: number; retry: number }[][] = Array.from({ length: k }, () => []);
+      let line = 0; let sold = 0; let timeouts = 0; let falseOut = 0; let last = 0;
+      const admit = Math.floor(k * CAP * 0.6);
+      const total = () => stock.reduce((a, b) => a + b, 0);
+      for (let t = 0; t < 400; t++) {
+        let arrivals = t < BURST ? A : 0;
+        if (mode === 'line') { line += arrivals; arrivals = 0; if (total() === 0) line = 0; else { arrivals = Math.min(line, admit); line -= arrivals; } }
+        for (let i = 0; i < arrivals; i++) q2[rnd(k)].push({ t0: t, retry: 0 });
+        if (total() === 0) q2 = q2.map(() => []);
+        const next: { t0: number; retry: number }[][] = Array.from({ length: k }, () => []);
+        for (let s = 0; s < k; s++) {
+          let done = 0;
+          for (const r of q2[s]) {
+            if (mode !== 'line' && t - r.t0 > TO) { timeouts++; continue; }
+            if (done >= CAP) { next[s].push(r); continue; }
+            done++;
+            if (stock[s] > 0) { stock[s]--; sold++; last = t; }
+            else if (k > 1 && r.retry < 1) { r.retry++; next[rnd(k)].push(r); }
+            else if (total() > 0) falseOut++;
+          }
+        }
+        q2 = next;
+        if (t >= BURST && line === 0 && q2.every((x) => x.length === 0)) break;
+      }
+      return { sold, over: 0, timeouts, falseOut, ticks: last + 1, left: total() };
+    }
+    function draw() {
+      const a = Number(q<HTMLInputElement>('[data-a]').value); const k = Number(q<HTMLSelectElement>('[data-k]').value);
+      q('[data-aval]').textContent = String(a);
+      const total = a * BURST;
+      const res = [sim(a, k, 'naive'), sim(a, k, 'single'), sim(a, k, 'sliced'), sim(a, k, 'line')];
+      res.forEach((x, i) => {
+        const n = i + 1;
+        q(`[data-o${n}]`).textContent = x.over > 0 ? `${x.sold} sold: ${x.over} too many` : `${x.sold} of ${UNITS} units sold`;
+        const parts: string[] = [];
+        if (x.timeouts > 0) parts.push(`${x.timeouts} of ${total} shoppers timed out`);
+        if (x.falseOut > 0) parts.push(`${x.falseOut} told sold out too early`);
+        if (x.left > 0) parts.push(`${x.left} units left unsold`);
+        if (x.over > 0) parts.push('stock sold twice');
+        parts.push(`last sale after ${x.ticks * 100} ms`);
+        q(`[data-n${n}]`).textContent = parts.join('; ');
+        const bad = x.over > 0 || x.left > 0 || (x.timeouts + x.falseOut) * 100 > total;
+        q<HTMLElement>(`[data-b${n}]`).style.setProperty('--c', bad ? 'var(--bad)' : 'var(--good)');
+      });
+      const out = q('[data-verdict]'); const bad = res[0].over > 0 || res[1].timeouts > 0 || res[2].timeouts > 0; out.classList.toggle('bad', bad);
+      out.textContent = res[0].over > 0 ? `Check-then-update sold ${res[0].over} units that did not exist. The single counter row never oversells, but with ${a} shoppers per tick it timed out ${res[1].timeouts} of them. ${res[2].timeouts === 0 ? `Sliced counters (${k}) handled the burst with no timeouts.` : `Sliced counters (${k}) still timed out ${res[2].timeouts}, so the slices are too few for this burst.`}`
+        : res[1].timeouts > 0 || res[2].timeouts > 0 ? `No overselling, but the counter rows cannot keep up: ${res[1].timeouts} timeouts on one row and ${res[2].timeouts} with ${k} slices. Add slices, or admit shoppers through a queue.`
+        : 'With these settings every approach sells the units once. Raise the arrivals or lower the slices to see the counters become the bottleneck.';
+    }
+    root.addEventListener('input', draw); root.addEventListener('change', draw);
+    draw();
+  });
+</script>

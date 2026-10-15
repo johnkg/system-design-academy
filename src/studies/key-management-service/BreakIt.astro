@@ -1,0 +1,107 @@
+---
+import PlaygroundShell from '../../components/PlaygroundShell.astro';
+---
+<PlaygroundShell title="Break the KMS" hint="Every service needs the KMS for its data keys. Take it down for a while, and choose how the services are built: what do they do while it is gone? Each run replays 60 minutes with 1,000 requests per minute (80% reads of 200 hot keys, 20% writes), and the outage starts at minute 20.">
+  <ol class="how">
+    <li>The default is a <b>5-minute key cache</b> with the outage in <b>one region</b> and no replica: the cache covers only the first minutes, then about <b>a quarter of all requests fail</b>. After the KMS is back, the empty caches send a burst of calls, <b>about 4 times</b> the usual rate.</li>
+    <li>Tick <b>Fail over to a replica region</b>: nothing fails, because the other region holds the same keys, and the cost is extra latency for the calls that went there. Then change the outage to <b>all regions</b> (a bad policy rollout, say): the replica does not help, and requests fail again.</li>
+    <li>Choose <b>serve expired keys during an outage</b>: nothing fails even when every region is down, for up to 30 minutes after a key was fetched. The price is that a key you disable keeps working for that long. Choose <b>call the KMS on every operation</b> and a 15-minute outage is a 15-minute total outage, while every call hits the KMS all the time.</li>
+  </ol>
+  <div class="pg kmb" data-kmb>
+    <div class="pg-row">
+      <label>How services get data keys <select class="pg-in" data-d>
+        <option value="1">Call the KMS on every operation</option>
+        <option value="2" selected>Cache keys for a few minutes</option>
+        <option value="3">Cache, and serve expired keys during an outage</option>
+      </select></label>
+      <label>Cache lifetime (minutes) <input type="range" min="1" max="15" value="5" data-ttl /> <b data-ttlval></b></label>
+      <label>Outage length (minutes) <input type="range" min="1" max="40" value="15" data-out /> <b data-outval></b></label>
+      <label>The outage hits <select class="pg-in" data-scope>
+        <option value="region" selected>One region</option>
+        <option value="all">All regions at once</option>
+      </select></label>
+      <label><input type="checkbox" data-rep /> Fail over to a replica region</label>
+    </div>
+    <div class="pg-grid">
+      <div class="pg-box" data-b1><h3>Requests that failed</h3><span class="pg-mono" data-o1></span><span class="pg-note" data-n1></span></div>
+      <div class="pg-box" data-b2><h3>Calls to the KMS</h3><span class="pg-mono" data-o2></span><span class="pg-note" data-n2></span></div>
+      <div class="pg-box" data-b3><h3>A disabled key still works for</h3><span class="pg-mono" data-o3></span><span class="pg-note" data-n3></span></div>
+    </div>
+    <div class="kmb-strip" data-strip role="img" aria-label="Timeline"></div>
+    <p class="pg-note kmb-legend"><span class="kmb-key ok"></span> all served <span class="kmb-key stale"></span> some served from expired keys <span class="kmb-key fail"></span> some requests failed. The strip shows minutes 10 to 59; the outage begins at minute 20.</p>
+    <p class="pg-out" data-verdict aria-live="polite"></p>
+    <p class="pg-note">Model: one minute per step, a cache entry is refreshed on its first miss after it expires with a little jitter, writes share one cached data key, expired keys are served for at most 30 minutes after they were fetched, and a replica region answers a call that the local KMS cannot. Requests during minutes 10 to 59 are counted.</p>
+  </div>
+</PlaygroundShell>
+<style is:global>
+  .playground .kmb-strip { display: grid; grid-template-columns: repeat(50, minmax(0, 1fr)); gap: 2px; margin: 12px 0 6px; }
+  .playground .kmb-strip i { display: block; height: 22px; border-radius: 3px; background: var(--surface-2); border: 1px solid var(--border); }
+  .playground .kmb-strip i.stale, .playground .kmb-key.stale { background: var(--accent); border-color: var(--accent); }
+  .playground .kmb-strip i.fail, .playground .kmb-key.fail { background: var(--bad); border-color: var(--bad); }
+  .playground .kmb-strip i.down { box-shadow: 0 3px 0 -1px var(--text); }
+  .playground .kmb-legend .kmb-key { display: inline-block; width: 12px; height: 12px; border-radius: 3px; border: 1px solid var(--border); background: var(--surface-2); vertical-align: -1px; margin-left: 8px; }
+</style>
+<script>
+  document.querySelectorAll<HTMLElement>('[data-kmb]').forEach((root) => {
+    const q = <T extends HTMLElement>(s: string) => root.querySelector<T>(s)!;
+    const R = 1000, START = 20, MIN = 60, KEYS = 200, STALE = 30, FROM = 10;
+    type Run = { fail: number; stale: number; total: number; remote: number; steady: number; peak: number; calls: number; status: string[] };
+    function sim(design: number, ttl: number, outage: number, replica: boolean, scope: string): Run {
+      let seed = 99; const rnd = () => ((seed = (Math.imul(seed, 1664525) + 1013904223) >>> 0) / 4294967296);
+      const cache = new Map<number, number>(); const calls = new Array(MIN).fill(0); const status: string[] = new Array(MIN).fill('ok');
+      let fail = 0, stale = 0, total = 0, remote = 0;
+      for (let m = 0; m < MIN; m++) {
+        const down = m >= START && m < START + outage;
+        for (let i = 0; i < R; i++) {
+          const read = rnd() < 0.8; const key = read ? Math.floor(KEYS * Math.pow(rnd(), 3)) : -1;
+          if (m >= FROM) total++;
+          const e = cache.get(key);
+          if (design > 1 && e !== undefined && m - e < ttl) continue;
+          if (!down || (replica && scope === 'region')) {
+            calls[m]++; if (down) remote++;
+            if (design > 1) cache.set(key, m - Math.floor(rnd() * ttl * 0.5));
+            continue;
+          }
+          if (design === 3 && e !== undefined && m - e < STALE) { if (m >= FROM) stale++; if (status[m] === 'ok') status[m] = 'stale'; continue; }
+          if (m >= FROM) fail++;
+          status[m] = 'fail';
+        }
+      }
+      const sum = (a: number[]) => a.reduce((x, y) => x + y, 0);
+      const steady = sum(calls.slice(FROM, START)) / (START - FROM);
+      const peak = Math.max(...calls.slice(START + outage));
+      return { fail, stale, total, remote, steady, peak, calls: sum(calls.slice(FROM)), status: status.slice(FROM) };
+    }
+    const cells: HTMLElement[] = [];
+    const strip = q('[data-strip]');
+    for (let i = 0; i < MIN - FROM; i++) { const c = document.createElement('i'); strip.append(c); cells.push(c); }
+    const fmt = (n: number) => Math.round(n).toLocaleString('en-US');
+    function draw() {
+      const design = Number(q<HTMLSelectElement>('[data-d]').value); const ttl = Number(q<HTMLInputElement>('[data-ttl]').value); const outage = Number(q<HTMLInputElement>('[data-out]').value);
+      const scope = q<HTMLSelectElement>('[data-scope]').value; const replica = q<HTMLInputElement>('[data-rep]').checked;
+      q('[data-ttlval]').textContent = String(ttl); q('[data-outval]').textContent = String(outage);
+      q<HTMLInputElement>('[data-ttl]').disabled = design === 1;
+      const r = sim(design, ttl, outage, replica, scope);
+      const pct = (r.fail / r.total) * 100;
+      q('[data-o1]').textContent = `${fmt(r.fail)} of ${fmt(r.total)}`;
+      q('[data-n1]').textContent = r.fail ? `${pct.toFixed(1)}% of all requests; served from expired keys: ${fmt(r.stale)}` : `served from expired keys: ${fmt(r.stale)}`;
+      q('[data-o2]').textContent = `${fmt(r.calls)} in 50 minutes`;
+      q('[data-n2]').textContent = design === 1 ? `${fmt(r.steady)} per minute, every request` : `${fmt(r.steady)} per minute normally; busiest minute after the outage: ${fmt(r.peak)}`;
+      q('[data-o3]').textContent = design === 1 ? '0 minutes' : `${ttl} minutes`;
+      q('[data-n3]').textContent = design === 3 ? 'and up to 30 minutes during an outage' : design === 1 ? 'every call checks the policy again' : 'until the cached key expires';
+      q<HTMLElement>('[data-b1]').style.setProperty('--c', r.fail ? 'var(--bad)' : 'var(--good)');
+      q<HTMLElement>('[data-b2]').style.setProperty('--c', 'var(--accent)');
+      q<HTMLElement>('[data-b3]').style.setProperty('--c', design === 1 ? 'var(--good)' : 'var(--accent)');
+      cells.forEach((c, i) => { const m = i + FROM; c.className = `${r.status[i] === 'ok' ? '' : r.status[i]} ${m >= START && m < START + outage ? 'down' : ''}`.trim(); });
+      strip.setAttribute('aria-label', `Timeline of minutes 10 to 59: the outage lasts ${outage} minutes from minute 20; ${fmt(r.fail)} requests failed and ${fmt(r.stale)} were served from expired keys.`);
+      const out = q('[data-verdict]'); out.classList.toggle('bad', r.fail > 0);
+      if (r.fail === 0 && r.remote > 0 && r.stale === 0) out.textContent = `No request failed: the local KMS was down, but ${fmt(r.remote)} calls went to the replica region, which holds the same keys. Each of them paid cross-region latency, and this works only while the problem is local.`;
+      else if (r.fail === 0 && r.stale > 0) out.textContent = `No request failed: ${fmt(r.stale)} were served from keys whose cache lifetime had passed. The service stays up, and a key that was disabled in this period would have kept working for up to 30 minutes.`;
+      else if (r.fail === 0) out.textContent = `No request failed: the outage of ${outage} minutes was covered by the cache of ${ttl} minutes: every key that was needed while the KMS was down was still cached.`;
+      else if (design === 1) out.textContent = `${fmt(r.fail)} requests failed, every one during the ${outage}-minute outage. With no cache a KMS outage is a total outage for every service that uses it, and in normal times the KMS sees every one of the ${fmt(r.steady)} requests per minute.`;
+      else out.textContent = `${fmt(r.fail)} of ${fmt(r.total)} requests (${pct.toFixed(1)}%) failed: a cache of ${ttl} minutes only delays the problem, and once the entries expired nothing could refresh them${scope === 'all' && replica ? ', and a replica region is down too in an outage that hits every region' : ''}. After the KMS returned, the empty caches sent up to ${fmt(r.peak)} calls in one minute against ${fmt(r.steady)} normally.`;
+    }
+    root.addEventListener('input', draw); root.addEventListener('change', draw);
+    draw();
+  });
+</script>

@@ -1,0 +1,577 @@
+{
+  "name": "Design a Wide-Column Store",
+  "difficulty": "advanced",
+  "intent": "Build a database like Cassandra or Bigtable that absorbs a million writes per second across hundreds of machines, keeps serving when machines fail, and lets applications choose between speed and consistency per request.",
+  "codeTitle": "a replicated ring with quorums, hints, read repair and tombstones",
+  "finalIntro": "One sensor reading written at QUORUM while a replica is down, then read back and repaired.",
+  "prompt": "Design a distributed wide-column database. Applications store billions of rows, such as sensor readings, messages or activity events. Each row belongs to a partition chosen by a key, and rows inside a partition are sorted by a clustering key so that a time range can be read quickly. The database must absorb about 200,000 writes per second, grow by adding machines, survive the loss of machines and of a data centre, and let each request choose how strongly consistent it needs to be.",
+  "functional": [
+    "Write a row addressed by a partition key and a clustering key",
+    "Read one row, or a sorted slice of the rows inside one partition",
+    "Delete a row or a single column, and expire data automatically with a time to live",
+    "Add and remove machines while the database keeps serving",
+    "Let each read and write choose its consistency level",
+    "Replicate every row to several machines, across racks and data centres"
+  ],
+  "nonFunctional": [
+    "Writes take a few milliseconds at the 99th percentile, even at a sustained peak",
+    "Reads of a single partition take under 10 ms",
+    "No single point of failure: any node can be lost and the database stays available",
+    "Capacity grows nearly linearly with the number of nodes",
+    "A write acknowledged at QUORUM is never lost when a minority of replicas fail",
+    "Replicas that drift apart converge again without an operator",
+    "Deleted data stays deleted, even after an outage"
+  ],
+  "firstAttempt": {
+    "text": "One relational database server with a table of readings, a primary key on (sensor, time) and a replica for backup. Applications write rows with INSERT and read time ranges with SELECT.",
+    "limits": [
+      "Every write goes through one primary, so write throughput is capped by one machine and its disk",
+      "A B-tree updates pages in place, so random writes become random disk I/O",
+      "The data must fit one machine, or be split by hand in application code",
+      "If the primary fails, writes stop until a replica is promoted, and recently acknowledged writes may be lost",
+      "Adding capacity means a risky manual migration"
+    ]
+  },
+  "nodes": [
+    {
+      "id": "app",
+      "label": "Applications",
+      "kind": "client",
+      "x": 37,
+      "y": 63
+    },
+    {
+      "id": "single",
+      "label": "One SQL database",
+      "kind": "data",
+      "x": 12,
+      "y": 88,
+      "at": 0,
+      "until": 1
+    },
+    {
+      "id": "coord",
+      "label": "Coordinator",
+      "kind": "edge",
+      "x": 37,
+      "y": 37,
+      "at": 1
+    },
+    {
+      "id": "nodeA",
+      "label": "Replica A",
+      "kind": "data",
+      "x": 62,
+      "y": 63,
+      "at": 1
+    },
+    {
+      "id": "commit",
+      "label": "Commit log",
+      "kind": "data",
+      "x": 87,
+      "y": 63,
+      "at": 2
+    },
+    {
+      "id": "mem",
+      "label": "Memtable",
+      "kind": "data",
+      "x": 62,
+      "y": 88,
+      "at": 2
+    },
+    {
+      "id": "sst",
+      "label": "SSTables",
+      "kind": "data",
+      "x": 37,
+      "y": 88,
+      "at": 2
+    },
+    {
+      "id": "compact",
+      "label": "Compaction",
+      "kind": "compute",
+      "x": 12,
+      "y": 88,
+      "at": 2
+    },
+    {
+      "id": "ring",
+      "label": "Token ring",
+      "kind": "edge",
+      "x": 62,
+      "y": 37,
+      "at": 3
+    },
+    {
+      "id": "nodeB",
+      "label": "Replica B",
+      "kind": "data",
+      "x": 12,
+      "y": 37,
+      "at": 3
+    },
+    {
+      "id": "nodeC",
+      "label": "Replica C",
+      "kind": "data",
+      "x": 62,
+      "y": 12,
+      "at": 3
+    },
+    {
+      "id": "level",
+      "label": "Quorum rule",
+      "kind": "compute",
+      "x": 37,
+      "y": 12,
+      "at": 4
+    },
+    {
+      "id": "hints",
+      "label": "Hint store",
+      "kind": "async",
+      "x": 12,
+      "y": 12,
+      "at": 5
+    },
+    {
+      "id": "repair",
+      "label": "Repair",
+      "kind": "async",
+      "x": 87,
+      "y": 12,
+      "at": 5
+    },
+    {
+      "id": "buckets",
+      "label": "Time buckets",
+      "kind": "compute",
+      "x": 12,
+      "y": 63,
+      "at": 6
+    }
+  ],
+  "edges": [
+    {
+      "from": "app",
+      "to": "single",
+      "at": 0,
+      "until": 1
+    },
+    {
+      "from": "app",
+      "to": "coord",
+      "at": 1,
+      "until": 6
+    },
+    {
+      "from": "coord",
+      "to": "nodeA",
+      "at": 1
+    },
+    {
+      "from": "nodeA",
+      "to": "commit",
+      "at": 2
+    },
+    {
+      "from": "nodeA",
+      "to": "mem",
+      "at": 2
+    },
+    {
+      "from": "mem",
+      "to": "sst",
+      "at": 2
+    },
+    {
+      "from": "sst",
+      "to": "compact",
+      "at": 2
+    },
+    {
+      "from": "coord",
+      "to": "ring",
+      "at": 3
+    },
+    {
+      "from": "coord",
+      "to": "nodeB",
+      "at": 3
+    },
+    {
+      "from": "coord",
+      "to": "nodeC",
+      "at": 3
+    },
+    {
+      "from": "level",
+      "to": "coord",
+      "at": 4
+    },
+    {
+      "from": "coord",
+      "to": "hints",
+      "at": 5
+    },
+    {
+      "from": "hints",
+      "to": "nodeB",
+      "at": 5
+    },
+    {
+      "from": "repair",
+      "to": "nodeC",
+      "at": 5
+    },
+    {
+      "from": "app",
+      "to": "buckets",
+      "at": 6
+    },
+    {
+      "from": "buckets",
+      "to": "coord",
+      "at": 6
+    }
+  ],
+  "steps": [
+    {
+      "title": "Model the data around the queries",
+      "problem": "A general relational model assumes any query can be asked later, but a database spread over hundreds of machines can only answer quickly the queries it was laid out for.",
+      "fix": "Every row has a primary key made of two parts. The partition key is hashed, and the hash decides which machines own the row, so all rows with the same partition key live together. The clustering key sorts the rows inside the partition on disk, so a time slice is one sequential read. For sensor readings the key might be ((sensor_id, day), time DESC): one partition per sensor per day, newest reading first. Each query gets its own table, shaped to be answered from a single partition, and there are no joins. Bigtable and HBase get the same effect with one sorted row key and column families.",
+      "tradeoff": "Reads and writes touch one partition, so their cost is predictable no matter how big the cluster is. The price is that queries must be known in advance, data is copied into several tables, and an ad hoc question across partitions needs a separate analytics system.",
+      "concepts": [
+        {
+          "slug": "sql-vs-nosql"
+        },
+        {
+          "slug": "database-sharding"
+        },
+        {
+          "slug": "ordering-and-partitioning"
+        },
+        {
+          "slug": "database-indexing"
+        }
+      ]
+    },
+    {
+      "title": "Make writes sequential with an LSM tree",
+      "problem": "Updating B-tree pages in place turns a million small writes per second into a million random disk writes, and the disk becomes the limit.",
+      "fix": "Each node appends every write to a commit log, which is a sequential disk write and the crash safety net, and inserts it into the memtable, a sorted structure in memory. The write is acknowledged then, with no read and no random I/O. When the memtable is full it is flushed as an immutable, sorted SSTable file. A read checks the memtable and then the SSTables, using a Bloom filter per file to skip the files that cannot contain the key. A background compaction merges SSTables, keeps the newest version of each cell and drops what was overwritten, so the number of files stays small.",
+      "tradeoff": "Writes become as fast as appending to a file, and compaction runs in the background. A read may have to look in several files (read amplification), and compaction rewrites the same bytes several times (write amplification), so it needs spare disk and I/O. Size-tiered, leveled and time-window compaction trade these costs differently.",
+      "concepts": [
+        {
+          "slug": "lsm-trees-vs-b-trees"
+        },
+        {
+          "slug": "write-ahead-log"
+        },
+        {
+          "slug": "database-indexing"
+        },
+        {
+          "slug": "backpressure"
+        }
+      ]
+    },
+    {
+      "title": "Spread rows over a ring and replicate them",
+      "problem": "One node cannot hold the data or take the writes, and a single copy of a row is lost when its node fails.",
+      "fix": "Hash the partition key to a token on a ring. Each node owns many small token ranges, called virtual nodes, instead of one big range, so load is even and a new node takes a little from every existing node. A row is stored on the node that owns its token and on the next distinct nodes clockwise until there are RF copies, usually three, placed on different racks. Any node can be the coordinator for a request, because every node knows the ring from gossip, and it forwards the request to the replicas. There is no leader and no routing tier.",
+      "tradeoff": "Capacity and write rate grow by adding nodes, and no machine is special. Replication multiplies storage and write traffic by RF, a node that joins or leaves streams data in the background, and the ring state that nodes gossip must stay consistent enough to route requests.",
+      "concepts": [
+        {
+          "slug": "consistent-hashing"
+        },
+        {
+          "slug": "database-replication"
+        },
+        {
+          "slug": "gossip-protocol"
+        },
+        {
+          "slug": "database-sharding"
+        },
+        {
+          "slug": "failure-detection"
+        }
+      ]
+    },
+    {
+      "title": "Let each request choose its consistency",
+      "problem": "Some data, such as a bank balance, needs the latest value, and some, such as a like counter, must simply never fail or be slow. One setting for the whole database fits neither.",
+      "fix": "The coordinator sends each write to all RF replicas but waits for only W acknowledgements, and a read asks R replicas and returns the newest answer. The client picks the levels per request: ONE, QUORUM (a majority, 2 of 3) or ALL. When R + W is greater than RF, every read set overlaps every write set, so a QUORUM read after a QUORUM write sees the write, and one replica per partition can be down. Versions are ordered by timestamp, and the newest wins. LOCAL_QUORUM keeps the wait inside one data centre.",
+      "tradeoff": "The application decides between latency, availability and freshness for every call. With W + R of 3 or less, reads can be stale. Last write wins can drop one of two concurrent writes and relies on clocks, so conflicting updates need design care, such as one writer per row or a counter or set type that merges.",
+      "concepts": [
+        {
+          "slug": "quorums"
+        },
+        {
+          "slug": "consistency-models"
+        },
+        {
+          "slug": "cap-theorem"
+        },
+        {
+          "slug": "logical-clocks"
+        },
+        {
+          "slug": "acid-vs-base"
+        }
+      ]
+    },
+    {
+      "title": "Heal failures with hints, read repair and anti-entropy",
+      "problem": "When a replica is down or a message is lost, the copies of a row differ, and nothing guarantees they ever become equal.",
+      "fix": "Three mechanisms work together. Hinted handoff: the coordinator keeps a hint for a replica that did not answer and replays it when the node returns, if the outage is shorter than the hint window of a few hours. Read repair: when a read finds replicas disagreeing, the coordinator compares timestamps, returns the newest, and writes it back to the stale replicas. Anti-entropy repair: nodes compare Merkle trees of their data and stream only the ranges that differ, and it is run on a schedule. A failure detector marks slow or dead nodes so requests avoid them.",
+      "tradeoff": "The cluster converges without a leader and without downtime. Hints and read repair are best effort, so scheduled repair is not optional. Repair costs disk and network, and a very long outage is better handled by replacing the node than by catching it up.",
+      "concepts": [
+        {
+          "slug": "merkle-trees-and-anti-entropy"
+        },
+        {
+          "slug": "failure-detection"
+        },
+        {
+          "slug": "retries-and-backoff"
+        },
+        {
+          "slug": "hedged-requests-and-tail-latency"
+        },
+        {
+          "slug": "gossip-protocol"
+        }
+      ]
+    },
+    {
+      "title": "Deal with tombstones and wide partitions",
+      "problem": "SSTables are immutable, so a delete cannot erase a row, and a partition that keeps growing becomes slow, heavy and hot.",
+      "fix": "A delete writes a tombstone, a marker with a timestamp, that hides older data. Compaction may purge a tombstone only after gc_grace_seconds, ten days by default, and repair must finish on every replica inside that window. If a replica that missed the delete comes back after the tombstones were purged, its old data returns and is copied to the others. Reads of a partition full of tombstones scan them all, so deletes are avoided in favour of time to live, time-window compaction and dropping whole files. Partitions are kept to about 100 MB by adding a bucket such as the day to the partition key, and a hot partition is split by adding a bucket number.",
+      "tradeoff": "Deletes are cheap to write and safe across replicas, but the space is returned late and a queue-like pattern, with many writes then deletes in one partition, is slow. Bucketing keeps partitions small and spreads load, and the application must then read several buckets for a long time range.",
+      "concepts": [
+        {
+          "slug": "lsm-trees-vs-b-trees"
+        },
+        {
+          "slug": "merkle-trees-and-anti-entropy"
+        },
+        {
+          "slug": "ordering-and-partitioning"
+        },
+        {
+          "slug": "database-sharding"
+        }
+      ]
+    }
+  ],
+  "failures": [
+    {
+      "scenario": "A node is down for longer than the hint window",
+      "impact": "The hints were dropped, so that node misses the writes made in the meantime, and a read that depends on it returns old data.",
+      "answer": "QUORUM reads still return the newest value because the other two copies agree. When the node returns, read repair fixes the rows that are read and a full repair streams the rest. If the outage was longer than gc_grace_seconds, the node is wiped and rebuilt from its peers instead, so that it cannot bring deleted data back.",
+      "concepts": [
+        {
+          "slug": "merkle-trees-and-anti-entropy"
+        },
+        {
+          "slug": "quorums"
+        },
+        {
+          "slug": "failure-detection"
+        },
+        {
+          "slug": "database-replication"
+        }
+      ]
+    },
+    {
+      "scenario": "A queue table fills with tombstones",
+      "impact": "Messages are written and then deleted from one partition, so reads scan thousands of tombstones, time out, and the node spends its time in garbage collection.",
+      "answer": "Stop using the database as a queue: use a message queue, or put each short time window in its own partition and drop or let expire the whole window. Use time to live with time-window compaction, so that expired files are removed whole. Alert on the tombstones scanned per read before the failure threshold is hit.",
+      "concepts": [
+        {
+          "slug": "message-queues"
+        },
+        {
+          "slug": "lsm-trees-vs-b-trees"
+        },
+        {
+          "slug": "alerting"
+        },
+        {
+          "slug": "backpressure"
+        }
+      ]
+    },
+    {
+      "scenario": "One partition becomes huge and hot",
+      "impact": "A celebrity sensor or a single customer key grows into gigabytes, so the three nodes that own it are overloaded while the rest of the cluster is idle, and compaction of that partition stalls.",
+      "answer": "The partition key was too coarse. Add a bucket, such as the day or a number from 0 to 15, to the key so the data is split over many partitions, and read the buckets in parallel. Existing data is migrated with a copy job. Cache the hottest reads in front of the database.",
+      "concepts": [
+        {
+          "slug": "database-sharding"
+        },
+        {
+          "slug": "consistent-hashing"
+        },
+        {
+          "slug": "caching"
+        },
+        {
+          "slug": "ordering-and-partitioning"
+        }
+      ]
+    },
+    {
+      "scenario": "A client with a slow clock writes with old timestamps",
+      "impact": "Last write wins compares timestamps, so a newer value written with an old timestamp loses to an older value, and the update seems to be silently ignored.",
+      "answer": "Keep clocks synchronised with NTP and alert on drift. Let the servers assign timestamps where possible, and use lightweight transactions or a single writer per row when order really matters. Data types that merge, such as counters and sets, avoid the problem.",
+      "concepts": [
+        {
+          "slug": "logical-clocks"
+        },
+        {
+          "slug": "consistency-models"
+        },
+        {
+          "slug": "crdts"
+        },
+        {
+          "slug": "optimistic-concurrency-and-etags"
+        }
+      ]
+    },
+    {
+      "scenario": "A whole data centre is lost",
+      "impact": "Every partition loses the replicas that were in that data centre, and traffic must move.",
+      "answer": "With replicas in each data centre and LOCAL_QUORUM, the surviving data centre has a full quorum on its own, so applications fail over to it and keep working. When the lost data centre returns, repair brings it up to date. Only requests that used a global QUORUM or EACH_QUORUM are affected.",
+      "concepts": [
+        {
+          "slug": "multi-region-failover"
+        },
+        {
+          "slug": "quorums"
+        },
+        {
+          "slug": "database-replication"
+        },
+        {
+          "slug": "cap-theorem"
+        }
+      ]
+    }
+  ],
+  "alternatives": [
+    {
+      "title": "How data is placed",
+      "options": [
+        {
+          "name": "Hash of the partition key on a ring, as in Cassandra",
+          "pro": "Even load, no coordinator or master, and easy to grow",
+          "con": "Range scans across partitions are impossible, so queries must name the partition"
+        },
+        {
+          "name": "Sorted row ranges split into tablets, as in Bigtable and HBase",
+          "pro": "Range scans across the whole table, and a tablet splits when it gets big",
+          "con": "Needs a master and a metadata service, and sequential keys create hot tablets"
+        }
+      ],
+      "pick": "A hash ring when the workload is writes and lookups by key. Sorted tablets when scans across keys matter more."
+    },
+    {
+      "title": "How SSTables are compacted",
+      "options": [
+        {
+          "name": "Size-tiered",
+          "pro": "Lowest write amplification, so it suits heavy writes",
+          "con": "A row can be spread over many files, and it needs up to double the disk during a merge"
+        },
+        {
+          "name": "Leveled",
+          "pro": "A row is in few files, so reads are fast and predictable",
+          "con": "Rewrites data many times, which costs I/O on write-heavy tables"
+        },
+        {
+          "name": "Time-window",
+          "pro": "Perfect for time series with a time to live, since a whole expired window is deleted as a file",
+          "con": "Bad if old data is updated or deleted individually"
+        }
+      ],
+      "pick": "Time-window for sensor and event data, leveled for read-heavy tables, size-tiered otherwise."
+    },
+    {
+      "title": "How concurrent updates are resolved",
+      "options": [
+        {
+          "name": "Last write wins by timestamp",
+          "pro": "Simple and cheap, and it converges",
+          "con": "Silently drops one of two concurrent writes and depends on clocks"
+        },
+        {
+          "name": "Vector clocks and sibling values",
+          "pro": "Detects conflicts and lets the application merge them",
+          "con": "Pushes complexity onto every client"
+        },
+        {
+          "name": "Merging types and lightweight transactions",
+          "pro": "Counters and sets merge by design, and compare-and-set gives order when needed",
+          "con": "Transactions cost several round trips and lose availability"
+        }
+      ],
+      "pick": "Last write wins by default, merging types for counters and sets, and lightweight transactions for the few rows that need them."
+    },
+    {
+      "title": "The default consistency level",
+      "options": [
+        {
+          "name": "ONE for reads and writes",
+          "pro": "Fastest and always available",
+          "con": "Reads can be stale, and a lone acknowledged write can be lost if its node dies"
+        },
+        {
+          "name": "QUORUM for reads and writes",
+          "pro": "Reads see acknowledged writes and one replica per partition can fail",
+          "con": "Slower, and unavailable when two of three replicas are down"
+        },
+        {
+          "name": "LOCAL_QUORUM with replicas in several data centres",
+          "pro": "Quorum safety with local latency",
+          "con": "A read in another data centre can lag behind"
+        }
+      ],
+      "pick": "LOCAL_QUORUM for important data, ONE for data that can be recomputed, and ALL almost never."
+    }
+  ],
+  "roles": [
+    {
+      "id": "client",
+      "label": "Applications",
+      "description": "Services that write and read rows with a chosen consistency level."
+    },
+    {
+      "id": "edge",
+      "label": "Coordinators",
+      "description": "The node a request lands on, and the ring it uses to find replicas."
+    },
+    {
+      "id": "async",
+      "label": "Repair paths",
+      "description": "Hints and repairs that bring replicas back together."
+    },
+    {
+      "id": "compute",
+      "label": "Rules and background work",
+      "description": "The quorum rule, compaction and time bucketing."
+    },
+    {
+      "id": "data",
+      "label": "Storage",
+      "description": "Replicas with their commit log, memtable and SSTables."
+    }
+  ]
+}
