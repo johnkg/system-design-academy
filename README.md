@@ -65,6 +65,13 @@ What is built in:
 
 How it was checked: axe-core was run on every page in both themes, including after stepping through each animation and pressing every playground control, plus manual keyboard checks (skip link, focus return, Next at the last step). To repeat it, `npm install --save-dev axe-core`, copy `node_modules/axe-core/axe.min.js` into `public/`, load it in a page and call `axe.run()`; remove the copy afterwards. Not yet covered: testing with a real screen reader, 200% zoom/reflow, and Windows high-contrast mode.
 
+## Learning features
+- **Progress:** every concept, pattern and case study page has a "Mark as done" button. Progress is stored in `localStorage` (key `sda-progress`) and never leaves the browser; cards show a "Done" flag and the case-study list can hide finished ones.
+- **Paths (`/paths/`):** curated sequences driven by `src/data/paths.ts` (concepts first, case studies last). Slugs are validated, so a typo fails the build. The page shows "n of m done" and highlights the next item.
+- **Practise first:** each case study opens with a collapsible panel for your own design notes and a checklist of the design moves in the solution. Notes and ticks are saved per study in `localStorage`.
+- **Case-study search:** `/case-studies/` has search, a level filter and a "hide finished" toggle (also in the URL: `?q=`, `?level=`, `?hide=done`).
+- **Checks:** `npm run check:samples` runs every JavaScript, Python and C# sample and, for concepts and studies, fails if the three languages print different output. `.github/workflows/check.yml` runs it and the build on every pull request.
+
 ## Compare pages
 - `/compare/` (design patterns) is driven by `src/data/compare.ts`.
 - `/compare-concepts/` (system design concepts) is driven by `src/data/compareConcepts.ts`. Slugs are validated, so a typo fails the build.
