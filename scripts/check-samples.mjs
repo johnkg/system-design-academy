@@ -28,7 +28,9 @@ const run = ([cmd, argv]) =>
     const timer = setTimeout(() => child.kill('SIGKILL'), 180_000);
     child.stdout.on('data', (d) => (stdout += d));
     child.stderr.on('data', (d) => (stderr += d));
-    child.on('close', (status) => { clearTimeout(timer); resolve({ status, stdout, stderr }); });
+    // `dotnet run` prints compiler hints and warnings on stdout, but only when it actually compiles (never on a cached run),
+    // so drop those lines before comparing outputs.
+    child.on('close', (status) => { clearTimeout(timer); resolve({ status, stdout: stdout.replace(/^.*\.cs\(\d+,\d+\): (info|warning) CS\d+:.*\n/gm, ''), stderr }); });
   });
 
 // Collect one job per sample file, grouped by folder so outputs can be compared.

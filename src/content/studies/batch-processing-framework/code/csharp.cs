@@ -39,7 +39,7 @@ string Show(Dictionary<string, int> m) => string.Join(",", m.OrderBy(kv => kv.Ke
 var mapOut = Enumerable.Range(0, Splits).Select(MapTask).ToArray();
 var result = Enumerable.Range(0, Reducers).Select(p => ReduceTask(p, mapOut)).ToArray();
 
-int shuffled = mapOut.Sum(o => o.Sum(b => b.Count));
+int shuffled = mapOut.SelectMany(o => o).Sum(b => b.Count);
 var load = result.Select(r => r.Values.Sum()).ToArray();
 var merged = new Dictionary<string, int>();
 foreach (var r in result) foreach (var kv in r) merged[kv.Key] = kv.Value;
