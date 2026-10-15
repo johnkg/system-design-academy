@@ -1,0 +1,541 @@
+{
+  "name": "Design a Mobile Backend for Frontend",
+  "difficulty": "intermediate",
+  "intent": "Answer a phone's home-screen request with one small, screen-shaped response built from many microservice calls, fast on a slow network, and still useful when some of those services are slow or down.",
+  "codeTitle": "a BFF fan-out with timeouts, partial responses and ETags",
+  "finalIntro": "One home-screen request, from a phone with a flaky connection, through the BFF.",
+  "prompt": "Design the backend that serves the mobile app of a shopping company with 20 million daily users. The home screen shows the profile, recent orders, recommendations, promotions and the inbox count, and each of these comes from a different microservice. Phones are on slow, unreliable connections, many users run old app versions, and the app should open and stay useful even with a bad signal.",
+  "functional": [
+    "Return everything one screen needs in a single request",
+    "Show the screen even when an optional service is slow or down",
+    "Return only the fields the app version on that phone can use",
+    "Let the app skip a download when nothing has changed",
+    "Keep old app versions working while the backend and new apps change",
+    "Let the app catch up on what changed after it was offline"
+  ],
+  "nonFunctional": [
+    "The home screen is ready in about 300 ms at the 95th percentile, not counting the phone's own network time",
+    "No single optional service can slow the screen down or break it",
+    "A screen response is small, under about 10 KB",
+    "Handle around 7,000 screen requests per second in the busiest hour",
+    "A bad backend deploy must not break app versions that are already in people's hands",
+    "The BFF itself must never become the thing that takes the app down"
+  ],
+  "firstAttempt": {
+    "text": "The app talks to the microservices directly. To draw the home screen it calls the profile, orders, recommendations, promotions and inbox services itself, one after another or in a couple of waves, and builds the screen from the replies. Each service returns its full object, and the app picks the fields it wants.",
+    "limits": [
+      "Every call is a round trip on a mobile network, so five or six calls cost several hundred milliseconds even when each service is fast",
+      "Each service sends its whole response, so the phone downloads far more bytes than the screen shows",
+      "The app needs to know every service's address, its login rules and its error behaviour, so any backend change forces an app release",
+      "If one service is slow, the app has to decide on its own what to wait for, and most apps just wait",
+      "Old app versions in the field depend on exactly today's service responses, so no team can change theirs"
+    ]
+  },
+  "nodes": [
+    {
+      "id": "app",
+      "label": "Mobile app",
+      "kind": "client",
+      "x": 37,
+      "y": 63
+    },
+    {
+      "id": "profile",
+      "label": "Profile service",
+      "kind": "compute",
+      "x": 37,
+      "y": 37
+    },
+    {
+      "id": "orders",
+      "label": "Orders service",
+      "kind": "compute",
+      "x": 37,
+      "y": 88
+    },
+    {
+      "id": "recs",
+      "label": "Recommendations",
+      "kind": "compute",
+      "x": 62,
+      "y": 37
+    },
+    {
+      "id": "promos",
+      "label": "Promotions",
+      "kind": "compute",
+      "x": 62,
+      "y": 88
+    },
+    {
+      "id": "bff",
+      "label": "Mobile BFF",
+      "kind": "edge",
+      "x": 62,
+      "y": 63,
+      "at": 1
+    },
+    {
+      "id": "guard",
+      "label": "Timeouts and breakers",
+      "kind": "compute",
+      "x": 87,
+      "y": 63,
+      "at": 2
+    },
+    {
+      "id": "rules",
+      "label": "Version rules",
+      "kind": "data",
+      "x": 87,
+      "y": 88,
+      "at": 3
+    },
+    {
+      "id": "cache",
+      "label": "Response cache",
+      "kind": "data",
+      "x": 87,
+      "y": 37,
+      "at": 4
+    },
+    {
+      "id": "coalesce",
+      "label": "Request coalescer",
+      "kind": "compute",
+      "x": 87,
+      "y": 12,
+      "at": 5
+    },
+    {
+      "id": "feed",
+      "label": "Change feed",
+      "kind": "async",
+      "x": 12,
+      "y": 88,
+      "at": 6
+    }
+  ],
+  "edges": [
+    {
+      "from": "app",
+      "to": "profile",
+      "at": 0,
+      "until": 1
+    },
+    {
+      "from": "app",
+      "to": "orders",
+      "at": 0,
+      "until": 1
+    },
+    {
+      "from": "app",
+      "to": "recs",
+      "at": 0,
+      "until": 1
+    },
+    {
+      "from": "app",
+      "to": "promos",
+      "at": 0,
+      "until": 1
+    },
+    {
+      "from": "app",
+      "to": "bff",
+      "at": 1
+    },
+    {
+      "from": "bff",
+      "to": "profile",
+      "at": 1
+    },
+    {
+      "from": "bff",
+      "to": "orders",
+      "at": 1
+    },
+    {
+      "from": "bff",
+      "to": "recs",
+      "at": 1
+    },
+    {
+      "from": "bff",
+      "to": "promos",
+      "at": 1
+    },
+    {
+      "from": "bff",
+      "to": "guard",
+      "at": 2
+    },
+    {
+      "from": "rules",
+      "to": "bff",
+      "at": 3
+    },
+    {
+      "from": "bff",
+      "to": "cache",
+      "at": 4
+    },
+    {
+      "from": "cache",
+      "to": "coalesce",
+      "at": 5
+    },
+    {
+      "from": "coalesce",
+      "to": "recs",
+      "at": 5
+    },
+    {
+      "from": "feed",
+      "to": "bff",
+      "at": 6
+    },
+    {
+      "from": "feed",
+      "to": "app",
+      "at": 6
+    }
+  ],
+  "steps": [
+    {
+      "title": "Put one screen-shaped endpoint in front of the services",
+      "problem": "The phone makes five or six round trips on a mobile network, where each round trip costs 100 ms or more, and it downloads whole service objects to show a few fields.",
+      "fix": "Add a backend for frontend (BFF) that belongs to the mobile app team. It exposes one endpoint per screen, such as GET /v1/home. The BFF calls the services over the fast datacenter network, where a round trip is about 2 ms, joins the results, and returns exactly the fields the screen draws. The app makes one request, and the services never see a phone. The BFF has no business rules of its own and no database of record: it only aggregates and reshapes.",
+      "tradeoff": "One round trip over the slow link replaces many, and the app is decoupled from the service layout. The BFF is a new service to run, and the team owning it must resist the pull to put real logic in it. Its endpoints follow screens, so a redesigned screen means a BFF change.",
+      "concepts": [
+        {
+          "slug": "latency-and-round-trips"
+        },
+        {
+          "slug": "api-gateway"
+        },
+        {
+          "slug": "api-styles"
+        },
+        {
+          "slug": "proxies"
+        }
+      ]
+    },
+    {
+      "title": "Fan out in parallel, with a timeout for each call",
+      "problem": "Calling the services one after another adds their times together, and a single hung service holds the whole screen until the connection gives up, often 8 seconds or more.",
+      "fix": "Start every call that does not depend on another at once, and give each its own timeout, set from how important the part is and how fast the service normally is. A required part, such as the profile, gets a generous timeout and one retry. An optional part, such as recommendations, gets a tight one. A circuit breaker per service stops calling one that keeps failing. Each part of the reply is marked as fresh, stale or missing, so the app can draw what it has and hide what it lacks.",
+      "tradeoff": "The screen time becomes the slowest allowed call, not the slowest actual call, and a sick optional service costs one blank section, not the screen. Timeouts also turn a rare slow reply into a missing part, so they must be tuned from real percentiles, and every screen needs a decision about which parts are required.",
+      "concepts": [
+        {
+          "slug": "timeouts-and-deadlines"
+        },
+        {
+          "slug": "graceful-degradation"
+        },
+        {
+          "slug": "circuit-breaker"
+        },
+        {
+          "slug": "bulkhead"
+        },
+        {
+          "slug": "retries-and-backoff"
+        }
+      ]
+    },
+    {
+      "title": "Shape the response to the app version",
+      "problem": "Old and new app versions live side by side for months, and the services return big objects. Sending everything wastes bytes, and changing a field can crash the apps that already shipped.",
+      "fix": "The app sends its version in a header, and a rules table says which parts and fields each version understands. The BFF skips calls the old app would not display, trims every part to the fields on the screen, and uses short names and compact numbers. Responses only ever add fields, and removing one needs a release of the app first. Large images are sent as links with a size chosen from the device. Responses are compressed with gzip or brotli.",
+      "tradeoff": "A typical screen shrinks from about 70 KB to 6 KB, and old apps keep working. The rules table is one more thing to keep correct, and the BFF carries every version still in use. A version policy, such as a minimum supported version, is needed to retire them.",
+      "concepts": [
+        {
+          "slug": "api-versioning"
+        },
+        {
+          "slug": "schema-evolution-and-compatibility"
+        },
+        {
+          "slug": "feature-flags"
+        },
+        {
+          "slug": "http-versions"
+        }
+      ]
+    },
+    {
+      "title": "Cache the assembled screen and answer with ETags",
+      "problem": "Most opens return exactly what the app already has, yet each one costs six backend calls and a full download over the mobile network.",
+      "fix": "Cache assembled parts in the BFF, keyed by user, version and part, with a short time to live that fits how fast the data changes. Every response carries an ETag, a hash of the body. The app sends it back in If-None-Match, and when nothing changed the BFF answers 304 with no body, which is a few hundred bytes. Shared parts, such as promotions, are cached once for everyone, and the personal ones are cached per user. Stale copies are kept a while longer to fill in when a service is down.",
+      "tradeoff": "Many opens cost no backend call, and many cost almost no bytes. The data can be up to one time to live old, and a cache key that forgets the user or the version can show one person's data to another, which is a serious bug and needs tests.",
+      "concepts": [
+        {
+          "slug": "http-caching-headers"
+        },
+        {
+          "slug": "optimistic-concurrency-and-etags"
+        },
+        {
+          "slug": "caching"
+        },
+        {
+          "slug": "cdn"
+        }
+      ]
+    },
+    {
+      "title": "Coalesce identical requests so a spike does not reach the services",
+      "problem": "A push notification brings two million people to the home screen within a minute, and each one triggers the same shared calls, so the services see the spike multiplied by the number of calls per screen.",
+      "fix": "In front of the services, identical in-flight requests are merged: the first request for the promotions of today's campaign makes the call, and the thousands that arrive while it is running wait for its answer. When the cache entry expires, one request refreshes it while the others get the stale copy, and the expiry times get a little random jitter. Per-service concurrency limits keep one slow service from using up all the BFF's workers.",
+      "tradeoff": "The backend sees one call where there would have been thousands, and the spike turns into a smooth load. Waiting requests share one failure, so a failed call needs a short negative cache, and merging only suits answers that are the same for everyone.",
+      "concepts": [
+        {
+          "slug": "load-shedding"
+        },
+        {
+          "slug": "bulkhead"
+        },
+        {
+          "slug": "backpressure"
+        },
+        {
+          "slug": "hedged-requests-and-tail-latency"
+        },
+        {
+          "slug": "rate-limiting"
+        }
+      ]
+    },
+    {
+      "title": "Sync with tokens so the app works offline",
+      "problem": "A user opens the app in a lift, on a train, or after two days without a signal, and a full reload of everything is slow, costly and may fail on a weak connection.",
+      "fix": "The app keeps the last screen on the phone and shows it at once, then refreshes in the background. For lists that change, such as orders and the inbox, the response includes a sync token, an opaque marker of a position in a change feed. The app sends the token back and receives only what changed since, plus a new token. If the token is too old, the BFF says so and the app does a full reload. Writes made offline are queued on the phone and sent with an idempotency key, so a retry does not duplicate them.",
+      "tradeoff": "The app opens instantly, uses little data, and survives bad networks. The change feed must keep its history for a while and then compact it, conflicts between offline edits need a rule, and the app has more logic to test.",
+      "concepts": [
+        {
+          "slug": "idempotency"
+        },
+        {
+          "slug": "pagination"
+        },
+        {
+          "slug": "delivery-guarantees"
+        },
+        {
+          "slug": "message-queues"
+        },
+        {
+          "slug": "consistency-models"
+        }
+      ]
+    }
+  ],
+  "failures": [
+    {
+      "scenario": "The recommendations service hangs",
+      "impact": "Without protection every home-screen request waits for it, and the BFF's workers fill up with waiting calls, so even the profile and orders stop loading.",
+      "answer": "The 100 ms timeout cuts the call, the circuit breaker opens after a few failures and stops calling for a while, and the part is filled from a stale cached copy or left out. A separate pool of workers for this service means it can never use up all the capacity. The response says which parts are missing, and an alert fires on the rising timeout rate.",
+      "concepts": [
+        {
+          "slug": "circuit-breaker"
+        },
+        {
+          "slug": "bulkhead"
+        },
+        {
+          "slug": "timeouts-and-deadlines"
+        },
+        {
+          "slug": "alerting"
+        }
+      ]
+    },
+    {
+      "scenario": "A required service, such as orders, is down",
+      "impact": "The screen cannot be built honestly, because an empty orders list would be a lie about what the customer owns.",
+      "answer": "The BFF returns the parts it has with the orders part marked as unavailable, and the app shows a clear message with a retry, or the last copy from the phone with its age. It does not invent an empty list. Retries use backoff with jitter, and the request is not repeated by both the app and the BFF without limit.",
+      "concepts": [
+        {
+          "slug": "graceful-degradation"
+        },
+        {
+          "slug": "retries-and-backoff"
+        },
+        {
+          "slug": "health-checks"
+        },
+        {
+          "slug": "slos-and-error-budgets"
+        }
+      ]
+    },
+    {
+      "scenario": "A new BFF release removes a field that an old app needs",
+      "impact": "Every phone still on the old version crashes or shows a blank screen, and the fix is not in the user's hands, since they cannot be forced to update at once.",
+      "answer": "Contract tests replay recorded requests from every supported app version against the new BFF before release, and a canary deploy sends a small share of traffic to it first. Fields are only added, never removed, while any supported version uses them. Rolling back is a config change, and a minimum-version gate eventually retires the oldest apps.",
+      "concepts": [
+        {
+          "slug": "api-versioning"
+        },
+        {
+          "slug": "schema-evolution-and-compatibility"
+        },
+        {
+          "slug": "canary-deployments"
+        },
+        {
+          "slug": "feature-flags"
+        }
+      ]
+    },
+    {
+      "scenario": "A cache key forgets the user and shows someone else's orders",
+      "impact": "A privacy breach: one customer sees another's data, and an ETag shared by both can even make the wrong body look unchanged.",
+      "answer": "Personal parts are always keyed by the authenticated user id from the verified token, never from a request parameter, and responses that contain them are marked private so shared caches skip them. Shared and personal parts live in separate caches. A test that signs in as two users and compares bodies runs on every build.",
+      "concepts": [
+        {
+          "slug": "authentication-and-authorization"
+        },
+        {
+          "slug": "http-caching-headers"
+        },
+        {
+          "slug": "jwt-and-session-tokens"
+        },
+        {
+          "slug": "caching"
+        }
+      ]
+    },
+    {
+      "scenario": "A sync token is older than the change feed's history",
+      "impact": "The BFF cannot say what changed since then, and sending nothing would leave the app with a silently wrong list.",
+      "answer": "The BFF answers that the token has expired, and the app discards its local copy of that list and loads it again from scratch, getting a fresh token. The history is kept for long enough, such as 30 days, that this is rare, and the response carries a version so a change in token format is handled the same way.",
+      "concepts": [
+        {
+          "slug": "pagination"
+        },
+        {
+          "slug": "message-queues"
+        },
+        {
+          "slug": "consistency-models"
+        },
+        {
+          "slug": "delivery-guarantees"
+        }
+      ]
+    }
+  ],
+  "alternatives": [
+    {
+      "title": "How the screen is assembled",
+      "options": [
+        {
+          "name": "The app calls the services itself",
+          "pro": "No extra service to run",
+          "con": "Many slow round trips, big payloads, and backend changes force app releases"
+        },
+        {
+          "name": "A BFF with an endpoint per screen",
+          "pro": "One round trip, a tiny payload, and the mobile team controls the shape",
+          "con": "One more service, and screen changes need BFF changes"
+        },
+        {
+          "name": "A general GraphQL gateway",
+          "pro": "The app asks for any shape and the services stay independent",
+          "con": "Needs cost limits and caching work, and it is heavier to run"
+        }
+      ],
+      "pick": "A BFF with a screen endpoint. Use GraphQL when many different clients need many different shapes."
+    },
+    {
+      "title": "How many BFFs",
+      "options": [
+        {
+          "name": "One BFF for every client",
+          "pro": "Less to run",
+          "con": "It becomes a compromise between web, iOS and Android needs"
+        },
+        {
+          "name": "One BFF per client type",
+          "pro": "Each team ships on its own schedule with the shape it needs",
+          "con": "Some duplicated code and more services"
+        }
+      ],
+      "pick": "One BFF for the mobile apps, shared by iOS and Android, and a separate one for the web."
+    },
+    {
+      "title": "What to do with a slow part",
+      "options": [
+        {
+          "name": "Wait for it",
+          "pro": "The data is always complete",
+          "con": "One sick service makes every screen slow"
+        },
+        {
+          "name": "Cut it off and leave it out",
+          "pro": "A bounded response time",
+          "con": "Blank sections, and rare slow replies become missing data"
+        },
+        {
+          "name": "Cut it off and use a stale copy",
+          "pro": "Bounded time and a full screen",
+          "con": "The data may be old and must be marked as such"
+        }
+      ],
+      "pick": "A stale copy for optional parts, a retry for required ones, and an honest error when a required part is really missing."
+    },
+    {
+      "title": "How the app catches up after being offline",
+      "options": [
+        {
+          "name": "Reload the full screen",
+          "pro": "Simple and always correct",
+          "con": "Slow and costly on a bad network"
+        },
+        {
+          "name": "Sync tokens over a change feed",
+          "pro": "Only what changed is sent, and the app can work from a local copy",
+          "con": "A feed with history, a token-expiry rule and conflict handling"
+        },
+        {
+          "name": "Push every change",
+          "pro": "The screen is always current",
+          "con": "Costs battery and a connection, and it does not help an app that was asleep"
+        }
+      ],
+      "pick": "Full reload for the first open, sync tokens for the lists that change, and push only as a hint to sync."
+    }
+  ],
+  "roles": [
+    {
+      "id": "client",
+      "label": "Mobile app",
+      "description": "The phone, with its local copy of the last screen."
+    },
+    {
+      "id": "edge",
+      "label": "Mobile BFF",
+      "description": "The aggregation endpoint that the app talks to."
+    },
+    {
+      "id": "async",
+      "label": "Change feed",
+      "description": "The ordered log of changes that the sync tokens point into."
+    },
+    {
+      "id": "compute",
+      "label": "Services and guards",
+      "description": "The microservices, plus timeouts, breakers and coalescing."
+    },
+    {
+      "id": "data",
+      "label": "Rules and cache",
+      "description": "The version rules and the cached screen parts."
+    }
+  ]
+}

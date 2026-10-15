@@ -1,0 +1,103 @@
+---
+import PlaygroundShell from '../../components/PlaygroundShell.astro';
+---
+<PlaygroundShell title="Reconnect storm" hint="A zone fails and its clients all try to reconnect at second 0. Change how clients retry and whether the gateway sheds excess handshakes, and watch how long recovery takes.">
+  <ol class="how">
+    <li>The default is <b>retry every 1 second, no admission control</b>, with 20,000 clients and 800 handshakes a second: everyone retries in lockstep, the gateway drowns in handshakes, and it needs about <b>91 seconds</b> and roughly <b>a million attempts</b> to connect everyone.</li>
+    <li>Switch to <b>exponential backoff with full jitter</b>: the same clients finish in about <b>70 seconds</b> with around <b>104,000</b> attempts, ten times fewer, because retries spread out.</li>
+    <li>Also turn <b>admission control on</b> (excess handshakes are refused cheaply): jitter finishes in about <b>42 seconds</b>. Try <b>exponential backoff without jitter</b>: the clients stay in lockstep, wave after wave overloads the gateway, and after 180 seconds most are still not connected.</li>
+  </ol>
+  <div class="pg wsb" data-wsb>
+    <div class="pg-row">
+      <label>Clients retry with <select class="pg-in" data-s>
+        <option value="fixed" selected>a fixed 1 second delay</option>
+        <option value="exp">exponential backoff, no jitter</option>
+        <option value="jitter">exponential backoff, full jitter</option>
+      </select></label>
+      <label>Clients that lost their connection <select class="pg-in" data-n>
+        <option value="10000">10,000</option>
+        <option value="20000" selected>20,000</option>
+        <option value="40000">40,000</option>
+      </select></label>
+      <label>Handshakes the gateway completes per second <select class="pg-in" data-c>
+        <option value="400">400</option>
+        <option value="800" selected>800</option>
+        <option value="1600">1,600</option>
+      </select></label>
+      <label>Admission control <select class="pg-in" data-shed>
+        <option value="off" selected>off: every attempt costs a handshake</option>
+        <option value="on">on: excess attempts are refused cheaply</option>
+      </select></label>
+    </div>
+    <div class="pg-grid">
+      <div class="pg-box" data-b1><h3>Time until 99% are connected</h3><span class="pg-mono" data-o1></span><span class="pg-note" data-n1></span></div>
+      <div class="pg-box" data-b2><h3>Connection attempts made</h3><span class="pg-mono" data-o2></span><span class="pg-note" data-n2></span></div>
+      <div class="pg-box" data-b3><h3>Seconds when the gateway thrashed</h3><span class="pg-mono" data-o3></span><span class="pg-note" data-n3></span></div>
+    </div>
+    <div class="wsb-chart" role="img" aria-label="Connection attempts in each 10-second period, from 0 to 180 seconds" data-chart></div>
+    <p class="pg-note">Attempts per 10 seconds, on a square-root scale. Left is second 0, right is second 180.</p>
+    <p class="pg-out" data-verdict aria-live="polite"></p>
+    <p class="pg-note">Model: one step per second for 180 seconds. A failed attempt retries after 1 s (fixed), after min(60, 2 to the power of the failures so far minus 1) seconds (exponential), or after a random 1 to min(60, 2 to the power of the failures so far) seconds (jitter). Without admission control, a second with more than 3 times the gateway's capacity in attempts makes it thrash, and it completes only a quarter of its usual handshakes. With admission control it always completes its full rate, and the rest are refused at no cost. These numbers are a model, not a measurement.</p>
+  </div>
+</PlaygroundShell>
+<style is:global>
+  .playground .wsb-chart { display: flex; align-items: flex-end; gap: 3px; height: 90px; margin: 12px 0 4px; }
+  .playground .wsb-chart span { flex: 1 1 0; min-width: 0; background: var(--accent); border-radius: 2px 2px 0 0; }
+</style>
+<script>
+  document.querySelectorAll<HTMLElement>('[data-wsb]').forEach((root) => {
+    const q = <T extends HTMLElement>(s: string) => root.querySelector<T>(s)!;
+    const T = 180; const BUCKET = 10;
+    const cache = new Map<string, { per: number[]; total: number; t99: number; connected: number; thrash: number }>();
+    function sim(strategy: string, N: number, cap: number, shed: boolean) {
+      let seed = 7; const rnd = (k: number) => { seed = (seed * 1664525 + 1013904223) % 4294967296; return Math.floor(seed / 65536) % k; };
+      const next = new Int32Array(N); const fails = new Int32Array(N); const done = new Uint8Array(N);
+      const per = new Array<number>(T).fill(0); let connected = 0; let total = 0; let t99 = -1; let thrash = 0;
+      for (let t = 0; t < T; t++) {
+        const idx: number[] = [];
+        for (let i = 0; i < N; i++) if (!done[i] && next[i] <= t) idx.push(i);
+        const a = idx.length; per[t] = a; total += a;
+        const over = !shed && a > 3 * cap; const eff = over ? Math.floor(cap / 4) : cap; if (over) thrash++;
+        let ok = 0;
+        for (const i of idx) {
+          if (ok < eff) { ok++; done[i] = 1; connected++; }
+          else {
+            fails[i]++; const n = fails[i];
+            const d = strategy === 'fixed' ? 1 : strategy === 'exp' ? Math.min(60, 2 ** (n - 1)) : 1 + rnd(Math.min(60, 2 ** n));
+            next[i] = t + d;
+          }
+        }
+        if (t99 < 0 && connected >= N * 0.99) t99 = t + 1;
+      }
+      return { per, total, t99, connected, thrash };
+    }
+    const chart = q('[data-chart]');
+    const bars = Array.from({ length: T / BUCKET }, () => { const b = document.createElement('span'); chart.append(b); return b; });
+    const fmt = (n: number) => n.toLocaleString('en-US');
+    function draw() {
+      const s = q<HTMLSelectElement>('[data-s]').value; const N = Number(q<HTMLSelectElement>('[data-n]').value); const cap = Number(q<HTMLSelectElement>('[data-c]').value); const shed = q<HTMLSelectElement>('[data-shed]').value === 'on';
+      const key = `${s}|${N}|${cap}|${shed}`;
+      if (!cache.has(key)) cache.set(key, sim(s, N, cap, shed));
+      const r = cache.get(key)!;
+      const ok = r.t99 >= 0;
+      q('[data-o1]').textContent = ok ? `${r.t99} s` : `not within ${T} s`;
+      q('[data-n1]').textContent = ok ? `the minimum possible is ${Math.ceil((N * 0.99) / cap)} s at ${fmt(cap)} per second` : `${fmt(r.connected)} of ${fmt(N)} connected after ${T} s`;
+      q('[data-o2]').textContent = fmt(r.total);
+      q('[data-n2]').textContent = `${(r.total / N).toFixed(1)} attempts per client`;
+      q('[data-o3]').textContent = shed ? 'none (excess refused cheaply)' : `${r.thrash} of ${T}`;
+      q('[data-n3]').textContent = shed ? 'the gateway keeps its full handshake rate' : 'a thrashing second completes only a quarter of the usual handshakes';
+      const buckets = bars.map((_, i) => r.per.slice(i * BUCKET, (i + 1) * BUCKET).reduce((x, y) => x + y, 0));
+      const max = Math.max(...buckets, 1);
+      bars.forEach((b, i) => { b.style.height = `${Math.max(2, Math.round(100 * Math.sqrt(buckets[i] / max)))}%`; });
+      q<HTMLElement>('[data-b1]').style.setProperty('--c', ok ? 'var(--accent)' : 'var(--bad)');
+      q<HTMLElement>('[data-b2]').style.setProperty('--c', r.total > N * 10 ? 'var(--bad)' : 'var(--accent)');
+      q<HTMLElement>('[data-b3]').style.setProperty('--c', !shed && r.thrash > 0 ? 'var(--bad)' : 'var(--good)');
+      const out = q('[data-verdict]'); out.classList.toggle('bad', !ok || r.total > N * 10);
+      out.textContent = !ok ? `Not recovered: after ${T} seconds only ${fmt(r.connected)} of ${fmt(N)} clients are connected. ${s === 'exp' ? 'Without jitter the clients stay in lockstep: every wave is as large as the last, so each one overloads the gateway, and between waves its capacity sits idle.' : 'The gateway cannot clear the backlog because the attempts keep arriving faster than it can handle them.'}`
+        : r.total > N * 10 ? `Connected in ${r.t99} s, but with ${fmt(r.total)} attempts, ${(r.total / N).toFixed(0)} per client. Most of the work was refused handshakes that took capacity from the ones that could have succeeded.`
+        : `Connected in ${r.t99} s with ${fmt(r.total)} attempts, ${(r.total / N).toFixed(1)} per client. ${s === 'jitter' ? 'Random delays spread the retries so the gateway sees a stream, not waves.' : (shed ? 'Excess attempts were refused cheaply, so the gateway always used its full handshake rate.' : 'The gateway never reached the overload threshold, so no handshake capacity was wasted.')}`;
+    }
+    root.addEventListener('change', draw);
+    draw();
+  });
+</script>

@@ -1,0 +1,498 @@
+{
+  "name": "Design a Service Discovery Registry",
+  "difficulty": "advanced",
+  "intent": "Let thousands of service instances that start, stop and move all the time be found by their callers within seconds, without sending traffic to dead instances and without making the registry itself the thing that takes everything down.",
+  "codeTitle": "a lease registry with self-preservation and a watching client cache",
+  "finalIntro": "One instance joining, one dying, and a network partition that the registry refuses to believe.",
+  "prompt": "Design the registry that a fleet of 20,000 microservice instances uses to find each other. Instances are replaced several times a day by deploys and autoscaling and get new addresses each time. A caller must be able to ask for the healthy addresses of a named service, and must learn quickly when they change. The fleet runs in three zones.",
+  "functional": [
+    "An instance registers its name, address, port and metadata when it starts, and deregisters when it stops",
+    "A caller looks up the healthy instances of a service by name",
+    "An instance that crashes or hangs disappears from lookups without anyone removing it by hand",
+    "Callers can watch a service and be told about changes instead of polling",
+    "Instances carry metadata such as zone, version and weight, so callers can prefer the near ones or send a share to a canary",
+    "Lookups keep working in each zone even when the zones cannot reach each other"
+  ],
+  "nonFunctional": [
+    "A crashed instance stops receiving traffic within about 30 to 90 seconds, and a clean shutdown within a few seconds",
+    "Lookups are served from memory in under 10 ms, and almost always from the caller's own cache",
+    "Handle tens of thousands of heartbeats per minute and hundreds of watchers without falling over",
+    "Favour availability: a slightly stale answer beats no answer, because discovery is on the path of every call",
+    "A network problem between the registry and the fleet must not empty the registry and cause an outage",
+    "No single registry node, and no single zone, can take the whole fleet's discovery down"
+  ],
+  "firstAttempt": {
+    "text": "A configuration file, or a DNS name with a fixed list of addresses, that lists the instances of each service. People edit it when they deploy, and callers read it at start-up or every few minutes. Calls that fail are retried.",
+    "limits": [
+      "Someone must edit the list for every deploy and every scale-up, and they forget",
+      "A dead instance stays in the list until a person notices, so a share of calls keeps failing",
+      "Callers read the list rarely, so new capacity sits idle and removed instances still get traffic for minutes",
+      "DNS caches and ignores ports, so a changed address is seen at different times by different callers",
+      "There is no health information, and no metadata for zones or versions"
+    ]
+  },
+  "nodes": [
+    {
+      "id": "callers",
+      "label": "Callers",
+      "kind": "client",
+      "x": 87,
+      "y": 37
+    },
+    {
+      "id": "instances",
+      "label": "Service instances",
+      "kind": "compute",
+      "x": 62,
+      "y": 12
+    },
+    {
+      "id": "static",
+      "label": "Hand-edited list",
+      "kind": "data",
+      "x": 87,
+      "y": 63,
+      "at": 0,
+      "until": 1
+    },
+    {
+      "id": "api",
+      "label": "Registry API",
+      "kind": "edge",
+      "x": 62,
+      "y": 37,
+      "at": 1
+    },
+    {
+      "id": "registry",
+      "label": "Registry store",
+      "kind": "data",
+      "x": 37,
+      "y": 37,
+      "at": 1
+    },
+    {
+      "id": "checker",
+      "label": "Health checker",
+      "kind": "compute",
+      "x": 37,
+      "y": 12,
+      "at": 2
+    },
+    {
+      "id": "cache",
+      "label": "Client cache",
+      "kind": "data",
+      "x": 62,
+      "y": 63,
+      "at": 3
+    },
+    {
+      "id": "watch",
+      "label": "Watch stream",
+      "kind": "async",
+      "x": 37,
+      "y": 63,
+      "at": 3
+    },
+    {
+      "id": "guard",
+      "label": "Self-preservation",
+      "kind": "compute",
+      "x": 12,
+      "y": 37,
+      "at": 4
+    },
+    {
+      "id": "peer",
+      "label": "Zone B registry",
+      "kind": "data",
+      "x": 12,
+      "y": 63,
+      "at": 5
+    },
+    {
+      "id": "eject",
+      "label": "Outlier ejection",
+      "kind": "compute",
+      "x": 37,
+      "y": 88,
+      "at": 6
+    }
+  ],
+  "edges": [
+    {
+      "from": "callers",
+      "to": "static",
+      "at": 0,
+      "until": 1
+    },
+    {
+      "from": "callers",
+      "to": "instances",
+      "at": 0
+    },
+    {
+      "from": "instances",
+      "to": "api",
+      "at": 1
+    },
+    {
+      "from": "callers",
+      "to": "api",
+      "at": 1,
+      "until": 3
+    },
+    {
+      "from": "api",
+      "to": "registry",
+      "at": 1
+    },
+    {
+      "from": "checker",
+      "to": "instances",
+      "at": 2
+    },
+    {
+      "from": "checker",
+      "to": "registry",
+      "at": 2
+    },
+    {
+      "from": "registry",
+      "to": "watch",
+      "at": 3
+    },
+    {
+      "from": "watch",
+      "to": "cache",
+      "at": 3
+    },
+    {
+      "from": "cache",
+      "to": "callers",
+      "at": 3
+    },
+    {
+      "from": "guard",
+      "to": "registry",
+      "at": 4
+    },
+    {
+      "from": "registry",
+      "to": "peer",
+      "at": 5
+    },
+    {
+      "from": "eject",
+      "to": "cache",
+      "at": 6
+    }
+  ],
+  "steps": [
+    {
+      "title": "Register and deregister in a registry",
+      "problem": "A hand-edited list is wrong the moment a deploy finishes, and nobody edits it for autoscaling at three in the morning.",
+      "fix": "Make the instances report themselves. On start-up an instance calls the registry API with its service name, address, port, zone, version and weight, and the registry stores it in a map from service name to the set of instances. On a clean shutdown it deregisters. A caller asks the registry for the instances of a name and gets back the current set. The registry keeps its map in memory, because it is small (20,000 entries of a few hundred bytes are a few megabytes), and a lookup is a hash lookup.",
+      "tradeoff": "The list now maintains itself for the clean cases, and metadata travels with every entry. A crash never deregisters, so the registry fills with ghosts unless something else removes them, and the registry has become a dependency of every service.",
+      "concepts": [
+        {
+          "slug": "dns"
+        },
+        {
+          "slug": "load-balancing"
+        },
+        {
+          "slug": "api-gateway"
+        },
+        {
+          "slug": "caching"
+        }
+      ]
+    },
+    {
+      "title": "Renew a lease with heartbeats, and add health checks",
+      "problem": "Instances crash, are killed by the kernel, or hang while still holding their port. They never get to say goodbye.",
+      "fix": "Registration is a lease with a time to live, for example 30 seconds. The instance sends a heartbeat every 10 seconds, which renews the lease, so the lease survives two lost heartbeats. A sweep in the registry removes entries whose lease has run out. Heartbeats prove that the process is running, not that it works, so a health checker also calls each instance's health endpoint, and an instance that answers badly is marked down or has its lease cut, while an instance can also report its own state as starting, up, draining or down.",
+      "tradeoff": "Dead instances disappear by themselves, within about one lease time. A shorter lease finds failures sooner but multiplies heartbeat traffic and removes instances during a short pause such as a garbage collection, and a longer lease keeps dead instances in the list for longer.",
+      "concepts": [
+        {
+          "slug": "health-checks"
+        },
+        {
+          "slug": "failure-detection"
+        },
+        {
+          "slug": "leases-and-fencing-tokens"
+        },
+        {
+          "slug": "timeouts-and-deadlines"
+        }
+      ]
+    },
+    {
+      "title": "Let callers cache the answer and watch for changes",
+      "problem": "If every call looks up the registry, the registry sees every call in the company, and it adds a network round trip to each one.",
+      "fix": "Callers keep a local copy of the instances of the services they use, choose among them themselves (client-side discovery), and hold a watch stream open to the registry. The registry gives each change a version number and pushes the changes as small events: instance added, instance removed. A caller applies the events in order, and if it sees a gap or reconnects, it fetches a full snapshot and then carries on from its version. The alternative, server-side discovery, puts a load balancer or a sidecar proxy between the caller and the instances, so callers need no discovery code, at the price of another hop and another thing to run.",
+      "tradeoff": "Lookups cost nothing and changes arrive in about a second, and the registry's load depends on the number of changes and watchers, not on traffic. Each caller needs a discovery library, in every language, and every caller can hold a slightly different view at any moment.",
+      "concepts": [
+        {
+          "slug": "caching"
+        },
+        {
+          "slug": "pub-sub"
+        },
+        {
+          "slug": "real-time-communication"
+        },
+        {
+          "slug": "proxies"
+        },
+        {
+          "slug": "load-balancing"
+        }
+      ]
+    },
+    {
+      "title": "Stop evicting when the network is the problem",
+      "problem": "When a switch fails between the fleet and the registry, thousands of healthy instances stop being heard at once. A registry that believes the silence evicts them all and tells every caller that nothing exists.",
+      "fix": "Compare what is happening with what should be happening. The registry knows how many heartbeats to expect per minute, and when the renewals received fall below a threshold, such as 85 percent of that, it enters self-preservation mode: it stops expiring leases and keeps serving the last known list. Individual deregistrations still work. The mode ends by itself when renewals recover. Callers that cached the list keep calling instances that are in fact healthy.",
+      "tradeoff": "A partition no longer turns into an outage. While the mode is on, instances that really died stay in the list, so callers must tolerate some failures with retries and ejection, and the threshold needs choosing, because a very small fleet or a very large real outage looks the same as a partition.",
+      "concepts": [
+        {
+          "slug": "cap-theorem"
+        },
+        {
+          "slug": "graceful-degradation"
+        },
+        {
+          "slug": "failure-detection"
+        },
+        {
+          "slug": "circuit-breaker"
+        }
+      ]
+    },
+    {
+      "title": "Replicate across zones, and serve each zone locally",
+      "problem": "One registry in one zone is a single point of failure for discovery of the whole fleet, and cross-zone lookups are slower and fail when a zone is cut off.",
+      "fix": "Run a registry cluster in each zone. Instances register with the registry of their own zone, and the registries replicate every change to their peers, asynchronously and without electing a leader, with a version or timestamp on each entry so the newest wins. Callers read from their own zone first and fall back to another zone when their zone has nothing healthy. If two zones cannot talk, each keeps serving what it knows and merges when the link returns.",
+      "tradeoff": "Discovery survives the loss of a zone or of the links between zones, and local reads are fast. The registries are only eventually consistent, so for a short while one zone may list an instance that another has already removed, and conflicting updates need a rule such as the latest version wins.",
+      "concepts": [
+        {
+          "slug": "database-replication"
+        },
+        {
+          "slug": "consistency-models"
+        },
+        {
+          "slug": "multi-region-failover"
+        },
+        {
+          "slug": "cap-theorem"
+        },
+        {
+          "slug": "logical-clocks"
+        }
+      ]
+    },
+    {
+      "title": "Assume the list is stale, and drain instances gracefully",
+      "problem": "Whatever the registry says, it was true a few seconds ago. Instances shut down, networks stall and caches lag, so some calls always go to an address that is no longer there.",
+      "fix": "Make the stale cases cheap. An instance that is told to stop first marks itself draining, deregisters, waits a few seconds for the callers' caches to catch up and finishes its current requests, and only then exits. Callers set short connect timeouts, retry a failed call on a different instance, and eject an instance from their own list after several consecutive failures for a while, which also covers an instance the registry still believes in. Heartbeats and watch reconnections are spread with jitter, so a restart does not make every client arrive at the same second.",
+      "tradeoff": "Deploys are almost invisible to callers, and a stale entry costs one retry instead of an error. Shutdown takes a few seconds longer, retries need a budget so they cannot become a flood, and callers carry some resilience logic.",
+      "concepts": [
+        {
+          "slug": "retries-and-backoff"
+        },
+        {
+          "slug": "circuit-breaker"
+        },
+        {
+          "slug": "blue-green-and-rolling-deployments"
+        },
+        {
+          "slug": "timeouts-and-deadlines"
+        },
+        {
+          "slug": "graceful-degradation"
+        }
+      ]
+    }
+  ],
+  "failures": [
+    {
+      "scenario": "A switch fails and 40 percent of the instances stop being heard",
+      "impact": "Without protection the registry expires their leases and removes healthy instances. The remaining ones are overloaded and fail, and callers see an empty list.",
+      "answer": "Renewals fall below the 85 percent threshold, so the registry enters self-preservation and stops expiring leases. The last known list stays in place and serves calls. When the switch is repaired the heartbeats return and the mode ends. Real deaths during the partition are handled by callers' retries and ejection.",
+      "concepts": [
+        {
+          "slug": "failure-detection"
+        },
+        {
+          "slug": "graceful-degradation"
+        },
+        {
+          "slug": "cap-theorem"
+        },
+        {
+          "slug": "bulkhead"
+        }
+      ]
+    },
+    {
+      "scenario": "A registry node dies",
+      "impact": "Instances homed on it cannot renew, and their leases would run out on the other nodes.",
+      "answer": "Instances and callers know several registry addresses and move to another one on an error, and a registration to one node reaches the others by replication. Callers keep serving from their cache while they reconnect, and reconnections are spread with jitter.",
+      "concepts": [
+        {
+          "slug": "database-replication"
+        },
+        {
+          "slug": "retries-and-backoff"
+        },
+        {
+          "slug": "health-checks"
+        }
+      ]
+    },
+    {
+      "scenario": "A caller's cache holds an instance that was removed seconds ago",
+      "impact": "A request goes to a closed port or to a different service that took over the address.",
+      "answer": "The connect fails quickly because of the short timeout, and the call is retried on another instance. After several failures the instance is ejected from the caller's list. Each instance also checks the expected service name and version in the request, so an address reused by another service rejects the call instead of answering wrongly.",
+      "concepts": [
+        {
+          "slug": "retries-and-backoff"
+        },
+        {
+          "slug": "circuit-breaker"
+        },
+        {
+          "slug": "timeouts-and-deadlines"
+        }
+      ]
+    },
+    {
+      "scenario": "A bad deploy makes every new instance register as healthy while failing real requests",
+      "impact": "Heartbeats are fine and the health endpoint says yes, so the registry sends traffic to a broken version.",
+      "answer": "The health endpoint should check real dependencies, and the instance should register as starting and become up only after a warm-up. Callers' outlier ejection and the load balancer's error rates catch what the registry cannot see, and a canary share by version metadata limits the damage.",
+      "concepts": [
+        {
+          "slug": "health-checks"
+        },
+        {
+          "slug": "canary-deployments"
+        },
+        {
+          "slug": "circuit-breaker"
+        },
+        {
+          "slug": "metrics"
+        }
+      ]
+    }
+  ],
+  "alternatives": [
+    {
+      "title": "Where the lookup happens",
+      "options": [
+        {
+          "name": "Client-side discovery",
+          "pro": "No extra hop, and the caller can use zone, weight and load in its own choice",
+          "con": "A library in every language, and every client has its own view"
+        },
+        {
+          "name": "Server-side discovery (load balancer or sidecar)",
+          "pro": "Callers stay simple, and one place applies policy",
+          "con": "An extra hop and one more component that must be highly available"
+        },
+        {
+          "name": "DNS records",
+          "pro": "Every language already knows how",
+          "con": "Caching ignores the time to live, there are no ports without SRV records, and changes spread slowly"
+        }
+      ],
+      "pick": "Client-side or sidecar discovery fed by watch streams, with DNS only for the registry's own address."
+    },
+    {
+      "title": "How the registry stores data",
+      "options": [
+        {
+          "name": "Strongly consistent store (a consensus cluster)",
+          "pro": "Every reader sees the same list, and it is easy to reason about",
+          "con": "A partition makes the minority side unable to write, which means unable to register or renew"
+        },
+        {
+          "name": "Eventually consistent, peer to peer",
+          "pro": "Stays up and writable on both sides of a partition",
+          "con": "Views differ for a moment, and conflicts need a rule"
+        }
+      ],
+      "pick": "Eventually consistent for discovery, because a stale answer is better than none; a consensus store is for locks and leadership, not for the address book."
+    },
+    {
+      "title": "How a dead instance is found",
+      "options": [
+        {
+          "name": "Heartbeats with a lease",
+          "pro": "Cheap, and the instance proves it is alive on its own",
+          "con": "Shows the process runs, not that it works"
+        },
+        {
+          "name": "The registry polls health endpoints",
+          "pro": "Tests the real path and needs no cooperation from the instance",
+          "con": "Load grows with the fleet, and the registry's network view may differ from the callers'"
+        },
+        {
+          "name": "Callers report failures",
+          "pro": "Fastest and closest to the truth",
+          "con": "A caller with a broken network can accuse healthy instances"
+        }
+      ],
+      "pick": "Heartbeats for liveness, a health check for readiness, and callers' own ejection for the rest."
+    },
+    {
+      "title": "How big the lease is",
+      "options": [
+        {
+          "name": "Short (10 seconds)",
+          "pro": "Failures leave the list quickly",
+          "con": "Three times the heartbeat load, and a pause of a few seconds evicts a live instance"
+        },
+        {
+          "name": "Long (90 seconds)",
+          "pro": "Few false evictions and light traffic",
+          "con": "A crashed instance receives calls for up to a minute and a half"
+        }
+      ],
+      "pick": "About 30 seconds with a 10-second heartbeat, plus caller-side ejection to cover the gap."
+    }
+  ],
+  "roles": [
+    {
+      "id": "client",
+      "label": "Callers",
+      "description": "Services that look up and call other services."
+    },
+    {
+      "id": "edge",
+      "label": "Registry API",
+      "description": "The entry point for register, heartbeat and lookup."
+    },
+    {
+      "id": "async",
+      "label": "Watch stream",
+      "description": "Versioned change events pushed to callers."
+    },
+    {
+      "id": "compute",
+      "label": "Instances and checks",
+      "description": "Service instances, the health checker, self-preservation and outlier ejection."
+    },
+    {
+      "id": "data",
+      "label": "Registry state",
+      "description": "The registry maps, replicas and client caches."
+    }
+  ]
+}

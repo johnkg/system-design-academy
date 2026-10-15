@@ -1,0 +1,548 @@
+{
+  "name": "Design a Delayed Job and Timer Service",
+  "difficulty": "advanced",
+  "intent": "Hold hundreds of millions of one-shot timers, each with an exact future moment, and deliver every one on time, at least once, even when nodes crash, clocks disagree and callers cancel.",
+  "codeTitle": "a hierarchical timing wheel with cancellation",
+  "finalIntro": "One timer, from the request that creates it to the callback that fires it.",
+  "prompt": "Design a service where any team can say 'call this endpoint, or put this message on that queue, at exactly this time in the future': a payment that expires in 30 minutes, a reminder tomorrow at 09:00, a retry in 90 seconds. There are hundreds of millions of timers waiting at any moment, a few thousand new ones per second, and some are cancelled before they are due. Unlike a cron-style job scheduler, nothing repeats: every timer fires once, and the question is how to find the due ones precisely and cheaply.",
+  "functional": [
+    "Create a timer with a fire time, a target (a queue or a callback URL) and a payload",
+    "Fire each timer at its fire time, delivering the payload to the target",
+    "Cancel a timer, or move it to another time, before it fires",
+    "Look up a timer's state by its id",
+    "Retry a failed delivery, and set aside a timer that can never be delivered",
+    "Fire a timer immediately if its time is already in the past when it is created"
+  ],
+  "nonFunctional": [
+    "Hold several hundred million waiting timers, with fire times from seconds to a year away",
+    "Fire within about a second of the fire time at the 99th percentile, and never before it",
+    "Never lose a timer that was accepted, even when a node or a zone fails",
+    "Deliver at least once, and make duplicates harmless for the receiver",
+    "Create thousands of timers per second, and fire tens of thousands per second at the peak",
+    "Cancelling a timer must be reliable: a cancelled timer should not fire, apart from a short race at the very edge"
+  ],
+  "firstAttempt": {
+    "text": "One database table with the fire time, the target and the payload. Every second a poller runs 'select the rows where the fire time is in the past and the status is waiting', sends each one, and marks it done. A second copy of the poller is added for safety.",
+    "limits": [
+      "The poll scans an index over hundreds of millions of rows every second, so the cost grows with the number of waiting timers instead of the number of due ones",
+      "The poll interval is the precision: a timer can be a whole second late, and a busy second can stretch it to many",
+      "Two pollers pick up the same rows, so every timer is sent twice, and a crash between sending and marking loses or repeats the timer",
+      "A burst of rows all due at 09:00:00 is picked up by one query and hits the database and the target at once",
+      "Cancelling races with the poller, and there is no way to tell whether a cancel arrived in time",
+      "All the timers sit on one machine, so its size and its write rate are the limit of the whole service"
+    ]
+  },
+  "nodes": [
+    {
+      "id": "clients",
+      "label": "Callers",
+      "kind": "client",
+      "x": 12,
+      "y": 88
+    },
+    {
+      "id": "single",
+      "label": "One table, polled",
+      "kind": "compute",
+      "x": 37,
+      "y": 88,
+      "at": 0,
+      "until": 1
+    },
+    {
+      "id": "api",
+      "label": "Timer API",
+      "kind": "edge",
+      "x": 37,
+      "y": 88,
+      "at": 1
+    },
+    {
+      "id": "store",
+      "label": "Time-bucketed timer store",
+      "kind": "data",
+      "x": 62,
+      "y": 88,
+      "at": 1
+    },
+    {
+      "id": "loader",
+      "label": "Bucket loader",
+      "kind": "compute",
+      "x": 62,
+      "y": 63,
+      "at": 2
+    },
+    {
+      "id": "wheel",
+      "label": "Timing wheels",
+      "kind": "compute",
+      "x": 62,
+      "y": 37,
+      "at": 2
+    },
+    {
+      "id": "claim",
+      "label": "Claim and lease",
+      "kind": "compute",
+      "x": 87,
+      "y": 63,
+      "at": 3
+    },
+    {
+      "id": "queue",
+      "label": "Delivery queue",
+      "kind": "async",
+      "x": 87,
+      "y": 37,
+      "at": 4
+    },
+    {
+      "id": "targets",
+      "label": "Target services",
+      "kind": "client",
+      "x": 62,
+      "y": 12,
+      "at": 4
+    },
+    {
+      "id": "dedup",
+      "label": "Dedup by timer id",
+      "kind": "data",
+      "x": 37,
+      "y": 12,
+      "at": 4
+    },
+    {
+      "id": "owners",
+      "label": "Partition owners",
+      "kind": "compute",
+      "x": 37,
+      "y": 63,
+      "at": 5
+    },
+    {
+      "id": "clock",
+      "label": "Clock guard",
+      "kind": "compute",
+      "x": 12,
+      "y": 37,
+      "at": 6
+    },
+    {
+      "id": "monitor",
+      "label": "Lateness metrics",
+      "kind": "data",
+      "x": 12,
+      "y": 63,
+      "at": 6
+    }
+  ],
+  "edges": [
+    {
+      "from": "clients",
+      "to": "single",
+      "at": 0,
+      "until": 1
+    },
+    {
+      "from": "clients",
+      "to": "api",
+      "at": 1
+    },
+    {
+      "from": "api",
+      "to": "store",
+      "at": 1
+    },
+    {
+      "from": "store",
+      "to": "loader",
+      "at": 2
+    },
+    {
+      "from": "loader",
+      "to": "wheel",
+      "at": 2
+    },
+    {
+      "from": "wheel",
+      "to": "claim",
+      "at": 3
+    },
+    {
+      "from": "claim",
+      "to": "store",
+      "at": 3
+    },
+    {
+      "from": "claim",
+      "to": "queue",
+      "at": 4
+    },
+    {
+      "from": "queue",
+      "to": "targets",
+      "at": 4
+    },
+    {
+      "from": "targets",
+      "to": "dedup",
+      "at": 4
+    },
+    {
+      "from": "api",
+      "to": "owners",
+      "at": 5
+    },
+    {
+      "from": "owners",
+      "to": "store",
+      "at": 5
+    },
+    {
+      "from": "owners",
+      "to": "wheel",
+      "at": 5
+    },
+    {
+      "from": "clock",
+      "to": "owners",
+      "at": 6
+    },
+    {
+      "from": "owners",
+      "to": "monitor",
+      "at": 6
+    }
+  ],
+  "steps": [
+    {
+      "title": "Store timers in durable buckets keyed by fire time",
+      "problem": "A table scanned for 'fire time is in the past' gets slower as more timers wait, and the work is mostly looking at timers that are not due for hours.",
+      "fix": "Make the fire time the first part of the storage key. Each timer is written under a time bucket, for example the fire time rounded down to 10 seconds, then the exact fire time, then the timer id. Finding what is due in the next few seconds is a range read of one or two buckets, which touches only due timers and reads them in sequence, however many millions wait further out. A second index maps the timer id to its bucket, so a lookup or a cancel does not need to search. A store built on sorted, append-friendly files, such as a wide-column or log-structured database, takes the high write rate well.",
+      "tradeoff": "The cost of finding work no longer depends on how many timers are waiting, and the data is spread over many partitions by bucket. The bucket width is a choice: narrow buckets mean many small reads, wide ones mean big reads and bigger bursts. Everyone who picks 09:00:00 lands in the same bucket, which is dealt with in step 6.",
+      "concepts": [
+        {
+          "slug": "database-indexing"
+        },
+        {
+          "slug": "ordering-and-partitioning"
+        },
+        {
+          "slug": "lsm-trees-vs-b-trees"
+        },
+        {
+          "slug": "database-sharding"
+        }
+      ]
+    },
+    {
+      "title": "Load the next few minutes into hierarchical timing wheels",
+      "problem": "Reading the store every second gives one-second precision at best, and keeping millions of near-term timers sorted in a heap costs logarithmic time per timer and scatters memory.",
+      "fix": "A loader on each timer node reads buckets a few minutes ahead and puts their timers into an in-memory hierarchical timing wheel. A wheel is a ring of slots, one per tick, say 10 ms. A timer is dropped into the slot for its tick, in constant time. To cover a long delay without millions of slots, there are several wheels: with 64 slots each, the first covers 640 ms, the second 41 seconds, the third 44 minutes. A timer starts in the finest wheel whose range covers its delay and is moved down a level as its time approaches, so each timer moves a few times in its life. Every tick the node empties one slot and fires exactly those timers.",
+      "tradeoff": "Insert and expire are constant time per timer, and firing is precise to the tick, which a once-a-second poll cannot give. The wheel lives in memory, so it is only a cache of the store and is rebuilt after a crash. The loader horizon sets how much memory is used and how far ahead the store can be slow without anyone noticing.",
+      "concepts": [
+        {
+          "slug": "caching"
+        },
+        {
+          "slug": "latency-and-round-trips"
+        },
+        {
+          "slug": "queueing-theory-and-littles-law"
+        },
+        {
+          "slug": "timeouts-and-deadlines"
+        }
+      ]
+    },
+    {
+      "title": "Claim each due timer with a lease before sending it",
+      "problem": "When a slot fires, a second node, a restarted node or a node that was only paused might also hold the same timer, and a node that dies mid-send leaves nobody sure whether the timer went out.",
+      "fix": "Before sending, the node claims the timer with a conditional write in the store: 'set owner to me and lease-until to now + 30 seconds, if the timer is still unclaimed or its lease has expired'. Only one node can win. The winner sends the timer and then deletes it. If the winner crashes, nothing finishes the job, but the lease runs out, a sweeper finds claimed timers whose lease has expired and puts them back into a wheel, and another node claims them. Every claim carries an attempt number that grows, which the store and the receivers can use to reject a stale node that wakes up late.",
+      "tradeoff": "A crash turns into a delay of about one lease length instead of a lost timer. A short lease recovers fast but gives duplicate sends when a node is only slow, and a long lease is quiet but late. Claiming costs one extra store write for every timer, which can be done in batches.",
+      "concepts": [
+        {
+          "slug": "leases-and-fencing-tokens"
+        },
+        {
+          "slug": "optimistic-concurrency-and-etags"
+        },
+        {
+          "slug": "failure-detection"
+        },
+        {
+          "slug": "leader-election"
+        }
+      ]
+    },
+    {
+      "title": "Deliver at least once, and let the receiver ignore repeats",
+      "problem": "Sending and deleting cannot be one atomic step: the node can crash after the message is out and before the delete, and then the timer is sent again.",
+      "fix": "Accept that delivery is at least once. The message goes to the target through a queue or a callback, carrying the timer id and the attempt number as an idempotency key. A failed delivery is retried with growing, jittered waits. The timer is deleted only after the target acknowledges. The receiver keeps a table of timer ids it has handled, for longer than the longest retry window, and drops a repeat after the first one. A timer that keeps failing past its limit moves to a dead-letter list for a person or a job to look at.",
+      "tradeoff": "No timer is silently lost, and a repeat does no harm. Exactly-once delivery is not available across a network, so the effect is made safe instead. Every receiver needs a small dedup table, and a team that forgets will see double emails after a crash.",
+      "concepts": [
+        {
+          "slug": "delivery-guarantees"
+        },
+        {
+          "slug": "idempotency"
+        },
+        {
+          "slug": "retries-and-backoff"
+        },
+        {
+          "slug": "dead-letter-queues-and-poison-messages"
+        },
+        {
+          "slug": "message-queues"
+        }
+      ]
+    },
+    {
+      "title": "Shard by timer id, and make cancel win or lose cleanly",
+      "problem": "One node cannot hold every timer, and cancelling needs to reach the right bucket, the right wheel and any in-flight send.",
+      "fix": "Split the timer space into a fixed number of partitions by a hash of the timer id. Each partition is owned by exactly one node at a time, decided by a lease in a small coordination service, so the node count can change without moving timers one by one. A cancel is a conditional delete in the store, found through the id index. The owner is told to drop the timer from its wheel, but this is only a hint to save work: the claim in step 3 is the real decision. If the timer is already deleted, the claim fails and nothing is sent. If the claim won first, the cancel reports 'too late'. Moving a timer to a new time is a cancel followed by a new insert, guarded by a version number.",
+      "tradeoff": "The service grows by adding nodes, and a cancel gives a clear answer, 'cancelled' or 'already fired or firing', never both. A cancel that arrives in the last milliseconds can lose, and callers must expect that. Moving a partition costs a reload of its near-term timers.",
+      "concepts": [
+        {
+          "slug": "consistent-hashing"
+        },
+        {
+          "slug": "database-sharding"
+        },
+        {
+          "slug": "leader-election"
+        },
+        {
+          "slug": "optimistic-concurrency-and-etags"
+        },
+        {
+          "slug": "consensus"
+        }
+      ]
+    },
+    {
+      "title": "Guard the clocks, spread the hot seconds, and measure lateness",
+      "problem": "A node with a clock that is 3 seconds fast fires early, a clock that steps backwards repeats work, and a million customers who all pick 09:00:00 send a spike through the bucket, the wheel and the target at the same instant.",
+      "fix": "Fire times are absolute UTC instants. The wheel ticks by a monotonic clock, and the wall clock is used only to compute the delay when a bucket is loaded. A clock guard watches each node's offset from a trusted time source, and a node whose offset is past a limit, say 200 ms, gives up its partitions rather than fire early. A timer is never sent before its fire time on the node's own clock, and the lease uses durations, not wall times. Hot buckets are split into sub-buckets by a hash of the timer id, and the API can accept a window such as 'at 09:00:00, up to 5 seconds late' so a spike can be spread. Every send records its lateness, the actual time minus the fire time, and the 99th percentile is alerted on.",
+      "tradeoff": "Timers fire after their time and not before, with a measured and bounded error. Spreading a spike makes some timers a little later by design. The guard costs a monitor and some timers move when a node steps down, and the lateness number has to be watched, because slow loads, long leases and overload all show up in it.",
+      "concepts": [
+        {
+          "slug": "logical-clocks"
+        },
+        {
+          "slug": "slos-and-error-budgets"
+        },
+        {
+          "slug": "alerting"
+        },
+        {
+          "slug": "load-shedding"
+        },
+        {
+          "slug": "metrics"
+        }
+      ]
+    }
+  ],
+  "failures": [
+    {
+      "scenario": "A timer node dies with a million timers in its wheels",
+      "impact": "Everything that was due in the next few minutes on that node would not fire, and timers that were being sent are in an unknown state.",
+      "answer": "The wheels were only a cache. The node's partition leases expire, other nodes take the partitions and reload the next minutes of buckets from the store, which takes seconds. Timers that were claimed but not finished have an expired lease and are claimed again. Those timers are late by about the lease length plus the reload, and a few may be sent twice, which the receivers ignore.",
+      "concepts": [
+        {
+          "slug": "leases-and-fencing-tokens"
+        },
+        {
+          "slug": "failure-detection"
+        },
+        {
+          "slug": "idempotency"
+        }
+      ]
+    },
+    {
+      "scenario": "Five million timers are all set for midnight",
+      "impact": "One bucket, one wheel slot and one target receive millions of timers in a second, and everything after them is late.",
+      "answer": "The bucket is split into sub-buckets by a hash of the timer id, which spreads it over many partitions and nodes. The delivery queue absorbs the burst and the sender is paced to what each target can take. Callers that can wait pass a window, so the load is spread over a few seconds. The lateness metric shows how bad it was, and capacity can be added before the next big date.",
+      "concepts": [
+        {
+          "slug": "backpressure"
+        },
+        {
+          "slug": "load-shedding"
+        },
+        {
+          "slug": "ordering-and-partitioning"
+        },
+        {
+          "slug": "autoscaling"
+        }
+      ]
+    },
+    {
+      "scenario": "A cancel arrives at the same moment as the timer fires",
+      "impact": "The caller thinks the payment timeout was cancelled, but the timeout message is already on its way.",
+      "answer": "The claim and the cancel are both conditional writes on the same record, so exactly one wins. If the cancel wins, the claim fails and nothing is sent. If the claim wins, the cancel is told 'already firing'. The receiver of a timeout should in any case check the real state, for example whether the order has been paid, before acting.",
+      "concepts": [
+        {
+          "slug": "optimistic-concurrency-and-etags"
+        },
+        {
+          "slug": "idempotency"
+        },
+        {
+          "slug": "leases-and-fencing-tokens"
+        }
+      ]
+    },
+    {
+      "scenario": "A node's clock jumps forward by a minute",
+      "impact": "The node believes that a minute of timers is due and fires them early, or after a jump backwards it repeats slots.",
+      "answer": "The wheel advances by a monotonic clock, which does not jump, and the wall clock is compared with the trusted source by the clock guard. A node that is off by more than the limit stops owning partitions and its timers move elsewhere. A timer is not sent while the node's own time is before its fire time, so a fast clock cannot send it early. Large steps are alerted on.",
+      "concepts": [
+        {
+          "slug": "logical-clocks"
+        },
+        {
+          "slug": "alerting"
+        },
+        {
+          "slug": "health-checks"
+        }
+      ]
+    },
+    {
+      "scenario": "The target service is down for an hour",
+      "impact": "Thousands of timers per second fail to deliver, and retries could pile up on the target when it returns.",
+      "answer": "Deliveries are retried with exponential, jittered waits, and a circuit breaker per target stops hammering a service that is known to be down. The timers stay in the store as claimed-and-retrying, so nothing is lost. When the target returns, the retry load is paced. A timer past its retry limit goes to a dead-letter list, with the reason, so it can be replayed.",
+      "concepts": [
+        {
+          "slug": "retries-and-backoff"
+        },
+        {
+          "slug": "circuit-breaker"
+        },
+        {
+          "slug": "dead-letter-queues-and-poison-messages"
+        }
+      ]
+    }
+  ],
+  "alternatives": [
+    {
+      "title": "Where waiting timers live",
+      "options": [
+        {
+          "name": "A table that is polled for due rows",
+          "pro": "One familiar system, and enough for thousands of timers",
+          "con": "The cost depends on the number of waiting timers, and the poll interval limits the precision"
+        },
+        {
+          "name": "Per-message delays in a message broker",
+          "pro": "Nothing to build, if the delays are short",
+          "con": "Most brokers cap the delay at minutes or hours, or block messages behind a long delay at the head of a queue"
+        },
+        {
+          "name": "A sorted set in memory, scored by fire time",
+          "pro": "Simple, fast and precise to the millisecond",
+          "con": "Memory-bound, and durability and sharding are your job"
+        },
+        {
+          "name": "Durable time buckets with an in-memory wheel for the near term",
+          "pro": "Scales with the data, precise at the edge, and rebuildable",
+          "con": "Two layers to operate, and a loader to keep ahead of time"
+        }
+      ],
+      "pick": "Time buckets in a durable store, with timing wheels for the next few minutes."
+    },
+    {
+      "title": "The in-memory structure for near-term timers",
+      "options": [
+        {
+          "name": "A binary heap",
+          "pro": "Easy and exact, with no tick to choose",
+          "con": "Logarithmic insert and remove, and slow to cancel from the middle"
+        },
+        {
+          "name": "A single hashed wheel",
+          "pro": "Constant-time insert, simple",
+          "con": "Each slot may hold timers from later laps, which are checked again and again"
+        },
+        {
+          "name": "A hierarchical wheel",
+          "pro": "Constant-time insert and expiry, and covers long delays with few slots",
+          "con": "Timers cascade between levels, and precision is one tick"
+        }
+      ],
+      "pick": "A hierarchical wheel, with a tick of about 10 ms, since the target is one second of precision."
+    },
+    {
+      "title": "Delivery guarantee",
+      "options": [
+        {
+          "name": "At most once",
+          "pro": "No repeats",
+          "con": "A crash loses the timer, which is the one thing a timer service must not do"
+        },
+        {
+          "name": "At least once, with an idempotent receiver",
+          "pro": "No loss, and repeats are removed by the receiver",
+          "con": "Every receiver needs a dedup key and a table"
+        },
+        {
+          "name": "Exactly-once delivery",
+          "pro": "Nice to describe",
+          "con": "Cannot be done across a network, apart from through the receiver's own dedup"
+        }
+      ],
+      "pick": "At least once, with the timer id as the idempotency key."
+    },
+    {
+      "title": "How a cancel reaches a timer",
+      "options": [
+        {
+          "name": "Remove the timer from the wheel",
+          "pro": "Frees the memory right away",
+          "con": "Needs to find the right node and the right slot, and still races with firing"
+        },
+        {
+          "name": "Mark it deleted in the store and skip it",
+          "pro": "One conditional write decides, and the claim enforces it",
+          "con": "Dead entries stay in the wheel until their slot comes up"
+        }
+      ],
+      "pick": "Cancel in the store, and let the claim check be the single decision. A hint to the owner is only an optimisation."
+    }
+  ],
+  "roles": [
+    {
+      "id": "client",
+      "label": "Callers and targets",
+      "description": "The services that create timers and the ones that receive them."
+    },
+    {
+      "id": "edge",
+      "label": "Entry point",
+      "description": "The timer API that creates, cancels and looks up timers."
+    },
+    {
+      "id": "async",
+      "label": "Delivery queue",
+      "description": "Due timers on their way to the targets."
+    },
+    {
+      "id": "compute",
+      "label": "Timer engine",
+      "description": "The loader, the timing wheels, the claim logic and the clock guard."
+    },
+    {
+      "id": "data",
+      "label": "State",
+      "description": "The bucketed timer store, the receivers' dedup table and the lateness metrics."
+    }
+  ]
+}

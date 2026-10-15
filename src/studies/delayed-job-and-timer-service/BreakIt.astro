@@ -1,0 +1,87 @@
+---
+import PlaygroundShell from '../../components/PlaygroundShell.astro';
+---
+<PlaygroundShell title="Crash while firing" hint="4,000 timers come due while some of the timer nodes crash in the middle of firing. Compare four ways of firing a timer, with the same crashes in each.">
+  <ol class="how">
+    <li>At the start (<b>10% of attempts crash</b>, receiver dedup <b>off</b>), no design is clean. <b>Mark done, then send</b> loses about 200 timers. <b>Everyone fires</b> loses none but sends thousands of repeats. The re-scan and the lease lose nothing but still repeat about 230 timers.</li>
+    <li>Tick <b>receiver dedup</b>: every repeat disappears, and <b>everyone fires</b>, the <b>re-scan</b> and the <b>lease</b> become correct (everyone only because three nodes cover for each other, at three times the messages). The lost timers of <b>mark done, then send</b> stay lost, because dedup cannot bring back a message that was never sent.</li>
+    <li>Now compare how late the slowest 1% are: the <b>lease</b> recovers after its length (30 s by default), the <b>re-scan</b> after a whole scan period (60 s). Set the lease to <b>5 s</b> or <b>120 s</b> and watch that number follow it.</li>
+  </ol>
+  <div class="pg tmb" data-tmb>
+    <div class="pg-row">
+      <label>Attempts that crash (%) <input type="range" min="0" max="30" step="5" value="10" data-p /> <b data-pval></b></label>
+      <label>Lease length (seconds) <select class="pg-in" data-lease><option value="5">5</option><option value="30" selected>30</option><option value="120">120</option></select></label>
+      <label>Nodes that can see a due timer <input type="range" min="1" max="8" value="3" data-w /> <b data-wval></b></label>
+      <label><input type="checkbox" data-dedup /> Receiver ignores a repeated timer id</label>
+    </div>
+    <div class="pg-grid">
+      <div class="pg-box" data-b1><h3>Every node fires what it sees</h3><span class="pg-mono" data-o1></span><span class="pg-note" data-n1></span></div>
+      <div class="pg-box" data-b2><h3>Mark done, then send</h3><span class="pg-mono" data-o2></span><span class="pg-note" data-n2></span></div>
+      <div class="pg-box" data-b3><h3>Send, then mark done; re-scan every 60 s</h3><span class="pg-mono" data-o3></span><span class="pg-note" data-n3></span></div>
+      <div class="pg-box" data-b4><h3>Claim with a lease, send, delete</h3><span class="pg-mono" data-o4></span><span class="pg-note" data-n4></span></div>
+    </div>
+    <p class="pg-out" data-verdict aria-live="polite"></p>
+    <p class="pg-note">Model: 4,000 timers, and each attempt to fire one crashes with the chosen probability, half of the crashes before the message is sent and half after it is sent but before the timer is marked done. "Every node" means each of the nodes tries once, with no coordination and no retry. "Mark done, then send" tries once. "Re-scan" retries the timer 60 seconds after a crash, and "lease" retries it when the lease runs out. Both try up to 10 times. Late is the time from the fire time to the first message sent, shown for the slowest 1% of the timers that were sent. With dedup on, the receiver acts on a timer id only once.</p>
+  </div>
+</PlaygroundShell>
+<script>
+  document.querySelectorAll<HTMLElement>('[data-tmb]').forEach((root) => {
+    const q = <T extends HTMLElement>(s: string) => root.querySelector<T>(s)!;
+    const N = 4000; const MAXA = 10; const SCAN = 60;
+    let seed = 77; const rnd = () => ((seed = (seed * 1664525 + 1013904223) % 4294967296) / 4294967296);
+    // Two random numbers per attempt (does it crash, and before or after sending), drawn once so every setting sees the same crashes.
+    const draws = Array.from({ length: N }, () => Array.from({ length: 2 * MAXA }, () => rnd()));
+    type R = { lost: number; sends: number; dupSends: number; dupEffects: number; p99: number };
+    function run(kind: 'all' | 'first' | 'scan' | 'lease', p: number, w: number, lease: number, dedup: boolean): R {
+      let lost = 0; let dupSends = 0; let dupEffects = 0; let sentTimers = 0; const delays: number[] = [];
+      for (const d of draws) {
+        let sends = 0; let first = -1;
+        if (kind === 'all') {
+          for (let k = 0; k < w; k++) { const crashed = d[2 * k] < p; const before = d[2 * k + 1] < 0.5; if (!(crashed && before)) sends++; }
+          first = 0;
+        } else if (kind === 'first') {
+          const crashed = d[0] < p; const before = d[1] < 0.5; if (!(crashed && before)) sends = 1; first = 0;
+        } else {
+          const retry = kind === 'scan' ? SCAN : lease;
+          for (let k = 0; k < MAXA; k++) {
+            const crashed = d[2 * k] < p; const before = d[2 * k + 1] < 0.5;
+            if (!(crashed && before)) { sends++; if (first < 0) first = k * retry; }
+            if (!crashed) break;
+          }
+        }
+        if (sends === 0) { lost++; continue; }
+        sentTimers++; delays.push(first); dupSends += sends - 1; dupEffects += (dedup ? 1 : sends) - 1;
+      }
+      delays.sort((a, b) => a - b);
+      return { lost, sends: sentTimers, dupSends, dupEffects, p99: delays.length ? delays[Math.ceil(0.99 * delays.length) - 1] : 0 };
+    }
+    const kinds = ['all', 'first', 'scan', 'lease'] as const;
+    const names = ['every node fires', 'mark done, then send', 're-scan', 'lease'];
+    const fmt = (n: number) => n.toLocaleString('en-US');
+    function draw() {
+      const p = Number(q<HTMLInputElement>('[data-p]').value) / 100; const w = Number(q<HTMLInputElement>('[data-w]').value);
+      const lease = Number(q<HTMLSelectElement>('[data-lease]').value); const dedup = q<HTMLInputElement>('[data-dedup]').checked;
+      q('[data-pval]').textContent = `${Math.round(p * 100)}%`; q('[data-wval]').textContent = String(w);
+      const res = kinds.map((k) => run(k, p, w, lease, dedup));
+      const safe: number[] = [];
+      res.forEach((r, i) => {
+        const ok = r.lost === 0 && r.dupEffects === 0; if (ok) safe.push(i);
+        q(`[data-o${i + 1}]`).textContent = `lost ${fmt(r.lost)}, repeated effects ${fmt(r.dupEffects)}`;
+        q(`[data-n${i + 1}]`).textContent = `${fmt(r.dupSends)} extra messages sent; slowest 1% late by ${r.p99} s`;
+        q<HTMLElement>(`[data-b${i + 1}]`).style.setProperty('--c', ok ? 'var(--good)' : 'var(--bad)');
+      });
+      const out = q('[data-verdict]');
+      if (safe.length === 0) {
+        out.classList.add('bad');
+        const losing = res.map((r, i) => (r.lost > 0 ? names[i] : '')).filter(Boolean); const repeating = res.map((r, i) => (r.dupEffects > 0 ? names[i] : '')).filter(Boolean);
+        out.textContent = `No design is correct yet. Loses timers: ${losing.join(', ') || 'none'}. Acts twice on a timer: ${repeating.join(', ') || 'none'}.${dedup ? '' : ' Turn on receiver dedup to remove the repeats.'}`;
+      } else {
+        out.classList.remove('bad');
+        const both = safe.includes(2) && safe.includes(3);
+        out.textContent = `Correct for all ${fmt(N)} timers: ${safe.map((i) => names[i]).join(', ')}.` + (both ? ` The lease recovers a crashed timer in ${res[3].p99} s at the 99th percentile, the re-scan in ${res[2].p99} s.` : '') + (res[1].lost > 0 ? ` Mark done, then send still loses ${fmt(res[1].lost)}.` : '');
+      }
+    }
+    root.addEventListener('input', draw); root.addEventListener('change', draw);
+    draw();
+  });
+</script>

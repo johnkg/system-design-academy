@@ -1,0 +1,87 @@
+---
+import PlaygroundShell from '../../components/PlaygroundShell.astro';
+---
+<PlaygroundShell title="Judge 200 releases" hint="Each setting is tried on the same 200 simulated releases: 100 good ones (1% errors, like the old version) and 100 bad ones (2% errors). How many good releases does it stop by mistake, and how many bad ones does it let through?">
+  <ol class="how">
+    <li>Start with a <b>fixed limit of 1.5%</b>, stages 1%, 10%, 50%, 10 minutes, and the <b>shared blip</b> on: it stops <b>28 of the 100 good releases</b>, since a blip that hits old and new alike pushes the canary over the limit. Nothing bad gets through, but teams will soon bypass the platform.</li>
+    <li>Switch to <b>comparing with the baseline, z over 2.33</b>: only <b>2 good releases</b> are stopped, because the blip is in both groups and cancels. The z limit of 1.65 stops 16 good ones, since each of three checks has a 5% chance of a false alarm.</li>
+    <li>Choose <b>one 50% stage with a 2-minute bake</b> and the 2.33 test: <b>5 bad releases get through</b> and cost about 150 extra failed requests each on average, because 2 minutes is too little data. With 10 minutes none get through, but each bad release then hurts about 300 requests.</li>
+  </ol>
+  <div class="pg pdb" data-pdb>
+    <div class="pg-row">
+      <label>Decision rule <select class="pg-in" data-rule>
+        <option value="fixed" selected>Fixed limit: canary errors above 1.5%</option>
+        <option value="z164">Compare with baseline, z over 1.65</option>
+        <option value="z233">Compare with baseline, z over 2.33, at least 300 requests</option>
+      </select></label>
+      <label>Stages <select class="pg-in" data-plan>
+        <option value="three" selected>1%, then 10%, then 50%</option>
+        <option value="two">10%, then 50%</option>
+        <option value="one">50% only</option>
+      </select></label>
+      <label>Bake time per stage (minutes) <input type="range" min="2" max="30" value="10" data-bake /> <b data-bakeval></b></label>
+      <label><input type="checkbox" data-blip checked /> A shared dependency blips during 1 in 5 releases</label>
+    </div>
+    <div class="pg-grid">
+      <div class="pg-box" data-b1><h3>Good releases wrongly stopped</h3><span class="pg-mono" data-o1></span><span class="pg-note" data-n1></span></div>
+      <div class="pg-box" data-b2><h3>Bad releases that reached everyone</h3><span class="pg-mono" data-o2></span><span class="pg-note" data-n2></span></div>
+      <div class="pg-box" data-b3><h3>Extra failed requests per bad release</h3><span class="pg-mono" data-o3></span><span class="pg-note" data-n3></span></div>
+    </div>
+    <p class="pg-out" data-verdict aria-live="polite"></p>
+    <p class="pg-note">Model: one region at 100 requests per second, so a 10-minute stage has 60,000 requests. The old version fails 1% of requests, a bad release fails 2%. A blip adds 1.5 points of errors to both groups for one stage. Counts are drawn from a normal approximation with a fixed seed. A bad release that reaches everyone is assumed to run for 30 minutes before a person notices, at 100 requests per second and 1 extra failure per 100 requests. Only the extra failures from the regression are counted.</p>
+  </div>
+</PlaygroundShell>
+<script>
+  document.querySelectorAll<HTMLElement>('[data-pdb]').forEach((root) => {
+    const q = <T extends HTMLElement>(s: string) => root.querySelector<T>(s)!;
+    const RELEASES = 100; const RPS = 100; const MAXS = 3;
+    let seed = 4242; const u = () => ((seed = (seed * 1664525 + 1013904223) % 4294967296) / 4294967296);
+    const gauss = () => Math.sqrt(-2 * Math.log(1 - u())) * Math.cos(2 * Math.PI * u());
+    // The same random draws are reused for every setting, so only the setting changes the outcome.
+    const noise = Array.from({ length: 2 * RELEASES }, () => Array.from({ length: MAXS }, () => [gauss(), gauss()]));
+    const PLANS: Record<string, number[]> = { three: [1, 10, 50], two: [10, 50], one: [50] };
+    function simulate(rule: string, plan: string, bake: number, blip: boolean) {
+      const stages = PLANS[plan]; let falseStops = 0; let missed = 0; let extra = 0;
+      for (let r = 0; r < 2 * RELEASES; r++) {
+        const bad = r >= RELEASES; const trueRate = bad ? 0.02 : 0.01; let stopped = false;
+        const blipStage = blip && r % 5 === 0 ? Math.floor(r / 5) % stages.length : -1;
+        for (let s = 0; s < stages.length && !stopped; s++) {
+          const total = RPS * 60 * bake; let nc = Math.floor((total * stages[s]) / 100); let mult = 1;
+          if (rule === 'z233') while (nc * mult < 300) mult *= 2; // not enough data: wait longer
+          nc *= mult; const nb = total * mult - nc;
+          const bump = s === blipStage ? 0.015 : 0; const pc = trueRate + bump; const pb = 0.01 + bump;
+          const ec = Math.max(0, nc * pc + Math.sqrt(nc * pc * (1 - pc)) * noise[r][s][0]);
+          const eb = Math.max(0, nb * pb + Math.sqrt(nb * pb * (1 - pb)) * noise[r][s][1]);
+          let stop: boolean;
+          if (rule === 'fixed') stop = ec / nc > 0.015;
+          else { const p = (ec + eb) / (nc + nb); const se = Math.sqrt(p * (1 - p) * (1 / nc + 1 / nb)); const z = (ec / nc - eb / nb) / se; stop = z > (rule === 'z164' ? 1.645 : 2.326); }
+          if (bad) extra += nc * 0.01;
+          if (stop) { stopped = true; if (!bad) falseStops++; }
+        }
+        if (bad && !stopped) { missed++; extra += RPS * 60 * 30 * 0.01; }
+      }
+      return { falseStops, missed, avgExtra: Math.round(extra / RELEASES) };
+    }
+    function draw() {
+      const rule = q<HTMLSelectElement>('[data-rule]').value; const plan = q<HTMLSelectElement>('[data-plan]').value;
+      const bake = Number(q<HTMLInputElement>('[data-bake]').value); const blip = q<HTMLInputElement>('[data-blip]').checked;
+      q('[data-bakeval]').textContent = String(bake);
+      const r = simulate(rule, plan, bake, blip);
+      q('[data-o1]').textContent = `${r.falseStops} of ${RELEASES}`;
+      q('[data-n1]').textContent = r.falseStops >= 10 ? 'teams will start to bypass the platform' : 'rare enough to be trusted';
+      q('[data-o2]').textContent = `${r.missed} of ${RELEASES}`;
+      q('[data-n2]').textContent = r.missed > 0 ? 'the regression was not seen in time' : 'every bad release was stopped';
+      q('[data-o3]').textContent = r.avgExtra.toLocaleString('en-US');
+      q('[data-n3]').textContent = 'on average, including 30 minutes for any that got through';
+      q<HTMLElement>('[data-b1]').style.setProperty('--c', r.falseStops >= 10 ? 'var(--bad)' : 'var(--good)');
+      q<HTMLElement>('[data-b2]').style.setProperty('--c', r.missed > 0 ? 'var(--bad)' : 'var(--good)');
+      q<HTMLElement>('[data-b3]').style.setProperty('--c', 'var(--accent)');
+      const out = q('[data-verdict]'); const bad = r.falseStops >= 10 || r.missed > 0; out.classList.toggle('bad', bad);
+      out.textContent = r.missed > 0 ? `${r.missed} bad releases reached everyone: each stage had too little data to separate a 2% error rate from a 1% one. Lengthen the bake or use bigger stages.`
+        : r.falseStops >= 10 ? `Nothing bad got through, but ${r.falseStops} good releases were stopped. ${rule === 'fixed' ? 'A fixed limit cannot tell a blip that hits everyone from a bad release.' : 'Each check has a chance of a false alarm, and several checks add up. A higher z limit lowers it.'}`
+        : `Only ${r.falseStops} good releases were stopped and every bad one was caught, at about ${r.avgExtra.toLocaleString('en-US')} extra failed requests each.`;
+    }
+    root.addEventListener('input', draw); root.addEventListener('change', draw);
+    draw();
+  });
+</script>

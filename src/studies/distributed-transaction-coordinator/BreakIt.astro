@@ -1,0 +1,95 @@
+---
+import PlaygroundShell from '../../components/PlaygroundShell.astro';
+---
+<PlaygroundShell title="Kill the coordinator" hint="Fifty transactions are in flight when the coordinator dies. Choose where its decision is kept, what the waiting shards do, and watch whether atomicity holds and how long locks stay held.">
+  <ol class="how">
+    <li>The default is a crash <b>during the commit phase</b> with a decision log kept <b>in memory only</b> and shards that <b>wait</b>: all <b>50 of 50</b> transactions end split, committed on the shards that heard 'commit' and aborted on the rest, because the restarted coordinator has no log and presumes abort.</li>
+    <li>Change the log to <b>forced to local disk</b>: nothing is split, all 50 commit, but the shards that had not heard wait the whole 30 s, which is <b>2,070 row-seconds</b> of locks held. Choose <b>replicated</b>: the same correct result, with <b>207</b> row-seconds, because a standby answers after about 3 s.</li>
+    <li>Set shards to <b>abort alone after 2 s</b>: the locks are freed fast, but atomicity breaks again, even with a durable log. Set them to <b>ask the other shards</b> and the split case needs <b>no waiting at all</b>, yet a crash <b>after the decision</b> (nobody told yet) still blocks every shard for the full time.</li>
+  </ol>
+  <div class="pg dtc" data-dtc>
+    <div class="pg-row">
+      <label>The coordinator dies <select class="pg-in" data-crash>
+        <option value="before">after the votes, before logging a decision</option>
+        <option value="after">after logging commit, before telling any shard</option>
+        <option value="mid" selected>during the commit phase (some shards told)</option>
+      </select></label>
+      <label>Decision log is <select class="pg-in" data-log>
+        <option value="memory" selected>kept in memory only</option>
+        <option value="disk">forced to local disk</option>
+        <option value="replicated">replicated to 3 nodes</option>
+      </select></label>
+      <label>A shard that voted yes and hears nothing <select class="pg-in" data-policy>
+        <option value="wait" selected>waits for the coordinator</option>
+        <option value="timeout">aborts alone after 2 s</option>
+        <option value="peers">asks the other shards, then waits</option>
+      </select></label>
+      <label>Coordinator is away for (s) <input type="range" min="1" max="120" value="30" data-down /> <b data-downval></b></label>
+      <label>Transactions per second <input type="range" min="500" max="20000" step="500" value="5000" data-tps /> <b data-tpsval></b></label>
+    </div>
+    <div class="pg-grid">
+      <div class="pg-box" data-b1><h3>Transactions in flight</h3><span class="pg-mono" data-o1></span><span class="pg-note" data-n1></span></div>
+      <div class="pg-box" data-b2><h3>Locks held while in doubt</h3><span class="pg-mono" data-o2></span><span class="pg-note" data-n2></span></div>
+      <div class="pg-box" data-b3><h3>Split across shards</h3><span class="pg-mono" data-o3></span><span class="pg-note" data-n3></span></div>
+      <div class="pg-box" data-b4><h3>Acknowledged commits lost</h3><span class="pg-mono" data-o4></span><span class="pg-note" data-n4></span></div>
+    </div>
+    <p class="pg-out" data-verdict aria-live="polite"></p>
+    <p class="pg-note">Model: each transaction touches 3 shards, and the transactions in flight are the ones within a 10 ms window of work, so there are TPS &times; 0.01 of them. A client is told 'committed' as soon as the decision is logged. A replicated log lets a standby answer after at most 3 s. A row-second is one shard holding one transaction's locks for one second. When a shard asks its peers, it learns the outcome only if some peer has already committed. Which shards were told, in the mid-commit case, is chosen by a seeded generator.</p>
+  </div>
+</PlaygroundShell>
+<script>
+  document.querySelectorAll<HTMLElement>('[data-dtc]').forEach((root) => {
+    const q = <T extends HTMLElement>(s: string) => root.querySelector<T>(s)!;
+    const SHARDS = 3; const TIMEOUT = 2; const ELECTION = 3;
+    type Result = { K: number; stuck: number; rowSeconds: number; violations: number; lost: number; maxWait: number; commits: number; aborts: number; R: number };
+    function simulate(crash: string, log: string, policy: string, down: number, tps: number): Result {
+      const K = Math.max(1, Math.floor(tps * 0.01 + 0.5));
+      let seed = 77; const rnd = () => ((seed = (seed * 1664525 + 1013904223) % 4294967296) / 4294967296);
+      const R = log === 'replicated' ? Math.min(down, ELECTION) : down; // when a coordinator can answer again
+      const survives = log !== 'memory';
+      let stuck = 0; let rowSeconds = 0; let violations = 0; let lost = 0; let maxWait = 0; let commits = 0; let aborts = 0;
+      for (let t = 0; t < K; t++) {
+        const decided = crash !== 'before';
+        const told = crash === 'mid' ? 1 + Math.floor(rnd() * 2) : 0; // shards that already heard 'commit'
+        let c = 0; let a = 0; let inDoubt = 0;
+        for (let s = 0; s < SHARDS; s++) {
+          if (s < told) { c++; continue; }
+          let wait: number; let commitIt: boolean;
+          if (policy === 'peers' && told > 0) { wait = 0; commitIt = true; }
+          else if (policy === 'timeout' && R > TIMEOUT) { wait = TIMEOUT; commitIt = false; }
+          else { wait = R; commitIt = decided && survives; }
+          if (wait > 0) { inDoubt++; rowSeconds += wait; maxWait = Math.max(maxWait, wait); }
+          if (commitIt) c++; else a++;
+        }
+        if (inDoubt > 0) stuck++;
+        if (c > 0 && a > 0) violations++; else if (decided && c === 0) lost++; else if (c > 0) commits++; else aborts++;
+      }
+      return { K, stuck, rowSeconds, violations, lost, maxWait, commits, aborts, R };
+    }
+    const n = (v: number) => Math.round(v).toLocaleString('en-US');
+    function draw() {
+      const crash = q<HTMLSelectElement>('[data-crash]').value; const log = q<HTMLSelectElement>('[data-log]').value; const policy = q<HTMLSelectElement>('[data-policy]').value;
+      const down = Number(q<HTMLInputElement>('[data-down]').value); const tps = Number(q<HTMLInputElement>('[data-tps]').value);
+      q('[data-downval]').textContent = `${down} s`; q('[data-tpsval]').textContent = n(tps);
+      const r = simulate(crash, log, policy, down, tps);
+      q('[data-o1]').textContent = `${n(r.K)} transactions`;
+      q('[data-n1]').textContent = `clean commits ${n(r.commits)}, clean aborts ${n(r.aborts)}`;
+      q('[data-o2]').textContent = `${n(r.rowSeconds)} row-seconds`;
+      q('[data-n2]').textContent = r.stuck === 0 ? 'no shard had to wait' : `${n(r.stuck)} transactions stuck, the longest wait ${n(r.maxWait)} s`;
+      q('[data-o3]').textContent = `${n(r.violations)} of ${n(r.K)}`;
+      q('[data-n3]').textContent = r.violations ? 'committed on some shards, aborted on others' : 'every transaction ended the same everywhere';
+      q('[data-o4]').textContent = `${n(r.lost)} of ${n(r.K)}`;
+      q('[data-n4]').textContent = r.lost ? 'the client was told yes, the data says no' : 'nothing the client was promised disappeared';
+      const set = (id: string, bad: boolean, warn = false) => q<HTMLElement>(id).style.setProperty('--c', bad ? 'var(--bad)' : warn ? 'var(--accent)' : 'var(--good)');
+      set('[data-b1]', false, true); set('[data-b2]', false, r.rowSeconds > 0); set('[data-b3]', r.violations > 0); set('[data-b4]', r.lost > 0);
+      const cause = policy === 'timeout' && r.R > TIMEOUT ? `the shards gave up after ${TIMEOUT} s and aborted on their own, while the real decision was commit` : 'the restarted coordinator had no log, presumed abort, and contradicted what the decision had been';
+      const wait = r.rowSeconds === 0 ? 'No shard had to wait.' : `The price is ${n(r.rowSeconds)} row-seconds of locks held, up to ${n(r.maxWait)} s.`;
+      const out = q('[data-verdict]'); const bad = r.violations > 0 || r.lost > 0; out.classList.toggle('bad', bad);
+      out.textContent = r.violations > 0 ? `Atomicity is broken: ${n(r.violations)} of ${n(r.K)} transactions ended committed on some shards and aborted on others, because ${cause}.`
+        : r.lost > 0 ? `Atomicity holds, but ${n(r.lost)} commits that clients were told about were lost, because ${cause}.`
+        : `Correct: all ${n(r.K)} transactions ended the same on every shard (${n(r.commits)} committed, ${n(r.aborts)} aborted). ${wait}`;
+    }
+    root.addEventListener('input', draw); root.addEventListener('change', draw);
+    draw();
+  });
+</script>

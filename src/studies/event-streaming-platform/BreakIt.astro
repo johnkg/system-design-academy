@@ -1,0 +1,73 @@
+---
+import PlaygroundShell from '../../components/PlaygroundShell.astro';
+---
+<PlaygroundShell title="Retry after a lost acknowledgement" hint="A producer sends 200 numbered events to one partition. Requests and acknowledgements get lost, so it retries. See what ends up in the log, with and without an idempotent producer.">
+  <ol class="how">
+    <li>With the default (<b>idempotence off</b>, <b>5 requests in flight</b>, <b>15% loss</b>) the log holds <b>232 events for 200 sent</b>: <b>32 duplicates</b>, because a lost acknowledgement makes the producer resend something already stored, and <b>27 events out of order</b>, because a retry lands behind newer events.</li>
+    <li>Turn <b>idempotence on</b>: <b>200 events, no duplicates, none out of order</b>. The leader drops a repeated sequence number and refuses a gap. It needs <b>70 round trips</b> instead of 57, because refused events are sent again.</li>
+    <li>With idempotence off and <b>1 request in flight</b>, order is kept but the <b>32 duplicates</b> remain, and it takes <b>275 round trips</b>, nearly five times as many. Idempotence gives you the order and the speed together.</li>
+  </ol>
+  <div class="pg esb" data-esb>
+    <div class="pg-row">
+      <label>Idempotent producer <select class="pg-in" data-idem><option value="off" selected>off</option><option value="on">on</option></select></label>
+      <label>Requests in flight <select class="pg-in" data-k><option value="1">1</option><option value="5" selected>5</option></select></label>
+      <label>Requests and acknowledgements lost (%) <input type="range" min="0" max="30" step="5" value="15" data-loss /> <b data-lossval></b></label>
+    </div>
+    <div class="pg-grid">
+      <div class="pg-box" data-b1><h3>Events in the log</h3><span class="pg-mono" data-o1></span><span class="pg-note" data-n1></span></div>
+      <div class="pg-box" data-b2><h3>Duplicates</h3><span class="pg-mono" data-o2></span><span class="pg-note" data-n2></span></div>
+      <div class="pg-box" data-b3><h3>Events out of order</h3><span class="pg-mono" data-o3></span><span class="pg-note" data-n3></span></div>
+      <div class="pg-box" data-b4><h3>Round trips used</h3><span class="pg-mono" data-o4></span><span class="pg-note" data-n4></span></div>
+    </div>
+    <p class="pg-out" data-verdict aria-live="polite"></p>
+    <p class="pg-note">Model: one producer, one partition, 200 events numbered 0 to 199. In each round trip the producer sends the first N unacknowledged events in order. Each request is lost with the chosen probability, and an event that did arrive has its acknowledgement lost with the same probability. Unacknowledged events are retried first in the next round. With idempotence the leader keeps the next expected sequence number: a lower number is acknowledged and not stored, and a higher one is refused. "Out of order" counts events that appear after a higher-numbered event.</p>
+  </div>
+</PlaygroundShell>
+<script>
+  document.querySelectorAll<HTMLElement>('[data-esb]').forEach((root) => {
+    const q = <T extends HTMLElement>(s: string) => root.querySelector<T>(s)!;
+    const N = 200;
+    function run(idem: boolean, k: number, lossPct: number) {
+      let seed = 11; const rnd = () => ((seed = (seed * 1664525 + 1013904223) % 4294967296) / 4294967296);
+      const loss = lossPct / 100; let pending = Array.from({ length: N }, (_, i) => i); const log: number[] = []; let expected = 0; let rounds = 0;
+      while (pending.length > 0 && rounds < 5000) {
+        rounds++; const batch = pending.slice(0, k); const rest = pending.slice(k); const failed: number[] = [];
+        for (const id of batch) {
+          if (rnd() < loss) { failed.push(id); continue; } // the request never arrived
+          if (idem) {
+            if (id < expected) { /* already stored: acknowledged again, not stored twice */ }
+            else if (id > expected) { failed.push(id); continue; } // a gap: refused, sent again in order
+            else { log.push(id); expected++; }
+          } else log.push(id);
+          if (rnd() < loss) failed.push(id); // stored, but the acknowledgement was lost
+        }
+        pending = [...failed, ...rest];
+      }
+      const seen = new Set<number>(); let max = -1; let out = 0;
+      for (const id of log) { if (!seen.has(id)) { seen.add(id); if (id < max) out++; } max = Math.max(max, id); }
+      return { stored: log.length, dup: log.length - seen.size, out, rounds };
+    }
+    function draw() {
+      const idem = q<HTMLSelectElement>('[data-idem]').value === 'on'; const k = Number(q<HTMLSelectElement>('[data-k]').value); const loss = Number(q<HTMLInputElement>('[data-loss]').value);
+      q('[data-lossval]').textContent = String(loss);
+      const r = run(idem, k, loss); const base = run(idem, 1, loss);
+      q('[data-o1]').textContent = `${r.stored} of ${N} sent`; q('[data-n1]').textContent = r.stored === N ? 'exactly one copy of each' : `${r.stored - N} too many`;
+      q('[data-o2]').textContent = String(r.dup); q('[data-n2]').textContent = r.dup > 0 ? 'a retry stored the event again' : 'none stored twice';
+      q('[data-o3]').textContent = String(r.out); q('[data-n3]').textContent = r.out > 0 ? 'a retry landed behind newer events' : 'the log is in sending order';
+      q('[data-o4]').textContent = String(r.rounds); q('[data-n4]').textContent = k === 1 ? 'one request at a time' : `${(base.rounds / r.rounds).toFixed(1)} times fewer than with one request in flight`;
+      q<HTMLElement>('[data-b1]').style.setProperty('--c', r.dup > 0 ? 'var(--bad)' : 'var(--good)');
+      q<HTMLElement>('[data-b2]').style.setProperty('--c', r.dup > 0 ? 'var(--bad)' : 'var(--good)');
+      q<HTMLElement>('[data-b3]').style.setProperty('--c', r.out > 0 ? 'var(--bad)' : 'var(--good)');
+      q<HTMLElement>('[data-b4]').style.setProperty('--c', 'var(--accent)');
+      const out = q('[data-verdict]'); const bad = r.dup > 0 || r.out > 0; out.classList.toggle('bad', bad);
+      out.textContent = loss === 0 ? 'Nothing is lost, so nothing is retried and every setting is correct. Duplicates and disorder only appear when acknowledgements or requests are lost.'
+        : idem ? `Correct: ${r.stored} events, in order, with no duplicates, even though about ${loss}% of messages were lost. It took ${r.rounds} round trips.`
+        : r.dup > 0 && r.out > 0 ? `${r.dup} duplicates and ${r.out} events out of order. A lost acknowledgement makes the producer resend an event that was stored, and with ${k} requests in flight a retry lands behind newer events. Turn idempotence on.`
+        : r.out > 0 ? `${r.out} events out of order: a retry landed behind newer events sent while it was in flight. Turn idempotence on.`
+        : k === 1 ? `${r.dup} duplicates, but the order holds because only one request is in flight. It took ${r.rounds} round trips, ${(r.rounds / run(false, 5, loss).rounds).toFixed(1)} times as many as with 5 in flight.`
+        : `${r.dup} duplicates: a lost acknowledgement made the producer resend events that were already stored. Turn idempotence on.`;
+    }
+    root.addEventListener('input', draw); root.addEventListener('change', draw);
+    draw();
+  });
+</script>

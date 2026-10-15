@@ -1,0 +1,54 @@
+{
+  "actors": [
+    { "id": "caller", "label": "Order service", "role": "client", "x": 14, "y": 16 },
+    { "id": "api", "label": "Timer API", "role": "edge", "x": 50, "y": 16 },
+    { "id": "store", "label": "Timer store", "role": "data", "x": 86, "y": 16 },
+    { "id": "target", "label": "Order service callback", "role": "client", "x": 14, "y": 50 },
+    { "id": "queue", "label": "Delivery queue", "role": "async", "x": 50, "y": 50 },
+    { "id": "node", "label": "Timer node (wheels)", "role": "compute", "x": 86, "y": 50 },
+    { "id": "dedup", "label": "Dedup table", "role": "data", "x": 50, "y": 84 }
+  ],
+  "frames": [
+    {
+      "narration": "At 08:20 an order is placed. The order service creates a timer: in 40 minutes, at 09:00:00, call back to cancel the order if it is still unpaid. The API gives it the id t-501.",
+      "messages": [{ "from": "caller", "to": "api", "label": "fire at 09:00:00, key t-501" }],
+      "states": { "api": "accepted t-501" }
+    },
+    {
+      "narration": "The timer is stored under the bucket 09:00:00, which covers the 10 seconds from 09:00:00 to 09:00:10, and under the exact time and id. It is stored on three copies before the API says yes, and an index maps t-501 to this bucket for cancels.",
+      "messages": [{ "from": "api", "to": "store", "label": "write bucket 09:00:00" }],
+      "states": { "store": "t-501 in bucket 09:00:00" }
+    },
+    {
+      "narration": "At 08:55 the node that owns t-501's partition reads the bucket 09:00:00, five minutes ahead, about 52,000 timers. Five minutes is 30,000 ticks of 10 ms, more than the 4,096 the middle wheel covers, so t-501 goes into the coarsest of the three wheels.",
+      "messages": [{ "from": "store", "to": "node", "label": "load 09:00:00 bucket" }],
+      "states": { "node": "t-501 in coarse wheel" }
+    },
+    {
+      "narration": "As time passes, t-501 moves down. About 40 seconds before 09:00:00 it moves into the middle wheel, and less than a second before it moves into the finest wheel, in the slot for its exact tick. Nobody scans the other 52,000 timers to find it.",
+      "states": { "node": "t-501 in finest wheel" },
+      "highlight": ["node"]
+    },
+    {
+      "narration": "The tick 09:00:00.000 comes. The node claims t-501 in the store with a lease of 30 seconds. The claim is a conditional write, and it succeeds only if t-501 still exists and nobody else holds it, so a cancel or a second node would have stopped it here.",
+      "messages": [{ "from": "node", "to": "store", "label": "claim t-501, lease 30 s" }],
+      "states": { "store": "t-501 leased to node" }
+    },
+    {
+      "narration": "The node puts the message on the delivery queue with the key t-501 and the attempt number 1, and the queue hands it to the order service. It is sent 4 ms after the fire time, never before it.",
+      "messages": [{ "from": "node", "to": "queue", "label": "t-501 attempt 1" }, { "from": "queue", "to": "target", "label": "t-501 attempt 1" }],
+      "states": { "queue": "4 ms late" }
+    },
+    {
+      "narration": "The order service looks up t-501 in its dedup table. It has not seen it, so it records it and acts: the order is unpaid, so it is cancelled. Had the node crashed after sending, the lease would expire at 09:00:30, another node would send attempt 2, and the dedup table would drop it.",
+      "messages": [{ "from": "target", "to": "dedup", "label": "seen t-501?" }, { "from": "dedup", "to": "target", "label": "no, recorded" }],
+      "states": { "target": "order cancelled", "dedup": "t-501 recorded" }
+    },
+    {
+      "narration": "The order service acknowledges. Only now does the node delete the timer, so the store holds one fewer timer and the lateness metric gets a 4 ms point for the 99th-percentile graph.",
+      "messages": [{ "from": "target", "to": "queue", "label": "ack" }, { "from": "node", "to": "store", "label": "delete t-501" }],
+      "states": { "store": "t-501 done" },
+      "highlight": ["store"]
+    }
+  ]
+}

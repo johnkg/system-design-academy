@@ -1,0 +1,555 @@
+{
+  "name": "Design a WebSocket Gateway",
+  "difficulty": "advanced",
+  "intent": "Hold ten million long-lived connections open, know which server each user is on, push messages to all of a user's devices, and survive deploys and reconnect storms without dropping or duplicating anything.",
+  "codeTitle": "a gateway session with sequence numbers, a bounded buffer and resume",
+  "finalIntro": "One backend message pushed to a user's two devices, one of which drops and resumes.",
+  "prompt": "Design the connection layer that sits in front of a product's real-time features. Ten million clients (browsers and phones) keep a WebSocket open. Backend services say 'send this to user 42' without knowing which server holds the connection. Connections come and go constantly, servers are deployed daily, and a lost network zone must not take the service down.",
+  "functional": [
+    "Accept and authenticate WebSocket connections",
+    "Let any backend service push a message to every connection of a user, or to one named connection",
+    "Let clients send messages upstream to backend services",
+    "Detect dead connections and clean them up",
+    "Let a client that reconnects resume from the last message it received"
+  ],
+  "nonFunctional": [
+    "Hold 10 million concurrent connections, with about 50,000 on each gateway node",
+    "Deliver a pushed message to a connected device in under 200 ms at the median",
+    "Look up where a user is connected in a few milliseconds",
+    "Deploy new gateway versions every day without a visible wave of disconnects",
+    "A lost zone (one third of the nodes) causes a bounded reconnect wave, not an outage",
+    "One slow or stuck client never slows down others or exhausts server memory"
+  ],
+  "firstAttempt": {
+    "text": "One big server accepts the WebSockets and also runs the application logic. To send to a user, the code looks up that user's socket in an in-memory map and writes to it. A second server is added when the first is full, and clients are spread by round robin.",
+    "limits": [
+      "A backend that wants to message user 42 cannot know which of the servers holds their socket",
+      "A user with a phone and a laptop may be connected to two different servers",
+      "Deploying a new version restarts the process and drops every connection at once, and they all return together",
+      "A client that stops reading makes the server buffer data forever until memory runs out",
+      "A connection that dies silently (a phone going into a tunnel) looks open for minutes and wastes memory",
+      "A message sent while the client was reconnecting is simply lost"
+    ]
+  },
+  "nodes": [
+    {
+      "id": "clients",
+      "label": "Clients",
+      "kind": "client",
+      "x": 87,
+      "y": 88
+    },
+    {
+      "id": "single",
+      "label": "One server with sockets",
+      "kind": "compute",
+      "x": 62,
+      "y": 88,
+      "at": 0,
+      "until": 1
+    },
+    {
+      "id": "lb",
+      "label": "Load balancer",
+      "kind": "edge",
+      "x": 62,
+      "y": 63,
+      "at": 1
+    },
+    {
+      "id": "gw",
+      "label": "Gateway nodes",
+      "kind": "compute",
+      "x": 37,
+      "y": 63,
+      "at": 1
+    },
+    {
+      "id": "backend",
+      "label": "Backend services",
+      "kind": "compute",
+      "x": 62,
+      "y": 12,
+      "at": 2
+    },
+    {
+      "id": "registry",
+      "label": "Connection registry",
+      "kind": "data",
+      "x": 62,
+      "y": 37,
+      "at": 2
+    },
+    {
+      "id": "router",
+      "label": "Fan-out router",
+      "kind": "compute",
+      "x": 37,
+      "y": 12,
+      "at": 3
+    },
+    {
+      "id": "bus",
+      "label": "Per-node topics",
+      "kind": "async",
+      "x": 37,
+      "y": 37,
+      "at": 3
+    },
+    {
+      "id": "adm",
+      "label": "Admission control",
+      "kind": "edge",
+      "x": 87,
+      "y": 63,
+      "at": 4
+    },
+    {
+      "id": "ctrl",
+      "label": "Deploy controller",
+      "kind": "compute",
+      "x": 12,
+      "y": 63,
+      "at": 5
+    },
+    {
+      "id": "replay",
+      "label": "Resume buffer",
+      "kind": "data",
+      "x": 12,
+      "y": 37,
+      "at": 6
+    }
+  ],
+  "edges": [
+    {
+      "from": "clients",
+      "to": "single",
+      "at": 0,
+      "until": 1
+    },
+    {
+      "from": "clients",
+      "to": "lb",
+      "at": 1,
+      "until": 4
+    },
+    {
+      "from": "lb",
+      "to": "gw",
+      "at": 1
+    },
+    {
+      "from": "gw",
+      "to": "registry",
+      "at": 2
+    },
+    {
+      "from": "backend",
+      "to": "router",
+      "at": 2,
+      "until": 3
+    },
+    {
+      "from": "backend",
+      "to": "registry",
+      "at": 2,
+      "until": 3
+    },
+    {
+      "from": "backend",
+      "to": "router",
+      "at": 3
+    },
+    {
+      "from": "router",
+      "to": "registry",
+      "at": 3
+    },
+    {
+      "from": "router",
+      "to": "bus",
+      "at": 3
+    },
+    {
+      "from": "bus",
+      "to": "gw",
+      "at": 3
+    },
+    {
+      "from": "clients",
+      "to": "adm",
+      "at": 4
+    },
+    {
+      "from": "adm",
+      "to": "lb",
+      "at": 4
+    },
+    {
+      "from": "ctrl",
+      "to": "gw",
+      "at": 5
+    },
+    {
+      "from": "gw",
+      "to": "replay",
+      "at": 6
+    },
+    {
+      "from": "router",
+      "to": "replay",
+      "at": 6
+    }
+  ],
+  "steps": [
+    {
+      "title": "Put stateless gateway nodes behind a layer-4 load balancer",
+      "problem": "A single process cannot hold ten million sockets, and mixing application logic into the process that owns the sockets makes every code change a connection-dropping event.",
+      "fix": "Run a fleet of gateway nodes that do only connection work: the TLS handshake, the HTTP upgrade to WebSocket, authentication of the token, framing, heartbeats and a bounded buffer per connection. A TCP (layer-4) load balancer spreads new connections across them, preferring the node with the fewest connections rather than round robin, because connections last for hours. Application logic stays in backend services that talk to gateways over a simple internal protocol. A node sized for 50,000 connections uses about 1 GB for buffers and TLS state, so the work is bounded by memory and file descriptors more than by CPU.",
+      "tradeoff": "The part that must stay connected is small and rarely changes, and the rest of the system can be deployed freely. A connection is pinned to one node for its whole life, so balancing only happens at connect time, and a node can end up hot if its clients are chatty.",
+      "concepts": [
+        {
+          "slug": "real-time-communication"
+        },
+        {
+          "slug": "load-balancing"
+        },
+        {
+          "slug": "tcp-vs-udp"
+        },
+        {
+          "slug": "tls-and-https"
+        },
+        {
+          "slug": "horizontal-vs-vertical-scaling"
+        }
+      ]
+    },
+    {
+      "title": "Keep a registry of which node holds which connection",
+      "problem": "With many nodes, a backend that wants to reach user 42 has no idea where the socket is, and a user can have several connections on several nodes.",
+      "fix": "When a connection is authenticated, its gateway node writes an entry to a fast in-memory registry: user id to a set of (connection id, node id), with an expiry time. The entry is refreshed on every heartbeat, in batches per node rather than one write per connection, so about 170,000 individual refreshes a second become about six batch calls a second. When the connection closes the entry is deleted, and if the node dies the entries expire by themselves. The registry is sharded by user id.",
+      "tradeoff": "Any service can find a user's devices with one lookup. The registry is a soft copy: it can briefly list a connection that is gone or miss one that has just arrived, so delivery must tolerate a miss, and its refresh traffic is a real cost at this scale.",
+      "concepts": [
+        {
+          "slug": "caching"
+        },
+        {
+          "slug": "consistent-hashing"
+        },
+        {
+          "slug": "database-sharding"
+        },
+        {
+          "slug": "failure-detection"
+        },
+        {
+          "slug": "leases-and-fencing-tokens"
+        }
+      ]
+    },
+    {
+      "title": "Fan out through per-node topics",
+      "problem": "A user's phone and laptop may sit on different nodes, and a notification for a celebrity-sized audience means thousands of lookups and sends at once.",
+      "fix": "A fan-out router receives 'send to user 42', reads the registry, groups the target connections by node, and publishes one message per node on a topic named after the node. Each gateway subscribes only to its own topic, finds the local sockets for that user and writes to them. A message for 5,000 users on 800 nodes becomes 800 publishes, not 5,000. If the registry has no entry the message is handed to the push-notification path instead of being dropped.",
+      "tradeoff": "Backends stay ignorant of topology and the cost of a send is proportional to the number of nodes touched, not devices. A node can receive a message for a connection that just left, and then it must discard it quietly.",
+      "concepts": [
+        {
+          "slug": "pub-sub"
+        },
+        {
+          "slug": "message-queues"
+        },
+        {
+          "slug": "delivery-guarantees"
+        },
+        {
+          "slug": "ordering-and-partitioning"
+        },
+        {
+          "slug": "graceful-degradation"
+        }
+      ]
+    },
+    {
+      "title": "Detect dead connections and survive reconnect storms",
+      "problem": "A client that vanishes without a close frame looks connected for minutes, and when a zone is lost three million clients all reconnect in the same second and overload the survivors.",
+      "fix": "The gateway sends a WebSocket ping every 30 seconds and closes any connection that has not answered in 2 intervals or has been idle for the configured limit; ping intervals are staggered so they do not all fire at the same instant. Clients reconnect with capped exponential backoff and full jitter, picking a random delay between 0 and the current cap, so retries spread over minutes. An admission-control layer in front of the load balancer rate-limits new handshakes per node, and answers excess attempts instantly with a retry-after hint instead of letting them pile up inside TLS handshakes.",
+      "tradeoff": "Dead connections are gone within about a minute and a storm is flattened into a steady stream. Some users wait up to a minute to reconnect after a mass failure, and the heartbeat itself costs 330,000 pings a second, which is why its interval is a tuning knob.",
+      "concepts": [
+        {
+          "slug": "retries-and-backoff"
+        },
+        {
+          "slug": "rate-limiting"
+        },
+        {
+          "slug": "load-shedding"
+        },
+        {
+          "slug": "health-checks"
+        },
+        {
+          "slug": "timeouts-and-deadlines"
+        }
+      ]
+    },
+    {
+      "title": "Bound every connection's buffer and shed slow clients",
+      "problem": "A client on a bad network reads slowly, so data queues up for it inside the gateway, and enough slow clients can exhaust the memory of the whole node.",
+      "fix": "Each connection has a bounded outgoing queue, for example 256 messages or 1 MB. The gateway checks the queue before writing. When it is more than half full, low-value messages such as typing hints or superseded state updates are dropped or coalesced into the latest value. When it is full, the gateway closes that connection with a clear code and the client reconnects and resumes. Nothing in the delivery path ever blocks on one socket: writes are asynchronous, and fan-out from the topic to sockets is isolated so one stuck connection cannot delay the rest.",
+      "tradeoff": "Memory use is bounded and one bad client harms only itself. Some clients get disconnected on a poor network when they could have caught up eventually, and the system must define which messages are safe to drop.",
+      "concepts": [
+        {
+          "slug": "backpressure"
+        },
+        {
+          "slug": "bulkhead"
+        },
+        {
+          "slug": "load-shedding"
+        },
+        {
+          "slug": "queueing-theory-and-littles-law"
+        },
+        {
+          "slug": "graceful-degradation"
+        }
+      ]
+    },
+    {
+      "title": "Drain gracefully on deploy, and resume from a sequence number",
+      "problem": "Deploying a gateway node would drop its 50,000 connections at once, and any message sent while a client is between connections would be lost.",
+      "fix": "A deploy controller marks a node as draining: the load balancer stops sending it new connections, the registry entries are flagged, and the node sends each client a 'reconnect' frame at a randomly spread moment over several minutes, then closes it with a normal close code. Every message to a user gets a per-user sequence number and is kept in a resume buffer for a short time, for example 5 minutes or the last 1,000 messages. A client reconnects, says 'my last sequence number was 118', and the gateway replays 119 onwards, or tells the client to do a full refresh if the gap is older than the buffer. Applying a message with a number already seen is ignored, so replays are safe.",
+      "tradeoff": "A rolling deploy of about 330 nodes moves connections steadily with no visible gap and no loss within the window. Draining takes minutes per node, so a deploy takes hours unless several nodes drain in parallel, and the resume buffer costs memory and needs a fallback for long outages.",
+      "concepts": [
+        {
+          "slug": "blue-green-and-rolling-deployments"
+        },
+        {
+          "slug": "idempotency"
+        },
+        {
+          "slug": "logical-clocks"
+        },
+        {
+          "slug": "delivery-guarantees"
+        },
+        {
+          "slug": "retries-and-backoff"
+        }
+      ]
+    }
+  ],
+  "failures": [
+    {
+      "scenario": "A gateway node crashes with 50,000 connections",
+      "impact": "Those users are offline, their registry entries point to a dead node, and messages for them go nowhere until they reconnect.",
+      "answer": "Clients notice at the next failed ping or read and reconnect with jittered backoff, to a healthy node chosen by the load balancer. The dead node's registry entries expire after the lease time, and the router treats a publish to a node with no subscriber as a miss and falls back to the resume buffer and push notification. On reconnect each client resumes from its last sequence number.",
+      "concepts": [
+        {
+          "slug": "failure-detection"
+        },
+        {
+          "slug": "retries-and-backoff"
+        },
+        {
+          "slug": "leases-and-fencing-tokens"
+        },
+        {
+          "slug": "health-checks"
+        }
+      ]
+    },
+    {
+      "scenario": "A whole zone is lost",
+      "impact": "A third of the connections, around 3.3 million, try to reconnect almost at once, and the surviving nodes are asked to perform millions of TLS handshakes.",
+      "answer": "Spare capacity is planned in advance: nodes normally run at about 60% of their limit, so after a third of the fleet vanishes the survivors run at about 90%. Client jitter turns the spike into a flow, admission control caps handshakes per node and sheds the excess with a retry-after, and non-critical features are switched off until the fleet is calm. The reconnect takes minutes, not an outage.",
+      "concepts": [
+        {
+          "slug": "multi-region-failover"
+        },
+        {
+          "slug": "load-shedding"
+        },
+        {
+          "slug": "autoscaling"
+        },
+        {
+          "slug": "retries-and-backoff"
+        }
+      ]
+    },
+    {
+      "scenario": "A registry shard is unavailable",
+      "impact": "New connections cannot be recorded and routers cannot find the devices of the affected users.",
+      "answer": "Gateways accept the connection anyway and retry the registration in the background. Routers fall back to a broadcast on a small set of candidate nodes for important messages, or to the push-notification path. Replicas of the registry shard take over within seconds, and the nodes then re-register everything with one batch each.",
+      "concepts": [
+        {
+          "slug": "database-replication"
+        },
+        {
+          "slug": "graceful-degradation"
+        },
+        {
+          "slug": "circuit-breaker"
+        },
+        {
+          "slug": "health-checks"
+        }
+      ]
+    },
+    {
+      "scenario": "A mass of clients reads slowly after a network incident",
+      "impact": "Buffers on many nodes fill up together and memory climbs towards the limit.",
+      "answer": "Per-connection queue limits bound each client, and a per-node memory budget makes the gateway start closing the connections with the largest queues first. Low-priority message types stop being sent to clients who are behind, and an alert fires on the rate of slow-consumer disconnects so that people can see it before the node runs out of memory.",
+      "concepts": [
+        {
+          "slug": "backpressure"
+        },
+        {
+          "slug": "bulkhead"
+        },
+        {
+          "slug": "alerting"
+        },
+        {
+          "slug": "metrics"
+        }
+      ]
+    },
+    {
+      "scenario": "A client reconnects after being away for an hour",
+      "impact": "Its last sequence number is older than anything in the resume buffer, so the gap cannot be replayed.",
+      "answer": "The gateway answers 'resume impossible' and the client performs a full state fetch through the normal API, then continues with the new sequence number. Messages that matter beyond the buffer window, such as chat messages, live in a durable store and are fetched from there, not from the gateway.",
+      "concepts": [
+        {
+          "slug": "event-sourcing"
+        },
+        {
+          "slug": "pagination"
+        },
+        {
+          "slug": "idempotency"
+        },
+        {
+          "slug": "caching"
+        }
+      ]
+    }
+  ],
+  "alternatives": [
+    {
+      "title": "Transport",
+      "options": [
+        {
+          "name": "WebSocket",
+          "pro": "Full duplex, works in every browser, low overhead per message",
+          "con": "Long-lived stateful connections need their own routing, drain and heartbeat handling"
+        },
+        {
+          "name": "Server-sent events",
+          "pro": "Plain HTTP, automatic reconnection and Last-Event-ID resume built in",
+          "con": "One direction only, and the browser limits connections per host on HTTP/1.1"
+        },
+        {
+          "name": "Long polling",
+          "pro": "Works through any proxy",
+          "con": "A new request after every message, with much higher cost and delay"
+        }
+      ],
+      "pick": "WebSocket for two-way traffic, with server-sent events when the server only pushes, and long polling as the fallback."
+    },
+    {
+      "title": "How to find a user's node",
+      "options": [
+        {
+          "name": "Registry lookup",
+          "pro": "Exact, and any node can serve any user",
+          "con": "A refresh write for every connection and a component to keep alive"
+        },
+        {
+          "name": "Consistent hash of the user to a node",
+          "pro": "No registry and no lookup state",
+          "con": "Connections must be steered to a specific node, which breaks even balancing and makes a rebalance move many users"
+        },
+        {
+          "name": "Broadcast to every node",
+          "pro": "Nothing to maintain",
+          "con": "Every node handles every message, so cost grows with the fleet"
+        }
+      ],
+      "pick": "A registry, with batched refreshes and a fallback to the push-notification path on a miss."
+    },
+    {
+      "title": "Delivery guarantee",
+      "options": [
+        {
+          "name": "At most once",
+          "pro": "Simplest, nothing to store",
+          "con": "Messages sent during a reconnect are lost"
+        },
+        {
+          "name": "At least once with sequence numbers and resume",
+          "pro": "No loss within the buffer window, and duplicates are removed by the client",
+          "con": "A buffer to run and an application that accepts replays"
+        },
+        {
+          "name": "Exactly once end to end",
+          "pro": "Easiest to reason about for callers",
+          "con": "Needs acknowledgements and storage on every hop, and is rarely worth it for transient events"
+        }
+      ],
+      "pick": "At least once within a short window, with sequence numbers for de-duplication, and the durable store for anything that must never be lost."
+    },
+    {
+      "title": "What to do with a slow client",
+      "options": [
+        {
+          "name": "Buffer without limit",
+          "pro": "No message ever dropped by the gateway",
+          "con": "One client can exhaust a node's memory"
+        },
+        {
+          "name": "Drop the newest messages",
+          "pro": "Keeps memory bounded and the connection alive",
+          "con": "The client may miss the update that matters most"
+        },
+        {
+          "name": "Coalesce, then disconnect at the limit",
+          "pro": "Keeps the latest state, and cuts off clients that cannot keep up",
+          "con": "The reconnect has a cost, and the rules per message type take effort"
+        }
+      ],
+      "pick": "Coalesce what can be merged, drop the low-value messages, and disconnect when the queue is full."
+    }
+  ],
+  "roles": [
+    {
+      "id": "client",
+      "label": "Clients",
+      "description": "Browsers and phones holding a WebSocket open."
+    },
+    {
+      "id": "edge",
+      "label": "Entry layer",
+      "description": "The load balancer and admission control."
+    },
+    {
+      "id": "async",
+      "label": "Node topics",
+      "description": "Per-node topics that carry messages to the right gateway."
+    },
+    {
+      "id": "compute",
+      "label": "Gateway logic",
+      "description": "Gateway nodes, the fan-out router, backend services and the deploy controller."
+    },
+    {
+      "id": "data",
+      "label": "State",
+      "description": "The connection registry and the resume buffer."
+    }
+  ]
+}

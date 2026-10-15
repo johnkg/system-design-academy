@@ -1,0 +1,85 @@
+---
+import PlaygroundShell from '../../components/PlaygroundShell.astro';
+---
+<PlaygroundShell title="A partition cuts off healthy instances" hint="100 instances heartbeat to the registry every 10 seconds with a 30-second lease. At second 40 some healthy instances lose contact with the registry and some others really crash. What does the registry list at second 120, and what do callers feel?">
+  <ol class="how">
+    <li>At the start (<b>40 percent</b> cut off, <b>5</b> crashed, <b>self-preservation off</b>) the registry believes the silence: it lists only <b>55</b> instances, <b>40</b> healthy ones are dropped, the rest carry <b>127</b> requests per second each against a limit of 100, and <b>21.4 percent</b> of requests fail.</li>
+    <li>Turn <b>self-preservation on</b>: only 55 percent of the expected renewals arrive, below the 85 percent threshold, so nothing is evicted. All <b>100</b> are listed, the <b>5</b> dead ones still get <b>5 percent</b> of first tries, and the load is a comfortable <b>70</b> per instance.</li>
+    <li>Let callers <b>retry once on another instance</b>: failures drop to <b>0.25 percent</b>. The cost of the stale list is paid in retries.</li>
+    <li>Set the cut to <b>0</b> and the crashed instances to <b>30</b> with self-preservation on: only 70 percent of the renewals arrive, so the mode switches on for a <b>real</b> failure, and the <b>30</b> dead stay listed (30 percent of first tries fail, <b>9</b> percent with a retry). That is the price of the mode.</li>
+  </ol>
+  <div class="pg sdb" data-sdb>
+    <div class="pg-row">
+      <label>Healthy instances cut off from the registry (%) <input type="range" min="0" max="60" step="5" value="40" data-part /> <b data-partval></b></label>
+      <label>Instances that really crashed <input type="range" min="0" max="40" value="5" data-dead /> <b data-deadval></b></label>
+      <label>Registry mode <select class="pg-in" data-sp>
+        <option value="off" selected>Evict every expired lease</option>
+        <option value="on">Self-preservation below 85% of renewals</option>
+      </select></label>
+      <label>Callers <select class="pg-in" data-retry>
+        <option value="no" selected>Use the list, no retry</option>
+        <option value="yes">Retry once on another instance</option>
+      </select></label>
+    </div>
+    <div class="pg-grid">
+      <div class="pg-box" data-b1><h3>Instances in the registry</h3><span class="pg-mono" data-o1></span><span class="pg-note" data-n1></span></div>
+      <div class="pg-box" data-b2><h3>Healthy ones wrongly dropped</h3><span class="pg-mono" data-o2></span><span class="pg-note" data-n2></span></div>
+      <div class="pg-box" data-b3><h3>Dead ones still listed</h3><span class="pg-mono" data-o3></span><span class="pg-note" data-n3></span></div>
+      <div class="pg-box" data-b4><h3>Load on each healthy listed one</h3><span class="pg-mono" data-o4></span><span class="pg-note" data-n4></span></div>
+      <div class="pg-box" data-b5><h3>Requests that fail</h3><span class="pg-mono" data-o5></span><span class="pg-note" data-n5></span></div>
+    </div>
+    <p class="pg-out" data-verdict aria-live="polite"></p>
+    <p class="pg-note">Model: 7,000 requests per second spread evenly over the listed instances, each instance can serve 100 per second, and anything above that is dropped. The cut-off and crashed instances stop heartbeating at second 40, the registry sweeps every second, and a retry goes to a random listed instance. Clients can still reach the cut-off instances, because only their link to the registry is down.</p>
+  </div>
+</PlaygroundShell>
+<script>
+  document.querySelectorAll<HTMLElement>('[data-sdb]').forEach((root) => {
+    const q = <T extends HTMLElement>(s: string) => root.querySelector<T>(s)!;
+    const N = 100; const TTL = 30; const EVERY = 10; const DEMAND = 7000; const CAP = 100;
+    // Runs the registry for 120 simulated seconds and reports what it lists at the end.
+    function simulate(part: number, dead: number, sp: boolean, retry: boolean) {
+      const last = new Map<number, number>(); let ren: number[] = []; let spOn = false;
+      for (let t = 0; t <= 120; t++) {
+        for (let id = 0; id < N; id++) {
+          const down = t >= 40 && id < part + dead; // ids 0..part-1 are cut off, the next ones crashed
+          if (t % EVERY === id % EVERY && !down) { last.set(id, t); ren.push(t); }
+        }
+        ren = ren.filter((x) => x > t - TTL);
+        spOn = sp && ren.length * 100 < 85 * last.size * (TTL / EVERY);
+        if (!spOn) for (const [id, s] of Array.from(last)) if (t - s > TTL) last.delete(id);
+      }
+      const listed = Array.from(last.keys());
+      const deadListed = listed.filter((id) => id >= part && id < part + dead).length;
+      const healthyListed = listed.length - deadListed;
+      const missing = N - dead - healthyListed;
+      const a = listed.length ? healthyListed / listed.length : 0;
+      const offered = DEMAND * (a + (retry ? (1 - a) * a : 0));
+      const served = Math.min(offered, CAP * healthyListed);
+      return { listed: listed.length, deadListed, missing, load: healthyListed ? offered / healthyListed : 0, fail: 1 - served / DEMAND, spOn };
+    }
+    function draw() {
+      const part = Number(q<HTMLInputElement>('[data-part]').value); const dead = Number(q<HTMLInputElement>('[data-dead]').value);
+      const sp = q<HTMLSelectElement>('[data-sp]').value === 'on'; const retry = q<HTMLSelectElement>('[data-retry]').value === 'yes';
+      q('[data-partval]').textContent = String(part); q('[data-deadval]').textContent = String(dead);
+      const r = simulate(part, dead, sp, retry);
+      const failPct = r.fail * 100;
+      q('[data-o1]').textContent = `${r.listed} of ${N}`; q('[data-n1]').textContent = r.spOn ? 'self-preservation is on: no lease was expired' : 'leases that ran out were removed';
+      q('[data-o2]').textContent = String(r.missing); q('[data-n2]').textContent = r.missing ? 'alive and serving, but callers never hear of them' : 'none';
+      q('[data-o3]').textContent = String(r.deadListed); q('[data-n3]').textContent = r.deadListed ? `${((r.deadListed / r.listed) * 100).toFixed(0)}% of first tries go to a dead instance` : 'none';
+      q('[data-o4]').textContent = `${r.load.toFixed(0)} per second`; q('[data-n4]').textContent = r.load > CAP ? `over the limit of ${CAP}, so the excess is dropped` : `within the limit of ${CAP}`;
+      q('[data-o5]').textContent = `${failPct.toFixed(failPct < 1 && failPct > 0 ? 2 : 1)} %`; q('[data-n5]').textContent = `of ${DEMAND.toLocaleString('en-US')} requests per second`;
+      const set = (id: string, c: string) => q<HTMLElement>(id).style.setProperty('--c', c);
+      set('[data-b1]', 'var(--accent)');
+      set('[data-b2]', r.missing ? 'var(--bad)' : 'var(--good)');
+      set('[data-b3]', r.deadListed ? 'var(--accent)' : 'var(--good)');
+      set('[data-b4]', r.load > CAP ? 'var(--bad)' : 'var(--good)');
+      set('[data-b5]', failPct > 5.5 ? 'var(--bad)' : failPct > 0.5 ? 'var(--accent)' : 'var(--good)');
+      const out = q('[data-verdict]'); out.classList.toggle('bad', failPct > 5.5);
+      if (r.spOn) out.textContent = `Self-preservation is on, because fewer than 85% of the expected renewals arrive. Every instance stays listed, including ${r.deadListed} dead one${r.deadListed === 1 ? '' : 's'}. ${failPct.toFixed(failPct < 1 && failPct > 0 ? 2 : 1)}% of requests fail, ${retry ? 'after one retry' : 'and a retry on another instance would cut that sharply'}. A partition is not an outage, but a stale list is the price.`;
+      else if (r.missing > 0) out.textContent = `The registry believed the silence and dropped ${r.missing} healthy instances. The ${r.listed - r.deadListed} that remain get ${r.load.toFixed(0)} requests per second each${r.load > CAP ? `, above their limit of ${CAP}, so ${failPct.toFixed(1)}% of requests fail` : `, which they can still bear`}.`;
+      else out.textContent = `Normal operation: the registry removed only the ${dead} instance${dead === 1 ? '' : 's'} that really crashed, and ${failPct.toFixed(1)}% of requests fail.`;
+    }
+    root.addEventListener('input', draw); root.addEventListener('change', draw);
+    draw();
+  });
+</script>
