@@ -85,7 +85,7 @@ public static class Program
         Console.WriteLine($"{breaking} breaking, {changes.Count - breaking} safe: release {(breaking > 0 ? "blocked, ship it as a new version" : "allowed")}");
 
         // the store holds only hashes of keys, never the keys themselves
-        bool plaintext = Platform.Store.Keys.Any(k => k.ToString() == web || k.ToString() == admin);
+        bool plaintext = Platform.Store.Values.Any(r => (r.Plan + string.Join(",", r.Scopes) + r.Version).Contains(web) || (r.Plan + string.Join(",", r.Scopes) + r.Version).Contains(admin));
         if (plaintext || breaking != 4 || changes.Count != 7 || Platform.Handle(web, "GET /payments") != "429 monthly quota used") return 1;
         return 0;
     }
