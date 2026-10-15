@@ -1,0 +1,63 @@
+{
+  "name": "Distributed Training and Parallelism",
+  "area": "aiml",
+  "difficulty": "advanced",
+  "intent": "Understand why a large model cannot be trained on one GPU, how data, tensor and pipeline parallelism and state sharding split the work, and why the interconnect and failures decide what actually runs.",
+  "scenario": "A team trains a 70-billion-parameter model on 64 GPUs (8 nodes of 8). One 80 GB GPU cannot even hold the optimizer state, so the job is split across the cluster. Which split goes inside a node, which across nodes, and how often to checkpoint decides whether the GPUs are busy or waiting.",
+  "problem": "Training state is far larger than the weights. With mixed-precision Adam, each parameter costs about 16 bytes (2 for weights, 2 for gradients, 12 for optimizer state), so 70 billion parameters need roughly 1,120 GB before counting activations, against 80 GB on one GPU. Splitting the work across thousands of GPUs adds communication, idle time in pipelines, stragglers and frequent hardware failures, and a bad split leaves expensive GPUs mostly waiting.",
+  "howItWorks": [
+    { "title": "Count the memory first", "text": "Per parameter, mixed-precision Adam keeps bf16 weights (2 bytes), bf16 gradients (2) and fp32 master weights plus two moments (12): about 16 bytes. Activations come on top and grow with batch, sequence length and layers; recomputing them in the backward pass trades roughly a third more compute for a large cut in memory. This arithmetic, not compute, is usually what forces a model onto many GPUs." },
+    { "title": "Data parallelism and gradient all-reduce", "text": "Every replica holds the whole model and processes different data. After the backward pass the replicas must average their gradients. A ring all-reduce has each GPU send about 2(d-1)/d times the gradient size in 2(d-1) steps, almost independent of d, so the cost is set by bandwidth, not by replica count. Launching it per layer while the backward pass is still running overlaps most of it with compute, and accumulating several microbatches per step amortises it." },
+    { "title": "Shard the state: ZeRO and FSDP", "text": "Replicating 16 bytes per parameter on every replica is wasteful. Sharding the optimizer state across the d replicas (stage 1), then the gradients (stage 2), then the parameters themselves (stage 3, FSDP) cuts per-GPU state to 16/d bytes per parameter. Stage 3 pays with extra communication: parameters are all-gathered just before each layer in the forward and backward pass and gradients are reduce-scattered, about 1.5 times the traffic of plain data parallelism." },
+    { "title": "Split the model: tensor and pipeline parallelism", "text": "Tensor parallelism splits each layer's matrices across GPUs; every layer then needs all-reduces of activations in both passes, so it only works on the fastest links, normally inside one node. Pipeline parallelism gives each group of GPUs a block of consecutive layers and passes activations between them, which is cheap in bandwidth but leaves stages idle while the pipeline fills and drains: a fraction (p-1)/(m+p-1) of time for p stages and m microbatches." },
+    { "title": "Place each parallelism by link speed", "text": "Intra-node links are several times faster than the network between nodes, so the chattiest scheme (tensor parallel) goes inside a node, pipeline stages go across nodes, and data parallelism, whose traffic overlaps with compute, goes across the rest. A tensor-parallel group larger than a node is usually a mistake: the same traffic runs over the slower network and the step time is dominated by it." },
+    { "title": "Survive failures and measure utilisation", "text": "With thousands of GPUs the cluster fails far more often than any single device: if each GPU averages one failure in 50,000 hours, 4,096 GPUs see one about every 12 hours. A synchronous job stops when any one worker dies, so progress is protected by periodic checkpoints. Too rare and each failure throws away a lot of work; too frequent and writing checkpoints eats the run. A good interval is near sqrt(2 x write time x MTBF). Model FLOPs utilisation (MFU), the fraction of peak FLOPs spent on useful model math, is the single number that summarises all of this." }
+  ],
+  "pros": [
+    "Makes models possible that cannot fit on any single device",
+    "Sharding state (ZeRO/FSDP) removes the replication waste of plain data parallelism with little change to the model code",
+    "Combining the schemes lets you match each one to the link it needs",
+    "Periodic checkpoints turn a hardware failure into a bounded loss of work"
+  ],
+  "cons": [
+    "Communication and idle time cut utilisation: 35 to 50 percent MFU on a well-tuned large run is considered good",
+    "Many interacting knobs (parallel degrees, microbatches, recompute, overlap) and a configuration that fits in memory can still be very slow",
+    "Failures are routine at scale and every one costs lost work plus restart time",
+    "One slow GPU or link slows every synchronous step (stragglers)",
+    "Debugging is hard: hangs, loss spikes and silent data corruption surface far from the cause"
+  ],
+  "whenToUse": [
+    "The model state plus activations does not fit on one GPU even with recomputation",
+    "You need the wall-clock time of a large run to fit a deadline and have enough GPUs with a fast interconnect",
+    "Fine-tuning or pre-training where the batch size you want is bigger than one device can process"
+  ],
+  "whenNotToUse": [
+    "The model fits on one GPU: a single device, or plain data parallelism across a few, avoids nearly all the complexity",
+    "Fine-tuning with parameter-efficient methods or a quantised base, which can fit large models on one or a few GPUs",
+    "A small cluster on slow networking, where the communication cost can exceed the compute saved",
+    "Serving a trained model: inference has different bottlenecks (see the sibling concepts)"
+  ],
+  "pitfalls": [
+    "Putting a tensor-parallel group across nodes so every layer's all-reduce runs on the slow network",
+    "Counting only weights when sizing memory and forgetting gradients, optimizer state and activations (16 bytes per parameter, not 2)",
+    "Too few microbatches per step for the pipeline depth, leaving a large bubble",
+    "Writing checkpoints synchronously to slow shared storage so the GPUs idle during every save, or never testing a restore",
+    "Checkpointing the weights but not the optimizer state, data-loader position or random seeds, so the resumed run is not the same run",
+    "Comparing runs by GPU count instead of MFU or tokens per second per GPU, which hides a bad configuration",
+    "Ignoring stragglers: a single throttled GPU or flaky link caps the speed of thousands"
+  ],
+  "related": [
+    { "kind": "concept", "slug": "backups-and-point-in-time-recovery" },
+    { "kind": "concept", "slug": "failure-detection" },
+    { "kind": "concept", "slug": "queueing-theory-and-littles-law" },
+    { "kind": "concept", "slug": "write-ahead-log" },
+    { "kind": "concept", "slug": "llm-inference-and-kv-cache" },
+    { "kind": "concept", "slug": "continuous-batching-and-model-serving" }
+  ],
+  "roles": [
+    { "id": "worker", "label": "GPU worker", "description": "A GPU (or group of GPUs) holding a shard of the model state and running its part of each step." },
+    { "id": "fabric", "label": "Interconnect", "description": "Links between GPUs: fast inside a node, slower between nodes. Carries gradients, parameters and activations." },
+    { "id": "store", "label": "Checkpoint store", "description": "Durable storage that receives periodic snapshots of model and optimizer state." },
+    { "id": "orchestrator", "label": "Job controller", "description": "Detects a dead worker, stops the job, replaces the node and restarts everyone from the last checkpoint." }
+  ]
+}

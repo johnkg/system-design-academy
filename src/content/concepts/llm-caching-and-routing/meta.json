@@ -1,0 +1,64 @@
+{
+  "name": "LLM Caching and Routing",
+  "area": "aiml",
+  "difficulty": "intermediate",
+  "intent": "Cut the cost and latency of LLM calls by reusing work (response and prefix caches) and by sending each request to the cheapest model that can answer it.",
+  "scenario": "A SaaS support assistant sends every question with an 800-token prompt (600 tokens of shared system prompt and policy text, 200 of question) and gets about 150 tokens back. On a large model that is about $0.0047 and 2 seconds per question. Many questions repeat or paraphrase, and most are easy, but a naive cache sometimes returns the answer to a different question.",
+  "problem": "LLM calls are slow and billed per token. Output tokens are generated one at a time, so latency grows with answer length, and long prompts cost money on every call even when 75% of them is identical text. Large models are 10 to 50 times more expensive per token than small ones, yet most traffic does not need them. Caching and routing can remove most of the bill, but a cache that matches by meaning can return confidently wrong answers, and a router that trusts a model's confidence can ship wrong answers cheaply.",
+  "howItWorks": [
+    { "title": "Know where the cost comes from", "text": "Price is roughly input tokens times input rate plus output tokens times output rate, and output tokens usually cost 3 to 6 times more each. Latency is a prefill pass over the whole prompt plus one sequential decode step per output token. At 800 input and 150 output tokens, a large model costs on the order of a cent or less per call and 1 to 3 seconds; a small model is often 10 to 30 times cheaper and 3 to 5 times faster. Rates and speeds vary by provider and change often, so keep them in config, not code." },
+    { "title": "Exact-match response cache", "text": "Hash the normalized request (model, system prompt, parameters, user text, and the tenant) and store the response, as in any cache. A hit costs a lookup and is always correct for deterministic use. It only helps when identical requests repeat (FAQ buttons, retries, batch re-runs), and it is useless for free text, which rarely repeats byte for byte. Only cache when the answer does not depend on hidden state, and set a TTL tied to how fast the underlying facts change." },
+    { "title": "Prompt-prefix (KV) caching", "text": "Providers and self-hosted servers can reuse the attention state (the KV cache) computed for a prompt prefix, so a repeated 600-token system prompt is not recomputed and is typically billed at a discount. It only matches an identical prefix, token for token, from the start. Put stable content first (system prompt, tools, documents) and volatile content last (timestamp, user id, the question). One changed token early in the prompt invalidates everything after it. Entries expire after minutes of inactivity, so it pays off for steady traffic, not for rare calls." },
+    { "title": "Semantic cache by embedding similarity", "text": "Embed the question, find the nearest stored question, and return its answer if cosine similarity is above a threshold. This catches paraphrases that exact matching misses, but similarity measures topical closeness, not equivalence: \"refund within 30 days\" and \"refund within 3 days\" can score above 0.95. Choose the threshold from labelled pairs of your own traffic, scope entries per tenant and per prompt version, give them TTLs, and measure the wrong-hit rate, not just the hit rate." },
+    { "title": "Route by difficulty: a cascade", "text": "Send the request to a cheap model first and accept its answer when a signal says it is good enough (a self-reported or calibrated confidence, a verifier, a classifier on the question, or answer-format checks); otherwise escalate to the large model. Cost is the cheap call for everyone plus the large call for the escalated share. It works when most traffic is easy and the signal is reliable; it fails quietly when the cheap model is confidently wrong. A classifier that routes before calling any model avoids paying twice but needs its own training and evaluation." },
+    { "title": "Fallbacks, budgets and limits", "text": "Providers rate-limit by requests and by tokens per minute and return 429 or 5xx under load. Retry with backoff and jitter, fail over to another provider or a smaller model, and degrade honestly (shorter answer, cached answer with a note) rather than erroring. Enforce per-request token caps (max input, max output), per-tenant daily budgets, and a global spend alarm, because a loop or a long-context abuse can burn a month of budget in an hour." }
+  ],
+  "pros": [
+    "Caching removes whole calls: a hit costs about a millisecond and nearly nothing",
+    "Prefix caching cuts the cost and time-to-first-token of long shared prompts with no change in answers",
+    "Cascades can cut cost by half or more when most traffic is easy",
+    "Fallbacks keep the feature up through provider rate limits and outages"
+  ],
+  "cons": [
+    "Semantic caches and cheap-model routing trade money for wrong answers, and the wrong answers are fluent and look right",
+    "Hit rate depends on traffic: unique, long-tail questions barely cache",
+    "More moving parts: embedding model, vector index, thresholds, TTLs, confidence calibration, per-tenant scoping",
+    "Quality now depends on evaluation you must keep running, because model versions, prompts and traffic drift"
+  ],
+  "whenToUse": [
+    "High volume with repeated or paraphrased questions (support, search suggestions, FAQ bots)",
+    "Long shared prompts: system instructions, tool definitions or a document asked about many times",
+    "Mixed difficulty traffic where a small model handles most requests",
+    "Any production LLM feature that needs a spend ceiling and a plan for provider outages"
+  ],
+  "whenNotToUse": [
+    "Low volume, where the engineering and evaluation effort costs more than the savings",
+    "Personalised, time-sensitive or high-stakes answers (account balances, medical, legal, money movement) where a stale or near-miss answer is unacceptable",
+    "Highly diverse inputs where nothing repeats; start with prefix caching and a smaller model instead",
+    "When you cannot measure answer quality; you would be saving money blind"
+  ],
+  "pitfalls": [
+    "Putting a timestamp, request id or user name at the top of the prompt, which invalidates the prefix cache on every call",
+    "Choosing the similarity threshold by looking at hit rate alone; measure wrong-hit rate on labelled near-miss pairs, and note that good thresholds depend on the embedding model",
+    "A shared semantic cache across tenants or users, which can serve one customer's data to another",
+    "No TTL or no invalidation when the source documents or the system prompt change, so stale answers live forever",
+    "Escalating on model-reported confidence without calibration: models are often confidently wrong, and the cascade silently ships those answers",
+    "Retrying 429s immediately and in lockstep, which turns a rate limit into an outage",
+    "Caching responses that contain sampled randomness or tool side effects as if they were pure functions"
+  ],
+  "related": [
+    { "kind": "concept", "slug": "caching" },
+    { "kind": "concept", "slug": "rate-limiting" },
+    { "kind": "concept", "slug": "graceful-degradation" },
+    { "kind": "concept", "slug": "retries-and-backoff" },
+    { "kind": "concept", "slug": "llm-inference-and-kv-cache" },
+    { "kind": "concept", "slug": "embeddings-and-vector-search" }
+  ],
+  "roles": [
+    { "id": "gateway", "label": "App / gateway", "description": "Builds the prompt, enforces token budgets and tenant scope, and calls the cache and router." },
+    { "id": "cache", "label": "Response cache", "description": "Exact-match or embedding-similarity store of previous answers, scoped by tenant and prompt version." },
+    { "id": "router", "label": "Router", "description": "Chooses the model, decides on escalation from a confidence or difficulty signal, and handles fallbacks." },
+    { "id": "small", "label": "Small model", "description": "Cheap and fast; handles the easy majority of traffic." },
+    { "id": "large", "label": "Large model", "description": "Expensive and slower; used for hard requests and as the quality backstop." }
+  ]
+}

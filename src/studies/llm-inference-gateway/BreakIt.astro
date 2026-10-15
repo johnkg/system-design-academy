@@ -1,0 +1,98 @@
+---
+import PlaygroundShell from '../../components/PlaygroundShell.astro';
+---
+<PlaygroundShell title="A full GPU pool: queue, shed or divert" hint="Eight GPU slots serve requests that take 4 seconds on average. Callers give up if the first token takes longer than 5 seconds. Raise the load above 100% and choose what the gateway does with the excess. Each result simulates 10 minutes.">
+  <ol class="how">
+    <li>Start with the defaults: load <b>130%</b>, an <b>unbounded queue</b>, <b>no cancellation</b>. Only about <b>3%</b> of requests are answered in time, and about <b>95%</b> of the GPU time goes on requests whose caller left long ago. The queue has grown past the callers' patience, so the pool is busy and useless.</li>
+    <li>Tick <b>cancel when the caller leaves</b>: waiting requests of callers who have gone are dropped, so no GPU time is wasted and about <b>78%</b> are answered, but the 95th percentile of time to first token is still about <b>5 seconds</b> and about a fifth of callers wait and give up.</li>
+    <li>Switch to <b>bounded queue, reject fast</b>: about <b>75%</b> are answered, p95 time to first token drops to about <b>3 seconds</b>, and about <b>24%</b> get an immediate 429 instead of waiting for nothing. <b>Divert overflow to a provider</b> raises this to about <b>89%</b>, at the price of provider calls.</li>
+  </ol>
+  <div class="pg igb" data-igb>
+    <div class="pg-row">
+      <label>Offered load, as a share of GPU capacity (%) <input type="range" min="50" max="200" step="10" value="130" data-load /> <b data-loadval></b></label>
+      <label>When the pool is full <select class="pg-in" data-policy>
+        <option value="fifo" selected>Unbounded queue, first come first served</option>
+        <option value="shed">Bounded queue, reject fast</option>
+        <option value="divert">Bounded queue, divert overflow to a provider</option>
+      </select></label>
+      <label><input type="checkbox" data-cancel /> Cancel waiting requests when the caller leaves</label>
+    </div>
+    <div class="pg-grid">
+      <div class="pg-box" data-b1><h3>Answered in time</h3><span class="pg-mono" data-o1></span><span class="pg-note" data-n1></span></div>
+      <div class="pg-box" data-b2><h3>GPU time wasted</h3><span class="pg-mono" data-o2></span><span class="pg-note" data-n2></span></div>
+      <div class="pg-box" data-b3><h3>Rejected at once</h3><span class="pg-mono" data-o3></span><span class="pg-note" data-n3></span></div>
+      <div class="pg-box" data-b4><h3>Gave up waiting</h3><span class="pg-mono" data-o4></span><span class="pg-note" data-n4></span></div>
+      <div class="pg-box" data-b5><h3>95th percentile time to first token</h3><span class="pg-mono" data-o5></span><span class="pg-note" data-n5></span></div>
+    </div>
+    <p class="pg-out" data-verdict aria-live="polite"></p>
+    <p class="pg-note">Model: 8 GPU slots, each request holds a slot for an exponential time with a mean of 4 seconds (capped at 20), and a first token needs 0.3 seconds of prefill after the request starts. Callers abandon after 5 seconds without a first token. A bounded queue holds at most 4 requests. The provider has 3 extra slots of its own, answers with a 0.6 second first token and costs more. Without cancellation a dead request still runs to completion when it reaches the front.</p>
+  </div>
+</PlaygroundShell>
+<script>
+  document.querySelectorAll<HTMLElement>('[data-igb]').forEach((root) => {
+    const q = <T extends HTMLElement>(s: string) => root.querySelector<T>(s)!;
+    type Slot = { end: number; dead?: boolean } | null;
+    type Req = { at: number; gone: boolean };
+    function simulate(load: number, policy: string, cancel: boolean) {
+      const SLOTS = 8, MEAN = 4, DT = 0.05, T = 600, PATIENCE = 5, PREFILL = 0.3, MAXQ = 4, PSLOTS = 3;
+      const lam = (load / 100) * SLOTS / MEAN;
+      let seedA = 11, seedS = 99;
+      const arr = () => ((seedA = (seedA * 1664525 + 1013904223) % 4294967296) / 4294967296); // arrivals
+      const svc = () => Math.min(-Math.log(1 - ((seedS = (seedS * 1664525 + 1013904223) % 4294967296) / 4294967296)) * MEAN, 20); // service times
+      const slots: Slot[] = new Array(SLOTS).fill(null); const pslots: number[] = new Array(PSLOTS).fill(0);
+      let queue: Req[] = []; const ttfts: number[] = [];
+      const r = { arrived: 0, good: 0, diverted: 0, rejected: 0, abandoned: 0, busy: 0, wasted: 0, p95: 0 };
+      for (let t = 0; t < T; t += DT) {
+        if (arr() < lam * DT) {
+          r.arrived++;
+          if (policy !== 'fifo' && queue.length >= MAXQ) {
+            const f = policy === 'divert' ? pslots.findIndex((e) => e <= t) : -1;
+            if (f >= 0) { pslots[f] = t + svc(); r.diverted++; ttfts.push(0.6); } else r.rejected++;
+          } else queue.push({ at: t, gone: false });
+        }
+        for (let i = 0; i < SLOTS; i++) { const s = slots[i]; if (s && s.end <= t) slots[i] = null; }
+        for (const rq of queue) if (!rq.gone && t - rq.at > PATIENCE) { rq.gone = true; r.abandoned++; }
+        if (cancel) queue = queue.filter((rq) => !rq.gone);
+        for (let i = 0; i < SLOTS; i++) {
+          if (slots[i]) continue;
+          const rq = queue.shift(); if (!rq) break;
+          slots[i] = { end: t + svc(), dead: rq.gone };
+          if (!rq.gone) { r.good++; ttfts.push(t - rq.at + PREFILL); }
+        }
+        for (const s of slots) if (s) { r.busy++; if (s.dead) r.wasted++; }
+      }
+      ttfts.sort((a, b) => a - b);
+      r.p95 = ttfts.length ? ttfts[Math.floor(ttfts.length * 0.95)] : 0;
+      return r;
+    }
+    const pct = (a: number, b: number) => (b ? Math.round((a / b) * 100) : 0);
+    let frame = 0;
+    function draw() {
+      const load = Number(q<HTMLInputElement>('[data-load]').value); const policy = q<HTMLSelectElement>('[data-policy]').value; const cancel = q<HTMLInputElement>('[data-cancel]').checked;
+      q('[data-loadval]').textContent = `${load}%`;
+      const r = simulate(load, policy, cancel);
+      const ok = r.good + r.diverted; const okPct = pct(ok, r.arrived); const waste = pct(r.wasted, r.busy);
+      q('[data-o1]').textContent = `${ok.toLocaleString('en-US')} of ${r.arrived.toLocaleString('en-US')} (${okPct}%)`;
+      q('[data-n1]').textContent = r.diverted ? `${r.diverted} of them were answered by the provider` : 'all by the company GPUs';
+      q('[data-o2]').textContent = `${waste}%`; q('[data-n2]').textContent = 'of busy GPU slot time spent on callers who had already left';
+      q('[data-o3]').textContent = r.rejected.toLocaleString('en-US'); q('[data-n3]').textContent = policy === 'fifo' ? 'this policy never rejects' : 'told to retry later, in microseconds';
+      q('[data-o4]').textContent = r.abandoned.toLocaleString('en-US'); q('[data-n4]').textContent = 'waited past 5 seconds and left';
+      q('[data-o5]').textContent = `${r.p95.toFixed(1)} s`; q('[data-n5]').textContent = 'among answered requests';
+      const set = (id: string, color: string) => q<HTMLElement>(id).style.setProperty('--c', color);
+      set('[data-b1]', okPct >= 85 ? 'var(--good)' : okPct >= 60 ? 'var(--accent)' : 'var(--bad)');
+      set('[data-b2]', waste >= 20 ? 'var(--bad)' : 'var(--good)');
+      set('[data-b3]', 'var(--accent)');
+      set('[data-b4]', r.abandoned > r.arrived * 0.1 ? 'var(--bad)' : 'var(--good)');
+      set('[data-b5]', r.p95 > 4 ? 'var(--bad)' : 'var(--good)');
+      const out = q('[data-verdict]'); const bad = okPct < 60 || waste >= 20; out.classList.toggle('bad', bad);
+      if (load <= 100 && okPct >= 95) out.textContent = `The pool keeps up at ${load}% load, so almost everything is answered and the queue policy hardly matters. It matters above 100%.`;
+      else if (waste >= 20) out.textContent = `Collapse: ${waste}% of the GPU time serves callers who already left, so only ${okPct}% of requests are answered in time. The queue grew longer than the callers' patience, and the pool kept working through it.`;
+      else if (policy === 'fifo') out.textContent = `No GPU time is wasted, but ${r.abandoned.toLocaleString('en-US')} callers waited the full 5 seconds and left. Answered requests started up to 5 seconds late. A short, bounded queue would turn this waiting into fast rejections.`;
+      else if (policy === 'shed') out.textContent = `${r.rejected.toLocaleString('en-US')} requests were rejected at once, and the ${okPct}% that were accepted started within about ${r.p95.toFixed(1)} seconds. The pool delivers its full capacity, and callers can retry or fall back.`;
+      else out.textContent = `Overflow went to the provider: ${okPct}% answered, ${r.diverted.toLocaleString('en-US')} of them by the provider at a higher price, and ${r.rejected.toLocaleString('en-US')} rejected once the provider's slots were full too.`;
+    }
+    const schedule = () => { if (frame) cancelAnimationFrame(frame); frame = requestAnimationFrame(() => { frame = 0; draw(); }); };
+    root.addEventListener('input', schedule); root.addEventListener('change', schedule);
+    draw();
+  });
+</script>

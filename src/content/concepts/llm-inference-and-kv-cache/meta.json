@@ -1,0 +1,62 @@
+{
+  "name": "LLM Inference and the KV Cache",
+  "area": "aiml",
+  "difficulty": "advanced",
+  "intent": "Understand why serving a language model is limited by GPU memory and memory bandwidth, not by raw compute, and how the KV cache decides how many users one GPU can hold.",
+  "scenario": "A chat assistant runs an 8B-class model on one 80 GB GPU. Each conversation has about 8,000 tokens of context. With one user it feels instant; as users arrive, the GPU runs out of memory long before it runs out of arithmetic, and the 53rd user has to wait.",
+  "problem": "A model produces text one token at a time, and each new token needs the keys and values of every token before it. Recomputing them every step would be absurdly slow, so servers keep them in a KV cache in GPU memory. That cache grows linearly with sequence length and with the number of concurrent sequences, and it competes with the model weights for a fixed pool of expensive memory. Every decode step also has to stream the weights and the whole cache through the memory bus. Capacity (how many sequences fit) and speed (how fast each token comes out) are both set by memory, so capacity planning looks nothing like a CPU service.",
+  "howItWorks": [
+    { "title": "Autoregressive decoding: one token per forward pass", "text": "The model predicts the next token from everything so far, appends it, and repeats until it emits a stop token. Tokens of one response cannot be computed in parallel because each depends on the previous one. A 500 token answer is 500 sequential passes through the whole network. Latency is therefore the number of output tokens times the time of one pass." },
+    { "title": "Prefill: the prompt is processed in parallel", "text": "Before the first output token, the model reads the whole prompt in one pass. All prompt tokens are independent inputs at this point, so the GPU does large matrix multiplications at high utilisation. Prefill is compute-bound: its cost grows with prompt length and it sets time to first token (TTFT). Rough cost is 2 x parameters FLOPs per prompt token, so an 8B model needs about 16 GFLOPs per token and a 8,000 token prompt takes roughly 0.5 to 1 second on one modern GPU at realistic utilisation. Attention adds a term that grows with the square of the prompt length, which this page ignores." },
+    { "title": "Decode: memory-bandwidth-bound", "text": "Each decode step handles one new token per sequence, so the arithmetic per weight is tiny. The GPU must still read every weight (16 GB for 8B parameters in 16-bit) plus every sequence's cached keys and values from high-bandwidth memory. At roughly 2 TB/s that is on the order of 8 ms per step. The time is set by bytes moved divided by bandwidth, not by FLOPs. This gap between prefill and decode is why serving systems treat the two phases differently. The time between successive tokens is the inter-token latency (ITL)." },
+    { "title": "The KV cache: keep keys and values, do not recompute", "text": "Attention at each layer needs a key and a value vector for every earlier token. They never change once computed, so the server stores them. Size per token = 2 (K and V) x layers x kv_heads x head_dim x bytes per value. For 32 layers, 8 kv heads, head_dim 128 and 16-bit values that is 128 KiB per token, about 1 GB for an 8,000 token conversation. It grows linearly with tokens and linearly with the number of concurrent sequences. Without it each step would redo the work for the whole history, so cost per token would grow with the history length." },
+    { "title": "Memory sets concurrency, bandwidth sets throughput", "text": "Usable GPU memory minus the weights is the KV budget; dividing by per-sequence cache gives the maximum number of concurrent sequences. Batching several sequences into one decode step shares the weight read, so throughput rises with batch size, but each sequence's cache must still be read every step, so step time rises too. Past the point where cache reads dominate the weights, more batching buys little. Real engines allocate the cache in small blocks (paged attention) so that reserved-but-unused space does not waste capacity, and they batch continuously; see continuous-batching-and-model-serving." },
+    { "title": "Mitigations: fewer kv heads, smaller numbers, less cache", "text": "Grouped-query attention (GQA) shares each key/value head across several query heads: 8 kv heads instead of 32 cuts the cache 4x with a small quality cost, and multi-query attention (1 kv head) goes further. Quantising the cache to 8-bit halves it again and 4-bit quarters it, at some accuracy risk that must be evaluated on your tasks. Other levers: shorter contexts, sliding-window attention, evicting or compressing old tokens, sharing a common prompt prefix across requests, and offloading cold cache to CPU memory at a latency cost." }
+  ],
+  "pros": [
+    "The KV cache turns per-token cost from growing with the history into roughly constant compute per step",
+    "A simple formula (2 x layers x kv_heads x head_dim x bytes x tokens) lets you plan GPU capacity on paper",
+    "GQA and cache quantisation multiply concurrency without new hardware",
+    "Splitting prefill from decode makes the two latency numbers (TTFT and ITL) separately tunable"
+  ],
+  "cons": [
+    "The cache competes with the weights for scarce, expensive GPU memory and caps concurrency",
+    "Long contexts are costly: one 128k token conversation can occupy as much cache as dozens of short ones",
+    "Decode leaves most of the GPU's arithmetic idle unless you batch, and batching raises per-user latency",
+    "Cache quantisation and aggressive eviction can quietly degrade answer quality"
+  ],
+  "whenToUse": [
+    "Capacity planning for any self-hosted LLM: how many concurrent users per GPU at a given context length",
+    "Choosing a model or configuration: kv heads, cache precision and maximum context length have direct cost consequences",
+    "Diagnosing latency: separate slow TTFT (prefill, prompt length) from slow ITL (decode, batch size, cache size)"
+  ],
+  "whenNotToUse": [
+    "You call a hosted model API: the provider owns this problem and you see it only as price per token and rate limits. Count tokens and cache hits, not gigabytes",
+    "Tiny models or short prompts where the cache is a few MB and weights dominate: tune batching, not the cache",
+    "Training: gradients and optimiser state dominate memory there; see distributed-training-and-parallelism"
+  ],
+  "pitfalls": [
+    "Planning capacity from weights alone: a model that fits on the GPU may leave room for only a handful of long conversations",
+    "Sizing for the average context length when a few very long requests arrive together and exhaust memory",
+    "Reporting only tokens per second per GPU: throughput can look great while each user waits a long time between tokens",
+    "Ignoring max output tokens: the cache keeps growing during generation, so a runaway answer holds memory for its whole length",
+    "Quantising the cache without re-running your evaluation set, then discovering long-context quality dropped",
+    "Treating the roofline numbers as exact: real engines add scheduling overhead, kernel inefficiency and attention cost, so measure on your hardware"
+  ],
+  "related": [
+    { "kind": "concept", "slug": "queueing-theory-and-littles-law" },
+    { "kind": "concept", "slug": "backpressure" },
+    { "kind": "concept", "slug": "load-shedding" },
+    { "kind": "concept", "slug": "autoscaling" },
+    { "kind": "concept", "slug": "caching" },
+    { "kind": "concept", "slug": "hedged-requests-and-tail-latency" },
+    { "kind": "concept", "slug": "continuous-batching-and-model-serving" },
+    { "kind": "concept", "slug": "llm-caching-and-routing" }
+  ],
+  "roles": [
+    { "id": "client", "label": "Client", "description": "A user whose chat request carries a prompt and waits for streamed tokens." },
+    { "id": "engine", "label": "Inference engine", "description": "Schedules requests, batches sequences and allocates KV cache memory." },
+    { "id": "gpu", "label": "GPU compute", "description": "Runs the forward pass: matrix multiplies in prefill, weight streaming in decode." },
+    { "id": "kv", "label": "KV cache (HBM)", "description": "Keys and values of every token so far, held in GPU memory next to the weights." }
+  ]
+}

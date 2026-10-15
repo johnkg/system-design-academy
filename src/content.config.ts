@@ -35,7 +35,7 @@ const concepts = defineCollection({
   }),
   schema: z.object({
     name: z.string(),
-    area: z.enum(['scaling', 'data', 'messaging', 'reliability', 'api', 'security', 'observability', 'networking', 'distributed', 'deployment', 'databases', 'dataengineering']),
+    area: z.enum(['scaling', 'data', 'messaging', 'reliability', 'api', 'security', 'observability', 'networking', 'distributed', 'deployment', 'databases', 'dataengineering', 'aiml']),
     difficulty: z.enum(['beginner', 'intermediate', 'advanced']),
     intent: z.string(), // one-line summary
     scenario: z.string(), // the running example used in the animation and simulation

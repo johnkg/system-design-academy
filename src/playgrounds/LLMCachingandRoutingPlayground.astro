@@ -1,0 +1,178 @@
+---
+import PlaygroundShell from '../components/PlaygroundShell.astro';
+---
+<PlaygroundShell title="Simulate it" hint="The same 240 support questions are replayed through your choice of cache and routing. Compare cost with wrong answers served.">
+  <ol class="how">
+    <li>Start with the defaults: a <b>semantic cache at 0.95</b>, one large model. It saves about 94% of the cost but serves around 40 wrong answers, mostly <b>near-miss</b> hits where a similar but different question got another question's answer.</li>
+    <li>Raise the threshold to <b>0.99</b>: wrong answers fall to about 17 but the saving drops to about 79%. Lower it to <b>0.90</b>: about 99 wrong answers. There is no threshold that is both cheap and safe, only a trade-off.</li>
+    <li>Untick <b>Isolate cache per tenant</b>: answers to tenant-specific questions now leak across tenants (about 21 leaked answers at 0.95). Then pick <b>Exact match</b>: about 48% saved with only a few stale answers, because text must match exactly.</li>
+    <li>Set the cache to <b>None</b> and compare routing: <b>small model only</b> is cheapest but about 68 answers are wrong; the <b>cascade</b> at 65 escalates the doubtful ones for about 69% saved with about 19 wrong. Escalating below 90 is safer but saves only about 19%.</li>
+    <li>With cache None and the large model, switch <b>Prompt layout</b> to stable prefix first: cost drops about 34% with identical answers. With a timestamp at the top the prefix never matches and the saving is 0.</li>
+  </ol>
+  <div class="pg llm" data-llm>
+    <div class="pg-row">
+      <label>Cache <select class="pg-in" data-cache><option value="none">None</option><option value="exact">Exact match</option><option value="semantic" selected>Semantic (embeddings)</option></select></label>
+      <label>Similarity threshold <select class="pg-in" data-thr><option value="900">0.90</option><option value="930">0.93</option><option value="950" selected>0.95</option><option value="970">0.97</option><option value="980">0.98</option><option value="990">0.99</option></select></label>
+      <label>Entry lifetime <select class="pg-in" data-ttl><option value="0" selected>No expiry</option><option value="40">40 requests</option></select></label>
+      <label class="llm-check"><input type="checkbox" checked data-iso /> Isolate cache per tenant</label>
+    </div>
+    <div class="pg-row">
+      <label>Routing <select class="pg-in" data-route><option value="large" selected>Large model only</option><option value="small">Small model only</option><option value="cascade">Cascade: small first</option></select></label>
+      <label>Escalate if confidence below <select class="pg-in" data-esc><option value="40">40</option><option value="65" selected>65</option><option value="90">90</option></select></label>
+      <label>Prompt layout <select class="pg-in" data-prefix><option value="none" selected>No prefix caching</option><option value="stable">Stable prefix first</option><option value="volatile">Timestamp first</option></select></label>
+      <button class="btn" type="button" data-reset>Reset settings</button>
+    </div>
+    <div class="pg-grid">
+      <div class="pg-box" style="--c: var(--role-1)"><h3>Cost</h3><span class="pg-mono" data-cost></span><span class="pg-note" data-save></span></div>
+      <div class="pg-box" style="--c: var(--role-2)"><h3>Cache hit rate</h3><span class="pg-mono" data-hit></span><span class="pg-note" data-calls></span></div>
+      <div class="pg-box" data-wrongbox style="--c: var(--border)"><h3>Wrong answers served</h3><span class="pg-mono" data-wrong></span><span class="pg-note" data-why></span></div>
+      <div class="pg-box" style="--c: var(--role-3)"><h3>Average latency</h3><span class="pg-mono" data-lat></span><span class="pg-note">cache hit about 5 ms, embedding 40 ms</span></div>
+    </div>
+    <div class="llm-strip" data-strip role="img" aria-label="Outcome of each of the 240 requests"></div>
+    <p class="pg-note llm-legend"><span class="llm-key" style="--k: var(--role-2)"></span> answered by a model, correct <span class="llm-key" style="--k: var(--good)"></span> cache hit, correct <span class="llm-key" style="--k: var(--bad)"></span> wrong answer (cache or small model)</p>
+    <p class="pg-out" data-verdict></p>
+    <p class="pg-note">Assumptions: 800 input tokens (600 are a shared prompt prefix) and 150 output tokens per request; large model 3.0 and 15 dollars per million input and output tokens, small model 0.15 and 0.60; cached prefix tokens billed at 10%; the large model is always right, the small model is right on easy questions and on 25% of hard ones (30% of traffic); 40% of questions use fresh wording; the refund answer for one topic changes at request 160; two of six topics have tenant-specific answers. These are illustrative, not any vendor's prices. Embeddings are 4 toy numbers, so thresholds are only meaningful relative to each other.</p>
+  </div>
+</PlaygroundShell>
+<script>
+  type Cfg = { cache: string; thr: number; ttl: number; isolate: boolean; route: string; escalate: number; prefix: string };
+  interface Q { i: number; tenant: number; intent: number; phrasing: number; noise: number[]; smallCorrect: boolean; conf: number }
+  const N = 240;
+  const VEC = [[9, 1, 2, 0], [9, 1, 2, 2], [1, 9, 0, 1], [1, 8, 1, 3], [0, 1, 9, 2], [2, 0, 3, 9]];
+  const PH = [[0, 0, 0, 0], [-1, 0, 1, 0], [0, 1, 0, -1]];
+  const WEIGHT = [30, 20, 20, 10, 12, 8];
+  const TENANT_SPECIFIC = [false, false, false, false, true, true];
+  const CHANGE_AT = 160; const CHANGED = [false, false, true, false, false, false];
+  const PRICE: Record<string, { in: number; out: number }> = { small: { in: 150, out: 600 }, large: { in: 3000, out: 15000 } };
+  const IN_TOK = 800; const PREFIX = 600; const OUT_TOK = 150;
+  const LAT: Record<string, number> = { small: 600, large: 2000, embed: 40, hit: 5 };
+  const DEFAULTS: Cfg = { cache: 'semantic', thr: 950, ttl: 0, isolate: true, route: 'large', escalate: 65, prefix: 'none' };
+
+  function makeWorkload(seed: number, n: number): Q[] {
+    let s = seed >>> 0; const rnd = (m: number) => { s = (Math.imul(s, 1664525) + 1013904223) >>> 0; return (s >>> 16) % m; };
+    const out: Q[] = [];
+    for (let i = 0; i < n; i++) {
+      const tenant = rnd(2); const r = rnd(100); let intent = 0; let acc = 0;
+      for (let k = 0; k < 6; k++) { acc += WEIGHT[k]; if (r < acc) { intent = k; break; } }
+      let phrasing = rnd(3); const fresh = rnd(100) < 40; const noise = [rnd(3) - 1, rnd(3) - 1, rnd(3) - 1, rnd(3) - 1];
+      if (fresh) phrasing = 3;
+      const hard = rnd(100) < 30; const smallCorrect = hard ? rnd(100) < 25 : true;
+      const conf = hard ? (rnd(100) < 75 ? rnd(60) : 70 + rnd(30)) : 70 + rnd(30);
+      out.push({ i, tenant, intent, phrasing, noise, smallCorrect, conf });
+    }
+    return out;
+  }
+  const vecOf = (q: Q) => VEC[q.intent].map((v, d) => v + (q.phrasing === 3 ? q.noise[d] : PH[q.phrasing][d]));
+  const dot = (a: number[], b: number[]) => a.reduce((t, v, d) => t + v * b[d], 0);
+  const simAtLeast = (a: number[], b: number[], thr: number) => { const d = dot(a, b); return d > 0 && d * d * 1000000 >= thr * thr * dot(a, a) * dot(b, b); };
+  const simPermille = (a: number[], b: number[]) => Math.floor(1000 * dot(a, b) / Math.sqrt(dot(a, a) * dot(b, b)));
+
+  interface Entry { tenant: number; vec: number[]; intent: number; ver: number; ok: boolean; at: number }
+  function simulate(cfg: Cfg, work: Q[]) {
+    const entries: Entry[] = []; const exact = new Map<string, Entry>(); const seenPrefix: Record<string, boolean> = { small: false, large: false };
+    const st = { cost: 0, base: 0, hits: 0, wrong: { near: 0, tenant: 0, stale: 0, inherited: 0, small: 0 }, calls: { small: 0, large: 0 }, lat: 0, n: work.length, outcome: [] as string[] };
+    const version = (intent: number, i: number) => (CHANGED[intent] && i >= CHANGE_AT ? 1 : 0);
+    const modelCost = (m: string) => {
+      const p = PRICE[m]; let inCost = IN_TOK * p.in;
+      if (cfg.prefix === 'stable' && seenPrefix[m]) inCost = (IN_TOK - PREFIX) * p.in + Math.floor(PREFIX * p.in / 10);
+      if (cfg.prefix === 'stable') seenPrefix[m] = true;
+      if (m === 'small') st.calls.small++; else st.calls.large++;
+      return inCost + OUT_TOK * p.out;
+    };
+    for (const q of work) {
+      st.base += IN_TOK * PRICE.large.in + OUT_TOK * PRICE.large.out;
+      const v = vecOf(q); const key = (cfg.isolate ? q.tenant : -1) + ':' + (q.phrasing === 3 ? 'u' + q.i : q.intent * 3 + q.phrasing); const ver = version(q.intent, q.i);
+      let hit: Entry | null = null;
+      if (cfg.cache === 'exact') { const e = exact.get(key); if (e && (!cfg.ttl || q.i - e.at <= cfg.ttl)) hit = e; }
+      else if (cfg.cache === 'semantic') {
+        st.lat += LAT.embed; let bestSim = -1;
+        for (const e of entries) {
+          if (cfg.isolate && e.tenant !== q.tenant) continue;
+          if (cfg.ttl && q.i - e.at > cfg.ttl) continue;
+          if (!simAtLeast(v, e.vec, cfg.thr)) continue;
+          const sp = simPermille(v, e.vec); if (sp > bestSim) { bestSim = sp; hit = e; }
+        }
+      }
+      if (hit) {
+        st.hits++; st.lat += LAT.hit; let bad = '';
+        if (TENANT_SPECIFIC[q.intent] && hit.tenant !== q.tenant) bad = 'tenant';
+        else if (hit.intent !== q.intent) bad = 'near';
+        else if (hit.ver !== ver) bad = 'stale';
+        else if (!hit.ok) bad = 'inherited';
+        if (bad) st.wrong[bad as 'near']++;
+        st.outcome.push(bad ? 'bad' : 'hit'); continue;
+      }
+      let ok = true; let cost = 0; let lat = 0;
+      if (cfg.route === 'large') { cost = modelCost('large'); lat = LAT.large; }
+      else if (cfg.route === 'small') { cost = modelCost('small'); lat = LAT.small; ok = q.smallCorrect; }
+      else { cost = modelCost('small'); lat = LAT.small; if (q.conf < cfg.escalate) { cost += modelCost('large'); lat += LAT.large; } else ok = q.smallCorrect; }
+      st.cost += cost; st.lat += lat; if (!ok) st.wrong.small++;
+      st.outcome.push(ok ? 'model' : 'bad');
+      const e: Entry = { tenant: q.tenant, vec: v, intent: q.intent, ver, ok, at: q.i };
+      if (cfg.cache === 'exact') exact.set(key, e); else if (cfg.cache === 'semantic') entries.push(e);
+    }
+    const w = st.wrong; return { ...st, wrongTotal: w.near + w.tenant + w.stale + w.inherited + w.small };
+  }
+
+  const CAUSE: Record<string, string> = { near: 'near-miss questions answered with another question’s answer', tenant: 'answers leaked across tenants', stale: 'stale answers after the policy changed', inherited: 'wrong answers that were cached and reused', small: 'the small model being wrong' };
+  const SHORT: Record<string, string> = { near: 'near-miss', tenant: 'cross-tenant', stale: 'stale', inherited: 'reused wrong', small: 'small model' };
+  function verdict(r: ReturnType<typeof simulate>, cfg: Cfg) {
+    const save = Math.floor(100 * (r.base - r.cost) / r.base); const wr = r.wrongTotal; const pct = (100 * wr / r.n).toFixed(0);
+    const top = (Object.keys(r.wrong) as Array<keyof typeof r.wrong>).reduce((a, b) => (r.wrong[b] > r.wrong[a] ? b : a));
+    if (cfg.prefix === 'volatile' && cfg.cache === 'none' && r.cost >= r.base) return 'The prefix cache never matches because the timestamp at the top changes every request, so the saving is 0. Move volatile content to the end of the prompt.';
+    if (cfg.prefix === 'stable' && cfg.cache === 'none' && cfg.route === 'large' && wr === 0) return `Saves ${save}% with identical answers: the 600-token shared prefix is billed at 10% after the first call. This only works while the prefix is byte-identical and traffic keeps the cache warm.`;
+    if (r.cost >= r.base && wr === 0) return 'Baseline: every request pays for the large model and none is cached. Change one setting at a time and watch cost against wrong answers.';
+    if (wr === 0) return save >= 20 ? `Saves ${save}% with no wrong answers on this workload. Real traffic needs the same check on labelled near-miss pairs.` : `No wrong answers, but only ${save}% saved: little repeats exactly or the cheap path is rarely used.`;
+    if (wr / r.n > 0.05) return `Saves ${save}% but serves ${wr} wrong answers (${pct}% of requests), mostly ${CAUSE[top]}. Not safe to ship as is: tighten the threshold, scope the cache, add expiry or escalate more.`;
+    return `Saves ${save}% with ${wr} wrong answers (${pct}% of requests), mostly ${CAUSE[top]}. Acceptable only if a wrong answer is cheap and you keep measuring it.`;
+  }
+
+  const work = makeWorkload(7, N);
+  const dollars = (nano: number) => '$' + (nano / 1e9).toFixed(3);
+  document.querySelectorAll<HTMLElement>('[data-llm]').forEach((root) => {
+    const q = <T extends HTMLElement>(s: string) => root.querySelector<T>(s)!;
+    const strip = q('[data-strip]'); const cells: HTMLSpanElement[] = [];
+    for (let i = 0; i < N; i++) { const c = document.createElement('span'); c.className = 'llm-cell'; strip.appendChild(c); cells.push(c); }
+    const read = (): Cfg => ({
+      cache: q<HTMLSelectElement>('[data-cache]').value, thr: Number(q<HTMLSelectElement>('[data-thr]').value), ttl: Number(q<HTMLSelectElement>('[data-ttl]').value),
+      isolate: q<HTMLInputElement>('[data-iso]').checked, route: q<HTMLSelectElement>('[data-route]').value, escalate: Number(q<HTMLSelectElement>('[data-esc]').value), prefix: q<HTMLSelectElement>('[data-prefix]').value,
+    });
+    const colours: Record<string, string> = { model: 'var(--role-2)', hit: 'var(--good)', bad: 'var(--bad)' };
+    function draw() {
+      const cfg = read(); const r = simulate(cfg, work);
+      const semantic = cfg.cache === 'semantic';
+      q<HTMLSelectElement>('[data-thr]').disabled = !semantic;
+      q<HTMLSelectElement>('[data-ttl]').disabled = cfg.cache === 'none';
+      q<HTMLInputElement>('[data-iso]').disabled = cfg.cache === 'none';
+      q<HTMLSelectElement>('[data-esc]').disabled = cfg.route !== 'cascade';
+      q('[data-cost]').textContent = `${dollars(r.cost)} (baseline ${dollars(r.base)})`;
+      q('[data-save]').textContent = `${Math.floor(100 * (r.base - r.cost) / r.base)}% cheaper than large model, no cache`;
+      q('[data-hit]').textContent = `${Math.floor(100 * r.hits / r.n)}% (${r.hits} of ${r.n})`;
+      q('[data-calls]').textContent = `model calls: ${r.calls.small} small, ${r.calls.large} large`;
+      q('[data-wrong]').textContent = `${r.wrongTotal} of ${r.n} (${(100 * r.wrongTotal / r.n).toFixed(0)}%)`;
+      q<HTMLElement>('[data-wrongbox]').style.setProperty('--c', r.wrongTotal === 0 ? 'var(--good)' : 'var(--bad)');
+      const parts = (Object.keys(r.wrong) as Array<keyof typeof r.wrong>).filter((k) => r.wrong[k] > 0).map((k) => `${SHORT[k]} ${r.wrong[k]}`);
+      q('[data-why]').textContent = parts.length ? parts.join(', ') : 'none';
+      q('[data-lat]').textContent = `${Math.round(r.lat / r.n)} ms`;
+      for (let i = 0; i < N; i++) cells[i].style.background = colours[r.outcome[i]];
+      strip.setAttribute('aria-label', `Outcome of each of the ${N} requests: ${r.hits} cache hits, ${r.wrongTotal} wrong answers`);
+      q('[data-verdict]').textContent = verdict(r, cfg);
+    }
+    let queued = false;
+    const schedule = () => { if (queued) return; queued = true; requestAnimationFrame(() => { queued = false; draw(); }); };
+    root.querySelectorAll('select, input').forEach((el) => el.addEventListener('change', schedule));
+    q('[data-reset]').addEventListener('click', () => {
+      q<HTMLSelectElement>('[data-cache]').value = DEFAULTS.cache; q<HTMLSelectElement>('[data-thr]').value = String(DEFAULTS.thr); q<HTMLSelectElement>('[data-ttl]').value = String(DEFAULTS.ttl);
+      q<HTMLInputElement>('[data-iso]').checked = DEFAULTS.isolate; q<HTMLSelectElement>('[data-route]').value = DEFAULTS.route; q<HTMLSelectElement>('[data-esc]').value = String(DEFAULTS.escalate); q<HTMLSelectElement>('[data-prefix]').value = DEFAULTS.prefix;
+      draw();
+    });
+    draw();
+  });
+</script>
+<style is:global>
+  .playground .llm-check { display: inline-flex; align-items: center; gap: 6px; }
+  .playground .llm-strip { display: flex; flex-wrap: wrap; gap: 2px; margin: 12px 0 4px; }
+  .playground .llm-cell { width: 10px; height: 10px; border-radius: 2px; background: var(--border); }
+  .playground .llm-legend { display: flex; flex-wrap: wrap; align-items: center; gap: 4px 8px; }
+  .playground .llm-key { display: inline-block; width: 10px; height: 10px; border-radius: 2px; background: var(--k); }
+</style>

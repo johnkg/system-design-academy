@@ -1,0 +1,207 @@
+{
+  "actors": [
+    {
+      "id": "ctl",
+      "label": "Job controller",
+      "role": "orchestrator",
+      "x": 50,
+      "y": 14
+    },
+    {
+      "id": "a",
+      "label": "Node A",
+      "role": "worker",
+      "x": 14,
+      "y": 50
+    },
+    {
+      "id": "net",
+      "label": "Network",
+      "role": "fabric",
+      "x": 50,
+      "y": 50
+    },
+    {
+      "id": "b",
+      "label": "Node B",
+      "role": "worker",
+      "x": 86,
+      "y": 50
+    },
+    {
+      "id": "ckpt",
+      "label": "Checkpoints",
+      "role": "store",
+      "x": 50,
+      "y": 86
+    }
+  ],
+  "linkLabel": "traffic",
+  "frames": [
+    {
+      "narration": "Train a 70B model on 64 GPUs of 80 GB. Mixed-precision Adam needs about 16 bytes per parameter: 70 x 16 = 1,120 GB of state, before activations. One GPU cannot hold it.",
+      "states": {
+        "a": "1,120 GB needed",
+        "b": "1,120 GB needed"
+      },
+      "highlight": [
+        "a",
+        "b"
+      ]
+    },
+    {
+      "narration": "Data parallel: every replica sees different data, then the gradients must be averaged. Replicating the full state would still cost 1,120 GB per GPU, so this alone does not fit.",
+      "messages": [
+        {
+          "from": "a",
+          "to": "net",
+          "label": "gradients"
+        },
+        {
+          "from": "b",
+          "to": "net",
+          "label": "gradients"
+        }
+      ],
+      "states": {
+        "a": "OOM",
+        "b": "OOM"
+      },
+      "links": {
+        "add": [
+          [
+            "a",
+            "net"
+          ],
+          [
+            "b",
+            "net"
+          ]
+        ]
+      }
+    },
+    {
+      "narration": "Shard it (ZeRO-3 / FSDP): each of 64 GPUs keeps 1/64 of the state, 17.5 GB. Layers are all-gathered just in time and gradients reduce-scattered, about 1.5x the traffic of plain data parallel.",
+      "messages": [
+        {
+          "from": "net",
+          "to": "a",
+          "label": "layer params"
+        },
+        {
+          "from": "net",
+          "to": "b",
+          "label": "layer params"
+        }
+      ],
+      "states": {
+        "a": "17.5 GB state",
+        "b": "17.5 GB state",
+        "net": "1.5x traffic"
+      },
+      "highlight": [
+        "net"
+      ]
+    },
+    {
+      "narration": "Tensor parallel splits each layer across the 8 GPUs of a node. It needs all-reduces in every layer, so it stays on the fast links inside the node.",
+      "states": {
+        "a": "TP 8 in node, fast links",
+        "net": "idle"
+      },
+      "highlight": [
+        "a"
+      ]
+    },
+    {
+      "narration": "Pipeline parallel gives node A the first layers and node B the last, passing activations over the network. With 8 stages and 8 microbatches, 7/15 = 47% of the time is bubble.",
+      "messages": [
+        {
+          "from": "a",
+          "to": "b",
+          "label": "activations"
+        }
+      ],
+      "states": {
+        "a": "stage 1",
+        "b": "stage 8",
+        "net": "bubble 47%"
+      },
+      "highlight": [
+        "b"
+      ]
+    },
+    {
+      "narration": "More microbatches fill the pipeline: with 64 microbatches the bubble falls to 7/71, about 10%. Utilisation (MFU) is what you track: useful FLOPs over peak.",
+      "states": {
+        "a": "m = 64",
+        "b": "m = 64",
+        "net": "bubble 10%"
+      }
+    },
+    {
+      "narration": "Every 30 minutes the workers write their shards to storage. 14 bytes per parameter is about 980 GB, written in about 20 s.",
+      "messages": [
+        {
+          "from": "a",
+          "to": "ckpt",
+          "label": "shard"
+        },
+        {
+          "from": "b",
+          "to": "ckpt",
+          "label": "shard"
+        }
+      ],
+      "states": {
+        "ckpt": "step 9,000"
+      },
+      "highlight": [
+        "ckpt"
+      ]
+    },
+    {
+      "narration": "At 4,096 GPUs a failure happens about every 12 hours. Node B dies mid-step; the synchronous job cannot continue, and the controller stops everyone.",
+      "messages": [
+        {
+          "from": "ctl",
+          "to": "a",
+          "label": "stop"
+        },
+        {
+          "from": "ctl",
+          "to": "b",
+          "label": "stop"
+        }
+      ],
+      "states": {
+        "b": "failed",
+        "ctl": "detects failure"
+      },
+      "highlight": [
+        "b",
+        "ctl"
+      ]
+    },
+    {
+      "narration": "A spare node joins and all workers reload the last checkpoint. The work since that save, up to 30 minutes, plus restart time is lost. This is the interval trade-off.",
+      "messages": [
+        {
+          "from": "ckpt",
+          "to": "a",
+          "label": "restore"
+        },
+        {
+          "from": "ckpt",
+          "to": "b",
+          "label": "restore"
+        }
+      ],
+      "states": {
+        "a": "step 9,000",
+        "b": "spare node",
+        "ctl": "resume"
+      }
+    }
+  ]
+}

@@ -1,0 +1,223 @@
+{
+  "actors": [
+    {
+      "id": "user",
+      "label": "Support agent",
+      "role": "client",
+      "x": 12,
+      "y": 12
+    },
+    {
+      "id": "api",
+      "label": "Run API",
+      "role": "edge",
+      "x": 37,
+      "y": 12
+    },
+    {
+      "id": "worker",
+      "label": "Agent worker",
+      "role": "compute",
+      "x": 62,
+      "y": 37
+    },
+    {
+      "id": "log",
+      "label": "Step log",
+      "role": "data",
+      "x": 87,
+      "y": 37
+    },
+    {
+      "id": "tools",
+      "label": "Tool gateway",
+      "role": "edge",
+      "x": 37,
+      "y": 63
+    },
+    {
+      "id": "sandbox",
+      "label": "Sandbox",
+      "role": "compute",
+      "x": 62,
+      "y": 88
+    },
+    {
+      "id": "approvals",
+      "label": "Approval queue",
+      "role": "async",
+      "x": 12,
+      "y": 63
+    },
+    {
+      "id": "model",
+      "label": "Model gateway",
+      "role": "edge",
+      "x": 87,
+      "y": 88
+    }
+  ],
+  "frames": [
+    {
+      "narration": "A support agent asks for a run: 'investigate payment p-481 and refund it if it failed'. The run API stores the run with a budget of 30 steps, 150,000 tokens and 3 dollars, and puts it on the queue.",
+      "messages": [
+        {
+          "from": "user",
+          "to": "api",
+          "label": "task + budget"
+        }
+      ],
+      "states": {
+        "api": "run r-7 created"
+      }
+    },
+    {
+      "narration": "A worker leases the run, loads the log (empty) and asks the model for the first action through the model gateway. The model asks to look up the payment. The worker writes the intent and the idempotency key r-7:1 to the log, then calls the tool gateway.",
+      "messages": [
+        {
+          "from": "worker",
+          "to": "model",
+          "label": "step 1?"
+        },
+        {
+          "from": "model",
+          "to": "worker",
+          "label": "lookup_payment p-481"
+        },
+        {
+          "from": "worker",
+          "to": "log",
+          "label": "intent r-7:1"
+        }
+      ],
+      "states": {
+        "worker": "leased r-7"
+      }
+    },
+    {
+      "narration": "The tool gateway checks the arguments against the lookup_payment schema, applies a 5-second timeout and runs the read-only tool. The result goes back and the worker appends it to the log with the tokens used: step 1 costs 4,100 tokens.",
+      "messages": [
+        {
+          "from": "worker",
+          "to": "tools",
+          "label": "lookup_payment r-7:1"
+        },
+        {
+          "from": "tools",
+          "to": "worker",
+          "label": "failed: card declined"
+        },
+        {
+          "from": "worker",
+          "to": "log",
+          "label": "result + 4,100 tokens"
+        }
+      ],
+      "states": {
+        "log": "1 step, 4,100 tokens"
+      }
+    },
+    {
+      "narration": "Step 2 is a Python snippet that checks the customer's order history. The tool gateway has a short-lived token minted for this run with read-only scope on one tenant, and starts the code in a microVM sandbox with no other network access.",
+      "messages": [
+        {
+          "from": "worker",
+          "to": "tools",
+          "label": "run_code r-7:2"
+        },
+        {
+          "from": "tools",
+          "to": "sandbox",
+          "label": "code + token (read only)"
+        },
+        {
+          "from": "sandbox",
+          "to": "tools",
+          "label": "2 earlier refunds"
+        }
+      ],
+      "states": {
+        "sandbox": "microVM, 30 s limit"
+      }
+    },
+    {
+      "narration": "Step 3 is issue_refund, which is marked risky. The gateway does not run it. It parks the run in a waiting state, releases the worker and sends the exact action, a 49.90 refund to the card, to a person. The queue holds it for up to 24 hours.",
+      "messages": [
+        {
+          "from": "worker",
+          "to": "tools",
+          "label": "issue_refund r-7:3"
+        },
+        {
+          "from": "tools",
+          "to": "approvals",
+          "label": "approve 49.90 refund?"
+        }
+      ],
+      "states": {
+        "approvals": "waiting for a person",
+        "worker": "released"
+      }
+    },
+    {
+      "narration": "The person approves. The decision is written to the log, and another worker leases the run, since the first one was replaced in a deploy while it waited. The log is replayed to rebuild the conversation, so the 2 finished steps are not asked of the model again.",
+      "messages": [
+        {
+          "from": "approvals",
+          "to": "log",
+          "label": "approved by a person"
+        },
+        {
+          "from": "worker",
+          "to": "log",
+          "label": "replay 3 steps"
+        }
+      ],
+      "states": {
+        "worker": "resumed from the log",
+        "log": "approval recorded"
+      }
+    },
+    {
+      "narration": "The refund runs with key r-7:3 and succeeds, but this worker also crashes before writing the result. A third worker resumes, finds an intent with no result for step 3 and calls the tool gateway again with the same key. The gateway returns the saved result, so the customer is refunded once.",
+      "messages": [
+        {
+          "from": "worker",
+          "to": "tools",
+          "label": "issue_refund r-7:3 (again)"
+        },
+        {
+          "from": "tools",
+          "to": "worker",
+          "label": "saved result, no second refund"
+        }
+      ],
+      "states": {
+        "tools": "key r-7:3 seen",
+        "log": "step 3 recorded"
+      }
+    },
+    {
+      "narration": "The model writes a short summary and the run ends. The log holds 4 steps and 19,800 tokens, about 6 cents against the 3-dollar cap, and each model call, tool call and approval shows up as spans in one trace for audit.",
+      "messages": [
+        {
+          "from": "worker",
+          "to": "log",
+          "label": "finished: refunded 49.90"
+        },
+        {
+          "from": "api",
+          "to": "user",
+          "label": "summary + trace link"
+        }
+      ],
+      "states": {
+        "log": "4 steps, 19,800 tokens",
+        "user": "run r-7 done"
+      },
+      "highlight": [
+        "user"
+      ]
+    }
+  ]
+}

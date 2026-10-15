@@ -1,0 +1,561 @@
+{
+  "name": "Design a GPU Cluster Scheduler",
+  "difficulty": "advanced",
+  "intent": "Share a pool of thousands of GPUs between many teams, so that training jobs that need hundreds of GPUs at once start together on well-connected machines, inference keeps its capacity, and the expensive hardware never sits idle.",
+  "codeTitle": "a gang scheduler with rack-aware placement and backfill",
+  "finalIntro": "A 256-GPU training job being queued, placed inside one rack, started together, and later resumed on other GPUs after a failure.",
+  "prompt": "Design the scheduler for a shared pool of 4,096 GPUs (512 nodes of 8 GPUs, in 16 racks). Researchers from 20 teams submit training jobs of 1 to 1,024 GPUs that run for hours or weeks. Product teams run inference services on the same pool. Every GPU-hour is expensive, so the cluster should be busy, but each team must get its fair share.",
+  "functional": [
+    "Submit a job with its GPU count, priority, team and maximum run time, and see its place in the queue",
+    "Start a multi-GPU job only when all of its GPUs can start together",
+    "Share the cluster between teams by quota and fair share, with priorities",
+    "Place the workers of a job close together (same node, then same rack) for fast interconnect",
+    "Preempt low-priority jobs for urgent ones, and resume them from a checkpoint",
+    "Keep capacity reserved for inference services and scale it with traffic",
+    "Detect bad GPUs and nodes, and retry or resume the jobs that were running on them",
+    "Report utilisation, queue time and per-team usage"
+  ],
+  "nonFunctional": [
+    "Keep more than 85% of GPUs busy over a week",
+    "A scheduling decision takes well under a second, even with thousands of jobs waiting",
+    "No job ever holds only part of its GPUs while waiting for the rest",
+    "A big job must not starve behind a stream of small ones",
+    "A failed GPU costs at most one checkpoint interval of work, not the whole run",
+    "A scheduler crash loses no job and kills no running work"
+  ],
+  "firstAttempt": {
+    "text": "One FIFO queue and a counter of free GPUs. When a GPU frees up it goes to the first job in the queue that still needs one, and a job starts when it has all it asked for. Teams get GPUs in the order they submitted.",
+    "limits": [
+      "Two big jobs can each hold half of what they need and wait for the rest forever, with the whole cluster full and idle",
+      "A team that submits a thousand jobs first takes the whole cluster for days",
+      "GPUs are handed out wherever they are free, so a job's workers end up in different racks and train much slower",
+      "Waiting for a big job at the head of the queue leaves GPUs idle that short jobs could have used",
+      "A failed GPU kills a week-long job with nothing saved, and inference has no reserved capacity at all"
+    ]
+  },
+  "nodes": [
+    {
+      "id": "teams",
+      "label": "Teams' jobs",
+      "kind": "client",
+      "x": 12,
+      "y": 88,
+      "at": 0
+    },
+    {
+      "id": "fifo",
+      "label": "FIFO queue",
+      "kind": "compute",
+      "x": 37,
+      "y": 63,
+      "at": 0,
+      "until": 1
+    },
+    {
+      "id": "cluster",
+      "label": "GPU nodes",
+      "kind": "data",
+      "x": 62,
+      "y": 37,
+      "at": 0
+    },
+    {
+      "id": "api",
+      "label": "Submit API",
+      "kind": "edge",
+      "x": 37,
+      "y": 88,
+      "at": 1
+    },
+    {
+      "id": "queue",
+      "label": "Job queue",
+      "kind": "async",
+      "x": 37,
+      "y": 63,
+      "at": 1
+    },
+    {
+      "id": "sched",
+      "label": "Scheduler",
+      "kind": "compute",
+      "x": 62,
+      "y": 63,
+      "at": 1
+    },
+    {
+      "id": "quota",
+      "label": "Quota ledger",
+      "kind": "data",
+      "x": 62,
+      "y": 88,
+      "at": 2
+    },
+    {
+      "id": "topo",
+      "label": "Topology map",
+      "kind": "data",
+      "x": 87,
+      "y": 37,
+      "at": 3
+    },
+    {
+      "id": "ckpt",
+      "label": "Checkpoint store",
+      "kind": "data",
+      "x": 87,
+      "y": 12,
+      "at": 4
+    },
+    {
+      "id": "serving",
+      "label": "Inference traffic",
+      "kind": "client",
+      "x": 87,
+      "y": 88,
+      "at": 5
+    },
+    {
+      "id": "scaler",
+      "label": "Autoscaler",
+      "kind": "compute",
+      "x": 87,
+      "y": 63,
+      "at": 5
+    },
+    {
+      "id": "agents",
+      "label": "Node agents",
+      "kind": "edge",
+      "x": 62,
+      "y": 12,
+      "at": 6
+    },
+    {
+      "id": "health",
+      "label": "Health and retry",
+      "kind": "compute",
+      "x": 37,
+      "y": 37,
+      "at": 6
+    },
+    {
+      "id": "metrics",
+      "label": "Metrics",
+      "kind": "data",
+      "x": 37,
+      "y": 12,
+      "at": 6
+    }
+  ],
+  "edges": [
+    {
+      "from": "teams",
+      "to": "fifo",
+      "at": 0,
+      "until": 1
+    },
+    {
+      "from": "fifo",
+      "to": "cluster",
+      "at": 0,
+      "until": 1
+    },
+    {
+      "from": "teams",
+      "to": "api",
+      "at": 1
+    },
+    {
+      "from": "api",
+      "to": "queue",
+      "at": 1
+    },
+    {
+      "from": "queue",
+      "to": "sched",
+      "at": 1
+    },
+    {
+      "from": "sched",
+      "to": "cluster",
+      "at": 1
+    },
+    {
+      "from": "quota",
+      "to": "sched",
+      "at": 2
+    },
+    {
+      "from": "topo",
+      "to": "sched",
+      "at": 3
+    },
+    {
+      "from": "cluster",
+      "to": "ckpt",
+      "at": 4
+    },
+    {
+      "from": "serving",
+      "to": "scaler",
+      "at": 5
+    },
+    {
+      "from": "scaler",
+      "to": "sched",
+      "at": 5
+    },
+    {
+      "from": "cluster",
+      "to": "agents",
+      "at": 6
+    },
+    {
+      "from": "agents",
+      "to": "health",
+      "at": 6
+    },
+    {
+      "from": "health",
+      "to": "queue",
+      "at": 6
+    },
+    {
+      "from": "health",
+      "to": "metrics",
+      "at": 6
+    }
+  ],
+  "steps": [
+    {
+      "title": "Queue jobs and start each one as a gang",
+      "problem": "A training job on 256 GPUs is useless with 255. If GPUs are handed out one by one, two big jobs can each grab half the cluster and wait for the rest, and nothing ever runs.",
+      "fix": "Jobs are submitted to an API and stored in a durable queue. The scheduler looks at the queue in order and starts a job only when all of its GPUs can be reserved at the same moment: the reservation is all or nothing, and a job that does not fit holds nothing while it waits. Once the GPUs are reserved, the scheduler tells the node agents to launch every worker, and a job counts as running only when all workers have joined. The scheduler keeps its state in a replicated store, so a restart rebuilds the queue and the reservations.",
+      "tradeoff": "Deadlock by partial allocation is impossible, and the whole cluster can never be filled with half-started jobs. A big job may wait a long time for enough free GPUs to appear together, and the free GPUs that are waiting for it look idle, which the next steps address.",
+      "concepts": [
+        {
+          "slug": "message-queues"
+        },
+        {
+          "slug": "queueing-theory-and-littles-law"
+        },
+        {
+          "slug": "async-apis-and-long-running-operations"
+        },
+        {
+          "slug": "distributed-training-and-parallelism"
+        },
+        {
+          "slug": "containers-and-orchestration"
+        }
+      ]
+    },
+    {
+      "title": "Give each team a quota and a fair share",
+      "problem": "Whoever submits the most jobs would take the whole cluster, and a team that paid for 500 GPUs cannot get them when others are using them.",
+      "fix": "A quota ledger records each team's guaranteed GPUs and the GPU-hours it used recently, with older usage counting for less (a decay of a few days). The queue is ordered by priority class first, then by the team furthest below its fair share, then by submission time. A team may borrow idle GPUs beyond its quota, but borrowed capacity is the first to be reclaimed when the owner needs it back. Per-team limits on jobs and on GPUs stop one team flooding the queue.",
+      "tradeoff": "Teams get what they were promised and the cluster stays full because idle quota is lent out. Fair share is a policy people argue about, and borrowing makes reclaim (preemption) a regular event.",
+      "concepts": [
+        {
+          "slug": "queueing-theory-and-littles-law"
+        },
+        {
+          "slug": "rate-limiting"
+        },
+        {
+          "slug": "bulkhead"
+        },
+        {
+          "slug": "metrics"
+        },
+        {
+          "slug": "slos-and-error-budgets"
+        }
+      ]
+    },
+    {
+      "title": "Place workers close together, and pack to avoid fragmentation",
+      "problem": "GPUs inside one node talk over links of hundreds of GB/s, while across nodes they use a network that is about an order of magnitude slower, and across racks it is slower still. A job scattered over the cluster can train several times slower on the same number of GPUs.",
+      "fix": "The topology map knows each GPU's node, rack and network switch. The scheduler places a job of 8 GPUs or fewer on one node, a bigger job on whole nodes inside one rack, and only as a last resort across racks. Small jobs are packed with best-fit onto the fullest node that still has room, so that whole nodes stay empty for big jobs. Scoring prefers placements that leave the largest free blocks, and the scheduler can defragment by moving small, checkpointable jobs.",
+      "tradeoff": "Jobs run at full speed and the large free blocks that big jobs need are preserved. Strict placement makes big jobs wait for a whole empty rack, so some jobs may be allowed to span racks if they can tolerate it, and packing small jobs tightly concentrates the damage of one node failure.",
+      "concepts": [
+        {
+          "slug": "distributed-training-and-parallelism"
+        },
+        {
+          "slug": "latency-and-round-trips"
+        },
+        {
+          "slug": "horizontal-vs-vertical-scaling"
+        },
+        {
+          "slug": "containers-and-orchestration"
+        },
+        {
+          "slug": "load-balancing"
+        }
+      ]
+    },
+    {
+      "title": "Backfill short jobs, and preempt with checkpoints",
+      "problem": "While a 256-GPU job waits for room, hundreds of GPUs sit idle, and an urgent job cannot wait days for a long one to end.",
+      "fix": "The scheduler computes a reservation for the job at the head of the queue: the earliest time its GPUs will be free, given the end times that jobs declared. Any later job that fits in the free GPUs and will end before that time may start now, so it cannot delay the head. For urgent work, the scheduler preempts lower-priority jobs: it sends the job a warning signal, the training code writes a checkpoint to shared storage within a grace period, and the job goes back to the queue and later resumes from that checkpoint, possibly on other GPUs.",
+      "tradeoff": "Idle gaps fill up and urgent work starts in minutes, not days. Backfill relies on honest run-time limits, so jobs that overrun are killed, and every preemption costs the time to write and reload a checkpoint, plus the work since the last one if the grace period is too short.",
+      "concepts": [
+        {
+          "slug": "distributed-training-and-parallelism"
+        },
+        {
+          "slug": "timeouts-and-deadlines"
+        },
+        {
+          "slug": "leases-and-fencing-tokens"
+        },
+        {
+          "slug": "backups-and-point-in-time-recovery"
+        },
+        {
+          "slug": "graceful-degradation"
+        }
+      ]
+    },
+    {
+      "title": "Reserve capacity for inference, and autoscale it",
+      "problem": "Inference traffic follows the day and cannot wait in a queue, while training can. If both fight for the same GPUs, either users see errors or the cluster runs half empty to be safe.",
+      "fix": "Inference services get a reserved pool with a floor that is always theirs, and an autoscaler that adds replicas as request rate, queue depth or GPU memory for the KV cache rises. It grows by asking the scheduler for GPUs at the top priority, which preempts training jobs through the normal checkpoint path, and shrinks when traffic falls so that training can use the GPUs again overnight. Inference replicas are placed by their own rules: one model replica fits on a node, with spare replicas spread over racks.",
+      "tradeoff": "Serving stays fast at peak and training gets the idle hours. Scaling up takes minutes because a replica must pull weights and load them into GPU memory, so the floor must cover quick spikes, and preempting training for inference needs good checkpoints and clear priorities.",
+      "concepts": [
+        {
+          "slug": "autoscaling"
+        },
+        {
+          "slug": "continuous-batching-and-model-serving"
+        },
+        {
+          "slug": "llm-inference-and-kv-cache"
+        },
+        {
+          "slug": "load-shedding"
+        },
+        {
+          "slug": "queueing-theory-and-littles-law"
+        }
+      ]
+    },
+    {
+      "title": "Detect bad hardware, retry sensibly, and measure everything",
+      "problem": "With thousands of GPUs, something fails every day. A single bad GPU can slow or hang a 1,024-GPU job, and a job that keeps crashing the same way wastes GPU-hours with every retry.",
+      "fix": "Node agents report heartbeats and GPU health (memory errors, thermal throttling, link errors). Missed heartbeats or error counters mark the node as bad: it is cordoned, so no new work lands on it, and the job that was running there is stopped and requeued to resume from its last checkpoint on healthy GPUs, with a small retry budget and backoff. A job that fails repeatedly for the same reason is held for its owner. The scheduler exports utilisation, queue time per team and size, fragmentation, preemption counts and GPU-hours lost to failures.",
+      "tradeoff": "A failure costs one checkpoint interval and a restart, and bad nodes stop poisoning later jobs. Aggressive health checks remove healthy nodes by mistake, and every retry holds a large gang of GPUs, so the retry limit and the choice between waiting and giving up need care.",
+      "concepts": [
+        {
+          "slug": "failure-detection"
+        },
+        {
+          "slug": "health-checks"
+        },
+        {
+          "slug": "retries-and-backoff"
+        },
+        {
+          "slug": "dead-letter-queues-and-poison-messages"
+        },
+        {
+          "slug": "red-use-and-golden-signals"
+        },
+        {
+          "slug": "alerting"
+        }
+      ]
+    }
+  ],
+  "failures": [
+    {
+      "scenario": "A GPU in the middle of a 1,024-GPU job fails",
+      "impact": "Every worker in the gang waits at a collective operation, so 1,024 GPUs stop doing useful work, and without a checkpoint the run would start over.",
+      "answer": "The agent or the job's own timeout notices the hang, and the health service cordons the node. The scheduler releases the gang, reserves 1,024 healthy GPUs (a spare node is swapped in) and restarts the job from its last checkpoint. The loss is the work since that checkpoint, on average half the interval, and the restart time.",
+      "concepts": [
+        {
+          "slug": "failure-detection"
+        },
+        {
+          "slug": "health-checks"
+        },
+        {
+          "slug": "timeouts-and-deadlines"
+        },
+        {
+          "slug": "distributed-training-and-parallelism"
+        }
+      ]
+    },
+    {
+      "scenario": "The scheduler crashes or is restarted during a busy hour",
+      "impact": "If it forgets reservations, it could start a second job on GPUs that are already in use, or kill the jobs that are running.",
+      "answer": "Running workers belong to the node agents, not to the scheduler, so they keep going. The scheduler keeps its jobs and reservations in a replicated store with a leader, and a new leader rebuilds its view from the store and the agents' reports before it makes any new decision. Reservations carry a lease and a fencing token, so a stale scheduler cannot start work.",
+      "concepts": [
+        {
+          "slug": "leader-election"
+        },
+        {
+          "slug": "leases-and-fencing-tokens"
+        },
+        {
+          "slug": "consensus"
+        },
+        {
+          "slug": "database-replication"
+        }
+      ]
+    },
+    {
+      "scenario": "A stream of small jobs starves a 512-GPU job",
+      "impact": "Each time 40 GPUs free up, a small job takes them, and the big job never sees 512 free GPUs together.",
+      "answer": "The head of the queue holds a reservation: nothing may start that would push back its start time, and backfill is allowed only for jobs that will end before it. A job that has waited past its limit gets higher priority, and the scheduler can drain a rack on purpose by not placing new work there.",
+      "concepts": [
+        {
+          "slug": "queueing-theory-and-littles-law"
+        },
+        {
+          "slug": "backpressure"
+        },
+        {
+          "slug": "metrics"
+        }
+      ]
+    },
+    {
+      "scenario": "A traffic spike hits inference while training fills the cluster",
+      "impact": "Serving replicas cannot start until GPUs are free, and users see slow answers or errors in the meantime.",
+      "answer": "The reserved floor serves the first minutes. The autoscaler asks for more at the highest priority, and the scheduler preempts the lowest-priority training jobs with a checkpoint signal. Until the new replicas have loaded their weights, the gateway sheds the lowest-priority requests and keeps the rest within their latency target.",
+      "concepts": [
+        {
+          "slug": "autoscaling"
+        },
+        {
+          "slug": "load-shedding"
+        },
+        {
+          "slug": "continuous-batching-and-model-serving"
+        },
+        {
+          "slug": "graceful-degradation"
+        }
+      ]
+    }
+  ],
+  "alternatives": [
+    {
+      "title": "How capacity is shared",
+      "options": [
+        {
+          "name": "Static partitions per team",
+          "pro": "Simple, and every team knows what it owns",
+          "con": "Idle GPUs in one partition cannot help another team, so utilisation is low"
+        },
+        {
+          "name": "One shared pool with quotas and borrowing",
+          "pro": "High utilisation, and guaranteed shares when owners need them",
+          "con": "Needs fair-share accounting and preemption"
+        },
+        {
+          "name": "Pure priority queue",
+          "pro": "Easy to reason about",
+          "con": "Low-priority teams can starve, and one team can flood a priority class"
+        }
+      ],
+      "pick": "A shared pool with guaranteed quotas, borrowing of idle capacity, and preemption to reclaim it."
+    },
+    {
+      "title": "How a job gets its GPUs",
+      "options": [
+        {
+          "name": "Gang scheduling, all or nothing",
+          "pro": "No deadlock, and no idle half-started jobs",
+          "con": "Big jobs wait for a large free block"
+        },
+        {
+          "name": "Incremental allocation",
+          "pro": "Uses every free GPU immediately",
+          "con": "Jobs that hold part of what they need can deadlock the cluster"
+        },
+        {
+          "name": "Elastic jobs that can grow and shrink",
+          "pro": "Start with fewer GPUs and use spare ones",
+          "con": "The training code must support it, and changes in size need resharding"
+        }
+      ],
+      "pick": "Gang scheduling by default, with elastic jobs only where the framework supports them."
+    },
+    {
+      "title": "How to handle waiting big jobs",
+      "options": [
+        {
+          "name": "Strict queue order",
+          "pro": "Predictable and simple",
+          "con": "GPUs sit idle in front of a blocked job"
+        },
+        {
+          "name": "Backfill with a reservation for the head",
+          "pro": "Fills gaps with short jobs and cannot delay the head",
+          "con": "Needs trustworthy run-time limits"
+        },
+        {
+          "name": "Preempt to make room",
+          "pro": "Starts urgent jobs at once",
+          "con": "Wastes work between checkpoints"
+        }
+      ],
+      "pick": "Backfill for ordinary jobs and preemption only for higher priority classes."
+    },
+    {
+      "title": "How the scheduler is built",
+      "options": [
+        {
+          "name": "One central scheduler with a global view",
+          "pro": "Good placement and easy fairness",
+          "con": "Must be fast and highly available"
+        },
+        {
+          "name": "Several schedulers with optimistic placement",
+          "pro": "Scales to a huge number of small tasks",
+          "con": "Conflicts and retries, which hurt big gangs"
+        },
+        {
+          "name": "Extend a general container scheduler",
+          "pro": "Reuses existing tooling",
+          "con": "Per-pod decisions do not understand gangs, quotas or topology without add-ons"
+        }
+      ],
+      "pick": "One leader-based scheduler with a replicated state, as the number of jobs is thousands and the GPUs are the scarce resource."
+    }
+  ],
+  "roles": [
+    {
+      "id": "client",
+      "label": "Submitters",
+      "description": "Teams submitting jobs, and inference traffic."
+    },
+    {
+      "id": "edge",
+      "label": "Entry points",
+      "description": "The submit API and the node agents."
+    },
+    {
+      "id": "async",
+      "label": "Job queue",
+      "description": "Jobs waiting for their GPUs."
+    },
+    {
+      "id": "compute",
+      "label": "Decisions",
+      "description": "The scheduler, the autoscaler and the health service."
+    },
+    {
+      "id": "data",
+      "label": "State",
+      "description": "GPU nodes, quotas, topology, checkpoints and metrics."
+    }
+  ]
+}

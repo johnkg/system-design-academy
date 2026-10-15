@@ -1,0 +1,167 @@
+---
+import PlaygroundShell from '../components/PlaygroundShell.astro';
+---
+<PlaygroundShell title="Simulate it" hint="Pick a model, a cluster and a parallelism strategy. See memory per GPU (fits or out-of-memory), where the step time goes, and what failures cost.">
+  <ol class="how">
+    <li>The default is a <b>70B</b> model on <b>64 GPUs</b> of 80 GB with plain data parallel (no sharding): every GPU needs about 1,159 GB, so it is <b>out of memory</b>. Set <b>ZeRO stage</b> to <b>3</b>: 56.5 GB, it fits, MFU 50%.</li>
+    <li>With ZeRO-3, drop <b>Microbatches</b> to <b>1</b>: the all-gathers and reduce-scatters no longer hide behind compute and communication takes about 56% of the step (MFU 22%).</li>
+    <li>Return to 8 microbatches, set ZeRO stage <b>1</b> and <b>Tensor parallel</b> to <b>8</b> (one node): fits, MFU about 45%. Raise it to <b>16</b>: the group spans two nodes, and communication takes 75% of the step.</li>
+    <li>Set <b>Tensor parallel</b> 4, <b>Pipeline stages</b> 4, <b>Microbatches</b> 16 with ZeRO-1: the pipeline bubble is about 15% of the step. Raise microbatches to 64 and it shrinks.</li>
+    <li>Set <b>GPUs</b> to <b>4096</b> and change the <b>checkpoint interval</b>: 5 minutes wastes time saving, 240 minutes wastes time redoing lost work, and the minimum is in between.</li>
+  </ol>
+  <div class="pg dt" data-dt>
+    <div class="pg-row">
+      <label>Model <select class="pg-in" data-model><option value="7">7B</option><option value="13">13B</option><option value="70" selected>70B</option><option value="175">175B</option><option value="405">405B</option></select></label>
+      <label>GPUs <select class="pg-in" data-gpus><option value="8">8</option><option value="64" selected>64</option><option value="256">256</option><option value="1024">1,024</option><option value="4096">4,096</option></select></label>
+      <label>Memory per GPU <select class="pg-in" data-mem><option value="40">40 GB</option><option value="80" selected>80 GB</option><option value="141">141 GB</option></select></label>
+      <label>Between nodes <select class="pg-in" data-net><option value="10">10 GB/s per GPU</option><option value="25" selected>25 GB/s per GPU</option><option value="50">50 GB/s per GPU</option></select></label>
+    </div>
+    <div class="pg-row">
+      <label>ZeRO stage <select class="pg-in" data-stage><option value="0" selected>0: replicate everything</option><option value="1">1: shard optimizer</option><option value="2">2: + gradients</option><option value="3">3: + parameters (FSDP)</option></select></label>
+      <label>Tensor parallel <select class="pg-in" data-tp><option value="1" selected>1</option><option value="2">2</option><option value="4">4</option><option value="8">8 (one node)</option><option value="16">16 (two nodes)</option></select></label>
+      <label>Pipeline stages <select class="pg-in" data-pp><option value="1" selected>1</option><option value="2">2</option><option value="4">4</option><option value="8">8</option><option value="16">16</option></select></label>
+      <label>Microbatches <input type="range" min="1" max="64" value="8" data-m /> <b data-mval>8</b></label>
+    </div>
+    <div class="pg-row">
+      <label class="dt-check"><input type="checkbox" data-recompute /> Recompute activations</label>
+      <label class="dt-check"><input type="checkbox" checked data-overlap /> Overlap communication with backward pass</label>
+      <label>Checkpoint every <select class="pg-in" data-ckpt><option value="5">5 min</option><option value="15">15 min</option><option value="30" selected>30 min</option><option value="60">60 min</option><option value="240">240 min</option></select></label>
+      <button class="btn" type="button" data-reset>Reset</button>
+    </div>
+    <div class="pg-grid">
+      <div class="pg-box" data-membox>
+        <h3>Memory per GPU</h3>
+        <span class="pg-mono" data-memtext></span>
+        <div class="dt-bar" data-membar role="img" aria-label="Memory per GPU as stacked segments against capacity"></div>
+        <span class="pg-note">weights, gradients, optimizer, activations, overhead; the line marks GPU capacity</span>
+      </div>
+      <div class="pg-box" data-stepbox>
+        <h3>Where the step time goes</h3>
+        <span class="pg-mono" data-steptext></span>
+        <div class="dt-bar" data-stepbar role="img" aria-label="Step time split into compute, pipeline bubble, tensor parallel communication and data parallel communication"></div>
+        <span class="pg-note">compute, pipeline bubble, tensor-parallel communication, exposed data-parallel communication</span>
+      </div>
+      <div class="pg-box" style="--c: var(--role-4)">
+        <h3>Failures and checkpoints</h3>
+        <span class="pg-mono" data-ckpttext></span>
+        <span class="pg-note" data-ckptnote></span>
+      </div>
+    </div>
+    <div class="pg-out" data-verdict aria-live="polite"></div>
+    <p class="pg-note">Assumptions: 16 bytes per parameter (bf16 weights and gradients, fp32 master weights and two Adam moments); activations about 0.5 GB per billion parameters per GPU at one 4,096-token microbatch, divided by the tensor-parallel degree (8x less with recompute, which costs a third more compute); 4 GB fixed overhead; GPUs deliver 200 of 400 TFLOP/s on kernels; 8 GPUs per node at 300 GB/s inside the node; one gradient exchange per step; the pipeline uses a 1F1B-style schedule, and the bubble is (p-1)/(m+p-1); point-to-point pipeline traffic, ZeRO-3 gather buffers, latency and sequence parallelism are ignored. Checkpoints are 14 bytes per parameter written at 50 GB/s in total; each GPU fails on average once per 50,000 hours; a restart takes 10 minutes. These are round teaching numbers, not measurements of any product.</p>
+  </div>
+</PlaygroundShell>
+<script>
+  const MODELS: Record<number, [number, number]> = { 7: [32, 4096], 13: [40, 5120], 70: [80, 8192], 175: [96, 12288], 405: [126, 16384] };
+  const div = (a: number, b: number) => Math.floor((a + Math.floor(b / 2)) / b);
+  const f1 = (x10: number) => `${Math.floor(x10 / 10)}.${x10 % 10}`;
+  const gb = (x10: number) => `${Math.floor(x10 / 10).toLocaleString('en-US')}.${x10 % 10}`;
+
+  interface Cfg { P: number; N: number; mem: number; net: number; stage: number; tp: number; pp: number; m: number; recompute: boolean; overlap: boolean }
+  interface Plan { valid: boolean; dp: number; parts: number[]; total: number; fits: boolean; comp: number; bubble: number; tpMs: number; dpMs: number; dpExposed: number; step: number; comm: number; bub: number; mfu: number }
+
+  function plan(c: Cfg): Plan {
+    const mp = c.tp * c.pp;
+    const empty = { valid: false, dp: 0, parts: [0, 0, 0, 0, 0], total: 0, fits: false, comp: 0, bubble: 0, tpMs: 0, dpMs: 0, dpExposed: 0, step: 1, comm: 0, bub: 0, mfu: 0 };
+    if (mp > c.N || c.N % mp !== 0) return empty;
+    const dp = c.N / mp; const [L, h] = MODELS[c.P];
+    const w = div(20 * c.P, mp * (c.stage >= 3 ? dp : 1));
+    const g = div(20 * c.P, mp * (c.stage >= 2 ? dp : 1));
+    const o = div(120 * c.P, mp * (c.stage >= 1 ? dp : 1));
+    let a = div(5 * c.P, c.tp); if (c.recompute) a = div(a, 8);
+    const total = w + g + o + a + 40;
+    const comp = div((c.recompute ? 8 : 6) * c.P * c.m * 4096, mp * 200);
+    const bubble = c.pp > 1 ? div(comp * (c.pp - 1), c.m) : 0;
+    const tpMs = c.tp > 1 ? div(L * c.m * 4 * 2 * (c.tp - 1) * 4096 * h * 2, c.tp * c.pp * (c.tp <= 8 ? 300 : c.net) * 1000000) : 0;
+    const grad = div(2 * c.P * 1000000000, mp);
+    const dpBytes = div((c.stage >= 3 ? 3 : 2) * (dp - 1) * grad, dp);
+    const dpMs = dp > 1 ? div(dpBytes, (c.N <= 8 ? 300 : c.net) * 1000000) : 0;
+    const dpExposed = c.overlap ? Math.max(0, dpMs - div(2 * comp, 3)) : dpMs;
+    const step = comp + bubble + tpMs + dpExposed;
+    return { valid: true, dp, parts: [w, g, o, a, 40], total, fits: total <= c.mem * 10, comp, bubble, tpMs, dpMs, dpExposed, step,
+      comm: div((tpMs + dpExposed) * 1000, step), bub: div(bubble * 1000, step), mfu: div(div(6 * c.P * c.m * 4096, mp * 400) * 1000, step) };
+  }
+  function ckpt(P: number, N: number, minutes: number) {
+    const C = Math.max(1, div(14 * P, 50)); const mtbf = div(50000 * 3600, N); const t = minutes * 60;
+    const pm = div(C * 1000, t) + div((div(t, 2) + 600) * 1000, mtbf);
+    return { C, mtbf, pm, best: Math.floor(Math.sqrt(2 * C * mtbf)) };
+  }
+  function verdict(c: Cfg, p: Plan): { text: string; bad: boolean } {
+    if (!p.valid) return { text: `Invalid layout: tensor parallel (${c.tp}) x pipeline stages (${c.pp}) = ${c.tp * c.pp} must divide the ${c.N} GPUs.`, bad: true };
+    if (!p.fits) {
+      const hint = c.stage < 3 ? 'Shard more state (raise the ZeRO stage)' : !c.recompute ? 'Turn on activation recompute' : 'Split the model with tensor or pipeline parallelism, or use more or bigger GPUs';
+      return { text: `Out of memory: ${gb(p.total)} GB needed per GPU, ${c.mem} GB available. ${hint}.`, bad: true };
+    }
+    const mfu = `MFU ${f1(p.mfu)}%`;
+    if (c.tp > 8) return { text: `Fits, but slow (${mfu}): a tensor-parallel group of ${c.tp} spans nodes, so every layer's all-reduce runs on the slower network. Keep tensor parallel within a node.`, bad: true };
+    if (p.bub > 150) return { text: `Fits, but ${f1(p.bub)}% of the step is pipeline bubble (${mfu}). Raise microbatches or use fewer stages.`, bad: true };
+    if (p.comm > 250) return { text: `Fits, but communication-bound: ${f1(p.comm)}% of the step is exposed communication (${mfu}). Use more microbatches per step, overlap, a faster network, or a lower ZeRO stage.`, bad: true };
+    if (p.mfu < 300) return { text: `Fits, but utilisation is low (${mfu}). Most time is spent outside useful math; check the split above.`, bad: true };
+    return { text: `Fits and runs well: ${gb(p.total)} GB per GPU, ${mfu}, ${f1(p.comm)}% communication, ${f1(p.bub)}% bubble.`, bad: false };
+  }
+
+  document.querySelectorAll<HTMLElement>('[data-dt]').forEach((root) => {
+    const q = <T extends HTMLElement>(s: string) => root.querySelector<T>(s)!;
+    const num = (s: string) => Number(q<HTMLInputElement>(s).value);
+    const chk = (s: string) => q<HTMLInputElement>(s).checked;
+    const COLORS = ['var(--role-1)', 'var(--role-2)', 'var(--role-3)', 'var(--role-4)', 'var(--role-5)'];
+    const MEM_NAMES = ['weights', 'gradients', 'optimizer', 'activations', 'overhead'];
+    const STEP_COLORS = ['var(--role-1)', 'var(--role-6)', 'var(--role-3)', 'var(--role-2)'];
+    const STEP_NAMES = ['compute', 'bubble', 'tensor comm', 'data comm'];
+    const defaults: Record<string, string | boolean> = { '[data-model]': '70', '[data-gpus]': '64', '[data-mem]': '80', '[data-net]': '25', '[data-stage]': '0', '[data-tp]': '1', '[data-pp]': '1', '[data-m]': '8', '[data-recompute]': false, '[data-overlap]': true, '[data-ckpt]': '30' };
+    const memBar = q('[data-membar]'); const stepBar = q('[data-stepbar]');
+    const memSegs = COLORS.map((c) => { const d = document.createElement('span'); d.className = 'dt-seg'; d.style.background = c; memBar.appendChild(d); return d; });
+    const cap = document.createElement('span'); cap.className = 'dt-cap'; memBar.appendChild(cap);
+    const stepSegs = STEP_COLORS.map((c) => { const d = document.createElement('span'); d.className = 'dt-seg'; d.style.background = c; stepBar.appendChild(d); return d; });
+    let raf = 0;
+
+    function cfg(): Cfg {
+      return { P: num('[data-model]'), N: num('[data-gpus]'), mem: num('[data-mem]'), net: num('[data-net]'), stage: num('[data-stage]'), tp: num('[data-tp]'), pp: num('[data-pp]'), m: num('[data-m]'), recompute: chk('[data-recompute]'), overlap: chk('[data-overlap]') };
+    }
+    function draw() {
+      raf = 0;
+      const c = cfg(); const p = plan(c); const v = verdict(c, p);
+      q('[data-mval]').textContent = String(c.m);
+      const mbox = q<HTMLElement>('[data-membox]');
+      mbox.style.setProperty('--c', !p.valid || !p.fits ? 'var(--bad)' : 'var(--role-2)');
+      q<HTMLElement>('[data-stepbox]').style.setProperty('--c', p.valid ? 'var(--role-1)' : 'var(--border)');
+      if (p.valid) {
+        q('[data-memtext]').textContent = `${gb(p.total)} GB of ${c.mem} GB: ${p.fits ? 'FITS' : 'OUT OF MEMORY'} (data-parallel degree ${p.dp}) | ` + p.parts.map((x, i) => `${MEM_NAMES[i]} ${gb(x)}`).join(', ');
+        const scale = Math.max(p.total, c.mem * 10) * 1.05;
+        p.parts.forEach((x, i) => { memSegs[i].style.flexBasis = `${(x * 100) / scale}%`; });
+        cap.style.left = `${(c.mem * 1000) / scale}%`;
+        const parts = [p.comp, p.bubble, p.tpMs, p.dpExposed];
+        q('[data-steptext]').textContent = `step ${p.step.toLocaleString('en-US')} ms | MFU ${f1(p.mfu)}% | communication ${f1(p.comm)}% | bubble ${f1(p.bub)}% | ` + parts.map((x, i) => `${STEP_NAMES[i]} ${x.toLocaleString('en-US')} ms`).join(', ');
+        parts.forEach((x, i) => { stepSegs[i].style.flexBasis = `${(x * 100) / p.step}%`; });
+      } else {
+        q('[data-memtext]').textContent = 'no valid layout'; q('[data-steptext]').textContent = 'no valid layout';
+        memSegs.forEach((s) => { s.style.flexBasis = '0%'; }); stepSegs.forEach((s) => { s.style.flexBasis = '0%'; });
+      }
+      const k = ckpt(c.P, c.N, num('[data-ckpt]'));
+      q('[data-ckpttext]').textContent = `a failure about every ${f1(Math.floor(k.mtbf / 360))} h | checkpoint write ${k.C} s | overhead ${f1(k.pm)}% of the run`;
+      q('[data-ckptnote]').textContent = `Overhead = time spent saving + expected lost work and restart per failure. The best interval is about ${Math.max(1, Math.round(k.best / 60))} min (sqrt(2 x write time x MTBF)).`;
+      const out = q('[data-verdict]'); out.textContent = v.text; out.classList.toggle('bad', v.bad);
+    }
+    function schedule() {
+      if (raf) return;
+      raf = window.matchMedia('(prefers-reduced-motion: reduce)').matches ? (draw(), 0) : window.requestAnimationFrame(draw);
+    }
+    function reset() {
+      for (const [sel, val] of Object.entries(defaults)) {
+        const el = q<HTMLInputElement | HTMLSelectElement>(sel);
+        if (typeof val === 'boolean') (el as HTMLInputElement).checked = val; else el.value = val;
+      }
+      schedule();
+    }
+    root.addEventListener('input', schedule); root.addEventListener('change', schedule);
+    q('[data-reset]').addEventListener('click', reset);
+    draw();
+  });
+</script>
+<style is:global>
+  .playground .dt-check { display: inline-flex; align-items: center; gap: 6px; }
+  .playground .dt-bar { position: relative; display: flex; height: 18px; border: 1px solid var(--border); border-radius: 6px; overflow: hidden; background: var(--surface-2); }
+  .playground .dt-seg { display: block; flex: 0 0 0%; min-width: 0; }
+  .playground .dt-cap { position: absolute; top: 0; bottom: 0; width: 2px; background: var(--text); }
+  .playground .dt .pg-grid { grid-template-columns: repeat(auto-fit, minmax(260px, 1fr)); }
+</style>

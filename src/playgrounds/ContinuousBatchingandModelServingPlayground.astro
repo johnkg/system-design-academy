@@ -1,0 +1,172 @@
+---
+import PlaygroundShell from '../components/PlaygroundShell.astro';
+---
+<PlaygroundShell title="Simulate it" hint="80 chat requests with different output lengths arrive at a steady rate. One GPU replica serves them one decode step at a time. Switch the scheduler and the batch size and watch throughput, latency and idle slots.">
+  <ol class="how">
+    <li>Default: <b>continuous</b> batching, max batch 16, 4 requests per second. About 271 tokens/s, p95 latency about 16 s, 32% of slots idle. Switch to <b>Static</b>: about 114 tokens/s, p95 about 55 s and 74% idle, because every batch waits for its longest answer and the bars below show long gaps.</li>
+    <li>In continuous mode step the max batch through 1, 4, 16, 32: tokens/s goes about 45, 141, 271, 302. Batch 64 gives exactly the same as 32 because the queue never holds more than 32. Look at the sweep table: p95 stops improving and slowly gets worse (16.0 s at 16, 17.4 s at 32) because every step is slower with more sequences in it.</li>
+    <li>With batch 16 tick <b>Chunked prefill</b>: the longest step drops from about 415 ms to 61 ms (a 4,000 token prompt no longer freezes everyone else), for a small cost in throughput (about 265 tokens/s) and p95 (about 17.0 s).</li>
+    <li>Set max batch 4 and queue limit <b>8</b> (continuous): about 51 of the 80 requests are rejected, but the ones accepted finish with p95 about 15 s instead of about 38 s. That is load shedding trading rejected requests for bounded latency.</li>
+  </ol>
+  <div class="pg cbm" data-cbm>
+    <div class="pg-row">
+      <label>Scheduler <select class="pg-in" data-mode><option value="continuous" selected>Continuous (iteration-level)</option><option value="static">Static (batch runs to the longest)</option></select></label>
+      <label>Max batch size <select class="pg-in" data-batch><option>1</option><option>2</option><option>4</option><option>8</option><option selected>16</option><option>32</option><option>64</option></select></label>
+      <label>Arrivals per second <input type="range" min="1" max="8" value="4" data-rate /> <b data-rateval>4</b></label>
+      <label>Queue limit <select class="pg-in" data-queue><option value="0" selected>Unlimited</option><option value="8">8 waiting</option><option value="32">32 waiting</option></select></label>
+      <label class="cbm-check"><input type="checkbox" data-chunk /> Chunked prefill (continuous only)</label>
+    </div>
+    <div class="pg-grid">
+      <div class="pg-box" style="--c: var(--role-1)"><h3>Throughput</h3><span class="pg-mono" data-tps>0</span><span class="pg-note">generated tokens per second over the whole run</span></div>
+      <div class="pg-box" style="--c: var(--role-3)"><h3>Latency p50 / p95</h3><span class="pg-mono" data-lat>0</span><span class="pg-note">arrival to last token, accepted requests</span></div>
+      <div class="pg-box" style="--c: var(--role-4)"><h3>Idle slots</h3><span class="pg-mono" data-idle>0</span><span class="pg-note">batch slots that produced no token in a step</span></div>
+      <div class="pg-box" style="--c: var(--role-2)"><h3>Longest step</h3><span class="pg-mono" data-longest>0</span><span class="pg-note">worst pause every running user felt</span></div>
+    </div>
+    <div class="pg-out" data-verdict aria-live="polite"></div>
+    <h3>Slot occupancy over time</h3>
+    <div class="cbm-bars" data-bars role="img" aria-label="Slot occupancy over time"></div>
+    <p class="pg-note">Each bar is a slice of the run; its height is the share of batch slots that produced a token. Gaps mean the GPU waited for the longest sequence or for traffic.</p>
+    <h3>Batch size sweep (same scheduler and traffic)</h3>
+    <div class="cbm-sweep" data-sweep></div>
+    <p class="pg-note">Assumptions: a decode step costs 20 ms (weights read once) plus 1 ms per sequence in the batch; prefill costs 1 ms per 10 prompt tokens; chunks are 256 tokens. 80 requests: 80% answer in 16 to 63 tokens, 20% in 200 to 399; 10% have a 2,000 to 3,999 token prompt. Seeded, so every run is identical. The constants are illustrative orders of magnitude, not a benchmark of any GPU. Static batching here returns every answer when the whole batch ends. KV memory limits are ignored; see the KV cache concept for that.</p>
+  </div>
+</PlaygroundShell>
+<script>
+  interface Req { u: number; out: number; prompt: number; at: number }
+  interface Opts { mode: 'static' | 'continuous'; maxBatch: number; queueLimit: number; chunked: boolean }
+  const BASE = 20; const PER = 1; const CHUNK = 256; const N = 80; const SEED = 7; const COLS = 48;
+  function makeWorkload(n: number, seed: number) {
+    let s = seed >>> 0;
+    const next = () => { s = (Math.imul(s, 1664525) + 1013904223) >>> 0; return s >>> 8; };
+    const w: { u: number; out: number; prompt: number }[] = [];
+    for (let i = 0; i < n; i++) {
+      const u = next() % 1000; const r = next() % 100;
+      const out = r < 80 ? 16 + (next() % 48) : 200 + (next() % 200);
+      const prompt = next() % 10 === 0 ? 2000 + (next() % 2000) : 64 + (next() % 900);
+      w.push({ u, out, prompt });
+    }
+    return w;
+  }
+  function arrivals(w: { u: number; out: number; prompt: number }[], rate: number): Req[] {
+    let t = 0; const mean = 1000 / rate;
+    return w.map((r) => { t += Math.floor((r.u * 2 * mean) / 1000); return { ...r, at: t }; });
+  }
+  const pcost = (tok: number) => Math.floor((tok + 9) / 10);
+  function simulate(reqs: Req[], o: Opts) {
+    const n = reqs.length; const fin = new Array<number>(n).fill(-1); const shed = new Array<boolean>(n).fill(false);
+    let t = 0; let nx = 0; let steps = 0; let tokens = 0; let longest = 0;
+    const queue: number[] = []; let act: { i: number; left: number }[] = []; const pre: { i: number; rem: number }[] = [];
+    const trace: [number, number, number][] = [];
+    const enq = () => { while (nx < n && reqs[nx].at <= t) { if (o.queueLimit && queue.length >= o.queueLimit) shed[nx] = true; else queue.push(nx); nx++; } };
+    for (;;) {
+      enq();
+      if (!act.length && !pre.length && !queue.length) { if (nx >= n) break; t = reqs[nx].at; continue; }
+      let extra = 0;
+      const canAdmit = o.mode === 'continuous' || (!act.length && !pre.length);
+      while (canAdmit && act.length + pre.length < o.maxBatch && queue.length) {
+        const i = queue.shift()!;
+        if (o.chunked && o.mode === 'continuous') pre.push({ i, rem: reqs[i].prompt });
+        else { extra += pcost(reqs[i].prompt); act.push({ i, left: reqs[i].out }); }
+      }
+      let budget = o.chunked && o.mode === 'continuous' ? CHUNK : 0; const graduated: { i: number; rem: number }[] = [];
+      while (budget > 0 && pre.length) {
+        const take = Math.min(budget, pre[0].rem); pre[0].rem -= take; budget -= take; extra += pcost(take);
+        if (pre[0].rem === 0) graduated.push(pre.shift()!);
+      }
+      const dt = BASE + PER * act.length + extra; let live = 0;
+      for (const a of act) { if (a.left > 0) { a.left--; tokens++; live++; } }
+      trace.push([t, dt, live]);
+      t += dt; steps++; if (dt > longest) longest = dt;
+      if (o.mode === 'continuous') act = act.filter((a) => { if (a.left === 0) { fin[a.i] = t; return false; } return true; });
+      else if (act.every((a) => a.left === 0)) { for (const a of act) fin[a.i] = t; act = []; }
+      for (const g of graduated) act.push({ i: g.i, left: reqs[g.i].out });
+    }
+    const lat: number[] = []; for (let i = 0; i < n; i++) if (fin[i] >= 0) lat.push(fin[i] - reqs[i].at);
+    lat.sort((a, b) => a - b);
+    const pct = (q: number) => (lat.length ? lat[Math.floor(((lat.length - 1) * q) / 100)] : 0);
+    return {
+      done: lat.length, shed: shed.filter(Boolean).length, tokens, steps, makespan: t, trace,
+      tps: t ? Math.floor((tokens * 1000) / t) : 0, p50: pct(50), p95: pct(95),
+      idle: steps ? Math.floor(100 - (100 * tokens) / (steps * o.maxBatch)) : 0, longest,
+    };
+  }
+  const sec = (ms: number) => (ms / 1000).toFixed(1) + ' s';
+  const SIZES = [1, 2, 4, 8, 16, 32, 64];
+  const base = makeWorkload(N, SEED);
+
+  document.querySelectorAll<HTMLElement>('[data-cbm]').forEach((root) => {
+    const q = <T extends HTMLElement>(s: string) => root.querySelector<T>(s)!;
+    const sel = (s: string) => q<HTMLSelectElement>(s).value;
+    const bars = q('[data-bars]'); const sweep = q('[data-sweep]');
+    const barEls: HTMLElement[] = [];
+    for (let i = 0; i < COLS; i++) { const b = document.createElement('span'); b.className = 'cbm-bar'; bars.appendChild(b); barEls.push(b); }
+    const rows: { row: HTMLElement; fill: HTMLElement; text: HTMLElement }[] = [];
+    SIZES.forEach((sz) => {
+      const row = document.createElement('div'); row.className = 'cbm-row';
+      const name = document.createElement('span'); name.className = 'pg-mono'; name.textContent = 'batch ' + sz;
+      const track = document.createElement('span'); track.className = 'cbm-track';
+      const fill = document.createElement('span'); fill.className = 'cbm-fill'; track.appendChild(fill);
+      const text = document.createElement('span'); text.className = 'pg-mono';
+      row.append(name, track, text); sweep.appendChild(row); rows.push({ row, fill, text });
+    });
+    let raf = 0;
+    function opts(batch: number): Opts {
+      return { mode: sel('[data-mode]') as Opts['mode'], maxBatch: batch, queueLimit: Number(sel('[data-queue]')), chunked: q<HTMLInputElement>('[data-chunk]').checked };
+    }
+    function verdict(r: ReturnType<typeof simulate>, o: Opts, reqs: Req[]) {
+      const other = simulate(reqs, { ...o, mode: o.mode === 'static' ? 'continuous' : 'static' });
+      const notes: string[] = [];
+      if (o.maxBatch === 1) notes.push('Batch size 1 is no batching: every step reads all the weights for a single sequence, so the GPU is busy but moves only about ' + r.tps + ' tokens/s.');
+      else if (o.mode === 'static' && other.tps > r.tps * 1.2) notes.push('Static batching: ' + r.idle + '% of slots idle. Short answers sit finished inside the batch until the longest one ends. Continuous batching would give ' + other.tps + ' tokens/s and p95 ' + sec(other.p95) + ' on the same traffic.');
+      else if (o.mode === 'continuous' && r.tps > other.tps * 1.2) notes.push('Continuous batching refills a slot the moment a sequence finishes: ' + r.tps + ' tokens/s against ' + other.tps + ' for static batching, p95 ' + sec(r.p95) + ' against ' + sec(other.p95) + '.');
+      else notes.push('At this load the two schedulers are close, so the scheduler is not what limits you.');
+      if (r.shed > 0) notes.push(r.shed + ' of ' + reqs.length + ' requests were rejected by the queue limit; the accepted ones have bounded latency.');
+      if (o.mode === 'continuous' && r.idle >= 50) notes.push('Over half the slots are empty: the queue is shorter than the batch, so a bigger max batch buys nothing here.');
+      if (r.longest >= 300) notes.push('Longest step ' + r.longest + ' ms: a long prompt stalled every running user' + (o.mode === 'continuous' ? '; chunked prefill would spread it out.' : '.'));
+      return notes.join(' ');
+    }
+    function draw() {
+      raf = 0;
+      const rate = Number(q<HTMLInputElement>('[data-rate]').value);
+      q('[data-rateval]').textContent = String(rate);
+      const mode = sel('[data-mode]'); const chunk = q<HTMLInputElement>('[data-chunk]');
+      chunk.disabled = mode !== 'continuous';
+      const reqs = arrivals(base, rate); const o = opts(Number(sel('[data-batch]')));
+      const r = simulate(reqs, o);
+      q('[data-tps]').textContent = r.tps + ' tokens/s';
+      q('[data-lat]').textContent = sec(r.p50) + ' / ' + sec(r.p95);
+      q('[data-idle]').textContent = r.idle + '%';
+      q('[data-longest]').textContent = r.longest + ' ms';
+      q('[data-verdict]').textContent = verdict(r, o, reqs);
+      const occ = new Array<number>(COLS).fill(0); const w = r.makespan / COLS;
+      for (const [t0, dt, live] of r.trace) {
+        let a = t0; const end = t0 + dt;
+        while (a < end) { const c = Math.min(COLS - 1, Math.floor(a / w)); const stop = Math.min(end, (c + 1) * w); occ[c] += ((stop - a) * live) / o.maxBatch; a = stop > a ? stop : end; }
+      }
+      barEls.forEach((b, i) => { const v = Math.min(1, occ[i] / w); b.style.height = Math.max(2, Math.round(v * 100)) + '%'; });
+      bars.setAttribute('aria-label', 'Slot occupancy over time. Average ' + (100 - r.idle) + ' percent of slots busy.');
+      const sw = SIZES.map((sz) => simulate(reqs, opts(sz)));
+      const top = Math.max(...sw.map((x) => x.tps), 1);
+      sw.forEach((x, i) => {
+        rows[i].fill.style.width = Math.round((100 * x.tps) / top) + '%';
+        rows[i].text.textContent = x.tps + ' tok/s · p95 ' + sec(x.p95) + (x.shed ? ' · shed ' + x.shed : '');
+        rows[i].row.classList.toggle('cur', SIZES[i] === o.maxBatch);
+      });
+    }
+    function schedule() { if (!raf) raf = requestAnimationFrame(draw); }
+    root.addEventListener('input', schedule); root.addEventListener('change', schedule);
+    draw();
+  });
+</script>
+<style is:global>
+  .playground .cbm-check { display: inline-flex; align-items: center; gap: 6px; }
+  .playground .cbm-bars { display: flex; align-items: flex-end; gap: 2px; height: 72px; padding: 4px; border: 1px solid var(--border); border-radius: 8px; background: var(--surface); }
+  .playground .cbm-bar { flex: 1 1 0; min-width: 0; background: var(--role-1); border-radius: 2px 2px 0 0; transition: height .25s; }
+  .playground .cbm-sweep { display: grid; gap: 6px; }
+  .playground .cbm-row { display: grid; grid-template-columns: max-content minmax(60px, 1fr); gap: 4px 10px; align-items: center; padding: 4px 6px; border-radius: 8px; border: 1px solid transparent; }
+  .playground .cbm-row.cur { border-color: var(--accent); background: var(--accent-soft); }
+  .playground .cbm-row > .pg-mono:last-child { grid-column: 1 / -1; }
+  .playground .cbm-track { display: block; height: 10px; background: var(--surface-2); border-radius: 5px; overflow: hidden; }
+  .playground .cbm-fill { display: block; height: 100%; background: var(--role-1); transition: width .25s; }
+  @media (prefers-reduced-motion: reduce) { .playground .cbm-bar, .playground .cbm-fill { transition: none; } }
+</style>

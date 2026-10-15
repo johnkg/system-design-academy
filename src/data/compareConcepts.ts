@@ -226,6 +226,23 @@ export const problems: Problem[] = [
     { slug: 'table-formats-and-the-lakehouse', why: 'Add snapshots, atomic commits and compaction on top of files in object storage.' } ] },
   { text: 'Keep the history of how customer or product attributes changed over time', patterns: [
     { slug: 'slowly-changing-dimensions', why: 'Choose between overwriting and versioned rows, and decide which version a late-arriving fact joins to.' } ] },
+  { text: 'I want an assistant to answer from my own documents, with sources', patterns: [
+    { slug: 'retrieval-augmented-generation', why: 'Fetch the relevant passages at question time and let the model answer only from them.' },
+    { slug: 'embeddings-and-vector-search', why: 'Find passages by meaning, not only by shared words.' },
+    { slug: 'model-evaluation-and-drift', why: 'Measure retrieval and answers separately so you notice when quality slips.' } ] },
+  { text: 'Language model requests are slow or too expensive', patterns: [
+    { slug: 'llm-caching-and-routing', why: 'Reuse answers and shared prompt prefixes, and send easy requests to a cheaper model.' },
+    { slug: 'continuous-batching-and-model-serving', why: 'Keep the GPU busy by letting requests join and leave a running batch.' },
+    { slug: 'llm-inference-and-kv-cache', why: 'Understand why memory, not arithmetic, limits how many users one GPU can serve.' } ] },
+  { text: 'An AI agent reads untrusted content and can take actions', patterns: [
+    { slug: 'guardrails-and-prompt-injection', why: 'Limit what the model can do with scoped tools, approvals and tracking of untrusted text.' },
+    { slug: 'access-control-models', why: 'Give the agent the narrowest permissions that still let it do the job.' } ] },
+  { text: 'I must know whether a new model or prompt is safe to ship', patterns: [
+    { slug: 'model-evaluation-and-drift', why: 'Compare old and new on the same test set with a confidence interval, then watch live traffic.' },
+    { slug: 'canary-deployments', why: 'Send a small share of real traffic to the new version before everyone gets it.' } ] },
+  { text: 'A model does not fit on one GPU, or training takes too long', patterns: [
+    { slug: 'distributed-training-and-parallelism', why: 'Split data, state and layers across GPUs and balance memory against communication.' },
+    { slug: 'backups-and-point-in-time-recovery', why: 'Checkpoints bound how much work a failed machine can cost you.' } ] },
 ];
 
 export const confusions: Confusion[] = [
@@ -489,5 +506,16 @@ export const confusions: Confusion[] = [
       { aspect: 'Typical failure', values: ['A watermark too eager drops late events; too patient delays every answer', 'Offsets committed apart from state, so events are double counted or lost', 'A stream answer never corrected, or a batch that runs too rarely to be useful'] },
     ],
     rule: 'Watermarks decide when a window may close, checkpoints decide what survives a crash, and the batch-or-stream choice decides how often you can afford to be wrong and fix it later. Most pipelines need all three.',
+  },
+  {
+    title: 'Embeddings, retrieval or caching for a language model?',
+    blurb: 'Three ways to make a model use more than its prompt or answer faster. They solve different problems.',
+    patterns: ['embeddings-and-vector-search', 'retrieval-augmented-generation', 'llm-caching-and-routing'],
+    rows: [
+      { aspect: 'Answers', values: ['Which stored items are closest in meaning to this query?', 'What should the model be shown so it answers from the right facts?', 'Can I avoid, shorten or cheapen this model call?'] },
+      { aspect: 'Depends on', values: ['An embedding model and an index built over your data', 'Chunking, retrieval quality and a token budget for the prompt', 'How often requests repeat and how wrong a reused answer can be'] },
+      { aspect: 'Typical failure', values: ['Similar but wrong neighbours, or recall lost to aggressive compression', 'The right passage never retrieved, so a confident answer cites the wrong text', 'A near-duplicate question served a stale or another tenant\'s answer'] },
+    ],
+    rule: 'Vector search finds candidates, retrieval decides what the model sees, and caching decides whether the call is needed at all. A RAG system usually uses all three, and each needs its own tests.',
   },
 ];

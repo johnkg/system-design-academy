@@ -1,0 +1,194 @@
+---
+import PlaygroundShell from '../components/PlaygroundShell.astro';
+---
+<PlaygroundShell title="Simulate it" hint="2,000 points in 2D stand in for embeddings. An IVF index splits them into cells; a query only scans the nprobe nearest cells. Change the setting and compare with an exact scan.">
+  <ol class="how">
+    <li>Defaults (32 lists, nprobe 1): each query scans about <b>96</b> distance computations instead of <b>2,000</b>, and finds <b>350 of the 400</b> true top-10 neighbours (<b>87%</b>). Raise <b>nprobe</b> to 2 for <b>97%</b>, to 4 for <b>100%</b>. The picture shows the scanned points highlighted and any missed neighbour with a red ring.</li>
+    <li>Push <b>nprobe</b> to 32 (every list): recall is <b>100%</b> but the cost is <b>2,032</b> computations, more than the exact scan. The index only pays off while nprobe is a small share of the lists.</li>
+    <li>Set <b>nprobe</b> to 4, then switch the storage to <b>Compressed codes</b>: distances come from coarse coordinates and recall falls from <b>100%</b> to <b>50%</b> at the same cost. Choose <b>re-rank best 40</b>: recall returns to <b>87%</b> for 40 extra full-vector reads per query, and the codes need about <b>1 GB</b> of RAM at 10M vectors instead of <b>30.8 GB</b>.</li>
+    <li>Set the filter to <b>tag 3, post-filter</b>: only about 13 results come back for 40 queries, whatever the nprobe. Use <b>tag 3, pre-filter</b> instead: results are complete, but at nprobe 1 recall is only <b>13%</b> and at nprobe 4 only <b>33%</b>, because the 84 matching points are spread across many cells. Only nprobe 32 reaches <b>100%</b>, at which point you could simply scan the 84 matching rows exactly.</li>
+  </ol>
+  <div class="pg vs" data-vs>
+    <div class="pg-row">
+      <label>Lists (nlist) <select class="pg-in" data-nlist><option value="8">8</option><option value="16">16</option><option value="32" selected>32</option><option value="64">64</option></select></label>
+      <label>nprobe (lists scanned) <input type="range" min="1" max="32" value="1" data-nprobe /> <b data-nprobeval>1</b></label>
+      <label>Query shown in picture <input type="range" min="1" max="40" value="1" data-qsel /> <b data-qselval>1</b></label>
+    </div>
+    <div class="pg-row">
+      <label>Vector storage <select class="pg-in" data-store><option value="exact" selected>Full vectors</option><option value="pq">Compressed codes</option><option value="pqr">Compressed codes + re-rank best 40</option></select></label>
+      <label>Metadata filter <select class="pg-in" data-filter><option value="none" selected>None</option><option value="pre">tag 3, pre-filter</option><option value="post">tag 3, post-filter</option></select></label>
+      <button class="btn" type="button" data-reset>Reset</button>
+    </div>
+    <p class="pg-out" role="status" data-verdict></p>
+    <div class="pg-grid">
+      <div class="pg-box" data-recallbox style="--c: var(--role-2)"><h3>Recall@10</h3><span class="pg-mono" data-recall></span><span class="pg-note" data-recallnote></span></div>
+      <div class="pg-box" style="--c: var(--role-3)"><h3>Work per query</h3><span class="pg-mono" data-work></span><span class="pg-note" data-worknote></span></div>
+      <div class="pg-box" style="--c: var(--role-4)"><h3>Memory at 10M x 768-d</h3><span class="pg-mono" data-mem></span><span class="pg-note" data-memnote></span></div>
+    </div>
+    <h3>One query in the plane</h3>
+    <svg class="vs-svg" viewBox="0 0 400 400" role="img" aria-label="Scatter of 2000 points. Scanned points are highlighted, the query is a large marker, true nearest neighbours are ringed, and missed ones have a red ring." data-svg></svg>
+    <p class="pg-note" data-legend></p>
+    <p class="pg-note">Model assumptions: 2,000 points in 24 overlapping clusters, 40 queries, k = 10, seeded generator, k-means with 6 rounds. Distances are squared Euclidean. Compressed codes are modelled by rounding coordinates to multiples of 600 for the scan; real product quantisation uses learned codebooks and behaves differently. Real embeddings have hundreds of dimensions, where cells overlap far more than in 2D, so real indexes need a larger nprobe for the same recall. Memory assumes 768 float32 dimensions (3,072 bytes), 8 bytes of id per vector and 96-byte codes; graph or list overhead is ignored. The tag marks 1 point in 24 and matches 84 points.</p>
+  </div>
+</PlaygroundShell>
+<script>
+  const N = 2000, CLUSTERS = 24, K = 10, Q = 40, TAG = 3, STEP = 600, RERANK = 40;
+  const NS = 'http://www.w3.org/2000/svg';
+  function makeData() {
+    let seed = 12345;
+    const rnd = () => (seed = (seed * 48271) % 2147483647);
+    const cx = [], cy = [];
+    for (let c = 0; c < CLUSTERS; c++) { cx.push((rnd() % 8000) + 1000); cy.push((rnd() % 8000) + 1000); }
+    const jitter = () => (rnd() % 1601) + (rnd() % 1601) + (rnd() % 1601) - 2400;
+    const px = [], py = [], tag = [];
+    for (let i = 0; i < N; i++) { const t = i % CLUSTERS; tag.push(t); px.push(cx[t] + jitter()); py.push(cy[t] + jitter()); }
+    const qs = [];
+    for (let i = 0; i < Q; i++) { const t = rnd() % CLUSTERS; qs.push([cx[t] + jitter(), cy[t] + jitter()]); }
+    return { px, py, tag, qs };
+  }
+  const D = makeData();
+  const d2 = (ax, ay, bx, by) => (ax - bx) * (ax - bx) + (ay - by) * (ay - by);
+  const coarse = (v) => Math.floor(v / STEP + 0.5) * STEP;
+  const indexCache = new Map();
+  function buildIndex(nlist) {
+    if (indexCache.has(nlist)) return indexCache.get(nlist);
+    const { px, py } = D; const mx = [], my = [];
+    for (let c = 0; c < nlist; c++) { mx.push(px[Math.floor((c * N) / nlist)]); my.push(py[Math.floor((c * N) / nlist)]); }
+    const nearest = (x, y) => { let b = 0, bd = d2(x, y, mx[0], my[0]); for (let c = 1; c < nlist; c++) { const d = d2(x, y, mx[c], my[c]); if (d < bd) { bd = d; b = c; } } return b; };
+    for (let it = 0; it < 6; it++) {
+      const sx = new Array(nlist).fill(0), sy = new Array(nlist).fill(0), n = new Array(nlist).fill(0);
+      for (let i = 0; i < N; i++) { const c = nearest(px[i], py[i]); sx[c] += px[i]; sy[c] += py[i]; n[c]++; }
+      for (let c = 0; c < nlist; c++) if (n[c] > 0) { mx[c] = Math.floor(sx[c] / n[c]); my[c] = Math.floor(sy[c] / n[c]); }
+    }
+    const lists = Array.from({ length: nlist }, () => []);
+    for (let i = 0; i < N; i++) lists[nearest(px[i], py[i])].push(i);
+    const idx = { nlist, mx, my, lists };
+    indexCache.set(nlist, idx); return idx;
+  }
+  // filter: -1 none, otherwise the tag a result must carry. Returns the K best ids by key (distance, id).
+  function exactTop(q, filter) {
+    const cand = [];
+    for (let i = 0; i < N; i++) if (filter < 0 || D.tag[i] === filter) cand.push(d2(q[0], q[1], D.px[i], D.py[i]) * 4096 + i);
+    cand.sort((a, b) => a - b);
+    return cand.slice(0, K).map((v) => v % 4096);
+  }
+  // opts: { nlist, nprobe, store: exact|pq|pqr, filter: none|pre|post }
+  function annQuery(q, opts) {
+    const idx = buildIndex(opts.nlist);
+    const tagFilter = opts.filter === 'none' ? -1 : TAG;
+    const scanFilter = opts.filter === 'pre' ? TAG : -1;
+    const order = [...Array(opts.nlist).keys()].sort((a, b) => d2(q[0], q[1], idx.mx[a], idx.my[a]) - d2(q[0], q[1], idx.mx[b], idx.my[b]) || a - b);
+    const probed = order.slice(0, opts.nprobe);
+    const cand = []; let scanned = 0;
+    const qx = opts.store === 'exact' ? q[0] : coarse(q[0]), qy = opts.store === 'exact' ? q[1] : coarse(q[1]);
+    for (const c of probed) for (const i of idx.lists[c]) {
+      if (scanFilter >= 0 && D.tag[i] !== scanFilter) continue;
+      scanned++;
+      const x = opts.store === 'exact' ? D.px[i] : coarse(D.px[i]), y = opts.store === 'exact' ? D.py[i] : coarse(D.py[i]);
+      cand.push(d2(qx, qy, x, y) * 4096 + i);
+    }
+    cand.sort((a, b) => a - b);
+    let top; let reads = 0;
+    if (opts.store === 'pqr') {
+      const best = cand.slice(0, RERANK).map((v) => v % 4096); reads = best.length;
+      top = best.map((i) => d2(q[0], q[1], D.px[i], D.py[i]) * 4096 + i).sort((a, b) => a - b).slice(0, K).map((v) => v % 4096);
+    } else top = cand.slice(0, K).map((v) => v % 4096);
+    if (opts.filter === 'post') top = top.filter((i) => D.tag[i] === tagFilter);
+    return { top, probed, work: scanned + opts.nlist, reads };
+  }
+  function evaluate(opts) {
+    const tagFilter = opts.filter === 'none' ? -1 : TAG;
+    let hits = 0, work = 0, reads = 0, returned = 0;
+    for (const q of D.qs) {
+      const truth = new Set(exactTop(q, tagFilter));
+      const r = annQuery(q, opts);
+      work += r.work; reads += r.reads; returned += r.top.length; hits += r.top.filter((i) => truth.has(i)).length;
+    }
+    return { hits, total: Q * K, avgWork: Math.floor(work / Q), avgReads: Math.floor(reads / Q), returned };
+  }
+  function memory(store) { // MB for 10M vectors of 768 dims
+    const V = 10000000;
+    if (store === 'exact') return { ram: Math.floor((V * (3072 + 8)) / 1000000), ssd: 0 };
+    if (store === 'pq') return { ram: Math.floor((V * (96 + 8)) / 1000000), ssd: 0 };
+    return { ram: Math.floor((V * (96 + 8)) / 1000000), ssd: Math.floor((V * 3072) / 1000000) };
+  }
+  const fmtMB = (mb) => (mb >= 1000 ? (mb / 1000).toFixed(1) + ' GB' : mb + ' MB');
+  function verdictFor(o, r) {
+    const pct = Math.floor((r.hits * 100) / r.total);
+    if (o.filter === 'post') return `Post-filtering throws away most of the top 10: only ${r.returned} of ${r.total} wanted results came back (${pct}% recall). The filter has to run inside the search, or you must over-fetch a lot.`;
+    if (o.filter === 'pre') return pct < 95
+      ? `Pre-filtering keeps the results valid (${r.returned} of ${r.total}) but recall is only ${pct}%: the few matching points are spread over many cells, so a low nprobe misses them. With a filter this selective, an exact scan of the 84 matching rows is cheaper and perfect.`
+      : `Recall ${pct}% with only ${r.avgWork} computations, but that needs nearly every list probed. With 84 matching rows, scanning them exactly costs about the same and needs no index.`;
+    if (r.avgWork >= N) return `Scanning ${r.avgWork} distance computations per query costs more than the exact scan (${N}) and is no better. At this nprobe the index has stopped paying off.`;
+    if (pct < 80) return `Recall ${pct}%: roughly 1 in ${Math.max(2, Math.round(100 / (100 - pct)))} true neighbours is missed. Raise nprobe, use re-ranking, or accept the loss only if the application tolerates it.`;
+    if (pct < 95) return `Recall ${pct}% at ${r.avgWork} computations (${Math.floor((r.avgWork * 100) / N)}% of an exact scan). Often acceptable, but compare against your target recall on real queries.`;
+    return `Recall ${pct}% at ${r.avgWork} computations (${Math.floor((r.avgWork * 100) / N)}% of an exact scan). Good operating point. Going higher mostly adds cost.`;
+  }
+  document.querySelectorAll('[data-vs]').forEach((root) => {
+    const q = (s) => root.querySelector(s);
+    const val = (s) => Number(q(s).value);
+    const circles = []; let qMark = null; let scheduled = false;
+    const svg = q('[data-svg]');
+    let lo = 1e9, hi = -1e9;
+    for (let i = 0; i < N; i++) { lo = Math.min(lo, D.px[i], D.py[i]); hi = Math.max(hi, D.px[i], D.py[i]); }
+    const sc = (v) => 10 + ((v - lo) / (hi - lo)) * 380;
+    for (let i = 0; i < N; i++) {
+      const c = document.createElementNS(NS, 'circle');
+      c.setAttribute('cx', String(sc(D.px[i]))); c.setAttribute('cy', String(400 - sc(D.py[i]))); c.setAttribute('r', '2');
+      svg.appendChild(c); circles.push(c);
+    }
+    const ring = document.createElementNS(NS, 'g'); svg.appendChild(ring);
+    qMark = document.createElementNS(NS, 'path'); qMark.setAttribute('d', 'M-7 0H7M0 -7V7'); qMark.setAttribute('stroke', 'var(--text)'); qMark.setAttribute('stroke-width', '3'); svg.appendChild(qMark);
+
+    function options() { return { nlist: val('[data-nlist]'), nprobe: val('[data-nprobe]'), store: q('[data-store]').value, filter: q('[data-filter]').value }; }
+    function draw() {
+      scheduled = false;
+      const nprobeEl = q('[data-nprobe]'); const nl = val('[data-nlist]');
+      nprobeEl.max = String(nl); if (Number(nprobeEl.value) > nl) nprobeEl.value = String(nl);
+      const o = options();
+      q('[data-nprobeval]').textContent = String(o.nprobe); q('[data-qselval]').textContent = String(val('[data-qsel]'));
+      const r = evaluate(o); const pct = Math.floor((r.hits * 100) / r.total);
+      q('[data-verdict]').textContent = verdictFor(o, r);
+      q('[data-recall]').textContent = `${pct}%`;
+      q('[data-recallnote]').textContent = `${r.hits} of ${r.total} true neighbours found over ${Q} queries`;
+      q('[data-work]').textContent = `${r.avgWork} of ${N}`;
+      q('[data-worknote]').textContent = `distance computations (${o.nlist} centroids + scanned points)${r.avgReads ? `, plus ${r.avgReads} full-vector reads` : ''}`;
+      const m = memory(o.store);
+      q('[data-mem]').textContent = `${fmtMB(m.ram)} RAM`;
+      q('[data-memnote]').textContent = m.ssd ? `plus ${fmtMB(m.ssd)} of full vectors on SSD for re-ranking` : o.store === 'exact' ? 'float32 vectors plus ids, before any graph or list overhead' : 'compressed codes only; distances are approximate';
+      // picture for one query
+      const qi = val('[data-qsel]') - 1; const qq = D.qs[qi];
+      const tagFilter = o.filter === 'none' ? -1 : TAG;
+      const truth = exactTop(qq, tagFilter); const res = annQuery(qq, o);
+      const idx = buildIndex(o.nlist); const probedPts = new Set();
+      for (const c of res.probed) for (const i of idx.lists[c]) probedPts.add(i);
+      for (let i = 0; i < N; i++) {
+        const el = circles[i]; const match = tagFilter < 0 || D.tag[i] === tagFilter;
+        el.setAttribute('fill', probedPts.has(i) ? 'var(--role-1)' : 'var(--border)');
+        el.setAttribute('opacity', match ? (probedPts.has(i) ? '0.85' : '0.9') : '0.15');
+      }
+      while (ring.firstChild) ring.removeChild(ring.firstChild);
+      const got = new Set(res.top); let missed = 0;
+      for (const i of truth) {
+        const e = document.createElementNS(NS, 'circle');
+        e.setAttribute('cx', String(sc(D.px[i]))); e.setAttribute('cy', String(400 - sc(D.py[i]))); e.setAttribute('r', '5');
+        e.setAttribute('fill', 'none'); e.setAttribute('stroke-width', '2');
+        const ok = got.has(i); if (!ok) missed++;
+        e.setAttribute('stroke', ok ? 'var(--text)' : 'var(--bad)');
+        ring.appendChild(e);
+      }
+      qMark.setAttribute('transform', `translate(${sc(qq[0])} ${400 - sc(qq[1])})`);
+      q('[data-legend]').textContent = `Query ${qi + 1}: highlighted points were scanned, grey ones were skipped. Of its ${truth.length} true neighbours (rings), ${truth.length - missed} were returned and ${missed} missed (red rings). The cross is the query.`;
+    }
+    function schedule() { if (scheduled) return; scheduled = true; requestAnimationFrame(draw); }
+    root.querySelectorAll('input,select').forEach((el) => el.addEventListener('input', schedule));
+    root.querySelectorAll('select').forEach((el) => el.addEventListener('change', schedule));
+    q('[data-reset]').addEventListener('click', () => {
+      q('[data-nlist]').value = '32'; q('[data-nprobe]').value = '1'; q('[data-qsel]').value = '1'; q('[data-store]').value = 'exact'; q('[data-filter]').value = 'none'; draw();
+    });
+    draw();
+  });
+</script>
+<style is:global>
+  .playground .vs-svg { width: 100%; max-width: 440px; height: auto; display: block; border: 1px solid var(--border); border-radius: 10px; background: var(--surface); }
+</style>

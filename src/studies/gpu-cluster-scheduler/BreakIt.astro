@@ -1,0 +1,136 @@
+---
+import PlaygroundShell from '../../components/PlaygroundShell.astro';
+---
+<PlaygroundShell title="Run 40 jobs on 64 GPUs" hint="Change how GPUs are handed out and placed, then watch the same 40 jobs from three teams. The cluster has 8 nodes of 8 GPUs in 2 racks, and team 0 sends 60% of the jobs.">
+  <ol class="how">
+    <li>Start with <b>GPUs handed out one by one</b>: big jobs each grab part of what they need and wait for the rest, so the cluster <b>deadlocks</b> with all 64 GPUs held and idle, after 15 of 40 jobs.</li>
+    <li>Switch to <b>gang scheduling</b> with placement <b>anywhere</b> and no backfill: all 40 finish at tick 66, but 13 jobs are split across racks and run slower, so useful utilisation is only 60%.</li>
+    <li>Place <b>inside one rack</b>: no job is split, and everything finishes at tick 53 with 75% utilisation. Add <b>backfill</b> and <b>fair share</b> to finish at tick 50 with 80%, and to cut the wait of the small team 2 from 21 ticks to 12.</li>
+  </ol>
+  <div class="pg gsb" data-gsb>
+    <div class="pg-row">
+      <label>Hand-out <select class="pg-in" data-gang>
+        <option value="0" selected>One GPU at a time, round-robin</option>
+        <option value="1">Gang: all of a job's GPUs or none</option>
+      </select></label>
+      <label>Placement <select class="pg-in" data-aware>
+        <option value="0" selected>Anywhere there is a free GPU</option>
+        <option value="1">Tightest node, or whole nodes in one rack</option>
+      </select></label>
+      <label>Short jobs may jump ahead <select class="pg-in" data-bf>
+        <option value="0" selected>No (strict queue)</option>
+        <option value="1">Yes (backfill, if they finish before the head can start)</option>
+      </select></label>
+      <label>Queue order <select class="pg-in" data-fair>
+        <option value="0" selected>First come, first served</option>
+        <option value="1">Fair share (team with least usage first)</option>
+      </select></label>
+    </div>
+    <div class="pg-grid">
+      <div class="pg-box" data-b1><h3>Outcome</h3><span class="pg-mono" data-o1></span><span class="pg-note" data-n1></span></div>
+      <div class="pg-box" data-b2><h3>Useful utilisation</h3><span class="pg-mono" data-o2></span><span class="pg-note" data-n2></span></div>
+      <div class="pg-box" data-b3><h3>Average wait, in ticks</h3><span class="pg-mono" data-o3></span><span class="pg-note" data-n3></span></div>
+      <div class="pg-box" data-b4><h3>Jobs split across racks</h3><span class="pg-mono" data-o4></span><span class="pg-note" data-n4></span></div>
+    </div>
+    <p class="pg-out" data-verdict aria-live="polite"></p>
+    <p class="pg-note">Model: 40 jobs asking for 1, 2, 4, 8, 16 or 32 GPUs, each running 2 to 10 ticks and submitted in the first 8 ticks. A job that spans two racks runs 1.5 times as long, and one spread over more nodes than it needs runs 1.25 times as long. Useful utilisation counts only the GPU-ticks a job would need on ideal placement, divided by the cluster's capacity until the end. Backfill and placement apply only to gang scheduling.</p>
+  </div>
+</PlaygroundShell>
+<script>
+  document.querySelectorAll<HTMLElement>('[data-gsb]').forEach((root) => {
+    const q = <T extends HTMLElement>(s: string) => root.querySelector<T>(s)!;
+    const NODES = 8; const PER = 8; const RACK = 4; const TOTAL = 40;
+    type Slot = [number, number];
+    type Job = { id: number; gpus: number; team: number; dur: number; submit: number; held: Slot[]; got: number; start: number; end: number; slots: Slot[] };
+    function makeJobs(): Job[] {
+      let seed = 7; const rnd = (n: number) => { seed = (seed * 1664525 + 1013904223) % 4294967296; return Math.floor(seed / 65536) % n; };
+      const sizes = [1, 2, 4, 8, 8, 16, 16, 32];
+      const jobs: Job[] = Array.from({ length: TOTAL }, (_, id) => { const gpus = sizes[rnd(8)]; const r = rnd(10); const team = r < 6 ? 0 : r < 8 ? 1 : 2; return { id, gpus, team, dur: 2 + rnd(9), submit: rnd(8), held: [], got: 0, start: -1, end: -1, slots: [] }; });
+      return jobs.sort((a, b) => a.submit * 100 + a.id - (b.submit * 100 + b.id));
+    }
+    function placeAware(free: number[], g: number): Slot[] | null {
+      if (g <= PER) { let b = -1; for (let n = 0; n < NODES; n++) if (free[n] >= g && (b < 0 || free[n] < free[b])) b = n; return b < 0 ? null : [[b, g]]; }
+      const need = g / PER;
+      for (let r = 0; r < NODES / RACK; r++) { const w: Slot[] = []; for (let n = r * RACK; n < (r + 1) * RACK; n++) if (free[n] === PER) w.push([n, PER]); if (w.length >= need) return w.slice(0, need); }
+      return null;
+    }
+    function placeAny(free: number[], g: number): Slot[] | null {
+      let left = g; const s: Slot[] = [];
+      for (let n = 0; n < NODES && left > 0; n++) if (free[n] > 0) { const c = Math.min(free[n], left); s.push([n, c]); left -= c; }
+      return left > 0 ? null : s;
+    }
+    function simulate(o: { gang: boolean; aware: boolean; backfill: boolean; fair: boolean }) {
+      const jobs = makeJobs(); const free: number[] = new Array(NODES).fill(PER); const usage = [0, 0, 0];
+      let running: Job[] = []; let t = 0; let done = 0; let stuck = false; let crossRack = 0;
+      const place = o.aware ? placeAware : placeAny;
+      const begin = (j: Job, slots: Slot[]) => {
+        const racks = new Set(slots.map(([n]) => Math.floor(n / RACK))).size; const nodes = new Set(slots.map(([n]) => n)).size; const minNodes = Math.ceil(j.gpus / PER);
+        const num = racks > 1 ? 3 : nodes > minNodes ? 5 : 1; const den = racks > 1 ? 2 : nodes > minNodes ? 4 : 1;
+        if (racks > 1) crossRack++;
+        j.start = t; j.end = t + Math.ceil((j.dur * num) / den); j.slots = slots; running.push(j);
+      };
+      for (; done < TOTAL && t < 400; t++) {
+        const fin = running.filter((r) => r.end === t); fin.forEach((j) => { j.slots.forEach(([n, c]) => { free[n] += c; }); done++; });
+        running = running.filter((r) => r.end !== t);
+        const queue = jobs.filter((j) => j.submit <= t && j.start < 0).sort((a, b) => (o.fair ? usage[a.team] - usage[b.team] : 0) || a.submit - b.submit || a.id - b.id);
+        let progressed = fin.length > 0;
+        if (!o.gang) {
+          let again = true;
+          while (again) {
+            again = false;
+            for (const j of queue) {
+              if (j.start >= 0 || j.got === j.gpus) continue;
+              const n = free.findIndex((f) => f > 0); if (n < 0) break;
+              free[n]--; j.held.push([n, 1]); j.got++; again = true; progressed = true;
+              if (j.got === j.gpus) begin(j, j.held);
+            }
+          }
+        } else {
+          let shadow = -1;
+          for (const j of queue) {
+            if (shadow >= 0 && !(o.backfill && t + j.dur <= shadow)) continue;
+            const s = place(free, j.gpus);
+            if (s) { s.forEach(([n, c]) => { free[n] -= c; }); begin(j, s); progressed = true; continue; }
+            if (shadow < 0) {
+              if (!o.backfill) break;
+              const copy = free.slice();
+              for (const r of [...running].sort((a, b) => a.end - b.end)) { r.slots.forEach(([n, c]) => { copy[n] += c; }); if (place(copy, j.gpus)) { shadow = r.end; break; } }
+            }
+          }
+        }
+        for (const r of running) usage[r.team] += r.gpus;
+        if (!progressed && running.length === 0 && queue.length > 0) { stuck = true; break; }
+      }
+      const idleHeld = jobs.filter((j) => j.start < 0).reduce((s, j) => s + j.got, 0);
+      const started = jobs.filter((j) => j.start >= 0);
+      const avg = (l: Job[]) => (l.length ? Math.floor(l.reduce((s, j) => s + j.start - j.submit, 0) / l.length) : -1);
+      const useful = started.filter((j) => j.end <= t).reduce((s, j) => s + j.gpus * j.dur, 0);
+      return { stuck, done, t, idleHeld, crossRack, util: t ? Math.floor((100 * useful) / (t * NODES * PER)) : 0, wait: avg(started), wait0: avg(started.filter((j) => j.team === 0)), wait2: avg(started.filter((j) => j.team === 2)) };
+    }
+    const sel = (s: string) => q<HTMLSelectElement>(s).value === '1';
+    const colour = (s: string, c: string) => q<HTMLElement>(s).style.setProperty('--c', c);
+    function draw() {
+      const gang = sel('[data-gang]');
+      q<HTMLSelectElement>('[data-aware]').disabled = !gang; q<HTMLSelectElement>('[data-bf]').disabled = !gang;
+      const r = simulate({ gang, aware: sel('[data-aware]'), backfill: sel('[data-bf]'), fair: sel('[data-fair]') });
+      const w = (n: number) => (n < 0 ? 'none started' : String(n));
+      q('[data-o1]').textContent = r.stuck ? `Deadlock at tick ${r.t}` : `All ${TOTAL} done at tick ${r.t}`;
+      q('[data-n1]').textContent = r.stuck ? `${r.done} of ${TOTAL} finished, ${r.idleHeld} GPUs held by jobs that cannot start` : 'every job got all its GPUs at once';
+      q('[data-o2]').textContent = `${r.util}%`;
+      q('[data-n2]').textContent = r.stuck ? 'the cluster is full, but nothing is running' : 'time lost to splits and gaps shows up here';
+      q('[data-o3]').textContent = `team 0: ${w(r.wait0)}, team 2: ${w(r.wait2)}`;
+      q('[data-n3]').textContent = 'team 0 sends 60% of the jobs, team 2 sends 20%';
+      q('[data-o4]').textContent = String(r.crossRack);
+      q('[data-n4]').textContent = gang && sel('[data-aware]') ? 'big jobs wait for a free rack instead' : 'these run 1.5 times as long';
+      colour('[data-b1]', r.stuck ? 'var(--bad)' : 'var(--good)'); colour('[data-b2]', r.util >= 75 ? 'var(--good)' : 'var(--accent)');
+      colour('[data-b3]', 'var(--accent)'); colour('[data-b4]', r.crossRack === 0 ? 'var(--good)' : 'var(--accent)');
+      const out = q('[data-verdict]'); out.classList.toggle('bad', r.stuck);
+      out.textContent = r.stuck
+        ? `Deadlock: every big job holds some GPUs and waits for the rest, and nobody lets go. Handing out GPUs one at a time cannot work for jobs that need many at once. Choose gang scheduling.`
+        : (!sel('[data-aware]') ? `Everything finishes, but ${r.crossRack} jobs were split across racks and run slower. Placement that keeps a job inside one rack finishes sooner.`
+          : `Gang scheduling with rack-aware placement: no job is split, finishing at tick ${r.t}. ${sel('[data-bf]') ? 'Backfill filled the gaps in front of waiting big jobs without delaying them.' : 'Without backfill, GPUs sit idle while a big job at the head of the queue waits for room.'}`);
+    }
+    root.addEventListener('input', draw); root.addEventListener('change', draw);
+    draw();
+  });
+</script>

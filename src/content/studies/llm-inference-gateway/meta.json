@@ -1,0 +1,554 @@
+{
+  "name": "Design an LLM Inference Gateway",
+  "difficulty": "advanced",
+  "intent": "Put one shared front door in front of several language models for dozens of internal teams, so that each team gets its own token budget, answers stream back quickly, and a saturated GPU pool degrades gracefully instead of collapsing.",
+  "codeTitle": "a token budget with reserve and refund",
+  "finalIntro": "One streamed chat request, cancelled half way, from the key check to the bill.",
+  "prompt": "Your company runs its own GPU-hosted models and also buys capacity from outside model providers. Forty internal teams want to call them. Design the shared gateway: it must authenticate teams, give each a budget measured in tokens, choose the right model and fall back when one fails, stream answers as they are generated, avoid paying twice for repeated prompts, survive the moment the GPUs are full, and tell finance who spent what.",
+  "functional": [
+    "Authenticate each caller and map it to a team",
+    "Enforce per-team limits in tokens per minute and a monthly spending cap",
+    "Route a request to a model, with fallbacks and cheaper-first cascades across self-hosted and provider backends",
+    "Stream the answer back as it is generated, and stop the work when the caller disconnects",
+    "Reuse work through prompt-prefix and semantic caches",
+    "Record usage and cost per team, model and feature"
+  ],
+  "nonFunctional": [
+    "Gateway overhead under 10 ms, because the model itself takes seconds",
+    "Time to first token under 1 second at the median and under 3 seconds at the 95th percentile",
+    "Support tens of thousands of open streams at once",
+    "When the GPUs are saturated, reject or divert quickly instead of letting every request get slow",
+    "A team can never exceed its budget by more than a small, bounded amount",
+    "Usage records are complete and match the provider invoices within a percent or two"
+  ],
+  "firstAttempt": {
+    "text": "Each team gets an API key for the outside provider, and its code calls the provider directly. Teams pick their own model, retry on errors, and add up their own bills in a spreadsheet.",
+    "limits": [
+      "Keys are shared in chat and repositories, nobody knows who spent what, and revoking one breaks a whole team",
+      "A bug in a loop can spend a month's money in an afternoon, because nothing stops it",
+      "Every team writes its own retry and streaming code, and gets it wrong in different ways",
+      "The company's own GPUs sit idle while teams pay the provider's prices, because nobody is routing to them",
+      "Rate limits belong to the one company account, so one team's burst makes every other team fail"
+    ]
+  },
+  "nodes": [
+    {
+      "id": "apps",
+      "label": "Team apps",
+      "kind": "client",
+      "x": 12,
+      "y": 12
+    },
+    {
+      "id": "single",
+      "label": "Provider API",
+      "kind": "compute",
+      "x": 37,
+      "y": 12,
+      "at": 0,
+      "until": 1
+    },
+    {
+      "id": "gw",
+      "label": "Gateway",
+      "kind": "edge",
+      "x": 37,
+      "y": 37,
+      "at": 1
+    },
+    {
+      "id": "budget",
+      "label": "Token budgets",
+      "kind": "data",
+      "x": 12,
+      "y": 37,
+      "at": 1
+    },
+    {
+      "id": "relay",
+      "label": "Stream relay",
+      "kind": "edge",
+      "x": 37,
+      "y": 12,
+      "at": 2
+    },
+    {
+      "id": "gpu",
+      "label": "Own GPU pool",
+      "kind": "compute",
+      "x": 12,
+      "y": 63,
+      "at": 1
+    },
+    {
+      "id": "router",
+      "label": "Router",
+      "kind": "compute",
+      "x": 37,
+      "y": 63,
+      "at": 3
+    },
+    {
+      "id": "provider",
+      "label": "Provider APIs",
+      "kind": "compute",
+      "x": 37,
+      "y": 88,
+      "at": 3
+    },
+    {
+      "id": "cache",
+      "label": "Prefix and answer cache",
+      "kind": "data",
+      "x": 62,
+      "y": 37,
+      "at": 4
+    },
+    {
+      "id": "queue",
+      "label": "Admission queue",
+      "kind": "async",
+      "x": 12,
+      "y": 88,
+      "at": 5
+    },
+    {
+      "id": "metrics",
+      "label": "TTFT metrics",
+      "kind": "data",
+      "x": 62,
+      "y": 63,
+      "at": 6
+    },
+    {
+      "id": "usage",
+      "label": "Usage and cost",
+      "kind": "data",
+      "x": 62,
+      "y": 12,
+      "at": 6
+    }
+  ],
+  "edges": [
+    {
+      "from": "apps",
+      "to": "single",
+      "at": 0,
+      "until": 1
+    },
+    {
+      "from": "apps",
+      "to": "gw",
+      "at": 1
+    },
+    {
+      "from": "gw",
+      "to": "budget",
+      "at": 1
+    },
+    {
+      "from": "gw",
+      "to": "gpu",
+      "at": 1,
+      "until": 3
+    },
+    {
+      "from": "gw",
+      "to": "relay",
+      "at": 2
+    },
+    {
+      "from": "relay",
+      "to": "apps",
+      "at": 2
+    },
+    {
+      "from": "gw",
+      "to": "router",
+      "at": 3
+    },
+    {
+      "from": "router",
+      "to": "gpu",
+      "at": 3,
+      "until": 5
+    },
+    {
+      "from": "router",
+      "to": "provider",
+      "at": 3
+    },
+    {
+      "from": "gw",
+      "to": "cache",
+      "at": 4
+    },
+    {
+      "from": "router",
+      "to": "queue",
+      "at": 5
+    },
+    {
+      "from": "queue",
+      "to": "gpu",
+      "at": 5
+    },
+    {
+      "from": "gw",
+      "to": "metrics",
+      "at": 6
+    },
+    {
+      "from": "gw",
+      "to": "usage",
+      "at": 6
+    }
+  ],
+  "steps": [
+    {
+      "title": "Put one gateway in front, with a token budget per team",
+      "problem": "Shared provider keys give no accountability and no brake, and a request limit counts the wrong thing: one request can cost 50 tokens or 100,000.",
+      "fix": "Teams call the gateway with their own key. The gateway authenticates it, finds the team, and checks a token bucket for that team before anything runs. Because the real cost of a request is not known until the answer is finished, it reserves the prompt size plus the maximum output the caller allows, then returns the unused part when the answer ends. A monthly spending cap sits beside the per-minute bucket. Provider keys stay in the gateway's secret store and teams never see them.",
+      "tradeoff": "Cost is measured in the unit the models actually charge for, and a runaway loop is stopped within a minute. The reservation is pessimistic, so callers who ask for a huge maximum output are throttled early, and the gateway has to count tokens itself, using the tokenizer of each model, which can differ from the provider's count by a few percent.",
+      "concepts": [
+        {
+          "slug": "rate-limiting"
+        },
+        {
+          "slug": "authentication-and-authorization"
+        },
+        {
+          "slug": "api-gateway"
+        },
+        {
+          "slug": "secrets-management"
+        },
+        {
+          "slug": "guardrails-and-prompt-injection"
+        }
+      ]
+    },
+    {
+      "title": "Stream the answer and stop work on cancel",
+      "problem": "A long answer takes 10 to 60 seconds to generate. Waiting for all of it feels broken, and if the user closes the tab the GPU keeps generating text nobody will read.",
+      "fix": "The model generates one token at a time, so the gateway relays them to the caller as server-sent events over a long-lived HTTP connection. A stream relay tier does only this job, holds the open connections cheaply, and sends a small keep-alive comment every 15 seconds so proxies do not close idle streams. When the caller disconnects, or a deadline passes, the relay notices the closed socket and sends a cancel to the backend, which frees the GPU slot at once. The unused part of the reservation is refunded.",
+      "tradeoff": "The first words appear after a fraction of a second and cancelled work is not wasted. Thousands of open connections need their own capacity and careful deploys, because restarting a relay cuts every stream it holds, and an error can arrive after the 200 status was already sent, so errors travel inside the stream.",
+      "concepts": [
+        {
+          "slug": "real-time-communication"
+        },
+        {
+          "slug": "http-versions"
+        },
+        {
+          "slug": "timeouts-and-deadlines"
+        },
+        {
+          "slug": "llm-inference-and-kv-cache"
+        },
+        {
+          "slug": "backpressure"
+        }
+      ]
+    },
+    {
+      "title": "Route across models and providers, with fallbacks",
+      "problem": "Teams ask for a model by name, but the best choice depends on the task, the price and which backends are healthy right now. A single backend is also a single point of failure.",
+      "fix": "A router turns a request for a logical model such as 'assistant-large' into an ordered list of real backends: the company's GPUs first because they are already paid for, then one or two providers. Health and latency are tracked per backend, with a circuit breaker that stops sending to one that is failing. If the first choice errors before sending a token, the gateway retries on the next with backoff. Cheap-first cascades try a small model and escalate only when a check, such as a confidence score or a format validation, says the answer is not good enough. Changes to routing roll out as a percentage of traffic, with quality measured on a sample.",
+      "tradeoff": "An outage at one backend becomes a slower answer rather than an error, and expensive models are used only where they earn their cost. Different models answer differently, so a fallback can change behaviour, a retry after the first token has been sent is not possible, and a cascade that escalates often costs more than going straight to the big model.",
+      "concepts": [
+        {
+          "slug": "llm-caching-and-routing"
+        },
+        {
+          "slug": "circuit-breaker"
+        },
+        {
+          "slug": "retries-and-backoff"
+        },
+        {
+          "slug": "graceful-degradation"
+        },
+        {
+          "slug": "model-evaluation-and-drift"
+        },
+        {
+          "slug": "load-balancing"
+        }
+      ]
+    },
+    {
+      "title": "Cache the prefix, and sometimes the whole answer",
+      "problem": "Most requests begin with the same long system prompt and documents, and many users ask nearly the same question. Recomputing the same thousands of tokens on a GPU wastes the scarcest resource.",
+      "fix": "Two caches work at different levels. A prefix cache keeps the attention state for the start of a prompt on the GPU that computed it, and the router sends requests with the same prefix to the same replica, using a hash of the first blocks of tokens, so only the new tail needs to be processed. An answer cache, used only for deterministic or low-risk calls, returns a stored response when the exact prompt matches, or when an embedding of the question is very close to an earlier one and the team has opted in. Cache keys include the model, the system prompt and the team's tenant, so answers never cross a boundary.",
+      "tradeoff": "Prefill cost and time to first token fall sharply for long shared prompts, and repeated questions cost nothing. Sending the same prefix to one replica can overload it, a semantic match can return a wrong answer to a question that only looks similar, and cached answers go stale when the model or the documents change.",
+      "concepts": [
+        {
+          "slug": "llm-caching-and-routing"
+        },
+        {
+          "slug": "llm-inference-and-kv-cache"
+        },
+        {
+          "slug": "embeddings-and-vector-search"
+        },
+        {
+          "slug": "caching"
+        },
+        {
+          "slug": "retrieval-augmented-generation"
+        }
+      ]
+    },
+    {
+      "title": "Queue, prioritise and shed when the GPUs are full",
+      "problem": "A GPU pool has a fixed number of sequences it can generate at once. Above that, a plain queue just grows, every request waits longer than its caller will, and the pool spends its time on answers that no one is waiting for.",
+      "fix": "Requests enter an admission queue per model with a short maximum wait, based on how long callers will really wait. Interactive traffic goes ahead of batch jobs. When the queue is longer than the wait allows, the gateway rejects at once with a retry-after hint or diverts to a provider, instead of accepting work it cannot finish. Waiting requests whose caller has gone are dropped before they start. Under heavy overload newer requests are served first, since the oldest are most likely abandoned. Queue depth and wait time drive the autoscaler that adds GPU replicas.",
+      "tradeoff": "Latency stays bounded and the GPUs keep doing useful work at 100 percent load, so the pool delivers its full capacity. Some callers get an immediate rejection that they must handle, batch work can be starved without a quota, and a queue limit that is too tight rejects requests the pool could have served.",
+      "concepts": [
+        {
+          "slug": "load-shedding"
+        },
+        {
+          "slug": "queueing-theory-and-littles-law"
+        },
+        {
+          "slug": "backpressure"
+        },
+        {
+          "slug": "continuous-batching-and-model-serving"
+        },
+        {
+          "slug": "autoscaling"
+        }
+      ]
+    },
+    {
+      "title": "Meter every call and watch time to first token",
+      "problem": "Finance needs to know which team and feature spent how much, and engineers need to know why a stream felt slow. Neither is possible from request counts and average latency.",
+      "fix": "Every call, including cached, cancelled and failed ones, produces one usage event with team, feature tag, model, backend, input tokens (cached and uncached), output tokens and computed cost, sent through a log to the metering pipeline and reconciled against provider invoices. Latency is measured in the phases a user feels: queue wait, time to first token, inter-token gap and total time, shown as percentiles per model and per team. A trace id follows the request from the key check to the backend, and service-level objectives on time to first token and on rejection rate set the alerts.",
+      "tradeoff": "Costs can be charged back, anomalies show up within minutes, and slowness can be placed in the queue, the prefill or the decode. Every call adds an event and a few metric labels, high-cardinality labels such as the user id must stay out of metrics, and prompt text in logs needs redaction and retention rules.",
+      "concepts": [
+        {
+          "slug": "metrics"
+        },
+        {
+          "slug": "distributed-tracing"
+        },
+        {
+          "slug": "slos-and-error-budgets"
+        },
+        {
+          "slug": "red-use-and-golden-signals"
+        },
+        {
+          "slug": "cardinality-and-sampling"
+        },
+        {
+          "slug": "structured-logging"
+        }
+      ]
+    }
+  ],
+  "failures": [
+    {
+      "scenario": "The primary provider has an outage during business hours",
+      "impact": "Every request routed there fails, and all forty teams see errors at once.",
+      "answer": "The circuit breaker opens after a burst of failures and the router moves that traffic to the GPU pool and the second provider, with slightly different answers and a higher price. Requests that failed before the first token are retried on the next backend, and a status banner tells teams that behaviour may differ. When the provider recovers, a few probe requests close the breaker.",
+      "concepts": [
+        {
+          "slug": "circuit-breaker"
+        },
+        {
+          "slug": "graceful-degradation"
+        },
+        {
+          "slug": "retries-and-backoff"
+        },
+        {
+          "slug": "multi-region-failover"
+        }
+      ]
+    },
+    {
+      "scenario": "One team ships a bug that sends the same huge prompt in a tight loop",
+      "impact": "Without a limit, that team could spend a month's budget in an hour and take most of the GPU capacity from everyone else.",
+      "answer": "The team's token bucket empties within seconds and further calls get a 429 with a retry-after value, while other teams are untouched because every budget and every queue share is separate. An alert tells the team and the platform owners, and the monthly cap stops anything that slips under the per-minute rate.",
+      "concepts": [
+        {
+          "slug": "rate-limiting"
+        },
+        {
+          "slug": "bulkhead"
+        },
+        {
+          "slug": "alerting"
+        }
+      ]
+    },
+    {
+      "scenario": "Traffic doubles for ten minutes and the GPU pool is full",
+      "impact": "An unbounded queue would make everyone wait past their timeout, and the pool would then burn capacity on abandoned requests.",
+      "answer": "The admission queue rejects or diverts what it cannot serve within the wait limit, batch work yields to interactive work, and the autoscaler starts more replicas. Waiting requests for disconnected callers are dropped. Callers see a fast 429 or a slower provider answer, but answers that are accepted still start within seconds.",
+      "concepts": [
+        {
+          "slug": "load-shedding"
+        },
+        {
+          "slug": "autoscaling"
+        },
+        {
+          "slug": "backpressure"
+        },
+        {
+          "slug": "queueing-theory-and-littles-law"
+        }
+      ]
+    },
+    {
+      "scenario": "A client reads the stream slowly, or disconnects without closing the socket",
+      "impact": "The relay holds buffered tokens and a GPU slot for a caller who is not consuming them.",
+      "answer": "Writes to a client have a bounded buffer and a deadline, and a stream that stalls is cancelled. The backend is told to stop, the slot is freed, and the reservation is settled with the tokens actually produced. Keep-alive comments and TCP timeouts detect half-open connections.",
+      "concepts": [
+        {
+          "slug": "timeouts-and-deadlines"
+        },
+        {
+          "slug": "backpressure"
+        },
+        {
+          "slug": "tcp-vs-udp"
+        }
+      ]
+    },
+    {
+      "scenario": "The semantic cache returns an answer that is wrong for this user",
+      "impact": "A question that only looks similar to an earlier one gets the earlier answer, or a cached answer leaks across teams.",
+      "answer": "Cache keys include the tenant, the model and the system prompt, so nothing crosses a boundary. The similarity threshold is high and tuned on labelled pairs, only opted-in routes use it, entries have a short lifetime and are flushed when the underlying documents or model change, and a sample of hits is checked against fresh answers.",
+      "concepts": [
+        {
+          "slug": "llm-caching-and-routing"
+        },
+        {
+          "slug": "embeddings-and-vector-search"
+        },
+        {
+          "slug": "model-evaluation-and-drift"
+        }
+      ]
+    }
+  ],
+  "alternatives": [
+    {
+      "title": "How to limit usage",
+      "options": [
+        {
+          "name": "Requests per minute",
+          "pro": "Simple, and every gateway already has it",
+          "con": "A request can cost 50 or 100,000 tokens, so it neither protects the GPUs nor the bill"
+        },
+        {
+          "name": "Tokens per minute with reserve and refund",
+          "pro": "Matches how models are priced and how GPU time is used",
+          "con": "Needs token counting and a settle step at the end of every call"
+        },
+        {
+          "name": "A monthly spending cap only",
+          "pro": "Easy to explain to finance",
+          "con": "Too slow: a loop can burn a lot in the minutes before it is noticed"
+        }
+      ],
+      "pick": "Tokens per minute with reserve and refund, plus a monthly cap as a backstop."
+    },
+    {
+      "title": "How to route",
+      "options": [
+        {
+          "name": "The caller names the backend",
+          "pro": "Nothing to build",
+          "con": "Teams hard-code providers, and no one can shift traffic or fail over"
+        },
+        {
+          "name": "Static rules per logical model",
+          "pro": "Predictable and easy to audit",
+          "con": "Does not react to load or outages by itself"
+        },
+        {
+          "name": "Dynamic by health, queue and cost, with cascades",
+          "pro": "Uses cheap capacity first and survives failures",
+          "con": "Behaviour is harder to predict and test, and quality must be monitored"
+        }
+      ],
+      "pick": "Static ordered lists per logical model, with health-based skipping, and cascades only for routes where a quality check exists."
+    },
+    {
+      "title": "How to cache",
+      "options": [
+        {
+          "name": "Exact-match answer cache",
+          "pro": "Always correct for a deterministic request",
+          "con": "Hits are rare for free-form text"
+        },
+        {
+          "name": "Semantic answer cache",
+          "pro": "Catches paraphrases of common questions",
+          "con": "Can return a wrong answer, and needs tuning and flushing"
+        },
+        {
+          "name": "Prefix (KV) cache on the GPU",
+          "pro": "Safe, because the answer is still generated fresh, and saves most of the prefill",
+          "con": "Needs affinity routing and uses GPU memory"
+        }
+      ],
+      "pick": "Prefix cache everywhere, exact-match for deterministic routes, and semantic cache only where a team opts in."
+    },
+    {
+      "title": "What to do when the pool is full",
+      "options": [
+        {
+          "name": "Queue without limit",
+          "pro": "No request is ever refused",
+          "con": "Waits pass the caller's timeout, and the pool wastes work on abandoned requests"
+        },
+        {
+          "name": "Bounded queue with fast rejection",
+          "pro": "Keeps accepted requests fast",
+          "con": "Callers must handle 429 responses"
+        },
+        {
+          "name": "Divert overflow to a provider",
+          "pro": "Callers are not refused",
+          "con": "Costs more, and only works while a provider has capacity"
+        }
+      ],
+      "pick": "Bounded queue by priority, divert overflow for routes that allow it, and reject the rest quickly."
+    }
+  ],
+  "roles": [
+    {
+      "id": "client",
+      "label": "Callers",
+      "description": "Team applications and batch jobs that call the gateway."
+    },
+    {
+      "id": "edge",
+      "label": "Gateway",
+      "description": "Authentication, budgets and the stream relay that holds open connections."
+    },
+    {
+      "id": "async",
+      "label": "Admission queue",
+      "description": "Waiting requests for a GPU pool, ordered by priority."
+    },
+    {
+      "id": "compute",
+      "label": "Model backends",
+      "description": "The router, the company GPU pool and the outside providers."
+    },
+    {
+      "id": "data",
+      "label": "State",
+      "description": "Budgets, caches, metrics and usage records."
+    }
+  ]
+}

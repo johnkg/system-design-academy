@@ -1,0 +1,108 @@
+---
+import PlaygroundShell from '../components/PlaygroundShell.astro';
+---
+<PlaygroundShell title="Simulate it" hint="One 8B-class model (32 layers, head size 128, 16 GB of weights) on one GPU. Change the context, the users, the kv heads and the cache precision, and watch the memory budget decide the outcome.">
+  <ol class="how">
+    <li>At the default (8,192 tokens, 32 users, <b>32 kv heads</b>, 16-bit, 80 GB) the cache is 4.3 GB per conversation, so <b>only 13 of 32 users fit</b> and 19 wait. Compute is not the problem.</li>
+    <li>Set kv heads to <b>8 (GQA)</b>: the cache shrinks 4x, <b>all 32 fit</b> and the GPU produces about 1,270 tokens/s. Set cache precision to <b>8-bit</b> and capacity doubles to 104 while speed rises to about 1,930 tokens/s (smaller cache, shorter steps).</li>
+    <li>Raise users to 256 and context to <b>131,072</b> with 8 kv heads: just <b>3 sequences</b> fit, and each of them reads 17 GB of cache every step. Then try <b>Batch 1</b> versus <b>Batch 52</b> at 8,192: one user gets 117 tokens/s, 52 users get 28 tokens/s each but 1,447 in total.</li>
+  </ol>
+  <div class="pg kvp" data-kv>
+    <div class="pg-row">
+      <label>Context per sequence <select class="pg-in" data-ctx><option value="2048">2,048 tokens</option><option value="4096">4,096 tokens</option><option value="8192" selected>8,192 tokens</option><option value="32768">32,768 tokens</option><option value="131072">131,072 tokens</option></select></label>
+      <label>Concurrent users wanted <input type="range" min="1" max="256" value="32" data-users /> <b data-usersval>32</b></label>
+    </div>
+    <div class="pg-row">
+      <label>KV heads <select class="pg-in" data-heads><option value="32" selected>32 (full multi-head)</option><option value="8">8 (grouped-query)</option><option value="4">4</option><option value="1">1 (multi-query)</option></select></label>
+      <label>Cache precision <select class="pg-in" data-bits><option value="16" selected>16-bit</option><option value="8">8-bit</option><option value="4">4-bit</option></select></label>
+      <label>GPU memory <select class="pg-in" data-gpu><option value="24">24 GB</option><option value="40">40 GB</option><option value="80" selected>80 GB</option></select></label>
+      <button class="btn" type="button" data-reset>Reset</button>
+    </div>
+    <div class="kvp-bar" role="img" aria-label="GPU memory split" data-bar>
+      <div class="kvp-seg" data-seg-w style="--c: var(--role-1)"></div>
+      <div class="kvp-seg" data-seg-r style="--c: var(--border)"></div>
+      <div class="kvp-seg" data-seg-k style="--c: var(--role-3)"></div>
+      <div class="kvp-seg" data-seg-f style="--c: var(--surface-2)"></div>
+    </div>
+    <p class="pg-note" data-barnote></p>
+    <div class="pg-grid">
+      <div class="pg-box" style="--c: var(--role-3)"><h3>KV cache size</h3><span class="pg-mono" data-kvtoken></span><span class="pg-mono" data-kvseq></span></div>
+      <div class="pg-box" style="--c: var(--role-2)"><h3>Capacity</h3><span class="pg-mono" data-max></span><span class="pg-mono" data-served></span></div>
+      <div class="pg-box" style="--c: var(--role-4)"><h3>Speed (estimate)</h3><span class="pg-mono" data-step></span><span class="pg-mono" data-tps></span><span class="pg-mono" data-ttft></span></div>
+    </div>
+    <p class="pg-out" data-verdict role="status"></p>
+    <p class="pg-note">Model: 32 layers, head size 128, 8 billion parameters at 16 bits (16 GB). Assumptions: 10% of GPU memory is reserved for activations and fragmentation; memory bandwidth 2 TB/s; 200 TFLOP/s achievable. A decode step takes the larger of (bytes read / bandwidth) and (2 x parameters x batch / FLOPs); the bytes are the weights once plus every sequence's whole cache. Time to first token is 2 x parameters x prompt tokens / FLOPs and ignores attention's quadratic term. Real engines add overhead, so treat the numbers as a roofline ceiling and measure your own hardware.</p>
+  </div>
+</PlaygroundShell>
+<script>
+  // ---- pure model (same formulas as the code samples) ----
+  const LAYERS = 32, HEAD_DIM = 128, WEIGHTS = 16e9, BW_PER_US = 2e6, FLOPS_PER_US = 2e8, FLOPS_PER_TOKEN = 16e9, MAX_BATCH = 256;
+  interface Input { ctx: number; users: number; heads: number; bits: number; gpuGB: number }
+  interface Result { usable: number; kvToken: number; kvSeq: number; free: number; maxSeq: number; served: number; waiting: number; stepUs: number; bound: 'memory' | 'compute'; perUserTps: number; totalTps: number; ttftMs: number; kvUsed: number }
+  function model(i: Input): Result {
+    const usable = Math.floor(i.gpuGB * 1e9 * 9 / 10);
+    const kvToken = Math.floor(2 * LAYERS * i.heads * HEAD_DIM * i.bits / 8);
+    const kvSeq = kvToken * i.ctx;
+    const free = usable - WEIGHTS;
+    const maxSeq = free > 0 ? Math.min(MAX_BATCH, Math.floor(free / kvSeq)) : 0;
+    const served = Math.min(i.users, maxSeq);
+    const memUs = Math.floor((WEIGHTS + served * kvSeq) / BW_PER_US);
+    const compUs = Math.floor(served * FLOPS_PER_TOKEN / FLOPS_PER_US);
+    const stepUs = Math.max(memUs, compUs);
+    const perUserTps = served > 0 ? 1e6 / stepUs : 0;
+    return { usable, kvToken, kvSeq, free, maxSeq, served, waiting: i.users - served, stepUs, bound: memUs >= compUs ? 'memory' : 'compute', perUserTps, totalTps: served > 0 ? Math.floor(served * 1e6 / stepUs) : 0, ttftMs: Math.floor(i.ctx * FLOPS_PER_TOKEN / FLOPS_PER_US / 1000), kvUsed: served * kvSeq };
+  }
+  const gb = (b: number) => (b / 1e9).toFixed(1);
+  const fmt = (n: number) => Math.round(n).toLocaleString('en-US');
+  function verdict(i: Input, r: Result): { text: string; bad: boolean } {
+    if (r.free <= 0) return { text: `The weights alone (16.0 GB) do not fit in ${gb(r.usable)} GB of usable memory. Pick a bigger GPU or quantise the weights.`, bad: true };
+    if (r.maxSeq === 0) return { text: `Not even one conversation fits: it needs ${gb(r.kvSeq)} GB of cache but only ${gb(r.free)} GB is free. Reduce context, kv heads or cache precision.`, bad: true };
+    if (r.waiting > 0) return { text: `Memory-limited: only ${r.maxSeq} of ${i.users} users fit; ${r.waiting} wait in the queue. The GPU is not out of arithmetic, it is out of room for cache. Fewer kv heads, a smaller cache precision or a shorter context raise the limit.`, bad: true };
+    const why = r.bound === 'memory' ? 'Each step is limited by memory bandwidth (weights plus cache).' : 'Each step is limited by compute: batching has used up the spare arithmetic.';
+    return { text: `All ${i.users} ${i.users === 1 ? 'user fits' : 'users fit'}, using ${Math.round(100 * r.kvUsed / r.free)}% of the KV budget. Each user gets about ${fmt(r.perUserTps)} tokens/s (${(r.stepUs / 1000).toFixed(1)} ms between tokens), the GPU about ${fmt(r.totalTps)} in total. ${why}`, bad: false };
+  }
+
+  document.querySelectorAll<HTMLElement>('[data-kv]').forEach((root) => {
+    const q = <T extends HTMLElement>(s: string) => root.querySelector<T>(s)!;
+    const num = (s: string) => Number(q<HTMLInputElement | HTMLSelectElement>(s).value);
+    let pending = 0;
+    function draw() {
+      pending = 0;
+      const i: Input = { ctx: num('[data-ctx]'), users: num('[data-users]'), heads: num('[data-heads]'), bits: num('[data-bits]'), gpuGB: num('[data-gpu]') };
+      const r = model(i);
+      q('[data-usersval]').textContent = String(i.users);
+      const total = i.gpuGB * 1e9;
+      const reserved = total - r.usable;
+      const w = Math.min(WEIGHTS, r.usable);
+      const kv = Math.min(r.kvUsed, Math.max(0, r.free));
+      const freeRest = Math.max(0, total - w - reserved - kv);
+      const set = (s: string, v: number) => { q(s).style.width = `${(100 * v / total).toFixed(2)}%`; };
+      set('[data-seg-w]', w); set('[data-seg-r]', reserved); set('[data-seg-k]', kv); set('[data-seg-f]', freeRest);
+      q('[data-bar]').setAttribute('aria-label', `GPU memory: weights ${gb(w)} GB, reserved ${gb(reserved)} GB, KV cache ${gb(kv)} GB, free ${gb(freeRest)} GB`);
+      q('[data-barnote]').textContent = `Weights ${gb(w)} GB · reserved ${gb(reserved)} GB · KV cache ${gb(kv)} GB · free ${gb(freeRest)} GB of ${i.gpuGB} GB`;
+      q('[data-kvtoken]').textContent = `per token: ${fmt(r.kvToken / 1024)} KiB`;
+      q('[data-kvseq]').textContent = `per sequence: ${gb(r.kvSeq)} GB`;
+      q('[data-max]').textContent = r.free > 0 ? `max concurrent: ${r.maxSeq >= MAX_BATCH ? `${MAX_BATCH}+ (capped)` : r.maxSeq}` : 'weights do not fit';
+      q('[data-served]').textContent = `running now: ${r.served} · waiting: ${r.waiting}`;
+      if (r.served > 0) {
+        q('[data-step]').textContent = `decode step: ${(r.stepUs / 1000).toFixed(1)} ms (${r.bound}-bound)`;
+        q('[data-tps]').textContent = `${fmt(r.perUserTps)} tokens/s per user · ${fmt(r.totalTps)} total`;
+      } else { q('[data-step]').textContent = 'decode step: n/a'; q('[data-tps]').textContent = 'no sequence running'; }
+      q('[data-ttft]').textContent = `prefill (time to first token): ${r.ttftMs >= 1000 ? (r.ttftMs / 1000).toFixed(2) + ' s' : r.ttftMs + ' ms'}`;
+      const v = verdict(i, r);
+      const out = q('[data-verdict]'); out.textContent = v.text; out.classList.toggle('bad', v.bad);
+    }
+    const schedule = () => { if (!pending) { pending = 1; requestAnimationFrame(draw); } };
+    root.querySelectorAll('select, input').forEach((el) => el.addEventListener('input', schedule));
+    q('[data-reset]').addEventListener('click', () => {
+      q<HTMLSelectElement>('[data-ctx]').value = '8192'; q<HTMLInputElement>('[data-users]').value = '32'; q<HTMLSelectElement>('[data-heads]').value = '32';
+      q<HTMLSelectElement>('[data-bits]').value = '16'; q<HTMLSelectElement>('[data-gpu]').value = '80'; draw();
+    });
+    draw();
+  });
+</script>
+<style is:global>
+  .playground .kvp-bar { display: flex; height: 22px; border: 1px solid var(--border); border-radius: 6px; overflow: hidden; background: var(--surface); }
+  .playground .kvp-seg { background: var(--c); height: 100%; min-width: 0; }
+  .playground .kvp label { display: inline-flex; flex-wrap: wrap; align-items: center; gap: 6px; }
+</style>

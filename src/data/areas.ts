@@ -12,6 +12,7 @@ export const areas = [
   { id: 'deployment', label: 'Cloud & deployment', blurb: 'How code reaches production safely, and how infrastructure grows, heals and survives a region failing' },
   { id: 'databases', label: 'Databases & storage', blurb: 'How a database stores, protects, queries and changes your data underneath the SQL' },
   { id: 'dataengineering', label: 'Data engineering', blurb: 'How data is moved, transformed and kept trustworthy at scale, in batches and in streams' },
+  { id: 'aiml', label: 'AI & ML systems', blurb: 'How models are served, fed with context, evaluated and kept safe in production, and how the machines that train them are used' },
   { id: 'patterns', label: 'Design patterns', blurb: 'The 23 classic Gang of Four patterns for structuring code' },
 ] as const;
 

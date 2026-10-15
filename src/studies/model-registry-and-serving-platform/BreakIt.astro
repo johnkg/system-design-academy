@@ -1,0 +1,89 @@
+---
+import PlaygroundShell from '../../components/PlaygroundShell.astro';
+---
+<PlaygroundShell title="A burst hits an endpoint that scaled to zero" hint="A 14 GB model has no replicas. At second 10, 60 requests per second arrive for 90 seconds, and callers give up after 15 seconds. Change where the weights come from, the minimum replicas and what the autoscaler watches.">
+  <ol class="how">
+    <li>The default (weights from the <b>shared store</b>, <b>0</b> minimum replicas, <b>queue depth</b>): the first answer comes at second 30 and <b>1,000 of 5,650</b> requests time out, because six replicas start together and share the store's bandwidth.</li>
+    <li>Switch to <b>node cache</b>: weights load from local disk, a replica is ready in 10 seconds, and <b>no request fails</b>.</li>
+    <li>Switch the signal to <b>GPU utilisation</b> with 0 minimum replicas: with no replica there is nothing to measure, so it <b>never scales</b> and every request fails. A minimum of 1 saves it, but 820 still time out from the shared store.</li>
+  </ol>
+  <div class="pg mrb" data-mrb>
+    <div class="pg-row">
+      <label>Weights come from <select class="pg-in" data-src>
+        <option value="store" selected>the shared artifact store</option>
+        <option value="cache">a pre-pulled cache on the node</option>
+      </select></label>
+      <label>Minimum replicas <select class="pg-in" data-min>
+        <option value="0" selected>0 (scale to zero)</option>
+        <option value="1">1</option>
+        <option value="2">2</option>
+      </select></label>
+      <label>Autoscaler watches <select class="pg-in" data-sig>
+        <option value="queue" selected>queue depth</option>
+        <option value="util">GPU utilisation</option>
+      </select></label>
+    </div>
+    <div class="pg-grid">
+      <div class="pg-box" data-b1><h3>Requests that failed</h3><span class="pg-mono" data-o1></span><span class="pg-note" data-n1></span></div>
+      <div class="pg-box" data-b2><h3>First answer at</h3><span class="pg-mono" data-o2></span><span class="pg-note" data-n2></span></div>
+      <div class="pg-box" data-b3><h3>Wait of the slowest 5 percent</h3><span class="pg-mono" data-o3></span><span class="pg-note" data-n3></span></div>
+      <div class="pg-box" data-b4><h3>Replicas at the peak</h3><span class="pg-mono" data-o4></span><span class="pg-note" data-n4></span></div>
+    </div>
+    <p class="pg-out" data-verdict aria-live="polite"></p>
+    <p class="pg-note">Model: one replica serves 10 requests per second and takes 6 s to start plus the time to load 14 GB. From the store a node reads 1 GB/s but the store serves 2 GB/s in total, so replicas starting together share it. From the node cache a replica reads 4 GB/s. The autoscaler decides every 5 s and runs at most 10 replicas. Queue depth asks for enough replicas for the arrival rate plus the backlog cleared in 10 s. Utilisation grows the fleet by used/60 percent, and sees nothing at zero replicas. Requests that wait over 15 s fail.</p>
+  </div>
+</PlaygroundShell>
+<script>
+  document.querySelectorAll<HTMLElement>('[data-mrb]').forEach((root) => {
+    const q = <T extends HTMLElement>(s: string) => root.querySelector<T>(s)!;
+    const SIZE = 14; const NODE = 1; const EGRESS = 2; const NVME = 4; const INIT = 6; const CAP = 10; const TIMEOUT = 15; const T = 150;
+    const rate = (t: number) => (t < 10 ? 0 : t < 100 ? 60 : 5);
+    function sim(src: string, minR: number, sig: string) {
+      let ready = minR; const starting: number[] = []; const queue: number[] = [];
+      let served = 0; let total = 0; const waits: number[] = []; let peak = minR; let first: number | null = null;
+      for (let t = 0; t < T; t++) {
+        for (let i = starting.length - 1; i >= 0; i--) if (starting[i] <= t) { starting.splice(i, 1); ready++; }
+        for (let k = 0; k < rate(t); k++) queue.push(t);
+        total += rate(t);
+        const cap = ready * CAP; let used = 0;
+        while (queue.length && used < cap) {
+          const a = queue.shift()!; const w = t - a;
+          if (w > TIMEOUT) continue;
+          served++; used++; waits.push(w); if (first === null) first = t;
+        }
+        while (queue.length && t - queue[0] > TIMEOUT) queue.shift();
+        if (t % 5 === 0) {
+          const cur = ready + starting.length; let desired: number;
+          if (sig === 'queue') desired = Math.ceil((rate(t) + queue.length / 10) / CAP);
+          else if (ready === 0) desired = cur;
+          else { const util = Math.min(1, used / cap); desired = util > 0.6 ? Math.ceil((cur * util) / 0.6) : cur; }
+          desired = Math.max(minR, Math.min(10, desired));
+          for (let n = desired - cur; n > 0; n--) {
+            const bw = src === 'cache' ? NVME : Math.min(NODE, EGRESS / (starting.length + 1));
+            starting.push(t + INIT + Math.ceil(SIZE / bw));
+          }
+        }
+        peak = Math.max(peak, ready + starting.length);
+      }
+      waits.sort((a, b) => a - b);
+      return { total, served, failed: total - served, p95: waits.length ? waits[Math.floor(waits.length * 0.95)] : 0, peak, first };
+    }
+    const fmt = (n: number) => n.toLocaleString('en-US');
+    function draw() {
+      const src = q<HTMLSelectElement>('[data-src]').value; const minR = Number(q<HTMLSelectElement>('[data-min]').value); const sig = q<HTMLSelectElement>('[data-sig]').value;
+      const r = sim(src, minR, sig); const pct = Math.round((r.failed / r.total) * 100);
+      q('[data-o1]').textContent = `${fmt(r.failed)} of ${fmt(r.total)}`; q('[data-n1]').textContent = `${pct} percent of requests`;
+      q('[data-o2]').textContent = r.first === null ? 'never' : `second ${r.first}`; q('[data-n2]').textContent = r.first === null ? 'no replica ever started' : `${Math.max(0, r.first - 10)} s after the first request`;
+      q('[data-o3]').textContent = `${r.p95} s`; q('[data-n3]').textContent = `callers give up at ${TIMEOUT} s`;
+      q('[data-o4]').textContent = String(r.peak); q('[data-n4]').textContent = `the need is ${Math.ceil(60 / CAP)} for 60 requests per second`;
+      q<HTMLElement>('[data-b1]').style.setProperty('--c', r.failed === 0 ? 'var(--good)' : 'var(--bad)');
+      q<HTMLElement>('[data-b2]').style.setProperty('--c', 'var(--accent)'); q<HTMLElement>('[data-b3]').style.setProperty('--c', 'var(--accent)'); q<HTMLElement>('[data-b4]').style.setProperty('--c', 'var(--accent)');
+      const out = q('[data-verdict]'); out.classList.toggle('bad', r.failed > 0);
+      out.textContent = r.served === 0 ? 'Nothing is served: with zero replicas there is no utilisation to measure, so the autoscaler never starts one. Scale-from-zero needs a signal that exists without replicas, such as queue depth.'
+        : r.failed === 0 ? `No request failed. The first replica was ready ${Math.max(0, (r.first ?? 0) - 10)} s after the first request, inside the callers' 15 s patience.`
+        : `${fmt(r.failed)} requests failed (${pct} percent) while replicas were still loading weights${src === 'store' ? ', and replicas that start together share the store, so each one takes longer' : ''}. Try the node cache or a higher minimum.`;
+    }
+    root.addEventListener('change', draw);
+    draw();
+  });
+</script>
