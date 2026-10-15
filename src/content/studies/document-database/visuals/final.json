@@ -1,0 +1,59 @@
+{
+  "actors": [
+    { "id": "app", "label": "Order service", "role": "client", "x": 14, "y": 16 },
+    { "id": "router", "label": "Query router", "role": "edge", "x": 50, "y": 16 },
+    { "id": "config", "label": "Config servers", "role": "data", "x": 86, "y": 16 },
+    { "id": "sec1", "label": "Secondary 1", "role": "data", "x": 14, "y": 50 },
+    { "id": "primary", "label": "Shard 2 primary", "role": "data", "x": 50, "y": 50 },
+    { "id": "disk", "label": "Journal and indexes", "role": "data", "x": 86, "y": 50 },
+    { "id": "sec2", "label": "Secondary 2 (behind)", "role": "data", "x": 50, "y": 84 }
+  ],
+  "frames": [
+    {
+      "narration": "The order service inserts an order for customer 42 with its three lines embedded in the document. It asks for write concern majority, so it will be told 'ok' only when most nodes have the write.",
+      "messages": [{ "from": "app", "to": "router", "label": "insert order, customer 42, w:majority" }]
+    },
+    {
+      "narration": "The router looks up the shard key, a hash of the customer id, in its copy of the chunk map from the config servers. The chunk belongs to shard 2, so only that shard is contacted.",
+      "messages": [{ "from": "router", "to": "config", "label": "chunk map (cached)" }, { "from": "router", "to": "primary", "label": "insert" }],
+      "states": { "router": "shard 2" }
+    },
+    {
+      "narration": "The primary checks the document against the schema rules, then writes the document, the entries of its three indexes and an oplog entry numbered 5001 in one atomic step. The change is journalled before it is acknowledged.",
+      "messages": [{ "from": "primary", "to": "disk", "label": "journal + 3 index entries" }],
+      "states": { "primary": "wrote oplog 5001" }
+    },
+    {
+      "narration": "The secondaries pull oplog entries and apply them in order. Secondary 1 has entry 5001 straight away. Secondary 2 is a little slow and has only reached 5000.",
+      "messages": [{ "from": "sec1", "to": "primary", "label": "fetch 5001" }, { "from": "primary", "to": "sec1", "label": "5001" }],
+      "states": { "sec1": "at 5001", "sec2": "at 5000" }
+    },
+    {
+      "narration": "Two of three nodes now hold entry 5001, which is a majority, so the write is committed. The primary replies, and the order service is told that the order is saved.",
+      "messages": [{ "from": "primary", "to": "router", "label": "ok, majority" }, { "from": "router", "to": "app", "label": "ok" }],
+      "states": { "primary": "committed 5001" },
+      "highlight": ["app"]
+    },
+    {
+      "narration": "Now the primary's machine loses power. The secondaries stop receiving heartbeats, which come every 2 seconds. After the 10 second election timeout, secondary 2 times out first and starts an election for term 8, with its log ending at 5000.",
+      "messages": [{ "from": "sec2", "to": "sec1", "label": "vote for me? my log ends at 5000" }],
+      "states": { "primary": "down" }
+    },
+    {
+      "narration": "Secondary 1 refuses, because its own log ends at 5001, which is more recent than the candidate's. This rule is why a majority-acknowledged write cannot be lost: a node that lacks it can never collect a majority of votes.",
+      "messages": [{ "from": "sec1", "to": "sec2", "label": "denied: I have 5001" }],
+      "states": { "sec1": "denied the vote" }
+    },
+    {
+      "narration": "Secondary 1 times out and starts its own election, for term 9, with its log ending at 5001. Secondary 2 grants the vote, since 5001 is at least as recent as its own log. With its own vote that is two of three, so secondary 1 becomes the primary.",
+      "messages": [{ "from": "sec1", "to": "sec2", "label": "vote for me? my log ends at 5001" }, { "from": "sec2", "to": "sec1", "label": "granted" }],
+      "states": { "sec1": "primary, term 9" },
+      "highlight": ["sec1"]
+    },
+    {
+      "narration": "The router discovers the new primary, and the order service's next write goes there with its retry id. Secondary 2 catches up on 5001 from the new primary, and when the old machine comes back it rejoins as a secondary and rolls back anything past 5001. The order inserted at the start is still there.",
+      "messages": [{ "from": "app", "to": "router", "label": "next write, retryable" }, { "from": "router", "to": "sec1", "label": "to the new primary" }, { "from": "sec1", "to": "sec2", "label": "5001" }],
+      "states": { "sec2": "caught up to 5001", "primary": "back as a secondary" }
+    }
+  ]
+}

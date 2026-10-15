@@ -1,0 +1,78 @@
+---
+import PlaygroundShell from '../../components/PlaygroundShell.astro';
+---
+<PlaygroundShell title="One huge import, nine small ones" hint="A big tenant queues 600 chunks at once, and at tick 20 nine small tenants each queue 12 chunks. A worker handles one chunk per tick. How long do the small tenants wait?">
+  <ol class="how">
+    <li>The default is <b>first come, first served</b>, <b>no queue limit</b> and <b>8 workers</b>: the small tenants wait <b>63 ticks on average</b> (worst 69) behind the big backlog, and 600 chunks sit in the queue.</li>
+    <li>Switch to <b>one chunk per tenant in turn</b>: the small tenants wait <b>14 ticks</b> for each of them, and the big tenant finishes at tick 89 instead of 75.</li>
+    <li>Keep first come, first served but set the <b>queue limit to 100</b>: the big tenant is told to slow down (a 429 response), the queue never goes above 208, and the small tenants wait 19 ticks, because there is less ahead of them.</li>
+  </ol>
+  <div class="pg bib" data-bib>
+    <div class="pg-row">
+      <label>Who is served next <select class="pg-in" data-pol>
+        <option value="fifo" selected>First come, first served</option>
+        <option value="fair">One chunk per tenant in turn</option>
+        <option value="cap">First come, first served, at most half the workers per tenant</option>
+      </select></label>
+      <label>Queued chunks allowed per tenant <select class="pg-in" data-lim>
+        <option value="0" selected>No limit</option>
+        <option value="100">100</option>
+        <option value="40">40</option>
+      </select></label>
+      <label>Workers <input type="range" min="4" max="16" step="4" value="8" data-wk /> <b data-wkval></b></label>
+    </div>
+    <div class="pg-grid">
+      <div class="pg-box" data-b1><h3>Small tenants wait (average, worst)</h3><span class="pg-mono" data-o1></span><span class="pg-note" data-n1></span></div>
+      <div class="pg-box" data-b2><h3>Big tenant finishes at tick</h3><span class="pg-mono" data-o2></span><span class="pg-note" data-n2></span></div>
+      <div class="pg-box" data-b3><h3>Most chunks waiting at once</h3><span class="pg-mono" data-o3></span><span class="pg-note" data-n3></span></div>
+    </div>
+    <p class="pg-out" data-verdict aria-live="polite"></p>
+    <p class="pg-note">Model: 10 tenants, one chunk takes one tick on one worker, the big tenant sends 600 chunks at tick 1 and each small tenant sends 12 at tick 20. A wait is measured from tick 20 to the tick of the tenant's last chunk. With a queue limit the big tenant sends more only as room appears, and every tick it is refused counts as a 429 tick.</p>
+  </div>
+</PlaygroundShell>
+<script>
+  document.querySelectorAll<HTMLElement>('[data-bib]').forEach((root) => {
+    const q = <T extends HTMLElement>(s: string) => root.querySelector<T>(s)!;
+    const ARR = 20; const BIG = 600; const SMALL = 12; const N = 10;
+    function sim(policy: string, W: number, limit: number) {
+      const done = new Array(N).fill(0); const left = new Array(N).fill(SMALL); left[0] = BIG;
+      const q2: number[] = []; const inQ = new Array(N).fill(0); let pendBig = BIG; let ptr = 0; let peak = 0; let slow = 0;
+      for (let t = 1; t < 5000; t++) {
+        const n = limit === 0 ? pendBig : Math.min(limit - inQ[0], pendBig);
+        for (let k = 0; k < n; k++) { q2.push(0); inQ[0]++; }
+        pendBig -= n; if (limit > 0 && pendBig > 0) slow++;
+        if (t === ARR) for (let i = 1; i < N; i++) for (let k = 0; k < SMALL; k++) { q2.push(i); inQ[i]++; }
+        peak = Math.max(peak, q2.length);
+        const taken: number[] = [];
+        if (policy === 'fifo') { for (let k = 0; k < W && q2.length; k++) { const who = q2.shift()!; inQ[who]--; taken.push(who); } }
+        else if (policy === 'fair') {
+          for (let k = 0; k < W && q2.length; k++) { let c = 0; while (inQ[ptr % N] === 0 && c < N) { ptr++; c++; } const who = ptr % N; ptr++; q2.splice(q2.indexOf(who), 1); inQ[who]--; taken.push(who); }
+        } else {
+          const cap = Math.max(1, Math.floor(W / 2)); const used = new Array(N).fill(0);
+          for (let k = 0; k < q2.length && taken.length < W;) { const who = q2[k]; if (used[who] < cap) { used[who]++; inQ[who]--; taken.push(who); q2.splice(k, 1); } else k++; }
+        }
+        for (const who of taken) { left[who]--; if (left[who] === 0) done[who] = t; }
+        if (left.every((x: number) => x === 0)) break;
+      }
+      const waits = done.slice(1).map((d: number) => d - ARR);
+      return { bigDone: done[0], avg: Math.round(waits.reduce((a: number, b: number) => a + b, 0) / waits.length), worst: Math.max(...waits), peak, slow };
+    }
+    function draw() {
+      const policy = q<HTMLSelectElement>('[data-pol]').value; const limit = Number(q<HTMLSelectElement>('[data-lim]').value); const w = Number(q<HTMLInputElement>('[data-wk]').value);
+      q('[data-wkval]').textContent = String(w);
+      const r = sim(policy, w, limit);
+      q('[data-o1]').textContent = `${r.avg} ticks, worst ${r.worst}`; q('[data-n1]').textContent = 'average and worst of the nine small tenants';
+      q('[data-o2]').textContent = String(r.bigDone); q('[data-n2]').textContent = 'its 600 chunks, with the others sharing the workers';
+      q('[data-o3]').textContent = `${r.peak} chunks`; q('[data-n3]').textContent = limit === 0 ? 'nothing refuses work, so the queue grows with the largest upload' : `the big tenant was told to slow down for ${r.slow} ticks`;
+      q<HTMLElement>('[data-b1]').style.setProperty('--c', r.avg >= 30 ? 'var(--bad)' : 'var(--good)');
+      q<HTMLElement>('[data-b2]').style.setProperty('--c', 'var(--accent)');
+      q<HTMLElement>('[data-b3]').style.setProperty('--c', r.peak >= 300 ? 'var(--bad)' : 'var(--good)');
+      const out = q('[data-verdict]'); const starved = r.avg >= 30; out.classList.toggle('bad', starved);
+      out.textContent = starved ? `The small tenants are starved: they wait ${r.avg} ticks on average because the big tenant's backlog is ahead of them in the queue. Serving tenants in turn, or limiting how much one tenant can queue, fixes it.`
+        : r.peak >= 300 ? `The small tenants are served quickly (${r.avg} ticks), but ${r.peak} chunks are buffered. A queue limit keeps that bounded by pushing the waiting back to the big tenant's client.`
+        : `The small tenants wait ${r.avg} ticks and at most ${r.peak} chunks are buffered. The big tenant finishes at tick ${r.bigDone}, which is the price of sharing the workers.`;
+    }
+    root.addEventListener('input', draw); root.addEventListener('change', draw);
+    draw();
+  });
+</script>

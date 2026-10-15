@@ -1,0 +1,97 @@
+---
+import PlaygroundShell from '../../components/PlaygroundShell.astro';
+---
+<PlaygroundShell title="Pick a shard key" hint="24,000 orders are inserted into a sharded collection. Each shard key sends them to shards differently. Watch which shard gets the load and what a query for one customer costs.">
+  <ol class="how">
+    <li>With <b>8 shards</b> and <b>a few huge customers</b> (the default), a <b>timestamp key</b> sends <b>100%</b> of inserts to one shard, and the <b>customer id</b> as a range sends <b>65%</b> to one shard, because the biggest customers have the lowest ids.</li>
+    <li>Switch to <b>evenly sized customers</b>: the customer range key now looks fine at <b>13%</b> per shard (an even share is 12.5%). The key that works depends on the data, which is why a bad choice is found only in production.</li>
+    <li>The <b>hashed _id</b> and the <b>customer plus hashed suffix</b> keys stay even in both cases, but only the compound key answers a query for a typical customer from <b>one shard</b>. A hashed _id must ask all of them.</li>
+  </ol>
+  <div class="pg dbb" data-dbb>
+    <div class="pg-row">
+      <label>Shards <select class="pg-in" data-s><option value="4">4</option><option value="8" selected>8</option></select></label>
+      <label>Customers <select class="pg-in" data-skew>
+        <option value="even">200 customers of equal size</option>
+        <option value="zipf" selected>a few huge customers (the biggest has 17% of orders)</option>
+      </select></label>
+    </div>
+    <div class="pg-grid" data-grid></div>
+    <p class="pg-out" data-verdict aria-live="polite"></p>
+    <p class="pg-note">Model: 24,000 inserts from 200 customers, where the biggest customer is 17% of the orders in the uneven case. A shard primary takes 10,000 writes per second, so the cluster takes 10,000 divided by the share of the busiest shard. Ranged keys cut the key space into equal ranges, and customer ids are given out in sign-up order, so the oldest customers are the biggest. The balancer moves whole chunks, which cannot help when one key value or the newest range is the hot spot. Bars show each shard's share of the inserts.</p>
+  </div>
+</PlaygroundShell>
+<style is:global>
+  .playground .dbb .bars { display: flex; align-items: flex-end; gap: 3px; height: 56px; margin-top: 0.4rem; }
+  .playground .dbb .bars span { flex: 1; min-width: 4px; background: var(--accent); border-radius: 2px 2px 0 0; }
+  .playground .dbb .bars span.hot { background: var(--bad); }
+  .playground .dbb .bars span.off { display: none; }
+</style>
+<script>
+  document.querySelectorAll<HTMLElement>('[data-dbb]').forEach((root) => {
+    const q = <T extends HTMLElement>(s: string) => root.querySelector<T>(s)!;
+    const INSERTS = 24000; const CUSTOMERS = 200; const CAP = 10000; const MAXSHARDS = 8;
+    const KEYS = [
+      { name: 'Timestamp (ObjectId), ranged', targeted: 'all' },
+      { name: 'Hashed _id', targeted: 'all' },
+      { name: 'Customer id, ranged', targeted: 'one' },
+      { name: 'Customer id, hashed', targeted: 'one' },
+      { name: 'Customer id + hashed suffix', targeted: 'compound' },
+    ];
+    const mix = (x: number) => { let h = Math.imul(x + 1, 2654435761) >>> 0; h ^= h >>> 15; h = Math.imul(h, 2246822519) >>> 0; h ^= h >>> 13; return h >>> 0; };
+    // Build the five boxes once, each with MAXSHARDS bars. Later draws only change text, heights and classes.
+    const grid = q('[data-grid]');
+    const boxes = KEYS.map((k) => {
+      const box = document.createElement('div'); box.className = 'pg-box';
+      const h = document.createElement('h3'); h.textContent = k.name;
+      const o = document.createElement('span'); o.className = 'pg-mono';
+      const n = document.createElement('span'); n.className = 'pg-note';
+      const m = document.createElement('span'); m.className = 'pg-note';
+      const bars = document.createElement('div'); bars.className = 'bars'; bars.setAttribute('aria-hidden', 'true');
+      const spans = Array.from({ length: MAXSHARDS }, () => { const s = document.createElement('span'); bars.append(s); return s; });
+      box.append(h, o, n, m, bars); grid.append(box);
+      return { box, o, n, m, spans };
+    });
+    const cache = new Map<string, number[][]>();
+    function simulate(s: number, zipf: boolean): number[][] {
+      const id = `${s}-${zipf}`; const hit = cache.get(id); if (hit) return hit;
+      let seed = 77; const rnd = (n: number) => { seed = (Math.imul(seed, 1664525) + 1013904223) >>> 0; return (seed >>> 8) % n; };
+      const cum: number[] = []; let t = 0;
+      for (let c = 0; c < CUSTOMERS; c++) { t += zipf ? Math.floor(10000 / (c + 1)) : 50; cum.push(t); }
+      const customerOf = () => { const r = rnd(t); let lo = 0; let hi = CUSTOMERS - 1; while (lo < hi) { const m = (lo + hi) >> 1; if (cum[m] > r) hi = m; else lo = m + 1; } return lo; };
+      const load = KEYS.map(() => new Array(s).fill(0));
+      for (let i = 0; i < INSERTS; i++) {
+        const c = customerOf();
+        load[0][s - 1]++; // every new timestamp is larger than all earlier ones, so it lands in the last range
+        load[1][mix(i) % s]++;
+        load[2][Math.floor((c * s) / CUSTOMERS)]++;
+        load[3][mix(c * 7919) % s]++;
+        load[4][mix(i * 31 + c) % s]++;
+      }
+      cache.set(id, load); return load;
+    }
+    function draw() {
+      const s = Number(q<HTMLSelectElement>('[data-s]').value); const zipf = q<HTMLSelectElement>('[data-skew]').value === 'zipf';
+      const load = simulate(s, zipf); const ideal = 100 / s;
+      const share: number[] = []; const cap: number[] = [];
+      load.forEach((l, k) => {
+        const max = Math.max(...l); const pct = (max * 100) / INSERTS; share.push(pct); cap.push(Math.round(CAP / (pct / 100)));
+        const b = boxes[k]; const hot = pct > ideal * 1.5;
+        b.o.textContent = `busiest shard: ${Math.round(pct)}% of inserts`;
+        b.n.textContent = `the cluster can take ${cap[k].toLocaleString('en-US')} writes per second (even would be ${(CAP * s).toLocaleString('en-US')})`;
+        const t = KEYS[k].targeted;
+        b.m.textContent = t === 'all' ? `a query for one customer visits all ${s} shards` : t === 'one' ? 'a query for one customer visits 1 shard' : `a query for one customer visits 1 shard, and for the biggest customer up to ${s}`;
+        b.box.style.setProperty('--c', hot ? 'var(--bad)' : 'var(--good)');
+        b.spans.forEach((sp, i) => {
+          sp.classList.toggle('off', i >= s);
+          if (i < s) { sp.style.height = `${Math.max(2, Math.round((l[i] * 100) / INSERTS))}%`; sp.classList.toggle('hot', l[i] === max && hot); }
+        });
+      });
+      const out = q('[data-verdict]'); const worst = share.indexOf(Math.max(...share)); const bad = share[worst] > ideal * 1.5; out.classList.toggle('bad', bad);
+      out.textContent = bad
+        ? `Hot shard: "${KEYS[worst].name}" sends ${Math.round(share[worst])}% of inserts to one of ${s} shards, so the cluster is limited to ${cap[worst].toLocaleString('en-US')} writes per second instead of ${(CAP * s).toLocaleString('en-US')}. The balancer cannot fix this, because it moves chunks and the load follows the key.`
+        : `Every key is within 1.5 times the even share of ${Math.round(ideal)}% here. The difference is in queries: only the keys with a customer prefix answer a one-customer query from a single shard.`;
+    }
+    root.addEventListener('input', draw); root.addEventListener('change', draw);
+    draw();
+  });
+</script>

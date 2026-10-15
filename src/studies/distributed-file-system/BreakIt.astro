@@ -1,0 +1,104 @@
+---
+import PlaygroundShell from '../../components/PlaygroundShell.astro';
+---
+<PlaygroundShell title="Lose a rack, then lose a server" hint="A cluster of 80 servers in 8 racks holds 4,000 chunks. Choose where the copies are placed, kill a rack, and see which chunks survive while the master is still repairing.">
+  <ol class="how">
+    <li>Start with the default: <b>rack-aware</b> placement, <b>3 copies</b>, a <b>rack fails</b>, repairs go <b>in chunk order</b>, and a second server fails <b>7 minutes</b> later. No chunk is lost to the rack, but <b>379</b> chunks are down to one copy when the second server dies, and it was holding the last copy of <b>12</b> of them.</li>
+    <li>Change repair order to <b>fewest copies first</b>: only <b>99</b> chunks are still at one copy when the second server dies, and just <b>5</b> are lost. Same cluster, same speed, a smarter queue.</li>
+    <li>Set the second failure to <b>0</b>: rack-aware placement then loses <b>nothing</b>. Switch placement to <b>all copies in one rack</b> and the rack failure alone destroys <b>475</b> chunks. Switch to <b>random servers</b> and a few chunks (<b>5</b>) happen to have all copies in the dead rack.</li>
+  </ol>
+  <div class="pg dfb" data-dfb>
+    <div class="pg-row">
+      <label>Where copies go <select class="pg-in" data-place>
+        <option value="rackAware" selected>rack-aware (1 copy, then 2 in another rack)</option>
+        <option value="random">any servers at random</option>
+        <option value="sameRack">all copies in one rack</option>
+      </select></label>
+      <label>Copies of each chunk <select class="pg-in" data-copies><option value="2">2</option><option value="3" selected>3</option></select></label>
+      <label>What fails first <select class="pg-in" data-fail><option value="server">one server</option><option value="rack" selected>a whole rack</option></select></label>
+      <label>Repair order <select class="pg-in" data-prio>
+        <option value="fifo" selected>in chunk order</option>
+        <option value="prio">fewest copies first</option>
+      </select></label>
+      <label>Second server fails after (minutes, 0 = never) <input type="range" min="0" max="15" value="7" data-second /> <b data-secondval></b></label>
+    </div>
+    <div class="pg-grid">
+      <div class="pg-box" data-b1><h3>Chunks that lost a copy</h3><span class="pg-mono" data-o1></span><span class="pg-note" data-n1></span></div>
+      <div class="pg-box" data-b2><h3>Down to one copy at the second failure</h3><span class="pg-mono" data-o2></span><span class="pg-note" data-n2></span></div>
+      <div class="pg-box" data-b3><h3>Chunks lost for good</h3><span class="pg-mono" data-o3></span><span class="pg-note" data-n3></span></div>
+    </div>
+    <p class="pg-out" data-verdict aria-live="polite"></p>
+    <p class="pg-note">Model: 80 servers in 8 racks of 10, 4,000 chunks placed with a seeded random choice, and a cluster that can make 60 chunk copies per minute (disk and network are limited on purpose). The master knows about a failure at once, which ignores the few minutes of heartbeat timeout. The second failure is the unluckiest server: the one holding the most single-copy chunks.</p>
+  </div>
+</PlaygroundShell>
+<script>
+  document.querySelectorAll<HTMLElement>('[data-dfb]').forEach((root) => {
+    const q = <T extends HTMLElement>(s: string) => root.querySelector<T>(s)!;
+    const RACKS = 8; const PER = 10; const S = RACKS * PER; const CH = 4000; const RATE = 60;
+    function sim(place: string, copies: number, fail: string, prio: boolean, second: number) {
+      let seed = 11; const rnd = (n: number) => { seed = (seed * 1664525 + 1013904223) % 4294967296; return Math.floor(seed / 65536) % n; };
+      const rack = (s: number) => Math.floor(s / PER);
+      const alive: boolean[] = new Array(S).fill(true);
+      const rep: number[][] = [];
+      for (let c = 0; c < CH; c++) {
+        const r: number[] = [];
+        if (place === 'random') { while (r.length < copies) { const s = rnd(S); if (!r.includes(s)) r.push(s); } }
+        else if (place === 'sameRack') { const k = rnd(RACKS); while (r.length < copies) { const s = k * PER + rnd(PER); if (!r.includes(s)) r.push(s); } }
+        else { const a = rnd(S); r.push(a); let b: number; do { b = rnd(S); } while (rack(b) === rack(a)); r.push(b); while (r.length < copies) { const d = rack(b) * PER + rnd(PER); if (!r.includes(d)) r.push(d); } }
+        rep.push(r);
+      }
+      const live = (c: number) => rep[c].filter((s) => alive[s]);
+      const kill = (list: number[]) => list.forEach((s) => { alive[s] = false; });
+      if (fail === 'server') kill([rnd(S)]); else { const k = rnd(RACKS); kill(Array.from({ length: PER }, (_, i) => k * PER + i)); }
+      let degraded = 0; let single = 0;
+      for (let c = 0; c < CH; c++) { const n = live(c).length; if (n < copies && n > 0) degraded++; if (n === 1) single++; }
+      let healed = -1; let secondInfo = ''; let singleAtSecond = 0; let happened = false;
+      const done = () => { for (let c = 0; c < CH; c++) { const n = live(c).length; if (n > 0 && n < copies) return false; } return true; };
+      if (done()) healed = 0;
+      for (let m = 1; m <= 200 && healed < 0; m++) {
+        const queue: number[][] = [];
+        for (let c = 0; c < CH; c++) { const n = live(c).length; if (n > 0 && n < copies) queue.push([n, c]); }
+        queue.sort((a, b) => (prio ? a[0] - b[0] || a[1] - b[1] : a[1] - b[1]));
+        for (const [, c] of queue.slice(0, RATE)) {
+          const l = live(c); let t: number;
+          do { t = rnd(S); } while (!alive[t] || rep[c].includes(t) || (place === 'sameRack' ? rack(t) !== rack(l[0]) : place === 'rackAware' && new Set(l.map(rack)).size === 1 && rack(t) === rack(l[0])));
+          rep[c].push(t);
+        }
+        if (m === second) {
+          const cnt: number[] = new Array(S).fill(0); singleAtSecond = 0;
+          for (let c = 0; c < CH; c++) { const l = live(c); if (l.length === 1) { cnt[l[0]]++; singleAtSecond++; } }
+          let w = -1; let best = -1; for (let s = 0; s < S; s++) if (alive[s] && cnt[s] > best) { best = cnt[s]; w = s; }
+          kill([w]); happened = true; secondInfo = `server ${w} held the last copy of ${best}`;
+        }
+        if (done()) healed = m;
+      }
+      let lost = 0; for (let c = 0; c < CH; c++) if (live(c).length === 0) lost++;
+      return { degraded, single, lost, healed, secondInfo, singleAtSecond, happened };
+    }
+    const fmt = (n: number) => n.toLocaleString('en-US');
+    function draw() {
+      const place = q<HTMLSelectElement>('[data-place]').value; const copies = Number(q<HTMLSelectElement>('[data-copies]').value);
+      const fail = q<HTMLSelectElement>('[data-fail]').value; const prio = q<HTMLSelectElement>('[data-prio]').value === 'prio';
+      const second = Number(q<HTMLInputElement>('[data-second]').value);
+      q('[data-secondval]').textContent = second === 0 ? 'never' : `${second} min`;
+      const r = sim(place, copies, fail, prio, second);
+      q('[data-o1]').textContent = fmt(r.degraded); q('[data-n1]').textContent = `${fmt(r.single)} of them are down to a single copy`;
+      q('[data-o2]').textContent = r.happened ? fmt(r.singleAtSecond) : 'no second failure';
+      q('[data-n2]').textContent = r.happened ? r.secondInfo : second === 0 ? 'the slider is at 0' : 'repair had already finished';
+      q('[data-o3]').textContent = fmt(r.lost);
+      q('[data-n3]').textContent = r.degraded === 0 && r.lost > 0 ? 'nothing left to repair from' : r.healed >= 0 ? `full redundancy again after ${r.healed} min` : 'repair did not finish';
+      q<HTMLElement>('[data-b1]').style.setProperty('--c', 'var(--accent)');
+      q<HTMLElement>('[data-b2]').style.setProperty('--c', 'var(--accent)');
+      q<HTMLElement>('[data-b3]').style.setProperty('--c', r.lost === 0 ? 'var(--good)' : 'var(--bad)');
+      const out = q('[data-verdict]'); out.classList.toggle('bad', r.lost > 0);
+      let text: string;
+      if (r.lost === 0) text = `No chunk was lost. Every chunk kept at least one copy, and the master rebuilt the missing ones in ${r.healed} min.`;
+      else if (place === 'sameRack') text = `Losing the rack destroyed every copy of ${fmt(r.lost)} chunks at once. Copies in one failure domain are not independent, however many there are.`;
+      else if (r.happened) text = `The second server held the last copy of ${fmt(r.lost)} chunks that were still waiting for repair. ${prio ? 'The queue already did the endangered chunks first, so the rest is a matter of repair speed and of having more copies.' : 'Repairing the chunks with the fewest copies first would have shrunk this.'}`;
+      else text = `${fmt(r.lost)} chunks had every copy inside the failed rack, which random placement allows by chance. Rack-aware placement rules this out.`;
+      out.textContent = text;
+    }
+    root.addEventListener('input', draw); root.addEventListener('change', draw);
+    draw();
+  });
+</script>

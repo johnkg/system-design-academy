@@ -1,0 +1,544 @@
+{
+  "name": "Design a Distributed File System",
+  "difficulty": "advanced",
+  "intent": "Store petabytes of very large files on thousands of cheap servers that fail every day, with one metadata master, big replicated chunks, and no lost data.",
+  "codeTitle": "a mini chunk store with racks, heartbeats, re-replication and scrubbing",
+  "finalIntro": "A client appends to a file, a server dies, and the cluster repairs itself.",
+  "prompt": "Design a distributed file system in the style of GFS or HDFS. Applications write huge files (logs, crawled pages, training data) and read them back in large streams. The cluster has thousands of commodity servers in many racks, and some of them fail every day. The system must keep every byte safe and keep working while hardware breaks.",
+  "functional": [
+    "Create, delete, list and rename files in a directory tree",
+    "Append to a file and write to it, with many clients writing at once",
+    "Read any part of a file, mostly in long sequential streams",
+    "Keep files safe across disk, server and rack failures",
+    "Take consistent snapshots of a directory tree"
+  ],
+  "nonFunctional": [
+    "Hold tens of petabytes and hundreds of millions of files",
+    "Give high total throughput, since big streaming reads and appends matter more than low latency",
+    "Lose no data when a disk, a server or a whole rack fails, and repair within minutes to hours",
+    "Keep serving reads and writes while servers fail, and recover from a master crash within a minute",
+    "Detect silent disk corruption before the last good copy is gone",
+    "Run on cheap hardware, so failure is the normal case rather than the exception"
+  ],
+  "firstAttempt": {
+    "text": "One big file server (or a network-attached disk array) with a local file system. Every client mounts it and reads and writes files over the network. For safety, a nightly backup copies everything to a second machine.",
+    "limits": [
+      "The capacity and the bandwidth of a single machine are a hard ceiling, far below petabytes",
+      "When the machine fails, everything is unavailable until it is repaired or restored",
+      "A nightly backup means a day of data can be lost, and restoring petabytes takes days",
+      "Every read and write passes through one network card and one CPU",
+      "Silent disk corruption is copied into the backup without anyone noticing"
+    ]
+  },
+  "nodes": [
+    {
+      "id": "clients",
+      "label": "Clients",
+      "kind": "client",
+      "x": 62,
+      "y": 63
+    },
+    {
+      "id": "single",
+      "label": "One file server",
+      "kind": "data",
+      "x": 87,
+      "y": 37,
+      "at": 0,
+      "until": 1
+    },
+    {
+      "id": "master",
+      "label": "Master",
+      "kind": "edge",
+      "x": 37,
+      "y": 63,
+      "at": 1
+    },
+    {
+      "id": "chunks",
+      "label": "Chunkservers",
+      "kind": "data",
+      "x": 62,
+      "y": 88,
+      "at": 1,
+      "until": 2
+    },
+    {
+      "id": "racka",
+      "label": "Rack A servers",
+      "kind": "data",
+      "x": 62,
+      "y": 37,
+      "at": 2
+    },
+    {
+      "id": "rackb",
+      "label": "Rack B servers",
+      "kind": "data",
+      "x": 37,
+      "y": 37,
+      "at": 2
+    },
+    {
+      "id": "rackc",
+      "label": "Rack C servers",
+      "kind": "data",
+      "x": 12,
+      "y": 37,
+      "at": 2
+    },
+    {
+      "id": "repair",
+      "label": "Re-replicator",
+      "kind": "compute",
+      "x": 12,
+      "y": 63,
+      "at": 4
+    },
+    {
+      "id": "oplog",
+      "label": "Operation log",
+      "kind": "async",
+      "x": 37,
+      "y": 88,
+      "at": 5
+    },
+    {
+      "id": "standby",
+      "label": "Standby master",
+      "kind": "async",
+      "x": 12,
+      "y": 88,
+      "at": 5
+    },
+    {
+      "id": "scrub",
+      "label": "Scrubber",
+      "kind": "compute",
+      "x": 37,
+      "y": 12,
+      "at": 6
+    }
+  ],
+  "edges": [
+    {
+      "from": "clients",
+      "to": "single",
+      "at": 0,
+      "until": 1
+    },
+    {
+      "from": "clients",
+      "to": "master",
+      "at": 1
+    },
+    {
+      "from": "clients",
+      "to": "chunks",
+      "at": 1,
+      "until": 2
+    },
+    {
+      "from": "master",
+      "to": "chunks",
+      "at": 1,
+      "until": 2
+    },
+    {
+      "from": "clients",
+      "to": "racka",
+      "at": 2
+    },
+    {
+      "from": "master",
+      "to": "racka",
+      "at": 2
+    },
+    {
+      "from": "master",
+      "to": "rackb",
+      "at": 2
+    },
+    {
+      "from": "master",
+      "to": "rackc",
+      "at": 2
+    },
+    {
+      "from": "racka",
+      "to": "rackb",
+      "at": 3
+    },
+    {
+      "from": "rackb",
+      "to": "rackc",
+      "at": 3
+    },
+    {
+      "from": "master",
+      "to": "repair",
+      "at": 4
+    },
+    {
+      "from": "repair",
+      "to": "rackc",
+      "at": 4
+    },
+    {
+      "from": "master",
+      "to": "oplog",
+      "at": 5
+    },
+    {
+      "from": "oplog",
+      "to": "standby",
+      "at": 5
+    },
+    {
+      "from": "scrub",
+      "to": "racka",
+      "at": 6
+    },
+    {
+      "from": "scrub",
+      "to": "rackb",
+      "at": 6
+    },
+    {
+      "from": "scrub",
+      "to": "rackc",
+      "at": 6
+    }
+  ],
+  "steps": [
+    {
+      "title": "Split files into big chunks, and keep the map in a master",
+      "problem": "A single machine cannot hold or serve petabytes, and a file system whose every read goes through one server cannot scale.",
+      "fix": "Cut every file into large fixed-size chunks, for example 64 or 128 MB, and spread the chunks over many chunkservers, each storing its chunks as ordinary local files. One master keeps the metadata: the directory tree, the list of chunks of each file, and which servers hold each chunk. A client asks the master only where the data is, then reads and writes the chunkservers directly, so file data never passes through the master. The client also caches the answer for a while.",
+      "tradeoff": "Total throughput grows with the number of servers, and the master handles small metadata requests rather than bulk data. Big chunks keep the metadata small and make streaming efficient, but they suit big files and give small files a poor deal. The master is now a single point that every client depends on.",
+      "concepts": [
+        {
+          "slug": "database-sharding"
+        },
+        {
+          "slug": "caching"
+        },
+        {
+          "slug": "latency-and-round-trips"
+        },
+        {
+          "slug": "horizontal-vs-vertical-scaling"
+        }
+      ]
+    },
+    {
+      "title": "Replicate each chunk across racks",
+      "problem": "With thousands of commodity servers, disks and machines fail every day, and a whole rack can drop when its switch or power fails. A single copy of a chunk is a lost chunk.",
+      "fix": "Keep three copies of every chunk by default. Placement is rack-aware: the first copy goes on one server, the second on a server in a different rack, and the third on another server in that same second rack. Any single server failure and any single rack failure leaves at least one copy. The master spreads new chunks towards less full servers and avoids putting many new chunks on a server that was just added.",
+      "tradeoff": "Data survives a rack, and reads can go to the nearest copy. Raw storage cost is three times the data, and the cross-rack copy uses scarce bandwidth. Putting two copies in one rack is a deliberate compromise between safety and network cost.",
+      "concepts": [
+        {
+          "slug": "database-replication"
+        },
+        {
+          "slug": "quorums"
+        },
+        {
+          "slug": "consistent-hashing"
+        },
+        {
+          "slug": "cap-theorem"
+        }
+      ]
+    },
+    {
+      "title": "Write through a pipeline, and let a primary order the writes",
+      "problem": "Many clients can write to the same chunk at once, and all three copies must apply the writes in the same order, without sending every byte through the master.",
+      "fix": "The master gives one replica of the chunk a lease of about 60 seconds, which makes it the primary. A client first pushes its data along a chain: to the nearest replica, which forwards to the next as it receives, so every server's outbound bandwidth is used and the client sends the data once. Then the client tells the primary to write. The primary gives the write a serial number, applies it, and tells the secondaries to apply the writes in that same order. When all reply, the client is told it worked. Leases are renewed in heartbeats and expire by themselves if the primary dies.",
+      "tradeoff": "Data flow and control flow are separated, so the network is used fully and the master stays out of the data path. If a write fails on one replica, that region can be left inconsistent and the client must retry, so appends are at least once and readers have to cope with duplicates and padding.",
+      "concepts": [
+        {
+          "slug": "leases-and-fencing-tokens"
+        },
+        {
+          "slug": "idempotency"
+        },
+        {
+          "slug": "retries-and-backoff"
+        },
+        {
+          "slug": "logical-clocks"
+        },
+        {
+          "slug": "consistency-models"
+        }
+      ]
+    },
+    {
+      "title": "Detect dead servers with heartbeats, and re-replicate",
+      "problem": "Servers die all the time. Each death leaves thousands of chunks with only two copies, and a second failure before they are fixed could lose the last copy of some of them.",
+      "fix": "Every chunkserver sends the master a heartbeat every few seconds, carrying its list of chunks, which is how the master learns the chunk map in the first place. A server silent for some minutes is declared dead. The master then finds every chunk that is below its target, puts them in a queue ordered by how few copies remain, and instructs servers to copy them. Chunks down to one copy go first, copying is throttled so it does not starve normal traffic, and the new copies obey the rack rule.",
+      "tradeoff": "The cluster heals itself without an operator, and the time at risk is bounded by the copy rate, because every other server helps in parallel. A long timeout avoids copying data for a server that only rebooted, and a short one shortens the risk window. A dead rack causes a wave of copying that competes with applications.",
+      "concepts": [
+        {
+          "slug": "failure-detection"
+        },
+        {
+          "slug": "health-checks"
+        },
+        {
+          "slug": "backpressure"
+        },
+        {
+          "slug": "queueing-theory-and-littles-law"
+        },
+        {
+          "slug": "gossip-protocol"
+        }
+      ]
+    },
+    {
+      "title": "Make the master durable, replaceable, and small",
+      "problem": "The master holds all the metadata in memory, and every client depends on it. If it crashes, the file system is gone. Its memory also caps how many files can exist, and small files make that worse.",
+      "fix": "Every change to the namespace is first written to an operation log, which is replicated to several disks and to a standby master before the client is answered. The master takes a checkpoint of its state from time to time, so recovery loads the latest checkpoint and replays a short tail of the log. Chunk locations are not logged, since chunkservers report them on startup. A standby or shadow master follows the log and takes over in about a minute through leader election, and can already serve reads. To keep the master small, chunks are large, tiny files are packed into container files, and very big clusters split the namespace over several masters.",
+      "tradeoff": "The master stops being a single point of data loss, and metadata operations stay very fast because they are in memory. Memory is still the hard limit of one master, about 150 bytes per file and per chunk, so a billion tiny files is a problem, and failover must make sure the old master really stopped before the new one writes.",
+      "concepts": [
+        {
+          "slug": "write-ahead-log"
+        },
+        {
+          "slug": "leader-election"
+        },
+        {
+          "slug": "consensus"
+        },
+        {
+          "slug": "database-replication"
+        },
+        {
+          "slug": "leases-and-fencing-tokens"
+        }
+      ]
+    },
+    {
+      "title": "Checksum every block, and scrub in the background",
+      "problem": "Disks silently flip bits. A chunk may look healthy on a quiet server for months, and then the other copies are gone before anyone notices that this one is wrong.",
+      "fix": "Each chunk is split into 64 KB blocks, and every block has a 32-bit checksum stored next to the data. A chunkserver verifies the checksum on every read, and returns an error rather than bad data. The client reads another replica, and the master schedules a fresh copy and deletes the bad one. A background scrubber also reads cold chunks slowly, so damage is found while the other copies are still good. Checksums are computed again at the point of writing, and when data is copied during re-replication.",
+      "tradeoff": "Silent corruption becomes a normal, repaired event, and cold data is verified before it is needed. Checksums cost a little CPU and a few bytes per block, and the scrubber uses disk bandwidth, so it is rate-limited and run at quiet times.",
+      "concepts": [
+        {
+          "slug": "merkle-trees-and-anti-entropy"
+        },
+        {
+          "slug": "backups-and-point-in-time-recovery"
+        },
+        {
+          "slug": "quorums"
+        },
+        {
+          "slug": "graceful-degradation"
+        }
+      ]
+    }
+  ],
+  "failures": [
+    {
+      "scenario": "A chunkserver dies",
+      "impact": "Thousands of chunks drop from three copies to two, and reads of those chunks must use other replicas.",
+      "answer": "Clients retry on another replica from the list the master gave them. After the heartbeat timeout the master declares the server dead and queues its chunks for re-replication. All the other servers copy in parallel, so tens of terabytes are restored in minutes rather than hours.",
+      "concepts": [
+        {
+          "slug": "failure-detection"
+        },
+        {
+          "slug": "retries-and-backoff"
+        },
+        {
+          "slug": "database-replication"
+        }
+      ]
+    },
+    {
+      "scenario": "A rack loses its switch or power",
+      "impact": "Dozens of servers vanish together, and some chunks lose two of their three copies at the same time.",
+      "answer": "Rack-aware placement guarantees every chunk has a copy in another rack, so nothing is lost. The master puts chunks with a single copy at the front of the queue and copies them first, with the rate limited so applications still get bandwidth. Without the rack rule, a few chunks would have all three copies in that rack.",
+      "concepts": [
+        {
+          "slug": "failure-detection"
+        },
+        {
+          "slug": "backpressure"
+        },
+        {
+          "slug": "multi-region-failover"
+        }
+      ]
+    },
+    {
+      "scenario": "The master crashes",
+      "impact": "No client can open, create or find files, and writes to new chunks stop.",
+      "answer": "The standby master has followed the operation log and takes over within about a minute, using the checkpoint and the log tail. Chunkservers re-announce their chunk lists. Clients that cached chunk locations keep reading and writing during the gap. The old master must be fenced so it cannot still write to the log.",
+      "concepts": [
+        {
+          "slug": "leader-election"
+        },
+        {
+          "slug": "write-ahead-log"
+        },
+        {
+          "slug": "leases-and-fencing-tokens"
+        },
+        {
+          "slug": "consensus"
+        }
+      ]
+    },
+    {
+      "scenario": "A job writes a hundred million tiny files",
+      "impact": "The master runs out of memory long before the disks fill, and every metadata operation gets slow.",
+      "answer": "Each file costs the master about as much as a huge file, so the answer is to avoid tiny files: pack them into larger container files (sequence files, archives or a table format) with an index, set quotas on the number of files per directory, and move to a federated namespace if the cluster as a whole really needs more objects than one master can hold.",
+      "concepts": [
+        {
+          "slug": "database-sharding"
+        },
+        {
+          "slug": "rate-limiting"
+        },
+        {
+          "slug": "columnar-formats-and-partitioning"
+        }
+      ]
+    },
+    {
+      "scenario": "A disk flips a bit in a rarely read chunk",
+      "impact": "One copy is wrong, and if it stays undiscovered until two others are lost, the bad data may be the only copy left.",
+      "answer": "The block checksum fails when the scrubber reads it. The chunkserver reports the chunk to the master, which marks that replica bad, creates a new copy from a healthy replica and deletes the damaged one. Reads that meet the bad block earlier fall back to another replica in the same way.",
+      "concepts": [
+        {
+          "slug": "merkle-trees-and-anti-entropy"
+        },
+        {
+          "slug": "alerting"
+        },
+        {
+          "slug": "structured-logging"
+        }
+      ]
+    },
+    {
+      "scenario": "The primary dies in the middle of a write",
+      "impact": "Some replicas applied the write and others did not, so the copies of that region now differ.",
+      "answer": "The client sees an error and retries the write. Until the old lease expires, the master will not give a new primary, which prevents two primaries ordering writes at once. The inconsistent region is marked, readers skip duplicate and padding records using record ids and checksums, and the client's retry lands at a fresh offset.",
+      "concepts": [
+        {
+          "slug": "leases-and-fencing-tokens"
+        },
+        {
+          "slug": "idempotency"
+        },
+        {
+          "slug": "retries-and-backoff"
+        }
+      ]
+    }
+  ],
+  "alternatives": [
+    {
+      "title": "How to keep the metadata",
+      "options": [
+        {
+          "name": "One master with everything in memory",
+          "pro": "Simple, strongly consistent and very fast, with global knowledge for placement",
+          "con": "Limited by one machine's memory, and a failover to cover"
+        },
+        {
+          "name": "A federated set of masters, each owning part of the namespace",
+          "pro": "Raises the number of files that fit, and isolates teams",
+          "con": "Cross-directory renames are hard and the load is uneven"
+        },
+        {
+          "name": "Metadata in a distributed database",
+          "pro": "Scales to billions of files without a size limit",
+          "con": "Each metadata operation is slower and the system is more complex"
+        }
+      ],
+      "pick": "One in-memory master with a log and a standby, which is enough for very large clusters. Federate or move to a database store when file counts reach billions."
+    },
+    {
+      "title": "How to be safe against failure",
+      "options": [
+        {
+          "name": "Three full copies",
+          "pro": "Simple, fast reads, and easy and quick repair by copying",
+          "con": "Three times the storage"
+        },
+        {
+          "name": "Erasure coding, for example 6 data and 3 parity blocks",
+          "pro": "Survives any three losses with only 1.5 times the storage",
+          "con": "Reads of a lost block and repairs need many other blocks, and small writes are costly"
+        }
+      ],
+      "pick": "Copies for hot and new data, and erasure coding for cold data, where storage cost matters and reads are rare."
+    },
+    {
+      "title": "How big a chunk is",
+      "options": [
+        {
+          "name": "Small, about 4 MB",
+          "pro": "Good for small files and finer load balancing",
+          "con": "Many more chunks, so the master's memory and its traffic grow 16 to 32 times"
+        },
+        {
+          "name": "Large, 64 to 256 MB",
+          "pro": "Little metadata, long sequential transfers, and clients that rarely contact the master",
+          "con": "Small files waste a chunk's bookkeeping, and a hot small file can overload its few servers"
+        }
+      ],
+      "pick": "128 MB, with small files packed together and hot files given more copies."
+    },
+    {
+      "title": "What guarantees writes give",
+      "options": [
+        {
+          "name": "Strict POSIX semantics",
+          "pro": "Existing programs work unchanged",
+          "con": "Needs distributed locking and strict ordering that cost throughput"
+        },
+        {
+          "name": "Relaxed semantics with atomic record append",
+          "pro": "Many writers can append to one file with no coordination, which is what logs and pipelines need",
+          "con": "Readers must tolerate duplicates and padding, and applications have to be written for it"
+        }
+      ],
+      "pick": "Relaxed semantics with record append, since the workloads are append-heavy and write-once."
+    }
+  ],
+  "roles": [
+    {
+      "id": "client",
+      "label": "Applications",
+      "description": "Programs and jobs that read and write files."
+    },
+    {
+      "id": "edge",
+      "label": "Master",
+      "description": "The namespace, the chunk map and the leases."
+    },
+    {
+      "id": "async",
+      "label": "Operation log",
+      "description": "The durable record of metadata changes, and the standby that follows it."
+    },
+    {
+      "id": "compute",
+      "label": "Repair jobs",
+      "description": "Re-replication and the scrubber."
+    },
+    {
+      "id": "data",
+      "label": "Chunkservers",
+      "description": "The servers and racks that store the chunks."
+    }
+  ]
+}

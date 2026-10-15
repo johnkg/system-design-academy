@@ -1,0 +1,503 @@
+{
+  "name": "Design a VPN Gateway Service",
+  "difficulty": "advanced",
+  "intent": "Let a million devices keep an encrypted tunnel into a private network from any Wi-Fi or mobile network, through any NAT, on a fleet of gateways that can grow, shrink and be upgraded without anyone being disconnected.",
+  "codeTitle": "gateway selection, roaming sessions, dead-peer detection and draining",
+  "finalIntro": "A laptop connects, switches from office Wi-Fi to a mobile hotspot, and keeps working while its gateway is drained.",
+  "prompt": "Design a VPN service for a company with 1 million enrolled laptops and phones. Staff connect from homes, cafes and mobile networks. They reach private applications through an encrypted tunnel, keep working when they move between networks, and send only company traffic through the tunnel if the policy says so. Gateways must be added and upgraded with no outage.",
+  "functional": [
+    "Set up an encrypted tunnel between a device and a gateway, with mutual authentication",
+    "Choose a good gateway for each device by distance and load",
+    "Keep the session alive when the device changes network or address",
+    "Work behind home routers, carrier NAT and firewalls that block UDP",
+    "Split tunneling: send only some routes through the tunnel, as the policy says",
+    "Detect a dead peer and clean up its state",
+    "Add and remove gateways, and drain one for an upgrade"
+  ],
+  "nonFunctional": [
+    "A new tunnel is up in under a second, and a roam is invisible to applications",
+    "A dead peer is noticed within about a minute",
+    "Support 1 million enrolled devices and 300,000 connected at the peak",
+    "Forward secrecy: a stolen key reveals no past traffic",
+    "Losing a gateway disconnects its devices for only seconds",
+    "Gateways are mostly stateless so that they can scale out",
+    "Keepalives must not drain phone batteries"
+  ],
+  "firstAttempt": {
+    "text": "One big VPN server in the head office. Devices connect to its fixed address over TCP with a username and password, and the server identifies each tunnel by the device's source address and port. All traffic from the device goes through it.",
+    "limits": [
+      "Every user in the world sends traffic to one place, so far-away users get a slow connection and the server is a bandwidth bottleneck",
+      "The tunnel is identified by source address, so switching from Wi-Fi to mobile kills it and every application breaks",
+      "A home router forgets an idle connection after a minute or less, and the server's replies are silently dropped",
+      "TCP inside TCP stalls and retransmits twice when there is packet loss",
+      "If the server fails or needs an upgrade, everyone is disconnected at once, and they all reconnect at the same moment",
+      "Sending all traffic through it, even video calls and software updates, wastes its bandwidth"
+    ]
+  },
+  "nodes": [
+    {
+      "id": "client",
+      "label": "Devices",
+      "kind": "client",
+      "x": 62,
+      "y": 63
+    },
+    {
+      "id": "single",
+      "label": "One VPN server",
+      "kind": "compute",
+      "x": 37,
+      "y": 88,
+      "at": 0,
+      "until": 1
+    },
+    {
+      "id": "gw",
+      "label": "Gateways",
+      "kind": "edge",
+      "x": 62,
+      "y": 37,
+      "at": 1
+    },
+    {
+      "id": "auth",
+      "label": "Identity service",
+      "kind": "compute",
+      "x": 37,
+      "y": 37,
+      "at": 1
+    },
+    {
+      "id": "relay",
+      "label": "TCP 443 relay",
+      "kind": "edge",
+      "x": 37,
+      "y": 63,
+      "at": 2
+    },
+    {
+      "id": "ctl",
+      "label": "Directory and policy",
+      "kind": "compute",
+      "x": 87,
+      "y": 63,
+      "at": 3
+    },
+    {
+      "id": "load",
+      "label": "Load reports",
+      "kind": "async",
+      "x": 87,
+      "y": 37,
+      "at": 3
+    },
+    {
+      "id": "store",
+      "label": "Session store",
+      "kind": "data",
+      "x": 62,
+      "y": 12,
+      "at": 4
+    },
+    {
+      "id": "internet",
+      "label": "Open internet",
+      "kind": "edge",
+      "x": 62,
+      "y": 88,
+      "at": 5
+    },
+    {
+      "id": "private",
+      "label": "Private apps",
+      "kind": "data",
+      "x": 37,
+      "y": 12,
+      "at": 5
+    },
+    {
+      "id": "scaler",
+      "label": "Autoscaler",
+      "kind": "compute",
+      "x": 87,
+      "y": 12,
+      "at": 6
+    }
+  ],
+  "edges": [
+    {
+      "from": "client",
+      "to": "single",
+      "at": 0,
+      "until": 1
+    },
+    {
+      "from": "client",
+      "to": "gw",
+      "at": 1
+    },
+    {
+      "from": "gw",
+      "to": "auth",
+      "at": 1
+    },
+    {
+      "from": "client",
+      "to": "relay",
+      "at": 2
+    },
+    {
+      "from": "relay",
+      "to": "gw",
+      "at": 2
+    },
+    {
+      "from": "client",
+      "to": "ctl",
+      "at": 3
+    },
+    {
+      "from": "gw",
+      "to": "load",
+      "at": 3
+    },
+    {
+      "from": "load",
+      "to": "ctl",
+      "at": 3
+    },
+    {
+      "from": "gw",
+      "to": "store",
+      "at": 4
+    },
+    {
+      "from": "client",
+      "to": "internet",
+      "at": 5
+    },
+    {
+      "from": "gw",
+      "to": "private",
+      "at": 5
+    },
+    {
+      "from": "load",
+      "to": "scaler",
+      "at": 6
+    },
+    {
+      "from": "scaler",
+      "to": "gw",
+      "at": 6
+    }
+  ],
+  "steps": [
+    {
+      "title": "Build the tunnel: a handshake that agrees on fresh keys",
+      "problem": "Packets cross networks the company does not control, so each one must be hidden and protected from change, and both sides must know who they are talking to.",
+      "fix": "Run a short handshake over UDP before any data flows. The device and the gateway each prove their identity, the device with a certificate or a key that the identity service has enrolled and the gateway with its own key. They also exchange fresh ephemeral Diffie-Hellman values, so that both derive the same session keys without ever sending them. Every packet is then encrypted and authenticated with an AEAD cipher, carries a counter that stops replays, and the keys are replaced every couple of minutes. A WireGuard-style protocol needs one round trip, and IKEv2 with IPsec needs two exchanges.",
+      "tradeoff": "Forward secrecy means that stealing a long-term key later reveals no recorded traffic, and a handshake costs only a few asymmetric operations. Each rekey is a little extra work for the gateway, and handshake packets are an easy target for floods, so a gateway can answer an overloaded moment with a cookie that proves the sender's address before doing the expensive maths.",
+      "concepts": [
+        {
+          "slug": "encryption"
+        },
+        {
+          "slug": "tls-and-https"
+        },
+        {
+          "slug": "authentication-and-authorization"
+        },
+        {
+          "slug": "tcp-vs-udp"
+        }
+      ]
+    },
+    {
+      "title": "Get through NAT, and notice a dead peer",
+      "problem": "Almost every device sits behind a NAT. The NAT only lets replies in for a short time after the device last sent something, and some networks block UDP altogether.",
+      "fix": "The device always starts the conversation, and the gateway answers to whatever address and port the packets came from, which opens the NAT mapping. An idle tunnel sends a tiny keepalive every 25 seconds or so, which is shorter than the usual NAT timeout, so the mapping stays alive and the gateway can still reach the device. Both sides count missed keepalives, and after about three misses the peer is declared dead, the state is removed and the device reconnects. On networks that block UDP the device falls back to a relay on TCP port 443 that carries the same encrypted packets.",
+      "tradeoff": "The tunnel survives NAT, and a failed peer is found in tens of seconds, not minutes. Keepalives cost battery on phones, so they can be longer when the app is in the background. Detection that is too eager disconnects people over a few lost packets, and the TCP fallback has the double-retransmission problem, so it is the last choice, not the first.",
+      "concepts": [
+        {
+          "slug": "failure-detection"
+        },
+        {
+          "slug": "health-checks"
+        },
+        {
+          "slug": "tcp-vs-udp"
+        },
+        {
+          "slug": "timeouts-and-deadlines"
+        }
+      ]
+    },
+    {
+      "title": "Pick the gateway by latency and load",
+      "problem": "One address for everyone is slow for distant users, and the nearest gateway can be overloaded while another one sits idle.",
+      "fix": "Run gateways in many regions. Each one reports its load to a directory, and a device asks the directory for a short list of gateways. The device measures the round trip to each of them in parallel and picks the one with the lowest cost, which is the round-trip time plus a penalty that grows with load. Gateways that are full or draining are left out. The result is cached on the device, and the device looks again when the gateway gets slower or fails.",
+      "tradeoff": "People get a close gateway and load spreads out without a central bottleneck on the data path. The directory becomes a dependency for connecting, so it is cached and replicated, and its load numbers are a few seconds old, so many devices could choose the same gateway at the same moment unless the penalty and some randomness spread them.",
+      "concepts": [
+        {
+          "slug": "load-balancing"
+        },
+        {
+          "slug": "latency-and-round-trips"
+        },
+        {
+          "slug": "dns"
+        },
+        {
+          "slug": "anycast-and-bgp-routing"
+        },
+        {
+          "slug": "hedged-requests-and-tail-latency"
+        }
+      ]
+    },
+    {
+      "title": "Identify the session, not the address, so devices can roam",
+      "problem": "When a laptop moves from Wi-Fi to a mobile hotspot its source address changes, and a gateway that finds tunnels by address sees a stranger and drops the tunnel.",
+      "fix": "Give each session an id and key from the handshake, and find the session by that id in every packet. The source address is only the place to send replies, and it is updated to the latest address when a packet passes the authentication check and has a new counter value. A forged or replayed packet from a new address is thrown away, so nobody can hijack the session by spoofing. A copy of the session in a shared store, or a resumption ticket held by the device, lets any gateway continue it after a failure with no new login.",
+      "tradeoff": "A roam costs one packet, not a new handshake, and long downloads and calls survive a change of network. The session store is state that must be fast and replicated, the ticket must be encrypted and time-limited, and the gateway has to rate-limit address changes to stop an attacker redirecting traffic with a captured packet.",
+      "concepts": [
+        {
+          "slug": "jwt-and-session-tokens"
+        },
+        {
+          "slug": "idempotency"
+        },
+        {
+          "slug": "leases-and-fencing-tokens"
+        },
+        {
+          "slug": "delivery-guarantees"
+        }
+      ]
+    },
+    {
+      "title": "Split the tunnel by policy",
+      "problem": "Sending all traffic through the gateways, including video calls and updates, wastes bandwidth and slows everything, while sending too little leaves risky traffic uninspected.",
+      "fix": "The directory hands each device a policy: a list of routes, such as company address ranges, that go through the tunnel, and everything else leaves directly from the device. The device matches each destination to the longest matching prefix. For a high-risk group the policy can instead say full tunnel, and DNS queries for company names are sent through the tunnel so that internal names resolve. The gateway checks what each user may reach, and does not trust the device to follow the routes.",
+      "tradeoff": "Gateway bandwidth falls to a fraction and everyday browsing is faster. Split tunneling bypasses the company's inspection of internet traffic, so some groups must stay on a full tunnel, and a wrong overlap between a home network range and a company range sends traffic to the wrong place.",
+      "concepts": [
+        {
+          "slug": "cidr-and-subnetting"
+        },
+        {
+          "slug": "access-control-models"
+        },
+        {
+          "slug": "dns"
+        },
+        {
+          "slug": "proxies"
+        }
+      ]
+    },
+    {
+      "title": "Scale out, and drain a gateway before removing it",
+      "problem": "Load changes through the day, gateways need upgrades, and if one disappears every user on it would reconnect at the same time.",
+      "fix": "Gateways keep almost no state of their own, so the autoscaler adds and removes them based on the load reports. To remove one it marks the gateway as draining. The directory stops offering it, the gateway tells its devices to move, and each device resumes its session on another gateway with its ticket, spread out over a few minutes with random delay. The gateway is shut down when it is empty or after a time limit. A crash is handled the same way, only that devices find out through dead-peer detection, so they must also reconnect with backoff.",
+      "tradeoff": "Upgrades and scaling are routine and no one is cut off, but draining takes minutes, and the remaining gateways need spare capacity to absorb the move. Without jitter and backoff a failed gateway makes a thundering herd of reconnects, and each resume still costs the new gateway a little work.",
+      "concepts": [
+        {
+          "slug": "autoscaling"
+        },
+        {
+          "slug": "blue-green-and-rolling-deployments"
+        },
+        {
+          "slug": "retries-and-backoff"
+        },
+        {
+          "slug": "load-shedding"
+        },
+        {
+          "slug": "graceful-degradation"
+        }
+      ]
+    }
+  ],
+  "failures": [
+    {
+      "scenario": "A gateway crashes with 20,000 devices on it",
+      "impact": "Their tunnels stop working and, without care, all of them reconnect in the same second.",
+      "answer": "Devices notice after about three missed keepalives, ask the directory for another gateway and resume with their tickets, each after a random delay that grows with every failed try. The directory has already dropped the failed gateway after its health checks missed. The other gateways keep spare capacity and shed new handshakes with a cookie challenge if they are overloaded.",
+      "concepts": [
+        {
+          "slug": "failure-detection"
+        },
+        {
+          "slug": "retries-and-backoff"
+        },
+        {
+          "slug": "load-shedding"
+        },
+        {
+          "slug": "multi-region-failover"
+        }
+      ]
+    },
+    {
+      "scenario": "A coffee shop network blocks UDP",
+      "impact": "The handshake never gets an answer, so the device cannot connect at all.",
+      "answer": "After a short timeout the device tries the TCP 443 relay, which carries the same encrypted packets and looks like ordinary HTTPS to the firewall. It still prefers UDP and tries again later when the network changes.",
+      "concepts": [
+        {
+          "slug": "tcp-vs-udp"
+        },
+        {
+          "slug": "tls-and-https"
+        },
+        {
+          "slug": "proxies"
+        },
+        {
+          "slug": "timeouts-and-deadlines"
+        }
+      ]
+    },
+    {
+      "scenario": "An attacker replays or forges a packet from another address",
+      "impact": "If the gateway updated the reply address on every packet, the attacker could redirect a victim's traffic.",
+      "answer": "A packet must pass the authentication check and carry a counter higher than any seen before, before the address is changed. Captured packets fail the counter test. Address changes are also rate-limited, and the gateway can ask the new address to prove it holds the key before sending bulk data there.",
+      "concepts": [
+        {
+          "slug": "encryption"
+        },
+        {
+          "slug": "idempotency"
+        },
+        {
+          "slug": "rate-limiting"
+        }
+      ]
+    },
+    {
+      "scenario": "A device's key is stolen",
+      "impact": "Someone else could build a tunnel into the private network.",
+      "answer": "Keys are bound to the device hardware where possible, are enrolled and expire, and the identity service can revoke one at once. Gateways pull the revocation list and drop the matching sessions at the next rekey, which is at most two minutes away. Forward secrecy means that old recorded traffic stays unreadable.",
+      "concepts": [
+        {
+          "slug": "secrets-management"
+        },
+        {
+          "slug": "authentication-and-authorization"
+        },
+        {
+          "slug": "access-control-models"
+        }
+      ]
+    }
+  ],
+  "alternatives": [
+    {
+      "title": "The tunnel protocol",
+      "options": [
+        {
+          "name": "WireGuard-style",
+          "pro": "Small, fast, one round trip, roams by design",
+          "con": "Fixed cryptography choices, and extra work for per-user policy and address assignment"
+        },
+        {
+          "name": "IPsec with IKEv2",
+          "pro": "Built into many operating systems and widely certified",
+          "con": "Many options, harder to configure and to get through NAT, although MOBIKE supports roaming"
+        },
+        {
+          "name": "TLS-based (OpenVPN or similar)",
+          "pro": "Goes through almost any firewall",
+          "con": "Slower, and over TCP it suffers from tunnelling TCP in TCP"
+        }
+      ],
+      "pick": "A WireGuard-style protocol over UDP, with a TLS relay on 443 as the fallback."
+    },
+    {
+      "title": "How a device finds its gateway",
+      "options": [
+        {
+          "name": "DNS by region",
+          "pro": "Simple, and there is nothing new to run",
+          "con": "Coarse, and cached answers are slow to change when a gateway fails"
+        },
+        {
+          "name": "Anycast address",
+          "pro": "The network picks a near gateway and fails over quickly",
+          "con": "Flows can change gateway mid-session, and it is hard to steer by load"
+        },
+        {
+          "name": "Directory plus client probing",
+          "pro": "Chooses by measured latency and load",
+          "con": "Another service to run, and probes cost a few packets"
+        }
+      ],
+      "pick": "Directory plus client probing, with DNS or anycast only to reach the directory."
+    },
+    {
+      "title": "Where session state lives",
+      "options": [
+        {
+          "name": "In the gateway only",
+          "pro": "Fastest and simplest",
+          "con": "A failure means a new handshake for every user"
+        },
+        {
+          "name": "In a shared store",
+          "pro": "Any gateway can continue a session",
+          "con": "A store on the path for every roam and resume"
+        },
+        {
+          "name": "In an encrypted ticket on the device",
+          "pro": "No shared state at all",
+          "con": "Revocation is slower, and the ticket key must be rotated carefully"
+        }
+      ],
+      "pick": "State in the gateway, with an encrypted ticket on the device for resuming elsewhere."
+    },
+    {
+      "title": "How much traffic goes through the tunnel",
+      "options": [
+        {
+          "name": "Full tunnel",
+          "pro": "Everything is inspected and one policy applies",
+          "con": "The most bandwidth, and slow video and updates"
+        },
+        {
+          "name": "Split tunnel",
+          "pro": "Light on gateways, and everyday traffic is fast",
+          "con": "Internet traffic is not inspected, and route overlaps can confuse"
+        }
+      ],
+      "pick": "Split by default, full tunnel for high-risk groups and unmanaged networks."
+    }
+  ],
+  "roles": [
+    {
+      "id": "client",
+      "label": "Devices",
+      "description": "Laptops and phones that run the tunnel client."
+    },
+    {
+      "id": "edge",
+      "label": "Gateways",
+      "description": "VPN gateways, the TCP relay and the destinations they reach."
+    },
+    {
+      "id": "async",
+      "label": "Load reports",
+      "description": "Load and health numbers on their way to the directory."
+    },
+    {
+      "id": "compute",
+      "label": "Control plane",
+      "description": "Identity, directory and policy, and the autoscaler."
+    },
+    {
+      "id": "data",
+      "label": "State",
+      "description": "Session store and private applications."
+    }
+  ]
+}

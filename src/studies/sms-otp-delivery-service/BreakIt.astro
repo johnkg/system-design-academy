@@ -1,0 +1,105 @@
+---
+import PlaygroundShell from '../../components/PlaygroundShell.astro';
+---
+<PlaygroundShell title="An outage, a retry and a pumping attack" hint="2,000 sign-in requests arrive. Part way through, the cheapest provider goes down, some clients lose a response and retry, and a bot starts sending codes to premium numbers it controls. Change the design and watch each problem appear and disappear.">
+  <ol class="how">
+    <li>The default is the <b>simplest design</b>: one provider, no idempotency key, no guard. <b>464 of 1,556 real users never get a code</b>, <b>97 get two</b> and the bot tries <b>444 premium messages</b>.</li>
+    <li>Choose <b>failover</b>: almost every real user gets a code (1,551 of 1,556), but <b>637 attempts</b> still go to the dead provider and each one waits for a timeout. Choose <b>failover with a circuit breaker</b> and that drops to <b>10</b>.</li>
+    <li>Add an <b>idempotency key</b>: duplicate messages go to <b>0</b>. Add the <b>per-number limit</b>: the bot is capped at 3 per number, so 300 messages, and fraud spend falls from $46.78 to $32.90. Add the <b>conversion guard</b>: the range is blocked after 30 sends and the bot gets <b>30</b> messages in all ($3.05).</li>
+  </ol>
+  <div class="pg smsb" data-smsb>
+    <div class="pg-row">
+      <label>Provider routing <select class="pg-in" data-mode>
+        <option value="single" selected>one provider only</option>
+        <option value="failover">failover, always try the cheapest first</option>
+        <option value="breaker">failover with a circuit breaker</option>
+      </select></label>
+      <label>When a client retries <select class="pg-in" data-key>
+        <option value="none" selected>no idempotency key</option>
+        <option value="key">same key, send once</option>
+      </select></label>
+      <label>Pumping defence <select class="pg-in" data-guard>
+        <option value="none" selected>none</option>
+        <option value="number">3 codes per hour per number</option>
+        <option value="conversion">per-number limit plus conversion guard</option>
+      </select></label>
+      <label>Outage length (requests) <input type="range" min="0" max="1000" step="100" value="600" data-out /> <b data-outval></b></label>
+      <label>Share of traffic from the bot (%) <input type="range" min="0" max="60" step="10" value="30" data-att /> <b data-attval></b></label>
+    </div>
+    <div class="pg-grid">
+      <div class="pg-box" data-b1><h3>Real users who got a code</h3><span class="pg-mono" data-o1></span><span class="pg-note" data-n1></span></div>
+      <div class="pg-box" data-b2><h3>Duplicate messages sent</h3><span class="pg-mono" data-o2></span><span class="pg-note" data-n2></span></div>
+      <div class="pg-box" data-b3><h3>Attempts on the dead provider</h3><span class="pg-mono" data-o3></span><span class="pg-note" data-n3></span></div>
+      <div class="pg-box" data-b4><h3>Messages sent to the bot</h3><span class="pg-mono" data-o4></span><span class="pg-note" data-n4></span></div>
+    </div>
+    <p class="pg-out" data-verdict aria-live="polite"></p>
+    <p class="pg-note">Model: request 500 is when the bot starts and request 600 is when provider A goes down, for as long as the slider says. Provider A costs 0.8 cents and delivers 97% of messages. Provider B costs 1.0 cent and delivers 98.5%. The bot sends to premium numbers at 12 times the price, using 100 numbers it controls, and never enters a code. Of the real requests, 8% lose their response, and the client sends again. The circuit breaker opens after 5 failures and tries again 100 requests later. The conversion guard blocks a range after 30 sends if under 10% were verified. Costs are for these 2,000 requests.</p>
+  </div>
+</PlaygroundShell>
+<script>
+  document.querySelectorAll<HTMLElement>('[data-smsb]').forEach((root) => {
+    const q = <T extends HTMLElement>(s: string) => root.querySelector<T>(s)!;
+    const N = 2000; const ATTACK_FROM = 500; const OUT_FROM = 600; const NUMBERS = 100; const PRICE = { A: 8, B: 10 }; const PREMIUM = 12;
+    let seed = 99; const rnd = () => ((seed = (Math.imul(seed, 1664525) + 1013904223) >>> 0) / 4294967296);
+    const D = Array.from({ length: N }, () => ({ bot: rnd(), lost: rnd(), a: rnd(), b: rnd() }));
+    function run(mode: string, key: string, guard: string, outage: number, attack: number) {
+      const r = { legit: 0, delivered: 0, dup: 0, wasted: 0, botSends: 0, botBlocked: 0, fraud: 0, spend: 0 };
+      const br = { fails: 0, until: 0 }; const perNum = new Array(NUMBERS).fill(0); const range = { sent: 0, ok: 0 }; let botNo = 0;
+      const outAt = (i: number) => i >= OUT_FROM && i < OUT_FROM + outage;
+      function send(i: number, premium: boolean) {
+        const mult = premium ? PREMIUM : 1; const d = D[i];
+        if (mode !== 'breaker' || i >= br.until) {
+          const ok = !outAt(i) && d.a < 0.97;
+          if (ok) { br.fails = 0; r.spend += PRICE.A * mult; return true; }
+          if (outAt(i)) r.wasted++;
+          if (mode === 'breaker' && ++br.fails >= 5) br.until = i + 100;
+          if (mode === 'single') return false;
+        }
+        if (d.b < 0.985) { r.spend += PRICE.B * mult; return true; }
+        return false;
+      }
+      for (let i = 0; i < N; i++) {
+        const d = D[i]; const bot = i >= ATTACK_FROM && d.bot < attack / 100;
+        if (bot) {
+          const n = botNo++ % NUMBERS;
+          if (guard !== 'none' && perNum[n] >= 3) { r.botBlocked++; continue; }
+          if (guard === 'conversion' && range.sent >= 30 && range.ok * 10 < range.sent) { r.botBlocked++; continue; }
+          perNum[n]++; range.sent++; r.botSends++;
+          const before = r.spend; send(i, true); r.fraud += r.spend - before;
+          continue;
+        }
+        r.legit++;
+        const first = send(i, false); let got = first;
+        if (d.lost < 0.08 && key === 'none') { const again = send(i, false); if (first && again) r.dup++; got = first || again; }
+        if (got) r.delivered++;
+      }
+      return r;
+    }
+    const money = (tenths: number) => '$' + (tenths / 1000).toFixed(2);
+    function draw() {
+      const mode = q<HTMLSelectElement>('[data-mode]').value; const key = q<HTMLSelectElement>('[data-key]').value; const guard = q<HTMLSelectElement>('[data-guard]').value;
+      const outage = Number(q<HTMLInputElement>('[data-out]').value); const attack = Number(q<HTMLInputElement>('[data-att]').value);
+      q('[data-outval]').textContent = String(outage); q('[data-attval]').textContent = String(attack);
+      const r = run(mode, key, guard, outage, attack);
+      const missed = r.legit - r.delivered;
+      q('[data-o1]').textContent = `${r.delivered} of ${r.legit}`; q('[data-n1]').textContent = `${missed} could not sign in`;
+      q('[data-o2]').textContent = String(r.dup); q('[data-n2]').textContent = r.dup ? 'users got the code twice and were billed twice' : 'a retry never sends a second message';
+      q('[data-o3]').textContent = String(r.wasted); q('[data-n3]').textContent = r.wasted ? 'each one waits for a timeout before the next provider' : 'no time lost on a dead provider';
+      q('[data-o4]').textContent = String(r.botSends); q('[data-n4]').textContent = `fraud spend ${money(r.fraud)}, total ${money(r.spend)}; blocked ${r.botBlocked}`;
+      const badUsers = missed > r.legit * 0.05;
+      q<HTMLElement>('[data-b1]').style.setProperty('--c', badUsers ? 'var(--bad)' : 'var(--good)');
+      q<HTMLElement>('[data-b2]').style.setProperty('--c', r.dup ? 'var(--bad)' : 'var(--good)');
+      q<HTMLElement>('[data-b3]').style.setProperty('--c', r.wasted > 50 ? 'var(--bad)' : 'var(--good)');
+      q<HTMLElement>('[data-b4]').style.setProperty('--c', r.botSends > 100 ? 'var(--bad)' : 'var(--good)');
+      const issues: string[] = [];
+      if (badUsers) issues.push(`${missed} real users never got a code, because with one provider an outage is a sign-in outage`);
+      if (r.dup) issues.push(`${r.dup} users were sent a second code after a lost response, because a retry without a key is a new message`);
+      if (r.wasted > 50) issues.push(`${r.wasted} attempts went to a provider that was down, because nothing remembers it is unhealthy`);
+      if (r.botSends > 100) issues.push(`the bot got ${r.botSends} premium messages and ${money(r.fraud)} of spend, because nothing noticed that nobody enters those codes`);
+      const out = q('[data-verdict]'); out.classList.toggle('bad', issues.length > 0);
+      out.textContent = issues.length ? `Problems: ${issues.join('; ')}.` : `All four problems are handled: real users get one code each, failures cost almost no waiting, and the bot is stopped after ${r.botSends} messages (${money(r.fraud)}).`;
+    }
+    root.addEventListener('input', draw); root.addEventListener('change', draw);
+    draw();
+  });
+</script>

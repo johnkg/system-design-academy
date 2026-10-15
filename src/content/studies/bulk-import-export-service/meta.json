@@ -1,0 +1,591 @@
+{
+  "name": "Design a Bulk Import and Export Service",
+  "difficulty": "advanced",
+  "intent": "Let customers load and download millions of rows through an API, as background jobs that survive dropped connections, report every bad row, can be re-run safely, and share the workers fairly between tenants.",
+  "codeTitle": "a resumable upload, row-level errors and a fair scheduler",
+  "finalIntro": "One customer importing a big file over a poor network, then exporting the data again.",
+  "prompt": "Design the bulk import and export part of a SaaS API. A customer uploads a CSV of up to a few million rows, or asks to download all of their data. Imports must tell the customer which rows failed and why, and exports must be handed out as expiring download links. Many tenants share the system, and one tenant's huge job must not slow the others down.",
+  "functional": [
+    "Upload a large file in chunks, and resume it after a dropped connection",
+    "Run the import or export as a background job with a status that can be polled, and call a webhook when it finishes",
+    "Check every row while streaming, and produce a report with the line number and reason for each rejected row",
+    "Make it safe to submit or re-run the same import twice",
+    "Generate big exports and give out signed download links that expire",
+    "Cancel a job and see its progress as a percentage"
+  ],
+  "nonFunctional": [
+    "A 2 million row file, about 600 MB, imports in minutes, and the API request that starts it returns in under a second",
+    "A lost connection never forces the customer to start the upload again from zero",
+    "A job that crashes half way can be continued, and never writes a row twice",
+    "A small tenant's job starts within seconds even while another tenant has a job of 100 times its size",
+    "Memory use per worker is constant, however big the file is",
+    "A download link stops working after a short time, and only the right tenant can obtain one"
+  ],
+  "firstAttempt": {
+    "text": "One API endpoint accepts the whole file in a single POST. The handler reads the file into memory, checks all the rows, inserts them into the database in one transaction and answers with the number of rows saved. An export is a GET that selects every row and writes the response as it goes.",
+    "limits": [
+      "A request that runs for minutes hits timeouts at the load balancer, and a dropped connection loses the whole upload",
+      "The file is held in memory, so a few big imports at once exhaust the server",
+      "One bad row fails the whole transaction, or it is silently skipped, and the customer cannot tell which",
+      "If the client retries after a timeout, the rows are inserted twice",
+      "One tenant with a giant file uses all the request threads and every other tenant waits",
+      "A long export holds a database connection and a thread open, and the link to it is permanent and cannot be limited"
+    ]
+  },
+  "nodes": [
+    {
+      "id": "clients",
+      "label": "Customer apps",
+      "kind": "client",
+      "x": 62,
+      "y": 88
+    },
+    {
+      "id": "single",
+      "label": "One request handler",
+      "kind": "compute",
+      "x": 87,
+      "y": 88,
+      "at": 0,
+      "until": 1
+    },
+    {
+      "id": "api",
+      "label": "Import API",
+      "kind": "edge",
+      "x": 62,
+      "y": 63,
+      "at": 1
+    },
+    {
+      "id": "store",
+      "label": "Chunk storage",
+      "kind": "data",
+      "x": 87,
+      "y": 37,
+      "at": 1
+    },
+    {
+      "id": "jobs",
+      "label": "Job table",
+      "kind": "data",
+      "x": 12,
+      "y": 88,
+      "at": 2
+    },
+    {
+      "id": "hooks",
+      "label": "Webhook sender",
+      "kind": "async",
+      "x": 37,
+      "y": 88,
+      "at": 2
+    },
+    {
+      "id": "queue",
+      "label": "Job queue",
+      "kind": "async",
+      "x": 37,
+      "y": 63,
+      "at": 2
+    },
+    {
+      "id": "workers",
+      "label": "Import workers",
+      "kind": "compute",
+      "x": 37,
+      "y": 12,
+      "at": 2
+    },
+    {
+      "id": "db",
+      "label": "Target database",
+      "kind": "data",
+      "x": 62,
+      "y": 12,
+      "at": 2
+    },
+    {
+      "id": "report",
+      "label": "Error reports",
+      "kind": "data",
+      "x": 12,
+      "y": 12,
+      "at": 3
+    },
+    {
+      "id": "keys",
+      "label": "Idempotency keys",
+      "kind": "data",
+      "x": 62,
+      "y": 37,
+      "at": 4
+    },
+    {
+      "id": "sched",
+      "label": "Fair scheduler",
+      "kind": "compute",
+      "x": 12,
+      "y": 37,
+      "at": 5
+    },
+    {
+      "id": "export",
+      "label": "Export workers",
+      "kind": "compute",
+      "x": 87,
+      "y": 12,
+      "at": 6
+    },
+    {
+      "id": "links",
+      "label": "Signed links",
+      "kind": "edge",
+      "x": 87,
+      "y": 63,
+      "at": 6
+    }
+  ],
+  "edges": [
+    {
+      "from": "clients",
+      "to": "single",
+      "at": 0,
+      "until": 1
+    },
+    {
+      "from": "clients",
+      "to": "api",
+      "at": 1
+    },
+    {
+      "from": "api",
+      "to": "store",
+      "at": 1
+    },
+    {
+      "from": "api",
+      "to": "jobs",
+      "at": 2
+    },
+    {
+      "from": "api",
+      "to": "queue",
+      "at": 2
+    },
+    {
+      "from": "queue",
+      "to": "workers",
+      "at": 2,
+      "until": 5
+    },
+    {
+      "from": "store",
+      "to": "workers",
+      "at": 2
+    },
+    {
+      "from": "workers",
+      "to": "db",
+      "at": 2
+    },
+    {
+      "from": "workers",
+      "to": "jobs",
+      "at": 2
+    },
+    {
+      "from": "jobs",
+      "to": "hooks",
+      "at": 2
+    },
+    {
+      "from": "hooks",
+      "to": "clients",
+      "at": 2
+    },
+    {
+      "from": "workers",
+      "to": "report",
+      "at": 3
+    },
+    {
+      "from": "api",
+      "to": "keys",
+      "at": 4
+    },
+    {
+      "from": "workers",
+      "to": "keys",
+      "at": 4
+    },
+    {
+      "from": "queue",
+      "to": "sched",
+      "at": 5
+    },
+    {
+      "from": "sched",
+      "to": "workers",
+      "at": 5
+    },
+    {
+      "from": "db",
+      "to": "export",
+      "at": 6
+    },
+    {
+      "from": "export",
+      "to": "store",
+      "at": 6
+    },
+    {
+      "from": "store",
+      "to": "links",
+      "at": 6
+    },
+    {
+      "from": "links",
+      "to": "clients",
+      "at": 6
+    }
+  ],
+  "steps": [
+    {
+      "title": "Upload in small numbered chunks that can be resumed",
+      "problem": "A single request carrying 600 MB takes minutes, so any dropped connection, proxy timeout or phone going to sleep throws away everything sent so far.",
+      "fix": "The client first creates an upload session and learns the chunk size, for example 8 MB. It then sends each chunk with its number, straight into object storage, and every chunk is checked with a checksum. Sending the same chunk twice is harmless, because the chunk number decides where it is stored. After a failure the client asks the session which chunks it has and sends only the missing ones. When all are present the client says the upload is complete, and the server checks the count and a checksum of the whole file.",
+      "tradeoff": "A bad network costs a few chunks of re-sending rather than the whole file, and the API servers never hold the file. The protocol has more steps than a single POST, sessions that are never completed must be cleaned up after a day or so, and the client needs a little logic for resuming.",
+      "concepts": [
+        {
+          "slug": "idempotency"
+        },
+        {
+          "slug": "retries-and-backoff"
+        },
+        {
+          "slug": "api-styles"
+        },
+        {
+          "slug": "http-versions"
+        }
+      ]
+    },
+    {
+      "title": "Run the import as a background job with status and webhooks",
+      "problem": "Checking and writing two million rows takes minutes, far longer than a request should stay open, and the customer still wants to know how it is going.",
+      "fix": "Completing the upload creates a job record and puts a message on a queue, then answers at once with the job id. Workers take jobs from the queue, read the chunks from storage and update the job table with a state (queued, running, done, failed or cancelled) and a progress count. The customer can poll the job by id, or register a webhook, and a sender posts a signed message when the job ends and retries it with growing delays if the customer's server is down. Writing the state change and the event in one step, with an outbox, means a webhook is never lost or sent for a state that was not saved.",
+      "tradeoff": "Requests stay short and the system can absorb a burst by letting jobs wait. Customers must handle an asynchronous result, polling needs a sensible rate limit, and webhooks arrive at least once, so the receiver must tolerate a repeat.",
+      "concepts": [
+        {
+          "slug": "message-queues"
+        },
+        {
+          "slug": "webhooks"
+        },
+        {
+          "slug": "transactional-outbox"
+        },
+        {
+          "slug": "retries-and-backoff"
+        },
+        {
+          "slug": "api-styles"
+        }
+      ]
+    },
+    {
+      "title": "Validate while streaming and report every bad row",
+      "problem": "Loading the file into memory does not scale, and an import that stops at the first bad row, or hides bad rows, makes a huge file almost unusable.",
+      "fix": "A worker reads the chunks in order as a stream and checks each row against the schema: required columns, types, ranges, and references that must exist. A valid row is added to a batch of about 1,000 rows and written in one go. An invalid row is not written. It is recorded with its line number, the column and a clear reason into an error report, saved as a file next to the job. The customer chooses a policy: stop at the first error, stop after a fixed number, or import the good rows and report the rest.",
+      "tradeoff": "Memory stays constant, and the customer gets a precise list to fix and re-upload. Partial success needs a clear contract, because some rows are in and some are not, and checks that look at other rows, such as duplicate keys inside the file, need extra state or a second pass.",
+      "concepts": [
+        {
+          "slug": "backpressure"
+        },
+        {
+          "slug": "structured-logging"
+        },
+        {
+          "slug": "acid-vs-base"
+        },
+        {
+          "slug": "message-queues"
+        }
+      ]
+    },
+    {
+      "title": "Make every submit and every re-run idempotent",
+      "problem": "Clients time out and retry, workers crash after writing half a chunk, and customers upload the same fixed file again, so rows must never be duplicated.",
+      "fix": "The create request carries an idempotency key. The API stores it with the job id, and a second request with the same key returns the same job instead of starting another. Inside the job, each row is written as an upsert by its natural key (or by job id plus line number when there is none), so applying the same row again changes nothing. A job records the last chunk it finished, so a crashed job resumes from the next chunk rather than from the start, and re-running a whole file with the same content writes zero changes.",
+      "tradeoff": "Retries and re-runs are safe, and a crash costs at most one chunk of repeated work. Keys must be kept long enough to cover real retries, upserts cost a little more than plain inserts, and a re-run does not remove rows that were deleted from the file unless the contract says so.",
+      "concepts": [
+        {
+          "slug": "idempotency"
+        },
+        {
+          "slug": "acid-vs-base"
+        },
+        {
+          "slug": "retries-and-backoff"
+        },
+        {
+          "slug": "transactional-outbox"
+        }
+      ]
+    },
+    {
+      "title": "Share the workers fairly and push back when overloaded",
+      "problem": "If jobs are served in the order they arrive, one tenant that queues a 100 times bigger file makes everybody else wait for hours.",
+      "fix": "Each tenant has its own queue of chunks, not just of jobs. A scheduler takes turns between tenants that have work, handing out one chunk at a time, with weights for larger plans and a cap on how many workers one tenant can hold. When a tenant's queue or concurrent jobs exceed a limit, the API refuses new work with a 429 and a Retry-After header, so waiting is pushed back to the client instead of growing in memory. The pool of workers scales on the total number of waiting chunks.",
+      "tradeoff": "Small tenants start in seconds and the big tenant still makes steady progress. A big job takes longer than it would on an empty system, the scheduler is one more thing to tune, and limits need to be explained so a customer understands a 429.",
+      "concepts": [
+        {
+          "slug": "rate-limiting"
+        },
+        {
+          "slug": "backpressure"
+        },
+        {
+          "slug": "bulkhead"
+        },
+        {
+          "slug": "autoscaling"
+        },
+        {
+          "slug": "load-balancing"
+        }
+      ]
+    },
+    {
+      "title": "Generate big exports and hand out signed, expiring links",
+      "problem": "Exporting millions of rows as one response holds a connection open for minutes, and a permanent public file URL would let anyone with the link read a tenant's data forever.",
+      "fix": "An export is also a job. A worker reads the rows in pages from a replica, in a stable order, and writes compressed parts into object storage, updating progress as it goes. When it is done the customer is told by webhook or polling. The download link is a URL signed with a secret key that contains the object, the tenant and an expiry time of about 15 minutes. The customer downloads straight from storage or a CDN, so the API carries no bytes, and a fresh link can be requested at any time by someone who is allowed to.",
+      "tradeoff": "Exports never block the API or the primary database, and a leaked link is useful only for minutes. Files cost storage until they are deleted, a replica can be a little behind, and anyone holding a valid link can use it, so links must be short and the files must be deleted after a few days.",
+      "concepts": [
+        {
+          "slug": "authentication-and-authorization"
+        },
+        {
+          "slug": "cdn"
+        },
+        {
+          "slug": "secrets-management"
+        },
+        {
+          "slug": "encryption"
+        },
+        {
+          "slug": "database-replication"
+        }
+      ]
+    }
+  ],
+  "failures": [
+    {
+      "scenario": "A worker crashes in the middle of a chunk",
+      "impact": "Some of the chunk's rows are written and the rest are not, and the job seems to be stuck in the running state.",
+      "answer": "The job has a lease that the worker keeps renewing, and when it stops the message becomes visible on the queue again. Another worker restarts from the last finished chunk and applies the same chunk again, which is safe because every row is an upsert by key. Progress counts only whole chunks, so it never goes backwards.",
+      "concepts": [
+        {
+          "slug": "message-queues"
+        },
+        {
+          "slug": "idempotency"
+        },
+        {
+          "slug": "health-checks"
+        },
+        {
+          "slug": "retries-and-backoff"
+        }
+      ]
+    },
+    {
+      "scenario": "One tenant submits ten files of 5 GB each in a minute",
+      "impact": "Without limits the queue and the storage fill up, and the other tenants' jobs wait behind them.",
+      "answer": "The per-tenant limits refuse the extra imports with a 429 and a Retry-After, and the scheduler gives the tenant only its share of workers. The other tenants see no change in their start times. An alert tells the team when a tenant sits at its limit for a long time, so that support can raise it on purpose.",
+      "concepts": [
+        {
+          "slug": "rate-limiting"
+        },
+        {
+          "slug": "backpressure"
+        },
+        {
+          "slug": "bulkhead"
+        },
+        {
+          "slug": "alerting"
+        }
+      ]
+    },
+    {
+      "scenario": "The customer's webhook endpoint is down for an hour",
+      "impact": "The completion message cannot be delivered, and the customer's system never learns that the import finished.",
+      "answer": "The sender retries with exponential backoff and jitter for a day or more, and each message has a stable event id so the receiver can ignore repeats. Polling the job always gives the right answer, so the webhook is an optimisation rather than the only way to find out. After many failures the endpoint is marked unhealthy and the customer is notified.",
+      "concepts": [
+        {
+          "slug": "webhooks"
+        },
+        {
+          "slug": "retries-and-backoff"
+        },
+        {
+          "slug": "circuit-breaker"
+        },
+        {
+          "slug": "idempotency"
+        }
+      ]
+    },
+    {
+      "scenario": "A signed download link is posted in a public chat",
+      "impact": "Anyone who sees the link can download the tenant's data until it expires.",
+      "answer": "The link lives for about 15 minutes, which limits the exposure, and the signature covers the tenant and the file so it cannot be changed to read something else. Customers can revoke an export, which deletes the file or rotates the signing key for that tenant, and downloads are logged so unusual ones can be noticed. Very sensitive exports can require a login on top of the link.",
+      "concepts": [
+        {
+          "slug": "secrets-management"
+        },
+        {
+          "slug": "authentication-and-authorization"
+        },
+        {
+          "slug": "encryption"
+        },
+        {
+          "slug": "alerting"
+        }
+      ]
+    },
+    {
+      "scenario": "The same file is submitted twice by an impatient user",
+      "impact": "The customer's records could be doubled, or two jobs could write the same rows at once and fight over them.",
+      "answer": "With the same idempotency key the second request returns the first job. With a different key but the same content, the upserts make the second run change nothing, and a check on the file hash can tell the user that the same file is already being processed.",
+      "concepts": [
+        {
+          "slug": "idempotency"
+        },
+        {
+          "slug": "acid-vs-base"
+        },
+        {
+          "slug": "api-styles"
+        }
+      ]
+    }
+  ],
+  "alternatives": [
+    {
+      "title": "How a big file reaches the system",
+      "options": [
+        {
+          "name": "One request through the API",
+          "pro": "Simplest for the client",
+          "con": "Timeouts, no resume, and the API servers carry the bytes"
+        },
+        {
+          "name": "Chunks with a resumable session",
+          "pro": "Survives bad networks, and goes straight to storage",
+          "con": "A longer protocol and sessions to clean up"
+        },
+        {
+          "name": "A signed URL to upload directly to object storage",
+          "pro": "The API sees no bytes at all and the provider handles resuming",
+          "con": "Less control over checks during the upload, and tied to the provider"
+        }
+      ],
+      "pick": "Resumable chunks, using signed upload URLs for each chunk when the storage provider supports it."
+    },
+    {
+      "title": "How the customer finds out the result",
+      "options": [
+        {
+          "name": "Polling only",
+          "pro": "Simple and nothing for the customer to host",
+          "con": "Wasted requests, and a delay between polls"
+        },
+        {
+          "name": "Webhooks only",
+          "pro": "Immediate",
+          "con": "Lost if the endpoint is down, and hard to test"
+        },
+        {
+          "name": "Both",
+          "pro": "Immediate in the usual case, and always recoverable",
+          "con": "Two paths to maintain"
+        }
+      ],
+      "pick": "Both: a webhook as a hint and a job status endpoint as the truth."
+    },
+    {
+      "title": "What an import does with bad rows",
+      "options": [
+        {
+          "name": "All or nothing",
+          "pro": "Simple to reason about, since the data is either in or not",
+          "con": "One bad row in a million blocks the whole file, and a huge transaction"
+        },
+        {
+          "name": "Good rows in, bad rows reported",
+          "pro": "Fast progress, and the customer fixes only the bad rows",
+          "con": "Partial results need a clear contract"
+        },
+        {
+          "name": "Stop at a threshold",
+          "pro": "Catches a file in the wrong format early",
+          "con": "One more setting to explain"
+        }
+      ],
+      "pick": "Import the good rows and report the bad, with an optional threshold that stops a clearly wrong file."
+    },
+    {
+      "title": "How to share workers between tenants",
+      "options": [
+        {
+          "name": "First come, first served",
+          "pro": "Nothing to build",
+          "con": "One big tenant makes the rest wait"
+        },
+        {
+          "name": "Taking turns by chunk",
+          "pro": "Small jobs finish quickly, and it is simple to explain",
+          "con": "A big job is slower than on an empty system"
+        },
+        {
+          "name": "A dedicated pool for each large tenant",
+          "pro": "Strong isolation",
+          "con": "Idle workers cost money, and it needs a worker for every tenant"
+        }
+      ],
+      "pick": "Take turns by chunk with weights and a per-tenant cap, and dedicated pools only for the few largest customers."
+    }
+  ],
+  "roles": [
+    {
+      "id": "client",
+      "label": "Customer apps",
+      "description": "Upload chunks, poll jobs and download files."
+    },
+    {
+      "id": "edge",
+      "label": "Entry points",
+      "description": "The import API and the signed download links."
+    },
+    {
+      "id": "async",
+      "label": "Queues and webhooks",
+      "description": "The job queue and the sender of completion events."
+    },
+    {
+      "id": "compute",
+      "label": "Workers",
+      "description": "Import and export workers and the fair scheduler."
+    },
+    {
+      "id": "data",
+      "label": "State",
+      "description": "Chunk storage, the job table, error reports and the target database."
+    }
+  ]
+}

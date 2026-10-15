@@ -1,0 +1,64 @@
+{
+  "actors": [
+    { "id": "ana", "label": "Ana (bidding)", "role": "client", "x": 14, "y": 16 },
+    { "id": "api", "label": "Bid API", "role": "edge", "x": 38, "y": 16 },
+    { "id": "proxy", "label": "Proxy bidding", "role": "compute", "x": 62, "y": 16 },
+    { "id": "store", "label": "Auction row", "role": "data", "x": 86, "y": 16 },
+    { "id": "cy", "label": "Cy (also bidding)", "role": "client", "x": 14, "y": 50 },
+    { "id": "ledger", "label": "Bid ledger", "role": "data", "x": 62, "y": 50 },
+    { "id": "sched", "label": "Close scheduler", "role": "async", "x": 86, "y": 50 },
+    { "id": "watchers", "label": "Watchers", "role": "client", "x": 14, "y": 84 },
+    { "id": "push", "label": "Push gateway", "role": "edge", "x": 38, "y": 84 },
+    { "id": "closer", "label": "Close worker", "role": "compute", "x": 62, "y": 84 },
+    { "id": "orders", "label": "Orders", "role": "data", "x": 86, "y": 84 }
+  ],
+  "frames": [
+    {
+      "narration": "An auction ends at 12:00:00. Ben leads with a hidden maximum of 150, the price is 100 and the increment is 5. At 11:58:30, 90 seconds before the end, Ana bids a maximum of 200. She saw version 41 of the auction row.",
+      "messages": [{ "from": "ana", "to": "api", "label": "max 200, saw v41" }],
+      "states": { "store": "v41: price 100, Ben leads" }
+    },
+    {
+      "narration": "The API checks that the auction is open and that 200 is at least the price plus one increment, then hands the bid to the proxy bidding rules.",
+      "messages": [{ "from": "api", "to": "proxy", "label": "bid 200 on v41" }],
+      "states": { "api": "open, 200 is at least 105" }
+    },
+    {
+      "narration": "Ana's maximum beats Ben's 150, so she becomes the leader and the price is Ben's maximum plus one increment: 155. The write succeeds only because the row is still at version 41. It also sees that only 90 seconds are left, less than the 120 second window, so it moves the end time to 12:00:30. Ben's maximum is never shown to anyone.",
+      "messages": [{ "from": "proxy", "to": "store", "label": "if v41: Ana, 155, end 12:00:30, v42" }],
+      "states": { "store": "v42: price 155, Ana leads, ends 12:00:30" },
+      "highlight": ["store"]
+    },
+    {
+      "narration": "At the same instant Cy also saw version 41 and bids a maximum of 160. The row is already at version 42, so Cy's conditional write matches nothing and is refused as a conflict. Only one of two simultaneous bids can win the race.",
+      "messages": [{ "from": "cy", "to": "api", "label": "max 160, saw v41" }, { "from": "api", "to": "cy", "label": "conflict, now v42" }],
+      "states": { "cy": "conflict, retrying" }
+    },
+    {
+      "narration": "Cy re-reads the row. His maximum of 160 is above the new price plus an increment, so the retry is accepted, but it does not beat Ana's 200. Ana stays the leader and the price rises to 165, which is Cy's maximum plus one increment. Because 119 seconds are left, the end time moves again, to 12:00:31.",
+      "messages": [{ "from": "cy", "to": "store", "label": "retry: max 160 on v42" }],
+      "states": { "store": "v43: price 165, Ana leads, ends 12:00:31" }
+    },
+    {
+      "narration": "Each accepted bid is appended to the ledger with its sequence number, server time and a hash of the entry before it, so that the history can be replayed and cannot be quietly edited. A bid event is published for the auction.",
+      "messages": [{ "from": "store", "to": "ledger", "label": "bids #42 and #43" }, { "from": "ledger", "to": "push", "label": "event v43" }],
+      "states": { "ledger": "2 new entries, chained" }
+    },
+    {
+      "narration": "The push gateway sends the latest state to everyone watching: price 165, Ana leading, ends 12:00:31. It batches, so a burst of bids in one moment becomes one message with the highest version. The scheduler also re-arms its timer for the new end time.",
+      "messages": [{ "from": "push", "to": "watchers", "label": "v43: 165, ends 12:00:31" }, { "from": "store", "to": "sched", "label": "end moved to 12:00:31" }],
+      "states": { "watchers": "price 165" },
+      "highlight": ["watchers"]
+    },
+    {
+      "narration": "No one bids again. At 12:00:31 the scheduler hands the auction to a close worker. The job is delivered twice because of a retry.",
+      "messages": [{ "from": "sched", "to": "closer", "label": "close auction (twice)" }]
+    },
+    {
+      "narration": "The worker closes the auction with one conditional write: open to closed, only if the version is still 43 and the end time has passed. One delivery wins. The other finds the auction already closed and does nothing. The order for Ana at 165 is created with the auction id as its key, so there is exactly one.",
+      "messages": [{ "from": "closer", "to": "store", "label": "if v43 and ended: closed" }, { "from": "closer", "to": "orders", "label": "order for Ana, 165" }],
+      "states": { "store": "closed, winner Ana, 165", "orders": "1 order" },
+      "highlight": ["orders"]
+    }
+  ]
+}
