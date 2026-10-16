@@ -48,6 +48,13 @@ const concepts = defineCollection({
     pitfalls: z.array(z.string()),
     related: z.array(z.object({ kind: z.enum(['concept', 'pattern']), slug: z.string() })).default([]),
     roles: z.array(z.object({ id: z.string(), label: z.string(), description: z.string() })),
+    // Self-check shown at the end of the page: scenario questions with one best answer each.
+    quiz: z.array(z.object({
+      question: z.string(),
+      options: z.array(z.string()).length(4),
+      answer: z.number().int().min(0).max(3),
+      explanation: z.string(),
+    })).min(3).max(3).optional(),
   }),
 });
 

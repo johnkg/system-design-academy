@@ -3,8 +3,8 @@
 // and any control inside a playground that throws when set to each of its options.
 //
 // Usage (after `npm run build`): node scripts/smoke-pages.mjs [--only substring] [--no-axe]
-// Needs Playwright with a Chromium browser. CI installs it with `npm install --no-save playwright`;
-// it is deliberately not a dependency of the site.
+// Needs Playwright (with a Chromium browser) and axe-core. CI installs both with `npm install --no-save playwright axe-core`;
+// they are deliberately not dependencies of the site. `--font "DejaVu Sans"` forces a wider font to mimic a CI runner or an Android phone.
 import { createRequire } from 'node:module';
 import { spawn } from 'node:child_process';
 import { existsSync, readdirSync, readFileSync, statSync } from 'node:fs';
@@ -12,7 +12,7 @@ import { join, relative } from 'node:path';
 
 const args = process.argv.slice(2);
 const only = args.includes('--only') ? args[args.indexOf('--only') + 1] : '';
-const useAxe = !args.includes('--no-axe');
+const font = args.includes('--font') ? args[args.indexOf('--font') + 1] : '';
 const root = new URL('..', import.meta.url).pathname;
 const dist = join(root, 'dist');
 if (!existsSync(dist)) { console.error('No dist/ folder: run `npm run build` first.'); process.exit(2); }
@@ -26,7 +26,11 @@ const load = (id) => {
 const playwright = load('playwright');
 if (!playwright) { console.error('Playwright is not installed (npm install --no-save playwright).'); process.exit(2); }
 let axeSource = '';
-try { axeSource = readFileSync(join(root, 'node_modules/axe-core/axe.min.js'), 'utf8'); } catch { console.warn('! axe-core not found: accessibility checks skipped'); }
+try { axeSource = readFileSync(join(root, 'node_modules/axe-core/axe.min.js'), 'utf8'); } catch {
+  // Without axe the accessibility half of this check silently disappears, so a CI run must fail instead of passing quietly.
+  console.error('axe-core not found: run `npm install --no-save axe-core` (or pass --no-axe to skip accessibility checks).');
+  if (!args.includes('--no-axe')) process.exit(2);
+}
 
 // Every built page, as a URL path.
 const pages = [];
@@ -79,6 +83,7 @@ async function check(path) {
     page.on('console', (m) => { if (m.type() === 'error') problems.push(`[${width}] console error: ${m.text().slice(0, 160)}`); });
     try {
       await page.goto(origin + base + path, { waitUntil: 'load' });
+      if (font) await page.addStyleTag({ content: `html, body, button, input, select, textarea { font-family: '${font}', sans-serif !important }` });
       await exercise(page);
       if (await page.evaluate(() => document.documentElement.scrollWidth > document.documentElement.clientWidth)) problems.push(`[${width}] horizontal scroll`);
       if (axeSource && width === 1280) {
