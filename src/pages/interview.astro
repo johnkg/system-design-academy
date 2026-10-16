@@ -1,0 +1,184 @@
+---
+import { getCollection } from 'astro:content';
+import Layout from '../layouts/Layout.astro';
+import { url } from '../lib';
+
+// A timed mock interview: one case study's task, split into the usual stages of a design interview.
+const studies = (await getCollection('studies')).map((s) => ({
+  slug: s.id, name: s.data.name, level: s.data.difficulty, prompt: s.data.prompt, href: url(`case-studies/${s.id}/`),
+  moves: s.data.steps.map((x) => x.title),
+})).sort((a, b) => a.name.localeCompare(b.name));
+const payload = JSON.stringify(studies).replace(/</g, '\\u003c');
+const stages = [
+  { id: 'clarify', title: 'Clarify', share: 10, hint: 'Ask about users, scale, the read to write ratio and what must never go wrong. State your assumptions out loud.' },
+  { id: 'estimate', title: 'Estimate', share: 10, hint: 'Requests per second at peak, data stored per year, bandwidth. Round hard and show the arithmetic.' },
+  { id: 'design', title: 'High-level design', share: 35, hint: 'Boxes and arrows, the main API calls and the data model. Start with the simplest thing that could work.' },
+  { id: 'deep', title: 'Deep dive', share: 30, hint: 'Pick the part that breaks first, say why, and fix it. Name the trade-off you are accepting.' },
+  { id: 'wrap', title: 'Wrap up', share: 15, hint: 'What fails and what the user sees, what you would monitor, and what you would build next.' },
+];
+---
+<Layout title="Mock interview | System Design Academy" description="A timed practice interview: a random case study task split into clarify, estimate, design, deep dive and wrap-up stages.">
+  <section class="hero">
+    <h1>Mock interview</h1>
+    <p class="lede">Get a task, a clock and five stages. Write what you would say, then compare with the case study. Notes stay in this browser.</p>
+  </section>
+
+  <div class="card panel" data-setup>
+    <div class="row"><label for="level">Level</label>
+      <select id="level" class="pg-in" data-level>
+        <option value="any">Any</option><option value="beginner">Beginner</option><option value="intermediate">Intermediate</option><option value="advanced">Advanced</option>
+      </select></div>
+    <div class="row"><label for="minutes">Time</label>
+      <select id="minutes" class="pg-in" data-minutes>
+        <option value="30">30 minutes</option><option value="45" selected>45 minutes</option><option value="60">60 minutes</option>
+      </select></div>
+    <div class="row"><label for="skip">Pick from</label>
+      <select id="skip" class="pg-in" data-skip>
+        <option value="unfinished">Case studies I have not finished</option><option value="all">All case studies</option>
+      </select></div>
+    <div class="actions"><button type="button" class="btn pg-primary" data-draw>Draw a task</button></div>
+  </div>
+
+  <div class="card panel" data-run hidden>
+    <h2 data-name></h2>
+    <p class="task" data-task></p>
+    <p class="clock"><span class="time" data-time>00:00</span> <span class="stage-name" data-stage-name></span></p>
+    <p class="note" data-announce aria-live="polite"></p>
+    <div class="actions">
+      <button type="button" class="btn pg-primary" data-toggle>Start the clock</button>
+      <button type="button" class="btn" data-next-stage>Next stage</button>
+      <button type="button" class="btn" data-finish>Finish</button>
+    </div>
+    <div class="stages">
+      {stages.map((st) => (
+        <section class="stage" data-stage={st.id} data-share={st.share}>
+          <h3><span data-stage-title>{st.title}</span> <small data-stage-len></small></h3>
+          <p class="hint">{st.hint}</p>
+          <label class="sr" for={`n-${st.id}`}>{st.title} notes</label>
+          <textarea id={`n-${st.id}`} class="pg-in notes" rows="4" data-notes={st.id}></textarea>
+        </section>
+      ))}
+    </div>
+  </div>
+
+  <div class="card panel" data-done hidden tabindex="-1">
+    <h2>Time is up, or you finished</h2>
+    <p>Now compare with the real design. Tick the moves your notes already had:</p>
+    <ul class="moves" data-moves></ul>
+    <p data-score aria-live="polite"></p>
+    <div class="actions">
+      <a class="btn pg-primary" data-open href={url('case-studies/')}>Open the case study</a>
+      <button type="button" class="btn" data-again>Draw another task</button>
+    </div>
+  </div>
+  <script type="application/json" id="interview-data" set:html={payload}></script>
+</Layout>
+<script>
+  interface S { slug: string; name: string; level: string; prompt: string; href: string; moves: string[] }
+  const all: S[] = JSON.parse(document.getElementById('interview-data')!.textContent!);
+  const $ = <T extends HTMLElement>(s: string) => document.querySelector<T>(s)!;
+  const get = (k: string) => { try { return localStorage.getItem(k); } catch { return null; } };
+  const set = (k: string, v: string | null) => { try { v === null ? localStorage.removeItem(k) : localStorage.setItem(k, v); } catch { /* storage blocked */ } };
+  const setup = $('[data-setup]'), run = $('[data-run]'), done = $('[data-done]');
+  const stageEls = [...document.querySelectorAll<HTMLElement>('[data-stage]')];
+  const fmt = (s: number) => `${String(Math.floor(s / 60)).padStart(2, '0')}:${String(Math.floor(s % 60)).padStart(2, '0')}`;
+
+  let study: S, total = 0, left = 0, timer = 0, stage = 0, running = false;
+  const bounds = () => { let acc = 0; return stageEls.map((e) => (acc += Number(e.dataset.share) / 100 * total)); }; // seconds elapsed at which each stage ends
+
+  function draw(slug?: string) {
+    const level = $<HTMLSelectElement>('[data-level]').value, unfinished = $<HTMLSelectElement>('[data-skip]').value === 'unfinished';
+    const doneKeys: string[] = (() => { try { return JSON.parse(get('sda-progress') ?? '[]'); } catch { return []; } })();
+    let pool = all.filter((s) => (level === 'any' || s.level === level) && (!unfinished || !doneKeys.includes(`studies/${s.slug}`)));
+    if (!pool.length) pool = all.filter((s) => level === 'any' || s.level === level);
+    study = (slug && all.find((s) => s.slug === slug)) || pool[Math.floor(Math.random() * pool.length)];
+    total = Number($<HTMLSelectElement>('[data-minutes]').value) * 60; left = total; stage = 0; running = false;
+    $('[data-name]').textContent = study.name; $('[data-task]').textContent = study.prompt;
+    stageEls.forEach((e) => {
+      const mins = Math.max(1, Math.round(Number(e.dataset.share) / 100 * total / 60));
+      e.querySelector('[data-stage-len]')!.textContent = `about ${mins} min`;
+      const ta = e.querySelector<HTMLTextAreaElement>('textarea')!; ta.value = get(`sda-interview/${study.slug}/${e.dataset.stage}`) ?? '';
+    });
+    setup.hidden = true; done.hidden = true; run.hidden = false;
+    $('[data-toggle]').textContent = 'Start the clock';
+    show(); $('[data-name]').scrollIntoView({ block: 'start' });
+    history.replaceState(null, '', `?study=${study.slug}&min=${total / 60}`);
+  }
+
+  function show() {
+    $('[data-time]').textContent = fmt(left);
+    stageEls.forEach((e, i) => e.classList.toggle('is-now', i === stage));
+    $('[data-stage-name]').textContent = `Stage ${stage + 1} of ${stageEls.length}: ${stageEls[stage].querySelector('[data-stage-title]')!.textContent}`;
+    ($('[data-next-stage]') as HTMLButtonElement).disabled = stage >= stageEls.length - 1;
+  }
+  function announce(msg: string) { $('[data-announce]').textContent = msg; }
+
+  function tick() {
+    left = Math.max(0, left - 1);
+    const elapsed = total - left, ends = bounds();
+    while (stage < stageEls.length - 1 && elapsed >= ends[stage]) { stage++; announce(`Time for stage ${stage + 1}: ${stageEls[stage].querySelector('[data-stage-title]')!.textContent}.`); }
+    if (left === 300 && total > 600) announce('Five minutes left.');
+    show();
+    if (!left) finish();
+  }
+
+  function toggle() {
+    running = !running;
+    $('[data-toggle]').textContent = running ? 'Pause' : 'Resume';
+    if (running) timer = window.setInterval(tick, 1000); else clearInterval(timer);
+  }
+
+  function finish() {
+    clearInterval(timer); running = false;
+    run.hidden = true; done.hidden = false;
+    const list = $('[data-moves]'); list.replaceChildren();
+    study.moves.forEach((m, i) => {
+      const li = document.createElement('li'), l = document.createElement('label'), c = document.createElement('input'); c.type = 'checkbox'; c.dataset.move = String(i);
+      const span = document.createElement('span'); span.textContent = m; l.append(c, ' ', span); li.append(l); list.append(li);
+    });
+    $('[data-score]').textContent = '';
+    $<HTMLAnchorElement>('[data-open]').href = study.href;
+    done.focus();
+  }
+
+  stageEls.forEach((e) => e.querySelector('textarea')!.addEventListener('input', (ev) => set(`sda-interview/${study.slug}/${e.dataset.stage}`, (ev.target as HTMLTextAreaElement).value)));
+  $('[data-draw]').addEventListener('click', () => draw());
+  $('[data-toggle]').addEventListener('click', toggle);
+  $('[data-next-stage]').addEventListener('click', () => { if (stage < stageEls.length - 1) { stage++; show(); announce(`Stage ${stage + 1}.`); } });
+  $('[data-finish]').addEventListener('click', finish);
+  $('[data-again]').addEventListener('click', () => { done.hidden = true; setup.hidden = false; history.replaceState(null, '', location.pathname); $('[data-draw]').focus(); });
+  done.addEventListener('change', () => {
+    const boxes = [...done.querySelectorAll<HTMLInputElement>('[data-move]')], hit = boxes.filter((b) => b.checked).length;
+    $('[data-score]').textContent = hit ? `Your answer had ${hit} of ${boxes.length} design moves.` : '';
+  });
+
+  const q = new URLSearchParams(location.search);
+  if (q.get('study') && all.some((s) => s.slug === q.get('study'))) {
+    if (['30', '45', '60'].includes(q.get('min') ?? '')) $<HTMLSelectElement>('[data-minutes]').value = q.get('min')!;
+    draw(q.get('study')!);
+  }
+</script>
+<style>
+  .hero { padding: 2.5rem 0 1rem; }
+  h1 { font-size: clamp(1.8rem, 5vw, 2.6rem); margin: 0 0 .4rem; }
+  .panel { display: grid; grid-template-columns: minmax(0, 1fr); gap: 12px; margin-bottom: 3rem; }
+  .panel h2 { margin: 0; font-size: 1.25rem; }
+  .row { display: flex; flex-wrap: wrap; gap: 8px 10px; align-items: center; }
+  .row select { max-width: 100%; }
+  .actions { display: flex; gap: 8px; flex-wrap: wrap; }
+  .task { margin: 0; background: var(--accent-soft); padding: 10px 14px; border-radius: 10px; overflow-wrap: anywhere; }
+  .clock { margin: 0; display: flex; flex-wrap: wrap; gap: 4px 14px; align-items: baseline; }
+  .time { font: 700 2.2rem ui-monospace, monospace; }
+  .stage-name { font-weight: 600; }
+  .note, .hint { margin: 0; color: var(--muted); min-height: 1.2em; }
+  .stages { display: grid; gap: 10px; }
+  .stage { border: 1px solid var(--border); border-radius: 10px; padding: 8px 14px 12px; display: grid; gap: 6px; min-width: 0; }
+  .stage.is-now { border-color: var(--accent); box-shadow: inset 4px 0 0 var(--accent); }
+  .stage h3 { margin: 0; font-size: 1.05rem; }
+  .stage small { color: var(--muted); font-weight: 400; }
+  .notes { width: 100%; font-family: inherit; resize: vertical; box-sizing: border-box; }
+  .moves { list-style: none; margin: 0; padding: 0; display: grid; gap: 6px; }
+  .moves :global(label) { display: flex; gap: 8px; align-items: flex-start; }
+  .moves :global(span) { min-width: 0; overflow-wrap: anywhere; }
+  [data-done]:focus { outline: none; }
+</style>
