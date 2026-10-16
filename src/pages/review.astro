@@ -1,0 +1,210 @@
+---
+import { getCollection } from 'astro:content';
+import Layout from '../layouts/Layout.astro';
+import { url } from '../lib';
+
+// Spaced review over every quiz question on the site. Which questions are due lives in this browser (see sdaReview in the layout).
+interface Q { id: string; title: string; href: string; question: string; options: string[]; answer: number; explanation: string }
+const questions: Q[] = [];
+for (const [collection, key, dir] of [['concepts', 'concepts', 'concepts'], ['patterns', 'patterns', 'patterns'], ['studies', 'studies', 'case-studies']] as const) {
+  for (const e of await getCollection(collection)) {
+    (e.data.quiz ?? []).forEach((q, i) => questions.push({ id: `${key}/${e.id}#${i}`, title: e.data.name, href: url(`${dir}/${e.id}/#quiz`), ...q }));
+  }
+}
+const payload = JSON.stringify(questions).replace(/</g, '\\u003c');
+---
+<Layout title="Review | System Design Academy" description="Spaced review: short scenario questions from the topics you have finished, brought back just before you would forget them.">
+  <section class="hero">
+    <h1>Review</h1>
+    <p class="lede">Ten questions at a time. Right answers come back after a longer gap, wrong ones tomorrow. It stays in this browser; nothing is sent anywhere.</p>
+  </section>
+
+  <div class="card panel" data-setup>
+    <p class="stats" data-stats aria-live="polite"></p>
+    <div class="row">
+      <label for="scope">Questions from</label>
+      <select id="scope" class="pg-in" data-scope>
+        <option value="done">Topics I marked done</option>
+        <option value="all">Everything</option>
+      </select>
+    </div>
+    <div class="actions">
+      <button type="button" class="btn pg-primary" data-start>Start review</button>
+      <button type="button" class="btn" data-reset>Forget my review history</button>
+    </div>
+    <p class="note" data-note></p>
+  </div>
+
+  <div class="card panel" data-session hidden>
+    <p class="progress" data-progress></p>
+    <fieldset class="q" data-fieldset>
+      <legend tabindex="-1" data-legend></legend>
+      <div data-options></div>
+    </fieldset>
+    <p class="fb" data-fb hidden></p>
+    <div class="actions">
+      <button type="button" class="btn pg-primary" data-check>Check</button>
+      <button type="button" class="btn pg-primary" data-next hidden>Next</button>
+    </div>
+    <p class="note" data-warn aria-live="polite"></p>
+  </div>
+
+  <div class="card panel" data-summary hidden tabindex="-1">
+    <h2>Session done</h2>
+    <p data-result aria-live="polite"></p>
+    <div data-missed hidden>
+      <h3>Worth another look</h3>
+      <ul data-missed-list></ul>
+    </div>
+    <div class="actions">
+      <button type="button" class="btn pg-primary" data-again>Another round</button>
+      <a class="btn" href={url('')}>Back to the catalog</a>
+    </div>
+  </div>
+  <script type="application/json" id="review-data" set:html={payload}></script>
+</Layout>
+<script>
+  interface Q { id: string; title: string; href: string; question: string; options: string[]; answer: number; explanation: string }
+  const all: Q[] = JSON.parse(document.getElementById('review-data')!.textContent!);
+  const $ = <T extends HTMLElement>(s: string) => document.querySelector<T>(s)!;
+  const review = (window as any).sdaReview;
+  const progress = (window as any).sdaProgress;
+  const SIZE = 10;
+  const scopeSel = $<HTMLSelectElement>('[data-scope]');
+  const setup = $('[data-setup]'), session = $('[data-session]'), summary = $('[data-summary]');
+  const topicOf = (id: string) => id.slice(0, id.indexOf('#'));
+
+  const shuffle = <T,>(a: T[]) => { const b = [...a]; for (let i = b.length - 1; i > 0; i--) { const j = Math.floor(Math.random() * (i + 1)); [b[i], b[j]] = [b[j], b[i]]; } return b; };
+  const doneTopics = () => new Set<string>(progress?.list?.() ?? []);
+
+  function pool() {
+    const hist = review.load();
+    if (scopeSel.value === 'all') return all;
+    const done = doneTopics();
+    return all.filter((q) => done.has(topicOf(q.id)) || hist[q.id]);
+  }
+
+  function plan(practiceAnyway = false) {
+    const hist = review.load(), today = review.today(), p = pool();
+    const due = p.filter((q) => hist[q.id] && hist[q.id].d <= today).sort((a, b) => hist[a.id].d - hist[b.id].d);
+    const fresh = shuffle(p.filter((q) => !hist[q.id]));
+    let list = [...due, ...fresh].slice(0, SIZE);
+    if (!list.length && practiceAnyway) list = shuffle(p).slice(0, SIZE);
+    return { p, due: due.length, fresh: fresh.length, list };
+  }
+
+  function showSetup() {
+    const { p, due, fresh } = plan();
+    const hist = review.load();
+    const known = p.filter((q) => hist[q.id] && hist[q.id].b >= 3).length;
+    $('[data-stats]').textContent = p.length
+      ? `${p.length} questions in this pool: ${due} due now, ${fresh} not seen yet, ${known} well remembered.`
+      : 'No questions in this pool yet.';
+    $('[data-note]').textContent = p.length ? '' : 'Mark some concepts as done (or take a concept quiz), or switch to Everything.';
+    ($('[data-start]') as HTMLButtonElement).disabled = !p.length;
+    setup.hidden = false; session.hidden = true; summary.hidden = true;
+  }
+
+  let practice = false, queue: Q[] = [], index = 0, right = 0, missed: Q[] = [], checked = false;
+
+  function start() {
+    const { list } = plan();
+    practice = !list.length;
+    queue = practice ? plan(true).list : list;
+    if (!queue.length) return;
+    index = 0; right = 0; missed = [];
+    setup.hidden = true; summary.hidden = true; session.hidden = false;
+    show();
+  }
+
+  function show() {
+    const q = queue[index];
+    checked = false;
+    $('[data-progress]').textContent = `${practice ? 'Nothing is due, so this is practice. ' : ''}Question ${index + 1} of ${queue.length}, from ${q.title}`;
+    const legend = $('[data-legend]');
+    legend.textContent = q.question;
+    const box = $('[data-options]');
+    box.replaceChildren(...q.options.map((o, j) => {
+      const label = document.createElement('label'); label.className = 'opt';
+      const input = document.createElement('input'); input.type = 'radio'; input.name = 'ans'; input.value = String(j);
+      const span = document.createElement('span'); span.textContent = o;
+      label.append(input, ' ', span);
+      return label;
+    }));
+    $('[data-fb]').hidden = true;
+    $('[data-warn]').textContent = '';
+    ($('[data-check]') as HTMLElement).hidden = false;
+    ($('[data-next]') as HTMLElement).hidden = true;
+    ($('[data-next]') as HTMLElement).textContent = index === queue.length - 1 ? 'Finish' : 'Next';
+    legend.focus();
+  }
+
+  function check() {
+    if (checked) return;
+    const picked = document.querySelector<HTMLInputElement>('[data-options] input:checked');
+    if (!picked) { $('[data-warn]').textContent = 'Pick an answer first.'; return; }
+    checked = true;
+    const q = queue[index], choice = Number(picked.value), ok = choice === q.answer;
+    if (ok) right++; else missed.push(q);
+    review.record(q.id, ok);
+    const opts = [...document.querySelectorAll<HTMLElement>('[data-options] .opt')];
+    opts.forEach((o, j) => { o.classList.toggle('is-right', j === q.answer); o.classList.toggle('is-wrong', j === choice && !ok); (o.querySelector('input') as HTMLInputElement).disabled = true; });
+    const fb = $('[data-fb]');
+    fb.textContent = ok ? `Correct. ${q.explanation}` : `Not quite. The best answer is: "${q.options[q.answer].replace(/[.]$/, '')}". ${q.explanation}`;
+    fb.classList.toggle('bad', !ok);
+    fb.hidden = false;
+    ($('[data-check]') as HTMLElement).hidden = true;
+    const next = $('[data-next]'); next.hidden = false; next.focus();
+  }
+
+  function next() {
+    if (index < queue.length - 1) { index++; show(); return; }
+    session.hidden = true; summary.hidden = false;
+    $('[data-result]').textContent = `${right} of ${queue.length} right.${missed.length ? ' The ones you missed come back tomorrow.' : ' Nothing to repeat tomorrow.'}`;
+    const seen = new Set<string>();
+    const list = $('[data-missed-list]'); list.replaceChildren();
+    for (const q of missed) {
+      if (seen.has(topicOf(q.id))) continue; seen.add(topicOf(q.id));
+      const li = document.createElement('li'), a = document.createElement('a'); a.href = q.href; a.textContent = q.title; li.append(a); list.append(li);
+    }
+    $('[data-missed]').hidden = !missed.length;
+    summary.focus();
+  }
+
+  $('[data-start]').addEventListener('click', start);
+  $('[data-check]').addEventListener('click', check);
+  $('[data-next]').addEventListener('click', next);
+  $('[data-again]').addEventListener('click', () => { showSetup(); $('[data-start]').focus(); });
+  $('[data-reset]').addEventListener('click', () => {
+    if (confirm('Forget which questions you have answered? Your done marks and notes stay.')) { review.clear(); showSetup(); }
+  });
+  scopeSel.addEventListener('change', showSetup);
+  document.addEventListener('keydown', (e) => {
+    if (session.hidden || e.key !== 'Enter' || (e.target as HTMLElement).tagName === 'BUTTON') return;
+    e.preventDefault(); checked ? next() : check();
+  });
+  if (!doneTopics().size && !Object.keys(review.load()).length) scopeSel.value = 'all';
+  showSetup();
+</script>
+<style>
+  .hero { padding: 2.5rem 0 1rem; }
+  h1 { font-size: clamp(1.8rem, 5vw, 2.6rem); margin: 0 0 .4rem; }
+  .panel { display: grid; grid-template-columns: minmax(0, 1fr); gap: 14px; margin-bottom: 3rem; }
+  .stats, .note, .progress { margin: 0; color: var(--muted); }
+  .row { display: flex; flex-wrap: wrap; gap: 10px; align-items: center; }
+  .row select { max-width: 100%; }
+  .actions { display: flex; gap: 8px; flex-wrap: wrap; }
+  .q { border: 1px solid var(--border); border-radius: 10px; padding: 10px 14px 12px; margin: 0; display: grid; gap: 8px; min-width: 0; }
+  .q legend { font-weight: 600; padding: 0 6px; max-width: 100%; overflow-wrap: anywhere; }
+  [data-options] { display: grid; gap: 8px; }
+  :global(.panel .opt) { display: flex; gap: 10px; align-items: flex-start; padding: 6px 10px; border: 1px solid var(--border); border-radius: 8px; cursor: pointer; background: var(--surface); }
+  :global(.panel .opt input) { margin-top: .35em; flex: none; }
+  :global(.panel .opt span) { min-width: 0; overflow-wrap: anywhere; }
+  :global(.panel .opt:hover) { background: var(--surface-2); }
+  :global(.panel .opt.is-right) { border-color: var(--good); box-shadow: inset 4px 0 0 var(--good); }
+  :global(.panel .opt.is-wrong) { border-color: var(--bad); box-shadow: inset 4px 0 0 var(--bad); }
+  .fb { margin: 0; padding: 8px 12px; border-radius: 8px; background: var(--accent-soft); overflow-wrap: anywhere; }
+  .fb.bad { background: color-mix(in srgb, var(--bad) 12%, var(--surface)); }
+  [data-summary] ul { margin: 0; padding-left: 1.2rem; }
+  [data-summary]:focus { outline: none; }
+</style>

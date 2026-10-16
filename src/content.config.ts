@@ -1,6 +1,14 @@
 import { defineCollection, z } from 'astro:content';
 import { glob } from 'astro/loaders';
 
+// Self-check shown at the end of a page: scenario questions with one best answer each (three per page).
+const quizSchema = z.array(z.object({
+  question: z.string(),
+  options: z.array(z.string()).length(4),
+  answer: z.number().int().min(0).max(3),
+  explanation: z.string(),
+})).min(3).max(3).optional();
+
 const patterns = defineCollection({
   // One folder per pattern; the folder name is the slug.
   loader: glob({
@@ -23,6 +31,7 @@ const patterns = defineCollection({
     pitfalls: z.array(z.string()),
     related: z.array(z.string()).default([]),
     roles: z.array(z.object({ id: z.string(), label: z.string(), description: z.string() })),
+    quiz: quizSchema,
   }),
 });
 
@@ -48,13 +57,7 @@ const concepts = defineCollection({
     pitfalls: z.array(z.string()),
     related: z.array(z.object({ kind: z.enum(['concept', 'pattern']), slug: z.string() })).default([]),
     roles: z.array(z.object({ id: z.string(), label: z.string(), description: z.string() })),
-    // Self-check shown at the end of the page: scenario questions with one best answer each.
-    quiz: z.array(z.object({
-      question: z.string(),
-      options: z.array(z.string()).length(4),
-      answer: z.number().int().min(0).max(3),
-      explanation: z.string(),
-    })).min(3).max(3).optional(),
+    quiz: quizSchema,
   }),
 });
 
@@ -81,6 +84,7 @@ const studies = defineCollection({
     // Step 0 is the first attempt; each entry in `steps` is step 1, 2, ...
     nodes: z.array(z.object({ id: z.string(), label: z.string(), kind: z.string(), x: z.number(), y: z.number(), at: z.number().default(0), until: z.number().optional() })),
     edges: z.array(z.object({ from: z.string(), to: z.string(), at: z.number().default(0), until: z.number().optional() })),
+    quiz: quizSchema,
     steps: z.array(z.object({
       title: z.string(),
       problem: z.string(),
