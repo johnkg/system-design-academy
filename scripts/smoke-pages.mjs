@@ -1,5 +1,6 @@
 // Loads every built page in a real browser and fails on anything a reader would hit:
-// uncaught script errors, console errors, accessibility violations (axe), horizontal scroll on a phone,
+// uncaught script errors, console errors, accessibility violations (axe), horizontal scroll at 320px (WCAG reflow, i.e. 400% zoom) with the
+// WCAG text-spacing overrides applied,
 // and any control inside a playground that throws when set to each of its options.
 //
 // Usage (after `npm run build`): node scripts/smoke-pages.mjs [--only substring] [--no-axe]
@@ -77,13 +78,15 @@ async function exercise(page) {
 
 async function check(path) {
   const problems = [];
-  for (const [width, scheme] of [[1280, 'light'], [375, 'dark']]) {
+  for (const [width, scheme] of [[1280, 'light'], [320, 'dark']]) {
     const page = await browser.newPage({ viewport: { width, height: 900 }, colorScheme: scheme });
     page.on('pageerror', (e) => problems.push(`[${width}] script error: ${e.message}`));
     page.on('console', (m) => { if (m.type() === 'error') problems.push(`[${width}] console error: ${m.text().slice(0, 160)}`); });
     try {
       await page.goto(origin + base + path, { waitUntil: 'load' });
       if (font) await page.addStyleTag({ content: `html, body, button, input, select, textarea { font-family: '${font}', sans-serif !important }` });
+      // WCAG 1.4.12: content must survive these user overrides without clipping or sideways scrolling.
+      if (width === 320) await page.addStyleTag({ content: '* { line-height: 1.5 !important; letter-spacing: .12em !important; word-spacing: .16em !important } p { margin-bottom: 2em !important }' });
       await exercise(page);
       if (await page.evaluate(() => document.documentElement.scrollWidth > document.documentElement.clientWidth)) problems.push(`[${width}] horizontal scroll`);
       if (axeSource && width === 1280) {
