@@ -68,6 +68,21 @@ for (const [id, m] of Object.entries(meta)) {
 const share = dist.total ? Math.round((100 * dist.longest) / dist.total) : 0;
 if (share > 35) err('quizzes', `the correct option is the single longest in ${share}% of questions (limit 35%, chance is 25%)`);
 
+
+// 4. The what's-new page: every link in the changelog must point at a real page.
+{
+  const text = readFileSync(join(root, 'data/changelog.ts'), 'utf8');
+  const pages = new Set(readdirSync(join(root, 'pages')).map((f) => f.replace(/\.astro$/, '').replace(/\.(ts|js)$/, '')));
+  const areaIds = new Set([...readFileSync(join(root, 'data/areas.ts'), 'utf8').matchAll(/id: '([a-z]+)'/g)].map((m) => m[1]));
+  for (const m of text.matchAll(/href: '([^']+)'/g)) {
+    const [first, second] = m[1].replace(/\/$/, '').split('/');
+    if (!pages.has(first)) err('data/changelog.ts', `link "${m[1]}" does not match a page`);
+    else if (first === 'cheatsheets' && second && !areaIds.has(second)) err('data/changelog.ts', `link "${m[1]}" names an unknown area`);
+  }
+  const dates = [...text.matchAll(/date: '(\d{4}-\d{2}-\d{2})'/g)].map((m) => m[1]);
+  if (dates.some((d, i) => i > 0 && d >= dates[i - 1])) err('data/changelog.ts', 'entries must be newest first with distinct dates');
+}
+
 for (const w of warnings) console.warn(`warn  ${w}`);
 for (const e of errors) console.error(`ERROR ${e}`);
 console.log(`checked ${Object.keys(meta).length} pages and ${dist.total} quiz questions (correct option longest in ${share}%): ${errors.length} error(s), ${warnings.length} warning(s)`);
