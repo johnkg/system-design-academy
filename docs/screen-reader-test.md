@@ -30,14 +30,14 @@ Each step lists what to do and what you should hear or be able to do.
 1. Open a concept (for example Caching). Walk the headings. Expect a sensible outline.
 2. Find "Test yourself". Expect each question to be a group with the question as its name, and each option to be a radio button read with its text.
 3. Choose an answer and submit. Expect the verdict to be announced, with "Best answer" and "Your answer" in words, not only colour.
-4. For a wrong answer, expect a "Read this part again" link that goes to the right section, and focus to move there.
+4. For a wrong answer, expect a "Read this part again" link. Following it should scroll to the right section and move focus there (on a case study, the diagram opens at that step).
 5. Retry. Expect the options to appear in a different order and the previous result to be cleared.
 
 ### 4. A case study page
 1. Open `/case-studies/url-shortener/`. Walk the headings. Expect the steps in order.
-2. Use the diagram's Next and Back controls. Expect the new step's text to be announced and the buttons to have names that say what they do.
+2. Use the diagram's Next and Prev controls. Expect the new step's text to be announced and the buttons to have names that say what they do.
 3. Open "Practise first". Expect each of the four steps to be a labelled group, the textareas to be labelled, and "Compare with the study's requirements" to report expanded or collapsed.
-4. Use the estimator. Expect each slider to announce its name, value and unit, and the outputs to be readable as a list.
+4. Use the estimator. Expect each slider to announce its name and value (the unit is part of the label where it matters), and the outputs to be readable as a list of terms and values.
 5. Use the "break it" simulation. Expect the control changes to produce an announced result or a result region you can find.
 
 ### 5. Review, progress and interview
@@ -50,7 +50,7 @@ Each step lists what to do and what you should hear or be able to do.
 2. Find a table (for example the Visitor pattern's results). Expect row and column headers to be announced as you move through cells.
 
 ### 7. Cheat sheets and concept map
-1. Open Cheat sheets, then one area. Expect a list you can step through item by item.
+1. Open Cheat sheets, then one area. Expect each idea to be a heading you can jump between, with its uses, limits and trap under it.
 2. Open the Map and choose a concept. Expect "read first" and "opens the door to" to be announced as lists with links.
 
 ### 8. Offline

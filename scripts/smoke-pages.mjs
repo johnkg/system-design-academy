@@ -89,7 +89,7 @@ async function check(path) {
       if (width === 320) await page.addStyleTag({ content: '* { line-height: 1.5 !important; letter-spacing: .12em !important; word-spacing: .16em !important } p { margin-bottom: 2em !important }' });
       await exercise(page);
       if (await page.evaluate(() => document.documentElement.scrollWidth > document.documentElement.clientWidth)) problems.push(`[${width}] horizontal scroll`);
-      if (axeSource && width === 1280) {
+      if (axeSource) { // both passes: light at desktop width, and dark at 320px, so both palettes are contrast-checked
         await page.addScriptTag({ content: axeSource });
         const res = await page.evaluate(() => axe.run());
         for (const v of res.violations) problems.push(`[${width}] axe ${v.id} x${v.nodes.length}: ${v.nodes[0].target.join(' ').slice(0, 100)}`);
@@ -101,9 +101,13 @@ async function check(path) {
 }
 
 // A second attempt rules out a one-off hiccup (a slow runner); a real defect fails twice.
+// A first-run failure that then passes is still printed, so an intermittent defect stays visible.
 async function checkTwice(path) {
   const first = await check(path);
-  return first.length ? check(path) : first;
+  if (!first.length) return first;
+  const second = await check(path);
+  if (!second.length) console.warn(`flaky ${path} (passed on retry)\n  ${first.slice(0, 3).join('\n  ')}`);
+  return second;
 }
 
 const queue = [...targets];

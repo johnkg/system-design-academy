@@ -4,9 +4,13 @@ export interface Change { date: string; title: string; items: { text: string; hr
 export const changelog: Change[] = [
   {
     date: '2026-10-20',
-    title: 'Three new case studies and clearer quiz questions',
+    title: 'Three new case studies, clearer quizzes and a full review',
     items: [
       { text: 'New case studies: a virtual waiting room for flash sales, a maps and routing service, and a package registry.', href: 'case-studies/' },
+      { text: 'Spaced review is fairer: retrying a quiz or practising early no longer pushes a question to a long gap, and days now follow your own time zone.', href: 'review/' },
+      { text: 'A missed case-study question now opens the diagram at the exact step that explains it, and following any "read this part again" link moves keyboard focus there.' },
+      { text: 'Simulations that run on their own can be paused, results and estimates are announced to screen readers, and long logs and tables scroll with the keyboard.' },
+      { text: 'Corrected numbers in several simulations and tables (ticket booking, package registry, metrics rollups, replication and leader election comparisons) and a smoother interview clock.' },
       { text: 'Fifteen quiz questions were tightened after a strict review: each now states the constraint that makes one answer clearly best, and a few weak or near-duplicate wrong options were replaced.' },
     ],
   },

@@ -59,9 +59,14 @@ const payload = JSON.stringify({ totals, names }).replace(/</g, '\\u003c');
   const keys = () => { try { return Object.keys(localStorage).filter((k) => k.startsWith('sda-')); } catch { return []; } };
   const labels: Record<string, string> = { concepts: 'Concepts', patterns: 'Patterns', studies: 'Case studies' };
 
+  const review = (window as any).sdaReview;
+  const strings = (v: unknown) => (Array.isArray(v) ? v.filter((x): x is string => typeof x === 'string') : []);
+  const isObject = (v: unknown): v is Record<string, unknown> => !!v && typeof v === 'object' && !Array.isArray(v);
+  const parse = (text: string | null) => { try { return JSON.parse(text ?? 'null'); } catch { return null; } };
+
   function render() {
-    let done: string[] = [];
-    try { const v = JSON.parse(get('sda-progress') ?? '[]'); if (Array.isArray(v)) done = v.filter((x) => typeof x === 'string'); } catch { /* damaged value */ }
+    // Read storage directly (not the layout's copy) so the page reflects a restore or erase immediately.
+    const done = strings(parse(get('sda-progress')));
     const stats = $('[data-stats]'); stats.replaceChildren();
     const sum = { d: 0, t: 0 };
     for (const kind of ['concepts', 'patterns', 'studies']) {
@@ -74,9 +79,8 @@ const payload = JSON.stringify({ totals, names }).replace(/</g, '\\u003c');
       card.append(big, label, bar); stats.append(card);
     }
     // Review summary.
-    let hist: Record<string, { b: number; d: number; m?: number }> = {};
-    try { hist = JSON.parse(get('sda-review') ?? '{}') || {}; } catch { /* damaged value */ }
-    const entries = Object.values(hist), today = Math.floor(Date.now() / 864e5);
+    const hist: Record<string, { b: number; d: number; m?: number }> = review.load();
+    const entries = Object.values(hist), today = review.today();
     $('[data-review]').textContent = entries.length
       ? `${entries.length} questions answered so far: ${entries.filter((e) => e.d <= today).length} due now, ${entries.filter((e) => e.b >= 3).length} well remembered, ${entries.filter((e) => (e.m ?? 0) > 0).length} missed at least once.`
       : 'No review history yet.';
@@ -85,8 +89,9 @@ const payload = JSON.stringify({ totals, names }).replace(/</g, '\\u003c');
     const quizKeys = keys().filter((k) => k.startsWith('sda-quiz/'));
     for (const k of quizKeys) {
       const rest = k.slice('sda-quiz/'.length);
-      // New keys are "kind/slug"; older concept results were saved as just the slug.
+      // New keys are "kind/slug"; older concept results were saved as just the slug, and the new key wins when both exist.
       const id = rest.includes('/') ? rest : `concepts/${rest}`;
+      if (!rest.includes('/') && quizKeys.includes(`sda-quiz/${id}`)) continue;
       const hit = meta.names[id];
       if (!hit) continue;
       const li = document.createElement('li'), a = document.createElement('a'); a.href = hit.href + '#quiz'; a.textContent = hit.name;
@@ -107,22 +112,21 @@ const payload = JSON.stringify({ totals, names }).replace(/</g, '\\u003c');
   $('[data-import]').addEventListener('change', async (e) => {
     const input = e.target as HTMLInputElement, msg = $('[data-msg]');
     const file = input.files?.[0]; if (!file) return;
-    try {
-      const parsed = JSON.parse(await file.text());
-      if (parsed?.app !== 'system-design-academy' || typeof parsed.data !== 'object' || !parsed.data) throw new Error('not a backup');
-      let n = 0;
-      for (const [k, v] of Object.entries<unknown>(parsed.data)) {
-        if (!k.startsWith('sda-') || typeof v !== 'string') continue;
-        if (k === 'sda-progress') {
-          const mine: string[] = JSON.parse(get(k) ?? '[]'), theirs: string[] = JSON.parse(v);
-          localStorage.setItem(k, JSON.stringify([...new Set([...mine, ...theirs.filter((x) => typeof x === 'string')])]));
-        } else localStorage.setItem(k, v);
-        n++;
-      }
-      msg.textContent = `Restored ${n} items.`;
-      render();
-    } catch { msg.textContent = 'That file is not a System Design Academy backup, so nothing was changed.'; }
+    const parsed = parse(await file.text().catch(() => null));
     input.value = '';
+    if (parsed?.app !== 'system-design-academy' || !isObject(parsed.data)) { msg.textContent = 'That file is not a System Design Academy backup, so nothing was changed.'; return; }
+    // Work out every write first, so a damaged entry cannot leave a half-applied restore.
+    const writes: [string, string][] = [];
+    for (const [k, v] of Object.entries(parsed.data)) {
+      if (!k.startsWith('sda-') || typeof v !== 'string') continue;
+      if (k === 'sda-progress') writes.push([k, JSON.stringify([...new Set([...strings(parse(get(k))), ...strings(parse(v))])])]);
+      else if (k === 'sda-review') { const theirs = parse(v); if (isObject(theirs)) writes.push([k, JSON.stringify({ ...review.load(), ...theirs })]); }
+      else writes.push([k, v]);
+    }
+    let n = 0;
+    for (const [k, v] of writes) { try { localStorage.setItem(k, v); n++; } catch { break; } }
+    msg.textContent = n === writes.length ? `Restored ${n} items.` : `Restored ${n} of ${writes.length} items; this browser refused the rest (storage full or blocked).`;
+    render();
   });
 
   $('[data-wipe]').addEventListener('click', () => {

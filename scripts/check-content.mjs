@@ -15,6 +15,8 @@ const errors = [], warnings = [];
 const err = (where, msg) => errors.push(`${where}: ${msg}`);
 const warn = (where, msg) => warnings.push(`${where}: ${msg}`);
 const has = (kind, slug) => kinds[kind].includes(slug);
+// Language files every code/ folder must have, read from the language config (a missing one leaves that language's readers with no code).
+const langFiles = [...readFileSync(join(root, 'languages.config.ts'), 'utf8').matchAll(/id: '([a-z]+)'.*?ext: '([a-z]+)'/g)].map((m) => `${m[1]}.${m[2]}`);
 
 // 1. Links between pages.
 for (const s of kinds.concepts) for (const r of meta[`concepts/${s}`].related ?? []) {
@@ -26,24 +28,40 @@ for (const s of kinds.patterns) for (const r of meta[`patterns/${s}`].related ??
 }
 for (const s of kinds.studies) {
   const m = meta[`studies/${s}`];
-  const refs = [...m.steps.flatMap((x) => x.concepts), ...m.failures.flatMap((x) => x.concepts), ...(m.alternatives ?? []).flatMap((x) => x.concepts ?? [])];
+  const refs = [...m.steps.flatMap((x) => x.concepts), ...m.failures.flatMap((x) => x.concepts)];
   for (const r of refs) if (!has(r.kind === 'pattern' ? 'patterns' : 'concepts', r.slug)) err(`studies/${s}`, `references unknown ${r.kind ?? 'concept'} "${r.slug}"`);
   const ids = new Set(m.nodes.map((n) => n.id));
   for (const e of m.edges) if (!ids.has(e.from) || !ids.has(e.to)) err(`studies/${s}`, `edge ${e.from} -> ${e.to} uses an unknown node`);
+  // The diagram shows a node or edge at steps at <= step < until. An arrow must never be visible while one of its ends is not.
+  const span = (x) => [x.at, x.until ?? Infinity], byId = new Map(m.nodes.map((n) => [n.id, n]));
+  for (const e of m.edges) {
+    const [a, b] = span(e);
+    for (const end of [e.from, e.to]) {
+      const n = byId.get(end); if (!n) continue;
+      const [na, nb] = span(n);
+      if (a < na || b > nb) err(`studies/${s}`, `edge ${e.from} -> ${e.to} (steps ${a} to ${b === Infinity ? 'end' : b - 1}) is shown while node "${end}" is not`);
+    }
+  }
 }
 
 // 2. Every page ships what readers expect.
+const playgroundFiles = readdirSync(join(root, 'playgrounds')).map((f) => f.toLowerCase());
+for (const kind of ['concepts', 'patterns']) for (const s of kinds[kind]) {
+  // The page finds a playground by name, ignoring case and punctuation (playgroundFor in src/lib.ts).
+  const want = `${meta[`${kind}/${s}`].name.replace(/[^a-z0-9]+/gi, '')}playground.astro`.toLowerCase();
+  if (!playgroundFiles.includes(want)) warn(`${kind}/${s}`, `no playground file named like ${want}`);
+}
+for (const [kind, list] of Object.entries(kinds)) for (const s of list) for (const dir of ['code', 'before']) {
+  // Some concepts teach without code; a page that has samples must have them in every language.
+  if (!existsSync(join(root, 'content', kind, s, dir))) { if (kind === 'studies' && dir === 'code') err(`studies/${s}`, 'no code/ folder'); continue; }
+  for (const f of langFiles) if (!existsSync(join(root, 'content', kind, s, dir, f))) err(`${kind}/${s}`, `no ${dir}/${f}`);
+}
 for (const s of kinds.concepts) {
-  const d = join(root, 'content/concepts', s);
-  if (!existsSync(join(d, 'visuals/steps.json'))) err(`concepts/${s}`, 'missing visuals/steps.json');
-  // The page finds a playground by name, ignoring case and punctuation.
-  const want = `${meta[`concepts/${s}`].name.replace(/[^a-z0-9]+/gi, '')}playground.astro`.toLowerCase();
-  if (!readdirSync(join(root, 'playgrounds')).some((f) => f.toLowerCase() === want)) warn(`concepts/${s}`, `no playground file named like ${want}`);
+  if (!existsSync(join(root, 'content/concepts', s, 'visuals/steps.json'))) err(`concepts/${s}`, 'missing visuals/steps.json');
   if (!meta[`concepts/${s}`].quiz) err(`concepts/${s}`, 'no quiz');
 }
 for (const s of kinds.studies) {
   const d = join(root, 'content/studies', s);
-  for (const f of ['javascript.js', 'csharp.cs', 'python.py']) if (!existsSync(join(d, 'code', f))) warn(`studies/${s}`, `no code/${f}`);
   if (!existsSync(join(d, 'visuals/final.json'))) warn(`studies/${s}`, 'no visuals/final.json');
   if (!existsSync(join(root, 'studies', s, 'Estimator.astro'))) warn(`studies/${s}`, 'no Estimator.astro');
   if (!meta[`studies/${s}`].quiz) err(`studies/${s}`, 'no quiz');
@@ -76,8 +94,9 @@ if (share > 35) err('quizzes', `the correct option is the single longest in ${sh
   const areaIds = new Set([...readFileSync(join(root, 'data/areas.ts'), 'utf8').matchAll(/id: '([a-z]+)'/g)].map((m) => m[1]));
   for (const m of text.matchAll(/href: '([^']+)'/g)) {
     const [first, second] = m[1].replace(/\/$/, '').split('/');
+    const detail = { concepts: kinds.concepts, patterns: kinds.patterns, 'case-studies': kinds.studies, cheatsheets: [...areaIds] }[first];
     if (!pages.has(first)) err('data/changelog.ts', `link "${m[1]}" does not match a page`);
-    else if (first === 'cheatsheets' && second && !areaIds.has(second)) err('data/changelog.ts', `link "${m[1]}" names an unknown area`);
+    else if (second && (!detail || !detail.includes(second))) err('data/changelog.ts', `link "${m[1]}" names a page that does not exist`);
   }
   const dates = [...text.matchAll(/date: '(\d{4}-\d{2}-\d{2})'/g)].map((m) => m[1]);
   if (dates.some((d, i) => i > 0 && d >= dates[i - 1])) err('data/changelog.ts', 'entries must be newest first with distinct dates');

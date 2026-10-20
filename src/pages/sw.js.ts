@@ -1,14 +1,14 @@
 import type { APIRoute } from 'astro';
+import { base } from '../lib';
 
 // Service worker: after you have visited a page it opens offline, and new deploys replace old caches.
-//  - Pages (navigations): network first, so you always get the newest version online; the cached copy is the fallback.
+//  - Pages (navigations): network first, so you always get the newest version online; the cached copy (any query string) is the fallback.
 //  - Hashed build files (/_astro/): cache first, they never change under the same name.
 //  - Everything else on this site: stale while revalidate.
 // The cache name carries the build time, so each deploy starts a fresh cache and the old ones are deleted on activate.
 const build = Date.now().toString(36);
 
 export const GET: APIRoute = () => {
-  const base = import.meta.env.BASE_URL.replace(/\/$/, '');
   const source = `
 const CACHE = 'sda-${build}';
 const BASE = ${JSON.stringify(base)};
@@ -37,7 +37,7 @@ self.addEventListener('fetch', (event) => {
     event.respondWith(fetch(req).then((res) => {
       if (res.ok) { const copy = res.clone(); caches.open(CACHE).then((c) => c.put(req, copy)); }
       return res;
-    }).catch(() => caches.match(req).then((hit) => hit || caches.match(BASE + '/offline/'))));
+    }).catch(() => caches.match(req, { ignoreSearch: true }).then((hit) => hit || caches.match(BASE + '/offline/'))));
     return;
   }
   if (url.pathname.startsWith(BASE + '/_astro/')) {
@@ -56,5 +56,5 @@ self.addEventListener('fetch', (event) => {
   }));
 });
 `;
-  return new Response(source, { headers: { 'Content-Type': 'text/javascript', 'Service-Worker-Allowed': `${base}/` } });
+  return new Response(source, { headers: { 'Content-Type': 'text/javascript' } });
 };

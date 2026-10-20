@@ -21,14 +21,14 @@ export const paths: LearningPath[] = [
     title: 'Build reliable systems',
     audience: 'Production engineers',
     blurb: 'How a service stays useful when dependencies are slow, overloaded or gone, and how you measure that promise.',
-    steps: [c('timeouts-and-deadlines'), c('retries-and-backoff'), c('idempotency'), c('circuit-breaker'), c('bulkhead'), c('backpressure'), c('load-shedding'), c('graceful-degradation'), c('health-checks'), c('slos-and-error-budgets'), s('alerting-and-on-call-system'), s('chaos-engineering-platform'), s('multi-region-active-active')],
+    steps: [c('retries-and-backoff'), c('timeouts-and-deadlines'), c('idempotency'), c('graceful-degradation'), c('circuit-breaker'), c('bulkhead'), c('backpressure'), c('load-shedding'), c('health-checks'), c('slos-and-error-budgets'), s('alerting-and-on-call-system'), s('chaos-engineering-platform'), s('multi-region-active-active')],
   },
   {
     id: 'distributed-data',
     title: 'Distributed data and agreement',
     audience: 'Going deeper',
     blurb: 'How copies of data stay consistent, how machines agree on one answer, and the systems built on those tools.',
-    steps: [c('consistency-models'), c('quorums'), c('logical-clocks'), c('consensus'), c('leader-election'), c('leases-and-fencing-tokens'), c('crdts'), s('key-value-store'), s('distributed-lock-service'), s('coordination-service'), s('distributed-sql-database'), s('distributed-transaction-coordinator')],
+    steps: [c('consistency-models'), c('quorums'), c('logical-clocks'), c('leader-election'), c('consensus'), c('leases-and-fencing-tokens'), c('crdts'), s('key-value-store'), s('distributed-lock-service'), s('coordination-service'), s('distributed-sql-database'), s('distributed-transaction-coordinator')],
   },
   {
     id: 'inside-the-database',
@@ -42,7 +42,7 @@ export const paths: LearningPath[] = [
     title: 'Ship safely',
     audience: 'Platform and DevOps',
     blurb: 'From code in a repository to many machines running it, and how to roll out changes without an outage.',
-    steps: [c('infrastructure-as-code'), c('containers-and-orchestration'), c('blue-green-and-rolling-deployments'), c('canary-deployments'), c('feature-flags'), c('autoscaling'), c('multi-region-failover'), s('ci-cd-system'), s('code-deployment'), s('progressive-delivery-platform'), s('container-orchestrator')],
+    steps: [c('infrastructure-as-code'), c('containers-and-orchestration'), c('blue-green-and-rolling-deployments'), c('feature-flags'), c('canary-deployments'), c('autoscaling'), c('multi-region-failover'), s('ci-cd-system'), s('code-deployment'), s('progressive-delivery-platform'), s('container-orchestrator')],
   },
   {
     id: 'security-and-trust',

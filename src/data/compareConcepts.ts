@@ -204,7 +204,7 @@ export const problems: Problem[] = [
     { slug: 'api-versioning', why: 'Version the contract itself when a change cannot be made compatible.' } ] },
   { text: 'Offer an API for work that takes longer than a request should wait', patterns: [
     { slug: 'async-apis-and-long-running-operations', why: 'Return 202 with a status resource, poll with backoff, or call back.' },
-    { slug: 'graphql-n-plus-one-and-dataloader', why: 'Batch the lookups behind a nested query so one request does not become hundreds.' } ] },
+    { slug: 'webhooks', why: 'Call the client back when the work is done, signed and retried, instead of making it poll.' } ] },
   { text: 'Make sure each message is handled once, in order, and bad ones do not block the rest', patterns: [
     { slug: 'delivery-guarantees', why: 'At-least-once delivery plus idempotent processing gives effectively once.' },
     { slug: 'ordering-and-partitioning', why: 'Order holds per key within a partition, and parallelism is capped by the partition count.' },
@@ -212,7 +212,7 @@ export const problems: Problem[] = [
   { text: 'Decide that a machine is dead, and make sure it cannot do harm if it is wrong', patterns: [
     { slug: 'failure-detection', why: 'Heartbeats and phi accrual trade detection speed against false alarms.' },
     { slug: 'leases-and-fencing-tokens', why: 'Fencing tokens make a stale owner harmless when the lease moved on.' },
-    { slug: 'merkle-trees-and-anti-entropy', why: 'Replicas find and repair their differences by comparing hash trees.' } ] },
+    { slug: 'gossip-protocol', why: 'Suspicion spreads through the cluster, so one node cannot declare another dead on its own.' } ] },
   { text: 'Process a huge dataset in parallel and combine the results', patterns: [
     { slug: 'mapreduce-and-shuffles', why: 'Map in parallel, move records to the reducer that owns each key, then reduce; watch for hot keys.' },
     { slug: 'batch-vs-stream-processing', why: 'Decide whether a periodic recompute is enough or the answer must keep up with events.' } ] },
@@ -241,8 +241,7 @@ export const problems: Problem[] = [
     { slug: 'model-evaluation-and-drift', why: 'Compare old and new on the same test set with a confidence interval, then watch live traffic.' },
     { slug: 'canary-deployments', why: 'Send a small share of real traffic to the new version before everyone gets it.' } ] },
   { text: 'A model does not fit on one GPU, or training takes too long', patterns: [
-    { slug: 'distributed-training-and-parallelism', why: 'Split data, state and layers across GPUs and balance memory against communication.' },
-    { slug: 'backups-and-point-in-time-recovery', why: 'Checkpoints bound how much work a failed machine can cost you.' } ] },
+    { slug: 'distributed-training-and-parallelism', why: 'Split data, state and layers across GPUs, balance memory against communication, and checkpoint so a failed machine costs minutes, not days.' } ] },
 ];
 
 export const confusions: Confusion[] = [
@@ -251,7 +250,7 @@ export const confusions: Confusion[] = [
     blurb: 'Both move messages between services asynchronously. The difference is how many receivers each message reaches.',
     patterns: ['message-queues', 'pub-sub'],
     rows: [
-      { aspect: 'Who receives a message', values: ['Exactly one consumer from a group of competing workers', 'Every subscriber gets its own copy'] },
+      { aspect: 'Who receives a message', values: ['One consumer from a group of competing workers (delivered at least once)', 'Every subscriber gets its own copy'] },
       { aspect: 'Typical purpose', values: ['Share out work: jobs, emails, image processing', 'Broadcast a fact: "order placed", "user signed up"'] },
       { aspect: 'Sender knows the receivers?', values: ['No, but it expects the work to get done', 'No, and does not care how many there are'] },
       { aspect: 'Adding a consumer', values: ['More throughput for the same work', 'A new reaction to the same event, with no change to the publisher'] },
@@ -290,7 +289,7 @@ export const confusions: Confusion[] = [
     patterns: ['database-replication', 'database-sharding'],
     rows: [
       { aspect: 'What happens to the data', values: ['Every replica holds all of it', 'Each shard holds only part of it'] },
-      { aspect: 'Helps with', values: ['Read capacity, failover, backups', 'Data size and write capacity'] },
+      { aspect: 'Helps with', values: ['Read capacity, failover, read-only analytics', 'Data size and write capacity'] },
       { aspect: 'Does not help with', values: ['Write capacity (writes still go to one primary)', 'Availability by itself: losing a shard loses its slice unless it is also replicated'] },
       { aspect: 'Main complication', values: ['Replication lag and stale reads', 'Choosing a shard key, cross-shard queries and rebalancing'] },
     ],
@@ -444,7 +443,7 @@ export const confusions: Confusion[] = [
       { aspect: 'What it decides', values: ['Which one node is in charge right now', 'The agreed order of operations in a log', 'How many replicas a read or write must touch'] },
       { aspect: 'Needs', values: ['A majority of nodes to vote', 'A majority to store each entry', 'R + W greater than N for fresh reads'] },
       { aspect: 'Single writer?', values: ['Yes: the leader', 'Yes: the leader orders writes, replicas agree', 'No: any replica can coordinate'] },
-      { aspect: 'Gives you', values: ['Automatic failover, no split brain', 'Strong consistency and no lost committed writes', 'Tunable consistency and availability'] },
+      { aspect: 'Gives you', values: ['Automatic failover; at most one leader per term (add fencing so a deposed leader cannot act)', 'Strong consistency and no lost committed writes', 'Tunable consistency and availability'] },
     ],
     rule: 'Consensus algorithms such as Raft include leader election. Quorum systems skip the leader and trade strict ordering for availability.',
   },

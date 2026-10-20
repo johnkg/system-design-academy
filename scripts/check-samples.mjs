@@ -13,6 +13,7 @@ const only = args.filter((a) => !a.startsWith('--'));
 const roots = ['patterns', 'concepts', 'studies'].map((c) => new URL(`../src/content/${c}/`, import.meta.url).pathname).filter((r) => existsSync(r));
 const hasDotnet = spawnSync('dotnet', ['--version']).status === 0;
 if (!hasDotnet) console.warn('! dotnet not found: C# samples will be skipped');
+if (!hasDotnet && process.env.CI) { console.error('FAIL dotnet is required in CI, or the C# samples would go unchecked'); process.exit(1); }
 
 const env = { ...process.env, DOTNET_NOLOGO: '1', DOTNET_CLI_TELEMETRY_OPTOUT: '1' };
 const commands = {
@@ -78,4 +79,5 @@ if (compare) {
 }
 
 console.log(`${ran - failed}/${ran} samples passed${compare ? `, ${mismatched} folder(s) with differing output` : ''}`);
-process.exit(failed || mismatched ? 1 : 0);
+if (!ran) console.error(only.length ? `FAIL no sample folder matches ${only.join(', ')}` : 'FAIL no samples found');
+process.exit(failed || mismatched || !ran ? 1 : 0);

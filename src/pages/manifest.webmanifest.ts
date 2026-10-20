@@ -1,8 +1,8 @@
 import type { APIRoute } from 'astro';
+import { base } from '../lib';
 
 // Lets browsers offer to install the site as an app. Paths follow the deploy base, so this is generated rather than a static file.
 export const GET: APIRoute = () => {
-  const base = import.meta.env.BASE_URL.replace(/\/$/, '');
   return new Response(JSON.stringify({
     name: 'System Design Academy',
     short_name: 'Sys Design',

@@ -185,6 +185,10 @@ import PlaygroundShell from '../../components/PlaygroundShell.astro';
     // SIM END
 
     const MAXN = 256;
+    // All-to-all is O(n^2) per round, so it is simulated with at most A2A_MAX nodes to keep the page responsive.
+    // Its message cost does not depend on chance, so it is computed exactly for the chosen size.
+    const A2A_MAX = 64;
+    const a2aCost = (n: number, pause: number) => { let s = 0; for (let t = 0; t < TICKS; t++) s += n - (t >= CRASH_T ? 1 : 0) - (t >= PAUSE_T && t < PAUSE_T + pause ? 1 : 0); const msgs = s * (n - 1); return { msgsPerNode: msgs / n / TICKS, kbPerNode: (msgs * 60) / n / TICKS / 1000 }; };
     const cells = q('[data-cells]');
     for (let i = 0; i < MAXN; i++) { const c = document.createElement('div'); c.className = 'cmb-cell'; cells.append(c); }
     const cellEls = Array.from(cells.children) as HTMLElement[];
@@ -209,17 +213,19 @@ import PlaygroundShell from '../../components/PlaygroundShell.astro';
       q('[data-thrval]').textContent = det === 'phi' ? `phi ${thr} (about ${Math.round(thr / 0.4342945)} s of silence on a steady link)` : `${thr} s`;
       q('[data-thrlabel]').textContent = proto === 'swim' ? 'Suspicion timeout (seconds)' : det === 'phi' ? 'Phi threshold' : 'Silence before a node is declared dead (seconds)';
       q('[data-lossval]').textContent = `${Math.round(loss * 100)}%`; q('[data-pauseval]').textContent = pause === 0 ? 'none' : `${pause} s`;
-      const key = [proto, det, n, thr, loss, pause].join('|');
+      const simN = proto === 'a2a' ? Math.min(n, A2A_MAX) : n;
+      const key = [proto, det, simN, thr, loss, pause].join('|');
       let r = cache.get(key);
-      if (!r) { r = simulate({ n, proto, det, thr, loss, pause }); if (cache.size > 40) cache.clear(); cache.set(key, r); }
-      const healthy = n - 1; const slowFlag = r.flagged[S] === 1; const otherWrong = r.wrong - (slowFlag ? 1 : 0);
+      if (!r) { r = simulate({ n: simN, proto, det, thr, loss, pause }); if (cache.size > 40) cache.clear(); cache.set(key, r); }
+      const cost = simN < n ? a2aCost(n, pause) : r;
+      const healthy = simN - 1; const slowFlag = r.flagged[S] === 1; const otherWrong = r.wrong - (slowFlag ? 1 : 0);
       const maxSlow = Math.max(...r.slowSeen);
       q('[data-o1]').textContent = r.detect >= 0 ? `${r.detect} s` : 'not by the end';
       q('[data-n1]').textContent = proto === 'a2a' ? 'Every node decides alone, once it has heard nothing for the timeout.' : proto === 'gossip' ? 'A node must also receive the news that the counter stopped rising, and the news arrives late and unevenly.' : 'First a probe fails, then the suspicion timeout runs, then the news is spread on the probe messages.';
       q('[data-o2]').textContent = `${r.wrong} of ${healthy}`;
       q('[data-n2]').textContent = `${fmt(r.accus)} accusations in all. ${pause > 0 ? `The frozen node was called dead by up to ${maxSlow} nodes.` : 'No node was frozen.'}`;
-      q('[data-o3]').textContent = r.msgsPerNode.toFixed(1);
-      q('[data-n3]').textContent = `${r.kbPerNode.toFixed(1)} KB/s out of each node, ${fmt(r.msgsPerNode * n)} messages a second in the whole cluster.`;
+      q('[data-o3]').textContent = cost.msgsPerNode.toFixed(1);
+      q('[data-n3]').textContent = `${cost.kbPerNode.toFixed(1)} KB/s out of each node, ${fmt(cost.msgsPerNode * n)} messages a second in the whole cluster.`;
       q('[data-o4]').textContent = `${fmt(r.moved)} of 10,000 (${(r.moved / 100).toFixed(1)}%)`;
       q('[data-n4]').textContent = r.ringEvents > 0 ? `${r.ringEvents} needless removal${r.ringEvents > 1 ? 's' : ''} from the ring, with the keys moved out and back.` : 'The ring was never changed for a healthy node.';
       q('[data-o5]').textContent = `${(r.maxMis * 100).toFixed(1)}%`;
@@ -235,7 +241,7 @@ import PlaygroundShell from '../../components/PlaygroundShell.astro';
       const bar = q('[data-pausebar]'); bar.setAttribute('x', String(PAUSE_T * 5)); bar.setAttribute('width', String(pause * 5));
       q('[data-chart]').setAttribute('aria-label', `Nodes that think the crashed node is dead: ${r.crashSeen[TICKS - 1]} of ${healthy} at the end. Nodes that think the frozen node is dead: at most ${maxSlow}.`);
       cellEls.forEach((el, i) => {
-        el.hidden = i >= n;
+        el.hidden = i >= simN;
         const state = i === C ? 'crashed' : r!.flagged[i] === 1 ? 'accused' : '';
         el.className = `cmb-cell ${state}`.trim(); el.textContent = state === 'crashed' ? 'X' : state === 'accused' ? '!' : '';
         el.title = `node ${i + 1}: ${state === 'crashed' ? 'crashed' : state === 'accused' ? 'healthy but declared dead' : 'never accused'}`;
@@ -246,7 +252,8 @@ import PlaygroundShell from '../../components/PlaygroundShell.astro';
       const slowText = pause > 0 ? (slowFlag ? `The frozen node, paused ${pause} s, was declared dead by up to ${maxSlow} nodes.` : `The frozen node, paused ${pause} s, was never declared dead.`) : '';
       const lossText = otherWrong > 0 ? `${otherWrong} other healthy node${otherWrong > 1 ? 's were' : ' was'} accused only because packets were lost.` : '';
       const ringText = r.ringEvents > 0 ? `The ring moved ${fmt(r.moved)} keys for nothing.` : 'No data was moved for a healthy node.';
-      out.textContent = [crashText, r.wrong === 0 ? 'No healthy node was declared dead.' : `${r.wrong} healthy node${r.wrong > 1 ? 's were' : ' was'} declared dead.`, slowText, lossText, ringText].filter(Boolean).join(' ');
+      const capText = simN < n ? `All-to-all heartbeats are simulated with ${simN} nodes here to keep the page responsive, so every result except the message cost is for ${simN} nodes; the message cost is for all ${n}.` : '';
+      out.textContent = [crashText, r.wrong === 0 ? 'No healthy node was declared dead.' : `${r.wrong} healthy node${r.wrong > 1 ? 's were' : ' was'} declared dead.`, slowText, lossText, ringText, capText].filter(Boolean).join(' ');
       out.classList.toggle('bad', r.wrong > 0 || r.detect < 0);
     }
     let queued = false;

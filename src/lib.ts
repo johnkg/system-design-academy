@@ -40,5 +40,14 @@ export function getVisual<T>(slug: string, name: string, collection: Collection 
   return jsonModules[`/src/content/${collection}/${slug}/visuals/${name}.json`] as T | undefined;
 }
 
-export const url = (path: string) =>
-  `${import.meta.env.BASE_URL.replace(/\/$/, '')}/${path.replace(/^\//, '')}`;
+// A concept or pattern may ship an interactive simulation at src/playgrounds/<Name>Playground.astro,
+// matched by its display name ignoring case, spaces and punctuation (scripts/check-content.mjs uses the same rule).
+const playgrounds = import.meta.glob('/src/playgrounds/*.astro', { eager: true }) as Record<string, { default: any }>;
+export const playgroundFor = (name: string) => {
+  const want = `/${name.replace(/[^a-z0-9]+/gi, '')}playground.astro`.toLowerCase();
+  return Object.entries(playgrounds).find(([p]) => p.toLowerCase().endsWith(want))?.[1].default;
+};
+
+/** The deploy base path without a trailing slash ('' locally, '/system-design-academy' on GitHub Pages). */
+export const base = import.meta.env.BASE_URL.replace(/\/$/, '');
+export const url = (path: string) => `${base}/${path.replace(/^\//, '')}`;

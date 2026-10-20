@@ -63,7 +63,7 @@ export function learnFor(kind: 'concepts' | 'patterns' | 'studies', slug: string
   }
   const sections: Section[] = [
     { id: 'first-attempt', label: 'The first attempt', text: `${data.firstAttempt.text} ${data.firstAttempt.limits.join(' ')}`, concepts: [] },
-    ...data.steps.map((s: any, i: number) => ({ id: 'fix', label: `Step ${i + 1}: ${s.title}`, text: `${s.title} ${s.problem} ${s.fix} ${s.tradeoff}`, concepts: s.concepts })),
+    ...data.steps.map((s: any, i: number) => ({ id: `step-${i + 1}`, label: `Step ${i + 1}: ${s.title}`, text: `${s.title} ${s.problem} ${s.fix} ${s.tradeoff}`, concepts: s.concepts })),
     ...data.failures.map((f: any, i: number) => ({ id: `fail-${i}`, label: `What if something fails: ${f.scenario}`, text: `${f.scenario} ${f.impact} ${f.answer}`, concepts: f.concepts })),
     ...(data.alternatives ?? []).map((a: any, i: number) => ({ id: `alt-${i}`, label: `Choices: ${a.title}`, text: `${a.title} ${a.options.map((o: any) => `${o.name} ${o.pro} ${o.con}`).join(' ')} ${a.pick}`, concepts: [] })),
   ];
