@@ -1,0 +1,206 @@
+---
+import PlaygroundShell from '../../components/PlaygroundShell.astro';
+---
+<PlaygroundShell title="Route a trip through changing traffic" hint="A small city of 216 intersections with a slow zone that builds up in the middle and a road that closes. Pick the routing algorithm and how often traffic is refreshed, then watch the work per query and the ETA error.">
+  <ol class="how">
+    <li>The default is <b>plain Dijkstra</b> with traffic read <b>only at departure</b>: the search visits <b>214 of 216</b> intersections for one route, and the ETA is wrong by <b>19 minutes</b> on average, because the app promised <b>41 minutes</b> and the trip took <b>78</b> once the middle of the city jammed.</li>
+    <li>Switch to <b>A*</b>: the same route, found after only <b>110 intersections</b>. Set the refresh to <b>every 5 minutes</b> with rerouting on: the ETA error falls to <b>4.8 minutes</b>, and the driver is sent around the jam at the next refresh (<b>1 reroute</b>), arriving after <b>61 minutes</b>.</li>
+    <li>Switch to a <b>contraction hierarchy</b>: a query visits only <b>40</b> intersections, but it needs <b>about 48,000 units of preprocessing</b> after every traffic refresh. With <b>1,000 requests</b> per refresh that is <b>88 per request</b>, a little better than A* at <b>110</b>. With only <b>10</b> requests per refresh it is <b>4,875</b> per request, far worse, and with <b>100,000</b> it falls to <b>40</b>.</li>
+  </ol>
+  <div class="pg mrb" data-mrb>
+    <div class="pg-row">
+      <label>Routing algorithm <select class="pg-in" data-alg>
+        <option value="dijkstra" selected>Plain Dijkstra</option>
+        <option value="astar">A* with a straight-line estimate</option>
+        <option value="ch">Contraction hierarchy</option>
+      </select></label>
+      <label>Traffic refresh <select class="pg-in" data-ref>
+        <option value="0" selected>Only at departure</option>
+        <option value="15">Every 15 minutes</option>
+        <option value="5">Every 5 minutes</option>
+        <option value="1">Every minute</option>
+      </select></label>
+      <label>Route requests sharing one traffic snapshot <select class="pg-in" data-req>
+        <option value="10">10</option>
+        <option value="1000" selected>1,000</option>
+        <option value="100000">100,000</option>
+      </select></label>
+      <label><input type="checkbox" data-rr /> Reroute the driver at each refresh</label>
+    </div>
+    <div class="pg-grid">
+      <div class="pg-box" data-b1><h3>Intersections visited by the first query</h3><span class="pg-mono" data-o1></span><span class="pg-note" data-n1></span></div>
+      <div class="pg-box" data-b2><h3>Preprocessing after each traffic refresh</h3><span class="pg-mono" data-o2></span><span class="pg-note" data-n2></span></div>
+      <div class="pg-box" data-b3><h3>Work per request, preprocessing included</h3><span class="pg-mono" data-o3></span><span class="pg-note" data-n3></span></div>
+      <div class="pg-box" data-b4><h3>Average ETA error over the trip</h3><span class="pg-mono" data-o4></span><span class="pg-note" data-n4></span></div>
+      <div class="pg-box" data-b5><h3>Reroutes</h3><span class="pg-mono" data-o5></span><span class="pg-note" data-n5></span></div>
+    </div>
+    <svg class="mrb-map" viewBox="0 0 364 244" role="img" data-map aria-label="Map of a small city"></svg>
+    <p class="pg-note">Map: pale dots are intersections, thick grey lines are fast arterial roads, the shaded square is the zone that jams, filled dots are the intersections the first query visited, the dashed line is the first route and the solid line is the route the driver actually took. The trip goes from the bottom left to the top right. There is a river with two bridges, on the two fast rows near the middle.</p>
+    <p class="pg-out" data-verdict aria-live="polite"></p>
+    <p class="pg-note">Model: 18 by 12 intersections, local roads take 160 s and arterial roads 80 s (plus up to 16 s of variation so that ties are rare). From minute 6 the middle zone slows down steadily to three times its normal time at minute 20, and from minute 14 one road near the destination takes five times as long. A traffic snapshot is the true traffic at the moment of the refresh, so a longer refresh interval means older data. The ETA error is the average, over each minute of the trip, of the difference between the arrival time shown (the rest of the current route priced with the latest snapshot) and the real arrival. The A* estimate is the straight-line distance in blocks times 80 s, which never overestimates because traffic only slows roads. The contraction hierarchy is built for real (nodes ordered by edge difference, shortcuts added when a bounded witness search finds no shorter detour) and rebuilt for every new snapshot; its preprocessing work counts the intersections settled by the witness searches. Work per request is intersections visited plus preprocessing divided by the requests that share a snapshot.</p>
+  </div>
+</PlaygroundShell>
+<style is:global>
+  .playground .mrb-map { width: 100%; max-width: 560px; height: auto; display: block; background: var(--surface); border: 1px solid var(--border); border-radius: 8px; margin: 12px 0 4px; }
+  .playground .mrb-road { stroke: var(--border); stroke-width: 1; }
+  .playground .mrb-road.art { stroke: var(--muted); stroke-width: 2.5; opacity: .45; }
+  .playground .mrb-zone { fill: var(--bad); opacity: .12; }
+  .playground .mrb-dot { fill: var(--surface-2); stroke: var(--border); stroke-width: 1; }
+  .playground .mrb-dot.seen { fill: var(--accent); stroke: var(--accent); }
+  .playground .mrb-first { fill: none; stroke: var(--text); stroke-width: 2; stroke-dasharray: 5 4; }
+  .playground .mrb-driven { fill: none; stroke: var(--accent); stroke-width: 3; opacity: .9; }
+  .playground .mrb-end { fill: var(--text); }
+</style>
+<script>
+  // @ts-nocheck
+  document.querySelectorAll('[data-mrb]').forEach((root) => {
+    const W = 18, H = 12, N = W * H;
+    const SRC = 11 * W + 0, DST = 0 * W + 17;
+    const id = (x, y) => y * W + x;
+    const edges = []; // [a,b,base]
+    for (let y = 0; y < H; y++) for (let x = 0; x < W; x++) {
+      if (x + 1 < W) { if (!(x === 8 && y % 4 !== 0)) edges.push([id(x, y), id(x + 1, y), y % 4 === 0 ? 80 : 160]); }
+      if (y + 1 < H) edges.push([id(x, y), id(x, y + 1), x % 6 === 0 ? 80 : 160]);
+    }
+    const mid = (e) => { const a = edges[e][0], b = edges[e][1]; return [((a % W) + (b % W)) / 2, (Math.floor(a / W) + Math.floor(b / W)) / 2]; };
+    // congestion: a zone in the middle slows from minute 4 to 16, and one incident closes a road from minute 9
+    const mult = (e, tMin) => {
+      const [mx, my] = mid(e); let m = 1;
+      if (mx >= 5 && mx <= 12 && my >= 3 && my <= 8) { const r = Math.min(1, Math.max(0, (tMin - 6) / 14)); m = 1 + 2 * r; }
+      if (tMin >= 14 && mx >= 11 && mx <= 12 && my >= 0 && my <= 1) m = Math.max(m, 5);
+      return m;
+    };
+    const adj = Array.from({ length: N }, () => []);
+    edges.forEach((e, i) => { e[2] += (i * 7 % 5) * 4; });
+    edges.forEach((e, i) => { adj[e[0]].push([e[1], i]); adj[e[1]].push([e[0], i]); });
+    const cost = (e, tMin) => Math.round(edges[e][2] * mult(e, tMin));
+
+    class Heap { constructor() { this.a = []; }
+      push(k, v) { const a = this.a; a.push([k, v]); let i = a.length - 1; while (i > 0) { const p = (i - 1) >> 1; if (a[p][0] <= a[i][0]) break; [a[p], a[i]] = [a[i], a[p]]; i = p; } }
+      pop() { const a = this.a, t = a[0], l = a.pop(); if (a.length) { a[0] = l; let i = 0; for (;;) { let c = 2 * i + 1; if (c >= a.length) break; if (c + 1 < a.length && a[c + 1][0] < a[c][0]) c++; if (a[i][0] <= a[c][0]) break; [a[i], a[c]] = [a[c], a[i]]; i = c; } } return t; }
+      get size() { return this.a.length; } peek() { return this.a[0][0]; } }
+
+    const heur = (v, t) => (Math.abs((v % W) - (t % W)) + Math.abs(Math.floor(v / W) - Math.floor(t / W))) * 80;
+    function search(s, t, w, useH) { // w[e]: cost of each edge
+      const dist = new Array(N).fill(Infinity), prev = new Array(N).fill(-1), done = new Array(N).fill(false), h = new Heap(); let settled = 0; const order = [];
+      dist[s] = 0; h.push(useH ? heur(s, t) : 0, s);
+      while (h.size) { const [, u] = h.pop(); if (done[u]) continue; done[u] = true; settled++; order.push(u); if (u === t) break;
+        for (const [v, e] of adj[u]) { const nd = dist[u] + w[e]; if (nd < dist[v]) { dist[v] = nd; prev[v] = u; h.push(nd + (useH ? heur(v, t) : 0), v); } } }
+      const path = []; for (let v = t; v !== -1; v = prev[v]) path.push(v); path.reverse();
+      return { cost: dist[t], path, settled, order };
+    }
+    // Contraction hierarchy
+    function buildCH(w) {
+      const out = Array.from({ length: N }, () => new Map()), inn = Array.from({ length: N }, () => new Map()); // neighbour -> [cost, via]
+      const add = (a, b, c, via) => { const o = out[a].get(b); if (!o || c < o[0]) { out[a].set(b, [c, via]); inn[b].set(a, [c, via]); } };
+      edges.forEach((e, i) => { add(e[0], e[1], w[i], -1); add(e[1], e[0], w[i], -1); });
+      const contracted = new Array(N).fill(false), level = new Array(N).fill(0); let work = 0, shortcuts = 0;
+      function witness(u, x, limit, skip) { // dist from u to x avoiding skip, bounded
+        const d = new Map([[u, 0]]), h = new Heap(); h.push(0, u); let n = 0;
+        while (h.size && n < 30) { const [k, a] = h.pop(); if (k > d.get(a)) continue; n++; work++; if (a === x || k > limit) break;
+          for (const [b, [c]] of out[a]) { if (b === skip || contracted[b]) continue; const nd = k + c; if (nd < (d.has(b) ? d.get(b) : Infinity)) { d.set(b, nd); h.push(nd, b); } } }
+        return d.has(x) ? d.get(x) : Infinity;
+      }
+      function plan(v) { const list = [];
+        for (const [u, [cu]] of inn[v]) { if (contracted[u]) continue; for (const [x, [cx]] of out[v]) { if (contracted[x] || x === u) continue; const c = cu + cx; if (witness(u, x, c, v) > c) list.push([u, x, c]); } }
+        return list; }
+      const prio = (v) => { const sc = plan(v).length; let deg = 0; for (const u of inn[v].keys()) if (!contracted[u]) deg++; return sc - deg + level[v]; };
+      const q = new Heap(); for (let v = 0; v < N; v++) q.push(prio(v), v);
+      const rank = new Array(N).fill(0); let r = 0;
+      while (q.size) { const [k, v] = q.pop(); if (contracted[v]) continue; const p = prio(v); if (q.size && p > q.peek()) { q.push(p, v); continue; }
+        const list = plan(v); for (const [u, x, c] of list) { add(u, x, c, v); shortcuts++; }
+        contracted[v] = true; rank[v] = r++; for (const u of out[v].keys()) level[u] = Math.max(level[u], level[v] + 1); for (const u of inn[v].keys()) level[u] = Math.max(level[u], level[v] + 1); }
+      const up = Array.from({ length: N }, () => []), dn = Array.from({ length: N }, () => []);
+      for (let a = 0; a < N; a++) for (const [b, [c, via]] of out[a]) { if (rank[b] > rank[a]) up[a].push([b, c, via]); else dn[b].push([a, c, via]); } // dn[b]: edges a->b with rank[a]>rank[b], walked backwards from target
+      const viaOf = (a, b) => out[a].get(b)[1];
+      return { up, dn, shortcuts, work, rank, viaOf };
+    }
+    function queryCH(ch, s, t) {
+      const D = [new Map([[s, 0]]), new Map([[t, 0]])], P = [new Map(), new Map()], H2 = [new Heap(), new Heap()], G = [ch.up, ch.dn]; H2[0].push(0, s); H2[1].push(0, t);
+      let best = Infinity, meet = -1, settled = 0; const order = [];
+      while (H2[0].size || H2[1].size) {
+        const m = Math.min(H2[0].size ? H2[0].peek() : Infinity, H2[1].size ? H2[1].peek() : Infinity); if (m >= best) break;
+        const side = (H2[1].size && (!H2[0].size || H2[1].peek() < H2[0].peek())) ? 1 : 0; const [k, u] = H2[side].pop(); if (k > D[side].get(u)) continue; settled++; order.push(u);
+        if (D[1 - side].has(u) && k + D[1 - side].get(u) < best) { best = k + D[1 - side].get(u); meet = u; }
+        for (const [v, c, via] of G[side][u]) { const nd = k + c; if (nd < (D[side].has(v) ? D[side].get(v) : Infinity)) { D[side].set(v, nd); P[side].set(v, [u, via]); H2[side].push(nd, v); } }
+      }
+      if (meet < 0) return { cost: Infinity, path: [], settled, order };
+      const unpack = (a, b) => { const m = ch.viaOf(a, b); return m < 0 ? [a, b] : [...unpack(a, m).slice(0, -1), ...unpack(m, b)]; };
+      const path = [s]; const fw = []; for (let v = meet; v !== s; v = P[0].get(v)[0]) fw.push(v); fw.reverse();
+      let cur = s; for (const v of fw) { path.push(...unpack(cur, v).slice(1)); cur = v; }
+      for (let v = meet; v !== t; ) { const nx = P[1].get(v)[0]; path.push(...unpack(v, nx).slice(1)); v = nx; }
+      return { cost: best, path, settled, order };
+    }
+    const edgeOf = new Map(); edges.forEach((e, i) => { edgeOf.set(e[0] * N + e[1], i); edgeOf.set(e[1] * N + e[0], i); });
+    function trip(alg, refreshMin, reroute) {
+      const snapAt = (tSec) => (refreshMin ? Math.floor(tSec / 60 / refreshMin) * refreshMin : 0);
+      let ch = null, queries = 0, settledTotal = 0, rebuilds = 0, buildWork = 0, snapKey = -1, w = null, firstOrder = null;
+      const plan = (from, tSec) => {
+        const k = snapAt(tSec); if (k !== snapKey) { snapKey = k; w = edges.map((_, e) => cost(e, k)); if (alg === 'ch') { ch = buildCH(w); rebuilds++; buildWork += ch.work; } }
+        const r = alg === 'ch' ? queryCH(ch, from, DST) : search(from, DST, w, alg === 'astar');
+        queries++; settledTotal += r.settled; if (!firstOrder) firstOrder = r.order; return r;
+      };
+      let t = 0, cur = SRC, route = plan(cur, 0), eta = route.cost, reroutes = 0, i = 0, nextRefresh = refreshMin ? refreshMin * 60 : Infinity, nextMin = 0; const first = route.path.slice(), driven = [SRC], marks = [];
+      while (cur !== DST) {
+        if (reroute && t >= nextRefresh) { while (nextRefresh <= t) nextRefresh += refreshMin * 60; const r = plan(cur, t); if (r.path.join() !== route.path.slice(i).join()) { reroutes++; } route = r; i = 0; }
+        while (t >= nextMin * 60) { marks.push({ t, rest: route.path.slice(i), k: snapAt(t * 1) }); nextMin++; }
+        const nx = route.path[i + 1]; t += cost(edgeOf.get(cur * N + nx), t / 60); cur = nx; i++; driven.push(cur);
+      }
+      // the ETA the app would show each minute: remaining cost of the current route under the latest snapshot
+      let errSum = 0; for (const m of marks) { let rem = 0; for (let j = 0; j + 1 < m.rest.length; j++) rem += cost(edgeOf.get(m.rest[j] * N + m.rest[j + 1]), m.k); errSum += Math.abs(m.t + rem - t); }
+      return { eta, actual: t, queries, settledPerQuery: settledTotal / queries, rebuilds, buildWork, reroutes, first, driven, firstOrder, meanErr: errSum / marks.length };
+    }
+
+    const q = (s) => root.querySelector(s);
+    const NS = 'http://www.w3.org/2000/svg';
+    const px = (v) => 12 + (v % W) * 20, py = (v) => 12 + Math.floor(v / W) * 20;
+    const mk = (tag, attrs, parent) => { const el = document.createElementNS(NS, tag); for (const k in attrs) el.setAttribute(k, attrs[k]); parent.append(el); return el; };
+    const svg = q('[data-map]');
+    mk('rect', { class: 'mrb-zone', x: 12 + 5 * 20 - 10, y: 12 + 3 * 20 - 10, width: 7 * 20 + 20, height: 5 * 20 + 20 }, svg);
+    edges.forEach((e) => mk('line', { class: 'mrb-road' + (e[2] < 100 ? ' art' : ''), x1: px(e[0]), y1: py(e[0]), x2: px(e[1]), y2: py(e[1]) }, svg));
+    const dots = Array.from({ length: N }, (_, v) => mk('circle', { class: 'mrb-dot', cx: px(v), cy: py(v), r: 3 }, svg));
+    const firstLine = mk('polyline', { class: 'mrb-first', points: '' }, svg), drivenLine = mk('polyline', { class: 'mrb-driven', points: '' }, svg);
+    mk('rect', { class: 'mrb-end', x: px(SRC) - 5, y: py(SRC) - 5, width: 10, height: 10 }, svg); mk('circle', { class: 'mrb-end', cx: px(DST), cy: py(DST), r: 6 }, svg);
+    const pts = (path) => path.map((v) => px(v) + ',' + py(v)).join(' ');
+    const fmt = (n) => Math.round(n).toLocaleString('en-US');
+    const cache = new Map();
+    const cached = (a, f, rr) => { const k = a + '|' + f + '|' + rr; if (!cache.has(k)) cache.set(k, trip(a, f, rr)); return cache.get(k); };
+    let token = 0;
+    function draw() {
+      const alg = q('[data-alg]').value, ref = Number(q('[data-ref]').value), req = Number(q('[data-req]').value), rr = q('[data-rr]').checked;
+      const key = alg + '|' + ref + '|' + rr; const my = ++token;
+      const out = q('[data-verdict]'); out.textContent = alg === 'ch' ? 'Building the hierarchy...' : 'Working...';
+      setTimeout(() => {
+        if (my !== token) return;
+        show(cached(alg, ref, rr), alg, ref, req, rr);
+      }, 15);
+    }
+    function show(r, alg, ref, req, rr) {
+      dots.forEach((d, v) => d.classList.remove('seen')); r.firstOrder.forEach((v) => dots[v].classList.add('seen'));
+      firstLine.setAttribute('points', pts(r.first)); drivenLine.setAttribute('points', pts(r.driven));
+      const base = cached('astar', ref, rr).settledPerQuery;
+      const first = r.firstOrder.length, perBuild = r.rebuilds ? r.buildWork / r.rebuilds : 0;
+      const perReq = r.settledPerQuery + perBuild / req;
+      const errMin = r.meanErr / 60, etaMin = r.eta / 60, actMin = r.actual / 60;
+      q('[data-o1]').textContent = first + ' of ' + N; q('[data-n1]').textContent = alg === 'dijkstra' ? 'spreads in every direction until it reaches the destination' : alg === 'astar' ? 'the estimate steers the search toward the destination' : 'searches upward from both ends of the trip and meets in the middle';
+      q('[data-o2]').textContent = alg === 'ch' ? fmt(perBuild) + ' units' : 'none'; q('[data-n2]').textContent = alg === 'ch' ? 'rebuilt ' + r.rebuilds + (r.rebuilds === 1 ? ' time' : ' times') + ' on this trip, because new traffic changes the edge weights the shortcuts were made from' : 'edge weights are just read, so a new snapshot costs nothing extra';
+      q('[data-o3]').textContent = fmt(perReq); q('[data-n3]').textContent = 'average over ' + r.queries + (r.queries === 1 ? ' query' : ' queries') + ' on the trip, with ' + fmt(req) + ' requests sharing each snapshot';
+      q('[data-o4]').textContent = errMin.toFixed(1) + ' min'; q('[data-n4]').textContent = 'first ETA ' + Math.round(etaMin) + ' min, trip took ' + Math.round(actMin) + ' min';
+      q('[data-o5]').textContent = String(r.reroutes); q('[data-n5]').textContent = rr ? (ref ? 'route checked ' + r.queries + (r.queries === 1 ? ' time' : ' times') + ' on this trip' : 'no refresh while driving, so nothing to react to') : 'rerouting is off, the driver follows the first route';
+      const col = (el, c) => q(el).style.setProperty('--c', c);
+      col('[data-b1]', 'var(--accent)'); col('[data-b2]', alg === 'ch' && perReq > base ? 'var(--bad)' : 'var(--accent)');
+      col('[data-b3]', 'var(--accent)'); col('[data-b4]', errMin > 8 ? 'var(--bad)' : errMin < 5 ? 'var(--good)' : 'var(--accent)'); col('[data-b5]', 'var(--accent)');
+      const v = q('[data-verdict]'); const bad = errMin > 8 || (alg === 'ch' && perReq > base);
+      v.classList.toggle('bad', bad);
+      const parts = [];
+      if (alg === 'ch' && perReq > base) parts.push('The hierarchy loses here: rebuilding it costs ' + fmt(perBuild) + ' units and only ' + fmt(req) + ' requests share each snapshot, which is ' + fmt(perBuild / req) + ' per request on top of ' + Math.round(r.settledPerQuery) + ' for the query itself, more than the ' + Math.round(base) + ' that A* needs. It pays off only when very many requests share one rebuild.');
+      else if (alg === 'ch') parts.push('The hierarchy pays off: ' + Math.round(r.settledPerQuery) + ' intersections per query, and the rebuild is spread over ' + fmt(req) + ' requests, ' + fmt(perReq) + ' per request against ' + Math.round(base) + ' for A*.');
+      else parts.push('Each query visits about ' + Math.round(r.settledPerQuery) + ' of ' + N + ' intersections' + (alg === 'dijkstra' ? ', and a continent has tens of millions of intersections, and the same search would settle a large share of them.' : ', fewer than Dijkstra, but a continent is still far too big for it.'));
+      if (errMin > 8) parts.push('The ETA is off by ' + errMin.toFixed(1) + ' minutes on average, because traffic data ' + (ref ? 'is up to ' + ref + ' minutes old' : 'was read once, at departure') + '.');
+      else parts.push('The ETA stays within ' + errMin.toFixed(1) + ' minutes on average.');
+      v.textContent = parts.join(' ');
+    }
+    root.addEventListener('input', draw); root.addEventListener('change', draw);
+    draw();
+  });
+</script>

@@ -1,0 +1,542 @@
+{
+  "name": "Design a virtual waiting room",
+  "difficulty": "advanced",
+  "intent": "Put a queue in front of a site during a flash sale or ticket drop, so that a crowd far larger than the backend is admitted fairly, at a rate the backend can take, while the waiting page itself survives the stampede.",
+  "codeTitle": "signed queue tokens and a paced admission pointer",
+  "finalIntro": "One fan joining the queue, waiting, surviving a restart and getting in.",
+  "prompt": "Design a virtual waiting room for an online ticket drop. A million fans arrive within a minute of the sale opening, but the shop behind it can safely start only about 80 new shoppers per second. Visitors who arrive should wait in a fair line, see their progress, be let in at a pace the backend can handle, and keep their place if anything crashes. Bots should not be able to jump the line.",
+  "functional": [
+    "Put every visitor into a queue when the sale is busy, and let them straight in when it is not",
+    "Give each visitor a place in line and show their progress and an estimated wait",
+    "Admit people in order at a rate set from the backend's capacity",
+    "Let an admitted visitor shop for a limited time with a pass, then give the slot back",
+    "Keep a visitor's place across page reloads and across a crash of the queue servers",
+    "Make it hard for scripts and duplicate tabs to gain places"
+  ],
+  "nonFunctional": [
+    "Absorb about a million visitors in a minute, with the waiting page staying up even if the shop is down",
+    "The backend never sees more new shoppers per second than it can serve",
+    "Ordering is fair: a place cannot be forged, moved or bought, and the rules for the opening crowd are published",
+    "A visitor never loses their place because a server restarted",
+    "Waiting visitors cause almost no load on the origin, even while polling for progress",
+    "Admission can be slowed or paused within seconds if the backend degrades"
+  ],
+  "firstAttempt": {
+    "text": "Send everyone straight to the shop, and add servers or a short error page when it is too busy. Visitors refresh until they get through, and a rate limit per IP address tries to keep the load down.",
+    "limits": [
+      "A million visitors against a shop that starts about 80 new shoppers per second means almost every request fails, and the backend wastes its effort on timeouts",
+      "Refreshing makes it worse: each failed fan retries, so the load stays high long after the first rush",
+      "Whoever has the fastest connection, or runs a script, wins, so the line is unfair and bots take most of the tickets",
+      "Autoscaling cannot help, since the database and the stock counter behind the shop do not scale in seconds",
+      "There is no way to tell people how long they will wait, so they keep hammering the page"
+    ]
+  },
+  "nodes": [
+    {
+      "id": "users",
+      "label": "Fans' browsers",
+      "kind": "client",
+      "x": 87,
+      "y": 63
+    },
+    {
+      "id": "shop",
+      "label": "Shop backend",
+      "kind": "compute",
+      "x": 37,
+      "y": 63
+    },
+    {
+      "id": "edge",
+      "label": "Edge waiting page",
+      "kind": "edge",
+      "x": 62,
+      "y": 63,
+      "at": 1
+    },
+    {
+      "id": "queue",
+      "label": "Queue service",
+      "kind": "compute",
+      "x": 62,
+      "y": 37,
+      "at": 2
+    },
+    {
+      "id": "counter",
+      "label": "Place counter",
+      "kind": "data",
+      "x": 62,
+      "y": 12,
+      "at": 2
+    },
+    {
+      "id": "admit",
+      "label": "Admission controller",
+      "kind": "compute",
+      "x": 37,
+      "y": 88,
+      "at": 3
+    },
+    {
+      "id": "pointer",
+      "label": "Admitted pointer",
+      "kind": "data",
+      "x": 62,
+      "y": 88,
+      "at": 3
+    },
+    {
+      "id": "joinlog",
+      "label": "Join log",
+      "kind": "async",
+      "x": 87,
+      "y": 37,
+      "at": 4
+    },
+    {
+      "id": "bot",
+      "label": "Bot check",
+      "kind": "compute",
+      "x": 37,
+      "y": 37,
+      "at": 5
+    },
+    {
+      "id": "cache",
+      "label": "Cached pointer",
+      "kind": "edge",
+      "x": 87,
+      "y": 88,
+      "at": 6
+    }
+  ],
+  "edges": [
+    {
+      "from": "users",
+      "to": "shop",
+      "at": 0,
+      "until": 1
+    },
+    {
+      "from": "users",
+      "to": "edge",
+      "at": 1
+    },
+    {
+      "from": "edge",
+      "to": "shop",
+      "at": 1
+    },
+    {
+      "from": "edge",
+      "to": "queue",
+      "at": 2,
+      "until": 5
+    },
+    {
+      "from": "queue",
+      "to": "counter",
+      "at": 2
+    },
+    {
+      "from": "shop",
+      "to": "admit",
+      "at": 3
+    },
+    {
+      "from": "admit",
+      "to": "pointer",
+      "at": 3
+    },
+    {
+      "from": "pointer",
+      "to": "edge",
+      "at": 3
+    },
+    {
+      "from": "queue",
+      "to": "joinlog",
+      "at": 4
+    },
+    {
+      "from": "joinlog",
+      "to": "counter",
+      "at": 4
+    },
+    {
+      "from": "edge",
+      "to": "bot",
+      "at": 5
+    },
+    {
+      "from": "bot",
+      "to": "queue",
+      "at": 5
+    },
+    {
+      "from": "users",
+      "to": "cache",
+      "at": 6
+    },
+    {
+      "from": "pointer",
+      "to": "cache",
+      "at": 6
+    }
+  ],
+  "steps": [
+    {
+      "title": "Serve a static waiting page from the edge",
+      "problem": "When the sale opens, a million visitors reach the site in a minute. If the check 'is there room?' runs on the shop's own servers, those servers are the first thing to fall over, and the waiting page goes down with the shop.",
+      "fix": "Put the front door on the CDN edge. A small edge function looks at each request: with a valid pass it is forwarded to the shop, and without one it gets the waiting page. The waiting page is plain static HTML, CSS and JavaScript cached at every edge location, so it costs the origin nothing, however many people open it. The shop itself sits behind the edge and only receives traffic the edge lets through.",
+      "tradeoff": "The part that must survive a stampede is the part that scales best, and the shop never sees the crowd. The decision logic now runs at the edge, where it must be tiny, stateless and quick, and it needs a cheap way to learn how far the queue has advanced.",
+      "concepts": [
+        {
+          "slug": "cdn"
+        },
+        {
+          "slug": "caching"
+        },
+        {
+          "slug": "http-caching-headers"
+        },
+        {
+          "slug": "load-shedding"
+        }
+      ]
+    },
+    {
+      "title": "Give each visitor a signed token and a fair place",
+      "problem": "A queue is only worth anything if people trust it. If a place is just a number in the page or an unsigned cookie, anyone can edit it. If the server must remember every visitor, the queue itself becomes a million-row database under the same stampede.",
+      "fix": "When a visitor joins, a queue service takes the next number from an atomic counter and returns a token: the place, the time it was issued and an HMAC signature made with a secret key. The browser stores it as a cookie. Because the signature can be checked by any edge location with the key, no server has to look the token up, and a forged or altered place fails the check. The rules for the opening crowd are fair by design: everyone who joins before the sale opens, or within a short window after, goes into a pool that is shuffled once with a seeded random draw (a lottery) and then numbered. People who come later are numbered in order of arrival.",
+      "tradeoff": "Places cannot be changed or forged and the queue needs no per-visitor storage, only a counter. A lottery for the opening window removes the advantage of a fast connection, at the price of a delay while the window is open. A strictly first-come queue is simpler to explain but rewards speed and scripts.",
+      "concepts": [
+        {
+          "slug": "jwt-and-session-tokens"
+        },
+        {
+          "slug": "ordering-and-partitioning"
+        },
+        {
+          "slug": "encryption"
+        },
+        {
+          "slug": "authentication-and-authorization"
+        }
+      ]
+    },
+    {
+      "title": "Set the admission rate from the backend's capacity",
+      "problem": "Letting people in too fast brings the shop down, and letting them in too slowly wastes capacity and the tickets sell out later than they could. A fixed number guessed in advance is wrong the moment the backend slows down.",
+      "fix": "The admission controller advances a pointer: every place below it may enter. Its starting rate comes from Little's law. If the shop can hold 16,000 shoppers at once and each keeps a slot about 200 seconds, it can start about 80 new shoppers per second. The controller then watches the shop's latency and error rate, and slows the pointer, or pauses it, when they worsen, and speeds up again slowly when they recover, much as TCP adjusts its window. Admission is a rate of new sessions, not a count of pages.",
+      "tradeoff": "The backend is held at the edge of its capacity instead of being flooded, and the queue length, not an error page, absorbs the surplus. Admitting too fast is worse than admitting a little slowly, because overload makes the useful rate fall, so the controller should lean cautious and recover gradually.",
+      "concepts": [
+        {
+          "slug": "queueing-theory-and-littles-law"
+        },
+        {
+          "slug": "backpressure"
+        },
+        {
+          "slug": "rate-limiting"
+        },
+        {
+          "slug": "autoscaling"
+        },
+        {
+          "slug": "tcp-congestion-control"
+        }
+      ]
+    },
+    {
+      "title": "Issue a short pass, and keep the place across crashes",
+      "problem": "Once a visitor's place is below the pointer they must be able to shop, but not for ever, or slots never come back. And the queue service, which holds the counter and the pointer, will sometimes restart in the middle of a sale.",
+      "fix": "When the edge sees a token whose place is below the pointer, it issues a second signed token, a pass, valid for a short time such as ten minutes and tied to the browser session. The pass is what the edge checks on every request to the shop; when it expires, the slot is free for the next person. The counter and the pointer are the only shared state, so they are kept in a replicated store and every join is appended to a log. After a crash, a new instance reloads the pointer and rebuilds the counter from the log. Tokens held in browsers are checked by signature, so they remain valid across the restart.",
+      "tradeoff": "Slots are returned by themselves, even from people who walk away, and a restart costs no one their place. A fixed expiry can end a purchase half way through, so the shop can extend the pass while a checkout is under way, and the log must be durable before a token is handed out.",
+      "concepts": [
+        {
+          "slug": "write-ahead-log"
+        },
+        {
+          "slug": "database-replication"
+        },
+        {
+          "slug": "leases-and-fencing-tokens"
+        },
+        {
+          "slug": "idempotency"
+        },
+        {
+          "slug": "health-checks"
+        }
+      ]
+    },
+    {
+      "title": "Resist bots and duplicate tabs",
+      "problem": "A script can open thousands of connections and hold thousands of places in the line, and one person can open ten tabs. Every extra place taken is a place taken from a real fan.",
+      "fix": "Joining the queue requires passing a bot check first: a challenge, such as a proof of work or a human-verification step, plus signals such as account age and device, and per-address and per-account rate limits. The token is bound to a logged-in or verified identity where one exists, so a second join returns the first token instead of a new place. Passes are bound to the session and cannot be handed to someone else. Together with the lottery for the opening window, which gives a script no advantage from being fast, this makes the line hard to game, though never impossible.",
+      "tradeoff": "Each real person gets about one place, and the economics of botting get worse. Challenges add friction and can wrongly block people who use shared addresses or assistive tools, and attackers adapt, so the checks need monitoring and tuning, and a way to review cases afterwards.",
+      "concepts": [
+        {
+          "slug": "rate-limiting"
+        },
+        {
+          "slug": "authentication-and-authorization"
+        },
+        {
+          "slug": "alerting"
+        },
+        {
+          "slug": "secrets-management"
+        }
+      ]
+    },
+    {
+      "title": "Let the waiting page work out its own progress",
+      "problem": "Waiting people want to see their progress. If each of a million pages asks a server 'where am I?' every ten seconds, that is 100,000 requests per second, which is a stampede of its own.",
+      "fix": "The page needs only one number, how far the pointer has got. The controller publishes the pointer as a tiny file at an edge-cached address with a time to live of about one second. Each page fetches that file, subtracts it from the place in its own token, and works out its position and an estimate from the recent speed of the pointer. The server also returns a poll interval with a random jitter, and it can lengthen the interval when load is high. The origin handles about one fetch per edge location per second, however many people wait.",
+      "tradeoff": "Progress costs the origin almost nothing and no per-visitor state is kept. The pointer is a second or two old, so a position can be a little behind, and estimates are rough while the backend's speed changes. Users on very old browsers may need a fallback of slower polling.",
+      "concepts": [
+        {
+          "slug": "caching"
+        },
+        {
+          "slug": "cdn"
+        },
+        {
+          "slug": "retries-and-backoff"
+        },
+        {
+          "slug": "real-time-communication"
+        },
+        {
+          "slug": "graceful-degradation"
+        }
+      ]
+    }
+  ],
+  "failures": [
+    {
+      "scenario": "A queue server crashes in the middle of the sale",
+      "impact": "If places lived only in its memory, everyone would lose their place or be given a new, later one.",
+      "answer": "The browsers hold signed tokens that any instance can verify, so existing places stay valid. A new instance reloads the pointer from the replicated store and rebuilds the counter from the join log, and the edge keeps serving the cached waiting page in the meantime. At worst new joins are paused for a few seconds.",
+      "concepts": [
+        {
+          "slug": "write-ahead-log"
+        },
+        {
+          "slug": "database-replication"
+        },
+        {
+          "slug": "health-checks"
+        },
+        {
+          "slug": "jwt-and-session-tokens"
+        }
+      ]
+    },
+    {
+      "scenario": "The shop slows down because the payment provider is struggling",
+      "impact": "Admitted shoppers hold their slots for longer, so more shoppers pile up inside the shop than it can handle.",
+      "answer": "The controller sees higher latency and errors and slows or pauses the pointer, so no new shoppers enter until the slots drain. The queue absorbs the wait, and the waiting page can show a message. Circuit breakers inside the shop stop one slow dependency from taking down the rest.",
+      "concepts": [
+        {
+          "slug": "circuit-breaker"
+        },
+        {
+          "slug": "backpressure"
+        },
+        {
+          "slug": "load-shedding"
+        },
+        {
+          "slug": "timeouts-and-deadlines"
+        }
+      ]
+    },
+    {
+      "scenario": "A script tries to forge a token with a better place",
+      "impact": "If tokens were not protected, a user could change the number in the cookie and jump to the front.",
+      "answer": "The edge recomputes the HMAC over the place with the secret key and compares it with the signature, so any changed place fails and is sent back to the waiting page to join again. The key never leaves the servers, is rotated on a schedule, and the verification uses a constant-time comparison.",
+      "concepts": [
+        {
+          "slug": "encryption"
+        },
+        {
+          "slug": "secrets-management"
+        },
+        {
+          "slug": "jwt-and-session-tokens"
+        }
+      ]
+    },
+    {
+      "scenario": "Everyone refreshes at once when the page says 'your turn soon'",
+      "impact": "A synchronised burst of requests hits the edge and the origin just when the pointer reaches the front.",
+      "answer": "The pointer file is cached at the edge, polling intervals carry random jitter, and the controller can lengthen the interval. A pass is issued by the edge, not by the origin, so admission does not need a call to the shop. Retries of failed fetches back off exponentially.",
+      "concepts": [
+        {
+          "slug": "retries-and-backoff"
+        },
+        {
+          "slug": "caching"
+        },
+        {
+          "slug": "cdn"
+        },
+        {
+          "slug": "backpressure"
+        }
+      ]
+    }
+  ],
+  "alternatives": [
+    {
+      "title": "How the queue is ordered",
+      "options": [
+        {
+          "name": "First come, first served",
+          "pro": "Simple, and easy to explain",
+          "con": "Rewards fast connections, scripts and people near the data centre"
+        },
+        {
+          "name": "Random lottery for an opening window",
+          "pro": "Removes the advantage of speed, so everyone who comes in the window has an equal chance",
+          "con": "Everyone waits until the window closes, and the fairness has to be seen to be believed"
+        },
+        {
+          "name": "Priority for members or earlier registrants",
+          "pro": "Rewards loyalty, and can reduce scalping",
+          "con": "Needs identity and rules that people may dispute"
+        }
+      ],
+      "pick": "A lottery for the opening window, then first come, first served for later arrivals."
+    },
+    {
+      "title": "Where queue state is kept",
+      "options": [
+        {
+          "name": "A row per visitor in a database",
+          "pro": "Flexible, and easy to inspect",
+          "con": "A write per visitor under the heaviest load, and a big store to rebuild"
+        },
+        {
+          "name": "Signed, self-describing tokens",
+          "pro": "No lookup to verify, and any edge location can check them",
+          "con": "A token cannot be revoked without extra state, and the key must be protected"
+        },
+        {
+          "name": "A server session with a cookie id",
+          "pro": "Easy to revoke or change",
+          "con": "Every check needs the session store"
+        }
+      ],
+      "pick": "Signed tokens, with only a counter, a pointer and a join log as shared state."
+    },
+    {
+      "title": "How to decide the admission rate",
+      "options": [
+        {
+          "name": "A fixed rate set by hand",
+          "pro": "Predictable, and simple to run",
+          "con": "Wrong as soon as the backend speeds up or slows down"
+        },
+        {
+          "name": "A rate from capacity, with feedback",
+          "pro": "Tracks the backend's real health, and recovers by itself",
+          "con": "Needs good signals and careful tuning to avoid oscillation"
+        },
+        {
+          "name": "A cap on concurrent shoppers",
+          "pro": "Directly protects the scarce resource, and frees slots as people leave",
+          "con": "Needs the shop to report when sessions end"
+        }
+      ],
+      "pick": "Start from capacity using Little's law and adjust with feedback, with a cap on concurrent shoppers as a safety limit."
+    },
+    {
+      "title": "How the page learns its progress",
+      "options": [
+        {
+          "name": "Poll an API per visitor",
+          "pro": "Exact, and personal",
+          "con": "A million visitors poll the origin, which is a stampede"
+        },
+        {
+          "name": "Poll a cached pointer file",
+          "pro": "Almost no origin load, and no per-visitor state",
+          "con": "A second or two out of date"
+        },
+        {
+          "name": "Push over WebSockets",
+          "pro": "Instant updates",
+          "con": "A million open connections to keep alive, which is costly and fragile"
+        }
+      ],
+      "pick": "A cached pointer file with jittered polling."
+    }
+  ],
+  "roles": [
+    {
+      "id": "client",
+      "label": "Fans",
+      "description": "Browsers that wait for a place and then shop."
+    },
+    {
+      "id": "edge",
+      "label": "Edge",
+      "description": "The waiting page, pass checks and the cached pointer."
+    },
+    {
+      "id": "async",
+      "label": "Join log",
+      "description": "The append-only record of joins used to rebuild the counter."
+    },
+    {
+      "id": "compute",
+      "label": "Services",
+      "description": "Queue, bot check, admission controller and the shop."
+    },
+    {
+      "id": "data",
+      "label": "State",
+      "description": "The place counter and the admitted pointer."
+    }
+  ],
+  "quiz": [
+    {
+      "question": "A ticket drop expects a million visitors in one minute. The team puts the waiting page on the shop's own web servers, which return a 'please wait' page whenever the shop is full. The servers still fail at on-sale. What is the most useful change?",
+      "options": [
+        "Serve the waiting page as static content from the CDN edge, and let only visitors with a valid pass through to the shop's servers",
+        "Add many more web servers behind the load balancer, so that the waiting page is served from a larger pool during the first minute",
+        "Make the waiting page lighter by removing images, so that each server can answer more requests every second than it could before",
+        "Ask visitors to refresh the page every few seconds, so that the traffic is spread more evenly over the first few minutes of the sale"
+      ],
+      "answer": 0,
+      "explanation": "Even a light page still costs a request on the shop's servers, and a million visitors in a minute is far more than a pool can take without long warm-up. A cached static page at the edge costs the origin nothing, and refreshing only adds traffic. The shop then sees just the admitted visitors."
+    },
+    {
+      "question": "A waiting room hands out places as plain numbers in a cookie, and users find they can edit the cookie to jump the line. The team wants to fix it without storing a row for each of a million visitors. What should they do?",
+      "options": [
+        "Encrypt the whole cookie with a key that every visitor's browser gets, so that people can no longer read the place number in it",
+        "Store each place in a database table and compare it with the cookie on every request, so that edited places can be detected centrally",
+        "Sign the place and the issue time with an HMAC under a secret key, and let the edge verify the signature without any lookup",
+        "Hide the place by hashing it with a public algorithm in the cookie, so that people cannot work out which number to put there"
+      ],
+      "answer": 2,
+      "explanation": "A signature that only the servers can produce makes any altered place fail verification, and checking it needs no stored state. Sending the key to browsers or hashing with a public function does not stop anyone producing a valid value, and a table lookup brings back the per-visitor store."
+    },
+    {
+      "question": "The shop holds about 16,000 shoppers at once and each keeps a slot for roughly 200 seconds. The controller admits 200 people per second and the shop begins to time out, with fewer completed purchases than before. What is the best fix?",
+      "options": [
+        "Raise the admission rate further, since more people inside the shop will eventually produce more completed purchases than before",
+        "Lower the rate towards about 80 per second, from slots divided by hold time, and adjust it from the shop's latency and errors",
+        "Keep 200 per second but give each shopper a longer time limit, so that fewer of them are cut off in the middle of buying",
+        "Remove the queue for the next ten minutes and send everyone straight to the shop, so that the backlog clears as quickly as possible"
+      ],
+      "answer": 1,
+      "explanation": "By Little's law 16,000 slots with a 200-second hold support about 80 new shoppers per second, so 200 per second overfills the shop, and overload lowers the useful rate. Admitting more or removing the queue makes it worse, and longer limits keep slots occupied for longer."
+    }
+  ]
+}
