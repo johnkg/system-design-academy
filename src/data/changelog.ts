@@ -3,6 +3,13 @@ export interface Change { date: string; title: string; items: { text: string; hr
 
 export const changelog: Change[] = [
   {
+    date: '2026-10-20',
+    title: 'Clearer quiz questions',
+    items: [
+      { text: 'Fifteen quiz questions were tightened after a strict review: each now states the constraint that makes one answer clearly best, and a few weak or near-duplicate wrong options were replaced.' },
+    ],
+  },
+  {
     date: '2026-10-18',
     title: 'Work offline, find your way, and learn from mistakes',
     items: [
