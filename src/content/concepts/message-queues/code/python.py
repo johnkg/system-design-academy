@@ -1,6 +1,8 @@
 """A message queue in Python: publish, receive, ack, retry, and a dead-letter queue."""
 from dataclasses import dataclass
 
+MAX_ATTEMPTS = 3  # deliveries before a message goes to the dead-letter queue
+
 
 @dataclass
 class Message:
@@ -10,7 +12,7 @@ class Message:
 
 
 class MessageQueue:
-    def __init__(self, max_attempts=3):
+    def __init__(self, max_attempts=MAX_ATTEMPTS):
         self.max_attempts = max_attempts
         self._ready = []
         self._in_flight = {}
@@ -56,7 +58,7 @@ def handle(body):
         raise ValueError("malformed address")
 
 
-queue = MessageQueue(3)
+queue = MessageQueue(MAX_ATTEMPTS)
 for m in ["email:ada", "email:BAD", "email:cy"]:
     queue.publish(m)  # the producer never waits
 

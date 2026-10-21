@@ -3,6 +3,12 @@
 import assert from "node:assert";
 
 const LEASE = 4; // a worker renews its lease every second; if it stops, the job is re-queued after 4 s
+const WORK_MIN = 6, WORK_SPREAD = 10; // a job needs 6..15 s of work
+const RESTART_DELAY = 2; // seconds before a crashed worker comes back
+const WORKERS = 2, SEED = 7, CRASH_AT = 4, MAX_TICKS = 100; // worker 0 crashes at t = CRASH_AT
+const POLL_CAP = 16; // longest wait between polls (s)
+const DONE_AT = 45; // the polled job finishes at this second
+const CLIENTS = 1000000;
 
 function* lcg(seed) {
   let state = seed;
@@ -30,7 +36,7 @@ class JobService {
   // POST /reports: the same key always returns the same operation.
   create(t, key) {
     if (this.byKey.has(key)) return this.byKey.get(key);
-    const work = 6 + (this.random.next().value % 10);
+    const work = WORK_MIN + (this.random.next().value % WORK_SPREAD);
     const job = { id: this.jobs.size + 1, state: "pending", work, left: work, lease: 0, runs: 0 };
     this.jobs.set(job.id, job);
     this.byKey.set(key, job.id);
@@ -49,7 +55,7 @@ class JobService {
       const job = this.workers[crashWorker];
       this.log(t, job, `worker ${crashWorker} crashed, lease stays at t=${job.lease}`);
       this.workers[crashWorker] = null; // the job stays 'running' until its lease expires
-      this.downUntil[crashWorker] = t + 2;
+      this.downUntil[crashWorker] = t + RESTART_DELAY;
     }
     for (const job of this.jobs.values()) {
       if (job.state === "running" && job.lease <= t && !this.workers.includes(job)) {
@@ -82,7 +88,7 @@ class JobService {
   }
 }
 
-const svc = new JobService(2, 7);
+const svc = new JobService(WORKERS, SEED);
 const a = svc.create(0, "key-a");
 svc.create(0, "key-b");
 const aAgain = svc.create(0, "key-a"); // the client retried a lost 202
@@ -91,8 +97,8 @@ svc.create(1, "key-c");
 let t = 0;
 while ([...svc.jobs.values()].some((j) => j.state !== "succeeded")) {
   t += 1;
-  svc.tick(t, t === 4 ? 0 : -1);
-  assert.ok(t < 100);
+  svc.tick(t, t === CRASH_AT ? 0 : -1);
+  assert.ok(t < MAX_TICKS);
 }
 assert.ok(svc.results.size === 3 && [...svc.jobs.values()].every((j) => j.state === "succeeded"));
 console.log(`jobs: ${svc.jobs.size}, results stored: ${svc.results.size}, runs: [${[...svc.jobs.values()].map((j) => j.runs).join(", ")}]`);
@@ -106,13 +112,13 @@ function pollTimes(doneAt, first, growth) {
     now += wait;
     times.push(now);
     if (now >= doneAt) return times;
-    wait = Math.min(16, wait * growth);
+    wait = Math.min(POLL_CAP, wait * growth);
   }
 }
 
-const fixed = pollTimes(45, 1, 1);
-const backoff = pollTimes(45, 2, 2);
+const fixed = pollTimes(DONE_AT, 1, 1);
+const backoff = pollTimes(DONE_AT, 2, 2);
 console.log(`fixed 1 s: ${fixed.length} polls, result seen at ${fixed.at(-1)} s`);
 console.log(`backoff 2,4,8,16: ${backoff.length} polls, result seen at ${backoff.at(-1)} s`);
-assert.ok(backoff.length < fixed.length && backoff.at(-1) - 45 < 16);
-console.log(`1,000,000 clients: ${1000000} req/s fixed, ${Math.floor((1000000 * backoff.length) / 45)} req/s average with backoff`);
+assert.ok(backoff.length < fixed.length && backoff.at(-1) - DONE_AT < POLL_CAP);
+console.log(`1,000,000 clients: ${CLIENTS} req/s fixed, ${Math.floor((CLIENTS * backoff.length) / DONE_AT)} req/s average with backoff`);

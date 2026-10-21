@@ -2,16 +2,21 @@
 // then run all three for real and compare the estimate with what happened. Integer maths only, so the output is exact.
 const SEQ = 1000, TUPLE = 10, CMP = 3, HASH = 5, SETUP = 1000; // cost units: one sequential page read = 1000
 const CUST_PER_PAGE = 40, ORD_PER_PAGE = 100;
+const SEED = 7, NL_ONE_IN = 10; // one customer in 10 lives in NL
+const ROW_KEY = 1000; // a result row packs both ids: order_id * 1000 + customer_id
+const STALE_SHRINK = 20; // stale statistics were taken when the tables were 20x smaller
+const LARGE_CUST = 1000, LARGE_ORD = 20000;
+const WRONG_PLAN_FACTOR = 5; // the stale plan must cost at least this many times the best one
 const METHODS = ["nested loop", "hash join", "merge join"];
 
 function makeTables(nCust, nOrd, presorted = false) {
-  let state = 7;
+  let state = SEED;
   const rnd = (n) => { // tiny LCG, so every run (and every language) sees the same rows
     state = (state * 1664525 + 1013904223) % 4294967296;
     return Math.floor(state / 256) % n;
   };
   const customers = [];
-  for (let i = 1; i <= nCust; i++) customers.push([i, rnd(10) === 0 ? "NL" : "US"]);
+  for (let i = 1; i <= nCust; i++) customers.push([i, rnd(NL_ONE_IN) === 0 ? "NL" : "US"]);
   const orders = [];
   for (let i = 1; i <= nOrd; i++) orders.push([i, 1 + Math.min(rnd(nCust), rnd(nCust))]); // skewed: low ids order more
   if (presorted) orders.sort((a, b) => a[1] - b[1] || a[0] - b[0]); // like a table clustered on customer_id
@@ -49,12 +54,12 @@ function run(method, customers, orders, country, presorted) {
   const outer = customers.filter((c) => c[1] === country).map((c) => c[0]);
   const out = [];
   if (method === "nested loop") {
-    for (const cid of outer) for (const [oid, ocid] of orders) { w.cmp++; if (ocid === cid) out.push(oid * 1000 + cid); }
+    for (const cid of outer) for (const [oid, ocid] of orders) { w.cmp++; if (ocid === cid) out.push(oid * ROW_KEY + cid); }
   } else if (method === "hash join") {
     w.setup = SETUP;
     const table = new Set();
     for (const cid of outer) { w.hash++; table.add(cid); }
-    for (const [oid, ocid] of orders) { w.hash++; if (table.has(ocid)) { w.cmp++; out.push(oid * 1000 + ocid); } }
+    for (const [oid, ocid] of orders) { w.hash++; if (table.has(ocid)) { w.cmp++; out.push(oid * ROW_KEY + ocid); } }
   } else {
     const c = [0];
     let ordered = orders.map(([oid, ocid]) => [ocid, oid]);
@@ -65,7 +70,7 @@ function run(method, customers, orders, country, presorted) {
       w.cmp++;
       if (outer[i] < ordered[j][0]) i++;
       else if (outer[i] > ordered[j][0]) j++;
-      else { out.push(ordered[j][1] * 1000 + outer[i]); j++; }
+      else { out.push(ordered[j][1] * ROW_KEY + outer[i]); j++; }
     }
   }
   out.sort((a, b) => a - b);
@@ -81,7 +86,7 @@ function planAndRun(label, nCust, nOrd, stale, presorted = false) {
   const ndv = new Set(orders.map((o) => o[1])).size;
   const kReal = customers.filter((c) => c[1] === "NL").length;
   // fresh statistics are exact; stale ones are from when the tables were 20x smaller and NL was rare (0.2%)
-  const st = stale ? [Math.max(1, Math.floor(nCust / 20)), Math.max(1, Math.floor(nOrd / 20)), Math.max(1, Math.floor(ndv / 20)), 1] : [nCust, nOrd, ndv, kReal];
+  const st = stale ? [Math.max(1, Math.floor(nCust / STALE_SHRINK)), Math.max(1, Math.floor(nOrd / STALE_SHRINK)), Math.max(1, Math.floor(ndv / STALE_SHRINK)), 1] : [nCust, nOrd, ndv, kReal];
   const est = {}, runs = {};
   for (const m of METHODS) { est[m] = estimate(m, st, pC, pO, presorted); runs[m] = run(m, customers, orders, "NL", presorted); }
   const pick = cheapest((m) => est[m]);
@@ -97,10 +102,10 @@ function planAndRun(label, nCust, nOrd, stale, presorted = false) {
 function expect(ok, msg) { if (!ok) throw new Error(msg); }
 let [pick, best] = planAndRun("tiny", 16, 60, false);
 expect(pick === "nested loop" && best === "nested loop", "tiny: nested loop should win");
-[pick, best] = planAndRun("large", 1000, 20000, false);
+[pick, best] = planAndRun("large", LARGE_CUST, LARGE_ORD, false);
 expect(pick === "hash join" && best === "hash join", "large: hash join should win");
-let [stalePick, staleBest, got, ideal] = planAndRun("large, stale stats", 1000, 20000, true);
-expect(stalePick === "nested loop" && staleBest === "hash join" && got > 5 * ideal, "stale statistics should pick the wrong method");
-[pick, best] = planAndRun("large, orders sorted by customer_id", 1000, 20000, false, true);
+let [stalePick, staleBest, got, ideal] = planAndRun("large, stale stats", LARGE_CUST, LARGE_ORD, true);
+expect(stalePick === "nested loop" && staleBest === "hash join" && got > WRONG_PLAN_FACTOR * ideal, "stale statistics should pick the wrong method");
+[pick, best] = planAndRun("large, orders sorted by customer_id", LARGE_CUST, LARGE_ORD, false, true);
 expect(pick === "merge join" && best === "merge join", "sorted input: merge join should win");
 console.log(`stale statistics made the query cost ${Math.floor(got / ideal)}x more than necessary`);

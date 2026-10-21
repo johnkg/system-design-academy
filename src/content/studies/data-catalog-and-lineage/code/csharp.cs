@@ -4,14 +4,19 @@ using System;
 using System.Collections.Generic;
 using System.Linq;
 
-ulong seed = 7;
+// Outputs are t20..t199.
+const int Seed = 7, Events = 300, FirstOutput = 20, OutputRange = 180;
+const int AllHops = 99; // a depth limit deeper than any path in this graph
+const int Teams = 5;
+ulong seed = Seed;
+// Linear congruential generator (Numerical Recipes constants), high 16 bits.
 int Random(int n) { seed = (seed * 1664525UL + 1013904223UL) % 4294967296UL; return (int)((seed / 65536UL) % (ulong)n); }
 
 var catalog = new Catalog();
 int accepted = 0;
-for (int k = 0; k < 300; k++)
+for (int k = 0; k < Events; k++)
 {
-    int outId = 20 + Random(180); // asset names t20..t199; inputs always have a lower number, so the graph is acyclic
+    int outId = FirstOutput + Random(OutputRange); // asset names t20..t199; inputs always have a lower number, so the graph is acyclic
     var picks = new[] { Random(outId), Random(outId) };
     var inputs = picks.Distinct().Select(i => $"t{i}").ToList();
     var ev = new RunEvent($"e{k}", inputs, new List<string> { $"t{outId}" });
@@ -20,10 +25,10 @@ for (int k = 0; k < 300; k++)
 Console.WriteLine($"events accepted: {accepted} of 600 deliveries, edges: {catalog.Edges.Count}");
 
 Dictionary<string, int> Hops(int limit) => catalog.Reach(catalog.Down, "t0", limit);
-Console.WriteLine($"t0 impact: {Hops(1).Count} at 1 hop, {Hops(2).Count} within 2 hops, {Hops(99).Count} in all");
-Console.WriteLine($"t0 is {Hops(99).Values.Max()} hops from its farthest consumer, and {catalog.Reach(catalog.Up, "t199", 99).Count} assets feed t199");
+Console.WriteLine($"t0 impact: {Hops(1).Count} at 1 hop, {Hops(2).Count} within 2 hops, {Hops(AllHops).Count} in all");
+Console.WriteLine($"t0 is {Hops(AllHops).Values.Max()} hops from its farthest consumer, and {catalog.Reach(catalog.Up, "t199", AllHops).Count} assets feed t199");
 
-var teams = Hops(99).Keys.Select(n => $"team-{int.Parse(n.Substring(1)) % 5}").Distinct().OrderBy(t => t, StringComparer.Ordinal);
+var teams = Hops(AllHops).Keys.Select(n => $"team-{int.Parse(n.Substring(1)) % Teams}").Distinct().OrderBy(t => t, StringComparer.Ordinal);
 Console.WriteLine($"teams to notify: {string.Join(", ", teams)}");
 Console.WriteLine($"search \"t1\": {string.Join(", ", catalog.Search("t1").Take(3))}");
 
@@ -35,16 +40,17 @@ for (bool changed = true; changed;)
     foreach (var (a, b) in catalog.Edges) if (slow.Contains(a) && !slow.Contains(b)) { slow.Add(b); changed = true; }
 }
 slow.Remove("t0");
-bool same = slow.Count == Hops(99).Count && slow.All(n => Hops(99).ContainsKey(n));
+bool same = slow.Count == Hops(AllHops).Count && slow.All(n => Hops(AllHops).ContainsKey(n));
 catalog.Ingest(new RunEvent("cycle", new List<string> { "t150" }, new List<string> { "t0" })); // a feedback loop must not hang the walk
-bool survives = Hops(99).Count == slow.Count;
+bool survives = Hops(AllHops).Count == slow.Count;
 Console.WriteLine($"matches the slow method: {same.ToString().ToLower()}; survives a cycle: {survives.ToString().ToLower()}");
-if (!same || !survives || accepted != 300) Environment.Exit(1);
+if (!same || !survives || accepted != Events) Environment.Exit(1);
 
 record RunEvent(string Id, List<string> Inputs, List<string> Outputs);
 
 class Catalog
 {
+    const int ExactMatchBonus = 1000, PerConsumer = 10; // search ranking weights
     HashSet<string> seen = new();
     public List<(string, string)> Edges = new();
     public Dictionary<string, List<string>> Down = new();
@@ -89,7 +95,7 @@ class Catalog
     public List<string> Search(string query)
     {
         var names = Edges.SelectMany(e => new[] { e.Item1, e.Item2 }).Distinct();
-        int Score(string n) => (n == query ? 1000 : 0) + 10 * (Down.TryGetValue(n, out var l) ? l.Count : 0);
+        int Score(string n) => (n == query ? ExactMatchBonus : 0) + PerConsumer * (Down.TryGetValue(n, out var l) ? l.Count : 0);
         return names.Where(n => n.Contains(query)).OrderByDescending(Score).ThenBy(n => n, StringComparer.Ordinal).ToList();
     }
 }

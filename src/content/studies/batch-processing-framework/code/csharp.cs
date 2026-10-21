@@ -5,6 +5,10 @@ using System.Collections.Generic;
 using System.Linq;
 
 const int Splits = 8, Reducers = 4, PerSplit = 500, Vocab = 40;
+const int TopN = 3; // words in the top list
+const int LostReducer = 2; // failure demo: the reducer whose output is lost
+const int BackupNum = 3; // start a backup copy after 3/2 of the median task time
+const int BackupDen = 2;
 uint seed = 7;
 int Next() { unchecked { seed = seed * 1664525u + 1013904223u; } return (int)(seed >> 16); }
 
@@ -43,24 +47,25 @@ int shuffled = mapOut.SelectMany(o => o).Sum(b => b.Count);
 var load = result.Select(r => r.Values.Sum()).ToArray();
 var merged = new Dictionary<string, int>();
 foreach (var r in result) foreach (var kv in r) merged[kv.Key] = kv.Value;
-var top = merged.OrderByDescending(kv => kv.Value).ThenBy(kv => kv.Key, StringComparer.Ordinal).Take(3);
+var top = merged.OrderByDescending(kv => kv.Value).ThenBy(kv => kv.Key, StringComparer.Ordinal).Take(TopN);
 Console.WriteLine($"input: {Splits} splits x {PerSplit} words, {Reducers} reducers");
 Console.WriteLine($"shuffle records: {Splits * PerSplit} without a combiner, {shuffled} with it");
 Console.WriteLine($"words per reducer: {string.Join(", ", load)}; distinct words: {merged.Count}");
 Console.WriteLine($"top 3: {string.Join(", ", top.Select(kv => $"{kv.Key}={kv.Value}"))}");
 
 // Failure: reducer 2's output is lost, and so are the map outputs held by the machine that ran splits 3 and 5.
-string before = Show(result[2]);
+int[] lostSplits = { 3, 5 }; // map outputs lost with the failed machine
+string before = Show(result[LostReducer]);
 mapRuns = 0; reduceRuns = 0;
-for (int i = 0; i < Splits; i++) if (i == 3 || i == 5) mapOut[i] = MapTask(i); // recompute the lost inputs from the source splits
-result[2] = ReduceTask(2, mapOut);                                            // then only the lost partition
-bool same = Show(result[2]) == before;
+for (int i = 0; i < Splits; i++) if (lostSplits.Contains(i)) mapOut[i] = MapTask(i); // recompute the lost inputs from the source splits
+result[LostReducer] = ReduceTask(LostReducer, mapOut);                                            // then only the lost partition
+bool same = Show(result[LostReducer]) == before;
 Console.WriteLine($"recovery: re-ran {mapRuns} map tasks and {reduceRuns} reduce task instead of {Splits} and {Reducers}; identical: {(same ? "true" : "false")}");
 
 // Straggler: nine map tasks run at once, and one machine is slow. After 1.5 x the median time, start a backup copy elsewhere.
 int[] times = { 10, 10, 11, 10, 9, 10, 45, 10, 12 };
 int median = times.OrderBy(t => t).ToArray()[times.Length / 2];
-int limit = median * 3 / 2;
+int limit = median * BackupNum / BackupDen;
 int slowest = times.Max();
 int withBackup = times.Max(t => t > limit ? Math.Min(t, limit + median) : t);
 Console.WriteLine($"straggler: job takes {slowest} without a backup, {withBackup} with a backup started at {limit}");

@@ -15,8 +15,10 @@ public static class Program
     public static void Main()
     {
         // 98 ordinary requests between 80 and 120 ms, plus two very slow ones
+        const int OrdinaryRequests = 98, MinMs = 80, SpreadMs = 41;
+        const int ScatterStep = 37; // coprime with SpreadMs, so the values scatter over the range
         var latencies = new List<int>();
-        for (var i = 1; i <= 98; i++) latencies.Add(80 + (i * 37) % 41);
+        for (var i = 1; i <= OrdinaryRequests; i++) latencies.Add(MinMs + (i * ScatterStep) % SpreadMs);
         latencies.Add(2400);
         latencies.Add(2900);
 

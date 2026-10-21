@@ -9,7 +9,8 @@ const fastHash = (password) => hex(createHash("sha256").update(password).digest(
 
 // Better: a unique salt per user and many iterations, so every guess is slow.
 const ITERATIONS = 100_000;
-const slowHash = (password, salt) => pbkdf2Sync(password, salt, ITERATIONS, 32, "sha256");
+const KEY_BYTES = 32; // a 256-bit derived key
+const slowHash = (password, salt) => pbkdf2Sync(password, salt, ITERATIONS, KEY_BYTES, "sha256");
 
 function verify(password, salt, stored) {
   const candidate = slowHash(password, salt);

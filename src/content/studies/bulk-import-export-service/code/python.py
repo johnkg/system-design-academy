@@ -2,20 +2,24 @@
 # an idempotent re-run, and a fair scheduler that stops one big tenant from starving small ones.
 import re, sys
 
-seed = 7
+SEED = 7
+seed = SEED
 
 def rand(n):
+    """Linear congruential generator (Numerical Recipes constants), high 16 bits."""
     global seed
     seed = (seed * 1664525 + 1013904223) % 4294967296
     return (seed // 65536) % n
 
 CHUNK = 8
+ROWS, MAX_QTY = 44, 9
+ROW_KINDS = 10  # 1 in 10 rows has a bad email, 1 in 10 a bad quantity
 
 def make_rows(n):
     rows = []
     for i in range(1, n + 1):
-        r = rand(10)
-        rows.append(f'{i},bad-email,3' if r == 0 else f'{i},u{i}@x.io,many' if r == 1 else f'{i},u{i}@x.io,{1 + rand(9)}')
+        r = rand(ROW_KINDS)
+        rows.append(f'{i},bad-email,3' if r == 0 else f'{i},u{i}@x.io,many' if r == 1 else f'{i},u{i}@x.io,{1 + rand(MAX_QTY)}')
     return rows
 
 # The server remembers which chunks arrived, so a client that reconnects only sends the missing ones.
@@ -84,7 +88,7 @@ def schedule(queues, fair):
                 done[n] = tick
     return ' '.join(f'{n}={done[n]}' for n in queues)
 
-rows = make_rows(44)
+rows = make_rows(ROWS)
 up = Upload(-(-len(rows) // CHUNK))
 chunk = lambda i: rows[i * CHUNK:(i + 1) * CHUNK]
 for i in [0, 1, 2, 1]:  # the connection drops here, and chunk 1 was sent twice

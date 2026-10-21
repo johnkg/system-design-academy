@@ -13,7 +13,9 @@ static class P
         ("wait_file", new string[0]), ("extract", new[] { "wait_file" }), ("clean", new[] { "extract" }),
         ("by_region", new[] { "clean" }), ("by_product", new[] { "clean" }), ("report", new[] { "by_region", "by_product" }) };
     public const int Poke = 10, Timeout = 30, MaxAttempts = 3; // sensor checks every 10 minutes and gives up after 30
-    public static bool Flaky(string task, int day) => Hash($"{task}:{day}") % 5 == 0; // fails its first two attempts, then works
+    const int FlakyOneIn = 5; // one task-day in 5 is flaky
+    const int BackoffMin = 30; // retry backoff in minutes: 30, then 60
+    public static bool Flaky(string task, int day) => Hash($"{task}:{day}") % FlakyOneIn == 0; // fails its first two attempts, then works
 
     public class Orchestrator
     {
@@ -34,7 +36,7 @@ static class P
             }
             for (int attempt = 1; attempt <= MaxAttempts; attempt++)
             {
-                if (Flaky(task, day) && attempt < MaxAttempts) { Retries++; Backoff += 30 * (1 << (attempt - 1)); continue; }
+                if (Flaky(task, day) && attempt < MaxAttempts) { Retries++; Backoff += BackoffMin * (1 << (attempt - 1)); continue; }
                 string inputs = string.Join(",", deps.Select(d => Output[$"{d}/{day}"]));
                 Output[key] = Hash($"{task}:{day}:{inputs}"); // overwrite the partition, never append
                 return "success";

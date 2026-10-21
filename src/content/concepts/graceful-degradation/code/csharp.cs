@@ -11,13 +11,21 @@ public static class Program
     record Page(string Outcome, int Ms);
 
     const int N = 100, CriticalTimeout = 2000, UsableMs = 1000;
+    const int OptionalTimeout = 300; // ms the degrading page waits for an optional part
+    const int DownMs = 15, DownJitterMs = 25;     // a down dependency fails fast
+    const int SlowMs = 1500, SlowJitterMs = 1000; // a slow dependency
+    const int FallbackMs = 5; // cost of substituting a fallback
+    const int RenderMs = 15;  // assembling the page
+    const int P95 = 95;
+
+    // Park-Miller (MINSTD) generator
     static long seed = 12345;
     static long Next() { seed = (seed * 48271) % 2147483647; return seed; }
 
     static (bool Ok, int Ms) CallDep(int b, string mode, long a)
     {
-        if (mode == "down") return (false, 15 + (int)(a % 25)); // fails fast
-        if (mode == "slow") return (true, 1500 + (int)(a % 1000));
+        if (mode == "down") return (false, DownMs + (int)(a % DownJitterMs)); // fails fast
+        if (mode == "slow") return (true, SlowMs + (int)(a % SlowJitterMs));
         return (true, b + (int)(a % b));
     }
 
@@ -36,8 +44,8 @@ public static class Program
             slowest = Math.Max(slowest, ms);
             if (cfg.Fallbacks && req[i][1] % 100 < dep.Hit) substituted++; else missing++;
         }
-        if (errorAt >= 0) return new Page("error", errorAt + 15);
-        return new Page(substituted + missing > 0 ? "degraded" : "full", slowest + (substituted > 0 ? 5 : 0) + 15);
+        if (errorAt >= 0) return new Page("error", errorAt + RenderMs);
+        return new Page(substituted + missing > 0 ? "degraded" : "full", slowest + (substituted > 0 ? FallbackMs : 0) + RenderMs);
     }
 
     public static void Main()
@@ -46,7 +54,7 @@ public static class Program
         var scenarios = new (string Label, Dictionary<string, string> Modes)[] {
             ("healthy", new()), ("reviews down", new() { ["reviews"] = "down" }), ("recs slow", new() { ["recs"] = "slow" }),
             ("inventory down", new() { ["inventory"] = "down" }), ("product down", new() { ["product"] = "down" }) };
-        var configs = new[] { ("naive", new Cfg(true, false, CriticalTimeout)), ("degrading", new Cfg(false, true, 300)) };
+        var configs = new[] { ("naive", new Cfg(true, false, CriticalTimeout)), ("degrading", new Cfg(false, true, OptionalTimeout)) };
 
         // One fixed set of random draws per request, shared by every configuration.
         var draws = new long[N][][];
@@ -60,7 +68,7 @@ public static class Program
                 int Count(string o) => pages.Count(p => p.Outcome == o);
                 var lat = pages.Select(p => p.Ms).OrderBy(x => x).ToList();
                 int usable = pages.Count(p => p.Outcome != "error" && p.Ms <= UsableMs);
-                var res = (Count("full"), Count("degraded"), Count("error"), lat[N * 95 / 100], usable);
+                var res = (Count("full"), Count("degraded"), Count("error"), lat[N * P95 / 100], usable);
                 results[label + "/" + cname] = res;
                 Console.WriteLine($"{label,-15} {cname,-10} full={res.Item1,3} degraded={res.Item2,3} error={res.Item3,3} p95={res.Item4,4}ms usable={res.Item5,3}%");
             }
@@ -73,8 +81,8 @@ public static class Program
             else if (d.Error != 0) throw new Exception("optional failure failed a page: " + label);
         }
         if (results["reviews down/naive"].Error != N) throw new Exception("naive page should fail when reviews is down");
-        if (results["recs slow/degrading"].P95 > 320) throw new Exception("optional timeout must bound page latency");
-        if (results["recs slow/naive"].P95 <= 1000) throw new Exception("naive page should be slow when recs is slow");
+        if (results["recs slow/degrading"].P95 > OptionalTimeout + FallbackMs + RenderMs) throw new Exception("optional timeout must bound page latency");
+        if (results["recs slow/naive"].P95 <= UsableMs) throw new Exception("naive page should be slow when recs is slow");
         Console.WriteLine("invariants hold");
     }
 }

@@ -82,20 +82,23 @@ class Wallet:
         return len([r for r in self.log.values() if r['state'] == state])
 
 
-seed = 7
+SEED, TRANSFERS, MIN_AMOUNT, AMOUNT_RANGE = 7, 24, 20, 80
+CRASH_EVERY, RETRY_EVERY = 5, 4  # every 5th transfer crashes mid-way, every 4th is sent again
+seed = SEED
 
 
 def random_below(n):
+    """Linear congruential generator (Numerical Recipes constants), high 16 bits."""
     global seed
     seed = (seed * 1664525 + 1013904223) % 4294967296
     return (seed // 65536) % n
 
 
 transfers = []
-for tid in range(24):
+for tid in range(TRANSFERS):
     frm = random_below(ACCOUNTS)
     to = (frm + 1 + random_below(ACCOUNTS - 1)) % ACCOUNTS
-    transfers.append({'id': tid, 'from': frm, 'to': to, 'amt': 20 + random_below(80), 'crash': tid % 5 == 2, 'again': tid % 4 == 1})
+    transfers.append({'id': tid, 'from': frm, 'to': to, 'amt': MIN_AMOUNT + random_below(AMOUNT_RANGE), 'crash': tid % CRASH_EVERY == 2, 'again': tid % RETRY_EVERY == 1})
 
 bad_sum, twice = naive(transfers)
 print(f"naive debit then credit: total {ACCOUNTS * START} -> {bad_sum}, {ACCOUNTS * START - bad_sum} lost, {twice} transfers charged twice")

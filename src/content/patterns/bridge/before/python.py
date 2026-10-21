@@ -1,16 +1,18 @@
 # Without the pattern: one class for every remote x device combination.
+TV_START_VOLUME, RADIO_START_VOLUME = 30, 10
+VOLUME_STEP = 10
 
 
 class TvBasicRemote:
     def __init__(self):
         self.on = False
-        self.volume = 30
+        self.volume = TV_START_VOLUME
 
     def toggle_power(self):
         self.on = not self.on
 
     def volume_up(self):
-        self.volume += 10
+        self.volume += VOLUME_STEP
 
 
 class TvAdvancedRemote(TvBasicRemote):
@@ -21,13 +23,13 @@ class TvAdvancedRemote(TvBasicRemote):
 class RadioBasicRemote:  # same logic, copied for the radio
     def __init__(self):
         self.on = False
-        self.volume = 10
+        self.volume = RADIO_START_VOLUME
 
     def toggle_power(self):
         self.on = not self.on
 
     def volume_up(self):
-        self.volume += 10
+        self.volume += VOLUME_STEP
 
 
 class RadioAdvancedRemote(RadioBasicRemote):

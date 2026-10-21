@@ -2,10 +2,12 @@
 # a table's hourly row count is compared with the same hour of the week in earlier weeks, using median and MAD (integers only).
 import sys
 
-seed = 4242
+SEED = 4242
+seed = SEED
 
 
 def random(n):
+    """Linear congruential generator (Numerical Recipes constants), high 16 bits."""
     global seed
     seed = (seed * 1664525 + 1013904223) % 4294967296
     return (seed // 65536) % n
@@ -13,23 +15,33 @@ def random(n):
 
 HOURS_PER_WEEK = 168
 WEEKS = 5
+HOURS_PER_DAY, DAYS_PER_WEEK = 24, 7
+WEEKEND_FIRST_DAY, WEEKEND_PERCENT = 5, 40  # days 5 and 6 are the weekend
+NOISE_MIN_PER_MILLE, NOISE_STEPS, PER_MILLE = 950, 101, 1000  # a factor of 0.950..1.050
+# Incidents in the last week: an outage on day 2, 13:00-16:00, and a double load on day 4 at 03:00.
+OUTAGE_DAY, OUTAGE_FIRST_HOUR, OUTAGE_LAST_HOUR, OUTAGE_PERCENT = 2, 13, 16, 35
+DOUBLE_LOAD_DAY, DOUBLE_LOAD_HOUR, DOUBLE_LOAD_FACTOR = 4, 3, 4
+NAIVE_SIGMAS, SEASONAL_SIGMAS = 3, 4
+MAD_TO_SIGMA_X100, MIN_SIGMA_PERCENT = 148, 3  # sigma = 1.48 * MAD, at least 3% of the median
+FIXED_FLOOR = 200
+OPEN_AFTER, CLOSE_AFTER = 2, 3  # breaker: alerting hours to open, healthy hours to close
 # Rows loaded per hour (in thousands) for each hour of the day: quiet at night, busy in the afternoon.
 SHAPE = [120, 90, 70, 60, 60, 80, 150, 300, 520, 700, 820, 900, 880, 860, 900, 940, 880, 760, 600, 480, 380, 300, 220, 160]
 
 series = []
 incident = []
 for t in range(HOURS_PER_WEEK * WEEKS):
-    hour = t % 24
-    day = (t // 24) % 7
-    v = SHAPE[hour] * (40 if day >= 5 else 100) // 100  # weekends carry 40% of the weekday volume
-    v = v * (950 + random(101)) // 1000                 # noise of about plus or minus 5%
+    hour = t % HOURS_PER_DAY
+    day = (t // HOURS_PER_DAY) % DAYS_PER_WEEK
+    v = SHAPE[hour] * (WEEKEND_PERCENT if day >= WEEKEND_FIRST_DAY else 100) // 100  # weekends carry 40% of the weekday volume
+    v = v * (NOISE_MIN_PER_MILLE + random(NOISE_STEPS)) // PER_MILLE                 # noise of about plus or minus 5%
     week = t // HOURS_PER_WEEK
     bad = False
-    if week == WEEKS - 1 and day == 2 and 13 <= hour <= 16:
-        v = v * 35 // 100  # a source stops sending
+    if week == WEEKS - 1 and day == OUTAGE_DAY and OUTAGE_FIRST_HOUR <= hour <= OUTAGE_LAST_HOUR:
+        v = v * OUTAGE_PERCENT // 100  # a source stops sending
         bad = True
-    if week == WEEKS - 1 and day == 4 and hour == 3:
-        v *= 4  # a job loads the data twice
+    if week == WEEKS - 1 and day == DOUBLE_LOAD_DAY and hour == DOUBLE_LOAD_HOUR:
+        v *= DOUBLE_LOAD_FACTOR  # a job loads the data twice
         bad = True
     series.append(v)
     incident.append(bad)
@@ -48,7 +60,7 @@ variance = sum((x - mean) * (x - mean) for x in history) // len(history)
 
 
 def naive_flag(x):
-    return (x - mean) * (x - mean) > 9 * variance
+    return (x - mean) * (x - mean) > NAIVE_SIGMAS * NAIVE_SIGMAS * variance
 
 
 # Seasonal baseline: the median of the same hour of the week in the 4 earlier weeks, with a spread from the MAD.
@@ -56,8 +68,8 @@ def seasonal_flag(t):
     same = [series[t - w * HOURS_PER_WEEK] for w in range(1, WEEKS)]
     med = median(same)
     mad = median([abs(x - med) for x in same])
-    sigma100 = max(mad * 148, med * 3)  # 1.48 * MAD estimates sigma, with a floor of 3% of the median (times 100)
-    return abs(series[t] - med) * 100 > 4 * sigma100
+    sigma100 = max(mad * MAD_TO_SIGMA_X100, med * MIN_SIGMA_PERCENT)  # 1.48 * MAD estimates sigma, with a floor of 3% of the median (times 100)
+    return abs(series[t] - med) * 100 > SEASONAL_SIGMAS * sigma100
 
 
 start = HOURS_PER_WEEK * (WEEKS - 1)
@@ -77,7 +89,7 @@ def score(flag):
 
 
 naive = score(lambda t: naive_flag(series[t]))
-fixed = score(lambda t: series[t] < 200)
+fixed = score(lambda t: series[t] < FIXED_FLOOR)
 seasonal = score(seasonal_flag)
 print(f"incidents: {sum(incident)}; mean {mean}, last-week low {min(series[start:])}")
 print(f"naive: hit {naive[0]}, false alarms {naive[1]}, missed {naive[2]}")
@@ -94,10 +106,10 @@ for t in range(start, len(series)):
     else:
         good_run += 1
         bad_run = 0
-    if not is_open and bad_run >= 2:
+    if not is_open and bad_run >= OPEN_AFTER:
         is_open = True
         opened += 1
-    elif is_open and good_run >= 3:
+    elif is_open and good_run >= CLOSE_AFTER:
         is_open = False
     if is_open:
         held += 1

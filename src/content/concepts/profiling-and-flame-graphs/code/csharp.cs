@@ -15,17 +15,22 @@ class Node
 
 class Program
 {
+    const long EncodeLoopUs = 170; // true self time of encode_loop before the regression
+    const long RegressionUs = 1000; // what the regression adds to encode_loop
+    const long Seed = 7;
+    const long BarWidth = 40; // characters for 100% in the flame graph
+    const long SigmaBound = 5; // sampling error must stay within 5 standard deviations
     static readonly (string, long)[] Base = {
         ("handler", 160), ("handler;auth", 120), ("handler;route", 80),
         ("handler;parse", 60), ("handler;parse;regex_match", 100),
         ("handler;db_query", 50), ("handler;db_query;driver_decode", 90),
         ("handler;serialize", 50), ("handler;serialize;json_encode", 90),
-        ("handler;serialize;json_encode;encode_loop", 170),
+        ("handler;serialize;json_encode;encode_loop", EncodeLoopUs),
         ("handler;audit_log", 30),
     };
 
     static (string, long)[] Truth(bool regressed) =>
-        Base.Select(b => (b.Item1, b.Item1.EndsWith("encode_loop") && regressed ? b.Item2 + 1000 : b.Item2)).ToArray();
+        Base.Select(b => (b.Item1, b.Item1.EndsWith("encode_loop") && regressed ? b.Item2 + RegressionUs : b.Item2)).ToArray();
 
     // MINSTD: x = x * 48271 mod (2^31 - 1)
     static SortedDictionary<string, long> Sample((string, long)[] stacks, int n, long seed)
@@ -69,7 +74,7 @@ class Program
 
     static void Flame(Node node, long total, int depth, List<string> o)
     {
-        string bar = new string('#', (int)Math.Max(1, node.Total * 40 / total));
+        string bar = new string('#', (int)Math.Max(1, node.Total * BarWidth / total));
         o.Add($"{(new string(' ', depth * 2) + node.Name),-34} {bar,-40} {Pct(node.Total, total),5}% self {Pct(node.SelfN, total),5}%");
         foreach (var k in node.Kids.Values) Flame(k, total, depth + 1, o);
     }
@@ -97,7 +102,7 @@ class Program
     static void Main()
     {
         const int N = 6000;
-        var root = Build(Collapsed(Sample(Truth(true), N, 7)));
+        var root = Build(Collapsed(Sample(Truth(true), N, Seed)));
         Check(root);
         Assert(root.Total == N && SelfByFunction(root).Values.Sum() == N, "samples lost");
         Console.WriteLine($"flame graph, {N} samples at 100 Hz (width = share, not time):");
@@ -112,20 +117,20 @@ class Program
         Console.WriteLine($"\nestimate error for audit_log (true {Pct(trueSelf["audit_log"], tt)}%):");
         foreach (int n in new[] { 100, 1000, 10000, 60000 })
         {
-            var est = SelfByFunction(Build(Collapsed(Sample(real, n, 7))));
+            var est = SelfByFunction(Build(Collapsed(Sample(real, n, Seed))));
             long k = est.GetValueOrDefault("audit_log"), worst = 0;
             foreach (var (f, w) in trueSelf)
             {
                 long num = Math.Abs(est.GetValueOrDefault(f) * tt - w * n);
                 double p = (double)w / tt;
-                Assert((double)num / ((double)n * tt) <= 5 * Math.Sqrt(p * (1 - p) / n) + 1.0 / n, "error outside 5 sigma");
+                Assert((double)num / ((double)n * tt) <= SigmaBound * Math.Sqrt(p * (1 - p) / n) + 1.0 / n, "error outside 5 sigma");
                 worst = Math.Max(worst, num);
             }
             Console.WriteLine($"n={n,5}  audit_log samples={k,4}  est {Pct(k, n),5}%  worst error over all functions {Pct(worst, (long)n * tt)} pts");
         }
 
         long baseTot = Truth(false).Sum(s => s.Item2);
-        Console.WriteLine($"\nregression: total {baseTot} -> {tt} us per request, encode_loop share {Pct(170, baseTot)}% -> {Pct(1170, tt)}%");
-        Assert(tt == baseTot + 1000, "regression adds 1000");
+        Console.WriteLine($"\nregression: total {baseTot} -> {tt} us per request, encode_loop share {Pct(EncodeLoopUs, baseTot)}% -> {Pct(EncodeLoopUs + RegressionUs, tt)}%");
+        Assert(tt == baseTot + RegressionUs, "regression adds 1000");
     }
 }

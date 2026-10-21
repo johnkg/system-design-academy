@@ -20,22 +20,23 @@ class PaymentApi {
   }
 }
 
+const AMOUNT = 50, CHANGED_AMOUNT = 80; // dollars; the second is a different body under the same key
 const api = new PaymentApi();
 
 console.log("--- without reusing the key: the retry becomes a second payment");
-api.charge("attempt-1", 50);
-api.charge("attempt-2", 50); // the app made a new key on retry
+api.charge("attempt-1", AMOUNT);
+api.charge("attempt-2", AMOUNT); // the app made a new key on retry
 console.log(`charges: [${api.charges}] total $${api.charges.reduce((a, b) => a + b, 0)}`);
 
 const fresh = new PaymentApi();
 const show = (r) => `{ status: ${r.status}, amount: ${r.amount}, replayed: ${r.replayed} }`;
 console.log("--- reusing the key: the retry is a replay");
-console.log(show(fresh.charge("abc-123", 50)));
-console.log(show(fresh.charge("abc-123", 50))); // the response was lost, so the client retries with the same key
+console.log(show(fresh.charge("abc-123", AMOUNT)));
+console.log(show(fresh.charge("abc-123", AMOUNT))); // the response was lost, so the client retries with the same key
 console.log(`charges: [${fresh.charges}] total $${fresh.charges.reduce((a, b) => a + b, 0)}`);
 
 try {
-  fresh.charge("abc-123", 80);
+  fresh.charge("abc-123", CHANGED_AMOUNT);
 } catch (e) {
   console.log(`rejected: ${e.message}`);
 }

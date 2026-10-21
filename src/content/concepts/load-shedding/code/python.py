@@ -3,6 +3,7 @@
 STEPS, SPIKE_STEPS = 200, 100        # 20 s in total, the first 10 s overloaded
 CAPACITY, TIMEOUT, LIMIT = 10, 20, 50
 SPIKE_ARRIVALS, CALM_ARRIVALS = 30, 6  # 300 per second, then 60 per second
+STEP_MS = 100
 
 
 def run(policy):
@@ -27,7 +28,7 @@ def run(policy):
             latency = step - arrived + 1
             if latency <= TIMEOUT:
                 good += 1            # an answer the caller was still waiting for
-                lat_sum += latency * 100
+                lat_sum += latency * STEP_MS
             else:
                 wasted += 1          # the server was busy, but the caller had already left
     return {"good": good, "wasted": wasted, "rejected": rejected, "dropped": dropped,

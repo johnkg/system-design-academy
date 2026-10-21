@@ -28,9 +28,12 @@ class HashRing {
   }
 }
 
-const keys = Array.from({ length: 10000 }, (_, i) => `key-${i}`);
-const ring = new HashRing(100);
-["A", "B", "C"].forEach((n) => ring.addNode(n));
+const KEY_COUNT = 10000;
+const VIRTUAL_NODES = 100; // ring points per physical node
+const INITIAL_NODES = ["A", "B", "C"];
+const keys = Array.from({ length: KEY_COUNT }, (_, i) => `key-${i}`);
+const ring = new HashRing(VIRTUAL_NODES);
+INITIAL_NODES.forEach((n) => ring.addNode(n));
 
 const before = new Map(keys.map((k) => [k, ring.nodeFor(k)]));
 const load = {};
@@ -39,5 +42,5 @@ console.log("keys per node:", JSON.stringify(load));
 
 ring.addNode("D");
 const movedRing = keys.filter((k) => before.get(k) !== ring.nodeFor(k)).length;
-const movedMod = keys.filter((k) => hash32(k) % 3 !== hash32(k) % 4).length;
-console.log(`adding a 4th node moves ${(movedRing / 100).toFixed(1)}% of keys on the ring, ${(movedMod / 100).toFixed(1)}% with hash mod N`);
+const movedMod = keys.filter((k) => hash32(k) % INITIAL_NODES.length !== hash32(k) % (INITIAL_NODES.length + 1)).length;
+console.log(`adding a 4th node moves ${((100 * movedRing) / KEY_COUNT).toFixed(1)}% of keys on the ring, ${((100 * movedMod) / KEY_COUNT).toFixed(1)}% with hash mod N`);

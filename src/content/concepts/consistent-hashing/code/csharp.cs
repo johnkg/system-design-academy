@@ -5,11 +5,15 @@ using System.Linq;
 
 public static class Program
 {
+    const int KeyCount = 10000;
+    const int VirtualNodes = 100; // ring points per physical node
+    static readonly string[] InitialNodes = { "A", "B", "C" };
+
     public static void Main()
     {
-        var keys = Enumerable.Range(0, 10000).Select(i => $"key-{i}").ToList();
-        var ring = new HashRing(100);
-        foreach (var n in new[] { "A", "B", "C" }) ring.AddNode(n);
+        var keys = Enumerable.Range(0, KeyCount).Select(i => $"key-{i}").ToList();
+        var ring = new HashRing(VirtualNodes);
+        foreach (var n in InitialNodes) ring.AddNode(n);
 
         var before = keys.ToDictionary(k => k, ring.NodeFor);
         var load = before.Values.GroupBy(v => v).OrderBy(g => g.Key).ToDictionary(g => g.Key, g => g.Count());
@@ -17,8 +21,8 @@ public static class Program
 
         ring.AddNode("D");
         int movedRing = keys.Count(k => before[k] != ring.NodeFor(k));
-        int movedMod = keys.Count(k => Hashing.Hash32(k) % 3 != Hashing.Hash32(k) % 4);
-        Console.WriteLine($"adding a 4th node moves {movedRing / 100.0:F1}% of keys on the ring, {movedMod / 100.0:F1}% with hash mod N");
+        int movedMod = keys.Count(k => Hashing.Hash32(k) % InitialNodes.Length != Hashing.Hash32(k) % (InitialNodes.Length + 1));
+        Console.WriteLine($"adding a 4th node moves {100.0 * movedRing / KeyCount:F1}% of keys on the ring, {100.0 * movedMod / KeyCount:F1}% with hash mod N");
     }
 }
 

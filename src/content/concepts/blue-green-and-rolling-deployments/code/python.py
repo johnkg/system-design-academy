@@ -2,12 +2,15 @@
 # (start a v2 server, stop a v1 server) and checks that capacity never drops below the minimum.
 # Integers only and no clock: one tick is one second, so the output is the same every run.
 
+MAX_TICKS = 200  # safety limit: give up if a rollout has not finished by then
+
+
 def plan(n, max_surge, max_unavailable, ready_after):
     if max_surge == 0 and max_unavailable == 0:
         raise ValueError("surge 0 and unavailable 0 can never make progress")
     old, new_ready, starting = n, 0, []  # v1 servers (all ready), ready v2 servers, countdowns for booting v2
     rows = []
-    for tick in range(200):
+    for tick in range(MAX_TICKS):
         started = stopped = 0
         while True:
             new_count = new_ready + len(starting)

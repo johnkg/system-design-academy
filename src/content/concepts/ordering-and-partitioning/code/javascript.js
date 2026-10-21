@@ -1,6 +1,12 @@
 // Message ordering vs scale-out: competing consumers against a key-partitioned log, with retries.
 // A deterministic simulation (integer maths only, so every language prints the same numbers).
 const KEYS = 12, N = 240, HOT = 30, PARTS = 4, BACKOFF = 5, LATER = 30;
+const SEED = 42;
+const MAX_FAILS = 3, FAIL_PCT = 8; // up to 3 failed attempts, 8% each
+const LOW_BALANCE = 20; // below this an account only receives deposits
+const MIN_DEPOSIT = 20, DEPOSIT_SPREAD = 41, MIN_WITHDRAWAL = 10; // deposits are 20..60
+const MIN_PROC_MS = 6, PROC_SPREAD = 9; // processing takes 6..14 ms
+const MS_PER_S = 1000;
 
 function fnv1a(s) { // 32-bit FNV-1a: the multiply is masked to 32 bits on purpose
   let h = 0x811c9dc5;
@@ -13,16 +19,16 @@ function rng(seed) { // mulberry32, returns an unsigned 32-bit integer
 }
 
 function makeStream() { // account events; key 0 is the hot account (30% of traffic)
-  const next = rng(42), bal = Array(KEYS).fill(0), seq = Array(KEYS).fill(0), ev = [];
+  const next = rng(SEED), bal = Array(KEYS).fill(0), seq = Array(KEYS).fill(0), ev = [];
   for (let id = 0; id < N; id++) {
     const u = next(), v = next(), w = next(), a = next(), p = next();
     const key = u % 100 < HOT ? 0 : 1 + (v % (KEYS - 1));
-    let nfail = 0, ok = true; // up to 3 failed attempts, 8% each
-    for (let j = 0; j < 3; j++) { const d = next(); if (ok && d % 100 < 8) nfail++; else ok = false; }
-    const deposit = bal[key] < 20 || w % 2 === 0;
-    const amount = deposit ? 20 + (a % 41) : 10 + (a % (bal[key] - 9)); // a withdrawal never exceeds the true balance
+    let nfail = 0, ok = true;
+    for (let j = 0; j < MAX_FAILS; j++) { const d = next(); if (ok && d % 100 < FAIL_PCT) nfail++; else ok = false; }
+    const deposit = bal[key] < LOW_BALANCE || w % 2 === 0;
+    const amount = deposit ? MIN_DEPOSIT + (a % DEPOSIT_SPREAD) : MIN_WITHDRAWAL + (a % (bal[key] - MIN_WITHDRAWAL + 1)); // a withdrawal never exceeds the true balance
     bal[key] += deposit ? amount : -amount;
-    ev.push({ id, key, seq: seq[key]++, deposit, amount, proc: 6 + (p % 9), nfail });
+    ev.push({ id, key, seq: seq[key]++, deposit, amount, proc: MIN_PROC_MS + (p % PROC_SPREAD), nfail });
   }
   return ev;
 }
@@ -57,7 +63,7 @@ function run(ev, { partitioned, consumers, retry }) { // events arrive 1 ms apar
     if (e.deposit) bal[e.key] += e.amount; else if (bal[e.key] >= e.amount) bal[e.key] -= e.amount; else overdrafts++;
   }
   const span = Math.max(...done);
-  return { throughput: Math.floor((ev.length * 1000) / span), violations, overdrafts, hottest: Math.max(...load) };
+  return { throughput: Math.floor((ev.length * MS_PER_S) / span), violations, overdrafts, hottest: Math.max(...load) };
 }
 
 const ev = makeStream();

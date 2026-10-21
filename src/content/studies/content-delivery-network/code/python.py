@@ -4,6 +4,14 @@ import sys
 
 TTL, EDGE_CAP, SHIELD_CAP, POPS, REQUESTS = 20000, 200, 500, 4, 20000
 EDGE_SHIELD, ORIGIN_TRIP, ORIGIN_WORK = 16, 80, 30  # milliseconds: edge to shield and back, origin round trip, origin processing
+SEED = 99
+MAX_GAP_MS = 3  # requests arrive 1..3 ms apart
+UNIFORM_RANGE = 10000  # u is uniform in 0..9999
+KEY_DIVISOR = 2000000000  # u^3 / KEY_DIVISOR gives keys 0..499
+HERD_REQUESTS = 100  # herd demo: requests in the first 100 ms, all for one key
+HERD_KEY = 7
+HERD_FETCH_MS = 110
+HERD_CACHE_CAP = 10
 
 
 class Cache:
@@ -38,7 +46,7 @@ class Cache:
 
 
 def simulate(shielded, coalesce):
-    state = {'seed': 99, 'origin': 0}
+    state = {'seed': SEED, 'origin': 0}
 
     def next_number():
         state['seed'] = (state['seed'] * 1664525 + 1013904223) & 0xFFFFFFFF
@@ -53,9 +61,9 @@ def simulate(shielded, coalesce):
     now = 0
     total_wait = 0
     for _ in range(REQUESTS):
-        now += 1 + next_number() % 3
-        u = next_number() % 10000
-        key = (u * u * u) // 2000000000                # cubing a uniform number favours low keys: a few popular objects
+        now += 1 + next_number() % MAX_GAP_MS
+        u = next_number() % UNIFORM_RANGE
+        key = (u * u * u) // KEY_DIVISOR                # cubing a uniform number favours low keys: a few popular objects
         edge = edges[next_number() % POPS]
         if shielded:
             total_wait += edge.lookup(key, now, coalesce, lambda: EDGE_SHIELD + shield.lookup(key, now, coalesce, from_origin))
@@ -67,15 +75,15 @@ def simulate(shielded, coalesce):
 
 # 100 requests for a new object arrive within 100 ms while its fetch takes 110 ms.
 def herd(coalesce):
-    cache = Cache(10)
+    cache = Cache(HERD_CACHE_CAP)
     fetches = [0]
 
     def fetch():
         fetches[0] += 1
-        return 110
+        return HERD_FETCH_MS
 
-    for t in range(100):
-        cache.lookup(7, t, coalesce, fetch)
+    for t in range(HERD_REQUESTS):
+        cache.lookup(HERD_KEY, t, coalesce, fetch)
     return fetches[0]
 
 

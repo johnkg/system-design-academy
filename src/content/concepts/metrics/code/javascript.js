@@ -1,8 +1,10 @@
 // Latency metrics in JavaScript: why the average hides the slow tail, and how percentiles reveal it.
 
 // 98 ordinary requests between 80 and 120 ms, plus two very slow ones
+const ORDINARY_REQUESTS = 98, MIN_MS = 80, SPREAD_MS = 41;
+const SCATTER_STEP = 37; // coprime with SPREAD_MS, so the values scatter over the range
 const latencies = [];
-for (let i = 1; i <= 98; i++) latencies.push(80 + ((i * 37) % 41));
+for (let i = 1; i <= ORDINARY_REQUESTS; i++) latencies.push(MIN_MS + ((i * SCATTER_STEP) % SPREAD_MS));
 latencies.push(2400, 2900);
 
 // Nearest-rank percentile: the smallest value that at least p% of the observations do not exceed

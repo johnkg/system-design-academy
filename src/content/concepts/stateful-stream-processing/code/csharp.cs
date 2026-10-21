@@ -4,18 +4,22 @@ using System.Collections.Generic;
 using System.Linq;
 
 const int N = 600, KEYS = 12, OPS = 3, CRASH = 330, COMMIT_EVERY = 120;
+const int SEED = 12345, SKEW_STEPS = 1000; // r in 0..999 is squared, so low keys are hot
+const int KEY_GROUPS = 12;
+const int SHORT_INTERVAL = 50, LONG_INTERVAL = 200; // checkpoint intervals, in events
 
 // Seeded orders stream: event i is "customer k placed an order"; low ids are the busy customers.
 var events = new int[N];
-long x = 12345;
+long x = SEED;
 for (int i = 0; i < N; i++)
 {
+    // Park-Miller "minimal standard" LCG (MINSTD).
     x = (x * 48271) % 2147483647;
-    long r = x % 1000;
-    events[i] = (int)((r * r * KEYS) / 1000000);
+    long r = x % SKEW_STEPS;
+    events[i] = (int)((r * r * KEYS) / (SKEW_STEPS * SKEW_STEPS));
 }
 // key -> key group -> operator instance: each key lives on exactly one instance.
-static int OpOf(int k) => (((k * 7 + 2) % 12) * OPS) / 12;
+static int OpOf(int k) => (((k * 7 + 2) % KEY_GROUPS) * OPS) / KEY_GROUPS;
 
 void Must(bool c, string m) { if (!c) { Console.WriteLine("FAILED: " + m); Environment.Exit(1); } }
 
@@ -62,15 +66,15 @@ Result Run(int interval, string kind, bool separate)
     return r;
 }
 
-foreach (int i in new[] { 0, 50, 200 }) Must(Run(i, "plain", false).Wrong == 0, "state exact with checkpoints");
-var idem = Run(50, "idempotent", false);
-var tx = Run(50, "transactional", false);
-Run(200, "transactional", false);
-var plain = Run(50, "plain", false);
+foreach (int i in new[] { 0, SHORT_INTERVAL, LONG_INTERVAL }) Must(Run(i, "plain", false).Wrong == 0, "state exact with checkpoints");
+var idem = Run(SHORT_INTERVAL, "idempotent", false);
+var tx = Run(SHORT_INTERVAL, "transactional", false);
+Run(LONG_INTERVAL, "transactional", false);
+var plain = Run(SHORT_INTERVAL, "plain", false);
 Must(plain.Dup == 30 && plain.Replayed == 30, "plain sink repeats the replayed outputs");
 Must(idem.Dup == 0 && idem.Extra == 30 && idem.Wrong == 0, "upsert absorbs the replay");
 Must(tx.Dup == 0 && tx.Missing == 0 && tx.Extra == 30, "2PC sink: no duplicates, open transaction aborted");
-var behind = Run(50, "plain", true); var ahead = Run(200, "plain", true);
+var behind = Run(SHORT_INTERVAL, "plain", true); var ahead = Run(LONG_INTERVAL, "plain", true);
 Must(behind.Double == 60 && behind.Wrong > 0, "offset committed separately, behind the state: double counting");
 Must(ahead.Lost == 40 && ahead.Wrong > 0, "offset committed separately, ahead of the state: lost events");
 Console.WriteLine("ok");

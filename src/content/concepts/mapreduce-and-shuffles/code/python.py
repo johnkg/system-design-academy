@@ -53,20 +53,23 @@ if totals[True] != totals[False]:
     raise SystemExit("combiner changed the answer")
 
 # Skew: 2000 events, half of them for one hot key. One reducer gets the hot key and becomes the straggler.
-seed = 12345
+EVENTS, COLD_USERS, SEED = 2000, 50, 12345
+SALT_BUCKETS = R * 2  # the hot key is split over this many salted keys
+seed = SEED
 
 
 def rand(n):
+    """Linear congruential generator (Numerical Recipes constants)."""
     global seed
     seed = (seed * 1664525 + 1013904223) & 0xFFFFFFFF
     return (seed >> 8) % n
 
 
-events = ["hot" if i % 2 == 0 else "user" + str(rand(50)) for i in range(2000)]
+events = ["hot" if i % 2 == 0 else "user" + str(rand(COLD_USERS)) for i in range(EVENTS)]
 
 
 def ratio(l):
-    h = max(l) * R * 100 // 2000
+    h = max(l) * R * 100 // EVENTS
     return f"{h // 100}.{h % 100:02d}"
 
 
@@ -78,9 +81,9 @@ def load(key_of):
 
 
 plain = load(lambda e: e)
-salted = load(lambda e: "hot#" + str(rand(R * 2)) if e == "hot" else e)  # stage 1: spread the hot key over 6 salted keys
+salted = load(lambda e: "hot#" + str(rand(SALT_BUCKETS)) if e == "hot" else e)  # stage 1: spread the hot key over 6 salted keys
 print(f"plain  load [{', '.join(map(str, plain))}] slowest/average = {ratio(plain)}")
 print(f"salted load [{', '.join(map(str, salted))}] slowest/average = {ratio(salted)}")
 print("stage 2 merges the 6 partial counts of 'hot' into one number (tiny shuffle)")
-if sum(plain) != 2000 or sum(salted) != 2000:
+if sum(plain) != EVENTS or sum(salted) != EVENTS:
     raise SystemExit("records lost")

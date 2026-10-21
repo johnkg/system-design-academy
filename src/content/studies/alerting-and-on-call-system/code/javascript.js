@@ -1,7 +1,10 @@
 // An alerting pipeline in JavaScript:
 // a rule fires only after its condition held for a while, then alerts are silenced, deduplicated, grouped into notifications and escalated.
 
-let seed = 7;
+const SEED = 7, MINUTES = 120, THRESHOLD = 60, QUICK_FOR = 1, PATIENT_FOR = 3;
+const RAW_ALERTS = 400, INSTANCES = 8;
+let seed = SEED;
+// Linear congruential generator (Numerical Recipes constants), high 16 bits.
 const random = (n) => { seed = (seed * 1664525 + 1013904223) % 4294967296; return Math.floor(seed / 65536) % n; };
 
 // 1. Rule evaluation: fire when the value has been above the threshold for `forMinutes` samples in a row.
@@ -14,13 +17,13 @@ function evaluate(samples, threshold, forMinutes) {
   });
   return fires;
 }
-const samples = Array.from({ length: 120 }, () => random(100));
-const quick = evaluate(samples, 60, 1).length, patient = evaluate(samples, 60, 3).length;
+const samples = Array.from({ length: MINUTES }, () => random(100));
+const quick = evaluate(samples, THRESHOLD, QUICK_FOR).length, patient = evaluate(samples, THRESHOLD, PATIENT_FOR).length;
 console.log(`rule value > 60 over 120 minutes: ${quick} fires with for=1, ${patient} fires with for=3`);
 
 // 2. Firing alerts from three services, with many repeats of the same alert.
 const SERVICES = ['checkout', 'search', 'batch'], NAMES = ['latency', 'errors'];
-const raw = Array.from({ length: 400 }, (_, id) => ({ id, minute: random(120), service: SERVICES[random(3)], name: NAMES[random(2)], instance: random(8) }));
+const raw = Array.from({ length: RAW_ALERTS }, (_, id) => ({ id, minute: random(MINUTES), service: SERVICES[random(SERVICES.length)], name: NAMES[random(NAMES.length)], instance: random(INSTANCES) }));
 raw.sort((a, b) => a.minute - b.minute || a.id - b.id);
 
 const silences = [{ service: 'batch', from: 30, to: 90 }]; // a maintenance window for the batch service
@@ -43,7 +46,7 @@ console.log(`${fresh} new alerts became ${notifications.size} notifications`);
 // 3. Escalation: page the primary, and if nobody acknowledges, the secondary, and then the manager.
 const ackChance = [60, 70, 100], pages = [0, 0, 0];
 for (let n = 0; n < notifications.size; n++) {
-  for (let level = 0; level < 3; level++) {
+  for (let level = 0; level < ackChance.length; level++) {
     pages[level]++;
     if (random(100) < ackChance[level]) break;
   }

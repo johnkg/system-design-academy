@@ -6,22 +6,28 @@ const WEIGHT = [30, 20, 20, 10, 12, 8]; // how often each question topic is aske
 const TENANT_SPECIFIC = [false, false, false, false, true, true]; // answer depends on who asks
 const PRICE = { small: [150, 600], large: [3000, 15000] }; // nano-dollars per input / output token
 const IN_TOK = 800, OUT_TOK = 150;
+const SEED = 7, QUERIES = 240, TENANTS = 2, WORDINGS = 3; // 3 fixed wordings per topic
+const FRESH_PERCENT = 40, HARD_PERCENT = 30, SMALL_SOLVES_HARD_PERCENT = 25;
+// Confidence: a hard question is usually low (0..59), otherwise 70..99.
+const LOW_CONF_PERCENT = 75, LOW_CONF_RANGE = 60, HIGH_CONF_MIN = 70, HIGH_CONF_RANGE = 30;
+const PERMILLE = 1000, NANO_PER_MICRO = 1000;
 
 function makeWorkload(n) {
-  let s = 7;
+  let s = SEED;
+  // Linear congruential generator (Numerical Recipes constants).
   const rnd = (m) => { s = (Math.imul(s, 1664525) + 1013904223) >>> 0; return (s >>> 16) % m; };
   const work = [];
   for (let i = 0; i < n; i++) {
-    const tenant = rnd(2);
+    const tenant = rnd(TENANTS);
     const r = rnd(100);
     let intent = 0, acc = 0;
-    for (let k = 0; k < 6; k++) { acc += WEIGHT[k]; if (r < acc) { intent = k; break; } }
-    const wording = rnd(3); // 3 fixed wordings per topic
-    const fresh = rnd(100) < 40; // 40% of questions use brand-new wording
+    for (let k = 0; k < WEIGHT.length; k++) { acc += WEIGHT[k]; if (r < acc) { intent = k; break; } }
+    const wording = rnd(WORDINGS);
+    const fresh = rnd(100) < FRESH_PERCENT; // 40% of questions use brand-new wording
     const noise = [rnd(3) - 1, rnd(3) - 1, rnd(3) - 1, rnd(3) - 1];
-    const hard = rnd(100) < 30;
-    const smallOk = hard ? rnd(100) < 25 : true;
-    const conf = hard ? (rnd(100) < 75 ? rnd(60) : 70 + rnd(30)) : 70 + rnd(30);
+    const hard = rnd(100) < HARD_PERCENT;
+    const smallOk = hard ? rnd(100) < SMALL_SOLVES_HARD_PERCENT : true;
+    const conf = hard ? (rnd(100) < LOW_CONF_PERCENT ? rnd(LOW_CONF_RANGE) : HIGH_CONF_MIN + rnd(HIGH_CONF_RANGE)) : HIGH_CONF_MIN + rnd(HIGH_CONF_RANGE);
     const wobble = [[0, 0, 0, 0], [-1, 0, 1, 0], [0, 1, 0, -1]][wording];
     const vec = VEC[intent].map((v, d) => v + (fresh ? noise[d] : wobble[d]));
     work.push({ i, tenant, intent, key: fresh ? "u" + i : intent + ":" + wording, vec, smallOk, conf });
@@ -30,8 +36,8 @@ function makeWorkload(n) {
 }
 
 const dot = (a, b) => a.reduce((t, v, d) => t + v * b[d], 0);
-const simOk = (a, b, thr) => { const d = dot(a, b); return d > 0 && d * d * 1000000 >= thr * thr * dot(a, a) * dot(b, b); };
-const permille = (a, b) => Math.floor((1000 * dot(a, b)) / Math.sqrt(dot(a, a) * dot(b, b)));
+const simOk = (a, b, thr) => { const d = dot(a, b); return d > 0 && d * d * PERMILLE * PERMILLE >= thr * thr * dot(a, a) * dot(b, b); };
+const permille = (a, b) => Math.floor((PERMILLE * dot(a, b)) / Math.sqrt(dot(a, a) * dot(b, b)));
 const callCost = (m) => IN_TOK * PRICE[m][0] + OUT_TOK * PRICE[m][1];
 
 function run(work, { cache, thr = 950, isolate = true, route = "large", escalate = 65 }) {
@@ -63,7 +69,7 @@ function run(work, { cache, thr = 950, isolate = true, route = "large", escalate
   return { cost, hits, wrong };
 }
 
-const work = makeWorkload(240);
+const work = makeWorkload(QUERIES);
 const base = work.length * callCost("large");
 console.log(`one large call = ${callCost("large")} nano-dollars, one small call = ${callCost("small")}`);
 const configs = [
@@ -82,7 +88,7 @@ for (const [label, cfg] of configs) {
   const r = run(work, cfg);
   results[label] = r;
   const saved = Math.floor((100 * (base - r.cost)) / base);
-  console.log(`${label.padEnd(24)} cost=${Math.floor(r.cost / 1000)}u$ saved=${saved}% hits=${r.hits} wrong=${r.wrong}`);
+  console.log(`${label.padEnd(24)} cost=${Math.floor(r.cost / NANO_PER_MICRO)}u$ saved=${saved}% hits=${r.hits} wrong=${r.wrong}`);
 }
 const R = results;
 if (R["no cache, large model"].wrong !== 0) process.exit(1);

@@ -18,14 +18,15 @@ class PostStore {
 }
 
 const LIMIT = 5;
+const POSTS = 20; // posts in the demo feed
 
-const offsetStore = new PostStore(20);
+const offsetStore = new PostStore(POSTS);
 console.log("offset pagination");
 console.log(`  page 1: ${offsetStore.byOffset(0, LIMIT)}`);
 offsetStore.add(); // post 21 is published while the client reads
 console.log(`  page 2: ${offsetStore.byOffset(LIMIT, LIMIT)}   <- 16 appears again`);
 
-const cursorStore = new PostStore(20);
+const cursorStore = new PostStore(POSTS);
 console.log("cursor pagination");
 const first = cursorStore.byCursor(null, LIMIT);
 console.log(`  page 1: ${first.ids}`);

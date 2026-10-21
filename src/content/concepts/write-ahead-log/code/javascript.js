@@ -79,8 +79,10 @@ function recover(disk, durable) {
   return [scanned.length, redone, skipped, losers, undone];
 }
 
+const START_BALANCES = [100, 100, 100, 100]; // four pages of $100
+
 function scenario(obeyWal) {
-  const db = new Db([100, 100, 100, 100]);
+  const db = new Db(START_BALANCES);
   db.update(1, 0, -30); db.update(1, 1, 30); db.commit(1);       // T1: page 0 -> page 1, $30
   db.checkpoint();
   db.update(2, 2, -20); db.update(2, 3, 20); db.commit(2);       // T2 commits, its pages stay in the pool
@@ -88,9 +90,9 @@ function scenario(obeyWal) {
   db.update(4, 1, -50);                                          // T4 debits page 1 ...
   db.evict(1, obeyWal);                                          // ... the pool steals that dirty page ...
   const [disk, log] = db.crash();                                // ... and the power fails before T4 commits
-  const onDisk = [0, 1, 2, 3].map((p) => disk.get(p)[0]).join(",");
+  const onDisk = START_BALANCES.map((_, p) => disk.get(p)[0]).join(",");
   const [scanned, redone, skipped, losers, undone] = recover(disk, log);
-  const final = [0, 1, 2, 3].map((p) => disk.get(p)[0]);
+  const final = START_BALANCES.map((_, p) => disk.get(p)[0]);
   console.log(`obey write-ahead rule: ${obeyWal ? "true" : "false"}`);
   console.log(`  durable log ${log.length} records, fsyncs ${db.fsyncs}, pages on disk at crash [${onDisk}]`);
   console.log(`  analysis scanned ${scanned}, losers [${losers.join(",")}]; redo applied ${redone} skipped ${skipped}; undo ${undone}`);

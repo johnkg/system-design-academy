@@ -56,8 +56,9 @@ def verify(token, secret, expect):
 
 SECRET = "demo-secret-at-least-32-bytes-long!"
 NOW = 1000
+TOKEN_TTL_S = 300  # access tokens live 5 minutes
 expect = {"now": NOW, "iss": "auth.shop", "aud": "orders-api"}
-good = {"iss": "auth.shop", "sub": "alice", "aud": "orders-api", "exp": NOW + 300}
+good = {"iss": "auth.shop", "sub": "alice", "aud": "orders-api", "exp": NOW + TOKEN_TTL_S}
 
 token = sign(good, SECRET)
 print("token: " + token[:36] + "...")

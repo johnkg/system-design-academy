@@ -7,6 +7,7 @@ using System.Text;
 public static class Program
 {
     const int Iterations = 100_000;
+    const int KeyBytes = 32; // a 256-bit derived key
 
     static string Hex(byte[] bytes) => Convert.ToHexString(bytes).ToLowerInvariant();
 
@@ -15,7 +16,7 @@ public static class Program
 
     // Better: a unique salt per user and many iterations, so every guess is slow.
     static byte[] SlowHash(string password, byte[] salt) =>
-        Rfc2898DeriveBytes.Pbkdf2(Encoding.UTF8.GetBytes(password), salt, Iterations, HashAlgorithmName.SHA256, 32);
+        Rfc2898DeriveBytes.Pbkdf2(Encoding.UTF8.GetBytes(password), salt, Iterations, HashAlgorithmName.SHA256, KeyBytes);
 
     static bool Verify(string password, byte[] salt, byte[] stored) =>
         CryptographicOperations.FixedTimeEquals(SlowHash(password, salt), stored); // constant-time compare

@@ -8,12 +8,13 @@ const BW_BYTES_PER_US = 2_000_000;       // 2 TB/s memory bandwidth
 const FLOPS_PER_US = 200_000_000;        // 200 TFLOP/s achievable
 const FLOPS_PER_TOKEN = 16_000_000_000;  // 2 x parameters per generated token
 const MAX_BATCH = 256;
+const BITS_PER_BYTE = 8, US_PER_MS = 1000;
 const div = (a, b) => Math.floor(a / b);
 const pad = (v, n) => String(v).padStart(n);
 
 function kvBytesPerToken(kvHeads, bits) {
   // 2 (K and V) x layers x kv_heads x head_dim x bytes per value
-  return div(2 * LAYERS * kvHeads * HEAD_DIM * bits, 8);
+  return div(2 * LAYERS * kvHeads * HEAD_DIM * bits, BITS_PER_BYTE);
 }
 function maxSequences(kvPerToken, ctx) {
   return Math.min(MAX_BATCH, div(USABLE - WEIGHTS, kvPerToken * ctx));
@@ -24,7 +25,7 @@ function decodeStepUs(batch, kvPerToken, ctx) {
   const computeUs = div(batch * FLOPS_PER_TOKEN, FLOPS_PER_US);
   return [Math.max(memoryUs, computeUs), memoryUs >= computeUs ? "memory" : "compute"];
 }
-const prefillMs = (ctx) => div(div(ctx * FLOPS_PER_TOKEN, FLOPS_PER_US), 1000);
+const prefillMs = (ctx) => div(div(ctx * FLOPS_PER_TOKEN, FLOPS_PER_US), US_PER_MS);
 
 const configs = [
   ["MHA-32 fp16", 32, 16, 8192],

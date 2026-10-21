@@ -1,5 +1,15 @@
 // A tiny LSM tree in JavaScript: memtable, immutable sorted runs, bloom filters, tombstones and merge compaction.
 // All numbers are integers so the output is identical in every language.
+const BITS_PER_KEY = 10; // bloom filter size per key
+const HASHES = 4; // hash functions per key (seeds 1..4)
+const MEM_LIMIT = 4; // entries the memtable holds before it flushes
+const MAX_RUNS = 3; // sorted runs before compaction
+const OPS = 40; // demo: random puts and deletes
+const KEY_SPACE = 16; // keys user:00..user:15
+const DELETE_ONE_IN = 5; // one op in 5 is a delete
+const REPORT_EVERY = 10;
+const ABSENT_FROM = 20; // keys from here on were never written
+const ABSENT_KEYS = 16;
 
 const fnv = (key, seed) => { // deterministic 32-bit FNV-1a hash, seeded
   let h = (2166136261 ^ seed) >>> 0;
@@ -8,8 +18,8 @@ const fnv = (key, seed) => { // deterministic 32-bit FNV-1a hash, seeded
 };
 
 class Bloom {
-  constructor(entries) { this.bits = new Array(entries * 10).fill(false); } // 10 bits per key, 4 hashes
-  slots(key) { return [1, 2, 3, 4].map((seed) => fnv(key, seed) % this.bits.length); }
+  constructor(entries) { this.bits = new Array(entries * BITS_PER_KEY).fill(false); } // 10 bits per key, 4 hashes
+  slots(key) { return Array.from({ length: HASHES }, (_, i) => i + 1).map((seed) => fnv(key, seed) % this.bits.length); }
   add(key) { for (const s of this.slots(key)) this.bits[s] = true; }
   mightContain(key) { return this.slots(key).every((s) => this.bits[s]); }
 }
@@ -79,19 +89,19 @@ let seed = 7;
 const rnd = (n) => { seed = (Math.imul(seed, 1664525) + 1013904223) >>> 0; return (seed >>> 8) % n; };
 const userKey = (n) => `user:${String(n).padStart(2, "0")}`;
 
-const db = new Lsm(4, 3);
+const db = new Lsm(MEM_LIMIT, MAX_RUNS);
 const truth = new Map(); // a plain map that must always agree with the LSM
-for (let op = 1; op <= 40; op++) {
-  const key = userKey(rnd(16));
-  if (rnd(5) === 0) { db.delete(key); truth.delete(key); }
+for (let op = 1; op <= OPS; op++) {
+  const key = userKey(rnd(KEY_SPACE));
+  if (rnd(DELETE_ONE_IN) === 0) { db.delete(key); truth.delete(key); }
   else { db.put(key, `v${op}`); truth.set(key, `v${op}`); }
-  for (let n = 0; n < 16; n++) {
+  for (let n = 0; n < KEY_SPACE; n++) {
     if (db.get(userKey(n)) !== truth.get(userKey(n))) throw new Error(`stale read of ${userKey(n)} after op ${op}`);
   }
-  if (op % 10 === 0) console.log(`op ${op}: runs=[${db.runs.map((r) => r.entries.length).join(",")}] memtable=${db.mem.size}`);
+  if (op % REPORT_EVERY === 0) console.log(`op ${op}: runs=[${db.runs.map((r) => r.entries.length).join(",")}] memtable=${db.mem.size}`);
 }
 db.bloomSkips = 0; db.runReads = 0;
-for (let n = 20; n < 36; n++) if (db.get(userKey(n)) !== undefined) throw new Error("ghost key"); // 16 absent keys
+for (let n = ABSENT_FROM; n < ABSENT_FROM + ABSENT_KEYS; n++) if (db.get(userKey(n)) !== undefined) throw new Error("ghost key"); // 16 absent keys
 console.log(`16 lookups of absent keys: ${db.runReads} run reads, ${db.bloomSkips} skipped by bloom filters`);
 
 const amp = Math.floor((db.flushed + db.compacted) * 100 / db.puts);

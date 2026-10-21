@@ -1,10 +1,13 @@
 // A tiny protobuf-like tag-length-value codec: field numbers, wire types, unknown fields skipped.
 const WIRE = { int: 0, bool: 0, str: 2 }; // varint = 0, length-delimited = 2
 const ZERO = { int: 0, bool: false, str: "" };
+// A varint byte holds 7 value bits; its high bit says another byte follows.
+const VARINT_BASE = 128, CONTINUE_BIT = 128, VALUE_MASK = 127;
+const TAG_BASE = 8; // tag = field number * 8 + wire type (3 bits)
 
 function varint(n) {
   const out = [];
-  while (n >= 128) { out.push((n % 128) | 128); n = Math.floor(n / 128); }
+  while (n >= VARINT_BASE) { out.push((n % VARINT_BASE) | CONTINUE_BIT); n = Math.floor(n / VARINT_BASE); }
   out.push(n);
   return out;
 }
@@ -13,7 +16,7 @@ function encode(schema, msg) {
   const out = [];
   for (const f of schema) {
     if (!(f.name in msg)) continue;
-    out.push(...varint(f.num * 8 + WIRE[f.type])); // the tag: number and wire type, never the name
+    out.push(...varint(f.num * TAG_BASE + WIRE[f.type])); // the tag: number and wire type, never the name
     if (f.type === "str") {
       const bytes = [...msg[f.name]].map((c) => c.charCodeAt(0));
       out.push(...varint(bytes.length), ...bytes);
@@ -25,9 +28,9 @@ function encode(schema, msg) {
 function decode(schema, bytes) {
   const values = {}, unknown = [];
   let i = 0;
-  const readVarint = () => { let v = 0, m = 1, b; do { b = bytes[i++]; v += (b & 127) * m; m *= 128; } while (b & 128); return v; };
+  const readVarint = () => { let v = 0, m = 1, b; do { b = bytes[i++]; v += (b & VALUE_MASK) * m; m *= VARINT_BASE; } while (b & CONTINUE_BIT); return v; };
   while (i < bytes.length) {
-    const tag = readVarint(), num = Math.floor(tag / 8), wt = tag % 8;
+    const tag = readVarint(), num = Math.floor(tag / TAG_BASE), wt = tag % TAG_BASE;
     const f = schema.find((x) => x.num === num);
     const known = f && WIRE[f.type] === wt; // a wire-type mismatch is skipped like an unknown field
     if (wt === 0) { const v = readVarint(); if (known) values[f.name] = f.type === "bool" ? v !== 0 : v; else unknown.push(num); }

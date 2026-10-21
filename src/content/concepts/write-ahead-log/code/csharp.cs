@@ -89,9 +89,11 @@ static class Program
         return (scanned.Count, redone, skipped, losers, undone);
     }
 
+    static readonly int[] StartBalances = { 100, 100, 100, 100 }; // four pages of $100
+
     static int[] Scenario(bool obeyWal)
     {
-        var db = new Db(new[] { 100, 100, 100, 100 });
+        var db = new Db(StartBalances);
         db.Update(1, 0, -30); db.Update(1, 1, 30); db.Commit(1);            // T1: page 0 -> page 1, $30
         db.Checkpoint();
         db.Update(2, 2, -20); db.Update(2, 3, 20); db.Commit(2);            // T2 commits, its pages stay in the pool
@@ -99,9 +101,9 @@ static class Program
         db.Update(4, 1, -50);                                               // T4 debits page 1 ...
         db.Evict(1, obeyWal);                                               // ... the pool steals that dirty page ...
         var (disk, log) = db.Crash();                                       // ... and the power fails before T4 commits
-        string onDisk = string.Join(",", Enumerable.Range(0, 4).Select(p => disk[p][0]));
+        string onDisk = string.Join(",", Enumerable.Range(0, StartBalances.Length).Select(p => disk[p][0]));
         var (scanned, redone, skipped, losers, undone) = Recover(disk, log);
-        int[] final = Enumerable.Range(0, 4).Select(p => disk[p][0]).ToArray();
+        int[] final = Enumerable.Range(0, StartBalances.Length).Select(p => disk[p][0]).ToArray();
         Console.WriteLine($"obey write-ahead rule: {(obeyWal ? "true" : "false")}");
         Console.WriteLine($"  durable log {log.Count} records, fsyncs {db.Fsyncs}, pages on disk at crash [{onDisk}]");
         Console.WriteLine($"  analysis scanned {scanned}, losers [{string.Join(",", losers)}]; redo applied {redone} skipped {skipped}; undo {undone}");

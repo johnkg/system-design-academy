@@ -11,6 +11,31 @@ FAULTS = {
 }
 
 
+REQUESTS = 400  # checkout requests per period
+SAMPLES = 12  # resource samples per period
+PAY_SLOWDOWN = 12  # payments_slow multiplies payment latency
+BAD_DEPLOY_FAIL_PCT = 25
+ERR_JUMP_PM = 50  # diagnosis: an error-rate jump (per mille) that marks a bad build
+SLOW_FACTOR = 3  # p99 this many times the healthy p99 is slow
+POOL_WAITERS_ALERT = 10  # mean pool waiters that blame the pool
+SEED = 7
+CONTROL_SEED = 8  # a second healthy period
+# Draws as (minimum, spread): a value is minimum + (random % spread).
+OWN_MS = (10, 20)  # checkout's own work
+PAY_MS = (40, 40)
+INV_MS = (15, 15)
+DB_MS = (4, 8)
+LOCK_WAIT_MS = (600, 400)  # db_lock: extra time per query
+POOL_WAIT_MS = (500, 500)  # pool_exhaustion: waiting for a connection
+FAST_FAIL_MS = (5, 8)  # bad_deploy: a failed inventory call
+POOL_UTIL_PCT = (30, 15)  # resource samples
+DB_CPU_PCT = (25, 10)
+EXHAUSTED_WAITERS = (20, 10)
+EXHAUSTED_CPU_PCT = (15, 5)
+LOCKED_WAITERS = (10, 10)
+LOCKED_CPU_PCT = (5, 5)
+
+
 def lcg(seed):
     state = [seed & 0xFFFFFFFF]
 
@@ -23,32 +48,36 @@ def lcg(seed):
 # One period of 400 checkout requests plus 12 resource samples, with an optional injected fault.
 def simulate(fault, seed):
     r = lcg(seed)
+
+    def draw(d):
+        return d[0] + r() % d[1]
+
     events = []  # (svc, dur, ok)
-    for _ in range(400):
-        own = 10 + r() % 20
-        pay, inv, db, pool, ok = 40 + r() % 40, 15 + r() % 15, 4 + r() % 8, 0, True
+    for _ in range(REQUESTS):
+        own = draw(OWN_MS)
+        pay, inv, db, pool, ok = draw(PAY_MS), draw(INV_MS), draw(DB_MS), 0, True
         if fault == "payments_slow":
-            pay *= 12
+            pay *= PAY_SLOWDOWN
         if fault == "db_lock":
-            db += 600 + r() % 400
+            db += draw(LOCK_WAIT_MS)
         if fault == "pool_exhaustion":
-            pool = 500 + r() % 500  # waiting for a connection, not a slow query
-        if fault == "bad_deploy" and r() % 100 < 25:
+            pool = draw(POOL_WAIT_MS)  # waiting for a connection, not a slow query
+        if fault == "bad_deploy" and r() % 100 < BAD_DEPLOY_FAIL_PCT:
             ok = False
-            inv = 5 + r() % 8
+            inv = draw(FAST_FAIL_MS)
         if ok:
             events += [("payments", pay, True), ("db", db, True), ("inventory", inv, True), ("checkout", own + pool + pay + inv + db, True)]
         else:  # the bad inventory build fails fast and checkout returns 500 straight away
             events += [("inventory", inv, False), ("checkout", own + inv, False)]
     samples = []  # (pool_util, waiters, cpu)
-    for _ in range(12):
-        pool_util, waiters, cpu = 30 + r() % 15, 0, 25 + r() % 10
+    for _ in range(SAMPLES):
+        pool_util, waiters, cpu = draw(POOL_UTIL_PCT), 0, draw(DB_CPU_PCT)
         if fault == "pool_exhaustion":
-            pool_util, waiters = 100, 20 + r() % 10
-            cpu = 15 + r() % 5  # starved database idles
+            pool_util, waiters = 100, draw(EXHAUSTED_WAITERS)
+            cpu = draw(EXHAUSTED_CPU_PCT)  # starved database idles
         if fault == "db_lock":
-            pool_util, waiters = 100, 10 + r() % 10
-            cpu = 5 + r() % 5
+            pool_util, waiters = 100, draw(LOCKED_WAITERS)
+            cpu = draw(LOCKED_CPU_PCT)
         samples.append((pool_util, waiters, cpu))
     return events, samples
 
@@ -86,17 +115,17 @@ def diagnose(healthy, faulty):
     f = lambda s: red(faulty[0], s)
     u = use(faulty[1])
     for d in DEPS:  # fast failures: a bad build, not a slow dependency
-        if f(d)["errPm"] - h(d)["errPm"] >= 50 and f(d)["failP50"] < h(d)["p99"]:
+        if f(d)["errPm"] - h(d)["errPm"] >= ERR_JUMP_PM and f(d)["failP50"] < h(d)["p99"]:
             return d
     for d in DEPS:
-        if f(d)["p99"] >= 3 * h(d)["p99"]:  # a dependency is slow in its own right
+        if f(d)["p99"] >= SLOW_FACTOR * h(d)["p99"]:  # a dependency is slow in its own right
             return d
-    if f("checkout")["p99"] >= 3 * h("checkout")["p99"]:
-        return "checkout db pool" if u["waiters"] >= 10 else "checkout"
+    if f("checkout")["p99"] >= SLOW_FACTOR * h("checkout")["p99"]:
+        return "checkout db pool" if u["waiters"] >= POOL_WAITERS_ALERT else "checkout"
     return "none"
 
 
-healthy = simulate("none", 7)
+healthy = simulate("none", SEED)
 
 
 def row(name, p):
@@ -105,12 +134,12 @@ def row(name, p):
 
 
 row("healthy", healthy)
-print(f"healthy diagnosis: {diagnose(healthy, simulate('none', 8))}")
+print(f"healthy diagnosis: {diagnose(healthy, simulate('none', CONTROL_SEED))}")
 
 correct = 0
 h_avg = red(healthy[0], "checkout")["avg"]
 for fault, culprit in FAULTS.items():
-    faulty = simulate(fault, 7)
+    faulty = simulate(fault, SEED)
     row(fault, faulty)
     got = diagnose(healthy, faulty)
     avg_flags = red(faulty[0], "checkout")["avg"] >= 2 * h_avg  # what an average-only dashboard could say
@@ -118,7 +147,7 @@ for fault, culprit in FAULTS.items():
     if got == culprit:
         correct += 1
 print(f"classified {correct} of 4 faults correctly")
-if correct != 4 or diagnose(healthy, simulate("none", 8)) != "none":
+if correct != len(FAULTS) or diagnose(healthy, simulate("none", CONTROL_SEED)) != "none":
     sys.exit(1)
-if red(simulate("bad_deploy", 7)[0], "checkout")["avg"] >= h_avg:
+if red(simulate("bad_deploy", SEED)[0], "checkout")["avg"] >= h_avg:
     sys.exit(1)  # the average even improves

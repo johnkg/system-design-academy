@@ -18,10 +18,11 @@ class Origin {
   static CC = { "/app.js": "max-age=60, stale-while-revalidate=30", "/index.html": "no-cache",
     "/me": "no-store", "/app.3f9a.js": "max-age=31536000, immutable" };
   static CHANGES_AT = { "/app.js": 100, "/index.html": 110 }; // a deploy: version 1 becomes version 2
+  static NEVER = 1e9; // change time for URLs that are never redeployed
   requests = 0;
 
   version(url, now) {
-    return now >= (Origin.CHANGES_AT[url] ?? 1e9) ? 2 : 1;
+    return now >= (Origin.CHANGES_AT[url] ?? Origin.NEVER) ? 2 : 1;
   }
 
   handle(url, now, ifNoneMatch) {

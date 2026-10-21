@@ -4,13 +4,16 @@ import sys
 
 WIRE = {"int": 0, "bool": 0, "str": 2}  # varint = 0, length-delimited = 2
 ZERO = {"int": 0, "bool": False, "str": ""}
+# A varint byte holds 7 value bits; its high bit says another byte follows.
+VARINT_BASE, CONTINUE_BIT, VALUE_MASK = 128, 128, 127
+TAG_BASE = 8  # tag = field number * 8 + wire type (3 bits)
 
 
 def varint(n):
     out = []
-    while n >= 128:
-        out.append((n % 128) | 128)
-        n //= 128
+    while n >= VARINT_BASE:
+        out.append((n % VARINT_BASE) | CONTINUE_BIT)
+        n //= VARINT_BASE
     out.append(n)
     return out
 
@@ -20,7 +23,7 @@ def encode(schema, msg):
     for f in schema:
         if f["name"] not in msg:
             continue
-        out += varint(f["num"] * 8 + WIRE[f["type"]])  # the tag: number and wire type, never the name
+        out += varint(f["num"] * TAG_BASE + WIRE[f["type"]])  # the tag: number and wire type, never the name
         if f["type"] == "str":
             data = [ord(c) for c in msg[f["name"]]]
             out += varint(len(data)) + data
@@ -39,14 +42,14 @@ def decode(schema, data):
         while True:
             b = data[i]
             i += 1
-            v += (b & 127) * m
-            m *= 128
-            if not b & 128:
+            v += (b & VALUE_MASK) * m
+            m *= VARINT_BASE
+            if not b & CONTINUE_BIT:
                 return v
 
     while i < len(data):
         tag = read_varint()
-        num, wt = tag // 8, tag % 8
+        num, wt = tag // TAG_BASE, tag % TAG_BASE
         f = next((x for x in schema if x["num"] == num), None)
         known = f is not None and WIRE[f["type"]] == wt  # a wire-type mismatch is skipped like an unknown field
         if wt == 0:

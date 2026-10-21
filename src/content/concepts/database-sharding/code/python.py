@@ -27,13 +27,16 @@ class ShardedStore:
         return sum(sum(1 for u in shard.values() if predicate(u)) for shard in self.shards)
 
 
-store = ShardedStore(3)
-for id in range(1, 1001):
-    store.put(id, {"id": id, "country": "FR" if id % 4 == 0 else "US"})
+SHARDS, NEW_SHARDS, USERS = 3, 4, 1000
+FR_EVERY = 4  # every 4th user lives in FR
+
+store = ShardedStore(SHARDS)
+for id in range(1, USERS + 1):
+    store.put(id, {"id": id, "country": "FR" if id % FR_EVERY == 0 else "US"})
 
 print("rows per shard:", ", ".join(str(len(s)) for s in store.shards))
-print("user 42 is on shard", shard_for(42, 3), "->", store.get(42)["country"])
+print("user 42 is on shard", shard_for(42, SHARDS), "->", store.get(42)["country"])
 print("users in FR (scatter-gather):", store.count_where(lambda u: u["country"] == "FR"))
 
-moved = sum(1 for id in range(1, 1001) if shard_for(id, 3) != shard_for(id, 4))
-print(f"going from 3 to 4 shards moves {moved / 10:g}% of keys")
+moved = sum(1 for id in range(1, USERS + 1) if shard_for(id, SHARDS) != shard_for(id, NEW_SHARDS))
+print(f"going from 3 to 4 shards moves {moved * 100 / USERS:g}% of keys")

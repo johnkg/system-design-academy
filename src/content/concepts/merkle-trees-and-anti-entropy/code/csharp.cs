@@ -6,6 +6,8 @@ using System.Security.Cryptography;
 using System.Text;
 
 const int NKeys = 4096, Leaves = 64, PerLeaf = NKeys / Leaves; // 64 keys per leaf range
+const int Seed = 42, StaleWrites = 4; // replica b missed this many writes
+const int ComparisonDivisor = 20; // the sync must compare fewer than NKeys / 20 hashes
 
 static byte[] Sha(byte[] data) => SHA256.HashData(data);
 
@@ -45,9 +47,9 @@ var a = new Dictionary<int, string>();
 for (int k = 0; k < NKeys; k++) a[k] = $"v{(k * 7) % 1000}";
 var b = new Dictionary<int, string>(a);
 
-long seed = 42; // MINSTD generator
+long seed = Seed; // MINSTD generator
 int Rand(int n) { seed = (seed * 48271) % 2147483647; return (int)(seed % n); }
-for (int i = 0; i < 4; i++) b[Rand(NKeys)] = "stale"; // missed writes
+for (int i = 0; i < StaleWrites; i++) b[Rand(NKeys)] = "stale"; // missed writes
 b.Remove(Rand(NKeys)); // lost write
 
 var ta = BuildTree(a); var tb = BuildTree(b);
@@ -70,6 +72,6 @@ bool same = ta[0][0].SequenceEqual(tb2[0][0]);
 Console.WriteLine($"roots equal after: {same.ToString().ToLower()}, root {Convert.ToHexString(ta[0][0]).ToLower()[..8]}");
 
 if (!same) return 1;
-if (cmp[0] * 20 >= NKeys) return 1;
+if (cmp[0] * ComparisonDivisor >= NKeys) return 1;
 if (sent > ranges.Count * PerLeaf) return 1;
 return 0;

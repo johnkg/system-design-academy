@@ -30,8 +30,9 @@ function verify(token, secret, expect) {
 
 const SECRET = "demo-secret-at-least-32-bytes-long!";
 const NOW = 1000;
+const TOKEN_TTL_S = 300; // access tokens live 5 minutes
 const expect = { now: NOW, iss: "auth.shop", aud: "orders-api" };
-const good = { iss: "auth.shop", sub: "alice", aud: "orders-api", exp: NOW + 300 };
+const good = { iss: "auth.shop", sub: "alice", aud: "orders-api", exp: NOW + TOKEN_TTL_S };
 
 const token = sign(good, SECRET);
 console.log("token: " + token.slice(0, 36) + "...");

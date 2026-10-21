@@ -2,12 +2,14 @@
 // Four migration orders run on the same seeded write stream; only the safe ones end equal to the old table.
 
 const N = 1000, CHUNK = 50, WRITES = 12; // rows, rows per backfill batch, live writes between steps
-let seed = 12345;
+const SEED = 12345;
+// 31-bit LCG (glibc constants)
+let seed = SEED;
 const rand = (n) => { seed = (Math.imul(seed, 1103515245) + 12345) & 0x7fffffff; return (seed >>> 8) % n; };
 const split = (name) => { const i = name.indexOf(" "); return name.slice(0, i) + "|" + name.slice(i + 1); };
 
 function migrate(mode) {
-  seed = 12345;
+  seed = SEED;
   const old = Array.from({ length: N }, (_, i) => `f${i} l${i}`); // the live table: full_name
   const next = new Array(N).fill(null);                            // the new columns (or the shadow table)
   let dualWrite = mode !== "backfill-first";                       // is the app writing both shapes yet?

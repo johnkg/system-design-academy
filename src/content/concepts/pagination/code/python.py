@@ -23,14 +23,15 @@ def join(ids):
 
 
 LIMIT = 5
+POSTS = 20  # posts in the demo feed
 
-offset_store = PostStore(20)
+offset_store = PostStore(POSTS)
 print("offset pagination")
 print(f"  page 1: {join(offset_store.by_offset(0, LIMIT))}")
 offset_store.add()  # post 21 is published while the client reads
 print(f"  page 2: {join(offset_store.by_offset(LIMIT, LIMIT))}   <- 16 appears again")
 
-cursor_store = PostStore(20)
+cursor_store = PostStore(POSTS)
 print("cursor pagination")
 first = cursor_store.by_cursor(None, LIMIT)
 print(f"  page 1: {join(first['ids'])}")

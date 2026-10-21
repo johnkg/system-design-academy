@@ -6,20 +6,22 @@ public static class Program
 {
     public static async Task Main()
     {
+        const int MaxAttempts = 5;
+        const int FlakyFailures = 2, DownAttempts = 3; // demo: failures before success, attempts for the dead service
         Func<int, Task> sleep = _ => Task.CompletedTask; // a real version would wait; here we only print the chosen delay
         Func<double> fixedRandom = () => 0.5;
 
         // A service that fails twice with a temporary error, then works
         Task<string> Flaky(int attempt) =>
-            attempt <= 2 ? throw new RetryableException("503 unavailable") : Task.FromResult($"ok on attempt {attempt}");
-        Console.WriteLine(await Retry.RunAsync(Flaky, 5, fixedRandom, sleep));
+            attempt <= FlakyFailures ? throw new RetryableException("503 unavailable") : Task.FromResult($"ok on attempt {attempt}");
+        Console.WriteLine(await Retry.RunAsync(Flaky, MaxAttempts, fixedRandom, sleep));
 
         // A permanent error is not retried at all
-        try { await Retry.RunAsync<string>(_ => throw new Exception("404 not found"), 5, fixedRandom, sleep); }
+        try { await Retry.RunAsync<string>(_ => throw new Exception("404 not found"), MaxAttempts, fixedRandom, sleep); }
         catch (Exception e) { Console.WriteLine($"gave up immediately: {e.Message}"); }
 
         // A service that never recovers: stops after the maximum attempts
-        try { await Retry.RunAsync<string>(_ => throw new RetryableException("503 unavailable"), 3, fixedRandom, sleep); }
+        try { await Retry.RunAsync<string>(_ => throw new RetryableException("503 unavailable"), DownAttempts, fixedRandom, sleep); }
         catch (Exception e) { Console.WriteLine($"gave up after 3 attempts: {e.Message}"); }
     }
 }

@@ -39,6 +39,7 @@ static class Program
     {
         ["search"] = (false, 120), ["calc"] = (false, 60), ["deploy"] = (true, 200),
     };
+    const int FinishCost = 50; // the model call that decides to finish
 
     // A stand-in for the model: it decides the next action from the step number. The real action is saved in the log.
     static Act Policy(string name, int i) => name switch
@@ -59,7 +60,7 @@ static class Program
             if (i >= o.MaxSteps) return "max-steps";
             if (i < log.Count) { if (log[i].Act.Tool == "finish") return "done"; continue; } // already done before a crash: skip it
             var act = Policy(o.Policy, i);
-            if (act.Tool == "finish") { log.Add(new Rec(act, "done", 50)); return "done"; }
+            if (act.Tool == "finish") { log.Add(new Rec(act, "done", FinishCost)); return "done"; }
             int n = log.Count;
             if (n >= 2 && log[n - 1].Act == act && log[n - 2].Act == act) return "loop";
             if (Tools[act.Tool].Risky && !o.Approve(act)) return "denied";

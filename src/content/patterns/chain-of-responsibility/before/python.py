@@ -1,10 +1,12 @@
 # Without the pattern: one function knows every approver and every limit.
 
+MANAGER_LIMIT, DIRECTOR_LIMIT = 1_000, 10_000
+
 
 def approve(amount):
-    if amount <= 1_000:
+    if amount <= MANAGER_LIMIT:
         return f"Manager approves ${amount}"
-    elif amount <= 10_000:
+    elif amount <= DIRECTOR_LIMIT:
         return f"Director approves ${amount}"
     else:
         return f"CEO approves ${amount}"

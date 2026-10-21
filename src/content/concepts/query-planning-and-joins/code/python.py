@@ -2,9 +2,14 @@
 # then run all three for real and compare the estimate with what happened. Integer maths only, so the output is exact.
 SEQ, TUPLE, CMP, HASH, SETUP = 1000, 10, 3, 5, 1000   # cost units: one sequential page read = 1000
 CUST_PER_PAGE, ORD_PER_PAGE = 40, 100
+SEED, NL_ONE_IN = 7, 10  # one customer in 10 lives in NL
+ROW_KEY = 1000  # a result row packs both ids: order_id * 1000 + customer_id
+STALE_SHRINK = 20  # stale statistics were taken when the tables were 20x smaller
+LARGE_CUST, LARGE_ORD = 1000, 20000
+WRONG_PLAN_FACTOR = 5  # the stale plan must cost at least this many times the best one
 
 
-def make_tables(n_cust, n_ord, presorted=False, seed=7):
+def make_tables(n_cust, n_ord, presorted=False, seed=SEED):
     state = seed
 
     def rnd(n):  # tiny LCG, so every run (and every language) sees the same rows
@@ -12,7 +17,7 @@ def make_tables(n_cust, n_ord, presorted=False, seed=7):
         state = (state * 1664525 + 1013904223) % 4294967296
         return (state >> 8) % n
 
-    customers = [(i, "NL" if rnd(10) == 0 else "US") for i in range(1, n_cust + 1)]
+    customers = [(i, "NL" if rnd(NL_ONE_IN) == 0 else "US") for i in range(1, n_cust + 1)]
     orders = [(i, 1 + min(rnd(n_cust), rnd(n_cust))) for i in range(1, n_ord + 1)]  # skewed: low ids order more
     if presorted:  # like a table clustered on customer_id
         orders.sort(key=lambda o: (o[1], o[0]))
@@ -64,7 +69,7 @@ def run(method, customers, orders, country, presorted):
             for oid, ocid in orders:
                 w["cmp"] += 1
                 if ocid == cid:
-                    out.append(oid * 1000 + cid)
+                    out.append(oid * ROW_KEY + cid)
     elif method == "hash join":
         w["setup"] = SETUP
         table = set()
@@ -73,7 +78,7 @@ def run(method, customers, orders, country, presorted):
         for oid, ocid in orders:
             w["hash"] += 1
             if ocid in table:
-                w["cmp"] += 1; out.append(oid * 1000 + ocid)
+                w["cmp"] += 1; out.append(oid * ROW_KEY + ocid)
     else:
         c = [0]
         ordered = [(ocid, oid) for oid, ocid in orders]
@@ -85,7 +90,7 @@ def run(method, customers, orders, country, presorted):
             w["cmp"] += 1
             if outer[i] < ordered[j][0]: i += 1
             elif outer[i] > ordered[j][0]: j += 1
-            else: out.append(ordered[j][1] * 1000 + outer[i]); j += 1
+            else: out.append(ordered[j][1] * ROW_KEY + outer[i]); j += 1
     cost = w["seq"] * SEQ + w["tuples"] * TUPLE + w["cmp"] * CMP + w["hash"] * HASH + w["setup"]
     return sorted(out), cost, w["cmp"] + w["hash"]
 
@@ -106,7 +111,7 @@ def plan_and_run(label, n_cust, n_ord, stale, presorted=False):
     ndv = len({o[1] for o in orders})
     k_real = sum(1 for _, ctry in customers if ctry == "NL")
     # fresh statistics are exact; stale ones are from when the tables were 20x smaller and NL was rare (0.2%)
-    st = (max(1, n_cust // 20), max(1, n_ord // 20), max(1, ndv // 20), 1) if stale else (n_cust, n_ord, ndv, k_real)
+    st = (max(1, n_cust // STALE_SHRINK), max(1, n_ord // STALE_SHRINK), max(1, ndv // STALE_SHRINK), 1) if stale else (n_cust, n_ord, ndv, k_real)
     est = {m: estimate(m, st, p_c, p_o, presorted) for m in METHODS}
     pick = min(METHODS, key=lambda m: est[m])
     runs = {m: run(m, customers, orders, "NL", presorted) for m in METHODS}
@@ -122,10 +127,10 @@ def plan_and_run(label, n_cust, n_ord, stale, presorted=False):
 
 pick, best, _, _ = plan_and_run("tiny", 16, 60, False)
 assert pick == best == "nested loop"
-pick, best, _, _ = plan_and_run("large", 1000, 20000, False)
+pick, best, _, _ = plan_and_run("large", LARGE_CUST, LARGE_ORD, False)
 assert pick == best == "hash join"
-pick, best, got, ideal = plan_and_run("large, stale stats", 1000, 20000, True)
-assert pick == "nested loop" and best == "hash join" and got > 5 * ideal
-pick, best, _, _ = plan_and_run("large, orders sorted by customer_id", 1000, 20000, False, True)
+pick, best, got, ideal = plan_and_run("large, stale stats", LARGE_CUST, LARGE_ORD, True)
+assert pick == "nested loop" and best == "hash join" and got > WRONG_PLAN_FACTOR * ideal
+pick, best, _, _ = plan_and_run("large, orders sorted by customer_id", LARGE_CUST, LARGE_ORD, False, True)
 assert pick == best == "merge join"
 print(f"stale statistics made the query cost {got // ideal}x more than necessary")

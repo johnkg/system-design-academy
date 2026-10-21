@@ -2,9 +2,10 @@
 # A fake clock moved by hand keeps the output deterministic.
 
 now = 0  # seconds
+TTL = 300  # seconds a record may be cached
 
 # What the authoritative server knows
-authoritative = {"shop.example.com": {"ip": "203.0.113.7", "ttl": 300}}
+authoritative = {"shop.example.com": {"ip": "203.0.113.7", "ttl": TTL}}
 
 
 class Resolver:
@@ -34,12 +35,12 @@ def lookup():
 lookup()  # cold: three round trips
 now = 10
 lookup()  # within the TTL: cache
-now = 299
+now = TTL - 1
 lookup()  # still within the TTL
 
 # The operator moves the site to a new server, but caches keep the old answer until the TTL ends
-authoritative["shop.example.com"] = {"ip": "198.51.100.9", "ttl": 300}
-now = 299
+authoritative["shop.example.com"] = {"ip": "198.51.100.9", "ttl": TTL}
+now = TTL - 1
 lookup()  # still the OLD address
-now = 301
+now = TTL + 1
 lookup()  # TTL over: the new address

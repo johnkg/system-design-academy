@@ -7,30 +7,37 @@ using System.Numerics;
 
 const int HI = 950, LO = 200, MaxDistance = 4, Capacity = 100; // scores are in thousandths
 
-ulong seed = 2024;
+const ulong Seed = 2024;
+// A 32-bit hash is built from two 16-bit halves.
+const int HalfWord = 65536, HashBits = 32;
+const int Uploads = 3000, HarmfulPercent = 6, ScoreScale = 1000;
+// An edited copy has 0..3 bits flipped.
+const int KnownBad = 40, EditedCopyPercent = 40, MaxFlips = 4;
+ulong seed = Seed;
+// Linear congruential generator (Numerical Recipes constants).
 int Random(int n)
 {
     seed = (seed * 1664525 + 1013904223) % 4294967296;
     return (int)((seed / 65536) % (ulong)n); // the high 16 bits are the better ones
 }
-uint Hash32() { uint a = (uint)Random(65536); uint b = (uint)Random(65536); return a * 65536 + b; }
+uint Hash32() { uint a = (uint)Random(HalfWord); uint b = (uint)Random(HalfWord); return a * (uint)HalfWord + b; }
 int Distance(uint a, uint b) => BitOperations.PopCount(a ^ b);
 
 // Build 3,000 uploads. A harmful upload scores high and a harmless one scores low, with an overlap in the middle.
 var known = new List<uint>();
 var uploads = new List<Upload>();
-for (int id = 0; id < 3000; id++)
+for (int id = 0; id < Uploads; id++)
 {
-    bool harmful = Random(100) < 6;
+    bool harmful = Random(100) < HarmfulPercent;
     int score;
-    if (harmful) { int a = Random(1000); int b = Random(1000); score = 1000 - a * b / 1000; }
-    else { int a = Random(1000); int b = Random(1000); int c = Random(1000); score = a * b * c / 1000000; }
+    if (harmful) { int a = Random(ScoreScale); int b = Random(ScoreScale); score = ScoreScale - a * b / ScoreScale; }
+    else { int a = Random(ScoreScale); int b = Random(ScoreScale); int c = Random(ScoreScale); score = a * b * c / (ScoreScale * ScoreScale); }
     uint hash = Hash32();
-    if (harmful && known.Count < 40) known.Add(hash); // the first harmful uploads become the known-bad list
-    else if (harmful && Random(100) < 40) // a later harmful upload may be an edited copy of a known one
+    if (harmful && known.Count < KnownBad) known.Add(hash); // the first harmful uploads become the known-bad list
+    else if (harmful && Random(100) < EditedCopyPercent) // a later harmful upload may be an edited copy of a known one
     {
         hash = known[Random(known.Count)];
-        for (int i = Random(4); i > 0; i--) hash ^= 1u << Random(32); // flip up to 3 bits
+        for (int i = Random(MaxFlips); i > 0; i--) hash ^= 1u << Random(HashBits); // flip up to 3 bits
     }
     uploads.Add(new Upload(id, harmful, score, hash));
 }

@@ -8,13 +8,17 @@ record Decoded(List<(string Name, object Value)> Values, List<int> Unknown);
 
 static class Codec
 {
+    // A varint byte holds 7 value bits; its high bit says another byte follows.
+    const int VarintBase = 128, ContinueBit = 128, ValueMask = 127;
+    const int TagBase = 8; // tag = field number * 8 + wire type (3 bits)
+
     static int Wire(string type) => type == "str" ? 2 : 0; // varint = 0, length-delimited = 2
 
     static object Zero(string type) => type == "int" ? 0L : type == "bool" ? false : "";
 
     static void Varint(List<int> o, long n)
     {
-        while (n >= 128) { o.Add((int)(n % 128) | 128); n /= 128; }
+        while (n >= VarintBase) { o.Add((int)(n % VarintBase) | ContinueBit); n /= VarintBase; }
         o.Add((int)n);
     }
 
@@ -24,7 +28,7 @@ static class Codec
         foreach (var f in schema)
         {
             if (!msg.ContainsKey(f.Name)) continue;
-            Varint(o, f.Num * 8 + Wire(f.Type)); // the tag: number and wire type, never the name
+            Varint(o, f.Num * TagBase + Wire(f.Type)); // the tag: number and wire type, never the name
             var v = msg[f.Name];
             if (f.Type == "str")
             {
@@ -45,13 +49,13 @@ static class Codec
         long ReadVarint()
         {
             long v = 0, m = 1; int b;
-            do { b = data[i++]; v += (b & 127) * m; m *= 128; } while ((b & 128) != 0);
+            do { b = data[i++]; v += (b & ValueMask) * m; m *= VarintBase; } while ((b & ContinueBit) != 0);
             return v;
         }
         while (i < data.Count)
         {
             long tag = ReadVarint();
-            int num = (int)(tag / 8), wt = (int)(tag % 8);
+            int num = (int)(tag / TagBase), wt = (int)(tag % TagBase);
             var f = schema.FirstOrDefault(x => x.Num == num);
             bool known = f != null && Wire(f.Type) == wt; // a wire-type mismatch is skipped like an unknown field
             if (wt == 0)

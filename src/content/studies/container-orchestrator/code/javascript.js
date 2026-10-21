@@ -8,9 +8,14 @@ const DEPLOYMENTS = [
   { name: 'cache', replicas: 4, cpu: 1, mem: 16 },
   { name: 'batch', replicas: 6, cpu: 4, mem: 8 },
 ];
+const TOTAL_PODS = DEPLOYMENTS.reduce((s, d) => s + d.replicas, 0);
+const SEED = 42, SCORE_SCALE = 1000; // free capacity is compared in thousandths
+const BINDS_PER_SECOND = 4, SPREAD_AT = 20;
+const LONG_GRACE = 40, SHORT_GRACE = 5, KILL_AT = 100, LOSS_PERCENT = 10;
 
 function simulate(grace, lossPercent, killAt) {
-  let seed = 42;
+  let seed = SEED;
+  // Linear congruential generator (Numerical Recipes constants), high 16 bits.
   const random = (n) => { seed = (seed * 1664525 + 1013904223) % 4294967296; return Math.floor(seed / 65536) % n; };
   const nodes = Array.from({ length: NODES }, (_, id) => ({ id, lastBeat: 0, ready: true, dead: false }));
   let pods = []; // the store: every pod object, with the node it is bound to (-1 while unscheduled)
@@ -25,7 +30,7 @@ function simulate(grace, lossPercent, killAt) {
     for (const n of nodes) {
       const freeCpu = CPU - used(n, 'cpu') - pod.cpu, freeMem = MEM - used(n, 'mem') - pod.mem;
       if (!n.ready || freeCpu < 0 || freeMem < 0) continue;
-      const score = Math.abs(Math.floor((freeCpu * 1000) / CPU) - Math.floor((freeMem * 1000) / MEM));
+      const score = Math.abs(Math.floor((freeCpu * SCORE_SCALE) / CPU) - Math.floor((freeMem * SCORE_SCALE) / MEM));
       if (score < bestScore) { best = n; bestScore = score; }
     }
     if (best) pod.node = best.id;
@@ -51,23 +56,23 @@ function simulate(grace, lossPercent, killAt) {
       const have = pods.filter((p) => p.dep === d.name).length;
       for (let i = have; i < d.replicas; i++) pods.push({ id: nextId++, dep: d.name, cpu: d.cpu, mem: d.mem, node: -1 });
     }
-    pods.filter((p) => p.node < 0).slice(0, 4).forEach(schedule); // the scheduler binds at most 4 pods per second
+    pods.filter((p) => p.node < 0).slice(0, BINDS_PER_SECOND).forEach(schedule); // the scheduler binds at most 4 pods per second
     for (const n of nodes) { r.maxCpu = Math.max(r.maxCpu, used(n, 'cpu')); r.maxMem = Math.max(r.maxMem, used(n, 'mem')); }
-    if (t === 20) r.spread = nodes.map((n) => pods.filter((p) => p.node === n.id).length).join(' ');
-    if (r.killed >= 0 && t > killAt && r.restoredAt < 0 && pods.length === 26 && pods.every((p) => p.node >= 0 && !nodes[p.node].dead)) r.restoredAt = t;
+    if (t === SPREAD_AT) r.spread = nodes.map((n) => pods.filter((p) => p.node === n.id).length).join(' ');
+    if (r.killed >= 0 && t > killAt && r.restoredAt < 0 && pods.length === TOTAL_PODS && pods.every((p) => p.node >= 0 && !nodes[p.node].dead)) r.restoredAt = t;
   }
   r.finalBound = pods.filter((p) => p.node >= 0 && !nodes[p.node].dead).length;
   return r;
 }
 
-const a = simulate(40, 0, 100);
+const a = simulate(LONG_GRACE, 0, KILL_AT);
 console.log(`pods per node at t=20: ${a.spread}`);
 console.log(`node ${a.killed} died at t=100 with ${a.killedPods} pods; marked NotReady at t=${a.notReadyAt}; all 26 pods bound again at t=${a.restoredAt}`);
-const b = simulate(5, 10, -1), c = simulate(40, 10, -1);
+const b = simulate(SHORT_GRACE, LOSS_PERCENT, -1), c = simulate(LONG_GRACE, LOSS_PERCENT, -1);
 console.log(`healthy nodes, 10% of heartbeats lost: grace 5 s gives ${b.falseEvictions} false evictions, grace 40 s gives ${c.falseEvictions}`);
 
 const ok = a.maxCpu <= CPU && a.maxMem <= MEM && b.maxCpu <= CPU && b.maxMem <= MEM
-  && a.finalBound === 26 && a.restoredAt > a.notReadyAt && a.notReadyAt - 100 <= 40 + BEAT + 1
+  && a.finalBound === TOTAL_PODS && a.restoredAt > a.notReadyAt && a.notReadyAt - KILL_AT <= LONG_GRACE + BEAT + 1
   && b.falseEvictions > 0 && c.falseEvictions === 0;
 console.log(`no node over-committed, desired equals actual, no flapping at 40 s: ${ok}`);
 if (!ok) process.exit(1);

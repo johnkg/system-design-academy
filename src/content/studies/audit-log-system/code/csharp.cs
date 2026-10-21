@@ -7,6 +7,13 @@ using System.Linq;
 
 const int Block = 250;
 const string Genesis = "00000000";
+const int Docs = 50; // documents the demo actions target
+const int StartTime = 1700000000; // Unix seconds of the first entry
+const int EntryGapS = 3; // entries are about 3 s apart, with up to 2 s of jitter
+const int Entries = 1000;
+const int EditAt = 300; // the entry an attacker edits
+const int TruncateTo = 900;
+const int ProveSeq = 777; // the entry the inclusion proof is for
 string[] actors = { "alice", "bob", "carol", "dan" };
 string[] actions = { "login", "read", "update", "delete", "export" };
 
@@ -29,8 +36,8 @@ List<Entry> Build(int count) // append-only: each entry stores the hash of the e
     string prev = Genesis;
     for (int seq = 0; seq < count; seq++)
     {
-        var e = new Entry { Seq = seq, Actor = actors[Random(4)], Action = actions[Random(5)], Target = $"doc-{Random(50)}" };
-        e.Time = 1700000000 + seq * 3 + Random(3);
+        var e = new Entry { Seq = seq, Actor = actors[Random(actors.Length)], Action = actions[Random(actions.Length)], Target = $"doc-{Random(Docs)}" };
+        e.Time = StartTime + seq * EntryGapS + Random(EntryGapS);
         e.Hash = Link(prev, e);
         prev = e.Hash;
         log.Add(e);
@@ -87,34 +94,35 @@ bool CheckProof(string hash, List<(char, string)> proof, string root)
     return hash == root;
 }
 
-var log = Build(1000);
+var log = Build(Entries);
 var cps = Checkpoints(log);
 Console.WriteLine($"entries: {log.Count}, checkpoints at: {string.Join(", ", cps.Select(c => c.End))}");
 Console.WriteLine($"head {log[999].Hash}, last root {cps[3].Root}");
 Console.WriteLine($"intact: chain {VerifyChain(log)}, checkpoints {VerifyCheckpoints(log, cps)}");
 
 var edited = log.Select(e => e.Copy()).ToList();
-edited[300].Actor = "mallory";
+edited[EditAt].Actor = "mallory";
 int editChain = VerifyChain(edited);
 Console.WriteLine($"edit entry 300: chain breaks at {editChain}");
 
-string p = edited[299].Hash; // a clean rewrite: recompute every later hash
-for (int i = 300; i < edited.Count; i++) { edited[i].Hash = Link(p, edited[i]); p = edited[i].Hash; }
+string p = edited[EditAt - 1].Hash; // a clean rewrite: recompute every later hash
+for (int i = EditAt; i < edited.Count; i++) { edited[i].Hash = Link(p, edited[i]); p = edited[i].Hash; }
 int rewriteChain = VerifyChain(edited);
 int rewriteCp = VerifyCheckpoints(edited, cps);
 Console.WriteLine($"rewrite from 300: chain {rewriteChain}, checkpoints disagree at {rewriteCp}");
 
-var dropped = log.Take(900).ToList();
+var dropped = log.Take(TruncateTo).ToList();
 int dropCp = VerifyCheckpoints(dropped, cps);
 Console.WriteLine($"truncate to 900: chain {VerifyChain(dropped)}, checkpoints disagree at {dropCp}");
 
 var proof = new List<(char, string)>();
-Merkle(Hashes(log, 750, 1000), 777 - 750, proof);
-bool okProof = CheckProof(log[777].Hash, proof, cps[3].Root);
+int proveStart = ProveSeq - ProveSeq % Block;
+Merkle(Hashes(log, proveStart, proveStart + Block), ProveSeq - proveStart, proof);
+bool okProof = CheckProof(log[ProveSeq].Hash, proof, cps[3].Root);
 bool badProof = CheckProof(Fnv("forged"), proof, cps[3].Root);
 Console.WriteLine($"proof for entry 777: {proof.Count} hashes, genuine {okProof.ToString().ToLower()}, forged {badProof.ToString().ToLower()}");
 
-if (editChain != 300 || rewriteChain != -1 || rewriteCp != 500 || dropCp != 1000 || !okProof || badProof) Environment.Exit(1);
+if (editChain != EditAt || rewriteChain != -1 || rewriteCp != 500 || dropCp != Entries || !okProof || badProof) Environment.Exit(1);
 
 record Checkpoint(int End, string Head, string Root);
 

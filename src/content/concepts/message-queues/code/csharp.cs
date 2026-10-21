@@ -4,9 +4,10 @@ using System.Collections.Generic;
 
 public static class Program
 {
+    internal const int MaxAttempts = 3; // deliveries before a message goes to the dead-letter queue
     public static void Main()
     {
-        var queue = new MessageQueue(3);
+        var queue = new MessageQueue(MaxAttempts);
         foreach (var m in new[] { "email:ada", "email:BAD", "email:cy" }) queue.Publish(m); // the producer never waits
 
         Message? message;
@@ -35,7 +36,7 @@ public class Message(int id, string body)
     public int Attempts { get; set; }
 }
 
-public class MessageQueue(int maxAttempts = 3)
+public class MessageQueue(int maxAttempts = Program.MaxAttempts)
 {
     private readonly Queue<Message> _ready = new();
     private readonly Dictionary<int, Message> _inFlight = new();

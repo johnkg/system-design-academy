@@ -18,10 +18,15 @@ public static class Program
 {
     const int Nodes = 8, Cpu = 16, Mem = 64, Beat = 10, End = 200;
     static readonly Deployment[] Deployments = { new("web", 16, 2, 4), new("cache", 4, 1, 16), new("batch", 6, 4, 8) };
+    static readonly int TotalPods = Deployments.Sum(d => d.Replicas);
+    const int Seed = 42, ScoreScale = 1000; // free capacity is compared in thousandths
+    const int BindsPerSecond = 4, SpreadAt = 20;
+    const int LongGrace = 40, ShortGrace = 5, KillAt = 100, LossPercent = 10;
 
     static Result Simulate(int grace, int lossPercent, int killAt)
     {
-        long seed = 42;
+        long seed = Seed;
+        // Linear congruential generator (Numerical Recipes constants), high 16 bits.
         int Random(int n) { seed = (seed * 1664525 + 1013904223) % 4294967296; return (int)(seed / 65536 % n); }
 
         var nodes = Enumerable.Range(0, Nodes).Select(i => new Node { Id = i }).ToList();
@@ -40,7 +45,7 @@ public static class Program
             {
                 int freeCpu = Cpu - Used(n, p => p.Cpu) - pod.Cpu, freeMem = Mem - Used(n, p => p.Mem) - pod.Mem;
                 if (!n.Ready || freeCpu < 0 || freeMem < 0) continue;
-                int score = Math.Abs(freeCpu * 1000 / Cpu - freeMem * 1000 / Mem);
+                int score = Math.Abs(freeCpu * ScoreScale / Cpu - freeMem * ScoreScale / Mem);
                 if (score < bestScore) { best = n; bestScore = score; }
             }
             if (best != null) pod.Node = best.Id;
@@ -73,10 +78,10 @@ public static class Program
                 int have = pods.Count(p => p.Dep == d.Name);
                 for (int i = have; i < d.Replicas; i++) pods.Add(new Pod { Id = nextId++, Dep = d.Name, Cpu = d.Cpu, Mem = d.Mem });
             }
-            foreach (var p in pods.Where(p => p.Node < 0).Take(4).ToList()) Schedule(p); // the scheduler binds at most 4 pods per second
+            foreach (var p in pods.Where(p => p.Node < 0).Take(BindsPerSecond).ToList()) Schedule(p); // the scheduler binds at most 4 pods per second
             foreach (var n in nodes) { r.MaxCpu = Math.Max(r.MaxCpu, Used(n, p => p.Cpu)); r.MaxMem = Math.Max(r.MaxMem, Used(n, p => p.Mem)); }
-            if (t == 20) r.Spread = string.Join(" ", nodes.Select(Count));
-            if (r.Killed >= 0 && t > killAt && r.RestoredAt < 0 && pods.Count == 26 && pods.All(p => p.Node >= 0 && !nodes[p.Node].Dead)) r.RestoredAt = t;
+            if (t == SpreadAt) r.Spread = string.Join(" ", nodes.Select(Count));
+            if (r.Killed >= 0 && t > killAt && r.RestoredAt < 0 && pods.Count == TotalPods && pods.All(p => p.Node >= 0 && !nodes[p.Node].Dead)) r.RestoredAt = t;
         }
         r.FinalBound = pods.Count(p => p.Node >= 0 && !nodes[p.Node].Dead);
         return r;
@@ -84,14 +89,14 @@ public static class Program
 
     public static int Main()
     {
-        var a = Simulate(40, 0, 100);
+        var a = Simulate(LongGrace, 0, KillAt);
         Console.WriteLine($"pods per node at t=20: {a.Spread}");
         Console.WriteLine($"node {a.Killed} died at t=100 with {a.KilledPods} pods; marked NotReady at t={a.NotReadyAt}; all 26 pods bound again at t={a.RestoredAt}");
-        var b = Simulate(5, 10, -1); var c = Simulate(40, 10, -1);
+        var b = Simulate(ShortGrace, LossPercent, -1); var c = Simulate(LongGrace, LossPercent, -1);
         Console.WriteLine($"healthy nodes, 10% of heartbeats lost: grace 5 s gives {b.FalseEvictions} false evictions, grace 40 s gives {c.FalseEvictions}");
 
         bool ok = a.MaxCpu <= Cpu && a.MaxMem <= Mem && b.MaxCpu <= Cpu && b.MaxMem <= Mem
-            && a.FinalBound == 26 && a.RestoredAt > a.NotReadyAt && a.NotReadyAt - 100 <= 40 + Beat + 1
+            && a.FinalBound == TotalPods && a.RestoredAt > a.NotReadyAt && a.NotReadyAt - KillAt <= LongGrace + Beat + 1
             && b.FalseEvictions > 0 && c.FalseEvictions == 0;
         Console.WriteLine($"no node over-committed, desired equals actual, no flapping at 40 s: {ok.ToString().ToLowerInvariant()}");
         return ok ? 0 : 1;

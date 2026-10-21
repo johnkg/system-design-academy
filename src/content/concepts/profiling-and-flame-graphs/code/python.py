@@ -3,19 +3,25 @@
 # check the sampled estimate against the known true proportions.
 import math
 
+ENCODE_LOOP_US = 170  # true self time of encode_loop before the regression
+REGRESSION_US = 1000  # what the regression adds to encode_loop
+SEED = 7
+BAR_WIDTH = 40  # characters for 100% in the flame graph
+SIGMA_BOUND = 5  # sampling error must stay within 5 standard deviations
+
 # True CPU microseconds per request, by stack. encode_loop regresses by +1000.
 BASE = [
     ("handler", 160), ("handler;auth", 120), ("handler;route", 80),
     ("handler;parse", 60), ("handler;parse;regex_match", 100),
     ("handler;db_query", 50), ("handler;db_query;driver_decode", 90),
     ("handler;serialize", 50), ("handler;serialize;json_encode", 90),
-    ("handler;serialize;json_encode;encode_loop", 170),
+    ("handler;serialize;json_encode;encode_loop", ENCODE_LOOP_US),
     ("handler;audit_log", 30),
 ]
 
 
 def truth(regressed):
-    return [(s, w + 1000 if s.endswith("encode_loop") and regressed else w) for s, w in BASE]
+    return [(s, w + REGRESSION_US if s.endswith("encode_loop") and regressed else w) for s, w in BASE]
 
 
 class Rng:  # MINSTD: x = x * 48271 mod (2^31 - 1), exact in doubles and 64-bit ints
@@ -70,7 +76,7 @@ def pct(n, total):  # one decimal, integer math only
 
 def flame(node, total, depth=0, out=None):
     out = [] if out is None else out
-    bar = "#" * max(1, node.total * 40 // total)
+    bar = "#" * max(1, node.total * BAR_WIDTH // total)
     out.append("%-34s %-40s %5s%% self %5s%%" % ("  " * depth + node.name, bar, pct(node.total, total), pct(node.self_n, total)))
     for k in sorted(node.kids):
         flame(node.kids[k], total, depth + 1, out)
@@ -94,7 +100,7 @@ def self_by_function(root):
 
 
 N = 6000
-counts = sample(truth(True), N, 7)
+counts = sample(truth(True), N, SEED)
 root = build(collapsed(counts))
 check(root)
 assert root.total == N and sum(self_by_function(root).values()) == N
@@ -108,17 +114,17 @@ tt = sum(w for _, w in true)
 true_self = {s.split(";")[-1]: w for s, w in true}
 print("\nestimate error for audit_log (true %s%%):" % pct(true_self["audit_log"], tt))
 for n in (100, 1000, 10000, 60000):
-    r = build(collapsed(sample(true, n, 7)))
+    r = build(collapsed(sample(true, n, SEED)))
     est = self_by_function(r)
     k = est.get("audit_log", 0)
     worst = 0
     for f, w in true_self.items():
         num = abs(est.get(f, 0) * tt - w * n)  # |estimate - truth| * n * tt, exact integers
         p = w / tt
-        assert num / (n * tt) <= 5 * math.sqrt(p * (1 - p) / n) + 1.0 / n
+        assert num / (n * tt) <= SIGMA_BOUND * math.sqrt(p * (1 - p) / n) + 1.0 / n
         worst = max(worst, num)
     print("n=%5d  audit_log samples=%4d  est %5s%%  worst error over all functions %s pts" % (n, k, pct(k, n), pct(worst, n * tt)))
 
 base_tot = sum(w for _, w in truth(False))
-print("\nregression: total %d -> %d us per request, encode_loop share %s%% -> %s%%" % (base_tot, tt, pct(170, base_tot), pct(1170, tt)))
-assert tt == base_tot + 1000
+print("\nregression: total %d -> %d us per request, encode_loop share %s%% -> %s%%" % (base_tot, tt, pct(ENCODE_LOOP_US, base_tot), pct(ENCODE_LOOP_US + REGRESSION_US, tt)))
+assert tt == base_tot + REGRESSION_US

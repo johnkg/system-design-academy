@@ -5,18 +5,21 @@ using System.Linq;
 
 public static class Program
 {
+    const int Shards = 3, NewShards = 4, Users = 1000;
+    const int FrEvery = 4; // every 4th user lives in FR
+
     public static void Main()
     {
-        var store = new ShardedStore(3);
-        for (int id = 1; id <= 1000; id++) store.Put(id, new User(id, id % 4 == 0 ? "FR" : "US"));
+        var store = new ShardedStore(Shards);
+        for (int id = 1; id <= Users; id++) store.Put(id, new User(id, id % FrEvery == 0 ? "FR" : "US"));
 
         Console.WriteLine("rows per shard: " + string.Join(", ", store.Sizes()));
-        Console.WriteLine($"user 42 is on shard {Sharding.ShardFor(42, 3)} -> {store.Get(42)!.Country}");
+        Console.WriteLine($"user 42 is on shard {Sharding.ShardFor(42, Shards)} -> {store.Get(42)!.Country}");
         Console.WriteLine("users in FR (scatter-gather): " + store.CountWhere(u => u.Country == "FR"));
 
         int moved = 0;
-        for (int id = 1; id <= 1000; id++) if (Sharding.ShardFor(id, 3) != Sharding.ShardFor(id, 4)) moved++;
-        Console.WriteLine($"going from 3 to 4 shards moves {moved / 10.0}% of keys");
+        for (int id = 1; id <= Users; id++) if (Sharding.ShardFor(id, Shards) != Sharding.ShardFor(id, NewShards)) moved++;
+        Console.WriteLine($"going from 3 to 4 shards moves {moved * 100.0 / Users}% of keys");
     }
 }
 

@@ -1,6 +1,11 @@
 // Synthetic probes with an N-of-M rule, and the p75 of a RUM sample, on one seeded day of 1440 minutes.
 const DAY = 1440, FAULT_START = 180, FAULT_END = 360, BRAZIL = 4;
-let state = 9;
+const LOCATIONS = 5, BLIP_PER_MILLE = 4, FAIL_PERCENT = 90;
+const VIEWS_PER_MINUTE = 40, LCP_MIN_MS = 900, LCP_JITTER_MS = 800, OUTAGE_SLOWDOWN = 3;
+const RUM_WINDOW_MIN = 15, RUM_MIN_SAMPLES = 20, LCP_GOOD_MS = 2500, LCP_POOR_MS = 4000;
+const SAMPLING_PCT = 10, THIN_SAMPLING_PCT = 1;
+const SEED = 9;
+let state = SEED;
 
 function rand(n) { // small integer LCG so every language prints the same numbers
   state = (Math.imul(state, 1664525) + 1013904223) >>> 0;
@@ -8,12 +13,12 @@ function rand(n) { // small integer LCG so every language prints the same number
 }
 
 // The world is drawn once, in a fixed order, so every probe setting sees the same day.
-const blip = Array.from({ length: 5 }, () => new Array(DAY).fill(0));  // 1 = single-probe network blip (0.4%)
-const fails = Array.from({ length: 5 }, () => new Array(DAY).fill(0)); // 1 = a probe in the faulted region fails (90%)
+const blip = Array.from({ length: LOCATIONS }, () => new Array(DAY).fill(0));  // 1 = single-probe network blip (0.4%)
+const fails = Array.from({ length: LOCATIONS }, () => new Array(DAY).fill(0)); // 1 = a probe in the faulted region fails (90%)
 for (let t = 0; t < DAY; t++) {
-  for (let loc = 0; loc < 5; loc++) {
-    blip[loc][t] = rand(1000) < 4 ? 1 : 0;
-    fails[loc][t] = rand(100) < 90 ? 1 : 0;
+  for (let loc = 0; loc < LOCATIONS; loc++) {
+    blip[loc][t] = rand(1000) < BLIP_PER_MILLE ? 1 : 0;
+    fails[loc][t] = rand(100) < FAIL_PERCENT ? 1 : 0;
   }
 }
 
@@ -53,10 +58,10 @@ function rumDay(samplingPct) {
   for (let t = 0; t < DAY; t++) {
     const slow = t >= FAULT_START && t < FAULT_END;
     const minute = [];
-    for (let v = 0; v < 40; v++) {                  // 40 Brazil page views per minute
+    for (let v = 0; v < VIEWS_PER_MINUTE; v++) {                  // 40 Brazil page views per minute
       if (rand(100) < samplingPct) {                // the sampling decision
-        const lcp = 900 + rand(800) + rand(800);    // 900..2500 ms, about 1.7 s median
-        minute.push(slow ? lcp * 3 : lcp);
+        const lcp = LCP_MIN_MS + rand(LCP_JITTER_MS) + rand(LCP_JITTER_MS); // 900..2500 ms, about 1.7 s median
+        minute.push(slow ? lcp * OUTAGE_SLOWDOWN : lcp);
       }
     }
     perMinute.push(minute);
@@ -65,9 +70,9 @@ function rumDay(samplingPct) {
 }
 
 function rumDetect(perMinute) { // 15-minute window, at least 20 samples, p75 above 4000 ms
-  for (let t = 15; t < DAY; t++) {
-    const window = perMinute.slice(t - 15, t).flat();
-    if (window.length >= 20 && p75(window) > 4000) return t - FAULT_START;
+  for (let t = RUM_WINDOW_MIN; t < DAY; t++) {
+    const window = perMinute.slice(t - RUM_WINDOW_MIN, t).flat();
+    if (window.length >= RUM_MIN_SAMPLES && p75(window) > LCP_POOR_MS) return t - FAULT_START;
   }
   return -1;
 }
@@ -79,12 +84,12 @@ for (const [interval, locations, need] of [[5, 3, 1], [5, 5, 1], [5, 5, 2], [1, 
   results[`${interval},${locations},${need}`] = [d, f];
 }
 
-const days = rumDay(10);
+const days = rumDay(SAMPLING_PCT);
 const fault = days.slice(FAULT_START, FAULT_END).flat();
 const normal = days.slice(0, FAULT_START).flat();
 const mean = Math.floor(fault.reduce((a, b) => a + b, 0) / fault.length);
 console.log(`RUM at 10%: normal p75 ${p75(normal)} ms, outage p75 ${p75(fault)} ms, outage mean ${mean} ms`);
-console.log(`RUM alert after ${rumDetect(days)} min with 10% sampling, after ${rumDetect(rumDay(1))} with 1%`);
+console.log(`RUM alert after ${rumDetect(days)} min with 10% sampling, after ${rumDetect(rumDay(THIN_SAMPLING_PCT))} with 1%`);
 
 function check(ok, message) { if (!ok) { console.error("assertion failed: " + message); process.exit(1); } }
 const r = (k) => results[k];
@@ -93,6 +98,6 @@ check(r("5,5,1")[0] >= 0 && r("5,5,1")[0] < 5, "a Brazil probe, any 1: found wit
 check(r("5,5,2")[0] === -1 || r("5,5,2")[0] > r("5,5,1")[0], "2 of 5 hides a one-region fault");
 check(r("1,5,3")[0] === -1 && r("1,5,3")[1] === 0, "3 of 5 never fires on blips or on one region");
 check(r("1,5,1")[1] > r("5,5,1")[1] && r("5,5,1")[1] > r("15,5,1")[1], "shorter interval, more false alarms");
-check(p75(normal) < 2500 && 4000 < p75(fault), "p75 moves from good to poor");
-check(rumDetect(days) >= 0 && rumDetect(days) < 30 && rumDetect(rumDay(1)) === -1, "1% sampling is too thin to alert");
+check(p75(normal) < LCP_GOOD_MS && LCP_POOR_MS < p75(fault), "p75 moves from good to poor");
+check(rumDetect(days) >= 0 && rumDetect(days) < 30 && rumDetect(rumDay(THIN_SAMPLING_PCT)) === -1, "1% sampling is too thin to alert");
 console.log("ok");

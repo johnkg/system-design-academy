@@ -9,7 +9,10 @@ public record Silence(string Service, int From, int To);
 
 public static class Program
 {
-    static long seed = 7;
+    const int Seed = 7, Minutes = 120, Threshold = 60, QuickFor = 1, PatientFor = 3;
+    const int RawAlerts = 400, Instances = 8;
+    static long seed = Seed;
+    // Linear congruential generator (Numerical Recipes constants), high 16 bits.
     static int Random(int n) { seed = (seed * 1664525 + 1013904223) % 4294967296; return (int)((seed / 65536) % n); }
 
     // 1. Rule evaluation: fire when the value has been above the threshold for forMinutes samples in a row.
@@ -26,19 +29,19 @@ public static class Program
 
     public static int Main()
     {
-        var samples = Enumerable.Range(0, 120).Select(_ => Random(100)).ToArray();
-        int quick = Evaluate(samples, 60, 1), patient = Evaluate(samples, 60, 3);
+        var samples = Enumerable.Range(0, Minutes).Select(_ => Random(100)).ToArray();
+        int quick = Evaluate(samples, Threshold, QuickFor), patient = Evaluate(samples, Threshold, PatientFor);
         Console.WriteLine($"rule value > 60 over 120 minutes: {quick} fires with for=1, {patient} fires with for=3");
 
         // 2. Firing alerts from three services, with many repeats of the same alert.
         string[] services = { "checkout", "search", "batch" }, names = { "latency", "errors" };
         var raw = new List<Alert>();
-        for (int i = 0; i < 400; i++)
+        for (int i = 0; i < RawAlerts; i++)
         {
-            int minute = Random(120);
-            string service = services[Random(3)];
-            string name = names[Random(2)];
-            raw.Add(new Alert(i, minute, service, name, Random(8)));
+            int minute = Random(Minutes);
+            string service = services[Random(services.Length)];
+            string name = names[Random(names.Length)];
+            raw.Add(new Alert(i, minute, service, name, Random(Instances)));
         }
         raw.Sort((a, b) => a.Minute != b.Minute ? a.Minute.CompareTo(b.Minute) : a.Id.CompareTo(b.Id));
 
@@ -65,7 +68,7 @@ public static class Program
         int[] ackChance = { 60, 70, 100 }, pages = { 0, 0, 0 };
         for (int n = 0; n < notifications.Count; n++)
         {
-            for (int level = 0; level < 3; level++)
+            for (int level = 0; level < ackChance.Length; level++)
             {
                 pages[level]++;
                 if (Random(100) < ackChance[level]) break;

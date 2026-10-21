@@ -11,7 +11,8 @@ public static class Program
     public static void Main()
     {
         var body = "{\"id\":\"evt_9\",\"type\":\"payment.succeeded\",\"order\":\"order-42\"}";
-        var request = new Request(1000, Receiver.Sign(1000, body), body);
+        const int SentAt = 1000; // the sender's clock when it signed, in seconds
+        var request = new Request(SentAt, Receiver.Sign(SentAt, body), body);
         var receiver = new Receiver();
 
         Console.WriteLine($"genuine event:      {receiver.Receive(request, 1010)}");

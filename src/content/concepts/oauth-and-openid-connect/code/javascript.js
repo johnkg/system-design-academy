@@ -62,7 +62,7 @@ console.log('first token still valid:', String(server.tokens.get('at-1')));
 
 const [, code2] = server.authorize('printshop', REDIRECT, CHALLENGE, 'S256', 10);
 check('stolen code, no verifier', server.token(code2, 'printshop', REDIRECT, '', 11), false);
-check('stolen code, guessed verifier', server.token(code2, 'printshop', REDIRECT, 'x'.repeat(43), 11), false);
+check('stolen code, guessed verifier', server.token(code2, 'printshop', REDIRECT, 'x'.repeat(VERIFIER.length), 11), false);
 check('redeem with other redirect_uri', server.token(code2, 'printshop', 'https://evil.test/cb', VERIFIER, 12), false);
 check('legit client still succeeds', server.token(code2, 'printshop', REDIRECT, VERIFIER, 13), true);
 

@@ -3,8 +3,11 @@
 // and a NEW random nonce for every message: reusing a nonce with the same key breaks the security.
 import { createCipheriv, createDecipheriv } from "node:crypto";
 
-const key = Buffer.from(Array.from({ length: 32 }, (_, i) => i)); // 256-bit key
-const nonce = Buffer.from(Array.from({ length: 12 }, (_, i) => 100 + i)); // 96-bit nonce
+const KEY_BYTES = 32; // 256-bit key
+const NONCE_BYTES = 12; // 96-bit nonce, the size GCM is designed for
+
+const key = Buffer.from(Array.from({ length: KEY_BYTES }, (_, i) => i));
+const nonce = Buffer.from(Array.from({ length: NONCE_BYTES }, (_, i) => 100 + i));
 
 function encrypt(plaintext) {
   const cipher = createCipheriv("aes-256-gcm", key, nonce);

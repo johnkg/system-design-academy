@@ -63,14 +63,19 @@ def show(label, plan):
     print(f"{label:<22}" + " ".join(f"{n}@{e['version']}/{e['registry'][:3]}" for n, e in sorted(plan.items())))
 
 
-lock = resolve(30, scopes={"acme-": "private"})
+LOCK_DAY = 30  # the day the lockfile is written
+ATTACK_DAY = 40  # the day the malicious releases appear
+TODAY = 41
+MIN_AGE_DAYS = 3  # quarantine: ignore releases younger than this
+
+lock = resolve(LOCK_DAY, scopes={"acme-": "private"})
 show("day 30 fresh + lock", lock)
-registries["public"]["httputil"].append(rel("1.2.9", 40, {"textkit": "^3.0.0"}, "httputil 1.2.9 + steal(env)"))
-registries["public"]["acme-billing"] = [rel("1.99.0", 40, {}, "acme-billing 1.99.0 (attacker)")]
-floating = resolve(41)
-locked = resolve(41, lock=lock)
-gated = resolve(41, min_age=3, scopes={"acme-": "private"})
-scoped = resolve(41, scopes={"acme-": "private"})
+registries["public"]["httputil"].append(rel("1.2.9", ATTACK_DAY, {"textkit": "^3.0.0"}, "httputil 1.2.9 + steal(env)"))
+registries["public"]["acme-billing"] = [rel("1.99.0", ATTACK_DAY, {}, "acme-billing 1.99.0 (attacker)")]
+floating = resolve(TODAY)
+locked = resolve(TODAY, lock=lock)
+gated = resolve(TODAY, min_age=MIN_AGE_DAYS, scopes={"acme-": "private"})
+scoped = resolve(TODAY, scopes={"acme-": "private"})
 show("day 41 floating", floating)
 show("day 41 lockfile", locked)
 show("day 41 age gate 3d", gated)

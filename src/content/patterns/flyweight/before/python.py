@@ -10,10 +10,11 @@ class Tree:
         self.texture = texture  # texture duplicated per tree
 
 
+TREES, TEXTURE_CHARS = 1000, 10_000
 trees = []
-for i in range(1000):
+for i in range(TREES):
     oak = i % 2
-    trees.append(Tree(i, i * 2, "Oak" if oak else "Pine", "green" if oak else "dark green", "x" * 10_000))
+    trees.append(Tree(i, i * 2, "Oak" if oak else "Pine", "green" if oak else "dark green", "x" * TEXTURE_CHARS))
 
 print(f"{len(trees)} trees, each with its own 10,000-character texture field")
 # Memory scales with the number of trees, not the number of species.

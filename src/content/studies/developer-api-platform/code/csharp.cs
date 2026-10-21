@@ -12,6 +12,7 @@ public static class Platform
     public static uint Fnv(string s) { uint h = 0x811c9dc5; foreach (char ch in s) { h ^= ch; h *= 0x01000193; } return h; }
 
     static readonly Dictionary<string, int> Plans = new() { ["free"] = 5, ["pro"] = 8 }; // calls per month
+    const int WarnPct = 80; // warn when this share of the quota is used
     static readonly Dictionary<string, string> Need = new() { ["GET /payments"] = "payments:read", ["POST /payments"] = "payments:write", ["GET /refunds"] = "refunds:read" };
     public static readonly Dictionary<uint, Rec> Store = new(); // hash of the key -> record. The key itself is never stored.
 
@@ -30,7 +31,7 @@ public static class Platform
         int limit = Plans[rec.Plan];
         if (rec.Used >= limit) return "429 monthly quota used";
         rec.Used++;
-        string warn = rec.Used * 10 >= limit * 8 ? " (80% of quota used)" : "";
+        string warn = rec.Used * 100 >= limit * WarnPct ? " (80% of quota used)" : "";
         return $"200 ok, version {rec.Version}{warn}";
     }
 
@@ -58,6 +59,8 @@ public static class Platform
 
 public static class Program
 {
+    const int ExtraCalls = 5; // enough calls to exhaust the free quota
+
     public static int Main()
     {
         var v1 = new Dictionary<string, string> {
@@ -72,7 +75,7 @@ public static class Program
         string admin = Platform.IssueKey("acme-admin", "pro", ["payments:read", "payments:write"], "2026-01-15");
         Console.WriteLine($"web key {web[..7]}..., admin key {admin[..7]}...");
         var calls = new List<(string, string)> { (web, "GET /payments"), (web, "POST /payments"), (web, "GET /refunds"), ("sk_bad", "GET /payments"), (admin, "POST /payments") };
-        for (int i = 0; i < 5; i++) calls.Add((web, "GET /payments"));
+        for (int i = 0; i < ExtraCalls; i++) calls.Add((web, "GET /payments"));
         foreach (var (key, route) in calls)
         {
             string who = key == web ? "web  " : key == admin ? "admin" : "other";

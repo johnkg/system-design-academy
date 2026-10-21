@@ -55,9 +55,10 @@ class Origin
         ["/app.js"] = "max-age=60, stale-while-revalidate=30", ["/index.html"] = "no-cache",
         ["/me"] = "no-store", ["/app.3f9a.js"] = "max-age=31536000, immutable" };
     static readonly Dictionary<string, int> ChangesAt = new() { ["/app.js"] = 100, ["/index.html"] = 110 }; // a deploy: v1 becomes v2
+    const int Never = 1000000000; // change time for URLs that are never redeployed
     public int Requests;
 
-    public int Version(string url, int now) => now >= (ChangesAt.TryGetValue(url, out var c) ? c : 1000000000) ? 2 : 1;
+    public int Version(string url, int now) => now >= (ChangesAt.TryGetValue(url, out var c) ? c : Never) ? 2 : 1;
 
     public (int status, string cc, string etag, int ver) Handle(string url, int now, string? ifNoneMatch)
     {

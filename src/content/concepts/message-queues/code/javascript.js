@@ -1,4 +1,5 @@
 // A message queue in JavaScript: publish, receive, ack, retry, and a dead-letter queue.
+const MAX_ATTEMPTS = 3; // deliveries before a message goes to the dead-letter queue
 
 class MessageQueue {
   #ready = [];
@@ -6,7 +7,7 @@ class MessageQueue {
   #nextId = 1;
   deadLetters = [];
 
-  constructor(maxAttempts = 3) { this.maxAttempts = maxAttempts; }
+  constructor(maxAttempts = MAX_ATTEMPTS) { this.maxAttempts = maxAttempts; }
 
   publish(body) { this.#ready.push({ id: this.#nextId++, body, attempts: 0 }); }
 
@@ -42,7 +43,7 @@ function runWorker(queue, handle) {
   }
 }
 
-const queue = new MessageQueue(3);
+const queue = new MessageQueue(MAX_ATTEMPTS);
 ["email:ada", "email:BAD", "email:cy"].forEach((m) => queue.publish(m)); // the producer never waits
 
 runWorker(queue, (body) => { if (body.includes("BAD")) throw new Error("malformed address"); });

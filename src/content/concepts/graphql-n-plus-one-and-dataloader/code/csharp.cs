@@ -4,10 +4,10 @@ using System;
 using System.Collections.Generic;
 using System.Linq;
 
-const int N = 5, M = 4; // 5 posts, 4 comments each
-var users = Enumerable.Range(1, 6).Select(i => new Row($"U{i}", i, 0, 0)).ToList();
-var posts = Enumerable.Range(1, N).Select(i => new Row($"P{i}", i, 0, (i * 2) % 6 + 1)).ToList();
-var comments = Enumerable.Range(1, N * M).Select(i => new Row($"C{i}", i, (i - 1) / M + 1, (i * 5 + 3) % 6 + 1)).ToList();
+const int N = 5, M = 4, Users = 6; // 5 posts, 4 comments each, 6 users
+var users = Enumerable.Range(1, Users).Select(i => new Row($"U{i}", i, 0, 0)).ToList();
+var posts = Enumerable.Range(1, N).Select(i => new Row($"P{i}", i, 0, (i * 2) % Users + 1)).ToList();
+var comments = Enumerable.Range(1, N * M).Select(i => new Row($"C{i}", i, (i - 1) / M + 1, (i * 5 + 3) % Users + 1)).ToList();
 
 Sel S(string name, params Sel[] kids) => new Sel(name, kids.ToList());
 var queries = new (string Text, List<Sel> Selection, int NaiveQ, int BatchQ)[]

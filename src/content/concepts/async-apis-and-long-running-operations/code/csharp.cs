@@ -4,8 +4,12 @@ using System;
 using System.Collections.Generic;
 using System.Linq;
 
+const int Workers = 2, Seed = 7, CrashAt = 4, MaxTicks = 100; // worker 0 crashes at t = CrashAt
+const int PollCap = 16; // longest wait between polls (s)
+const int DoneAt = 45; // the polled job finishes at this second
+const int Clients = 1000000;
 
-var svc = new JobService(2, 7);
+var svc = new JobService(Workers, Seed);
 int a = svc.Create(0, "key-a");
 svc.Create(0, "key-b");
 int aAgain = svc.Create(0, "key-a"); // the client retried a lost 202
@@ -15,8 +19,8 @@ int t = 0;
 while (svc.Jobs.Values.Any(j => j.State != "succeeded"))
 {
     t += 1;
-    svc.Tick(t, t == 4 ? 0 : -1);
-    if (t >= 100) throw new Exception("did not finish");
+    svc.Tick(t, t == CrashAt ? 0 : -1);
+    if (t >= MaxTicks) throw new Exception("did not finish");
 }
 if (svc.Results.Count != 3 || !svc.Jobs.Values.All(j => j.State == "succeeded")) throw new Exception("results");
 Console.WriteLine($"jobs: {svc.Jobs.Count}, results stored: {svc.Results.Count}, runs: [{string.Join(", ", svc.Jobs.Values.Select(j => j.Runs))}]");
@@ -31,16 +35,16 @@ static List<int> PollTimes(int doneAt, int first, int growth)
         now += wait;
         times.Add(now);
         if (now >= doneAt) return times;
-        wait = Math.Min(16, wait * growth);
+        wait = Math.Min(PollCap, wait * growth);
     }
 }
 
-var fixedPolls = PollTimes(45, 1, 1);
-var backoff = PollTimes(45, 2, 2);
+var fixedPolls = PollTimes(DoneAt, 1, 1);
+var backoff = PollTimes(DoneAt, 2, 2);
 Console.WriteLine($"fixed 1 s: {fixedPolls.Count} polls, result seen at {fixedPolls[^1]} s");
 Console.WriteLine($"backoff 2,4,8,16: {backoff.Count} polls, result seen at {backoff[^1]} s");
-if (!(backoff.Count < fixedPolls.Count && backoff[^1] - 45 < 16)) throw new Exception("backoff must cost fewer calls");
-Console.WriteLine($"1,000,000 clients: {1000000} req/s fixed, {1000000L * backoff.Count / 45} req/s average with backoff");
+if (!(backoff.Count < fixedPolls.Count && backoff[^1] - DoneAt < PollCap)) throw new Exception("backoff must cost fewer calls");
+Console.WriteLine($"1,000,000 clients: {Clients} req/s fixed, {(long)Clients * backoff.Count / DoneAt} req/s average with backoff");
 
 class Job
 {
@@ -51,6 +55,8 @@ class Job
 class JobService
 {
     const int Lease = 4;
+    const int WorkMin = 6, WorkSpread = 10; // a job needs 6..15 s of work
+    const int RestartDelay = 2; // seconds before a crashed worker comes back
     public SortedDictionary<int, Job> Jobs = new();
     public Dictionary<int, string> Results = new();
     Dictionary<string, int> byKey = new();
@@ -69,7 +75,7 @@ class JobService
     public int Create(int t, string key)
     {
         if (byKey.TryGetValue(key, out int existing)) return existing;
-        int work = 6 + (int)(Next() % 10);
+        int work = WorkMin + (int)(Next() % WorkSpread);
         var job = new Job { Id = Jobs.Count + 1, Work = work, Left = work };
         Jobs[job.Id] = job;
         byKey[key] = job.Id;
@@ -88,7 +94,7 @@ class JobService
             var job = workers[crashWorker]!;
             Log(t, job, $"worker {crashWorker} crashed, lease stays at t={job.Lease}");
             workers[crashWorker] = null; // the job stays 'running' until its lease expires
-            downUntil[crashWorker] = t + 2;
+            downUntil[crashWorker] = t + RestartDelay;
         }
         foreach (var job in Jobs.Values)
         {

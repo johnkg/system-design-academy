@@ -8,14 +8,18 @@ using System.Text;
 
 public static class Program
 {
-    static readonly byte[] Key = Enumerable.Range(0, 32).Select(i => (byte)i).ToArray(); // 256-bit key
-    static readonly byte[] Nonce = Enumerable.Range(0, 12).Select(i => (byte)(100 + i)).ToArray(); // 96-bit nonce
+    const int KeyBytes = 32; // 256-bit key
+    const int NonceBytes = 12; // 96-bit nonce, the size GCM is designed for
+    const int TagBytes = 16; // 128-bit authentication tag
+
+    static readonly byte[] Key = Enumerable.Range(0, KeyBytes).Select(i => (byte)i).ToArray();
+    static readonly byte[] Nonce = Enumerable.Range(0, NonceBytes).Select(i => (byte)(100 + i)).ToArray();
 
     static (byte[] Ciphertext, byte[] Tag) Encrypt(string plaintext)
     {
         var data = Encoding.UTF8.GetBytes(plaintext);
         var ciphertext = new byte[data.Length];
-        var tag = new byte[16]; // the tag proves the data was not changed
+        var tag = new byte[TagBytes]; // the tag proves the data was not changed
         using var aes = new AesGcm(Key, tag.Length);
         aes.Encrypt(Nonce, data, ciphertext, tag);
         return (ciphertext, tag);

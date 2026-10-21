@@ -6,7 +6,9 @@ using System.Linq;
 
 public static class Rng
 {
-    static long seed = 7;
+    const int Seed = 7;
+    static long seed = Seed;
+    // Linear congruential generator (Numerical Recipes constants), high 16 bits.
     public static int Next(int n) { seed = (seed * 1664525 + 1013904223) % 4294967296; return (int)((seed / 65536) % n); }
 }
 
@@ -26,6 +28,8 @@ public record Rec(int Id, string Email, int Qty);
 public static class Program
 {
     const int Chunk = 8;
+    const int Rows = 44, MaxQty = 9;
+    const int RowKinds = 10; // 1 in 10 rows has a bad email, 1 in 10 a bad quantity
     static readonly Dictionary<uint, string> Jobs = new();
 
     static bool AllDigits(string s) => s.Length > 0 && s.All(c => c >= '0' && c <= '9');
@@ -80,10 +84,10 @@ public static class Program
     public static int Main()
     {
         var rows = new List<string>();
-        for (int i = 1; i <= 44; i++)
+        for (int i = 1; i <= Rows; i++)
         {
-            int r = Rng.Next(10);
-            rows.Add(r == 0 ? $"{i},bad-email,3" : r == 1 ? $"{i},u{i}@x.io,many" : $"{i},u{i}@x.io,{1 + Rng.Next(9)}");
+            int r = Rng.Next(RowKinds);
+            rows.Add(r == 0 ? $"{i},bad-email,3" : r == 1 ? $"{i},u{i}@x.io,many" : $"{i},u{i}@x.io,{1 + Rng.Next(MaxQty)}");
         }
         var up = new Upload((rows.Count + Chunk - 1) / Chunk);
         string[] Slice(int i) => rows.Skip(i * Chunk).Take(Chunk).ToArray();

@@ -2,6 +2,8 @@
 import math
 from dataclasses import dataclass
 
+CENTS_PER_DOLLAR = 100
+
 
 class CardGateway:
     def pay(self, dollars):
@@ -24,7 +26,7 @@ def checkout(provider, amount):
         print(CardGateway().pay(amount))
     elif provider == "legacy":
         # Unit conversion and result handling copied wherever the bank is used.
-        result = LegacyBankApi().make_payment(math.floor(amount * 100 + 0.5), "USD")
+        result = LegacyBankApi().make_payment(math.floor(amount * CENTS_PER_DOLLAR + 0.5), "USD")
         print(f"Paid ${amount:.2f} (ref {result.ref})" if result.ok else "Payment failed")
     # Another provider? Another branch, with its own units and quirks.
 

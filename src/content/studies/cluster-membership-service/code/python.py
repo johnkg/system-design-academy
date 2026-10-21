@@ -4,10 +4,16 @@ import sys
 
 N, CRASH, SLOW, CRASH_AT, PAUSE_AT, PAUSE_FOR, ROUNDS = 12, 3, 7, 5, 20, 4, 40
 RETRANSMIT, PIGGYBACK, LOSS = 8, 4, 5  # each update is sent 8 times, 4 per message, 5% of messages are lost
+SEED = 7
+VNODES = 8  # ring tokens per member
+TOKEN_STRIDE = 100  # member m's tokens are hashed from m * 100 + v
+LONG_SUSPECT = 6  # rounds of suspicion: longer than the pause, then shorter
+SHORT_SUSPECT = 2
+KEYS = 1000  # keys placed on the ring
 ALIVE, SUSPECT, DEAD = 0, 1, 2
 MASK = 0xFFFFFFFF
 
-seed = 7
+seed = SEED
 
 
 def rand(n):
@@ -29,7 +35,7 @@ class Node:
 
 def run(suspect_for):
     global seed
-    seed = 7
+    seed = SEED
     nodes = [Node(i) for i in range(N)]
     ever_dead = set()
     learned_at = -1
@@ -99,6 +105,7 @@ def run(suspect_for):
     return learned_at, sorted(ever_dead), nodes[SLOW].inc
 
 
+# 32-bit integer hash finalizer (xor-shift-multiply)
 def mix(x):
     x = ((x ^ (x >> 16)) * 0x45D9F3B) & MASK
     x = ((x ^ (x >> 16)) * 0x45D9F3B) & MASK
@@ -109,8 +116,8 @@ def owner(key, members):  # first token at or after the key's hash, going clockw
     h = mix(key * 31 + 5)
     best, best_tok, first, first_tok = -1, 0, -1, 0
     for m in members:
-        for v in range(8):
-            tok = mix(m * 100 + v)
+        for v in range(VNODES):
+            tok = mix(m * TOKEN_STRIDE + v)
             if tok >= h and (best < 0 or tok < best_tok):
                 best, best_tok = m, tok
             if first < 0 or tok < first_tok:
@@ -118,18 +125,18 @@ def owner(key, members):  # first token at or after the key's hash, going clockw
     return best if best >= 0 else first
 
 
-for suspect_for in (6, 2):
+for suspect_for in (LONG_SUSPECT, SHORT_SUSPECT):
     learned, false_dead, inc_slow = run(suspect_for)
     print(f"suspicion {suspect_for}: crash known by every node {learned} rounds after it happened; healthy nodes declared dead: [{','.join(map(str, false_dead))}]; slow node incarnation {inc_slow}")
     if learned < 0:
         sys.exit(1)
-    if suspect_for == 6 and (len(false_dead) != 0 or inc_slow < 1):
+    if suspect_for == LONG_SUSPECT and (len(false_dead) != 0 or inc_slow < 1):
         sys.exit(1)  # the pause is shorter than the suspicion time, so it is refuted
-    if suspect_for == 2 and SLOW not in false_dead:
+    if suspect_for == SHORT_SUSPECT and SLOW not in false_dead:
         sys.exit(1)  # a too-short suspicion time causes a false positive
 
 everyone = list(range(N))
-keys = range(1000)
+keys = range(KEYS)
 before = [owner(k, everyone) for k in keys]
 
 

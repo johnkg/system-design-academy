@@ -1,12 +1,17 @@
 // A configuration service in JavaScript: schema check at publish, staged rollout with a health gate,
 // automatic rollback, and clients that keep a last-known-good copy when a fetch fails or is damaged.
+const MIN_TIMEOUT_MS = 50; // schema limits
+const MAX_TIMEOUT_MS = 5000;
+const MAX_RETRIES = 5;
+const CLIENTS = 1000;
+const ERROR_LIMIT = 10; // failed clients a stage may have before rollback
 
 const hash = (s) => { let h = 2166136261; for (let i = 0; i < s.length; i++) h = Math.imul(h ^ s.charCodeAt(i), 16777619) >>> 0; return h; };
 const flat = (c) => `${c.timeout_ms}|${c.retries}|${c.mode}`; // canonical text, used for the checksum
 
 function validate(c) { // the schema: type and range for every key
-  if (!Number.isInteger(c.timeout_ms) || c.timeout_ms < 50 || c.timeout_ms > 5000) return 'timeout_ms must be 50..5000';
-  if (!Number.isInteger(c.retries) || c.retries < 0 || c.retries > 5) return 'retries must be 0..5';
+  if (!Number.isInteger(c.timeout_ms) || c.timeout_ms < MIN_TIMEOUT_MS || c.timeout_ms > MAX_TIMEOUT_MS) return 'timeout_ms must be 50..5000';
+  if (!Number.isInteger(c.retries) || c.retries < 0 || c.retries > MAX_RETRIES) return 'retries must be 0..5';
   if (c.mode !== 'fast' && c.mode !== 'safe') return 'mode must be fast or safe';
   return 'ok';
 }
@@ -60,14 +65,15 @@ function rollout(service, clients, version, stages, limit) {
 
 const show = (r) => (r.ok ? `ok, version ${r.version}` : `rejected, ${r.why}`);
 const svc = new ConfigService();
-const clients = Array.from({ length: 1000 }, (_, i) => new Client(`c${i}`));
+const clients = Array.from({ length: CLIENTS }, (_, i) => new Client(`c${i}`));
 console.log('publish v1:', show(svc.publish({ timeout_ms: 800, retries: 2, mode: 'safe' })));
 svc.stable = 1; clients.forEach((c) => c.poll(svc));
 console.log('publish v2:', show(svc.publish({ timeout_ms: 500, retries: 3, mode: 'fast' })));
 console.log('publish bad:', show(svc.publish({ timeout_ms: 900, retries: 9, mode: 'fast' })));
 console.log('publish v3:', show(svc.publish({ timeout_ms: 60, retries: 1, mode: 'fast' })));
-const ok2 = rollout(svc, clients, 2, [5, 25, 100], 10);
-const ok3 = rollout(svc, clients, 3, [5, 25, 100], 10);
+const STAGES = [5, 25, 100]; // percent of clients at each step
+const ok2 = rollout(svc, clients, 2, STAGES, ERROR_LIMIT);
+const ok3 = rollout(svc, clients, 3, STAGES, ERROR_LIMIT);
 const onV2 = clients.filter((c) => c.version === 2).length;
 
 svc.down = true; // the service is unreachable, so every client keeps what it has
@@ -76,4 +82,4 @@ svc.down = false;
 const damaged = clients[7].poll(svc, true);
 console.log(`outage: ${kept} clients kept their copy; damaged payload: ${damaged}, still v${clients[7].version}`);
 console.log(`rollout v2: ${ok2}, rollout v3: ${ok3}, clients on v2: ${onV2}`);
-if (!ok2 || ok3 || onV2 !== 1000 || kept !== 1000 || damaged !== 'kept') process.exit(1);
+if (!ok2 || ok3 || onV2 !== CLIENTS || kept !== CLIENTS || damaged !== 'kept') process.exit(1);

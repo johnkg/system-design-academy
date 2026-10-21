@@ -1,6 +1,8 @@
 # A minimal tracer in Python: spans, parent-child links and trace context propagation.
 # A fake clock moved by hand makes the durations deterministic.
 
+# Simulated work per service, in milliseconds.
+PAYMENT_MS, ORDERS_BEFORE_MS, ORDERS_AFTER_MS, GATEWAY_EACH_SIDE_MS = 1800, 20, 30, 10
 clock = 0  # milliseconds
 spans = []
 
@@ -38,23 +40,23 @@ def from_header(header):
 
 def payment_service(header):
     span = start_span("payment", from_header(header))
-    work(1800)  # the slow part
+    work(PAYMENT_MS)  # the slow part
     end_span(span)
 
 
 def order_service(header):
     span = start_span("orders", from_header(header))
-    work(20)
+    work(ORDERS_BEFORE_MS)
     payment_service(to_header(span))  # pass the context on
-    work(30)
+    work(ORDERS_AFTER_MS)
     end_span(span)
 
 
 def gateway():
     span = start_span("gateway")
-    work(10)
+    work(GATEWAY_EACH_SIDE_MS)
     order_service(to_header(span))
-    work(10)
+    work(GATEWAY_EACH_SIDE_MS)
     end_span(span)
 
 

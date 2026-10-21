@@ -15,7 +15,14 @@ const SCENARIOS = [
   ["product down", { product: "down" }],
 ];
 const N = 100, CRITICAL_TIMEOUT = 2000, USABLE_MS = 1000;
+const OPTIONAL_TIMEOUT = 300; // ms the degrading page waits for an optional part
+const DOWN_MS = 15, DOWN_JITTER_MS = 25;     // a down dependency fails fast
+const SLOW_MS = 1500, SLOW_JITTER_MS = 1000; // a slow dependency
+const FALLBACK_MS = 5; // cost of substituting a fallback
+const RENDER_MS = 15;  // assembling the page
+const P95 = 95;
 
+// Park-Miller (MINSTD) generator
 let seed = 12345;
 const next = () => (seed = (seed * 48271) % 2147483647);
 
@@ -23,8 +30,8 @@ const next = () => (seed = (seed * 48271) % 2147483647);
 const draws = Array.from({ length: N }, () => DEPS.map(() => [next(), next()]));
 
 function callDep(base, mode, a) {
-  if (mode === "down") return { ok: false, ms: 15 + (a % 25) }; // fails fast
-  if (mode === "slow") return { ok: true, ms: 1500 + (a % 1000) };
+  if (mode === "down") return { ok: false, ms: DOWN_MS + (a % DOWN_JITTER_MS) }; // fails fast
+  if (mode === "slow") return { ok: true, ms: SLOW_MS + (a % SLOW_JITTER_MS) };
   return { ok: true, ms: base + (a % base) };
 }
 
@@ -40,14 +47,14 @@ function assemble(modes, cfg, req) {
     slowest = Math.max(slowest, r.ms);
     if (cfg.fallbacks && req[i][1] % 100 < dep.hit) substituted++; else missing++;
   });
-  if (errorAt >= 0) return { outcome: "error", ms: errorAt + 15 };
+  if (errorAt >= 0) return { outcome: "error", ms: errorAt + RENDER_MS };
   const outcome = substituted + missing > 0 ? "degraded" : "full";
-  return { outcome, ms: slowest + (substituted > 0 ? 5 : 0) + 15 };
+  return { outcome, ms: slowest + (substituted > 0 ? FALLBACK_MS : 0) + RENDER_MS };
 }
 
 const CONFIGS = [
   ["naive", { allCritical: true, fallbacks: false, optionalTimeout: CRITICAL_TIMEOUT }],
-  ["degrading", { allCritical: false, fallbacks: true, optionalTimeout: 300 }],
+  ["degrading", { allCritical: false, fallbacks: true, optionalTimeout: OPTIONAL_TIMEOUT }],
 ];
 const results = {};
 for (const [label, modes] of SCENARIOS) {
@@ -56,7 +63,7 @@ for (const [label, modes] of SCENARIOS) {
     const count = (o) => pages.filter((p) => p.outcome === o).length;
     const lat = pages.map((p) => p.ms).sort((x, y) => x - y);
     const usable = pages.filter((p) => p.outcome !== "error" && p.ms <= USABLE_MS).length;
-    const r = { full: count("full"), degraded: count("degraded"), error: count("error"), p95: lat[Math.floor((N * 95) / 100)], usable };
+    const r = { full: count("full"), degraded: count("degraded"), error: count("error"), p95: lat[Math.floor((N * P95) / 100)], usable };
     results[label + "/" + cname] = r;
     console.log(`${label.padEnd(15)} ${cname.padEnd(10)} full=${String(r.full).padStart(3)} degraded=${String(r.degraded).padStart(3)} error=${String(r.error).padStart(3)} p95=${String(r.p95).padStart(4)}ms usable=${String(r.usable).padStart(3)}%`);
   }
@@ -69,6 +76,6 @@ for (const [label] of SCENARIOS) {
   else if (d.error !== 0) throw new Error("optional failure failed a page: " + label);
 }
 if (results["reviews down/naive"].error !== N) throw new Error("naive page should fail when reviews is down");
-if (results["recs slow/degrading"].p95 > 320) throw new Error("optional timeout must bound page latency");
-if (results["recs slow/naive"].p95 <= 1000) throw new Error("naive page should be slow when recs is slow");
+if (results["recs slow/degrading"].p95 > OPTIONAL_TIMEOUT + FALLBACK_MS + RENDER_MS) throw new Error("optional timeout must bound page latency");
+if (results["recs slow/naive"].p95 <= USABLE_MS) throw new Error("naive page should be slow when recs is slow");
 console.log("invariants hold");

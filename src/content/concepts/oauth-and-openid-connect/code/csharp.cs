@@ -76,7 +76,7 @@ public static class Program
 
         var code2 = server.Authorize("printshop", Redirect, challenge, "S256", 10).Value;
         Check("stolen code, no verifier", server.Token(code2, "printshop", Redirect, "", 11), false);
-        Check("stolen code, guessed verifier", server.Token(code2, "printshop", Redirect, new string('x', 43), 11), false);
+        Check("stolen code, guessed verifier", server.Token(code2, "printshop", Redirect, new string('x', Verifier.Length), 11), false);
         Check("redeem with other redirect_uri", server.Token(code2, "printshop", "https://evil.test/cb", Verifier, 12), false);
         Check("legit client still succeeds", server.Token(code2, "printshop", Redirect, Verifier, 13), true);
 

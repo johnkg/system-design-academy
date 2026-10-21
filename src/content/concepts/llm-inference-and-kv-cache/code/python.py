@@ -8,11 +8,12 @@ BW_BYTES_PER_US = 2_000_000       # 2 TB/s memory bandwidth
 FLOPS_PER_US = 200_000_000        # 200 TFLOP/s achievable
 FLOPS_PER_TOKEN = 16_000_000_000  # 2 x parameters per generated token
 MAX_BATCH = 256
+BITS_PER_BYTE, US_PER_MS = 8, 1000
 
 
 def kv_bytes_per_token(kv_heads, bits):
     # 2 (K and V) x layers x kv_heads x head_dim x bytes per value
-    return 2 * LAYERS * kv_heads * HEAD_DIM * bits // 8
+    return 2 * LAYERS * kv_heads * HEAD_DIM * bits // BITS_PER_BYTE
 
 
 def max_sequences(kv_per_token, ctx):
@@ -27,7 +28,7 @@ def decode_step_us(batch, kv_per_token, ctx):
 
 
 def prefill_ms(ctx):
-    return ctx * FLOPS_PER_TOKEN // FLOPS_PER_US // 1000
+    return ctx * FLOPS_PER_TOKEN // FLOPS_PER_US // US_PER_MS
 
 
 configs = [

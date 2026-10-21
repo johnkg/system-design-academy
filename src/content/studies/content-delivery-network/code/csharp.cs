@@ -44,9 +44,18 @@ public record Result(string Name, int Origin, int Hits, int Joined, long Wait, b
 
 public static class Program
 {
+    const uint Seed = 99;
+    const int MaxGapMs = 3; // requests arrive 1..3 ms apart
+    const int UniformRange = 10000; // u is uniform in 0..9999
+    const long KeyDivisor = 2000000000; // u^3 / KeyDivisor gives keys 0..499
+    const int HerdRequests = 100; // herd demo: requests in the first 100 ms, all for one key
+    const int HerdKey = 7;
+    const int HerdFetchMs = 110;
+    const int HerdCacheCap = 10;
+
     static Result Simulate(string name, bool shielded, bool coalesce)
     {
-        uint seed = 99;
+        uint seed = Seed;
         Func<int> next = () => { seed = unchecked(seed * 1664525u + 1013904223u); return (int)(seed >> 8); };
         var edges = Enumerable.Range(0, Cdn.Pops).Select(_ => new Cache(Cdn.EdgeCap)).ToArray();
         var shield = new Cache(Cdn.ShieldCap);
@@ -54,8 +63,8 @@ public static class Program
         Func<long> fromOrigin = () => { origin++; return Cdn.OriginTrip + Cdn.OriginWork; };
         for (int i = 0; i < Cdn.Requests; i++)
         {
-            now += 1 + next() % 3;
-            long u = next() % 10000; int key = (int)(u * u * u / 2000000000L);    // cubing a uniform number favours low keys: a few popular objects
+            now += 1 + next() % MaxGapMs;
+            long u = next() % UniformRange; int key = (int)(u * u * u / KeyDivisor);    // cubing a uniform number favours low keys: a few popular objects
             var edge = edges[next() % Cdn.Pops];
             totalWait += edge.Lookup(key, now, coalesce, () => shielded ? Cdn.EdgeShield + shield.Lookup(key, now, coalesce, fromOrigin) : fromOrigin());
         }
@@ -66,8 +75,8 @@ public static class Program
     // 100 requests for a new object arrive within 100 ms while its fetch takes 110 ms.
     static int Herd(bool coalesce)
     {
-        var cache = new Cache(10); int fetches = 0;
-        for (int t = 0; t < 100; t++) cache.Lookup(7, t, coalesce, () => { fetches++; return 110; });
+        var cache = new Cache(HerdCacheCap); int fetches = 0;
+        for (int t = 0; t < HerdRequests; t++) cache.Lookup(HerdKey, t, coalesce, () => { fetches++; return HerdFetchMs; });
         return fetches;
     }
 

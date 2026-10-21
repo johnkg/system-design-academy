@@ -3,6 +3,9 @@ using System;
 
 public static class Program
 {
+    public const int TvStartVolume = 30, RadioStartVolume = 10;
+    public const int VolumeStep = 10;
+
     public static void Main()
     {
         var remote = new TvAdvancedRemote();
@@ -14,17 +17,17 @@ public static class Program
 
 public class TvBasicRemote
 {
-    public bool On; public int Volume = 30;
+    public bool On; public int Volume = Program.TvStartVolume;
     public void TogglePower() => On = !On;
-    public void VolumeUp() => Volume += 10;
+    public void VolumeUp() => Volume += Program.VolumeStep;
 }
 public class TvAdvancedRemote : TvBasicRemote { public void Mute() => Volume = 0; }
 
 public class RadioBasicRemote // same logic, copied for the radio
 {
-    public bool On; public int Volume = 10;
+    public bool On; public int Volume = Program.RadioStartVolume;
     public void TogglePower() => On = !On;
-    public void VolumeUp() => Volume += 10;
+    public void VolumeUp() => Volume += Program.VolumeStep;
 }
 public class RadioAdvancedRemote : RadioBasicRemote { public void Mute() => Volume = 0; }
 // Add a Speaker device: SpeakerBasicRemote and SpeakerAdvancedRemote.

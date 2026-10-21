@@ -34,7 +34,8 @@ class WebhookReceiver:
 
 
 body = '{"id":"evt_9","type":"payment.succeeded","order":"order-42"}'
-request = {"timestamp": 1000, "signature": sign(1000, body), "body": body}
+SENT_AT = 1000  # the sender's clock when it signed, in seconds
+request = {"timestamp": SENT_AT, "signature": sign(SENT_AT, body), "body": body}
 receiver = WebhookReceiver()
 
 print(f"genuine event:      {receiver.receive(request, 1010)}")

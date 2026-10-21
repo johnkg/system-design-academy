@@ -4,17 +4,23 @@ using System;
 using System.Collections.Generic;
 using System.Linq;
 
-const int N = 12, Crash = 3, Slow = 7, CrashAt = 5, PauseAt = 20, PauseFor = 4, Rounds = 40;
+const int N = Node.ClusterSize, Crash = 3, Slow = 7, CrashAt = 5, PauseAt = 20, PauseFor = 4, Rounds = 40;
 const int Retransmit = 8, Piggyback = 4, Loss = 5; // each update is sent 8 times, 4 per message, 5% of messages are lost
+const int Seed = 7;
+const int Vnodes = 8; // ring tokens per member
+const int TokenStride = 100; // member m's tokens are hashed from m * 100 + v
+const int LongSuspect = 6; // rounds of suspicion: longer than the pause, then shorter
+const int ShortSuspect = 2;
+const int Keys = 1000; // keys placed on the ring
 const int Alive = 0, Suspect = 1, Dead = 2;
 
-uint seed = 7;
+uint seed = Seed;
 int Rand(int n) { unchecked { seed = seed * 1664525u + 1013904223u; } return (int)((seed >> 16) % (uint)n); }
 bool Running(int x, int t) => !(x == Crash && t >= CrashAt) && !(x == Slow && t >= PauseAt && t < PauseAt + PauseFor);
 
 (int learnedAt, List<int> falseDead, int incSlow) Run(int suspectFor)
 {
-    seed = 7;
+    seed = Seed;
     var nodes = Enumerable.Range(0, N).Select(id => new Node(id)).ToList();
     var everDead = new SortedSet<int>();
     int learnedAt = -1;
@@ -76,6 +82,7 @@ bool Running(int x, int t) => !(x == Crash && t >= CrashAt) && !(x == Slow && t 
     return (learnedAt, everDead.ToList(), nodes[Slow].Inc);
 }
 
+// 32-bit integer hash finalizer (xor-shift-multiply)
 uint Mix(uint x)
 {
     unchecked
@@ -90,27 +97,27 @@ int Owner(int key, List<int> members) // first token at or after the key's hash,
     uint h = Mix(unchecked((uint)(key * 31 + 5)));
     int best = -1, first = -1; uint bestTok = 0, firstTok = 0;
     foreach (int m in members)
-        for (int v = 0; v < 8; v++)
+        for (int v = 0; v < Vnodes; v++)
         {
-            uint tok = Mix(unchecked((uint)(m * 100 + v)));
+            uint tok = Mix(unchecked((uint)(m * TokenStride + v)));
             if (tok >= h && (best < 0 || tok < bestTok)) { best = m; bestTok = tok; }
             if (first < 0 || tok < firstTok) { first = m; firstTok = tok; }
         }
     return best >= 0 ? best : first;
 }
 
-foreach (int suspectFor in new[] { 6, 2 })
+foreach (int suspectFor in new[] { LongSuspect, ShortSuspect })
 {
     var (learned, falseDead, incSlow) = Run(suspectFor);
     Console.WriteLine($"suspicion {suspectFor}: crash known by every node {learned} rounds after it happened; healthy nodes declared dead: [{string.Join(",", falseDead)}]; slow node incarnation {incSlow}");
     if (learned < 0) Environment.Exit(1);
-    if (suspectFor == 6 && (falseDead.Count != 0 || incSlow < 1)) Environment.Exit(1); // the pause is shorter than the suspicion time, so it is refuted
-    if (suspectFor == 2 && !falseDead.Contains(Slow)) Environment.Exit(1);             // a too-short suspicion time causes a false positive
+    if (suspectFor == LongSuspect && (falseDead.Count != 0 || incSlow < 1)) Environment.Exit(1); // the pause is shorter than the suspicion time, so it is refuted
+    if (suspectFor == ShortSuspect && !falseDead.Contains(Slow)) Environment.Exit(1);             // a too-short suspicion time causes a false positive
 }
 
 var everyone = Enumerable.Range(0, N).ToList();
-var before = Enumerable.Range(0, 1000).Select(k => Owner(k, everyone)).ToList();
-int Moved(int gone) { var rest = everyone.Where(m => m != gone).ToList(); return Enumerable.Range(0, 1000).Count(k => Owner(k, rest) != before[k]); }
+var before = Enumerable.Range(0, Keys).Select(k => Owner(k, everyone)).ToList();
+int Moved(int gone) { var rest = everyone.Where(m => m != gone).ToList(); return Enumerable.Range(0, Keys).Count(k => Owner(k, rest) != before[k]); }
 int Owned(int x) => before.Count(o => o == x);
 Console.WriteLine($"ring: removing node {Crash} moves {Moved(Crash)} of 1000 keys, exactly the {Owned(Crash)} it owned");
 Console.WriteLine($"ring: a false alarm on node {Slow} moves {Moved(Slow)} keys out and {Moved(Slow)} back");
@@ -119,7 +126,8 @@ if (Moved(Crash) != Owned(Crash) || Moved(Slow) != Owned(Slow) || Owned(Crash) =
 class Node
 {
     public int Id, Inc; public bool Refute;
-    public int[] Status = new int[12], Known = new int[12], Since = new int[12];
+    public const int ClusterSize = 12;
+    public int[] Status = new int[ClusterSize], Known = new int[ClusterSize], Since = new int[ClusterSize];
     public List<Update> Buffer = new();
     public Node(int id) { Id = id; }
 }

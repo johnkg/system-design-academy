@@ -2,6 +2,17 @@
 // One loop iteration = one round trip: the sender puts cwnd segments in flight.
 // All integer arithmetic, a seeded Park-Miller generator, no clock.
 const MSS = 1460, INITIAL_WINDOW = 10;
+const BYTES_PER_MS_PER_MBPS = 125; // 1 Mbit/s carries 125 bytes per millisecond
+const INITIAL_SSTHRESH = 1000000000; // effectively unlimited: slow start until the first loss
+const LOSS_SCALE = 10000; // loss rates are per 10,000 segments
+const MIN_FOR_FAST_RETRANSMIT = 4; // fewer segments than this cannot produce 3 duplicate ACKs
+const MIN_RTO_MS = 200;
+const RTO_RTTS = 3; // a timeout costs max(MIN_RTO_MS, RTO_RTTS * RTT)
+const FILE_BYTES = 5000000; // demo: 5 MB over 100 Mbit/s with 80 ms RTT, buffer = 1 BDP
+const LINK_MBPS = 100;
+const RTT_MS = 80;
+const BUFFER_SEGMENTS = 684;
+const SEED = 7;
 
 function makeRng(seed) {
   let s = seed;
@@ -9,17 +20,17 @@ function makeRng(seed) {
 }
 
 function transfer(fileBytes, mbps, rttMs, bufferSegs, lossPer10k, seed) {
-  const bdp = Math.floor((mbps * 125 * rttMs) / MSS); // bytes per RTT / MSS = segments needed in flight to fill the link
+  const bdp = Math.floor((mbps * BYTES_PER_MS_PER_MBPS * rttMs) / MSS); // bytes per RTT / MSS = segments needed in flight to fill the link
   const total = Math.ceil(fileBytes / MSS);
   const rng = makeRng(seed);
-  let cwnd = INITIAL_WINDOW, ssthresh = 1000000000;
+  let cwnd = INITIAL_WINDOW, ssthresh = INITIAL_SSTHRESH;
   let remaining = total, delivered = 0, timeMs = 0, retransmits = 0;
   const trace = [];
   while (remaining > 0) {
     const sent = Math.min(cwnd, remaining);
     const overflow = Math.max(0, sent - bdp - bufferSegs); // queue full: tail drop
     let random = 0;
-    for (let i = 0; i < sent; i++) if (rng() % 10000 < lossPer10k) random++;
+    for (let i = 0; i < sent; i++) if (rng() % LOSS_SCALE < lossPer10k) random++;
     const lost = Math.min(sent, overflow + random);
     // Invariant: more than BDP + buffer in flight cannot fit, so a loss event must follow.
     if (sent > bdp + bufferSegs && lost === 0) throw new Error("window above BDP+buffer without a loss");
@@ -31,7 +42,7 @@ function transfer(fileBytes, mbps, rttMs, bufferSegs, lossPer10k, seed) {
     retransmits += lost;
     if (lost > 0) {
       ssthresh = Math.max(2, Math.floor(cwnd / 2));
-      if (sent - lost < 4) { cwnd = 1; roundMs += Math.max(200, 3 * rttMs); } // too few dup ACKs: timeout
+      if (sent - lost < MIN_FOR_FAST_RETRANSMIT) { cwnd = 1; roundMs += Math.max(MIN_RTO_MS, RTO_RTTS * rttMs); } // too few dup ACKs: timeout
       else cwnd = ssthresh;                                                   // fast retransmit + fast recovery
     } else if (cwnd < ssthresh) cwnd = Math.min(cwnd * 2, ssthresh); // slow start: double per RTT
     else cwnd += 1;                                                 // congestion avoidance: +1 per RTT
@@ -42,7 +53,7 @@ function transfer(fileBytes, mbps, rttMs, bufferSegs, lossPer10k, seed) {
 }
 
 for (const [name, loss] of [["clean link", 0], ["0.1% random loss", 10], ["1% random loss", 100]]) {
-  const r = transfer(5000000, 100, 80, 684, loss, 7); // 100 Mbit/s, 80 ms RTT, buffer = 1 BDP
+  const r = transfer(FILE_BYTES, LINK_MBPS, RTT_MS, BUFFER_SEGMENTS, loss, SEED); // 100 Mbit/s, 80 ms RTT, buffer = 1 BDP
   console.log(`${name}: BDP=${r.bdp} segments, file=${r.total} segments`);
   console.log(`  cwnd per round: ${r.trace.slice(0, 14).join(" ")}${r.rounds > 14 ? " ..." : ""}`);
   console.log(`  rounds=${r.rounds} time=${r.timeMs} ms retransmits=${r.retransmits}`);

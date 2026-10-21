@@ -1,6 +1,8 @@
 # Caching in Python: an LRU cache with cache-aside reads.
 from collections import OrderedDict
 
+CACHE_CAPACITY = 2  # entries the cache holds before it evicts
+
 
 class LruCache:
     def __init__(self, max_size):
@@ -36,7 +38,7 @@ class Database:
 
 
 database = Database()
-cache = LruCache(2)
+cache = LruCache(CACHE_CAPACITY)
 hits = 0
 
 

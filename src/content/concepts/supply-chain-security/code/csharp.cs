@@ -86,15 +86,19 @@ public static class Program
 
     public static void Main()
     {
+        const int LockDay = 30; // the day the lockfile is written
+        const int AttackDay = 40; // the day the malicious releases appear
+        const int Today = 41;
+        const int MinAgeDays = 3; // quarantine: ignore releases younger than this
         var acme = new Dictionary<string, string> { ["acme-"] = "private" };
-        var lk = Resolve(30, scopes: acme);
+        var lk = Resolve(LockDay, scopes: acme);
         Show("day 30 fresh + lock", lk);
-        registries["public"]["httputil"].Add(R("1.2.9", 40, D(("textkit", "^3.0.0")), "httputil 1.2.9 + steal(env)"));
-        registries["public"]["acme-billing"] = new() { R("1.99.0", 40, D(), "acme-billing 1.99.0 (attacker)") };
-        var floating = Resolve(41);
-        var locked = Resolve(41, lk);
-        var gated = Resolve(41, scopes: acme, minAge: 3);
-        var scoped = Resolve(41, scopes: acme);
+        registries["public"]["httputil"].Add(R("1.2.9", AttackDay, D(("textkit", "^3.0.0")), "httputil 1.2.9 + steal(env)"));
+        registries["public"]["acme-billing"] = new() { R("1.99.0", AttackDay, D(), "acme-billing 1.99.0 (attacker)") };
+        var floating = Resolve(Today);
+        var locked = Resolve(Today, lk);
+        var gated = Resolve(Today, scopes: acme, minAge: MinAgeDays);
+        var scoped = Resolve(Today, scopes: acme);
         Show("day 41 floating", floating);
         Show("day 41 lockfile", locked);
         Show("day 41 age gate 3d", gated);

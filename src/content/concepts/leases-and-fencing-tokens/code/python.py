@@ -2,6 +2,7 @@
 # The clock is a plain variable so the pause scenario is deterministic.
 
 now = 0  # seconds, moved by hand
+LEASE_TTL = 10  # seconds a lease lasts
 
 
 class LeaseManager:
@@ -49,7 +50,7 @@ class Storage:
 def scenario(checks_tokens):
     global now
     now = 0
-    manager = LeaseManager(10)
+    manager = LeaseManager(LEASE_TTL)
     storage = Storage(checks_tokens, manager)
 
     a = manager.acquire("A")
@@ -60,7 +61,7 @@ def scenario(checks_tokens):
     print(f"t={now} A passes its lease check, then a GC pause freezes it until t=18")
     now = 5
     print(f"t={now} B asks for the lease: {'denied, A holds it' if manager.acquire('B') is None else 'granted'}")
-    now = 10
+    now = LEASE_TTL
     b = manager.acquire("B")
     print(f"t={now} B gets lease: token {b['token']}, expires at t={b['expires_at']}")
     storage.write("B", b["token"], "B1")

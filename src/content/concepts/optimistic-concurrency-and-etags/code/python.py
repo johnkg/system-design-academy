@@ -25,10 +25,12 @@ class Store:
         return 200
 
 
-seed = 7
+SEED, AGENTS, RECORDS, EDITS_EACH = 7, 4, 2, 10
+seed = SEED
 
 
 def rand(n):
+    """Linear congruential generator (Numerical Recipes constants), high 16 bits."""
     global seed
     seed = (seed * 1664525 + 1013904223) % 4294967296
     return (seed // 65536) % n
@@ -37,7 +39,7 @@ def rand(n):
 # Each step, a random agent that still has work does one action: read a record, or write back its edit.
 def run(use_if_match, agents, records, edits_each):
     global seed
-    seed = 7
+    seed = SEED
     store = Store(records, False)
     a = [{"left": edits_each, "id": -1, "notes": 0, "etag": ""} for _ in range(agents)]
     saved = conflicts = 0
@@ -59,8 +61,8 @@ def run(use_if_match, agents, records, edits_each):
     return saved, final, saved - final, conflicts
 
 
-none = run(False, 4, 2, 10)
-occ = run(True, 4, 2, 10)
+none = run(False, AGENTS, RECORDS, EDITS_EACH)
+occ = run(True, AGENTS, RECORDS, EDITS_EACH)
 print(f"no check:   saved={none[0]} final={none[1]} lost={none[2]} conflicts={none[3]}")
 print(f"if-match:   saved={occ[0]} final={occ[1]} lost={occ[2]} conflicts={occ[3]}")
 
@@ -70,7 +72,7 @@ print(f"PUT without If-Match: {strict.put(0, 1, None)}")
 print(f"PUT with {first}: {strict.put(0, 1, first)}")
 print(f"PUT with stale {first}: {strict.put(0, 2, first)}")
 
-if occ[2] != 0 or occ[1] != 40:
+if occ[2] != 0 or occ[1] != AGENTS * EDITS_EACH:
     raise SystemExit("version check must not lose updates")
 if none[2] <= 0:
     raise SystemExit("the unchecked run should lose updates")

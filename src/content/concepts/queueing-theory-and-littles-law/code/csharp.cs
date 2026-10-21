@@ -20,13 +20,17 @@ public static class Program
 {
     const double ServiceMs = 50;
     const int N = 20000;
+    const int ArrivalSeed = 12345;
+    const int ServiceSeed = 67890;
+    const int MsPerSecond = 1000;
+    const double Tolerance = 1e-6; // relative floating-point slack for Little's law
 
     static string F2(double x) => x.ToString("F2", CultureInfo.InvariantCulture);
 
     static (double util, double wait, double L, double lambda, double W) Simulate(double rho)
     {
-        var arrivals = new Lcg(12345);
-        var services = new Lcg(67890);
+        var arrivals = new Lcg(ArrivalSeed);
+        var services = new Lcg(ServiceSeed);
         double meanGap = ServiceMs / rho; // utilisation = service time / gap between arrivals
         var arrive = new List<double>();
         var depart = new List<double>();
@@ -55,7 +59,7 @@ public static class Program
         }
         double sojourn = 0;
         for (int i = 0; i < N; i++) sojourn += depart[i] - arrive[i];
-        return (busy / last, wait / N, area / last, (N / last) * 1000, sojourn / N);
+        return (busy / last, wait / N, area / last, (N / last) * MsPerSecond, sojourn / N);
     }
 
     public static int Main()
@@ -66,15 +70,15 @@ public static class Program
         {
             var r = Simulate(rho);
             double theory = (rho / (1 - rho)) * ServiceMs; // M/M/1 mean wait
-            double gap = Math.Abs(r.L - (r.lambda / 1000) * r.W);
+            double gap = Math.Abs(r.L - (r.lambda / MsPerSecond) * r.W);
             Console.WriteLine($"{F2(rho)} {F2(r.util)} {F2(r.wait)} {F2(theory)} {F2(r.L)} {F2(r.lambda)} {F2(r.W)} {gap.ToString("F6", CultureInfo.InvariantCulture)}");
-            if (gap > 1e-6 * Math.Max(1, r.L)) { Console.Error.WriteLine("Little's law violated"); return 1; }
+            if (gap > Tolerance * Math.Max(1, r.L)) { Console.Error.WriteLine("Little's law violated"); return 1; }
             if (r.wait <= previous) { Console.Error.WriteLine("wait must grow with load"); return 1; }
             previous = r.wait;
         }
         // Sizing: concurrency = rate x latency, then add headroom so the pool is not a hockey stick.
         double rate = 1000, latencyMs = 50, headroom = 0.7;
-        double inFlight = rate * latencyMs / 1000;
+        double inFlight = rate * latencyMs / MsPerSecond;
         Console.WriteLine($"in flight: {F2(inFlight)}, pool at {F2(headroom)} target: {(int)Math.Ceiling(inFlight / headroom)}");
         return 0;
     }

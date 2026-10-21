@@ -9,7 +9,7 @@ public record Request(int Duration, int Arrived);
 
 public static class Rng
 {
-    static long seed = 7;
+    static long seed = Program.BurstSeed;
     public static void Seed(long s) { seed = s; }
     public static int Next(int n) { seed = (seed * 1664525 + 1013904223) % 4294967296; return (int)((seed / 65536) % n); }
 }
@@ -44,12 +44,22 @@ public class Pooler
 
 public static class Program
 {
+    internal const int BurstSeed = 7;
+    const int Requests = 300; // requests in the burst
+    const int BurstMs = 100; // they all arrive within this window
+    const int MinTxMs = 5; // each transaction takes 5..15 ms
+    const int TxSpreadMs = 11;
+    const int RunMs = 400; // simulated time, long enough to drain the queue
+    const int LeakSeed = 99;
+    const int LeakSteps = 300;
+    const int Clients = 12;
+    const int ServerConns = 3; // server connections in transaction mode
     // 300 requests arrive within 100 ms (a burst) and each transaction takes 5 to 15 ms.
     static List<int>[] MakeBurst()
     {
-        Rng.Seed(7);
-        var byTime = Enumerable.Range(0, 100).Select(_ => new List<int>()).ToArray();
-        for (int i = 0; i < 300; i++) { int t = Rng.Next(100); byTime[t].Add(5 + Rng.Next(11)); }
+        Rng.Seed(BurstSeed);
+        var byTime = Enumerable.Range(0, BurstMs).Select(_ => new List<int>()).ToArray();
+        for (int i = 0; i < Requests; i++) { int t = Rng.Next(BurstMs); byTime[t].Add(MinTxMs + Rng.Next(TxSpreadMs)); }
         return byTime;
     }
 
@@ -57,26 +67,26 @@ public static class Program
     {
         var burst = MakeBurst();
         var pooler = new Pooler(size);
-        for (int now = 0; now < 400; now++) pooler.Tick(now, now < 100 ? burst[now] : new List<int>());
+        for (int now = 0; now < RunMs; now++) pooler.Tick(now, now < BurstMs ? burst[now] : new List<int>());
         int maxWait = pooler.Waits.Max();
         int avgWait = pooler.Waits.Sum() / pooler.Waits.Count;
         Console.WriteLine($"pool {size,2}: served {pooler.Served}, timed out {pooler.TimedOut}, max busy {pooler.MaxBusy}, max wait {maxWait}, avg wait {avgWait}");
         if (pooler.MaxBusy > size) throw new Exception("the pool was exceeded");
-        if (pooler.Served + pooler.TimedOut != 300) throw new Exception("a request was lost");
+        if (pooler.Served + pooler.TimedOut != Requests) throw new Exception("a request was lost");
         return pooler.TimedOut;
     }
 
     // Session state under transaction pooling: a client sets a value on its server connection, and a later transaction may land on another one.
     static int Leaks(string mode)
     {
-        Rng.Seed(99);
+        Rng.Seed(LeakSeed);
         var own = new HashSet<int>();                // what each client believes it set
         var state = new Dictionary<string, int>();   // what each server connection holds, keyed by client in session mode and by connection otherwise
         int wrong = 0;
-        for (int step = 0; step < 300; step++)
+        for (int step = 0; step < LeakSteps; step++)
         {
-            int client = Rng.Next(12);
-            string conn = mode == "session" ? $"client{client}" : $"conn{Rng.Next(3)}";
+            int client = Rng.Next(Clients);
+            string conn = mode == "session" ? $"client{client}" : $"conn{Rng.Next(ServerConns)}";
             if (Rng.Next(2) == 0) { state[conn] = client; own.Add(client); }                             // SET timezone for this client
             else if (own.Contains(client) && !(state.TryGetValue(conn, out var v) && v == client)) wrong++; // SHOW timezone sees another client's value
         }

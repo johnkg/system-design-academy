@@ -21,6 +21,7 @@ public record Pizza(string Size, string Crust, IReadOnlyList<string> Toppings, b
 
 public class PizzaBuilder // Builder
 {
+    private const int MaxToppings = 4;
     private string _size = "medium";
     private string _crust = "thin";
     private readonly List<string> _toppings = new();
@@ -33,7 +34,7 @@ public class PizzaBuilder // Builder
 
     public Pizza Build()
     {
-        if (_toppings.Count > 4) throw new InvalidOperationException("Too many toppings (max 4)");
+        if (_toppings.Count > MaxToppings) throw new InvalidOperationException("Too many toppings (max 4)");
         return new Pizza(_size, _crust, _toppings.ToArray(), _extraSauce);
     }
 }

@@ -2,6 +2,7 @@
 // The clock is a plain variable so the pause scenario is deterministic.
 
 let now = 0; // seconds, moved by hand
+const LEASE_TTL = 10; // seconds a lease lasts
 
 class LeaseManager {
   #holder = null;
@@ -51,7 +52,7 @@ class Storage {
 
 function scenario(checksTokens) {
   now = 0;
-  const manager = new LeaseManager(10);
+  const manager = new LeaseManager(LEASE_TTL);
   const storage = new Storage(checksTokens, manager);
 
   const a = manager.acquire("A");
@@ -62,7 +63,7 @@ function scenario(checksTokens) {
   console.log(`t=${now} A passes its lease check, then a GC pause freezes it until t=18`);
   now = 5;
   console.log(`t=${now} B asks for the lease: ${manager.acquire("B") === null ? "denied, A holds it" : "granted"}`);
-  now = 10;
+  now = LEASE_TTL;
   const b = manager.acquire("B");
   console.log(`t=${now} B gets lease: token ${b.token}, expires at t=${b.expiresAt}`);
   storage.write("B", b.token, "B1");

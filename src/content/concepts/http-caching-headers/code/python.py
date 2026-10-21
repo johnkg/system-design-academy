@@ -14,12 +14,13 @@ class Origin:
     CC = {"/app.js": "max-age=60, stale-while-revalidate=30", "/index.html": "no-cache",
           "/me": "no-store", "/app.3f9a.js": "max-age=31536000, immutable"}
     CHANGES_AT = {"/app.js": 100, "/index.html": 110}   # a deploy: version 1 becomes version 2
+    NEVER = 10**9  # change time for URLs that are never redeployed
 
     def __init__(self):
         self.requests = 0
 
     def version(self, url, now):
-        return 2 if now >= self.CHANGES_AT.get(url, 10**9) else 1
+        return 2 if now >= self.CHANGES_AT.get(url, self.NEVER) else 1
 
     def handle(self, url, now, if_none_match):
         self.requests += 1

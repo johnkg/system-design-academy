@@ -3,9 +3,11 @@
 import sys
 
 N, CHUNK, WRITES = 1000, 50, 12  # rows, rows per backfill batch, live writes between steps
-seed = 12345
+SEED = 12345
+seed = SEED
 
 
+# 31-bit LCG (glibc constants)
 def rand(n):
     global seed
     seed = (seed * 1103515245 + 12345) & 0x7FFFFFFF
@@ -19,7 +21,7 @@ def split(name):
 
 def migrate(mode):
     global seed
-    seed = 12345
+    seed = SEED
     old = [f"f{i} l{i}" for i in range(N)]  # the live table: full_name
     new = [None] * N                         # the new columns (or the shadow table)
     state = {"dual": mode != "backfill-first", "version": 0}  # is the app writing both shapes yet?

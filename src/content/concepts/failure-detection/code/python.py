@@ -6,6 +6,12 @@ import sys
 CRASH_BEAT = 140   # the sender dies after beat 139 (t = 139 s)
 END_MS = 160000    # the monitor stops watching here
 TICK_MS = 100      # the monitor checks every 100 ms
+BEAT_MS = 1000     # one heartbeat per second
+PER_MILLE = 1000   # random draws are 0..999 per mille
+BASE_DELAY_MS, SPIKE_MIN_MS, SPIKE_EXTRA_MS = 20, 400, 2000
+PAUSE_FIRST_BEAT, PAUSE_END_BEAT = 60, 65  # GC pause: these beats are never sent
+LOSSY_FIRST_BEAT, LOSSY_END_BEAT, LOSS_PER_MILLE = 100, 104, 700
+TRACE_SEED, JITTER_MS, SPIKE_PER_MILLE = 1, 50, 50
 
 
 def lcg(seed):     # 32-bit linear congruential generator, same in every language
@@ -23,16 +29,16 @@ def make_trace(seed, jitter, spike_per_mille):
     nxt = lcg(seed * 7919 + 13)
     arrivals = []
     for k in range(CRASH_BEAT):
-        total = nxt() % 1000 + nxt() % 1000 + nxt() % 1000 + nxt() % 1000
-        spike, extra, loss = nxt() % 1000, nxt() % 2000, nxt() % 1000
-        if 60 <= k < 65:
+        total = nxt() % PER_MILLE + nxt() % PER_MILLE + nxt() % PER_MILLE + nxt() % PER_MILLE
+        spike, extra, loss = nxt() % PER_MILLE, nxt() % SPIKE_EXTRA_MS, nxt() % PER_MILLE
+        if PAUSE_FIRST_BEAT <= k < PAUSE_END_BEAT:
             continue
-        if 100 <= k < 104 and loss < 700:
+        if LOSSY_FIRST_BEAT <= k < LOSSY_END_BEAT and loss < LOSS_PER_MILLE:
             continue
-        delay = 20 + (jitter * total) // 1000
+        delay = BASE_DELAY_MS + (jitter * total) // PER_MILLE
         if spike < spike_per_mille:
-            delay += 400 + extra
-        arrivals.append(1000 * k + delay)
+            delay += SPIKE_MIN_MS + extra
+        arrivals.append(BEAT_MS * k + delay)
     return sorted(arrivals)
 
 
@@ -47,12 +53,17 @@ class FixedTimeout:
         return silence_ms > self.timeout_ms
 
 
+PRIOR_LOW_MS, PRIOR_HIGH_MS = 750, 1250  # seed guess: 1 s +- 250 ms
+LOGISTIC_A, LOGISTIC_B = 1.5976, 0.070566  # logistic fit to the normal tail
+MIN_P, MAX_PHI = 1e-16, 16.0  # cap phi where the probability underflows
+
+
 class PhiAccrual:  # Akka-style: logistic approximation of the normal tail
     def __init__(self, threshold, window_size=100, min_std_ms=100):
         self.threshold, self.window_size, self.min_std_ms = threshold, window_size, min_std_ms
-        self.window = [750, 1250]  # seed guess: 1 s +- 250 ms
-        self.total = 2000
-        self.sum_sq = 750 * 750 + 1250 * 1250
+        self.window = [PRIOR_LOW_MS, PRIOR_HIGH_MS]
+        self.total = PRIOR_LOW_MS + PRIOR_HIGH_MS
+        self.sum_sq = PRIOR_LOW_MS * PRIOR_LOW_MS + PRIOR_HIGH_MS * PRIOR_HIGH_MS
 
     def arrive(self, interval_ms):
         self.window.append(interval_ms)
@@ -68,9 +79,9 @@ class PhiAccrual:  # Akka-style: logistic approximation of the normal tail
         mean = self.total / n
         std = max(math.sqrt(max(0.0, self.sum_sq / n - mean * mean)), self.min_std_ms)
         y = (silence_ms - mean) / std
-        e = math.exp(-y * (1.5976 + 0.070566 * y * y))
+        e = math.exp(-y * (LOGISTIC_A + LOGISTIC_B * y * y))
         p = e / (1 + e) if silence_ms > mean else 1 - 1 / (1 + e)  # P(heartbeat arrives later than now)
-        return 16.0 if p < 1e-16 else -math.log10(p)
+        return MAX_PHI if p < MIN_P else -math.log10(p)
 
     def suspect(self, silence_ms):
         return self.phi(silence_ms) >= self.threshold
@@ -99,7 +110,7 @@ def fmt2(x):
     return f"{n // 100}.{n % 100:02d}"
 
 
-trace = make_trace(1, 50, 50)
+trace = make_trace(TRACE_SEED, JITTER_MS, SPIKE_PER_MILLE)
 print(f"trace: {len(trace)} heartbeats, last at {trace[-1]} ms")
 results = {}
 for name, det in [("fixed 2000 ms", FixedTimeout(2000)), ("fixed 5000 ms", FixedTimeout(5000)), ("fixed 10000 ms", FixedTimeout(10000)),

@@ -35,9 +35,12 @@ class HashRing:
         return self._points[lo % len(self._points)][1]
 
 
-keys = [f"key-{i}" for i in range(10000)]
-ring = HashRing(100)
-for n in ["A", "B", "C"]:
+KEY_COUNT = 10000
+VIRTUAL_NODES = 100  # ring points per physical node
+INITIAL_NODES = ["A", "B", "C"]
+keys = [f"key-{i}" for i in range(KEY_COUNT)]
+ring = HashRing(VIRTUAL_NODES)
+for n in INITIAL_NODES:
     ring.add_node(n)
 
 before = {k: ring.node_for(k) for k in keys}
@@ -48,5 +51,5 @@ print("keys per node:", json.dumps(load, separators=(",", ":")))
 
 ring.add_node("D")
 moved_ring = sum(1 for k in keys if before[k] != ring.node_for(k))
-moved_mod = sum(1 for k in keys if hash32(k) % 3 != hash32(k) % 4)
-print(f"adding a 4th node moves {moved_ring / 100:.1f}% of keys on the ring, {moved_mod / 100:.1f}% with hash mod N")
+moved_mod = sum(1 for k in keys if hash32(k) % len(INITIAL_NODES) != hash32(k) % (len(INITIAL_NODES) + 1))
+print(f"adding a 4th node moves {100 * moved_ring / KEY_COUNT:.1f}% of keys on the ring, {100 * moved_mod / KEY_COUNT:.1f}% with hash mod N")

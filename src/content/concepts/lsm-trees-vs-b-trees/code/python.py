@@ -1,5 +1,15 @@
 # A tiny LSM tree in Python: memtable, immutable sorted runs, bloom filters, tombstones and merge compaction.
 # All numbers are integers so the output is identical in every language.
+BITS_PER_KEY = 10  # bloom filter size per key
+HASHES = 4  # hash functions per key (seeds 1..4)
+MEM_LIMIT = 4  # entries the memtable holds before it flushes
+MAX_RUNS = 3  # sorted runs before compaction
+OPS = 40  # demo: random puts and deletes
+KEY_SPACE = 16  # keys user:00..user:15
+DELETE_ONE_IN = 5  # one op in 5 is a delete
+REPORT_EVERY = 10
+ABSENT_FROM = 20  # keys from here on were never written
+ABSENT_KEYS = 16
 
 
 def fnv(key, seed):  # deterministic 32-bit FNV-1a hash, seeded
@@ -11,10 +21,10 @@ def fnv(key, seed):  # deterministic 32-bit FNV-1a hash, seeded
 
 class Bloom:
     def __init__(self, entries):
-        self.bits = [False] * (entries * 10)  # 10 bits per key, 4 hashes
+        self.bits = [False] * (entries * BITS_PER_KEY)  # 10 bits per key, 4 hashes
 
     def slots(self, key):
-        return [fnv(key, seed) % len(self.bits) for seed in (1, 2, 3, 4)]
+        return [fnv(key, seed) % len(self.bits) for seed in range(1, HASHES + 1)]
 
     def add(self, key):
         for s in self.slots(key):
@@ -112,23 +122,23 @@ def user_key(n):
     return f"user:{n:02d}"
 
 
-db = Lsm(4, 3)
+db = Lsm(MEM_LIMIT, MAX_RUNS)
 truth = {}  # a plain dict that must always agree with the LSM
-for op in range(1, 41):
-    key = user_key(rnd(16))
-    if rnd(5) == 0:
+for op in range(1, OPS + 1):
+    key = user_key(rnd(KEY_SPACE))
+    if rnd(DELETE_ONE_IN) == 0:
         db.delete(key)
         truth.pop(key, None)
     else:
         db.put(key, f"v{op}")
         truth[key] = f"v{op}"
-    for n in range(16):
+    for n in range(KEY_SPACE):
         if db.get(user_key(n)) != truth.get(user_key(n)):
             raise SystemExit(f"stale read of {user_key(n)} after op {op}")
-    if op % 10 == 0:
+    if op % REPORT_EVERY == 0:
         print(f"op {op}: runs=[{','.join(str(len(r.entries)) for r in db.runs)}] memtable={len(db.mem)}")
 db.bloom_skips = db.run_reads = 0
-for n in range(20, 36):
+for n in range(ABSENT_FROM, ABSENT_FROM + ABSENT_KEYS):
     if db.get(user_key(n)) is not None:
         raise SystemExit("ghost key")  # 16 absent keys
 print(f"16 lookups of absent keys: {db.run_reads} run reads, {db.bloom_skips} skipped by bloom filters")

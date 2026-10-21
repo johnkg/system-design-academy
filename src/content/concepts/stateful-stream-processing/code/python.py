@@ -2,19 +2,23 @@
 import sys
 
 N, KEYS, OPS, CRASH, COMMIT_EVERY = 600, 12, 3, 330, 120
+SEED, SKEW_STEPS = 12345, 1000  # r in 0..999 is squared, so low keys are hot
+KEY_GROUPS = 12
+SHORT_INTERVAL, LONG_INTERVAL = 50, 200  # checkpoint intervals, in events
 
 # Seeded orders stream: event i is "customer k placed an order"; low ids are the busy customers.
 EVENTS = []
-x = 12345
+x = SEED
 for i in range(N):
+    # Park-Miller "minimal standard" LCG (MINSTD).
     x = (x * 48271) % 2147483647
-    r = x % 1000
-    EVENTS.append((r * r * KEYS) // 1000000)
+    r = x % SKEW_STEPS
+    EVENTS.append((r * r * KEYS) // (SKEW_STEPS * SKEW_STEPS))
 
 
 # key -> key group -> operator instance: each key lives on exactly one instance.
 def op_of(k):
-    return (((k * 7 + 2) % 12) * OPS) // 12
+    return (((k * 7 + 2) % KEY_GROUPS) * OPS) // KEY_GROUPS
 
 
 class Sink:
@@ -91,16 +95,16 @@ def must(c, m):
         sys.exit(1)
 
 
-for i in (0, 50, 200):
+for i in (0, SHORT_INTERVAL, LONG_INTERVAL):
     must(run(i, "plain", False)["wrong"] == 0, "state exact with checkpoints")
-idem = run(50, "idempotent", False)
-tx = run(50, "transactional", False)
-run(200, "transactional", False)
-plain = run(50, "plain", False)
+idem = run(SHORT_INTERVAL, "idempotent", False)
+tx = run(SHORT_INTERVAL, "transactional", False)
+run(LONG_INTERVAL, "transactional", False)
+plain = run(SHORT_INTERVAL, "plain", False)
 must(plain["dup"] == 30 and plain["replayed"] == 30, "plain sink repeats the replayed outputs")
 must(idem["dup"] == 0 and idem["extra"] == 30 and idem["wrong"] == 0, "upsert absorbs the replay")
 must(tx["dup"] == 0 and tx["missing"] == 0 and tx["extra"] == 30, "2PC sink: no duplicates, open transaction aborted")
-behind, ahead = run(50, "plain", True), run(200, "plain", True)
+behind, ahead = run(SHORT_INTERVAL, "plain", True), run(LONG_INTERVAL, "plain", True)
 must(behind["double"] == 60 and behind["wrong"] > 0, "offset committed separately, behind the state: double counting")
 must(ahead["lost"] == 40 and ahead["wrong"] > 0, "offset committed separately, ahead of the state: lost events")
 print("ok")

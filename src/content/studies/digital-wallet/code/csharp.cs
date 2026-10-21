@@ -75,18 +75,21 @@ public class Wallet
 
 public static class Program
 {
-    static long seed = 7;
+    const int Seed = 7, Transfers = 24, MinAmount = 20, AmountRange = 80;
+    const int CrashEvery = 5, RetryEvery = 4; // every 5th transfer crashes mid-way, every 4th is sent again
+    static long seed = Seed;
+    // Linear congruential generator (Numerical Recipes constants), high 16 bits.
     static int Random(int n) { seed = (seed * 1664525 + 1013904223) % 4294967296; return (int)(seed / 65536 % n); }
 
     public static int Main()
     {
         int all = Wallet.Accounts * Wallet.Start;
         var transfers = new List<Transfer>();
-        for (int id = 0; id < 24; id++)
+        for (int id = 0; id < Transfers; id++)
         {
             int from = Random(Wallet.Accounts);
             int to = (from + 1 + Random(Wallet.Accounts - 1)) % Wallet.Accounts;
-            transfers.Add(new Transfer(id, from, to, 20 + Random(80), id % 5 == 2, id % 4 == 1));
+            transfers.Add(new Transfer(id, from, to, MinAmount + Random(AmountRange), id % CrashEvery == 2, id % RetryEvery == 1));
         }
 
         var bad = Wallet.Naive(transfers);

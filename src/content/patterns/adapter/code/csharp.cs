@@ -33,9 +33,11 @@ public class LegacyBankApi // Adaptee: third-party, cannot be changed
 
 public class LegacyBankAdapter(LegacyBankApi bank) : IPaymentGateway // Adapter
 {
+    const int CentsPerDollar = 100;
+
     public string Pay(decimal dollars)
     {
-        int cents = (int)Math.Round(dollars * 100);   // translate units
+        int cents = (int)Math.Round(dollars * CentsPerDollar); // translate units
         var result = bank.MakePayment(cents, "USD");  // translate the call
         return result.Ok                              // translate the result
             ? $"Paid ${dollars:F2} (ref {result.Ref})"

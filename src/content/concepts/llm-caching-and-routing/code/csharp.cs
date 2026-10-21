@@ -9,28 +9,34 @@ int[] WEIGHT = { 30, 20, 20, 10, 12, 8 }; // how often each question topic is as
 bool[] TENANT_SPECIFIC = { false, false, false, false, true, true }; // answer depends on who asks
 long[] SMALL = { 150, 600 }, LARGE = { 3000, 15000 }; // nano-dollars per input / output token
 const int IN_TOK = 800, OUT_TOK = 150;
+const int SEED = 7, QUERIES = 240, TENANTS = 2, WORDINGS = 3; // 3 fixed wordings per topic
+const int FRESH_PERCENT = 40, HARD_PERCENT = 30, SMALL_SOLVES_HARD_PERCENT = 25;
+// Confidence: a hard question is usually low (0..59), otherwise 70..99.
+const int LOW_CONF_PERCENT = 75, LOW_CONF_RANGE = 60, HIGH_CONF_MIN = 70, HIGH_CONF_RANGE = 30;
+const int PERMILLE = 1000, NANO_PER_MICRO = 1000;
 int[][] WOBBLE = { new[] { 0, 0, 0, 0 }, new[] { -1, 0, 1, 0 }, new[] { 0, 1, 0, -1 } };
 
 long CallCost(bool large) { var p = large ? LARGE : SMALL; return IN_TOK * p[0] + OUT_TOK * p[1]; }
 long Dot(int[] a, int[] b) { long t = 0; for (int d = 0; d < a.Length; d++) t += (long)a[d] * b[d]; return t; }
-bool SimOk(int[] a, int[] b, long thr) { long d = Dot(a, b); return d > 0 && d * d * 1000000 >= thr * thr * Dot(a, a) * Dot(b, b); }
-long Permille(int[] a, int[] b) => (long)Math.Floor(1000.0 * Dot(a, b) / Math.Sqrt((double)(Dot(a, a) * Dot(b, b))));
+bool SimOk(int[] a, int[] b, long thr) { long d = Dot(a, b); return d > 0 && d * d * PERMILLE * PERMILLE >= thr * thr * Dot(a, a) * Dot(b, b); }
+long Permille(int[] a, int[] b) => (long)Math.Floor((double)PERMILLE * Dot(a, b) / Math.Sqrt((double)(Dot(a, a) * Dot(b, b))));
 
 List<Q> MakeWorkload(int n)
 {
-    uint s = 7;
+    uint s = SEED;
+    // Linear congruential generator (Numerical Recipes constants).
     int Rnd(int m) { s = unchecked(s * 1664525u + 1013904223u); return (int)((s >> 16) % (uint)m); }
     var work = new List<Q>();
     for (int i = 0; i < n; i++)
     {
-        int tenant = Rnd(2), r = Rnd(100), intent = 0, acc = 0;
-        for (int k = 0; k < 6; k++) { acc += WEIGHT[k]; if (r < acc) { intent = k; break; } }
-        int wording = Rnd(3); // 3 fixed wordings per topic
-        bool fresh = Rnd(100) < 40; // 40% of questions use brand-new wording
+        int tenant = Rnd(TENANTS), r = Rnd(100), intent = 0, acc = 0;
+        for (int k = 0; k < WEIGHT.Length; k++) { acc += WEIGHT[k]; if (r < acc) { intent = k; break; } }
+        int wording = Rnd(WORDINGS);
+        bool fresh = Rnd(100) < FRESH_PERCENT; // 40% of questions use brand-new wording
         int[] noise = { Rnd(3) - 1, Rnd(3) - 1, Rnd(3) - 1, Rnd(3) - 1 };
-        bool hard = Rnd(100) < 30;
-        bool smallOk = hard ? Rnd(100) < 25 : true;
-        int conf = hard ? (Rnd(100) < 75 ? Rnd(60) : 70 + Rnd(30)) : 70 + Rnd(30);
+        bool hard = Rnd(100) < HARD_PERCENT;
+        bool smallOk = hard ? Rnd(100) < SMALL_SOLVES_HARD_PERCENT : true;
+        int conf = hard ? (Rnd(100) < LOW_CONF_PERCENT ? Rnd(LOW_CONF_RANGE) : HIGH_CONF_MIN + Rnd(HIGH_CONF_RANGE)) : HIGH_CONF_MIN + Rnd(HIGH_CONF_RANGE);
         var vec = VEC[intent].Select((v, d) => v + (fresh ? noise[d] : WOBBLE[wording][d])).ToArray();
         work.Add(new Q(tenant, intent, fresh ? "u" + i : intent + ":" + wording, vec, smallOk, conf));
     }
@@ -71,7 +77,7 @@ List<Q> MakeWorkload(int n)
     return (cost, hits, wrong);
 }
 
-var work = MakeWorkload(240);
+var work = MakeWorkload(QUERIES);
 long baseCost = work.Count * CallCost(true);
 Console.WriteLine($"one large call = {CallCost(true)} nano-dollars, one small call = {CallCost(false)}");
 var configs = new (string, Func<(long cost, int hits, int wrong)>)[]
@@ -92,7 +98,7 @@ foreach (var (label, fn) in configs)
     var r = fn();
     R[label] = r;
     long saved = 100 * (baseCost - r.cost) / baseCost;
-    Console.WriteLine($"{label.PadRight(24)} cost={r.cost / 1000}u$ saved={saved}% hits={r.hits} wrong={r.wrong}");
+    Console.WriteLine($"{label.PadRight(24)} cost={r.cost / NANO_PER_MICRO}u$ saved={saved}% hits={r.hits} wrong={r.wrong}");
 }
 if (R["no cache, large model"].wrong != 0) return 1;
 if (!(R["semantic 0.90"].wrong > R["semantic 0.99"].wrong)) return 1;

@@ -26,13 +26,15 @@ public class Agent { public int Left; public int Id = -1; public int Notes; publ
 
 public static class Program
 {
-    static long seed = 7;
+    const int Seed = 7, Agents = 4, Records = 2, EditsEach = 10;
+    static long seed = Seed;
+    // Linear congruential generator (Numerical Recipes constants), high 16 bits.
     static int Rand(int n) { seed = (seed * 1664525 + 1013904223) % 4294967296; return (int)((seed / 65536) % n); }
 
     // Each step, a random agent that still has work does one action: read a record, or write back its edit.
     static (int saved, int final, int lost, int conflicts) Run(bool useIfMatch, int agents, int records, int editsEach)
     {
-        seed = 7;
+        seed = Seed;
         var store = new Store(records, false);
         var a = Enumerable.Range(0, agents).Select(_ => new Agent { Left = editsEach }).ToList();
         int saved = 0, conflicts = 0;
@@ -58,8 +60,8 @@ public static class Program
 
     public static void Main()
     {
-        var none = Run(false, 4, 2, 10);
-        var occ = Run(true, 4, 2, 10);
+        var none = Run(false, Agents, Records, EditsEach);
+        var occ = Run(true, Agents, Records, EditsEach);
         Console.WriteLine($"no check:   saved={none.saved} final={none.final} lost={none.lost} conflicts={none.conflicts}");
         Console.WriteLine($"if-match:   saved={occ.saved} final={occ.final} lost={occ.lost} conflicts={occ.conflicts}");
 
@@ -69,7 +71,7 @@ public static class Program
         Console.WriteLine($"PUT with {first}: {strict.Put(0, 1, first)}");
         Console.WriteLine($"PUT with stale {first}: {strict.Put(0, 2, first)}");
 
-        if (occ.lost != 0 || occ.final != 40) throw new Exception("version check must not lose updates");
+        if (occ.lost != 0 || occ.final != Agents * EditsEach) throw new Exception("version check must not lose updates");
         if (none.lost <= 0) throw new Exception("the unchecked run should lose updates");
     }
 }

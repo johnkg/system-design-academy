@@ -2,6 +2,8 @@
 import crypto from "node:crypto";
 
 const N_KEYS = 4096, LEAVES = 64, PER_LEAF = N_KEYS / LEAVES; // 64 keys per leaf range
+const SEED = 42, STALE_WRITES = 4; // replica b missed this many writes
+const COMPARISON_DIVISOR = 20; // the sync must compare fewer than N_KEYS / 20 hashes
 const sha = (buf) => crypto.createHash("sha256").update(buf).digest();
 
 function buildTree(store) {
@@ -35,9 +37,9 @@ const a = new Map();
 for (let k = 0; k < N_KEYS; k++) a.set(k, `v${(k * 7) % 1000}`);
 const b = new Map(a);
 
-let seed = 42; // MINSTD generator
+let seed = SEED; // MINSTD generator
 const rand = (n) => { seed = (seed * 48271) % 2147483647; return seed % n; };
-for (let i = 0; i < 4; i++) b.set(rand(N_KEYS), "stale"); // missed writes
+for (let i = 0; i < STALE_WRITES; i++) b.set(rand(N_KEYS), "stale"); // missed writes
 b.delete(rand(N_KEYS)); // lost write
 
 const ta = buildTree(a), tb = buildTree(b);
@@ -59,5 +61,5 @@ const tb2 = buildTree(b);
 console.log(`roots equal after: ${ta[0][0].equals(tb2[0][0])}, root ${ta[0][0].toString("hex").slice(0, 8)}`);
 
 if (!ta[0][0].equals(tb2[0][0])) process.exit(1);
-if (stats.comparisons * 20 >= N_KEYS) process.exit(1);
+if (stats.comparisons * COMPARISON_DIVISOR >= N_KEYS) process.exit(1);
 if (sent > ranges.length * PER_LEAF) process.exit(1);

@@ -2,6 +2,8 @@
 import math
 from dataclasses import dataclass
 
+CENTS_PER_DOLLAR = 100
+
 
 class CardGateway:  # Target implementation: already speaks pay(dollars)
     def pay(self, dollars):
@@ -24,7 +26,7 @@ class LegacyBankAdapter:  # Adapter
         self._bank = bank
 
     def pay(self, dollars):
-        cents = math.floor(dollars * 100 + 0.5)             # translate units
+        cents = math.floor(dollars * CENTS_PER_DOLLAR + 0.5)  # translate units
         result = self._bank.make_payment(cents, "USD")      # translate the call
         if result.ok:                                       # translate the result
             return f"Paid ${dollars:.2f} (ref {result.ref})"

@@ -4,13 +4,17 @@ import math
 import random as random_module
 
 
+MAX_ATTEMPTS = 5
+FLAKY_FAILURES, DOWN_ATTEMPTS = 2, 3  # demo: failures before success, attempts for the dead service
+
+
 class ServiceError(Exception):
     def __init__(self, message, retryable):
         super().__init__(message)
         self.retryable = retryable
 
 
-async def retry(operation, *, max_attempts=5, base_ms=100, cap_ms=2000, random=random_module.random, sleep):
+async def retry(operation, *, max_attempts=MAX_ATTEMPTS, base_ms=100, cap_ms=2000, random=random_module.random, sleep):
     attempt = 1
     while True:
         try:
@@ -35,7 +39,7 @@ def fixed_random():
 
 # A service that fails twice with a temporary error, then works
 async def flaky(attempt):
-    if attempt <= 2:
+    if attempt <= FLAKY_FAILURES:
         raise ServiceError("503 unavailable", retryable=True)
     return f"ok on attempt {attempt}"
 
@@ -59,7 +63,7 @@ async def main():
         print(f"gave up immediately: {e}")
 
     try:
-        await retry(down, max_attempts=3, random=fixed_random, sleep=sleep)
+        await retry(down, max_attempts=DOWN_ATTEMPTS, random=fixed_random, sleep=sleep)
     except ServiceError as e:
         print(f"gave up after 3 attempts: {e}")
 

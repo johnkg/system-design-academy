@@ -4,7 +4,9 @@
 
 const N = 10, REQUESTS = 100, CAPACITY = 15, TICKS = 20, START = 5; // 10 instances, 100 requests per tick
 const STEADY = 50, GUARD = 100, DETECT = 2;                           // error rates in requests per thousand
+const PER_MILLE = 1000;
 
+// 32-bit LCG (Numerical Recipes constants)
 let seed = 7;
 const random = (n) => { seed = (seed * 1664525 + 1013904223) % 4294967296; return Math.floor(seed / 65536) % n; };
 
@@ -33,7 +35,7 @@ function run(exp) {
       if (!ok) ok = attempt(rotation[cursor++ % rotation.length]); // the client retries once
       if (!ok) errors++;
     }
-    const pm = Math.floor(errors * 1000 / REQUESTS);
+    const pm = Math.floor(errors * PER_MILLE / REQUESTS);
     if (t >= START) {
       maxPm = Math.max(maxPm, pm);
       if (pm > STEADY) violated = true;

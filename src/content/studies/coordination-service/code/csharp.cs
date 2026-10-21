@@ -4,7 +4,11 @@ using System;
 using System.Collections.Generic;
 using System.Linq;
 
-var c = new Cluster(5);
+const int Replicas = 5;
+const int SessionTimeout = 5; // a session silent this long expires
+const int LastBeat = 9; // b and c heartbeat at t=9; a went silent long before
+const int Now = 10;
+var c = new Cluster(Replicas);
 c.Create("/app", ""); c.Create("/app/config", "v1");
 c.Set("/app/config", "v2", 0);
 bool stale = Refused(() => c.Set("/app/config", "v3", 0)) == "bad version";
@@ -29,8 +33,8 @@ foreach (var s in new[] { "a", "b", "c" }) { c.Sessions[s] = 0; holders.Add(c.Cr
 string First() => c.State[c.State.Keys.Where(p => p.StartsWith("/lock/")).Min()!].Owner;
 Console.WriteLine($"lock holder {First()}, fencing token {holders[0].Zxid}");
 c.Watches[holders[0].Path] = new List<string> { "b" };
-c.Sessions["b"] = c.Sessions["c"] = 9;
-c.Expire(10, 5);
+c.Sessions["b"] = c.Sessions["c"] = LastBeat;
+c.Expire(Now, SessionTimeout);
 Console.WriteLine($"session a expired, {string.Join("; ", c.Events)}; lock holder now {First()}, token {holders[1].Zxid}");
 if (!stale || !blocked || First() != "b" || holders[1].Zxid <= holders[0].Zxid) Environment.Exit(1);
 

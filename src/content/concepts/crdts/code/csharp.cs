@@ -6,6 +6,9 @@ using System.Linq;
 
 abstract class Crdt
 {
+    public const string Ids = "ABC";
+    public const int InitialCount = 10; // sum of InitialSplit
+    public static readonly int[] InitialSplit = [4, 3, 3]; // the starting stock, already spread over replicas A, B, C
     public virtual void Inc(int r, int ts) { }
     public virtual void Dec(int r, int ts) { }
     public virtual void Add(int r, string el) { }
@@ -17,7 +20,7 @@ abstract class Crdt
     protected static int[] Max(int[] a, int[] b) => a.Select((x, i) => Math.Max(x, b[i])).ToArray();
 }
 
-class LWWCounter(int v = 10, int ts = 0, int by = 0) : Crdt // naive: one number and a timestamp, newest write wins
+class LWWCounter(int v = Crdt.InitialCount, int ts = 0, int by = 0) : Crdt // naive: one number and a timestamp, newest write wins
 {
     int v = v, ts = ts, by = by;
     public override void Inc(int r, int t) { v += 1; ts = t; by = r; }
@@ -35,7 +38,7 @@ class LWWCounter(int v = 10, int ts = 0, int by = 0) : Crdt // naive: one number
 
 class GCounter(int[]? init = null) : Crdt // one slot per replica, merge = element-wise max
 {
-    readonly int[] p = (int[])(init ?? [4, 3, 3]).Clone();
+    readonly int[] p = (int[])(init ?? InitialSplit).Clone();
     public override void Inc(int r, int ts) { p[r] += 1; }
     public override Crdt Merge(Crdt o) => new GCounter(Max(p, ((GCounter)o).p));
     public override string Value() => p.Sum().ToString();
@@ -45,7 +48,7 @@ class GCounter(int[]? init = null) : Crdt // one slot per replica, merge = eleme
 
 class PNCounter(int[]? ip = null, int[]? inn = null) : Crdt // two G-Counters: increments and decrements
 {
-    readonly int[] p = (int[])(ip ?? [4, 3, 3]).Clone(), n = (int[])(inn ?? [0, 0, 0]).Clone();
+    readonly int[] p = (int[])(ip ?? InitialSplit).Clone(), n = (int[])(inn ?? [0, 0, 0]).Clone();
     public override void Inc(int r, int ts) { p[r] += 1; }
     public override void Dec(int r, int ts) { n[r] += 1; }
     public override Crdt Merge(Crdt o) { var x = (PNCounter)o; return new PNCounter(Max(p, x.p), Max(n, x.n)); }
@@ -60,7 +63,7 @@ class ORSet(Dictionary<string, string>? adds = null, IEnumerable<string>? rem = 
     readonly Dictionary<string, string> adds = new(adds ?? new() { ["A0"] = "urgent" });
     readonly HashSet<string> rem = new(rem ?? []);
     int seq = seq;
-    public override void Add(int r, string el) { adds["ABC"[r] + seq.ToString()] = el; seq += 1; }
+    public override void Add(int r, string el) { adds[Ids[r] + seq.ToString()] = el; seq += 1; }
     public override void Remove(int r, string el) { foreach (var (t, e) in adds) if (e == el) rem.Add(t); }
     public override Crdt Merge(Crdt o)
     {
@@ -76,16 +79,17 @@ class ORSet(Dictionary<string, string>? adds = null, IEnumerable<string>? rem = 
 
 static class Program
 {
+    const int TsStep = 100; // ms between scripted operations (the LWW timestamp)
     static (Crdt[], int?) Counters(Func<Crdt> make, bool withDec)
     {
         var reps = new[] { make(), make(), make() };
         (int r, int d)[] script = [(0, 1), (1, 1), (2, 1), (0, 1), (1, 1), (2, 1), (0, 1), (1, 1), (1, 1), (1, 1), (2, 1), (2, -1)];
-        int net = 10;
+        int net = Crdt.InitialCount;
         for (int i = 0; i < script.Length; i++)
         {
             var (r, d) = script[i];
-            if (d > 0) { reps[r].Inc(r, (i + 1) * 100); net += 1; }
-            else if (withDec) { reps[r].Dec(r, (i + 1) * 100); net -= 1; }
+            if (d > 0) { reps[r].Inc(r, (i + 1) * TsStep); net += 1; }
+            else if (withDec) { reps[r].Dec(r, (i + 1) * TsStep); net -= 1; }
         }
         return (reps, net);
     }
@@ -116,7 +120,7 @@ static class Program
             for (int round = 0; round < 2; round++) // every pull is delivered twice
                 foreach (var i in perm) foreach (var j in perm) if (i != j) reps[i] = reps[i].Merge(reps[j]);
             var before = string.Join("#", reps.Select(r => r.Key()));
-            for (int i = 0; i < 3; i++) foreach (var s in snaps) reps[i] = reps[i].Merge(s);
+            for (int i = 0; i < Crdt.Ids.Length; i++) foreach (var s in snaps) reps[i] = reps[i].Merge(s);
             Check(before == string.Join("#", reps.Select(r => r.Key())), "stale replay changed a state");
             Check(reps.Select(r => r.Key()).Distinct().Count() == 1, "replicas diverged");
             keys.Add(reps[0].Key()); values.Add(reps[0].Value()); sizes.Add(reps[0].Size());

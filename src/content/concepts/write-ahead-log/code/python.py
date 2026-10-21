@@ -83,8 +83,11 @@ def recover(disk, log):
     return len(scanned), redone, skipped, losers, undone
 
 
+START_BALANCES = [100, 100, 100, 100]  # four pages of $100
+
+
 def scenario(obey_wal):
-    db = Db([100, 100, 100, 100])
+    db = Db(list(START_BALANCES))
     db.update(1, 0, -30); db.update(1, 1, 30); db.commit(1)       # T1: page 0 -> page 1, $30
     db.checkpoint()
     db.update(2, 2, -20); db.update(2, 3, 20); db.commit(2)       # T2 commits, its pages stay in the pool
@@ -92,9 +95,9 @@ def scenario(obey_wal):
     db.update(4, 1, -50)                                          # T4 debits page 1 ...
     db.evict(1, obey_wal)                                         # ... the pool steals that dirty page ...
     disk, log = db.crash()                                        # ... and the power fails before T4 commits
-    on_disk = ",".join(str(disk[p][0]) for p in range(4))
+    on_disk = ",".join(str(disk[p][0]) for p in range(len(START_BALANCES)))
     scanned, redone, skipped, losers, undone = recover(disk, log)
-    final = [disk[p][0] for p in range(4)]
+    final = [disk[p][0] for p in range(len(START_BALANCES))]
     print(f"obey write-ahead rule: {'true' if obey_wal else 'false'}")
     print(f"  durable log {len(log)} records, fsyncs {db.fsyncs}, pages on disk at crash [{on_disk}]")
     print(f"  analysis scanned {scanned}, losers {losers}; redo applied {redone} skipped {skipped}; undo {undone}")

@@ -6,9 +6,10 @@ using System.Collections.Generic;
 public static class Program
 {
     static int now; // seconds
+    const int Ttl = 300; // seconds a record may be cached
 
     // What the authoritative server knows
-    static readonly Dictionary<string, (string Ip, int Ttl)> Authoritative = new() { ["shop.example.com"] = ("203.0.113.7", 300) };
+    static readonly Dictionary<string, (string Ip, int Ttl)> Authoritative = new() { ["shop.example.com"] = ("203.0.113.7", Ttl) };
 
     static readonly Dictionary<string, (string Ip, int ExpiresAt)> Cache = new();
 
@@ -34,14 +35,14 @@ public static class Program
         Lookup();      // cold: three round trips
         now = 10;
         Lookup();      // within the TTL: cache
-        now = 299;
+        now = Ttl - 1;
         Lookup();      // still within the TTL
 
         // The operator moves the site to a new server, but caches keep the old answer until the TTL ends
-        Authoritative["shop.example.com"] = ("198.51.100.9", 300);
-        now = 299;
+        Authoritative["shop.example.com"] = ("198.51.100.9", Ttl);
+        now = Ttl - 1;
         Lookup();      // still the OLD address
-        now = 301;
+        now = Ttl + 1;
         Lookup();      // TTL over: the new address
     }
 }

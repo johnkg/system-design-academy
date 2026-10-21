@@ -8,14 +8,19 @@ class Planner
 {
     const long SEQ = 1000, TUPLE = 10, CMP = 3, HASH = 5, SETUP = 1000; // cost units: one sequential page read = 1000
     const long CUST_PER_PAGE = 40, ORD_PER_PAGE = 100;
+    const long SEED = 7, NL_ONE_IN = 10; // one customer in 10 lives in NL
+    const long ROW_KEY = 1000; // a result row packs both ids: order_id * 1000 + customer_id
+    const long STALE_SHRINK = 20; // stale statistics were taken when the tables were 20x smaller
+    const long LARGE_CUST = 1000, LARGE_ORD = 20000;
+    const long WRONG_PLAN_FACTOR = 5; // the stale plan must cost at least this many times the best one
     static readonly string[] Methods = { "nested loop", "hash join", "merge join" };
 
     static (List<(long id, string country)>, List<(long id, long cid)>) MakeTables(long nCust, long nOrd, bool presorted)
     {
-        long state = 7;
+        long state = SEED;
         long Rnd(long n) { state = (state * 1664525 + 1013904223) % 4294967296; return (state / 256) % n; } // tiny LCG: same rows in every language
         var customers = new List<(long, string)>();
-        for (long i = 1; i <= nCust; i++) customers.Add((i, Rnd(10) == 0 ? "NL" : "US"));
+        for (long i = 1; i <= nCust; i++) customers.Add((i, Rnd(NL_ONE_IN) == 0 ? "NL" : "US"));
         var orders = new List<(long, long)>();
         for (long i = 1; i <= nOrd; i++) { long a = Rnd(nCust), b = Rnd(nCust); orders.Add((i, 1 + Math.Min(a, b))); } // skewed: low ids order more
         if (presorted) orders = orders.OrderBy(o => o.Item2).ThenBy(o => o.Item1).ToList(); // like a table clustered on customer_id
@@ -59,14 +64,14 @@ class Planner
         var o = new List<long>();
         if (method == "nested loop")
         {
-            foreach (var cid in outer) foreach (var (oid, ocid) in orders) { cmp++; if (ocid == cid) o.Add(oid * 1000 + cid); }
+            foreach (var cid in outer) foreach (var (oid, ocid) in orders) { cmp++; if (ocid == cid) o.Add(oid * ROW_KEY + cid); }
         }
         else if (method == "hash join")
         {
             setup = SETUP;
             var table = new HashSet<long>();
             foreach (var cid in outer) { hash++; table.Add(cid); }
-            foreach (var (oid, ocid) in orders) { hash++; if (table.Contains(ocid)) { cmp++; o.Add(oid * 1000 + ocid); } }
+            foreach (var (oid, ocid) in orders) { hash++; if (table.Contains(ocid)) { cmp++; o.Add(oid * ROW_KEY + ocid); } }
         }
         else
         {
@@ -80,7 +85,7 @@ class Planner
                 cmp++;
                 if (outer[i] < ordered[j].cid) i++;
                 else if (outer[i] > ordered[j].cid) j++;
-                else { o.Add(ordered[j].oid * 1000 + outer[i]); j++; }
+                else { o.Add(ordered[j].oid * ROW_KEY + outer[i]); j++; }
             }
         }
         o.Sort();
@@ -97,7 +102,7 @@ class Planner
         long ndv = orders.Select(x => x.cid).Distinct().Count();
         long kReal = customers.Count(c => c.country == "NL");
         // fresh statistics are exact; stale ones are from when the tables were 20x smaller and NL was rare (0.2%)
-        long[] st = stale ? new[] { Math.Max(1, nCust / 20), Math.Max(1, nOrd / 20), Math.Max(1, ndv / 20), 1L } : new[] { nCust, nOrd, ndv, kReal };
+        long[] st = stale ? new[] { Math.Max(1, nCust / STALE_SHRINK), Math.Max(1, nOrd / STALE_SHRINK), Math.Max(1, ndv / STALE_SHRINK), 1L } : new[] { nCust, nOrd, ndv, kReal };
         var est = new Dictionary<string, long>(); var runs = new Dictionary<string, (List<long> rows, long cost, long cmp)>();
         foreach (var m in Methods) { est[m] = Estimate(m, st, pC, pO, presorted); var r = Run(m, customers, orders, "NL", presorted); runs[m] = (r.Item1, r.Item2, r.Item3); }
         string pick = Cheapest(m => est[m]);
@@ -116,11 +121,11 @@ class Planner
     {
         var (pick, best, _, _) = PlanAndRun("tiny", 16, 60, false);
         Expect(pick == "nested loop" && best == "nested loop", "tiny: nested loop should win");
-        (pick, best, _, _) = PlanAndRun("large", 1000, 20000, false);
+        (pick, best, _, _) = PlanAndRun("large", LARGE_CUST, LARGE_ORD, false);
         Expect(pick == "hash join" && best == "hash join", "large: hash join should win");
-        var (stalePick, staleBest, got, ideal) = PlanAndRun("large, stale stats", 1000, 20000, true);
-        Expect(stalePick == "nested loop" && staleBest == "hash join" && got > 5 * ideal, "stale statistics should pick the wrong method");
-        (pick, best, _, _) = PlanAndRun("large, orders sorted by customer_id", 1000, 20000, false, true);
+        var (stalePick, staleBest, got, ideal) = PlanAndRun("large, stale stats", LARGE_CUST, LARGE_ORD, true);
+        Expect(stalePick == "nested loop" && staleBest == "hash join" && got > WRONG_PLAN_FACTOR * ideal, "stale statistics should pick the wrong method");
+        (pick, best, _, _) = PlanAndRun("large, orders sorted by customer_id", LARGE_CUST, LARGE_ORD, false, true);
         Expect(pick == "merge join" && best == "merge join", "sorted input: merge join should win");
         Console.WriteLine($"stale statistics made the query cost {got / ideal}x more than necessary");
     }

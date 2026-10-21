@@ -24,8 +24,11 @@ public class Primary
 
 public static class Program
 {
-    static string Clock(int t) => $"{t / 3600:00}:{t % 3600 / 60:00}:{t % 60:00}";
-    static int At(int h, int m, int s = 0) => h * 3600 + m * 60 + s;
+    const int SecondsPerMinute = 60, SecondsPerHour = 3600;
+    const int MissingLsn = 6; // the archive segment we drop to show a broken chain
+    static string Clock(int t) => $"{t / SecondsPerHour:00}:{t % SecondsPerHour / SecondsPerMinute:00}:{t % SecondsPerMinute:00}";
+    static int At(int h, int m, int s = 0) => h * SecondsPerHour + m * SecondsPerMinute + s;
+    static readonly int MistakeAt = At(14, 3); // when the DELETE without WHERE runs
 
     public static void Apply(SortedDictionary<int, int> orders, Rec rec)
     {
@@ -72,19 +75,19 @@ public static class Program
         Console.WriteLine($"base backup {Clock(b.Ts)} covers up to LSN {b.Lsn}; archive holds LSN {b.Lsn + 1}..{archive.Count}");
         Console.WriteLine($"DELETE without WHERE is LSN {bad} at {Clock(archive[bad - 1].Ts)}");
 
-        var (good, n) = Restore(b, archive, At(14, 3) - 1);
-        Console.WriteLine($"restore to {Clock(At(14, 3) - 1)}: applied through LSN {n}: {Show(good)}");
+        var (good, n) = Restore(b, archive, MistakeAt - 1);
+        Console.WriteLine($"restore to {Clock(MistakeAt - 1)}: applied through LSN {n}: {Show(good)}");
         var (byLsn, n2) = Restore(b, archive, null, bad - 1);
         Console.WriteLine($"restore to LSN {bad - 1}: {Show(byLsn)}");
         bool same = Show(byLsn) == Show(good);
         Console.WriteLine($"same result by time and by LSN: {same.ToString().ToLower()}");
-        var (after, _) = Restore(b, archive, At(14, 3));
-        Console.WriteLine($"restore to {Clock(At(14, 3))}: {Show(after)}");
+        var (after, _) = Restore(b, archive, MistakeAt);
+        Console.WriteLine($"restore to {Clock(MistakeAt)}: {Show(after)}");
         var (latest, _2) = Restore(b, archive);
         Console.WriteLine($"restore to end of log: {Show(latest)}");
         Console.WriteLine($"replica (replays everything): {Show(db.Orders)}");
         Console.WriteLine($"base backup only (no archive): {Show(b.Orders)}");
-        try { Restore(b, archive.Where(r => r.Lsn != 6).ToList()); }
+        try { Restore(b, archive.Where(r => r.Lsn != MissingLsn).ToList()); }
         catch (InvalidOperationException e) { Console.WriteLine($"broken archive: {e.Message}"); }
 
         Check(Show(good) == "1=20 2=55 3=15 4=30 5=40 6=25" && n == bad - 1, "restore before the delete");

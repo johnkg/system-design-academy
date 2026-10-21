@@ -4,8 +4,9 @@ using System.Collections.Generic;
 
 public static class Program
 {
+    const int CacheCapacity = 2; // entries the cache holds before it evicts
     static readonly Database Db = new();
-    static readonly LruCache<int, string> Cache = new(2);
+    static readonly LruCache<int, string> Cache = new(CacheCapacity);
     static int _hits;
 
     public static void Main()

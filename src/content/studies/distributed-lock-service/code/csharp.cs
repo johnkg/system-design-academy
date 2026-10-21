@@ -26,7 +26,8 @@ public class Storage
 {
     readonly bool fencing;
     int maxToken = 0;
-    public int Value = 100;
+    public const int InitialValue = 100;
+    public int Value = InitialValue;
     public Storage(bool fencing) { this.fencing = fencing; }
 
     bool Accept(int token) // the heart of fencing: remember the highest token, refuse any lower one
@@ -41,6 +42,7 @@ public class Storage
 
 public static class Program
 {
+    const int RetryAfter = 500; // how long A waits before it takes the lock again
     // Worker A reads, then stalls. Worker B takes the lock and does a full read-modify-write. A then writes.
     static int Run(string name, bool fencing, bool failover)
     {
@@ -57,7 +59,7 @@ public static class Program
         bool accepted = store.Write(tokenA, seenByA + 1);        // A writes the stale result
         if (!accepted)                                           // A learns it lost the lock and starts again
         {
-            int t = lockSvc.Acquire("A", aWrites + 500);
+            int t = lockSvc.Acquire("A", aWrites + RetryAfter);
             store.Write(t, (store.Read(t) ?? -1) + 1);
             lockSvc.Release("A");
         }

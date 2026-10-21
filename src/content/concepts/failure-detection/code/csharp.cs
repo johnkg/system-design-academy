@@ -7,6 +7,13 @@ using System.Linq;
 const int CrashBeat = 140;   // the sender dies after beat 139 (t = 139 s)
 const int EndMs = 160000;    // the monitor stops watching here
 const int TickMs = 100;      // the monitor checks every 100 ms
+const int BeatMs = 1000;     // one heartbeat per second
+const int PerMille = 1000;   // random draws are 0..999 per mille
+const int BaseDelayMs = 20, SpikeMinMs = 400, SpikeExtraMs = 2000;
+// GC pause: these beats are never sent.
+const int PauseFirstBeat = 60, PauseEndBeat = 65;
+const int LossyFirstBeat = 100, LossyEndBeat = 104, LossPerMille = 700;
+const int TraceSeed = 1, JitterMs = 50, SpikePerMille = 50;
 
 // One heartbeat per second. Delay = 20 ms + jitter, with a 5% chance of a 0.4-2.4 s spike.
 // Beats 60-64 are never sent (a GC pause that silences the sender for about 6 s); beats 100-103 are lost with 70% probability.
@@ -17,13 +24,13 @@ static List<long> MakeTrace(uint seed, int jitter, int spikePerMille)
     var arrivals = new List<long>();
     for (int k = 0; k < CrashBeat; k++)
     {
-        int sum = next() % 1000; sum += next() % 1000; sum += next() % 1000; sum += next() % 1000;
-        int spike = next() % 1000, extra = next() % 2000, loss = next() % 1000;
-        if (k >= 60 && k < 65) continue;
-        if (k >= 100 && k < 104 && loss < 700) continue;
-        long delay = 20 + (long)jitter * sum / 1000;
-        if (spike < spikePerMille) delay += 400 + extra;
-        arrivals.Add(1000L * k + delay);
+        int sum = next() % PerMille; sum += next() % PerMille; sum += next() % PerMille; sum += next() % PerMille;
+        int spike = next() % PerMille, extra = next() % SpikeExtraMs, loss = next() % PerMille;
+        if (k >= PauseFirstBeat && k < PauseEndBeat) continue;
+        if (k >= LossyFirstBeat && k < LossyEndBeat && loss < LossPerMille) continue;
+        long delay = BaseDelayMs + (long)jitter * sum / PerMille;
+        if (spike < spikePerMille) delay += SpikeMinMs + extra;
+        arrivals.Add((long)BeatMs * k + delay);
     }
     arrivals.Sort();
     return arrivals;
@@ -35,7 +42,7 @@ static string Fmt2(double x)
     return $"{n / 100}.{(n % 100):D2}";
 }
 
-var trace = MakeTrace(1, 50, 50);
+var trace = MakeTrace(TraceSeed, JitterMs, SpikePerMille);
 Console.WriteLine($"trace: {trace.Count} heartbeats, last at {trace[^1]} ms");
 var results = new Dictionary<string, (List<long> fa, long detect)>();
 PhiAccrual phi8 = null!;
@@ -86,9 +93,12 @@ class FixedTimeout : IDetector
 
 class PhiAccrual : IDetector   // Akka-style: logistic approximation of the normal tail
 {
+    const long PriorLowMs = 750, PriorHighMs = 1250; // seed guess: 1 s +- 250 ms
+    const double LogisticA = 1.5976, LogisticB = 0.070566; // logistic fit to the normal tail
+    const double MinP = 1e-16, MaxPhi = 16.0; // cap phi where the probability underflows
     readonly int threshold, windowSize = 100; readonly double minStdMs = 100;
-    readonly Queue<long> window = new Queue<long>(new long[] { 750, 1250 });  // seed guess: 1 s +- 250 ms
-    long sum = 2000, sumSq = 750L * 750 + 1250L * 1250;
+    readonly Queue<long> window = new Queue<long>(new long[] { PriorLowMs, PriorHighMs });
+    long sum = PriorLowMs + PriorHighMs, sumSq = PriorLowMs * PriorLowMs + PriorHighMs * PriorHighMs;
     public PhiAccrual(int threshold) { this.threshold = threshold; }
     public void Arrive(long intervalMs)
     {
@@ -100,9 +110,9 @@ class PhiAccrual : IDetector   // Akka-style: logistic approximation of the norm
         int n = window.Count; double mean = (double)sum / n;
         double std = Math.Max(Math.Sqrt(Math.Max(0.0, (double)sumSq / n - mean * mean)), minStdMs);
         double y = (silenceMs - mean) / std;
-        double e = Math.Exp(-y * (1.5976 + 0.070566 * y * y));
+        double e = Math.Exp(-y * (LogisticA + LogisticB * y * y));
         double p = silenceMs > mean ? e / (1 + e) : 1 - 1 / (1 + e);  // P(heartbeat arrives later than now)
-        return p < 1e-16 ? 16.0 : -Math.Log10(p);
+        return p < MinP ? MaxPhi : -Math.Log10(p);
     }
     public bool Suspect(long silenceMs) => Phi(silenceMs) >= threshold;
 }

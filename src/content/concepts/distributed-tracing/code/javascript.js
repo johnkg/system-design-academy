@@ -1,6 +1,8 @@
 // A minimal tracer in JavaScript: spans, parent-child links and trace context propagation.
 // A fake clock moved by hand makes the durations deterministic.
 
+// Simulated work per service, in milliseconds.
+const PAYMENT_MS = 1800, ORDERS_BEFORE_MS = 20, ORDERS_AFTER_MS = 30, GATEWAY_EACH_SIDE_MS = 10;
 let clock = 0; // milliseconds
 const spans = [];
 
@@ -21,23 +23,23 @@ function fromHeader(header) {
 
 function paymentService(header) {
   const span = startSpan("payment", fromHeader(header));
-  work(1800); // the slow part
+  work(PAYMENT_MS); // the slow part
   endSpan(span);
 }
 
 function orderService(header) {
   const span = startSpan("orders", fromHeader(header));
-  work(20);
+  work(ORDERS_BEFORE_MS);
   paymentService(toHeader(span)); // pass the context on
-  work(30);
+  work(ORDERS_AFTER_MS);
   endSpan(span);
 }
 
 function gateway() {
   const span = startSpan("gateway");
-  work(10);
+  work(GATEWAY_EACH_SIDE_MS);
   orderService(toHeader(span));
-  work(10);
+  work(GATEWAY_EACH_SIDE_MS);
   endSpan(span);
 }
 

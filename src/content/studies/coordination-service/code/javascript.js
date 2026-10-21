@@ -61,7 +61,12 @@ class Cluster {
   }
 }
 
-const c = new Cluster(5);
+const REPLICAS = 5;
+const SESSION_TIMEOUT = 5; // a session silent this long expires
+const LAST_BEAT = 9; // b and c heartbeat at t=9; a went silent long before
+const NOW = 10;
+
+const c = new Cluster(REPLICAS);
 c.create('/app', ''); c.create('/app/config', 'v1');
 c.set('/app/config', 'v2', 0);
 let stale = false; try { c.set('/app/config', 'v3', 0); } catch (e) { stale = e.message === 'bad version'; }
@@ -84,6 +89,6 @@ for (const s of ['a', 'b', 'c']) { c.open(s, 0); holders.push(c.create('/lock/n-
 const first = () => c.children('/lock/').map((p) => c.state.get(p).owner)[0];
 console.log(`lock holder ${first()}, fencing token ${holders[0].zxid}`);
 c.watch(holders[0].path, 'b');
-c.beat('b', 9); c.beat('c', 9); c.expire(10, 5);
+c.beat('b', LAST_BEAT); c.beat('c', LAST_BEAT); c.expire(NOW, SESSION_TIMEOUT);
 console.log(`session a expired, ${c.events.join('; ')}; lock holder now ${first()}, token ${holders[1].zxid}`);
 if (!stale || !blocked || first() !== 'b' || holders[1].zxid <= holders[0].zxid) process.exit(1);

@@ -3,6 +3,10 @@
 import sys
 
 SPLITS, REDUCERS, PER_SPLIT, VOCAB = 8, 4, 500, 40
+TOP_N = 3  # words in the top list
+LOST_REDUCER = 2  # failure demo: the reducer whose output is lost
+BACKUP_NUM = 3  # start a backup copy after 3/2 of the median task time
+BACKUP_DEN = 2
 seed = 7
 
 
@@ -64,26 +68,27 @@ load = [sum(r.values()) for r in result]
 merged = {}
 for r in result:
     merged.update(r)
-top = sorted(merged.items(), key=lambda kv: (-kv[1], kv[0]))[:3]
+top = sorted(merged.items(), key=lambda kv: (-kv[1], kv[0]))[:TOP_N]
 print("input: %d splits x %d words, %d reducers" % (SPLITS, PER_SPLIT, REDUCERS))
 print("shuffle records: %d without a combiner, %d with it" % (SPLITS * PER_SPLIT, shuffled))
 print("words per reducer: %s; distinct words: %d" % (", ".join(str(n) for n in load), len(merged)))
 print("top 3: %s" % ", ".join("%s=%d" % kv for kv in top))
 
 # Failure: reducer 2's output is lost, and so are the map outputs held by the machine that ran splits 3 and 5.
-before = show(result[2])
+LOST_SPLITS = (3, 5)  # map outputs lost with the failed machine
+before = show(result[LOST_REDUCER])
 runs["map"] = 0
 runs["reduce"] = 0
-map_out = [map_task(i) if i in (3, 5) else o for i, o in enumerate(map_out)]  # recompute the lost inputs from the source splits
-result[2] = reduce_task(2, map_out)                                           # then only the lost partition
-same = show(result[2]) == before
+map_out = [map_task(i) if i in LOST_SPLITS else o for i, o in enumerate(map_out)]  # recompute the lost inputs from the source splits
+result[LOST_REDUCER] = reduce_task(LOST_REDUCER, map_out)                                           # then only the lost partition
+same = show(result[LOST_REDUCER]) == before
 print("recovery: re-ran %d map tasks and %d reduce task instead of %d and %d; identical: %s"
       % (runs["map"], runs["reduce"], SPLITS, REDUCERS, "true" if same else "false"))
 
 # Straggler: nine map tasks run at once, and one machine is slow. After 1.5 x the median time, start a backup copy elsewhere.
 times = [10, 10, 11, 10, 9, 10, 45, 10, 12]
 median = sorted(times)[len(times) // 2]
-limit = median * 3 // 2
+limit = median * BACKUP_NUM // BACKUP_DEN
 slowest = max(times)
 with_backup = max(min(t, limit + median) if t > limit else t for t in times)
 print("straggler: job takes %d without a backup, %d with a backup started at %d" % (slowest, with_backup, limit))

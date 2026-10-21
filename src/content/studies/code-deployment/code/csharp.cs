@@ -8,10 +8,14 @@ public record Result(string Status, int Hosts, int Errors);
 public static class Program
 {
     const int Hosts = 1000, Canary = 10, Batch = 100, Reqs = 200, Base = 2, Limit = 10;
+    const int PerMille = 1000, Bug = 30; // the bug fails 30 extra requests per thousand
+    const int NoGate = PerMille;         // a limit of 1000 per thousand never trips
+    const uint Seed = 7;
 
-    static uint seed = 7;
+    static uint seed = Seed;
+    // Linear congruential generator (Numerical Recipes constants).
     static uint Next() { unchecked { seed = seed * 1664525u + 1013904223u; } return seed; }
-    static bool Fails(int rate) => (Next() >> 8) % 1000 < rate; // one request fails with the given chance per thousand
+    static bool Fails(int rate) => (Next() >> 8) % PerMille < rate; // one request fails with the given chance per thousand
 
     static readonly int[] fleet = Enumerable.Repeat(1, Hosts).ToArray(); // the version each host runs
     static int lockedBy = -1;                                            // the version whose deploy holds the lock, or -1
@@ -35,7 +39,7 @@ public static class Program
                 for (int r = 0; r < size * Reqs; r++) if (Fails(Base + bug)) wave++; // traffic served by the new hosts
                 errors += wave;
                 if (during != null && done == Canary) during();
-                if (wave * 1000 > size * Reqs * limit) // the gate: error rate above the limit
+                if (wave * PerMille > size * Reqs * limit) // the gate: error rate above the limit
                 {
                     for (int i = 0; i < Hosts; i++) if (fleet[i] == version) fleet[i] = previous;
                     return new Result($"rolled back after {done} hosts", done, errors);
@@ -50,12 +54,12 @@ public static class Program
     {
         // 1. A release with a bug that fails 3% of requests, with the gate on. A second deploy tries to start during it.
         Result? second = null;
-        var gated = Deploy(2, 30, Limit, () => { second = Deploy(9, 0, Limit); });
+        var gated = Deploy(2, Bug, Limit, () => { second = Deploy(9, 0, Limit); });
         Console.WriteLine($"v2 with the gate: {gated.Status}, {gated.Errors} errors; v1 on {Running(1)} hosts");
         Console.WriteLine($"second deploy meanwhile: {second!.Status}");
 
         // 2. The same release with the gate switched off reaches every host.
-        var ungated = Deploy(2, 30, 1000);
+        var ungated = Deploy(2, Bug, NoGate);
         Console.WriteLine($"v2 without a gate: {ungated.Status} on {Running(2)} hosts, {ungated.Errors} errors");
         Array.Fill(fleet, 1);
 

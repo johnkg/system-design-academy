@@ -1,6 +1,8 @@
 # Builder in Python. A fluent builder with defaults and validation in build().
 from dataclasses import dataclass
 
+MAX_TOPPINGS = 4
+
 
 @dataclass(frozen=True)
 class Pizza:  # Product
@@ -39,7 +41,7 @@ class PizzaBuilder:  # Builder
         return self
 
     def build(self):
-        if len(self._toppings) > 4:
+        if len(self._toppings) > MAX_TOPPINGS:
             raise ValueError("Too many toppings (max 4)")
         return Pizza(self._size, self._crust, tuple(self._toppings), self._extra_sauce)
 

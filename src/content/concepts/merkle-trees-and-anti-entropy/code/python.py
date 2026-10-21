@@ -4,6 +4,8 @@ import sys
 
 N_KEYS, LEAVES = 4096, 64
 PER_LEAF = N_KEYS // LEAVES  # 64 keys per leaf range
+SEED, STALE_WRITES = 42, 4  # replica b missed this many writes
+COMPARISON_DIVISOR = 20  # the sync must compare fewer than N_KEYS / 20 hashes
 
 
 def sha(data):
@@ -41,7 +43,7 @@ def diff(a, b, depth, idx, stats, out):
 a = {k: f"v{(k * 7) % 1000}" for k in range(N_KEYS)}
 b = dict(a)
 
-seed = 42  # MINSTD generator
+seed = SEED  # MINSTD generator
 
 
 def rand(n):
@@ -50,7 +52,7 @@ def rand(n):
     return seed % n
 
 
-for _ in range(4):
+for _ in range(STALE_WRITES):
     b[rand(N_KEYS)] = "stale"  # missed writes
 b.pop(rand(N_KEYS), None)  # lost write
 
@@ -75,7 +77,7 @@ print(f"roots equal after: {str(ta[0][0] == tb2[0][0]).lower()}, root {ta[0][0].
 
 if ta[0][0] != tb2[0][0]:
     sys.exit(1)
-if stats["comparisons"] * 20 >= N_KEYS:
+if stats["comparisons"] * COMPARISON_DIVISOR >= N_KEYS:
     sys.exit(1)
 if sent > len(ranges) * PER_LEAF:
     sys.exit(1)

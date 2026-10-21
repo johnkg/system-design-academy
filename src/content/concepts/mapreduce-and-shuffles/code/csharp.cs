@@ -54,10 +54,13 @@ Console.WriteLine(totals[true]);
 if (totals[true] != totals[false]) throw new Exception("combiner changed the answer");
 
 // Skew: 2000 events, half of them for one hot key. One reducer gets the hot key and becomes the straggler.
-uint seed = 12345;
+const int EVENTS = 2000, COLD_USERS = 50, SEED = 12345;
+const int SALT_BUCKETS = R * 2; // the hot key is split over this many salted keys
+uint seed = SEED;
+// Linear congruential generator (Numerical Recipes constants).
 int Rand(int n) { seed = unchecked(seed * 1664525u + 1013904223u); return (int)((seed >> 8) % (uint)n); }
-var events = Enumerable.Range(0, 2000).Select(i => i % 2 == 0 ? "hot" : "user" + Rand(50)).ToList();
-string Ratio(int[] l) { int h = l.Max() * R * 100 / 2000; return $"{h / 100}.{(h % 100):00}"; }
+var events = Enumerable.Range(0, EVENTS).Select(i => i % 2 == 0 ? "hot" : "user" + Rand(COLD_USERS)).ToList();
+string Ratio(int[] l) { int h = l.Max() * R * 100 / EVENTS; return $"{h / 100}.{(h % 100):00}"; }
 int[] Load(Func<string, string> keyOf)
 {
     var l = new int[R];
@@ -65,8 +68,8 @@ int[] Load(Func<string, string> keyOf)
     return l;
 }
 var plain = Load(e => e);
-var salted = Load(e => e == "hot" ? "hot#" + Rand(R * 2) : e); // stage 1: spread the hot key over 6 salted keys
+var salted = Load(e => e == "hot" ? "hot#" + Rand(SALT_BUCKETS) : e); // stage 1: spread the hot key over 6 salted keys
 Console.WriteLine($"plain  load [{string.Join(", ", plain)}] slowest/average = {Ratio(plain)}");
 Console.WriteLine($"salted load [{string.Join(", ", salted)}] slowest/average = {Ratio(salted)}");
 Console.WriteLine("stage 2 merges the 6 partial counts of 'hot' into one number (tiny shuffle)");
-if (plain.Sum() != 2000 || salted.Sum() != 2000) throw new Exception("records lost");
+if (plain.Sum() != EVENTS || salted.Sum() != EVENTS) throw new Exception("records lost");

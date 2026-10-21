@@ -6,7 +6,9 @@ const hash = (s) => { let h = 2166136261; for (let i = 0; i < s.length; i++) { h
 // Tasks in dependency order: [name, upstream tasks].
 const TASKS = [['wait_file', []], ['extract', ['wait_file']], ['clean', ['extract']], ['by_region', ['clean']], ['by_product', ['clean']], ['report', ['by_region', 'by_product']]];
 const POKE = 10, TIMEOUT = 30, MAX_ATTEMPTS = 3; // sensor checks every 10 minutes and gives up after 30
-const flaky = (task, day) => hash(`${task}:${day}`) % 5 === 0; // fails its first two attempts, then works
+const FLAKY_ONE_IN = 5; // one task-day in 5 is flaky
+const BACKOFF_MIN = 30; // retry backoff in minutes: 30, then 60
+const flaky = (task, day) => hash(`${task}:${day}`) % FLAKY_ONE_IN === 0; // fails its first two attempts, then works
 
 class Orchestrator {
   constructor() { this.state = new Map(); this.output = new Map(); this.stats = {}; }
@@ -21,7 +23,7 @@ class Orchestrator {
       return 'success';
     }
     for (let attempt = 1; attempt <= MAX_ATTEMPTS; attempt++) {
-      if (flaky(task, day) && attempt < MAX_ATTEMPTS) { s.retries++; s.backoff += 30 * 2 ** (attempt - 1); continue; }
+      if (flaky(task, day) && attempt < MAX_ATTEMPTS) { s.retries++; s.backoff += BACKOFF_MIN * 2 ** (attempt - 1); continue; }
       const inputs = deps.map((d) => this.output.get(`${d}/${day}`));
       this.output.set(key, hash(`${task}:${day}:${inputs.join(',')}`)); // overwrite the partition, never append
       return 'success';

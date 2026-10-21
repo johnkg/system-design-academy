@@ -2,7 +2,9 @@
 import math
 
 # 98 ordinary requests between 80 and 120 ms, plus two very slow ones
-latencies = [80 + ((i * 37) % 41) for i in range(1, 99)]
+ORDINARY_REQUESTS, MIN_MS, SPREAD_MS = 98, 80, 41
+SCATTER_STEP = 37  # coprime with SPREAD_MS, so the values scatter over the range
+latencies = [MIN_MS + ((i * SCATTER_STEP) % SPREAD_MS) for i in range(1, ORDINARY_REQUESTS + 1)]
 latencies += [2400, 2900]
 
 

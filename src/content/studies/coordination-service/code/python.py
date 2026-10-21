@@ -80,7 +80,12 @@ def refused(fn):
         return str(e)
 
 
-c = Cluster(5)
+REPLICAS = 5
+SESSION_TIMEOUT = 5  # a session silent this long expires
+LAST_BEAT = 9  # b and c heartbeat at t=9; a went silent long before
+NOW = 10
+
+c = Cluster(REPLICAS)
 c.create("/app", "")
 c.create("/app/config", "v1")
 c.set("/app/config", "v2", 0)
@@ -109,8 +114,8 @@ for s in ["a", "b", "c"]:
 first = lambda: c.state[min(p for p in c.state if p.startswith("/lock/"))]["owner"]
 print(f"lock holder {first()}, fencing token {holders[0]['zxid']}")
 c.watches[holders[0]["path"]] = ["b"]
-c.sessions["b"] = c.sessions["c"] = 9
-c.expire(10, 5)
+c.sessions["b"] = c.sessions["c"] = LAST_BEAT
+c.expire(NOW, SESSION_TIMEOUT)
 print(f"session a expired, {'; '.join(c.events)}; lock holder now {first()}, token {holders[1]['zxid']}")
 if not stale or not blocked or first() != "b" or holders[1]["zxid"] <= holders[0]["zxid"]:
     sys.exit(1)

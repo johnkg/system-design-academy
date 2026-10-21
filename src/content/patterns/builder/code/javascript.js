@@ -11,6 +11,8 @@ class Pizza { // Product
   }
 }
 
+const MAX_TOPPINGS = 4;
+
 class PizzaBuilder { // Builder
   #size = "medium";
   #crust = "thin";
@@ -23,7 +25,7 @@ class PizzaBuilder { // Builder
   extraSauce() { this.#extraSauce = true; return this; }
 
   build() {
-    if (this.#toppings.length > 4) throw new Error("Too many toppings (max 4)");
+    if (this.#toppings.length > MAX_TOPPINGS) throw new Error("Too many toppings (max 4)");
     return new Pizza({ size: this.#size, crust: this.#crust, toppings: [...this.#toppings], extraSauce: this.#extraSauce });
   }
 }

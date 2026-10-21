@@ -18,10 +18,14 @@ class Lcg:
 
 SERVICE_MS = 50
 N = 20000
+ARRIVAL_SEED = 12345
+SERVICE_SEED = 67890
+MS_PER_SECOND = 1000
+TOLERANCE = 1e-6  # relative floating-point slack for Little's law
 
 
 def simulate(rho):
-    arrivals, services = Lcg(12345), Lcg(67890)
+    arrivals, services = Lcg(ARRIVAL_SEED), Lcg(SERVICE_SEED)
     mean_gap = SERVICE_MS / rho  # utilisation = service time / gap between arrivals
     arrive, depart = [], []
     t = free = wait = busy = 0.0
@@ -51,7 +55,7 @@ def simulate(rho):
     sojourn = 0.0
     for i in range(N):
         sojourn += depart[i] - arrive[i]
-    return {"util": busy / last, "wait": wait / N, "L": area / last, "lambda": (N / last) * 1000, "W": sojourn / N}
+    return {"util": busy / last, "wait": wait / N, "L": area / last, "lambda": (N / last) * MS_PER_SECOND, "W": sojourn / N}
 
 
 def f2(x):
@@ -63,9 +67,9 @@ print("rho  util  wait_ms  theory_ms  L  lambda_per_s  W_ms  L-lambda*W")
 for rho in [0.5, 0.7, 0.8, 0.9, 0.95]:
     r = simulate(rho)
     theory = (rho / (1 - rho)) * SERVICE_MS  # M/M/1 mean wait
-    gap = abs(r["L"] - (r["lambda"] / 1000) * r["W"])
+    gap = abs(r["L"] - (r["lambda"] / MS_PER_SECOND) * r["W"])
     print(f"{f2(rho)} {f2(r['util'])} {f2(r['wait'])} {f2(theory)} {f2(r['L'])} {f2(r['lambda'])} {f2(r['W'])} {gap:.6f}")
-    if gap > 1e-6 * max(1, r["L"]):
+    if gap > TOLERANCE * max(1, r["L"]):
         print("Little's law violated", file=sys.stderr)
         sys.exit(1)
     if r["wait"] <= previous:
@@ -74,5 +78,5 @@ for rho in [0.5, 0.7, 0.8, 0.9, 0.95]:
     previous = r["wait"]
 # Sizing: concurrency = rate x latency, then add headroom so the pool is not a hockey stick.
 rate, latency_ms, headroom = 1000, 50, 0.7
-in_flight = rate * latency_ms / 1000
+in_flight = rate * latency_ms / MS_PER_SECOND
 print(f"in flight: {f2(in_flight)}, pool at {f2(headroom)} target: {math.ceil(in_flight / headroom)}")

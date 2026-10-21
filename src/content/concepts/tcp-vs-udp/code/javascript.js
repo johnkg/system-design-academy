@@ -5,6 +5,7 @@
 const TOTAL = 5;      // segments 0 to 4
 const LATENCY = 1;    // ticks for a packet to cross the network
 const TIMEOUT = 4;    // ticks before the sender resends an unacknowledged segment
+const LAST_TICK = 11; // the simulation runs ticks 0 to 11
 const lostFirstTime = new Set([2]); // the network drops segment 2 the first time it is sent
 
 const inFlight = [];  // packets travelling: { arriveAt, kind, n }
@@ -26,7 +27,7 @@ function transmit(tick, segment) {
   }
 }
 
-for (let tick = 0; tick <= 11; tick++) {
+for (let tick = 0; tick <= LAST_TICK; tick++) {
   // Packets that arrive on this tick
   for (const packet of inFlight.filter((p) => p.arriveAt === tick)) {
     if (packet.kind === "data") {

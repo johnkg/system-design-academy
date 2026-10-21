@@ -12,7 +12,9 @@ public static class Program
 {
     const int N = 10, Requests = 100, Capacity = 15, Ticks = 20, Start = 5; // 10 instances, 100 requests per tick
     const int Steady = 50, Guard = 100, Detect = 2;                          // error rates in requests per thousand
+    const int PerMille = 1000;
 
+    // 32-bit LCG (Numerical Recipes constants)
     static long seed = 7;
     static int Random(int n) { seed = (seed * 1664525 + 1013904223) % 4294967296; return (int)(seed / 65536 % n); }
 
@@ -46,7 +48,7 @@ public static class Program
                 if (!ok) ok = Attempt(rotation[cursor++ % rotation.Length]); // the client retries once
                 if (!ok) errors++;
             }
-            int pm = errors * 1000 / Requests;
+            int pm = errors * PerMille / Requests;
             if (t >= Start)
             {
                 maxPm = Math.Max(maxPm, pm);

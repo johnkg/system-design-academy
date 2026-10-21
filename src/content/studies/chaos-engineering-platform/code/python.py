@@ -5,10 +5,12 @@ import sys
 
 N, REQUESTS, CAPACITY, TICKS, START = 10, 100, 15, 20, 5  # 10 instances, 100 requests per tick
 STEADY, GUARD, DETECT = 50, 100, 2                         # error rates in requests per thousand
+PER_MILLE = 1000
 
 seed = 7
 
 
+# 32-bit LCG (Numerical Recipes constants)
 def random(n):
     global seed
     seed = (seed * 1664525 + 1013904223) % 4294967296
@@ -48,7 +50,7 @@ def run(exp):
                 cursor += 1
             if not ok:
                 errors += 1
-        pm = errors * 1000 // REQUESTS
+        pm = errors * PER_MILLE // REQUESTS
         if t >= START:
             max_pm = max(max_pm, pm)
             if pm > STEADY:

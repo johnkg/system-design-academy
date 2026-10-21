@@ -1,6 +1,7 @@
 // Dead-letter queues: one ordered consumer over a seeded message list, four failure policies.
 // Time is counted in ticks (one processing attempt per tick), so the output is deterministic.
 const SEED = 7, TOTAL = 40, LIMIT = 3, HORIZON = 400;
+const POISON_PCT = 8, TRANSIENT_PCT = 17; // share of messages that always fail / fail for a while
 
 function makeKinds() {
   let x = SEED;
@@ -8,7 +9,7 @@ function makeKinds() {
   for (let i = 0; i < TOTAL; i++) {
     x = (x * 48271) % 2147483647; // MINSTD, integer only
     const r = x % 100;
-    kinds.push(r < 8 ? "poison" : r < 25 ? "transient" : "ok");
+    kinds.push(r < POISON_PCT ? "poison" : r < POISON_PCT + TRANSIENT_PCT ? "transient" : "ok");
   }
   return kinds;
 }

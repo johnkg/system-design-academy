@@ -3,18 +3,22 @@
 import sys
 
 HOSTS, CANARY, BATCH, REQS, BASE, LIMIT = 1000, 10, 100, 200, 2, 10
+PER_MILLE, BUG = 1000, 30  # the bug fails 30 extra requests per thousand
+NO_GATE = PER_MILLE        # a limit of 1000 per thousand never trips
+SEED = 7
 
-seed = 7
+seed = SEED
 
 
 def next_random():
+    """Linear congruential generator (Numerical Recipes constants)."""
     global seed
     seed = (seed * 1664525 + 1013904223) & 0xFFFFFFFF
     return seed
 
 
 def fails(rate):  # one request fails with the given chance per thousand
-    return ((next_random() >> 8) % 1000) < rate
+    return ((next_random() >> 8) % PER_MILLE) < rate
 
 
 fleet = [1] * HOSTS  # the version each host runs
@@ -44,7 +48,7 @@ def deploy(version, bug, limit, during=None):
             errors += wave
             if during and done == CANARY:
                 during()
-            if wave * 1000 > size * REQS * limit:  # the gate: error rate above the limit
+            if wave * PER_MILLE > size * REQS * limit:  # the gate: error rate above the limit
                 for i in range(HOSTS):
                     if fleet[i] == version:
                         fleet[i] = previous
@@ -68,12 +72,12 @@ def try_second():
     second = deploy(9, 0, LIMIT)
 
 
-gated = deploy(2, 30, LIMIT, try_second)
+gated = deploy(2, BUG, LIMIT, try_second)
 print(f"v2 with the gate: {gated['status']}, {gated['errors']} errors; v1 on {running(1)} hosts")
 print(f"second deploy meanwhile: {second['status']}")
 
 # 2. The same release with the gate switched off reaches every host.
-ungated = deploy(2, 30, 1000)
+ungated = deploy(2, BUG, NO_GATE)
 print(f"v2 without a gate: {ungated['status']} on {running(2)} hosts, {ungated['errors']} errors")
 fleet[:] = [1] * HOSTS
 

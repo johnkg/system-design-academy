@@ -3,6 +3,12 @@
 const CRASH_BEAT = 140;       // the sender dies after beat 139 (t = 139 s)
 const END_MS = 160000;        // the monitor stops watching here
 const TICK_MS = 100;          // the monitor checks every 100 ms
+const BEAT_MS = 1000;         // one heartbeat per second
+const PER_MILLE = 1000;       // random draws are 0..999 per mille
+const BASE_DELAY_MS = 20, SPIKE_MIN_MS = 400, SPIKE_EXTRA_MS = 2000;
+const PAUSE_FIRST_BEAT = 60, PAUSE_END_BEAT = 65;      // GC pause: these beats are never sent
+const LOSSY_FIRST_BEAT = 100, LOSSY_END_BEAT = 104, LOSS_PER_MILLE = 700;
+const TRACE_SEED = 1, JITTER_MS = 50, SPIKE_PER_MILLE = 50;
 
 function lcg(seed) {          // 32-bit linear congruential generator, same in every language
   let s = seed >>> 0;
@@ -15,13 +21,13 @@ function makeTrace(seed, jitter, spikePerMille) {
   const next = lcg(seed * 7919 + 13);
   const arrivals = [];
   for (let k = 0; k < CRASH_BEAT; k++) {
-    const sum = (next() % 1000) + (next() % 1000) + (next() % 1000) + (next() % 1000);
-    const spike = next() % 1000, extra = next() % 2000, loss = next() % 1000;
-    if (k >= 60 && k < 65) continue;
-    if (k >= 100 && k < 104 && loss < 700) continue;
-    let delay = 20 + Math.floor((jitter * sum) / 1000);
-    if (spike < spikePerMille) delay += 400 + extra;
-    arrivals.push(1000 * k + delay);
+    const sum = (next() % PER_MILLE) + (next() % PER_MILLE) + (next() % PER_MILLE) + (next() % PER_MILLE);
+    const spike = next() % PER_MILLE, extra = next() % SPIKE_EXTRA_MS, loss = next() % PER_MILLE;
+    if (k >= PAUSE_FIRST_BEAT && k < PAUSE_END_BEAT) continue;
+    if (k >= LOSSY_FIRST_BEAT && k < LOSSY_END_BEAT && loss < LOSS_PER_MILLE) continue;
+    let delay = BASE_DELAY_MS + Math.floor((jitter * sum) / PER_MILLE);
+    if (spike < spikePerMille) delay += SPIKE_MIN_MS + extra;
+    arrivals.push(BEAT_MS * k + delay);
   }
   return arrivals.sort((a, b) => a - b);
 }
@@ -32,10 +38,15 @@ class FixedTimeout {
   suspect(silenceMs) { return silenceMs > this.timeoutMs; }
 }
 
+const PRIOR_LOW_MS = 750, PRIOR_HIGH_MS = 1250; // seed guess: 1 s +- 250 ms
+const LOGISTIC_A = 1.5976, LOGISTIC_B = 0.070566; // logistic fit to the normal tail
+const MIN_P = 1e-16, MAX_PHI = 16; // cap phi where the probability underflows
+
 class PhiAccrual {            // Akka-style: logistic approximation of the normal tail
   constructor(threshold, windowSize = 100, minStdMs = 100) {
     this.threshold = threshold; this.windowSize = windowSize; this.minStdMs = minStdMs;
-    this.window = [750, 1250]; this.sum = 2000; this.sumSq = 750 * 750 + 1250 * 1250; // seed guess: 1 s +- 250 ms
+    this.window = [PRIOR_LOW_MS, PRIOR_HIGH_MS]; this.sum = PRIOR_LOW_MS + PRIOR_HIGH_MS;
+    this.sumSq = PRIOR_LOW_MS * PRIOR_LOW_MS + PRIOR_HIGH_MS * PRIOR_HIGH_MS;
   }
   arrive(intervalMs) {
     this.window.push(intervalMs); this.sum += intervalMs; this.sumSq += intervalMs * intervalMs;
@@ -45,9 +56,9 @@ class PhiAccrual {            // Akka-style: logistic approximation of the norma
     const n = this.window.length, mean = this.sum / n;
     const std = Math.max(Math.sqrt(Math.max(0, this.sumSq / n - mean * mean)), this.minStdMs);
     const y = (silenceMs - mean) / std;
-    const e = Math.exp(-y * (1.5976 + 0.070566 * y * y));
+    const e = Math.exp(-y * (LOGISTIC_A + LOGISTIC_B * y * y));
     const p = silenceMs > mean ? e / (1 + e) : 1 - 1 / (1 + e);  // P(heartbeat arrives later than now)
-    return p < 1e-16 ? 16 : -Math.log10(p);
+    return p < MIN_P ? MAX_PHI : -Math.log10(p);
   }
   suspect(silenceMs) { return this.phi(silenceMs) >= this.threshold; }
 }
@@ -68,7 +79,7 @@ function evaluate(arrivals, detector) {
 }
 
 const fmt2 = (x) => { const n = Math.floor(x * 100 + 0.5); return `${Math.floor(n / 100)}.${String(n % 100).padStart(2, "0")}`; };
-const trace = makeTrace(1, 50, 50);
+const trace = makeTrace(TRACE_SEED, JITTER_MS, SPIKE_PER_MILLE);
 console.log(`trace: ${trace.length} heartbeats, last at ${trace[trace.length - 1]} ms`);
 const results = {};
 for (const [name, det] of [["fixed 2000 ms", new FixedTimeout(2000)], ["fixed 5000 ms", new FixedTimeout(5000)], ["fixed 10000 ms", new FixedTimeout(10000)],

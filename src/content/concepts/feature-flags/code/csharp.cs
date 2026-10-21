@@ -12,6 +12,12 @@ record Result(bool On, string Reason);
 
 static class Program
 {
+    const uint Buckets = 10000, BucketsPerPercent = Buckets / 100;
+    const int UserCount = 1000, StaffEvery = 50; // every 50th user is staff
+    static readonly string[] Countries = { "US", "DE", "FR", "JP" };
+    const int ResaltPercent = 25;
+    const int MinSeenAtHalf = 300; // sanity floor for a 50% rollout
+
     static uint Fnv1a(string text)
     {
         uint hash = 2166136261; // offset basis
@@ -24,7 +30,7 @@ static class Program
     }
 
     // Same user + same flag key + same salt => same bucket (0..9999), on every server, forever.
-    static uint Bucket(Flag flag, string userId) => Fnv1a($"{flag.Key}:{flag.Salt}:{userId}") % 10000;
+    static uint Bucket(Flag flag, string userId) => Fnv1a($"{flag.Key}:{flag.Salt}:{userId}") % Buckets;
 
     static string Attr(User u, string name) => name == "staff" ? u.Staff : u.Country;
 
@@ -33,7 +39,7 @@ static class Program
         if (flag.Killed) return new Result(false, "kill switch");
         foreach (var rule in flag.Rules)
             if (Attr(user, rule.Attr) == rule.Value) return new Result(rule.Serve, $"rule {rule.Attr}={rule.Value}");
-        bool on = Bucket(flag, user.Id) < flag.Percent * 100; // percent in whole numbers: 25 -> buckets 0..2499
+        bool on = Bucket(flag, user.Id) < flag.Percent * BucketsPerPercent; // percent in whole numbers: 25 -> buckets 0..2499
         return new Result(on, $"rollout {flag.Percent}%");
     }
 
@@ -51,8 +57,7 @@ static class Program
 
     static int Main()
     {
-        var countries = new[] { "US", "DE", "FR", "JP" };
-        var users = Enumerable.Range(1, 1000).Select(i => new User($"user-{i}", countries[i % 4], i % 50 == 0 ? "true" : "false")).ToList();
+        var users = Enumerable.Range(1, UserCount).Select(i => new User($"user-{i}", Countries[i % Countries.Length], i % StaffEvery == 0 ? "true" : "false")).ToList();
         var flag = new Flag("new-checkout", "v1", 0, false, new[] { new Rule("staff", "true", true), new Rule("country", "DE", false) });
         HashSet<string> Seen(Flag f) => users.Where(u => Evaluate(f, u).On).Select(u => u.Id).ToHashSet();
 
@@ -67,8 +72,8 @@ static class Program
             previous = now;
         }
 
-        var salted = Seen(flag with { Percent = 25, Salt = "v2" });
-        var base25 = Seen(flag with { Percent = 25 });
+        var salted = Seen(flag with { Percent = ResaltPercent, Salt = "v2" });
+        var base25 = Seen(flag with { Percent = ResaltPercent });
         Console.WriteLine($"new salt at 25%: {base25.Count(id => salted.Contains(id))} of {base25.Count} keep the feature (the cohort was reshuffled)");
 
         int killed = Seen(flag with { Percent = 100, Killed = true }).Count;
@@ -77,6 +82,6 @@ static class Program
         var dave = users[4]; // user-5, in DE
         Console.WriteLine($"service down, no cache: {Show(EvaluateSafely(down, dave, null))}");
         Console.WriteLine($"service down, cached on: {Show(EvaluateSafely(down, dave, true))}");
-        return killed != 0 || Seen(flag with { Percent = 50 }).Count < 300 ? 1 : 0;
+        return killed != 0 || Seen(flag with { Percent = 50 }).Count < MinSeenAtHalf ? 1 : 0;
     }
 }

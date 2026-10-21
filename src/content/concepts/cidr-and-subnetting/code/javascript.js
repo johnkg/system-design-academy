@@ -1,15 +1,21 @@
 // CIDR math with plain integers: parse, describe, split, overlap check and longest-prefix match.
 
+const IPV4_BITS = 32;
+const OCTET_VALUES = 256; // values per dotted-quad octet
+const RESERVED_PER_SUBNET = 5; // network, router, DNS, future use, broadcast
+const FIRST_HOST_OFFSET = 4; // the first usable address follows network, router, DNS and future use
+const TIERS = 3, ZONES = 3, SUBNETS = TIERS * ZONES;
+
 const check = (ok) => { if (!ok) { console.error("invariant violated"); process.exit(1); } };
-const maskOf = (p) => (p === 0 ? 0 : (0xffffffff << (32 - p)) >>> 0);
-const parseIp = (s) => s.split(".").reduce((acc, o) => acc * 256 + Number(o), 0);
+const maskOf = (p) => (p === 0 ? 0 : (0xffffffff << (IPV4_BITS - p)) >>> 0);
+const parseIp = (s) => s.split(".").reduce((acc, o) => acc * OCTET_VALUES + Number(o), 0);
 const fmtIp = (n) => [24, 16, 8, 0].map((s) => (n >>> s) & 255).join(".");
 
 function parseCidr(text) {
   const [ip, len] = text.split("/");
   const prefix = Number(len);
   const net = (parseIp(ip) & maskOf(prefix)) >>> 0; // clear the host bits
-  const size = 2 ** (32 - prefix);
+  const size = 2 ** (IPV4_BITS - prefix);
   return { net, prefix, size, last: net + size - 1 };
 }
 const show = (c) => `${fmtIp(c.net)}/${c.prefix}`;
@@ -17,7 +23,7 @@ const show = (c) => `${fmtIp(c.net)}/${c.prefix}`;
 // Cloud VPCs reserve 5 addresses per subnet: network, router, DNS, future use, broadcast.
 function describe(text) {
   const c = parseCidr(text);
-  return `${show(c)} addresses=${c.size} usable=${c.size - 5} first=${fmtIp(c.net + 4)} last=${fmtIp(c.last - 1)} mask=${fmtIp(maskOf(c.prefix))}`;
+  return `${show(c)} addresses=${c.size} usable=${c.size - RESERVED_PER_SUBNET} first=${fmtIp(c.net + FIRST_HOST_OFFSET)} last=${fmtIp(c.last - 1)} mask=${fmtIp(maskOf(c.prefix))}`;
 }
 
 // Borrow bits: n subnets need ceil(log2 n) extra prefix bits, giving 2^bits equal slots.
@@ -25,7 +31,7 @@ function split(block, count) {
   let bits = 0;
   while (2 ** bits < count) bits++;
   const prefix = block.prefix + bits;
-  const step = 2 ** (32 - prefix);
+  const step = 2 ** (IPV4_BITS - prefix);
   return Array.from({ length: 2 ** bits }, (_, i) => ({ net: block.net + i * step, prefix, size: step, last: block.net + (i + 1) * step - 1 }));
 }
 
@@ -47,10 +53,10 @@ check(parseCidr("10.0.0.0/16").size === 65536);
 check(parseCidr("10.0.0.77/24").net === parseIp("10.0.0.0"));
 
 // Three tiers x three zones = 9 subnets -> 4 bits -> 16 slots of /20, tier by tier.
-const slots = split(parseCidr("10.20.0.0/16"), 9);
+const slots = split(parseCidr("10.20.0.0/16"), SUBNETS);
 const tiers = ["public", "private", "database"];
-slots.slice(0, 9).forEach((s, i) => console.log(`${tiers[Math.floor(i / 3)]}-${"abc"[i % 3]} ${show(s)} usable=${s.size - 5}`));
-console.log(`slots=${slots.length} free=${slots.length - 9}`);
+slots.slice(0, SUBNETS).forEach((s, i) => console.log(`${tiers[Math.floor(i / ZONES)]}-${"abc"[i % ZONES]} ${show(s)} usable=${s.size - RESERVED_PER_SUBNET}`));
+console.log(`slots=${slots.length} free=${slots.length - SUBNETS}`);
 const quarters = split(parseCidr("192.168.10.0/24"), 4);
 console.log(quarters.map(show).join(" "));
 check(slots.length === 16 && slots[0].size === 4096);

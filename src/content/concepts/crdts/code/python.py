@@ -3,10 +3,13 @@
 from itertools import permutations
 
 IDS = "ABC"
+INITIAL_SPLIT = [4, 3, 3]  # the starting stock, already spread over replicas A, B, C
+INITIAL_COUNT = 10  # sum of INITIAL_SPLIT
+TS_STEP = 100  # ms between scripted operations (the LWW timestamp)
 
 
 class LWWCounter:  # naive: one number and a timestamp, newest write wins
-    def __init__(self, v=10, ts=0, by=0): self.v, self.ts, self.by = v, ts, by
+    def __init__(self, v=INITIAL_COUNT, ts=0, by=0): self.v, self.ts, self.by = v, ts, by
     def inc(self, r, ts): self.v, self.ts, self.by = self.v + 1, ts, r
     def dec(self, r, ts): self.v, self.ts, self.by = self.v - 1, ts, r
     def merge(self, o):
@@ -18,7 +21,7 @@ class LWWCounter:  # naive: one number and a timestamp, newest write wins
 
 
 class GCounter:  # one slot per replica, merge = element-wise max
-    def __init__(self, p=None): self.p = list(p or [4, 3, 3])
+    def __init__(self, p=None): self.p = list(p or INITIAL_SPLIT)
     def inc(self, r, ts): self.p[r] += 1
     def merge(self, o): return GCounter([max(a, b) for a, b in zip(self.p, o.p)])
     def value(self): return sum(self.p)
@@ -27,7 +30,7 @@ class GCounter:  # one slot per replica, merge = element-wise max
 
 
 class PNCounter:  # two G-Counters: increments and decrements
-    def __init__(self, p=None, n=None): self.p, self.n = list(p or [4, 3, 3]), list(n or [0, 0, 0])
+    def __init__(self, p=None, n=None): self.p, self.n = list(p or INITIAL_SPLIT), list(n or [0, 0, 0])
     def inc(self, r, ts): self.p[r] += 1
     def dec(self, r, ts): self.n[r] += 1
     def merge(self, o):
@@ -55,9 +58,9 @@ def counters(cls, with_dec):
     reps = [cls(), cls(), cls()]
     script = [(0, 1), (1, 1), (2, 1), (0, 1), (1, 1), (2, 1), (0, 1), (1, 1), (1, 1), (1, 1), (2, 1), (2, -1)]
     for i, (r, d) in enumerate(script):
-        if d > 0: reps[r].inc(r, (i + 1) * 100)
-        elif with_dec: reps[r].dec(r, (i + 1) * 100)
-    return reps, 10 + sum(d for _, d in script if d > 0 or with_dec)
+        if d > 0: reps[r].inc(r, (i + 1) * TS_STEP)
+        elif with_dec: reps[r].dec(r, (i + 1) * TS_STEP)
+    return reps, INITIAL_COUNT + sum(d for _, d in script if d > 0 or with_dec)
 
 
 def sets(cls, _):
@@ -70,7 +73,7 @@ def sets(cls, _):
 
 def converge(name, cls, build, with_dec=True):
     keys, values, sizes = set(), set(), set()
-    for perm in permutations(range(3)):  # 6 merge orders
+    for perm in permutations(range(len(IDS))):  # 6 merge orders
         reps, expected = build(cls, with_dec)
         snaps = [r.merge(r) for r in reps]  # copies, replayed later as stale messages
         for _ in range(2):  # every pull is delivered twice
@@ -78,7 +81,7 @@ def converge(name, cls, build, with_dec=True):
                 for j in perm:
                     if i != j: reps[i] = reps[i].merge(reps[j])
         before = [r.key() for r in reps]
-        for i in range(3):
+        for i in range(len(IDS)):
             for s in snaps: reps[i] = reps[i].merge(s)
         assert before == [r.key() for r in reps], "stale replay changed a state"
         assert len({r.key() for r in reps}) == 1, "replicas diverged"

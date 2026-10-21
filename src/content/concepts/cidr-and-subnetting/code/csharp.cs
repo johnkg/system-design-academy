@@ -3,10 +3,16 @@ using System;
 using System.Collections.Generic;
 using System.Linq;
 
+const int Ipv4Bits = 32;
+const long OctetValues = 256; // values per dotted-quad octet
+const int ReservedPerSubnet = 5; // network, router, DNS, future use, broadcast
+const int FirstHostOffset = 4; // the first usable address follows network, router, DNS and future use
+const int Tiers = 3, Zones = 3, Subnets = Tiers * Zones;
+
 static void Check(bool ok) { if (!ok) { Console.Error.WriteLine("invariant violated"); Environment.Exit(1); } }
 
-static long MaskOf(int p) => p == 0 ? 0 : (long)(0xFFFFFFFFu << (32 - p));
-static long ParseIp(string s) => s.Split('.').Aggregate(0L, (acc, o) => acc * 256 + long.Parse(o));
+static long MaskOf(int p) => p == 0 ? 0 : (long)(0xFFFFFFFFu << (Ipv4Bits - p));
+static long ParseIp(string s) => s.Split('.').Aggregate(0L, (acc, o) => acc * OctetValues + long.Parse(o));
 static string FmtIp(long n) => string.Join(".", new[] { 24, 16, 8, 0 }.Select(s => ((n >> s) & 255).ToString()));
 
 static Cidr ParseCidr(string text)
@@ -14,7 +20,7 @@ static Cidr ParseCidr(string text)
     var parts = text.Split('/');
     int prefix = int.Parse(parts[1]);
     long net = ParseIp(parts[0]) & MaskOf(prefix); // clear the host bits
-    long size = 1L << (32 - prefix);
+    long size = 1L << (Ipv4Bits - prefix);
     return new Cidr(net, prefix, size, net + size - 1);
 }
 static string Show(Cidr c) => $"{FmtIp(c.Net)}/{c.Prefix}";
@@ -23,7 +29,7 @@ static string Show(Cidr c) => $"{FmtIp(c.Net)}/{c.Prefix}";
 static string Describe(string text)
 {
     var c = ParseCidr(text);
-    return $"{Show(c)} addresses={c.Size} usable={c.Size - 5} first={FmtIp(c.Net + 4)} last={FmtIp(c.Last - 1)} mask={FmtIp(MaskOf(c.Prefix))}";
+    return $"{Show(c)} addresses={c.Size} usable={c.Size - ReservedPerSubnet} first={FmtIp(c.Net + FirstHostOffset)} last={FmtIp(c.Last - 1)} mask={FmtIp(MaskOf(c.Prefix))}";
 }
 
 // Borrow bits: n subnets need ceil(log2 n) extra prefix bits, giving 2^bits equal slots.
@@ -32,7 +38,7 @@ static List<Cidr> Split(Cidr block, int count)
     int bits = 0;
     while ((1 << bits) < count) bits++;
     int prefix = block.Prefix + bits;
-    long step = 1L << (32 - prefix);
+    long step = 1L << (Ipv4Bits - prefix);
     return Enumerable.Range(0, 1 << bits).Select(i => new Cidr(block.Net + i * step, prefix, step, block.Net + (i + 1) * step - 1)).ToList();
 }
 
@@ -56,10 +62,10 @@ Check(ParseCidr("10.0.0.0/16").Size == 65536);
 Check(ParseCidr("10.0.0.77/24").Net == ParseIp("10.0.0.0"));
 
 // Three tiers x three zones = 9 subnets -> 4 bits -> 16 slots of /20, tier by tier.
-var slots = Split(ParseCidr("10.20.0.0/16"), 9);
+var slots = Split(ParseCidr("10.20.0.0/16"), Subnets);
 var tiers = new[] { "public", "private", "database" };
-for (int i = 0; i < 9; i++) Console.WriteLine($"{tiers[i / 3]}-{"abc"[i % 3]} {Show(slots[i])} usable={slots[i].Size - 5}");
-Console.WriteLine($"slots={slots.Count} free={slots.Count - 9}");
+for (int i = 0; i < Subnets; i++) Console.WriteLine($"{tiers[i / Zones]}-{"abc"[i % Zones]} {Show(slots[i])} usable={slots[i].Size - ReservedPerSubnet}");
+Console.WriteLine($"slots={slots.Count} free={slots.Count - Subnets}");
 var quarters = Split(ParseCidr("192.168.10.0/24"), 4);
 Console.WriteLine(string.Join(" ", quarters.Select(Show)));
 Check(slots.Count == 16 && slots[0].Size == 4096);

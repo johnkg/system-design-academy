@@ -1,6 +1,9 @@
 // Retry with exponential backoff and full jitter in JavaScript. Sleep and random are passed in so the demo is deterministic.
 
-async function retry(operation, { maxAttempts = 5, baseMs = 100, capMs = 2000, random = Math.random, sleep } = {}) {
+const MAX_ATTEMPTS = 5;
+const FLAKY_FAILURES = 2, DOWN_ATTEMPTS = 3; // demo: failures before success, attempts for the dead service
+
+async function retry(operation, { maxAttempts = MAX_ATTEMPTS, baseMs = 100, capMs = 2000, random = Math.random, sleep } = {}) {
   for (let attempt = 1; ; attempt++) {
     try {
       return await operation(attempt);
@@ -19,7 +22,7 @@ const fixedRandom = () => 0.5;
 
 // A service that fails twice with a temporary error, then works
 const flaky = async (attempt) => {
-  if (attempt <= 2) throw Object.assign(new Error("503 unavailable"), { retryable: true });
+  if (attempt <= FLAKY_FAILURES) throw Object.assign(new Error("503 unavailable"), { retryable: true });
   return `ok on attempt ${attempt}`;
 };
 console.log(await retry(flaky, { random: fixedRandom, sleep }));
@@ -35,7 +38,7 @@ try {
 // A service that never recovers: stops after the maximum attempts
 const down = async () => { throw Object.assign(new Error("503 unavailable"), { retryable: true }); };
 try {
-  await retry(down, { maxAttempts: 3, random: fixedRandom, sleep });
+  await retry(down, { maxAttempts: DOWN_ATTEMPTS, random: fixedRandom, sleep });
 } catch (e) {
   console.log(`gave up after 3 attempts: ${e.message}`);
 }

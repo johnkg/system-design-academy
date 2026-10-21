@@ -32,6 +32,8 @@ record Row(int T, int Old, int New, int Starting, int Ready, int Total, int Star
 
 static class Planner
 {
+    const int MaxTicks = 200; // safety limit: give up if a rollout has not finished by then
+
     public static List<Row> Plan(int n, int maxSurge, int maxUnavailable, int readyAfter)
     {
         if (maxSurge == 0 && maxUnavailable == 0) throw new ArgumentException("surge 0 and unavailable 0 can never make progress");
@@ -39,7 +41,7 @@ static class Planner
         int newReady = 0; // ready v2 servers
         var starting = new List<int>(); // countdowns for v2 servers that are still booting
         var rows = new List<Row>();
-        for (int tick = 0; tick < 200; tick++)
+        for (int tick = 0; tick < MaxTicks; tick++)
         {
             int started = 0, stopped = 0;
             while (true)

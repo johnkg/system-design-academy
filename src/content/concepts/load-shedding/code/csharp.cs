@@ -8,6 +8,7 @@ public static class Program
     const int Steps = 200, SpikeSteps = 100; // 20 s in total, the first 10 s overloaded
     const int Capacity = 10, Timeout = 20, Limit = 50;
     const int SpikeArrivals = 30, CalmArrivals = 6; // 300 per second, then 60 per second
+    const int StepMs = 100;
 
     record Result(int Good, int Wasted, int Rejected, int Dropped, int Left, int AvgMs);
 
@@ -43,7 +44,7 @@ public static class Program
                 if (latency <= Timeout)
                 {
                     good++; // an answer the caller was still waiting for
-                    latSum += latency * 100;
+                    latSum += latency * StepMs;
                 }
                 else wasted++; // the server was busy, but the caller had already left
             }

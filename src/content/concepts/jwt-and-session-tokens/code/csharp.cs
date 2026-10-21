@@ -42,7 +42,8 @@ static string Verify(string token, string secret, int now, string expIss, string
 
 const string Secret = "demo-secret-at-least-32-bytes-long!";
 const int Now = 1000;
-string token = Sign("auth.shop", "alice", "orders-api", Now + 300, Secret);
+const int TokenTtlS = 300; // access tokens live 5 minutes
+string token = Sign("auth.shop", "alice", "orders-api", Now + TokenTtlS, Secret);
 Console.WriteLine("token: " + token.Substring(0, 36) + "...");
 
 string[] tp = token.Split('.');
@@ -52,10 +53,10 @@ var cases = new List<(string Name, string Tok, string Want)>
     ("valid token", token, "ok"),
     ("alg=none, empty signature", B64s("{\"alg\":\"none\",\"typ\":\"JWT\"}") + "." + tp[1] + ".", "reject: alg is not HS256"),
     ("tampered payload (sub=admin)", tp[0] + "." + tamperedPayload + "." + tp[2], "reject: bad signature"),
-    ("signed with another key", Sign("auth.shop", "alice", "orders-api", Now + 300, "some-other-secret-of-32-bytes-xxxx"), "reject: bad signature"),
+    ("signed with another key", Sign("auth.shop", "alice", "orders-api", Now + TokenTtlS, "some-other-secret-of-32-bytes-xxxx"), "reject: bad signature"),
     ("expired", Sign("auth.shop", "alice", "orders-api", Now - 1, Secret), "reject: expired"),
-    ("wrong audience", Sign("auth.shop", "alice", "billing-api", Now + 300, Secret), "reject: wrong audience"),
-    ("wrong issuer", Sign("evil.example", "alice", "orders-api", Now + 300, Secret), "reject: wrong issuer"),
+    ("wrong audience", Sign("auth.shop", "alice", "billing-api", Now + TokenTtlS, Secret), "reject: wrong audience"),
+    ("wrong issuer", Sign("evil.example", "alice", "orders-api", Now + TokenTtlS, Secret), "reject: wrong issuer"),
     ("two parts only", tp[0] + "." + tp[1], "reject: malformed"),
 };
 

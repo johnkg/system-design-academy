@@ -58,14 +58,19 @@ function install(plan, verify) { // download each artifact, then check it agains
 const show = (label, plan) => console.log(label.padEnd(22) + Object.entries(plan).sort(byName).map(([n, e]) => `${n}@${e.version}/${e.registry.slice(0, 3)}`).join(" "));
 const must = (c, m) => { if (!c) { console.error("invariant violated: " + m); process.exit(1); } };
 
-const lock = resolve(30, { scopes: { "acme-": "private" } });
+const LOCK_DAY = 30; // the day the lockfile is written
+const ATTACK_DAY = 40; // the day the malicious releases appear
+const TODAY = 41;
+const MIN_AGE_DAYS = 3; // quarantine: ignore releases younger than this
+
+const lock = resolve(LOCK_DAY, { scopes: { "acme-": "private" } });
 show("day 30 fresh + lock", lock);
-registries.public.httputil.push(rel("1.2.9", 40, { textkit: "^3.0.0" }, "httputil 1.2.9 + steal(env)"));
-registries.public["acme-billing"] = [rel("1.99.0", 40, {}, "acme-billing 1.99.0 (attacker)")];
-const floating = resolve(41);
-const locked = resolve(41, { lock });
-const gated = resolve(41, { minAge: 3, scopes: { "acme-": "private" } });
-const scoped = resolve(41, { scopes: { "acme-": "private" } });
+registries.public.httputil.push(rel("1.2.9", ATTACK_DAY, { textkit: "^3.0.0" }, "httputil 1.2.9 + steal(env)"));
+registries.public["acme-billing"] = [rel("1.99.0", ATTACK_DAY, {}, "acme-billing 1.99.0 (attacker)")];
+const floating = resolve(TODAY);
+const locked = resolve(TODAY, { lock });
+const gated = resolve(TODAY, { minAge: MIN_AGE_DAYS, scopes: { "acme-": "private" } });
+const scoped = resolve(TODAY, { scopes: { "acme-": "private" } });
 show("day 41 floating", floating);
 show("day 41 lockfile", locked);
 show("day 41 age gate 3d", gated);

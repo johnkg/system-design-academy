@@ -4,6 +4,12 @@ import sys
 
 REGIONS = ["North", "South", "East", "West"]
 INIT = ["North", "South", "East", "South", "West", "East", "North", "West"]
+DAYS = 360
+FACTS = 200  # sales in the demo
+MIN_AMOUNT = 20  # sale amounts are 20..200
+AMOUNT_SPREAD = 181
+DAY_KEY = 1000000  # event sort key: day * DAY_KEY + position
+FACT_AFTER_CHANGES = 100000  # on the same day, changes load before facts
 # The change feed: customer index, effective day, arrival day, new region and tier.
 FEED = [
     (6, 80, 80, "South", "basic"),
@@ -23,8 +29,8 @@ def nxt():
     return seed >> 8
 
 facts = []
-for i in range(200):
-    facts.append({"id": i, "day": 1 + nxt() % 360, "cust": nxt() % 8, "amount": 20 + nxt() % 181})
+for i in range(FACTS):
+    facts.append({"id": i, "day": 1 + nxt() % DAYS, "cust": nxt() % len(INIT), "amount": MIN_AMOUNT + nxt() % AMOUNT_SPREAD})
 
 def hash_of(region, tier):  # hash of the tracked attributes only (FNV-1a, 32 bit)
     h = 2166136261
@@ -38,7 +44,7 @@ def load(kind, correct_late):
         rows.append({"sk": len(rows) + 1, "cust": cust, "region": region, "hash": hash_of(region, "basic"), "from": 1, "to": None})
     def covering(cust, day):
         return next(r for r in rows if r["cust"] == cust and r["from"] <= day and (r["to"] is None or day < r["to"]))
-    events = [(c[2] * 1000000 + i, c, None) for i, c in enumerate(FEED)] + [(f["day"] * 1000000 + 100000 + f["id"], None, f) for f in facts]
+    events = [(c[2] * DAY_KEY + i, c, None) for i, c in enumerate(FEED)] + [(f["day"] * DAY_KEY + FACT_AFTER_CHANGES + f["id"], None, f) for f in facts]
     fact_sk = {}
     for _, change, fact in sorted(events, key=lambda e: e[0]):
         if change:
@@ -101,7 +107,7 @@ check(revenue(t2fix["region_of"]) == truth, "type 2 with correction must match t
 check(revenue(t1["region_of"]) != truth, "type 1 must differ from the true-at-the-time totals")
 check(wrong(t2naive) > 0, "a late change without correction must mis-join some facts")
 for l in (t1, t2naive, t2fix):
-    for c in range(8):
+    for c in range(len(INIT)):
         mine = sorted((r for r in l["rows"] if r["cust"] == c), key=lambda r: r["from"])
         check(sum(1 for r in mine if r["to"] is None) == 1, "exactly one current row per customer")
         check(all(i == 0 or mine[i - 1]["to"] == r["from"] for i, r in enumerate(mine)), "versions must be contiguous")

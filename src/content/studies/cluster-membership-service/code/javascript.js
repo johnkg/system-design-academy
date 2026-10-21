@@ -3,14 +3,20 @@
 
 const N = 12, CRASH = 3, SLOW = 7, CRASH_AT = 5, PAUSE_AT = 20, PAUSE_FOR = 4, ROUNDS = 40;
 const RETRANSMIT = 8, PIGGYBACK = 4, LOSS = 5; // each update is sent 8 times, 4 per message, 5% of messages are lost
+const SEED = 7;
+const VNODES = 8; // ring tokens per member
+const TOKEN_STRIDE = 100; // member m's tokens are hashed from m * 100 + v
+const LONG_SUSPECT = 6; // rounds of suspicion: longer than the pause, then shorter
+const SHORT_SUSPECT = 2;
+const KEYS = 1000; // keys placed on the ring
 const ALIVE = 0, SUSPECT = 1, DEAD = 2;
 
-let seed = 7;
+let seed = SEED;
 const rand = (n) => { seed = (Math.imul(seed, 1664525) + 1013904223) >>> 0; return (seed >>> 16) % n; };
 const running = (x, t) => !(x === CRASH && t >= CRASH_AT) && !(x === SLOW && t >= PAUSE_AT && t < PAUSE_AT + PAUSE_FOR);
 
 function run(suspectFor) {
-  seed = 7;
+  seed = SEED;
   const nodes = Array.from({ length: N }, (_, id) => ({ id, inc: 0, refute: false, status: Array(N).fill(ALIVE), known: Array(N).fill(0), since: Array(N).fill(0), buffer: [] }));
   const everDead = new Set();
   let learnedAt = -1;
@@ -61,27 +67,28 @@ function run(suspectFor) {
   return { learnedAt, falseDead: [...everDead].sort((a, b) => a - b), incSlow: nodes[SLOW].inc };
 }
 
+// 32-bit integer hash finalizer (xor-shift-multiply)
 const mix = (x) => { x = Math.imul(x ^ (x >>> 16), 0x45d9f3b) >>> 0; x = Math.imul(x ^ (x >>> 16), 0x45d9f3b) >>> 0; return (x ^ (x >>> 16)) >>> 0; };
 function owner(key, members) { // first token at or after the key's hash, going clockwise
   const h = mix(key * 31 + 5); let best = -1, bestTok = 0, first = -1, firstTok = 0;
-  for (const m of members) for (let v = 0; v < 8; v++) {
-    const tok = mix(m * 100 + v);
+  for (const m of members) for (let v = 0; v < VNODES; v++) {
+    const tok = mix(m * TOKEN_STRIDE + v);
     if (tok >= h && (best < 0 || tok < bestTok)) { best = m; bestTok = tok; }
     if (first < 0 || tok < firstTok) { first = m; firstTok = tok; }
   }
   return best >= 0 ? best : first;
 }
 
-for (const suspectFor of [6, 2]) {
+for (const suspectFor of [LONG_SUSPECT, SHORT_SUSPECT]) {
   const r = run(suspectFor);
   console.log(`suspicion ${suspectFor}: crash known by every node ${r.learnedAt} rounds after it happened; healthy nodes declared dead: [${r.falseDead.join(',')}]; slow node incarnation ${r.incSlow}`);
   if (r.learnedAt < 0) process.exit(1);
-  if (suspectFor === 6 && (r.falseDead.length !== 0 || r.incSlow < 1)) process.exit(1); // the pause is shorter than the suspicion time, so it is refuted
-  if (suspectFor === 2 && !r.falseDead.includes(SLOW)) process.exit(1);                 // a too-short suspicion time causes a false positive
+  if (suspectFor === LONG_SUSPECT && (r.falseDead.length !== 0 || r.incSlow < 1)) process.exit(1); // the pause is shorter than the suspicion time, so it is refuted
+  if (suspectFor === SHORT_SUSPECT && !r.falseDead.includes(SLOW)) process.exit(1);                 // a too-short suspicion time causes a false positive
 }
 
 const all = Array.from({ length: N }, (_, i) => i), without = (x) => all.filter((m) => m !== x);
-const keys = Array.from({ length: 1000 }, (_, k) => k);
+const keys = Array.from({ length: KEYS }, (_, k) => k);
 const before = keys.map((k) => owner(k, all));
 const moved = (gone) => keys.filter((k) => owner(k, without(gone)) !== before[k]).length;
 const owned = (x) => before.filter((o) => o === x).length;

@@ -7,14 +7,16 @@ using System.Linq;
 class Bloom
 {
     readonly bool[] bits;
-    public Bloom(int entries) { bits = new bool[entries * 10]; } // 10 bits per key, 4 hashes
+    const int BitsPerKey = 10; // bloom filter size per key
+    const int Hashes = 4; // hash functions per key (seeds 1..4)
+    public Bloom(int entries) { bits = new bool[entries * BitsPerKey]; } // 10 bits per key, 4 hashes
     public static uint Fnv(string key, uint seed) // deterministic 32-bit FNV-1a hash, seeded
     {
         uint h = 2166136261u ^ seed;
         foreach (var ch in key) h = unchecked((h ^ ch) * 16777619u);
         return h;
     }
-    IEnumerable<int> Slots(string key) { for (uint seed = 1; seed <= 4; seed++) yield return (int)(Fnv(key, seed) % (uint)bits.Length); }
+    IEnumerable<int> Slots(string key) { for (uint seed = 1; seed <= Hashes; seed++) yield return (int)(Fnv(key, seed) % (uint)bits.Length); }
     public void Add(string key) { foreach (var s in Slots(key)) bits[s] = true; }
     public bool MightContain(string key) => Slots(key).All(s => bits[s]);
 }
@@ -98,6 +100,14 @@ class Lsm
 
 static class Program
 {
+    const int MemLimit = 4; // entries the memtable holds before it flushes
+    const int MaxRuns = 3; // sorted runs before compaction
+    const int Ops = 40; // demo: random puts and deletes
+    const int KeySpace = 16; // keys user:00..user:15
+    const int DeleteOneIn = 5; // one op in 5 is a delete
+    const int ReportEvery = 10;
+    const int AbsentFrom = 20; // keys from here on were never written
+    const int AbsentKeys = 16;
     static uint seed = 7;
     static int Rnd(int n) { seed = unchecked(seed * 1664525u + 1013904223u); return (int)((seed >> 8) % (uint)n); }
     static string UserKey(int n) => $"user:{n:00}";
@@ -106,22 +116,22 @@ static class Program
 
     static void Main()
     {
-        var db = new Lsm(4, 3);
+        var db = new Lsm(MemLimit, MaxRuns);
         var truth = new Dictionary<string, string>(); // a plain map that must always agree with the LSM
-        for (int op = 1; op <= 40; op++)
+        for (int op = 1; op <= Ops; op++)
         {
-            var key = UserKey(Rnd(16));
-            if (Rnd(5) == 0) { db.Delete(key); truth.Remove(key); }
+            var key = UserKey(Rnd(KeySpace));
+            if (Rnd(DeleteOneIn) == 0) { db.Delete(key); truth.Remove(key); }
             else { db.Put(key, $"v{op}"); truth[key] = $"v{op}"; }
-            for (int n = 0; n < 16; n++)
+            for (int n = 0; n < KeySpace; n++)
             {
                 truth.TryGetValue(UserKey(n), out var want);
                 if (db.Get(UserKey(n)) != want) Fail($"stale read of {UserKey(n)} after op {op}");
             }
-            if (op % 10 == 0) Console.WriteLine($"op {op}: runs=[{string.Join(",", db.Runs.Select(r => r.Entries.Count))}] memtable={db.Mem.Count}");
+            if (op % ReportEvery == 0) Console.WriteLine($"op {op}: runs=[{string.Join(",", db.Runs.Select(r => r.Entries.Count))}] memtable={db.Mem.Count}");
         }
         db.BloomSkips = 0; db.RunReads = 0;
-        for (int n = 20; n < 36; n++) if (db.Get(UserKey(n)) != null) Fail("ghost key"); // 16 absent keys
+        for (int n = AbsentFrom; n < AbsentFrom + AbsentKeys; n++) if (db.Get(UserKey(n)) != null) Fail("ghost key"); // 16 absent keys
         Console.WriteLine($"16 lookups of absent keys: {db.RunReads} run reads, {db.BloomSkips} skipped by bloom filters");
 
         int amp = (db.Flushed + db.Compacted) * 100 / db.Puts;

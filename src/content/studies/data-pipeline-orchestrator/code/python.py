@@ -15,10 +15,12 @@ def fnv(s):
 TASKS = [("wait_file", []), ("extract", ["wait_file"]), ("clean", ["extract"]), ("by_region", ["clean"]),
          ("by_product", ["clean"]), ("report", ["by_region", "by_product"])]
 POKE, TIMEOUT, MAX_ATTEMPTS = 10, 30, 3  # sensor checks every 10 minutes and gives up after 30
+FLAKY_ONE_IN = 5  # one task-day in 5 is flaky
+BACKOFF_MIN = 30  # retry backoff in minutes: 30, then 60
 
 
 def flaky(task, day):
-    return fnv(f"{task}:{day}") % 5 == 0  # fails its first two attempts, then works
+    return fnv(f"{task}:{day}") % FLAKY_ONE_IN == 0  # fails its first two attempts, then works
 
 
 class Orchestrator:
@@ -39,7 +41,7 @@ class Orchestrator:
         for attempt in range(1, MAX_ATTEMPTS + 1):
             if flaky(task, day) and attempt < MAX_ATTEMPTS:
                 s["retries"] += 1
-                s["backoff"] += 30 * 2 ** (attempt - 1)
+                s["backoff"] += BACKOFF_MIN * 2 ** (attempt - 1)
                 continue
             inputs = [str(self.output[f"{d}/{day}"]) for d in deps]
             self.output[key] = fnv(f"{task}:{day}:{','.join(inputs)}")  # overwrite the partition, never append

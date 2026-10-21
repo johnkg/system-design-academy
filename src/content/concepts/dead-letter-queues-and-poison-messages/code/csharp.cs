@@ -4,17 +4,18 @@ using System;
 using System.Collections.Generic;
 using System.Linq;
 
-const int Total = 40, Limit = 3, Horizon = 400;
+const int Seed = 7, Total = 40, Limit = 3, Horizon = 400;
+const int PoisonPct = 8, TransientPct = 17; // share of messages that always fail / fail for a while
 
 string[] MakeKinds()
 {
-    long x = 7;
+    long x = Seed;
     var kinds = new string[Total];
     for (int i = 0; i < Total; i++)
     {
         x = (x * 48271) % 2147483647; // MINSTD, integer only
         long r = x % 100;
-        kinds[i] = r < 8 ? "poison" : r < 25 ? "transient" : "ok";
+        kinds[i] = r < PoisonPct ? "poison" : r < PoisonPct + TransientPct ? "transient" : "ok";
     }
     return kinds;
 }

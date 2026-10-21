@@ -25,11 +25,12 @@ def join(items):
     return ",".join(str(i) for i in items)
 
 
+AMOUNT, CHANGED_AMOUNT = 50, 80  # dollars; the second is a different body under the same key
 api = PaymentApi()
 
 print("--- without reusing the key: the retry becomes a second payment")
-api.charge("attempt-1", 50)
-api.charge("attempt-2", 50)  # the app made a new key on retry
+api.charge("attempt-1", AMOUNT)
+api.charge("attempt-2", AMOUNT)  # the app made a new key on retry
 print(f"charges: [{join(api.charges)}] total ${sum(api.charges)}")
 
 fresh = PaymentApi()
@@ -40,11 +41,11 @@ def show(r):
 
 
 print("--- reusing the key: the retry is a replay")
-print(show(fresh.charge("abc-123", 50)))
-print(show(fresh.charge("abc-123", 50)))  # the response was lost, so the client retries with the same key
+print(show(fresh.charge("abc-123", AMOUNT)))
+print(show(fresh.charge("abc-123", AMOUNT)))  # the response was lost, so the client retries with the same key
 print(f"charges: [{join(fresh.charges)}] total ${sum(fresh.charges)}")
 
 try:
-    fresh.charge("abc-123", 80)
+    fresh.charge("abc-123", CHANGED_AMOUNT)
 except ValueError as e:
     print(f"rejected: {e}")

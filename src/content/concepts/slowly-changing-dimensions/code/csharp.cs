@@ -18,6 +18,12 @@ public static class Program
 {
     static readonly string[] Regions = { "North", "South", "East", "West" };
     static readonly string[] Init = { "North", "South", "East", "South", "West", "East", "North", "West" };
+    const int Days = 360;
+    const int Facts = 200; // sales in the demo
+    const int MinAmount = 20; // sale amounts are 20..200
+    const int AmountSpread = 181;
+    const int DayKey = 1000000; // event sort key: day * DAY_KEY + position
+    const int FactAfterChanges = 100000; // on the same day, changes load before facts
     // The change feed: effective day, arrival day, customer index, new region and tier.
     static readonly Change[] Feed =
     {
@@ -42,10 +48,10 @@ public static class Program
     static Loaded Load(int type, bool correctLate)
     {
         var l = new Loaded();
-        for (int c = 0; c < 8; c++) l.Rows.Add(new Row { Sk = c + 1, Cust = c, Region = Init[c], Hash = HashOf(Init[c], "basic"), From = 1, To = null });
+        for (int c = 0; c < Init.Length; c++) l.Rows.Add(new Row { Sk = c + 1, Cust = c, Region = Init[c], Hash = HashOf(Init[c], "basic"), From = 1, To = null });
         Row Covering(int cust, int day) => l.Rows.First(r => r.Cust == cust && r.From <= day && (r.To == null || day < r.To));
-        var events = Feed.Select((c, i) => (key: (long)c.Arrive * 1000000 + i, change: (Change?)c, fact: (Fact?)null))
-            .Concat(facts.Select(f => (key: (long)f.Day * 1000000 + 100000 + f.Id, change: (Change?)null, fact: (Fact?)f)))
+        var events = Feed.Select((c, i) => (key: (long)c.Arrive * DayKey + i, change: (Change?)c, fact: (Fact?)null))
+            .Concat(facts.Select(f => (key: (long)f.Day * DayKey + FactAfterChanges + f.Id, change: (Change?)null, fact: (Fact?)f)))
             .OrderBy(e => e.key);
         foreach (var e in events)
         {
@@ -98,7 +104,7 @@ public static class Program
     {
         uint seed = 7; // 32-bit LCG so every language produces the same sales
         int Next() { seed = unchecked(seed * 1664525 + 1013904223); return (int)(seed >> 8); }
-        for (int id = 0; id < 200; id++) { int day = 1 + Next() % 360, cust = Next() % 8, amount = 20 + Next() % 181; facts.Add(new Fact(id, day, cust, amount)); }
+        for (int id = 0; id < Facts; id++) { int day = 1 + Next() % Days, cust = Next() % Init.Length, amount = MinAmount + Next() % AmountSpread; facts.Add(new Fact(id, day, cust, amount)); }
 
         var truth = Revenue(TruthRegion);
         var t1 = Load(1, false); var t2naive = Load(2, false); var t2fix = Load(2, true);
@@ -115,7 +121,7 @@ public static class Program
         Check(!Same(Revenue(t1.RegionOf), truth), "type 1 must differ from the true-at-the-time totals");
         Check(Wrong(t2naive) > 0, "a late change without correction must mis-join some facts");
         foreach (var l in new[] { t1, t2naive, t2fix })
-            for (int c = 0; c < 8; c++)
+            for (int c = 0; c < Init.Length; c++)
             {
                 var mine = l.Rows.Where(r => r.Cust == c).OrderBy(r => r.From).ToList();
                 Check(mine.Count(r => r.To == null) == 1, "exactly one current row per customer");

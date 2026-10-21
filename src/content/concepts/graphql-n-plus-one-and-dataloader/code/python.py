@@ -2,10 +2,10 @@
 # The "tick" is simulated: the executor calls dispatch() after every resolver of one tree level has run, so it is deterministic.
 import sys
 
-N, M = 5, 4  # 5 posts, 4 comments each
-users = [{"tag": f"U{i}", "id": i} for i in range(1, 7)]
-posts = [{"tag": f"P{i}", "id": i, "authorId": ((i * 2) % 6) + 1} for i in range(1, N + 1)]
-comments = [{"tag": f"C{i}", "id": i, "postId": (i - 1) // M + 1, "authorId": ((i * 5 + 3) % 6) + 1} for i in range(1, N * M + 1)]
+N, M, USERS = 5, 4, 6  # 5 posts, 4 comments each, 6 users
+users = [{"tag": f"U{i}", "id": i} for i in range(1, USERS + 1)]
+posts = [{"tag": f"P{i}", "id": i, "authorId": ((i * 2) % USERS) + 1} for i in range(1, N + 1)]
+comments = [{"tag": f"C{i}", "id": i, "postId": (i - 1) // M + 1, "authorId": ((i * 5 + 3) % USERS) + 1} for i in range(1, N * M + 1)]
 
 
 class Db:  # counts every query it receives

@@ -1,11 +1,18 @@
 # Point-in-time recovery in Python: a base backup plus an ordered change log (the WAL archive).
 # restore() copies the base, then replays records in LSN order until the target time or LSN.
+SECONDS_PER_MINUTE, SECONDS_PER_HOUR = 60, 3600
+MISSING_LSN = 6  # the archive segment we drop to show a broken chain
+
+
 def clock(t):
-    return f"{t // 3600:02d}:{t % 3600 // 60:02d}:{t % 60:02d}"
+    return f"{t // SECONDS_PER_HOUR:02d}:{t % SECONDS_PER_HOUR // SECONDS_PER_MINUTE:02d}:{t % SECONDS_PER_MINUTE:02d}"
 
 
 def at(h, m, s=0):
-    return h * 3600 + m * 60 + s
+    return h * SECONDS_PER_HOUR + m * SECONDS_PER_MINUTE + s
+
+
+MISTAKE_AT = at(14, 3)  # when the DELETE without WHERE runs
 
 
 def apply(orders, rec):
@@ -69,20 +76,20 @@ archive = db.log
 print(f"base backup {clock(base['ts'])} covers up to LSN {base['lsn']}; archive holds LSN {base['lsn'] + 1}..{len(archive)}")
 print(f"DELETE without WHERE is LSN {bad} at {clock(archive[bad - 1][1])}")
 
-good, n = restore(base, archive, target_ts=at(14, 3) - 1)
-print(f"restore to {clock(at(14, 3) - 1)}: applied through LSN {n}: {show(good)}")
+good, n = restore(base, archive, target_ts=MISTAKE_AT - 1)
+print(f"restore to {clock(MISTAKE_AT - 1)}: applied through LSN {n}: {show(good)}")
 by_lsn, n2 = restore(base, archive, target_lsn=bad - 1)
 print(f"restore to LSN {bad - 1}: {show(by_lsn)}")
 same = by_lsn == good
 print(f"same result by time and by LSN: {str(same).lower()}")
-after, _ = restore(base, archive, target_ts=at(14, 3))
-print(f"restore to {clock(at(14, 3))}: {show(after)}")
+after, _ = restore(base, archive, target_ts=MISTAKE_AT)
+print(f"restore to {clock(MISTAKE_AT)}: {show(after)}")
 latest, _ = restore(base, archive)
 print(f"restore to end of log: {show(latest)}")
 print(f"replica (replays everything): {show(db.orders)}")
 print(f"base backup only (no archive): {show(base['orders'])}")
 try:
-    restore(base, [r for r in archive if r[0] != 6])
+    restore(base, [r for r in archive if r[0] != MISSING_LSN])
 except ValueError as e:
     print(f"broken archive: {e}")
 

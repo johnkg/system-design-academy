@@ -3,7 +3,14 @@
 // to replication lag) and the split-brain writes the old primary accepts when it comes back.
 
 const FAIL_AT = 25000, CLIENTS = 100, SYNC_RTT = 80, BACK_AFTER_PROMOTE = 15000;
+const SEED = 42;
+const HORIZON_SLACK_MS = 1000; // keep simulating this long after the last client recovers
+const WRITE_GAP_MIN_MS = 50; // writes arrive every 50..149 ms (about 10 per second)
+const WRITE_GAP_SPREAD_MS = 100;
+const LAG_MIN_PCT = 50; // each write's replication lag is 50..149% of lagMs
+const LAG_SPREAD_PCT = 100;
 
+// Park-Miller (MINSTD) generator
 function makeRng(seed) { let x = seed; return (n) => { x = (x * 48271) % 2147483647; return x % n; }; }
 
 // A fencing token authority: every promotion bumps the epoch, and storage rejects older epochs.
@@ -14,7 +21,7 @@ class Fence {
 }
 
 function simulate({ sync, lagMs, ttlMs, intervalMs, threshold, promoteMs, fencing }) {
-  const rng = makeRng(42);
+  const rng = makeRng(SEED);
   // 1. Failure detection: health checks run every interval; N consecutive failures declare A dead.
   const firstBadCheck = Math.ceil(FAIL_AT / intervalMs) * intervalMs;
   const detectAt = firstBadCheck + (threshold - 1) * intervalMs;
@@ -25,15 +32,15 @@ function simulate({ sync, lagMs, ttlMs, intervalMs, threshold, promoteMs, fencin
   // 3. Each client cached the old DNS answer at some random moment, so it keeps using A until its TTL ends.
   const recoverAt = [];
   for (let c = 0; c < CLIENTS; c++) recoverAt.push(promoteAt + rng(ttlMs));
-  const horizon = Math.max(...recoverAt) + 1000;
+  const horizon = Math.max(...recoverAt) + HORIZON_SLACK_MS;
   // 4. A seeded write stream (about 10 per second), replicated to B in order after a random lag.
   let t = 0, applied = 0, acked = 0, lost = 0, oldestLost = -1;
   let failed = 0, fenced = 0, diverged = 0;
   for (;;) {
-    t += 50 + rng(100);
+    t += WRITE_GAP_MIN_MS + rng(WRITE_GAP_SPREAD_MS);
     if (t >= horizon) break;
     const client = rng(CLIENTS);
-    const lag = Math.floor((lagMs * (50 + rng(100))) / 100);
+    const lag = Math.floor((lagMs * (LAG_MIN_PCT + rng(LAG_SPREAD_PCT))) / 100);
     if (t < FAIL_AT) {
       if (sync && t + SYNC_RTT > FAIL_AT) { failed++; continue; } // never acknowledged: the client retries
       acked++;

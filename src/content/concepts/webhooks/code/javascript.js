@@ -27,7 +27,8 @@ class WebhookReceiver {
 }
 
 const body = '{"id":"evt_9","type":"payment.succeeded","order":"order-42"}';
-const request = { timestamp: 1000, signature: sign(1000, body), body };
+const SENT_AT = 1000; // the sender's clock when it signed, in seconds
+const request = { timestamp: SENT_AT, signature: sign(SENT_AT, body), body };
 const receiver = new WebhookReceiver();
 
 console.log(`genuine event:      ${receiver.receive(request, 1010)}`);

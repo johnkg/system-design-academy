@@ -58,12 +58,13 @@ public class Storage
 
 public static class Program
 {
+    const int LeaseTtl = 10; // seconds a lease lasts
     static int time; // seconds, moved by hand
 
     static Storage Scenario(bool checksTokens)
     {
         time = 0;
-        var manager = new LeaseManager(10, () => time);
+        var manager = new LeaseManager(LeaseTtl, () => time);
         var storage = new Storage(checksTokens, manager, () => time);
 
         var a = manager.Acquire("A");
@@ -74,7 +75,7 @@ public static class Program
         Console.WriteLine($"t={time} A passes its lease check, then a GC pause freezes it until t=18");
         time = 5;
         Console.WriteLine($"t={time} B asks for the lease: {(manager.Acquire("B") == null ? "denied, A holds it" : "granted")}");
-        time = 10;
+        time = LeaseTtl;
         var b = manager.Acquire("B")!;
         Console.WriteLine($"t={time} B gets lease: token {b.Token}, expires at t={b.ExpiresAt}");
         storage.Write("B", b.Token, "B1");

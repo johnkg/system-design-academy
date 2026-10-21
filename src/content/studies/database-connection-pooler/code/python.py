@@ -4,8 +4,18 @@
 import sys
 
 WAIT_LIMIT = 20  # a request that has waited this long is rejected
+BURST_SEED = 7
+REQUESTS = 300  # requests in the burst
+BURST_MS = 100  # they all arrive within this window
+MIN_TX_MS = 5  # each transaction takes 5..15 ms
+TX_SPREAD_MS = 11
+RUN_MS = 400  # simulated time, long enough to drain the queue
+LEAK_SEED = 99
+LEAK_STEPS = 300
+CLIENTS = 12
+SERVER_CONNS = 3  # server connections in transaction mode
 
-seed = 7
+seed = BURST_SEED
 
 
 def random(n):
@@ -42,25 +52,25 @@ class Pooler:
 # 300 requests arrive within 100 ms (a burst) and each transaction takes 5 to 15 ms.
 def make_burst():
     global seed
-    seed = 7
-    by_time = [[] for _ in range(100)]
-    for i in range(300):
-        t = random(100)
-        by_time[t].append({"id": i, "duration": 5 + random(11)})
+    seed = BURST_SEED
+    by_time = [[] for _ in range(BURST_MS)]
+    for i in range(REQUESTS):
+        t = random(BURST_MS)
+        by_time[t].append({"id": i, "duration": MIN_TX_MS + random(TX_SPREAD_MS)})
     return by_time
 
 
 def run(size):
     burst = make_burst()
     pooler = Pooler(size)
-    for now in range(400):
-        pooler.tick(now, burst[now] if now < 100 else [])
+    for now in range(RUN_MS):
+        pooler.tick(now, burst[now] if now < BURST_MS else [])
     max_wait = max(pooler.waits)
     avg_wait = sum(pooler.waits) // len(pooler.waits)
     print(f"pool {size:>2}: served {pooler.served}, timed out {pooler.timed_out}, max busy {pooler.max_busy}, max wait {max_wait}, avg wait {avg_wait}")
     if pooler.max_busy > size:
         raise RuntimeError("the pool was exceeded")
-    if pooler.served + pooler.timed_out != 300:
+    if pooler.served + pooler.timed_out != REQUESTS:
         raise RuntimeError("a request was lost")
     return pooler.timed_out
 
@@ -73,13 +83,13 @@ if any(i > 0 and f > failures[i - 1] for i, f in enumerate(failures)):
 # Session state under transaction pooling: a client sets a value on its server connection, and a later transaction may land on another one.
 def leaks(mode):
     global seed
-    seed = 99
+    seed = LEAK_SEED
     own = {}    # what each client believes it set
     state = {}  # what each server connection holds, keyed by client in session mode and by connection otherwise
     wrong = 0
-    for _ in range(300):
-        client = random(12)
-        conn = f"client{client}" if mode == "session" else f"conn{random(3)}"
+    for _ in range(LEAK_STEPS):
+        client = random(CLIENTS)
+        conn = f"client{client}" if mode == "session" else f"conn{random(SERVER_CONNS)}"
         if random(2) == 0:
             state[conn] = client  # SET timezone for this client
             own[client] = True

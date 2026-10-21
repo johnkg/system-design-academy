@@ -5,6 +5,7 @@ This is a teaching model of what TCP does, not real networking code."""
 TOTAL = 5      # segments 0 to 4
 LATENCY = 1    # ticks for a packet to cross the network
 TIMEOUT = 4    # ticks before the sender resends an unacknowledged segment
+LAST_TICK = 11  # the simulation runs ticks 0 to 11
 lost_first_time = {2}  # the network drops segment 2 the first time it is sent
 
 in_flight = []  # packets travelling: {"arrive_at", "kind", "n"}
@@ -26,7 +27,7 @@ def transmit(tick, segment):
         in_flight.append({"arrive_at": tick + LATENCY, "kind": "data", "n": segment})
 
 
-for tick in range(12):
+for tick in range(LAST_TICK + 1):
     # Packets that arrive on this tick
     for packet in [p for p in in_flight if p["arrive_at"] == tick]:
         if packet["kind"] == "data":

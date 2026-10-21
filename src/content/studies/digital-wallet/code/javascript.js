@@ -51,11 +51,14 @@ class Wallet {
   count(state) { return [...this.log.values()].filter((r) => r.state === state).length; }
 }
 
-let seed = 7;
+const SEED = 7, TRANSFERS = 24, MIN_AMOUNT = 20, AMOUNT_RANGE = 80;
+const CRASH_EVERY = 5, RETRY_EVERY = 4; // every 5th transfer crashes mid-way, every 4th is sent again
+let seed = SEED;
+// Linear congruential generator (Numerical Recipes constants), high 16 bits.
 const random = (n) => { seed = (seed * 1664525 + 1013904223) % 4294967296; return Math.floor(seed / 65536) % n; };
-const transfers = Array.from({ length: 24 }, (_, id) => {
+const transfers = Array.from({ length: TRANSFERS }, (_, id) => {
   const from = random(ACCOUNTS);
-  return { id, from, to: (from + 1 + random(ACCOUNTS - 1)) % ACCOUNTS, amt: 20 + random(80), crash: id % 5 === 2, again: id % 4 === 1 };
+  return { id, from, to: (from + 1 + random(ACCOUNTS - 1)) % ACCOUNTS, amt: MIN_AMOUNT + random(AMOUNT_RANGE), crash: id % CRASH_EVERY === 2, again: id % RETRY_EVERY === 1 };
 });
 
 const bad = naive(transfers);

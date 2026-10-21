@@ -2,27 +2,35 @@
 # Integer maths and a seeded LCG keep the output identical in every language.
 import sys
 
-seed = 12345
+SEED = 12345
+seed = SEED
 
 
 def rnd():
+    """Park-Miller "minimal standard" LCG (MINSTD): multiplier 48271, modulus 2^31 - 1."""
     global seed
     seed = (seed * 48271) % 2147483647
     return seed
 
 
 N, CLUSTERS, NLIST, K, Q = 2000, 24, 32, 10, 40
+CENTER_MIN, CENTER_SPREAD = 1000, 8000  # cluster centres lie in [1000, 9000)
+JITTER_RANGE = 1600
+JITTER_CENTER = 3 * JITTER_RANGE // 2  # sum of three draws in 0..1600, centred on 0
+KMEANS_ROUNDS = 6
+ID_SLOTS = 4096  # a candidate packs distance * ID_SLOTS + id; N must stay below it
+FILTER_TAG = 3
 cx, cy = [], []
 for _ in range(CLUSTERS):
-    cx.append(rnd() % 8000 + 1000)
-    cy.append(rnd() % 8000 + 1000)
+    cx.append(rnd() % CENTER_SPREAD + CENTER_MIN)
+    cy.append(rnd() % CENTER_SPREAD + CENTER_MIN)
 
 
 def jitter():
-    a = rnd() % 1601
-    b = rnd() % 1601
-    c = rnd() % 1601
-    return a + b + c - 2400
+    a = rnd() % (JITTER_RANGE + 1)
+    b = rnd() % (JITTER_RANGE + 1)
+    c = rnd() % (JITTER_RANGE + 1)
+    return a + b + c - JITTER_CENTER
 
 
 px, py, tag = [], [], []
@@ -55,7 +63,7 @@ def nearest(x, y):
     return b
 
 
-for _ in range(6):
+for _ in range(KMEANS_ROUNDS):
     assign = [nearest(px[i], py[i]) for i in range(N)]
     sx, sy, n = [0] * NLIST, [0] * NLIST, [0] * NLIST
     for i, c in enumerate(assign):
@@ -79,9 +87,9 @@ def search(q, nprobe, filt, everything):
     for i in ids:
         if filt < 0 or tag[i] == filt:
             work += 1
-            cand.append(d2(q[0], q[1], px[i], py[i]) * 4096 + i)
+            cand.append(d2(q[0], q[1], px[i], py[i]) * ID_SLOTS + i)
     cand.sort()
-    return [v % 4096 for v in cand[:K]], work + (0 if everything else NLIST)
+    return [v % ID_SLOTS for v in cand[:K]], work + (0 if everything else NLIST)
 
 
 def run(nprobe, filt, post):
@@ -108,8 +116,9 @@ for p in [1, 2, 4, 8, 32]:
 if prev[0] != prev[2]:
     sys.exit(1)  # probing every list is exact
 for p in [1, 4, 32]:
-    pre, post = run(p, 3, False), run(p, 3, True)
+    pre, post = run(p, FILTER_TAG, False), run(p, FILTER_TAG, True)
     print(f"filter tag=3 nprobe={p}: pre-filter recall={pre[0] * 100 // pre[1]}% post-filter recall={post[0] * 100 // post[1]}% post-filter results returned={post[3]}/{post[1]}")
 # Memory: 10M vectors of 768 dimensions.
 V, D, MB = 10000000, 768, 1000000
-print(f"float32 {V * D * 4 // MB} MB, int8 {V * D // MB} MB, product quantisation (96 bytes per vector) {V * 96 // MB} MB")
+FLOAT32_BYTES, PQ_BYTES = 4, 96
+print(f"float32 {V * D * FLOAT32_BYTES // MB} MB, int8 {V * D // MB} MB, product quantisation (96 bytes per vector) {V * PQ_BYTES // MB} MB")

@@ -1,6 +1,13 @@
 # CIDR math with plain integers: parse, describe, split, overlap check and longest-prefix match.
 import sys
 
+IPV4_BITS = 32
+OCTET_VALUES = 256  # values per dotted-quad octet
+RESERVED_PER_SUBNET = 5  # network, router, DNS, future use, broadcast
+FIRST_HOST_OFFSET = 4  # the first usable address follows network, router, DNS and future use
+TIERS, ZONES = 3, 3
+SUBNETS = TIERS * ZONES
+
 
 def check(ok):
     if not ok:
@@ -9,13 +16,13 @@ def check(ok):
 
 
 def mask_of(p):
-    return 0 if p == 0 else (0xFFFFFFFF << (32 - p)) & 0xFFFFFFFF
+    return 0 if p == 0 else (0xFFFFFFFF << (IPV4_BITS - p)) & 0xFFFFFFFF
 
 
 def parse_ip(s):
     n = 0
     for o in s.split("."):
-        n = n * 256 + int(o)
+        n = n * OCTET_VALUES + int(o)
     return n
 
 
@@ -27,7 +34,7 @@ def parse_cidr(text):
     ip, length = text.split("/")
     prefix = int(length)
     net = parse_ip(ip) & mask_of(prefix)  # clear the host bits
-    size = 2 ** (32 - prefix)
+    size = 2 ** (IPV4_BITS - prefix)
     return {"net": net, "prefix": prefix, "size": size, "last": net + size - 1}
 
 
@@ -38,7 +45,7 @@ def show(c):
 # Cloud VPCs reserve 5 addresses per subnet: network, router, DNS, future use, broadcast.
 def describe(text):
     c = parse_cidr(text)
-    return (f"{show(c)} addresses={c['size']} usable={c['size'] - 5} first={fmt_ip(c['net'] + 4)} "
+    return (f"{show(c)} addresses={c['size']} usable={c['size'] - RESERVED_PER_SUBNET} first={fmt_ip(c['net'] + FIRST_HOST_OFFSET)} "
             f"last={fmt_ip(c['last'] - 1)} mask={fmt_ip(mask_of(c['prefix']))}")
 
 
@@ -48,7 +55,7 @@ def split(block, count):
     while 2 ** bits < count:
         bits += 1
     prefix = block["prefix"] + bits
-    step = 2 ** (32 - prefix)
+    step = 2 ** (IPV4_BITS - prefix)
     return [{"net": block["net"] + i * step, "prefix": prefix, "size": step, "last": block["net"] + (i + 1) * step - 1}
             for i in range(2 ** bits)]
 
@@ -74,11 +81,11 @@ check(parse_cidr("10.0.0.0/16")["size"] == 65536)
 check(parse_cidr("10.0.0.77/24")["net"] == parse_ip("10.0.0.0"))
 
 # Three tiers x three zones = 9 subnets -> 4 bits -> 16 slots of /20, tier by tier.
-slots = split(parse_cidr("10.20.0.0/16"), 9)
+slots = split(parse_cidr("10.20.0.0/16"), SUBNETS)
 tiers = ["public", "private", "database"]
-for i, s in enumerate(slots[:9]):
-    print(f"{tiers[i // 3]}-{'abc'[i % 3]} {show(s)} usable={s['size'] - 5}")
-print(f"slots={len(slots)} free={len(slots) - 9}")
+for i, s in enumerate(slots[:SUBNETS]):
+    print(f"{tiers[i // ZONES]}-{'abc'[i % ZONES]} {show(s)} usable={s['size'] - RESERVED_PER_SUBNET}")
+print(f"slots={len(slots)} free={len(slots) - SUBNETS}")
 quarters = split(parse_cidr("192.168.10.0/24"), 4)
 print(" ".join(show(q) for q in quarters))
 check(len(slots) == 16 and slots[0]["size"] == 4096)

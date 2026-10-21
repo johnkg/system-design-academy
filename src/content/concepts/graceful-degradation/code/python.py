@@ -15,7 +15,14 @@ SCENARIOS = [
     ("product down", {"product": "down"}),
 ]
 N, CRITICAL_TIMEOUT, USABLE_MS = 100, 2000, 1000
+OPTIONAL_TIMEOUT = 300  # ms the degrading page waits for an optional part
+DOWN_MS, DOWN_JITTER_MS = 15, 25  # a down dependency fails fast
+SLOW_MS, SLOW_JITTER_MS = 1500, 1000  # a slow dependency
+FALLBACK_MS = 5  # cost of substituting a fallback
+RENDER_MS = 15  # assembling the page
+P95 = 95
 
+# Park-Miller (MINSTD) generator
 seed = 12345
 
 
@@ -31,9 +38,9 @@ draws = [[(nxt(), nxt()) for _ in DEPS] for _ in range(N)]
 
 def call_dep(base, mode, a):
     if mode == "down":
-        return False, 15 + a % 25  # fails fast
+        return False, DOWN_MS + a % DOWN_JITTER_MS  # fails fast
     if mode == "slow":
-        return True, 1500 + a % 1000
+        return True, SLOW_MS + a % SLOW_JITTER_MS
     return True, base + a % base
 
 
@@ -57,14 +64,14 @@ def assemble(modes, cfg, req):
         else:
             missing += 1
     if error_at >= 0:
-        return "error", error_at + 15
+        return "error", error_at + RENDER_MS
     outcome = "degraded" if substituted + missing > 0 else "full"
-    return outcome, slowest + (5 if substituted > 0 else 0) + 15
+    return outcome, slowest + (FALLBACK_MS if substituted > 0 else 0) + RENDER_MS
 
 
 CONFIGS = [
     ("naive", {"all_critical": True, "fallbacks": False, "optional_timeout": CRITICAL_TIMEOUT}),
-    ("degrading", {"all_critical": False, "fallbacks": True, "optional_timeout": 300}),
+    ("degrading", {"all_critical": False, "fallbacks": True, "optional_timeout": OPTIONAL_TIMEOUT}),
 ]
 results = {}
 for label, modes in SCENARIOS:
@@ -73,7 +80,7 @@ for label, modes in SCENARIOS:
         count = lambda o: sum(1 for p in pages if p[0] == o)
         lat = sorted(p[1] for p in pages)
         usable = sum(1 for p in pages if p[0] != "error" and p[1] <= USABLE_MS)
-        r = {"full": count("full"), "degraded": count("degraded"), "error": count("error"), "p95": lat[N * 95 // 100], "usable": usable}
+        r = {"full": count("full"), "degraded": count("degraded"), "error": count("error"), "p95": lat[N * P95 // 100], "usable": usable}
         results[label + "/" + cname] = r
         print(f"{label:<15} {cname:<10} full={r['full']:>3} degraded={r['degraded']:>3} error={r['error']:>3} p95={r['p95']:>4}ms usable={r['usable']:>3}%")
 
@@ -85,6 +92,6 @@ for label, _ in SCENARIOS:
     else:
         assert d["error"] == 0, "optional failure failed a page: " + label
 assert results["reviews down/naive"]["error"] == N, "naive page should fail when reviews is down"
-assert results["recs slow/degrading"]["p95"] <= 320, "optional timeout must bound page latency"
-assert results["recs slow/naive"]["p95"] > 1000, "naive page should be slow when recs is slow"
+assert results["recs slow/degrading"]["p95"] <= OPTIONAL_TIMEOUT + FALLBACK_MS + RENDER_MS, "optional timeout must bound page latency"
+assert results["recs slow/naive"]["p95"] > USABLE_MS, "naive page should be slow when recs is slow"
 print("invariants hold")

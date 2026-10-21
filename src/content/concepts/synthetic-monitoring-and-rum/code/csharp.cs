@@ -4,7 +4,12 @@ using System.Collections.Generic;
 using System.Linq;
 
 const int Day = 1440, FaultStart = 180, FaultEnd = 360, Brazil = 4;
-uint state = 9;
+const int Locations = 5, BlipPerMille = 4, FailPercent = 90;
+const int ViewsPerMinute = 40, LcpMinMs = 900, LcpJitterMs = 800, OutageSlowdown = 3;
+const int RumWindowMin = 15, RumMinSamples = 20, LcpGoodMs = 2500, LcpPoorMs = 4000;
+const int SamplingPct = 10, ThinSamplingPct = 1;
+const uint Seed = 9;
+uint state = Seed;
 
 int Rand(int n) // small integer LCG so every language prints the same numbers
 {
@@ -13,13 +18,13 @@ int Rand(int n) // small integer LCG so every language prints the same numbers
 }
 
 // The world is drawn once, in a fixed order, so every probe setting sees the same day.
-var blip = new int[5, Day];  // 1 = single-probe network blip (0.4%)
-var fails = new int[5, Day]; // 1 = a probe in the faulted region fails (90%)
+var blip = new int[Locations, Day];  // 1 = single-probe network blip (0.4%)
+var fails = new int[Locations, Day]; // 1 = a probe in the faulted region fails (90%)
 for (int t = 0; t < Day; t++)
-    for (int loc = 0; loc < 5; loc++)
+    for (int loc = 0; loc < Locations; loc++)
     {
-        blip[loc, t] = Rand(1000) < 4 ? 1 : 0;
-        fails[loc, t] = Rand(100) < 90 ? 1 : 0;
+        blip[loc, t] = Rand(1000) < BlipPerMille ? 1 : 0;
+        fails[loc, t] = Rand(100) < FailPercent ? 1 : 0;
     }
 
 (int detect, int falseAlarms, int checks) Synthetic(int interval, int locations, int need)
@@ -66,12 +71,12 @@ List<List<int>> RumDay(int samplingPct)
     {
         bool slow = t >= FaultStart && t < FaultEnd;
         var minute = new List<int>();
-        for (int v = 0; v < 40; v++) // 40 Brazil page views per minute
+        for (int v = 0; v < ViewsPerMinute; v++) // 40 Brazil page views per minute
         {
             if (Rand(100) < samplingPct) // the sampling decision
             {
-                int lcp = 900 + Rand(800) + Rand(800); // 900..2500 ms, about 1.7 s median
-                minute.Add(slow ? lcp * 3 : lcp);
+                int lcp = LcpMinMs + Rand(LcpJitterMs) + Rand(LcpJitterMs); // 900..2500 ms, about 1.7 s median
+                minute.Add(slow ? lcp * OutageSlowdown : lcp);
             }
         }
         perMinute.Add(minute);
@@ -81,10 +86,10 @@ List<List<int>> RumDay(int samplingPct)
 
 int RumDetect(List<List<int>> perMinute) // 15-minute window, at least 20 samples, p75 above 4000 ms
 {
-    for (int t = 15; t < Day; t++)
+    for (int t = RumWindowMin; t < Day; t++)
     {
-        var window = perMinute.Skip(t - 15).Take(15).SelectMany(m => m).ToList();
-        if (window.Count >= 20 && P75(window) > 4000) return t - FaultStart;
+        var window = perMinute.Skip(t - RumWindowMin).Take(RumWindowMin).SelectMany(m => m).ToList();
+        if (window.Count >= RumMinSamples && P75(window) > LcpPoorMs) return t - FaultStart;
     }
     return -1;
 }
@@ -97,12 +102,12 @@ foreach (var (interval, locations, need) in new[] { (5, 3, 1), (5, 5, 1), (5, 5,
     results[$"{interval},{locations},{need}"] = (d, f);
 }
 
-var days = RumDay(10);
+var days = RumDay(SamplingPct);
 var fault = days.Skip(FaultStart).Take(FaultEnd - FaultStart).SelectMany(m => m).ToList();
 var normal = days.Take(FaultStart).SelectMany(m => m).ToList();
 long mean = fault.Sum(v => (long)v) / fault.Count;
 Console.WriteLine($"RUM at 10%: normal p75 {P75(normal)} ms, outage p75 {P75(fault)} ms, outage mean {mean} ms");
-int rum10 = RumDetect(days), rum1 = RumDetect(RumDay(1));
+int rum10 = RumDetect(days), rum1 = RumDetect(RumDay(ThinSamplingPct));
 Console.WriteLine($"RUM alert after {rum10} min with 10% sampling, after {rum1} with 1%");
 
 void Check(bool ok, string message)
@@ -115,6 +120,6 @@ Check(r["5,5,1"].detect >= 0 && r["5,5,1"].detect < 5, "a Brazil probe, any 1: f
 Check(r["5,5,2"].detect == -1 || r["5,5,2"].detect > r["5,5,1"].detect, "2 of 5 hides a one-region fault");
 Check(r["1,5,3"].detect == -1 && r["1,5,3"].falseAlarms == 0, "3 of 5 never fires on blips or on one region");
 Check(r["1,5,1"].falseAlarms > r["5,5,1"].falseAlarms && r["5,5,1"].falseAlarms > r["15,5,1"].falseAlarms, "shorter interval, more false alarms");
-Check(P75(normal) < 2500 && 4000 < P75(fault), "p75 moves from good to poor");
+Check(P75(normal) < LcpGoodMs && LcpPoorMs < P75(fault), "p75 moves from good to poor");
 Check(rum10 >= 0 && rum10 < 30 && rum1 == -1, "1% sampling is too thin to alert");
 Console.WriteLine("ok");

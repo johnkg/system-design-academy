@@ -12,10 +12,17 @@ def flat(c):  # canonical text, used for the checksum
     return f"{c['timeout_ms']}|{c['retries']}|{c['mode']}"
 
 
+MIN_TIMEOUT_MS = 50  # schema limits
+MAX_TIMEOUT_MS = 5000
+MAX_RETRIES = 5
+CLIENTS = 1000
+ERROR_LIMIT = 10  # failed clients a stage may have before rollback
+
+
 def validate(c):  # the schema: type and range for every key
-    if not 50 <= c["timeout_ms"] <= 5000:
+    if not MIN_TIMEOUT_MS <= c["timeout_ms"] <= MAX_TIMEOUT_MS:
         return "timeout_ms must be 50..5000"
-    if not 0 <= c["retries"] <= 5:
+    if not 0 <= c["retries"] <= MAX_RETRIES:
         return "retries must be 0..5"
     if c["mode"] not in ("fast", "safe"):
         return "mode must be fast or safe"
@@ -85,7 +92,7 @@ def rollout(service, clients, version, stages, limit):
 
 
 svc = ConfigService()
-clients = [Client(f"c{i}") for i in range(1000)]
+clients = [Client(f"c{i}") for i in range(CLIENTS)]
 print("publish v1:", svc.publish({"timeout_ms": 800, "retries": 2, "mode": "safe"}))
 svc.stable = 1
 for c in clients:
@@ -93,8 +100,9 @@ for c in clients:
 print("publish v2:", svc.publish({"timeout_ms": 500, "retries": 3, "mode": "fast"}))
 print("publish bad:", svc.publish({"timeout_ms": 900, "retries": 9, "mode": "fast"}))
 print("publish v3:", svc.publish({"timeout_ms": 60, "retries": 1, "mode": "fast"}))
-ok2 = rollout(svc, clients, 2, [5, 25, 100], 10)
-ok3 = rollout(svc, clients, 3, [5, 25, 100], 10)
+STAGES = [5, 25, 100]  # percent of clients at each step
+ok2 = rollout(svc, clients, 2, STAGES, ERROR_LIMIT)
+ok3 = rollout(svc, clients, 3, STAGES, ERROR_LIMIT)
 on_v2 = sum(1 for c in clients if c.version == 2)
 
 svc.down = True  # the service is unreachable, so every client keeps what it has
@@ -103,5 +111,5 @@ svc.down = False
 damaged = clients[7].poll(svc, True)
 print(f"outage: {kept} clients kept their copy; damaged payload: {damaged}, still v{clients[7].version}")
 print(f"rollout v2: {str(ok2).lower()}, rollout v3: {str(ok3).lower()}, clients on v2: {on_v2}")
-if not ok2 or ok3 or on_v2 != 1000 or kept != 1000 or damaged != "kept":
+if not ok2 or ok3 or on_v2 != CLIENTS or kept != CLIENTS or damaged != "kept":
     raise SystemExit(1)

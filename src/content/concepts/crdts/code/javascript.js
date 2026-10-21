@@ -1,11 +1,14 @@
 // G-Counter, PN-Counter and OR-Set as state-based CRDTs, plus a naive last-write-wins counter for contrast.
 // merge() is commutative, associative and idempotent, so any delivery order, with duplicates, converges.
 const IDS = "ABC";
+const INITIAL_SPLIT = [4, 3, 3]; // the starting stock, already spread over replicas A, B, C
+const INITIAL_COUNT = 10; // sum of INITIAL_SPLIT
+const TS_STEP = 100; // ms between scripted operations (the LWW timestamp)
 const maxv = (a, b) => a.map((x, i) => Math.max(x, b[i]));
 const sum = (a) => a.reduce((x, y) => x + y, 0);
 
 class LWWCounter { // naive: one number and a timestamp, newest write wins
-  constructor(v = 10, ts = 0, by = 0) { this.v = v; this.ts = ts; this.by = by; }
+  constructor(v = INITIAL_COUNT, ts = 0, by = 0) { this.v = v; this.ts = ts; this.by = by; }
   inc(r, ts) { this.v += 1; this.ts = ts; this.by = r; }
   dec(r, ts) { this.v -= 1; this.ts = ts; this.by = r; }
   merge(o) {
@@ -18,7 +21,7 @@ class LWWCounter { // naive: one number and a timestamp, newest write wins
 }
 
 class GCounter { // one slot per replica, merge = element-wise max
-  constructor(p = [4, 3, 3]) { this.p = [...p]; }
+  constructor(p = INITIAL_SPLIT) { this.p = [...p]; }
   inc(r) { this.p[r] += 1; }
   merge(o) { return new GCounter(maxv(this.p, o.p)); }
   value() { return String(sum(this.p)); }
@@ -27,7 +30,7 @@ class GCounter { // one slot per replica, merge = element-wise max
 }
 
 class PNCounter { // two G-Counters: increments and decrements
-  constructor(p = [4, 3, 3], n = [0, 0, 0]) { this.p = [...p]; this.n = [...n]; }
+  constructor(p = INITIAL_SPLIT, n = [0, 0, 0]) { this.p = [...p]; this.n = [...n]; }
   inc(r) { this.p[r] += 1; }
   dec(r) { this.n[r] += 1; }
   merge(o) { return new PNCounter(maxv(this.p, o.p), maxv(this.n, o.n)); }
@@ -49,10 +52,10 @@ class ORSet { // adds carry unique tags; remove tombstones only the tags it has 
 function counters(Cls, withDec) {
   const reps = [new Cls(), new Cls(), new Cls()];
   const script = [[0, 1], [1, 1], [2, 1], [0, 1], [1, 1], [2, 1], [0, 1], [1, 1], [1, 1], [1, 1], [2, 1], [2, -1]];
-  let net = 10;
+  let net = INITIAL_COUNT;
   script.forEach(([r, d], i) => {
-    if (d > 0) { reps[r].inc(r, (i + 1) * 100); net += 1; }
-    else if (withDec) { reps[r].dec(r, (i + 1) * 100); net -= 1; }
+    if (d > 0) { reps[r].inc(r, (i + 1) * TS_STEP); net += 1; }
+    else if (withDec) { reps[r].dec(r, (i + 1) * TS_STEP); net -= 1; }
   });
   return [reps, net];
 }
@@ -80,7 +83,7 @@ function converge(name, Cls, build, withDec = true) {
     for (let round = 0; round < 2; round++) // every pull is delivered twice
       for (const i of perm) for (const j of perm) if (i !== j) reps[i] = reps[i].merge(reps[j]);
     const before = reps.map((r) => r.key());
-    for (let i = 0; i < 3; i++) for (const s of snaps) reps[i] = reps[i].merge(s);
+    for (let i = 0; i < IDS.length; i++) for (const s of snaps) reps[i] = reps[i].merge(s);
     if (before.join("#") !== reps.map((r) => r.key()).join("#")) throw new Error("stale replay changed a state");
     if (new Set(reps.map((r) => r.key())).size !== 1) throw new Error("replicas diverged");
     keys.add(reps[0].key()); values.add(reps[0].value()); sizes.add(reps[0].size());

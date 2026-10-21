@@ -10,6 +10,7 @@ public static class Program
     const int Total = 5;      // segments 0 to 4
     const int Latency = 1;    // ticks for a packet to cross the network
     const int Timeout = 4;    // ticks before the sender resends an unacknowledged segment
+    const int LastTick = 11;  // the simulation runs ticks 0 to 11
     static readonly HashSet<int> LostFirstTime = new() { 2 }; // the network drops segment 2 the first time it is sent
 
     record Packet(int ArriveAt, string Kind, int N);
@@ -39,7 +40,7 @@ public static class Program
 
     public static void Main()
     {
-        for (var tick = 0; tick <= 11; tick++)
+        for (var tick = 0; tick <= LastTick; tick++)
         {
             // Packets that arrive on this tick
             foreach (var packet in InFlight.Where(p => p.ArriveAt == tick).ToList())

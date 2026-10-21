@@ -4,10 +4,13 @@ using System.Collections.Generic;
 
 public static class Program
 {
+    public const int TextureSize = 10_000; // characters in one species' texture
+    const int Trees = 1000;
+
     public static void Main()
     {
         var forest = new Forest();
-        for (int i = 0; i < 1000; i++)
+        for (int i = 0; i < Trees; i++)
             forest.Plant(i, i * 2, i % 2 == 1 ? "Oak" : "Pine", i % 2 == 1 ? "green" : "dark green");
 
         Console.WriteLine($"{forest.Size} trees, {TreeTypeFactory.Count} shared TreeType objects");
@@ -48,7 +51,7 @@ public class Forest // Client
 
     public void Plant(int x, int y, string name, string color)
     {
-        var type = TreeTypeFactory.Get(name, color, new string('x', 10_000)); // created once per species
+        var type = TreeTypeFactory.Get(name, color, new string('x', Program.TextureSize)); // created once per species
         _trees.Add(new Tree(x, y, type));
     }
 

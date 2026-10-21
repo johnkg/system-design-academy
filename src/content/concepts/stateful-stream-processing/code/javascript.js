@@ -1,16 +1,20 @@
 // Keyed counters with checkpoints: state + input offset are snapshotted together, a crash restores both and replays.
 const N = 600, KEYS = 12, OPS = 3, CRASH = 330, COMMIT_EVERY = 120;
+const SEED = 12345, SKEW_STEPS = 1000; // r in 0..999 is squared, so low keys are hot
+const KEY_GROUPS = 12;
+const SHORT_INTERVAL = 50, LONG_INTERVAL = 200; // checkpoint intervals, in events
 
 // Seeded orders stream: event i is "customer k placed an order"; low ids are the busy customers.
 const EVENTS = [];
-let x = 12345;
+let x = SEED;
 for (let i = 0; i < N; i++) {
+  // Park-Miller "minimal standard" LCG (MINSTD).
   x = (x * 48271) % 2147483647;
-  const r = x % 1000;
-  EVENTS.push(Math.floor((r * r * KEYS) / 1000000));
+  const r = x % SKEW_STEPS;
+  EVENTS.push(Math.floor((r * r * KEYS) / (SKEW_STEPS * SKEW_STEPS)));
 }
 // key -> key group -> operator instance: each key lives on exactly one instance.
-const opOf = (k) => Math.floor((((k * 7 + 2) % 12) * OPS) / 12);
+const opOf = (k) => Math.floor((((k * 7 + 2) % KEY_GROUPS) * OPS) / KEY_GROUPS);
 
 class Sink {
   constructor(kind) { this.kind = kind; this.records = []; this.pending = []; this.table = new Array(KEYS).fill(0); this.writes = 0; }
@@ -61,15 +65,15 @@ function run(interval, kind, separate) {
 }
 
 const must = (c, m) => { if (!c) { console.log("FAILED: " + m); process.exit(1); } };
-for (const i of [0, 50, 200]) must(run(i, "plain", false).wrong === 0, "state exact with checkpoints");
-const idem = run(50, "idempotent", false);
-const tx = run(50, "transactional", false);
-run(200, "transactional", false);
-const plain = run(50, "plain", false);
+for (const i of [0, SHORT_INTERVAL, LONG_INTERVAL]) must(run(i, "plain", false).wrong === 0, "state exact with checkpoints");
+const idem = run(SHORT_INTERVAL, "idempotent", false);
+const tx = run(SHORT_INTERVAL, "transactional", false);
+run(LONG_INTERVAL, "transactional", false);
+const plain = run(SHORT_INTERVAL, "plain", false);
 must(plain.dup === 30 && plain.replayed === 30, "plain sink repeats the replayed outputs");
 must(idem.dup === 0 && idem.extra === 30 && idem.wrong === 0, "upsert absorbs the replay");
 must(tx.dup === 0 && tx.missing === 0 && tx.extra === 30, "2PC sink: no duplicates, open transaction aborted");
-const behind = run(50, "plain", true), ahead = run(200, "plain", true);
+const behind = run(SHORT_INTERVAL, "plain", true), ahead = run(LONG_INTERVAL, "plain", true);
 must(behind.double === 60 && behind.wrong > 0, "offset committed separately, behind the state: double counting");
 must(ahead.lost === 40 && ahead.wrong > 0, "offset committed separately, ahead of the state: lost events");
 console.log("ok");

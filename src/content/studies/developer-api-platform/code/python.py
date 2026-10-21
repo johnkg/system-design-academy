@@ -12,6 +12,8 @@ def fnv(s):  # stands in for SHA-256
 
 
 PLANS = {'free': 5, 'pro': 8}  # calls per month
+WARN_PCT = 80  # warn when this share of the quota is used
+EXTRA_CALLS = 5  # enough calls to exhaust the free quota
 NEED = {'GET /payments': 'payments:read', 'POST /payments': 'payments:write', 'GET /refunds': 'refunds:read'}
 store = {}  # hash of the key -> record. The key itself is never stored.
 
@@ -33,7 +35,7 @@ def handle(secret, route):
     if rec['used'] >= limit:
         return '429 monthly quota used'
     rec['used'] += 1
-    warn = ' (80% of quota used)' if rec['used'] * 10 >= limit * 8 else ''
+    warn = ' (80% of quota used)' if rec['used'] * 100 >= limit * WARN_PCT else ''
     return f"200 ok, version {rec['version']}{warn}"
 
 
@@ -69,7 +71,7 @@ web = issue_key('acme-web', 'free', ['payments:read'], '2025-03-01')
 admin = issue_key('acme-admin', 'pro', ['payments:read', 'payments:write'], '2026-01-15')
 print(f'web key {web[:7]}..., admin key {admin[:7]}...')
 calls = [(web, 'GET /payments'), (web, 'POST /payments'), (web, 'GET /refunds'), ('sk_bad', 'GET /payments'), (admin, 'POST /payments')]
-calls += [(web, 'GET /payments')] * 5
+calls += [(web, 'GET /payments')] * EXTRA_CALLS
 for key, route in calls:
     who = 'web  ' if key == web else 'admin' if key == admin else 'other'
     print(f'{who} {route.ljust(14)} -> {handle(key, route)}')

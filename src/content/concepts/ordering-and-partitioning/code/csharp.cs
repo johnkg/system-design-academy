@@ -11,6 +11,12 @@ record Result(int Throughput, int Violations, int Overdrafts, int Hottest);
 public static class Program
 {
     const int Keys = 12, N = 240, Hot = 30, Parts = 4, Backoff = 5, Later = 30;
+    const uint Seed = 42;
+    const int MaxFails = 3, FailPct = 8; // up to 3 failed attempts, 8% each
+    const int LowBalance = 20; // below this an account only receives deposits
+    const int MinDeposit = 20, DepositSpread = 41, MinWithdrawal = 10; // deposits are 20..60
+    const int MinProcMs = 6, ProcSpread = 9; // processing takes 6..14 ms
+    const int MsPerS = 1000;
 
     static uint Fnv1a(string s) // 32-bit FNV-1a: the multiply is masked to 32 bits on purpose
     {
@@ -36,17 +42,17 @@ public static class Program
 
     static List<Ev> MakeStream() // account events; key 0 is the hot account (30% of traffic)
     {
-        var next = Rng(42); var bal = new int[Keys]; var seq = new int[Keys]; var ev = new List<Ev>();
+        var next = Rng(Seed); var bal = new int[Keys]; var seq = new int[Keys]; var ev = new List<Ev>();
         for (int id = 0; id < N; id++)
         {
             uint u = next(), v = next(), w = next(), a = next(), p = next();
             int key = u % 100 < Hot ? 0 : 1 + (int)(v % (Keys - 1));
-            int nfail = 0; bool ok = true; // up to 3 failed attempts, 8% each
-            for (int j = 0; j < 3; j++) { uint d = next(); if (ok && d % 100 < 8) nfail++; else ok = false; }
-            bool deposit = bal[key] < 20 || w % 2 == 0;
-            int amount = deposit ? 20 + (int)(a % 41) : 10 + (int)(a % (uint)(bal[key] - 9)); // a withdrawal never exceeds the true balance
+            int nfail = 0; bool ok = true;
+            for (int j = 0; j < MaxFails; j++) { uint d = next(); if (ok && d % 100 < FailPct) nfail++; else ok = false; }
+            bool deposit = bal[key] < LowBalance || w % 2 == 0;
+            int amount = deposit ? MinDeposit + (int)(a % DepositSpread) : MinWithdrawal + (int)(a % (uint)(bal[key] - MinWithdrawal + 1)); // a withdrawal never exceeds the true balance
             bal[key] += deposit ? amount : -amount;
-            ev.Add(new Ev(id, key, seq[key]++, deposit, amount, 6 + (int)(p % 9), nfail));
+            ev.Add(new Ev(id, key, seq[key]++, deposit, amount, MinProcMs + (int)(p % ProcSpread), nfail));
         }
         return ev;
     }
@@ -89,7 +95,7 @@ public static class Program
             if (e.Seq < top[e.Key]) violations++; else top[e.Key] = e.Seq; // finished after a later event of its key
             if (e.Deposit) bal[e.Key] += e.Amount; else if (bal[e.Key] >= e.Amount) bal[e.Key] -= e.Amount; else overdrafts++;
         }
-        return new Result(ev.Count * 1000 / done.Max(), violations, overdrafts, load.Max());
+        return new Result(ev.Count * MsPerS / done.Max(), violations, overdrafts, load.Max());
     }
 
     public static int Main()

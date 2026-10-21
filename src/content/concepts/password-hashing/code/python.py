@@ -11,10 +11,11 @@ def fast_hash(password):
 
 # Better: a unique salt per user and many iterations, so every guess is slow.
 ITERATIONS = 100_000
+KEY_BYTES = 32  # a 256-bit derived key
 
 
 def slow_hash(password, salt):
-    return hashlib.pbkdf2_hmac("sha256", password.encode(), salt, ITERATIONS, 32)
+    return hashlib.pbkdf2_hmac("sha256", password.encode(), salt, ITERATIONS, KEY_BYTES)
 
 
 def verify(password, salt, stored):

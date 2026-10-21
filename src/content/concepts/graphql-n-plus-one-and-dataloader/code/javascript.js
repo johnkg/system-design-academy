@@ -1,9 +1,9 @@
 // A miniature GraphQL-style executor over in-memory tables, with a DataLoader that collects keys until the end of a tick.
 // The "tick" is simulated: the executor calls dispatch() after every resolver of one tree level has run, so it is deterministic.
-const N = 5, M = 4; // 5 posts, 4 comments each
-const users = [1, 2, 3, 4, 5, 6].map((id) => ({ tag: `U${id}`, id }));
-const posts = Array.from({ length: N }, (_, i) => ({ tag: `P${i + 1}`, id: i + 1, authorId: (((i + 1) * 2) % 6) + 1 }));
-const comments = Array.from({ length: N * M }, (_, i) => ({ tag: `C${i + 1}`, id: i + 1, postId: Math.floor(i / M) + 1, authorId: (((i + 1) * 5 + 3) % 6) + 1 }));
+const N = 5, M = 4, USERS = 6; // 5 posts, 4 comments each, 6 users
+const users = Array.from({ length: USERS }, (_, i) => ({ tag: `U${i + 1}`, id: i + 1 }));
+const posts = Array.from({ length: N }, (_, i) => ({ tag: `P${i + 1}`, id: i + 1, authorId: (((i + 1) * 2) % USERS) + 1 }));
+const comments = Array.from({ length: N * M }, (_, i) => ({ tag: `C${i + 1}`, id: i + 1, postId: Math.floor(i / M) + 1, authorId: (((i + 1) * 5 + 3) % USERS) + 1 }));
 
 class Db { // counts every query it receives
   constructor() { this.queries = 0; this.keys = 0; this.rows = 0; this.log = []; }

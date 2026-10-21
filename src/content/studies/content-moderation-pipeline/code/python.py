@@ -2,10 +2,15 @@
 # then a review queue that is served most-suspicious first and has limited reviewer capacity.
 import sys
 
-seed = 2024
+SEED = 2024
+HALF_WORD, HASH_BITS = 65536, 32  # a 32-bit hash is built from two 16-bit halves
+UPLOADS, HARMFUL_PERCENT, SCORE_SCALE = 3000, 6, 1000
+KNOWN_BAD, EDITED_COPY_PERCENT, MAX_FLIPS = 40, 40, 4  # an edited copy has 0..3 bits flipped
+seed = SEED
 
 
 def next_state():
+    """Linear congruential generator (Numerical Recipes constants)."""
     global seed
     seed = (seed * 1664525 + 1013904223) % 4294967296
     return seed
@@ -16,7 +21,7 @@ def random(n):
 
 
 def hash32():
-    return random(65536) * 65536 + random(65536)
+    return random(HALF_WORD) * HALF_WORD + random(HALF_WORD)
 
 
 def distance(a, b):
@@ -28,19 +33,19 @@ HI, LO, MAX_DISTANCE, CAPACITY = 950, 200, 4, 100  # scores are in thousandths
 # Build 3,000 uploads. A harmful upload scores high and a harmless one scores low, with an overlap in the middle.
 known = []
 uploads = []
-for id in range(3000):
-    harmful = random(100) < 6
+for id in range(UPLOADS):
+    harmful = random(100) < HARMFUL_PERCENT
     if harmful:
-        score = 1000 - (random(1000) * random(1000)) // 1000
+        score = SCORE_SCALE - (random(SCORE_SCALE) * random(SCORE_SCALE)) // SCORE_SCALE
     else:
-        score = (random(1000) * random(1000) * random(1000)) // 1000000
+        score = (random(SCORE_SCALE) * random(SCORE_SCALE) * random(SCORE_SCALE)) // (SCORE_SCALE * SCORE_SCALE)
     h = hash32()
-    if harmful and len(known) < 40:
+    if harmful and len(known) < KNOWN_BAD:
         known.append(h)  # the first harmful uploads become the known-bad list
-    elif harmful and random(100) < 40:  # a later harmful upload may be an edited copy of a known one
+    elif harmful and random(100) < EDITED_COPY_PERCENT:  # a later harmful upload may be an edited copy of a known one
         h = known[random(len(known))]
-        for _ in range(random(4)):
-            h = (h ^ (1 << random(32))) & 0xFFFFFFFF  # flip up to 3 bits
+        for _ in range(random(MAX_FLIPS)):
+            h = (h ^ (1 << random(HASH_BITS))) & 0xFFFFFFFF  # flip up to 3 bits
     uploads.append({'id': id, 'harmful': harmful, 'score': score, 'hash': h})
 
 fate = {'hash_blocked': [], 'removed': [], 'published': [], 'queued': []}

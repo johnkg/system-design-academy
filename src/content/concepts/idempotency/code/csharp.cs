@@ -5,22 +5,24 @@ using System.Linq;
 
 public static class Program
 {
+    const int Amount = 50, ChangedAmount = 80; // dollars; the second is a different body under the same key
+
     public static void Main()
     {
         var api = new PaymentApi();
 
         Console.WriteLine("--- without reusing the key: the retry becomes a second payment");
-        api.Charge("attempt-1", 50);
-        api.Charge("attempt-2", 50); // the app made a new key on retry
+        api.Charge("attempt-1", Amount);
+        api.Charge("attempt-2", Amount); // the app made a new key on retry
         Console.WriteLine($"charges: [{string.Join(",", api.Charges)}] total ${api.Charges.Sum()}");
 
         var fresh = new PaymentApi();
         Console.WriteLine("--- reusing the key: the retry is a replay");
-        Console.WriteLine(fresh.Charge("abc-123", 50));
-        Console.WriteLine(fresh.Charge("abc-123", 50)); // the response was lost, so the client retries with the same key
+        Console.WriteLine(fresh.Charge("abc-123", Amount));
+        Console.WriteLine(fresh.Charge("abc-123", Amount)); // the response was lost, so the client retries with the same key
         Console.WriteLine($"charges: [{string.Join(",", fresh.Charges)}] total ${fresh.Charges.Sum()}");
 
-        try { fresh.Charge("abc-123", 80); }
+        try { fresh.Charge("abc-123", ChangedAmount); }
         catch (Exception e) { Console.WriteLine($"rejected: {e.Message}"); }
     }
 }

@@ -1,6 +1,7 @@
 # Dead-letter queues: one ordered consumer over a seeded message list, four failure policies.
 # Time is counted in ticks (one processing attempt per tick), so the output is deterministic.
 SEED, TOTAL, LIMIT, HORIZON = 7, 40, 3, 400
+POISON_PCT, TRANSIENT_PCT = 8, 17  # share of messages that always fail / fail for a while
 
 
 def make_kinds():
@@ -8,7 +9,7 @@ def make_kinds():
     for _ in range(TOTAL):
         x = (x * 48271) % 2147483647  # MINSTD, integer only
         r = x % 100
-        kinds.append("poison" if r < 8 else "transient" if r < 25 else "ok")
+        kinds.append("poison" if r < POISON_PCT else "transient" if r < POISON_PCT + TRANSIENT_PCT else "ok")
     return kinds
 
 

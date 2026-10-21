@@ -1,4 +1,6 @@
 // Flyweight in JavaScript. Trees share one TreeType per species.
+const TEXTURE_SIZE = 10_000; // characters in one species' texture
+const TREES = 1000;
 
 class TreeType { // Flyweight: intrinsic, immutable, shared
   constructor(name, color, texture) {
@@ -28,14 +30,14 @@ class Tree { // Context: extrinsic state (x, y) + a reference to the shared type
 class Forest { // Client
   #trees = [];
   plant(x, y, name, color) {
-    const type = TreeTypeFactory.get(name, color, "x".repeat(10_000)); // big texture, created once per species
+    const type = TreeTypeFactory.get(name, color, "x".repeat(TEXTURE_SIZE)); // big texture, created once per species
     this.#trees.push(new Tree(x, y, type));
   }
   get size() { return this.#trees.length; }
 }
 
 const forest = new Forest();
-for (let i = 0; i < 1000; i++) {
+for (let i = 0; i < TREES; i++) {
   forest.plant(i, i * 2, i % 2 ? "Oak" : "Pine", i % 2 ? "green" : "dark green");
 }
 console.log(`${forest.size} trees, ${TreeTypeFactory.count} shared TreeType objects`);

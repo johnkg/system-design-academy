@@ -3,6 +3,8 @@
 // All times are logical milliseconds, so the run is the same every time.
 
 const TTL = 10000; // lease length
+const INITIAL_VALUE = 100;
+const RETRY_AFTER = 500; // how long A waits before it takes the lock again
 
 class LockService {
   constructor() { this.counter = 0; this.holder = null; this.expires = 0; }
@@ -18,7 +20,7 @@ class LockService {
 }
 
 class Storage {
-  constructor(fencing) { this.fencing = fencing; this.value = 100; this.maxToken = 0; }
+  constructor(fencing) { this.fencing = fencing; this.value = INITIAL_VALUE; this.maxToken = 0; }
   accept(token) { // the heart of fencing: remember the highest token, refuse any lower one
     if (this.fencing && token < this.maxToken) return false;
     this.maxToken = Math.max(this.maxToken, token);
@@ -42,7 +44,7 @@ function run(name, fencing, failover) {
   lock.release('B');
   const accepted = store.write(tokenA, seenByA + 1);        // A writes the stale result
   if (!accepted) {                                          // A learns it lost the lock and starts again
-    const t = lock.acquire('A', aWrites + 500);
+    const t = lock.acquire('A', aWrites + RETRY_AFTER);
     store.write(t, store.read(t) + 1);
     lock.release('A');
   }

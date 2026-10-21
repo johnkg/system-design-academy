@@ -3,6 +3,8 @@ using System;
 
 public static class Program
 {
+    const int CentsPerDollar = 100;
+
     public static void Main()
     {
         Checkout("card", 25m);
@@ -18,7 +20,7 @@ public static class Program
         else if (provider == "legacy")
         {
             // Unit conversion and result handling copied wherever the bank is used.
-            var result = new LegacyBankApi().MakePayment((int)Math.Round(amount * 100), "USD");
+            var result = new LegacyBankApi().MakePayment((int)Math.Round(amount * CentsPerDollar), "USD");
             Console.WriteLine(result.Ok ? $"Paid ${amount:F2} (ref {result.Ref})" : "Payment failed");
         }
         // Another provider? Another branch, with its own units and quirks.

@@ -93,8 +93,11 @@ def make_tag(h, mask, ciphertext):
     return bytes(a ^ b for a, b in zip(digest, mask))
 
 
-key = bytes(range(32))  # 256-bit key
-nonce = bytes(100 + i for i in range(12))  # 96-bit nonce
+KEY_BYTES = 32  # 256-bit key
+NONCE_BYTES = 12  # 96-bit nonce, the size GCM is designed for
+
+key = bytes(range(KEY_BYTES))
+nonce = bytes(100 + i for i in range(NONCE_BYTES))
 
 
 def encrypt(plaintext):

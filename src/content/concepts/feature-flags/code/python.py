@@ -2,6 +2,13 @@
 # Hashing is FNV-1a 32-bit with explicit masking, so every language computes the same bucket.
 import sys
 
+BUCKETS = 10000
+BUCKETS_PER_PERCENT = BUCKETS // 100
+USER_COUNT, STAFF_EVERY = 1000, 50  # every 50th user is staff
+COUNTRIES = ["US", "DE", "FR", "JP"]
+RESALT_PERCENT = 25
+MIN_SEEN_AT_HALF = 300  # sanity floor for a 50% rollout
+
 
 def fnv1a(text):
     h = 2166136261  # offset basis
@@ -13,7 +20,7 @@ def fnv1a(text):
 
 # Same user + same flag key + same salt => same bucket (0..9999), on every server, forever.
 def bucket(flag, user_id):
-    return fnv1a(f"{flag['key']}:{flag['salt']}:{user_id}") % 10000
+    return fnv1a(f"{flag['key']}:{flag['salt']}:{user_id}") % BUCKETS
 
 
 def evaluate(flag, user):
@@ -22,7 +29,7 @@ def evaluate(flag, user):
     for rule in flag["rules"]:
         if user[rule["attr"]] == rule["equals"]:
             return {"on": rule["serve"], "reason": f"rule {rule['attr']}={fmt(rule['equals'])}"}
-    on = bucket(flag, user["id"]) < flag["percent"] * 100  # percent in whole numbers: 25 -> buckets 0..2499
+    on = bucket(flag, user["id"]) < flag["percent"] * BUCKETS_PER_PERCENT  # percent in whole numbers: 25 -> buckets 0..2499
     return {"on": on, "reason": f"rollout {flag['percent']}%"}
 
 
@@ -40,7 +47,7 @@ def evaluate_safely(fetch_flag, user, last_known=None, safe_default=False):
         return {"on": last_known, "reason": "service down, last known"}
 
 
-users = [{"id": f"user-{i}", "country": ["US", "DE", "FR", "JP"][i % 4], "staff": i % 50 == 0} for i in range(1, 1001)]
+users = [{"id": f"user-{i}", "country": COUNTRIES[i % len(COUNTRIES)], "staff": i % STAFF_EVERY == 0} for i in range(1, USER_COUNT + 1)]
 flag = {"key": "new-checkout", "salt": "v1", "percent": 0, "killed": False,
         "rules": [{"attr": "staff", "equals": True, "serve": True}, {"attr": "country", "equals": "DE", "serve": False}]}
 
@@ -64,8 +71,8 @@ for percent in [0, 10, 25, 50, 100]:
         sys.exit(1)
     previous = now
 
-salted = seen(percent=25, salt="v2")
-base25 = seen(percent=25)
+salted = seen(percent=RESALT_PERCENT, salt="v2")
+base25 = seen(percent=RESALT_PERCENT)
 print(f"new salt at 25%: {len(base25 & salted)} of {len(base25)} keep the feature (the cohort was reshuffled)")
 
 print(f"killed: {len(seen(percent=100, killed=True))} see it")
@@ -78,5 +85,5 @@ def down():
 dave = users[4]  # user-5, in DE
 print(f"service down, no cache: {show(evaluate_safely(down, dave, None))}")
 print(f"service down, cached on: {show(evaluate_safely(down, dave, True))}")
-if len(seen(percent=100, killed=True)) != 0 or len(seen(percent=50)) < 300:
+if len(seen(percent=100, killed=True)) != 0 or len(seen(percent=50)) < MIN_SEEN_AT_HALF:
     sys.exit(1)

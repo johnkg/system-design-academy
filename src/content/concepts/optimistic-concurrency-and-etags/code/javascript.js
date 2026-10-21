@@ -18,12 +18,14 @@ class Store {
   }
 }
 
-let seed = 7;
+const SEED = 7, AGENTS = 4, RECORDS = 2, EDITS_EACH = 10;
+let seed = SEED;
+// Linear congruential generator (Numerical Recipes constants), high 16 bits.
 const rand = (n) => { seed = (seed * 1664525 + 1013904223) % 4294967296; return Math.floor(seed / 65536) % n; };
 
 // Each step, a random agent that still has work does one action: read a record, or write back its edit.
 function run(useIfMatch, agents, records, editsEach) {
-  seed = 7;
+  seed = SEED;
   const store = new Store(records, false);
   const a = Array.from({ length: agents }, () => ({ left: editsEach, id: -1, notes: 0, etag: "" }));
   let saved = 0, conflicts = 0;
@@ -44,8 +46,8 @@ function run(useIfMatch, agents, records, editsEach) {
   return { saved, final, lost: saved - final, conflicts };
 }
 
-const none = run(false, 4, 2, 10);
-const occ = run(true, 4, 2, 10);
+const none = run(false, AGENTS, RECORDS, EDITS_EACH);
+const occ = run(true, AGENTS, RECORDS, EDITS_EACH);
 console.log(`no check:   saved=${none.saved} final=${none.final} lost=${none.lost} conflicts=${none.conflicts}`);
 console.log(`if-match:   saved=${occ.saved} final=${occ.final} lost=${occ.lost} conflicts=${occ.conflicts}`);
 
@@ -55,5 +57,5 @@ console.log(`PUT without If-Match: ${strict.put(0, 1, undefined).status}`);
 console.log(`PUT with ${first.etag}: ${strict.put(0, 1, first.etag).status}`);
 console.log(`PUT with stale ${first.etag}: ${strict.put(0, 2, first.etag).status}`);
 
-if (occ.lost !== 0 || occ.final !== 40) throw new Error("version check must not lose updates");
+if (occ.lost !== 0 || occ.final !== AGENTS * EDITS_EACH) throw new Error("version check must not lose updates");
 if (none.lost <= 0) throw new Error("the unchecked run should lose updates");

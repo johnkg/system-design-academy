@@ -2,13 +2,15 @@
 // (start a v2 server, stop a v1 server) and checks that capacity never drops below the minimum.
 // Integers only and no clock: one tick is one second, so the output is the same every run.
 
+const MAX_TICKS = 200; // safety limit: give up if a rollout has not finished by then
+
 function plan(n, maxSurge, maxUnavailable, readyAfter) {
   if (maxSurge === 0 && maxUnavailable === 0) throw new Error("surge 0 and unavailable 0 can never make progress");
   let old = n; // v1 servers, all ready
   let newReady = 0; // ready v2 servers
   let starting = []; // countdowns for v2 servers that are still booting
   const rows = [];
-  for (let tick = 0; tick < 200; tick++) {
+  for (let tick = 0; tick < MAX_TICKS; tick++) {
     let started = 0, stopped = 0;
     for (;;) {
       const newCount = newReady + starting.length;

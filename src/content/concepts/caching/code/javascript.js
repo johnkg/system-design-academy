@@ -1,5 +1,7 @@
 // Caching in JavaScript: an LRU cache with cache-aside reads.
 
+const CACHE_CAPACITY = 2; // entries the cache holds before it evicts
+
 class LruCache {
   #max;
   #entries = new Map(); // a Map remembers insertion order, so the first key is the least recently used
@@ -28,7 +30,7 @@ class LruCache {
 }
 
 const database = { reads: 0, load(id) { this.reads++; return `product-${id}`; } };
-const cache = new LruCache(2);
+const cache = new LruCache(CACHE_CAPACITY);
 let hits = 0;
 
 function getProduct(id) { // cache-aside: check the cache, fall back to the database, then fill

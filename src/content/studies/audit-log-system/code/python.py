@@ -24,6 +24,13 @@ ACTORS = ["alice", "bob", "carol", "dan"]
 ACTIONS = ["login", "read", "update", "delete", "export"]
 BLOCK = 250
 GENESIS = "00000000"
+DOCS = 50  # documents the demo actions target
+START_TIME = 1700000000  # Unix seconds of the first entry
+ENTRY_GAP_S = 3  # entries are about 3 s apart, with up to 2 s of jitter
+ENTRIES = 1000
+EDIT_AT = 300  # the entry an attacker edits
+TRUNCATE_TO = 900
+PROVE_SEQ = 777  # the entry the inclusion proof is for
 
 
 def data_of(e):
@@ -38,8 +45,8 @@ def build(count):  # append-only: each entry stores the hash of the entry before
     log = []
     prev = GENESIS
     for seq in range(count):
-        e = {"seq": seq, "actor": ACTORS[random(4)], "action": ACTIONS[random(5)], "target": f"doc-{random(50)}"}
-        e["time"] = 1700000000 + seq * 3 + random(3)
+        e = {"seq": seq, "actor": ACTORS[random(len(ACTORS))], "action": ACTIONS[random(len(ACTIONS))], "target": f"doc-{random(DOCS)}"}
+        e["time"] = START_TIME + seq * ENTRY_GAP_S + random(ENTRY_GAP_S)
         e["hash"] = link(prev, e)
         prev = e["hash"]
         log.append(e)
@@ -104,33 +111,33 @@ def lower(flag):
     return "true" if flag else "false"
 
 
-log = build(1000)
+log = build(ENTRIES)
 cps = checkpoints(log)
 print(f"entries: {len(log)}, checkpoints at: {', '.join(str(c['end']) for c in cps)}")
 print(f"head {log[999]['hash']}, last root {cps[3]['root']}")
 print(f"intact: chain {verify_chain(log)}, checkpoints {verify_checkpoints(log, cps)}")
 
 edited = [dict(e) for e in log]
-edited[300]["actor"] = "mallory"
+edited[EDIT_AT]["actor"] = "mallory"
 edit_chain = verify_chain(edited)
 print(f"edit entry 300: chain breaks at {edit_chain}")
 
-prev = edited[299]["hash"]  # a clean rewrite: recompute every later hash
-for i in range(300, len(edited)):
+prev = edited[EDIT_AT - 1]["hash"]  # a clean rewrite: recompute every later hash
+for i in range(EDIT_AT, len(edited)):
     edited[i]["hash"] = link(prev, edited[i])
     prev = edited[i]["hash"]
 rewrite_chain = verify_chain(edited)
 rewrite_cp = verify_checkpoints(edited, cps)
 print(f"rewrite from 300: chain {rewrite_chain}, checkpoints disagree at {rewrite_cp}")
 
-dropped = log[:900]
+dropped = log[:TRUNCATE_TO]
 drop_cp = verify_checkpoints(dropped, cps)
 print(f"truncate to 900: chain {verify_chain(dropped)}, checkpoints disagree at {drop_cp}")
 
-proof = prove_entry(log, 777)
-ok_proof = check_proof(log[777]["hash"], proof, cps[3]["root"])
+proof = prove_entry(log, PROVE_SEQ)
+ok_proof = check_proof(log[PROVE_SEQ]["hash"], proof, cps[3]["root"])
 bad_proof = check_proof(fnv("forged"), proof, cps[3]["root"])
 print(f"proof for entry 777: {len(proof)} hashes, genuine {lower(ok_proof)}, forged {lower(bad_proof)}")
 
-if edit_chain != 300 or rewrite_chain != -1 or rewrite_cp != 500 or drop_cp != 1000 or not ok_proof or bad_proof:
+if edit_chain != EDIT_AT or rewrite_chain != -1 or rewrite_cp != 500 or drop_cp != ENTRIES or not ok_proof or bad_proof:
     sys.exit(1)

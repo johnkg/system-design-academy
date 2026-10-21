@@ -3,6 +3,7 @@
 const STEPS = 200, SPIKE_STEPS = 100; // 20 s in total, the first 10 s overloaded
 const CAPACITY = 10, TIMEOUT = 20, LIMIT = 50;
 const SPIKE_ARRIVALS = 30, CALM_ARRIVALS = 6; // 300 per second, then 60 per second
+const STEP_MS = 100;
 
 function run(policy) {
   const queue = []; let head = 0; // each entry is the step the request arrived in
@@ -27,7 +28,7 @@ function run(policy) {
       const latency = step - arrived + 1;
       if (latency <= TIMEOUT) {
         good++; // an answer the caller was still waiting for
-        latSum += latency * 100;
+        latSum += latency * STEP_MS;
       } else {
         wasted++; // the server was busy, but the caller had already left
       }

@@ -2,6 +2,12 @@
 // Customers move between regions while sales continue. Days are 1..360; a row is valid for from <= day < to.
 const REGIONS = ["North", "South", "East", "West"];
 const INIT = ["North", "South", "East", "South", "West", "East", "North", "West"];
+const DAYS = 360;
+const FACTS = 200; // sales in the demo
+const MIN_AMOUNT = 20; // sale amounts are 20..200
+const AMOUNT_SPREAD = 181;
+const DAY_KEY = 1000000; // event sort key: day * DAY_KEY + position
+const FACT_AFTER_CHANGES = 100000; // on the same day, changes load before facts
 // The change feed: effective day, arrival day, customer index, new region and tier.
 const FEED = [
   { cust: 6, eff: 80, arrive: 80, region: "South", tier: "basic" },
@@ -17,7 +23,7 @@ const FEED = [
 let seed = 7; // 32-bit LCG so every language produces the same sales
 const next = () => { seed = (Math.imul(seed, 1664525) + 1013904223) >>> 0; return seed >>> 8; };
 const facts = [];
-for (let id = 0; id < 200; id++) facts.push({ id, day: 1 + (next() % 360), cust: next() % 8, amount: 20 + (next() % 181) });
+for (let id = 0; id < FACTS; id++) facts.push({ id, day: 1 + (next() % DAYS), cust: next() % INIT.length, amount: MIN_AMOUNT + (next() % AMOUNT_SPREAD) });
 
 const hash = (rec) => { // hash of the tracked attributes only (FNV-1a, 32 bit)
   let h = 2166136261;
@@ -30,8 +36,8 @@ function load(type, correctLate) {
   INIT.forEach((region, cust) => rows.push({ sk: nextSk++, cust, region, tier: "basic", hash: hash({ region, tier: "basic" }), from: 1, to: null }));
   const covering = (cust, day) => rows.find((r) => r.cust === cust && r.from <= day && (r.to === null || day < r.to));
   const events = [
-    ...FEED.map((c, i) => ({ key: c.arrive * 1000000 + i, change: c })),
-    ...facts.map((f) => ({ key: f.day * 1000000 + 100000 + f.id, fact: f })),
+    ...FEED.map((c, i) => ({ key: c.arrive * DAY_KEY + i, change: c })),
+    ...facts.map((f) => ({ key: f.day * DAY_KEY + FACT_AFTER_CHANGES + f.id, fact: f })),
   ].sort((a, b) => a.key - b.key);
   const factSk = new Map();
   for (const e of events) {
@@ -82,7 +88,7 @@ console.log(`skipped unchanged records: ${t2fix.skipped}, facts re-keyed by the 
 check(same(revenue(t2fix.regionOf), truth), "type 2 with correction must match the true-at-the-time totals");
 check(!same(revenue(t1.regionOf), truth), "type 1 must differ from the true-at-the-time totals");
 check(wrong(t2naive) > 0, "a late change without correction must mis-join some facts");
-for (const l of [t1, t2naive, t2fix]) for (let c = 0; c < 8; c++) {
+for (const l of [t1, t2naive, t2fix]) for (let c = 0; c < INIT.length; c++) {
   const mine = l.rows.filter((r) => r.cust === c).sort((a, b) => a.from - b.from);
   check(mine.filter((r) => r.to === null).length === 1, "exactly one current row per customer");
   check(mine.every((r, i) => i === 0 || mine[i - 1].to === r.from), "versions must be contiguous");

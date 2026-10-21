@@ -3,6 +3,12 @@
 import sys
 
 KEYS, N, HOT, PARTS, BACKOFF, LATER = 12, 240, 30, 4, 5, 30
+SEED = 42
+MAX_FAILS, FAIL_PCT = 3, 8  # up to 3 failed attempts, 8% each
+LOW_BALANCE = 20  # below this an account only receives deposits
+MIN_DEPOSIT, DEPOSIT_SPREAD, MIN_WITHDRAWAL = 20, 41, 10  # deposits are 20..60
+MIN_PROC_MS, PROC_SPREAD = 6, 9  # processing takes 6..14 ms
+MS_PER_S = 1000
 M = 0xFFFFFFFF
 
 
@@ -27,21 +33,21 @@ def rng(seed):  # mulberry32, returns an unsigned 32-bit integer
 
 
 def make_stream():  # account events; key 0 is the hot account (30% of traffic)
-    nxt, bal, seq, ev = rng(42), [0] * KEYS, [0] * KEYS, []
+    nxt, bal, seq, ev = rng(SEED), [0] * KEYS, [0] * KEYS, []
     for i in range(N):
         u, v, w, a, p = nxt(), nxt(), nxt(), nxt(), nxt()
         key = 0 if u % 100 < HOT else 1 + v % (KEYS - 1)
-        nfail, ok = 0, True  # up to 3 failed attempts, 8% each
-        for _ in range(3):
+        nfail, ok = 0, True
+        for _ in range(MAX_FAILS):
             d = nxt()
-            if ok and d % 100 < 8:
+            if ok and d % 100 < FAIL_PCT:
                 nfail += 1
             else:
                 ok = False
-        deposit = bal[key] < 20 or w % 2 == 0
-        amount = 20 + a % 41 if deposit else 10 + a % (bal[key] - 9)  # a withdrawal never exceeds the true balance
+        deposit = bal[key] < LOW_BALANCE or w % 2 == 0
+        amount = MIN_DEPOSIT + a % DEPOSIT_SPREAD if deposit else MIN_WITHDRAWAL + a % (bal[key] - MIN_WITHDRAWAL + 1)  # a withdrawal never exceeds the true balance
         bal[key] += amount if deposit else -amount
-        ev.append(dict(id=i, key=key, seq=seq[key], deposit=deposit, amount=amount, proc=6 + p % 9, nfail=nfail))
+        ev.append(dict(id=i, key=key, seq=seq[key], deposit=deposit, amount=amount, proc=MIN_PROC_MS + p % PROC_SPREAD, nfail=nfail))
         seq[key] += 1
     return ev
 
@@ -99,7 +105,7 @@ def run(ev, partitioned, consumers, retry):  # events arrive 1 ms apart
             bal[e["key"]] -= e["amount"]
         else:
             overdrafts += 1
-    return dict(throughput=len(ev) * 1000 // max(done), violations=violations, overdrafts=overdrafts, hottest=max(load))
+    return dict(throughput=len(ev) * MS_PER_S // max(done), violations=violations, overdrafts=overdrafts, hottest=max(load))
 
 
 ev = make_stream()

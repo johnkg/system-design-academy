@@ -8,32 +8,39 @@ WEIGHT = [30, 20, 20, 10, 12, 8]  # how often each question topic is asked
 TENANT_SPECIFIC = [False, False, False, False, True, True]  # answer depends on who asks
 PRICE = {"small": (150, 600), "large": (3000, 15000)}  # nano-dollars per input / output token
 IN_TOK, OUT_TOK = 800, 150
+SEED, QUERIES, TENANTS, WORDINGS = 7, 240, 2, 3  # 3 fixed wordings per topic
+FRESH_PERCENT, HARD_PERCENT, SMALL_SOLVES_HARD_PERCENT = 40, 30, 25
+# Confidence: a hard question is usually low (0..59), otherwise 70..99.
+LOW_CONF_PERCENT, LOW_CONF_RANGE, HIGH_CONF_MIN, HIGH_CONF_RANGE = 75, 60, 70, 30
+PERMILLE, NANO_PER_MICRO = 1000, 1000
 
 
 def make_workload(n):
-    s = 7
+    s = SEED
 
     def rnd(m):
+        """Linear congruential generator (Numerical Recipes constants)."""
         nonlocal s
         s = (s * 1664525 + 1013904223) & 0xFFFFFFFF
         return (s >> 16) % m
 
     work = []
     for i in range(n):
-        tenant = rnd(2)
+        tenant = rnd(TENANTS)
         r = rnd(100)
         intent, acc = 0, 0
-        for k in range(6):
+        for k in range(len(WEIGHT)):
             acc += WEIGHT[k]
             if r < acc:
                 intent = k
                 break
-        wording = rnd(3)  # 3 fixed wordings per topic
-        fresh = rnd(100) < 40  # 40% of questions use brand-new wording
+        wording = rnd(WORDINGS)
+        fresh = rnd(100) < FRESH_PERCENT  # 40% of questions use brand-new wording
         noise = [rnd(3) - 1, rnd(3) - 1, rnd(3) - 1, rnd(3) - 1]
-        hard = rnd(100) < 30
-        small_ok = (rnd(100) < 25) if hard else True
-        conf = ((rnd(60) if rnd(100) < 75 else 70 + rnd(30)) if hard else 70 + rnd(30))
+        hard = rnd(100) < HARD_PERCENT
+        small_ok = (rnd(100) < SMALL_SOLVES_HARD_PERCENT) if hard else True
+        conf = ((rnd(LOW_CONF_RANGE) if rnd(100) < LOW_CONF_PERCENT else HIGH_CONF_MIN + rnd(HIGH_CONF_RANGE))
+                if hard else HIGH_CONF_MIN + rnd(HIGH_CONF_RANGE))
         wobble = [[0, 0, 0, 0], [-1, 0, 1, 0], [0, 1, 0, -1]][wording]
         vec = [v + (noise[d] if fresh else wobble[d]) for d, v in enumerate(VEC[intent])]
         key = "u%d" % i if fresh else "%d:%d" % (intent, wording)
@@ -47,11 +54,11 @@ def dot(a, b):
 
 def sim_ok(a, b, thr):
     d = dot(a, b)
-    return d > 0 and d * d * 1000000 >= thr * thr * dot(a, a) * dot(b, b)
+    return d > 0 and d * d * PERMILLE * PERMILLE >= thr * thr * dot(a, a) * dot(b, b)
 
 
 def permille(a, b):
-    return math.floor(1000 * dot(a, b) / math.sqrt(dot(a, a) * dot(b, b)))
+    return math.floor(PERMILLE * dot(a, b) / math.sqrt(dot(a, a) * dot(b, b)))
 
 
 def call_cost(m):
@@ -91,7 +98,7 @@ def run(work, cache, thr=950, isolate=True, route="large", escalate=65):
     return cost, hits, wrong
 
 
-work = make_workload(240)
+work = make_workload(QUERIES)
 base = len(work) * call_cost("large")
 print("one large call = %d nano-dollars, one small call = %d" % (call_cost("large"), call_cost("small")))
 configs = [
@@ -110,7 +117,7 @@ for label, cfg in configs:
     cost, hits, wrong = run(work, **cfg)
     R[label] = (cost, hits, wrong)
     saved = (100 * (base - cost)) // base
-    print("%s cost=%du$ saved=%d%% hits=%d wrong=%d" % (label.ljust(24), cost // 1000, saved, hits, wrong))
+    print("%s cost=%du$ saved=%d%% hits=%d wrong=%d" % (label.ljust(24), cost // NANO_PER_MICRO, saved, hits, wrong))
 if R["no cache, large model"][2] != 0:
     sys.exit(1)
 if not R["semantic 0.90"][2] > R["semantic 0.99"][2]:

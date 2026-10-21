@@ -4,13 +4,15 @@ using System;
 using System.Linq;
 
 const int N = 1000, CHUNK = 50, WRITES = 12; // rows, rows per backfill batch, live writes between steps
-uint seed = 12345;
+const uint SEED = 12345;
+// 31-bit LCG (glibc constants)
+uint seed = SEED;
 int Rand(int n) { seed = (seed * 1103515245u + 12345u) & 0x7fffffffu; return (int)((seed >> 8) % (uint)n); }
 string Split(string name) { int i = name.IndexOf(' '); return name[..i] + "|" + name[(i + 1)..]; }
 
 (int wrong, int version) Migrate(string mode)
 {
-    seed = 12345;
+    seed = SEED;
     var old = Enumerable.Range(0, N).Select(i => $"f{i} l{i}").ToArray(); // the live table: full_name
     var next = new string?[N];                                              // the new columns (or the shadow table)
     bool dualWrite = mode != "backfill-first";                              // is the app writing both shapes yet?

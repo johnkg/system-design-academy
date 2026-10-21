@@ -3,18 +3,24 @@
 // check the sampled estimate against the known true proportions.
 import assert from "node:assert";
 
+const ENCODE_LOOP_US = 170; // true self time of encode_loop before the regression
+const REGRESSION_US = 1000; // what the regression adds to encode_loop
+const SEED = 7;
+const BAR_WIDTH = 40; // characters for 100% in the flame graph
+const SIGMA_BOUND = 5; // sampling error must stay within 5 standard deviations
+
 // True CPU microseconds per request, by stack. encode_loop regresses by +1000.
 const BASE = [
   ["handler", 160], ["handler;auth", 120], ["handler;route", 80],
   ["handler;parse", 60], ["handler;parse;regex_match", 100],
   ["handler;db_query", 50], ["handler;db_query;driver_decode", 90],
   ["handler;serialize", 50], ["handler;serialize;json_encode", 90],
-  ["handler;serialize;json_encode;encode_loop", 170],
+  ["handler;serialize;json_encode;encode_loop", ENCODE_LOOP_US],
   ["handler;audit_log", 30],
 ];
 
 const truth = (regressed) =>
-  BASE.map(([s, w]) => [s, s.endsWith("encode_loop") && regressed ? w + 1000 : w]);
+  BASE.map(([s, w]) => [s, s.endsWith("encode_loop") && regressed ? w + REGRESSION_US : w]);
 
 // MINSTD: x = x * 48271 mod (2^31 - 1), exact in doubles and 64-bit ints
 function sample(stacks, n, seed) {
@@ -57,7 +63,7 @@ function pct(n, total) { // one decimal, integer math only
 }
 
 function flame(node, total, depth = 0, out = []) {
-  const bar = "#".repeat(Math.max(1, Math.floor((node.total * 40) / total)));
+  const bar = "#".repeat(Math.max(1, Math.floor((node.total * BAR_WIDTH) / total)));
   out.push(`${("  ".repeat(depth) + node.name).padEnd(34)} ${bar.padEnd(40)} ${pct(node.total, total).padStart(5)}% self ${pct(node.selfN, total).padStart(5)}%`);
   for (const k of Object.keys(node.kids).sort()) flame(node.kids[k], total, depth + 1, out);
   return out;
@@ -81,7 +87,7 @@ function selfByFunction(root) {
 }
 
 const N = 6000;
-const root = build(collapsed(sample(truth(true), N, 7)));
+const root = build(collapsed(sample(truth(true), N, SEED)));
 check(root);
 assert.strictEqual(root.total, N);
 assert.strictEqual(Object.values(selfByFunction(root)).reduce((a, b) => a + b, 0), N);
@@ -95,18 +101,18 @@ const tt = real.reduce((a, [, w]) => a + w, 0);
 const trueSelf = Object.fromEntries(real.map(([s, w]) => [s.split(";").pop(), w]));
 console.log(`\nestimate error for audit_log (true ${pct(trueSelf.audit_log, tt)}%):`);
 for (const n of [100, 1000, 10000, 60000]) {
-  const est = selfByFunction(build(collapsed(sample(real, n, 7))));
+  const est = selfByFunction(build(collapsed(sample(real, n, SEED))));
   const k = est.audit_log || 0;
   let worst = 0;
   for (const [f, w] of Object.entries(trueSelf)) {
     const num = Math.abs((est[f] || 0) * tt - w * n); // |estimate - truth| * n * tt, exact integers
     const p = w / tt;
-    assert(num / (n * tt) <= 5 * Math.sqrt((p * (1 - p)) / n) + 1 / n);
+    assert(num / (n * tt) <= SIGMA_BOUND * Math.sqrt((p * (1 - p)) / n) + 1 / n);
     worst = Math.max(worst, num);
   }
   console.log(`n=${String(n).padStart(5)}  audit_log samples=${String(k).padStart(4)}  est ${pct(k, n).padStart(5)}%  worst error over all functions ${pct(worst, n * tt)} pts`);
 }
 
 const baseTot = truth(false).reduce((a, [, w]) => a + w, 0);
-console.log(`\nregression: total ${baseTot} -> ${tt} us per request, encode_loop share ${pct(170, baseTot)}% -> ${pct(1170, tt)}%`);
-assert.strictEqual(tt, baseTot + 1000);
+console.log(`\nregression: total ${baseTot} -> ${tt} us per request, encode_loop share ${pct(ENCODE_LOOP_US, baseTot)}% -> ${pct(ENCODE_LOOP_US + REGRESSION_US, tt)}%`);
+assert.strictEqual(tt, baseTot + REGRESSION_US);

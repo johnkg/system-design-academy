@@ -7,6 +7,7 @@ TOOLS = {
     "calc": {"risky": False, "cost": 60},
     "deploy": {"risky": True, "cost": 200},
 }
+FINISH_COST = 50  # the model call that decides to finish
 
 
 class Crash(Exception):
@@ -63,7 +64,7 @@ def run_agent(o):
             continue
         act = policy(o["policy"], i)
         if act["tool"] == "finish":
-            log.append({"act": act, "result": "done", "cost": 50})
+            log.append({"act": act, "result": "done", "cost": FINISH_COST})
             return "done"
         n = len(log)
         if n >= 2 and all(r["act"] == act for r in (log[n - 1], log[n - 2])):

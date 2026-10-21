@@ -1,8 +1,11 @@
 // Point-in-time recovery in JavaScript: a base backup plus an ordered change log (the WAL archive).
 // restore() copies the base, then replays records in LSN order until the target time or LSN.
+const SECONDS_PER_MINUTE = 60, SECONDS_PER_HOUR = 3600;
+const MISSING_LSN = 6; // the archive segment we drop to show a broken chain
 const pad = (n) => String(n).padStart(2, "0");
-const clock = (t) => `${pad(Math.floor(t / 3600))}:${pad(Math.floor((t % 3600) / 60))}:${pad(t % 60)}`;
-const at = (h, m, s = 0) => h * 3600 + m * 60 + s;
+const clock = (t) => `${pad(Math.floor(t / SECONDS_PER_HOUR))}:${pad(Math.floor((t % SECONDS_PER_HOUR) / SECONDS_PER_MINUTE))}:${pad(t % SECONDS_PER_MINUTE)}`;
+const at = (h, m, s = 0) => h * SECONDS_PER_HOUR + m * SECONDS_PER_MINUTE + s;
+const MISTAKE_AT = at(14, 3); // when the DELETE without WHERE runs
 
 function apply(orders, rec) {
   if (rec.op === "delete_all") orders.clear();
@@ -58,20 +61,20 @@ const archive = db.log;
 console.log(`base backup ${clock(base.ts)} covers up to LSN ${base.lsn}; archive holds LSN ${base.lsn + 1}..${archive.length}`);
 console.log(`DELETE without WHERE is LSN ${bad} at ${clock(archive[bad - 1].ts)}`);
 
-const [good, n] = restore(base, archive, at(14, 3) - 1);
-console.log(`restore to ${clock(at(14, 3) - 1)}: applied through LSN ${n}: ${show(good)}`);
+const [good, n] = restore(base, archive, MISTAKE_AT - 1);
+console.log(`restore to ${clock(MISTAKE_AT - 1)}: applied through LSN ${n}: ${show(good)}`);
 const [byLsn, n2] = restore(base, archive, null, bad - 1);
 console.log(`restore to LSN ${bad - 1}: ${show(byLsn)}`);
 const same = eq(byLsn, good);
 console.log(`same result by time and by LSN: ${same}`);
-const [after] = restore(base, archive, at(14, 3));
-console.log(`restore to ${clock(at(14, 3))}: ${show(after)}`);
+const [after] = restore(base, archive, MISTAKE_AT);
+console.log(`restore to ${clock(MISTAKE_AT)}: ${show(after)}`);
 const [latest] = restore(base, archive);
 console.log(`restore to end of log: ${show(latest)}`);
 console.log(`replica (replays everything): ${show(db.orders)}`);
 console.log(`base backup only (no archive): ${show(base.orders)}`);
 try {
-  restore(base, archive.filter((r) => r.lsn !== 6));
+  restore(base, archive.filter((r) => r.lsn !== MISSING_LSN));
 } catch (e) {
   console.log(`broken archive: ${e.message}`);
 }

@@ -8,14 +8,15 @@ public static class Program
     public static void Main()
     {
         const int limit = 5;
+        const int posts = 20; // posts in the demo feed
 
-        var offsetStore = new PostStore(20);
+        var offsetStore = new PostStore(posts);
         Console.WriteLine("offset pagination");
         Console.WriteLine($"  page 1: {string.Join(",", offsetStore.ByOffset(0, limit))}");
         offsetStore.Add(); // post 21 is published while the client reads
         Console.WriteLine($"  page 2: {string.Join(",", offsetStore.ByOffset(limit, limit))}   <- 16 appears again");
 
-        var cursorStore = new PostStore(20);
+        var cursorStore = new PostStore(posts);
         Console.WriteLine("cursor pagination");
         var (ids, next) = cursorStore.ByCursor(null, limit);
         Console.WriteLine($"  page 1: {string.Join(",", ids)}");

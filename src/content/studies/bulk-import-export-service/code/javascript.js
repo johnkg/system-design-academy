@@ -1,13 +1,17 @@
 // A bulk import in JavaScript: a resumable chunked upload, row-by-row validation with an error report,
 // an idempotent re-run, and a fair scheduler that stops one big tenant from starving small ones.
 
-let seed = 7;
+const SEED = 7;
+let seed = SEED;
+// Linear congruential generator (Numerical Recipes constants), high 16 bits.
 const rand = (n) => { seed = (seed * 1664525 + 1013904223) % 4294967296; return Math.floor(seed / 65536) % n; };
 
 const CHUNK = 8;
+const ROWS = 44, MAX_QTY = 9;
+const ROW_KINDS = 10; // 1 in 10 rows has a bad email, 1 in 10 a bad quantity
 const makeRows = (n) => Array.from({ length: n }, (_, k) => {
-  const i = k + 1, r = rand(10);
-  return r === 0 ? `${i},bad-email,3` : r === 1 ? `${i},u${i}@x.io,many` : `${i},u${i}@x.io,${1 + rand(9)}`;
+  const i = k + 1, r = rand(ROW_KINDS);
+  return r === 0 ? `${i},bad-email,3` : r === 1 ? `${i},u${i}@x.io,many` : `${i},u${i}@x.io,${1 + rand(MAX_QTY)}`;
 });
 
 // The server remembers which chunks arrived, so a client that reconnects only sends the missing ones.
@@ -56,7 +60,7 @@ function schedule(queues, fair) {
   return names.map((n) => `${n}=${done[n]}`).join(' ');
 }
 
-const rows = makeRows(44);
+const rows = makeRows(ROWS);
 const up = new Upload(Math.ceil(rows.length / CHUNK));
 const chunk = (i) => rows.slice(i * CHUNK, (i + 1) * CHUNK);
 [0, 1, 2, 1].forEach((i) => up.put(i, chunk(i))); // the connection drops here, and chunk 1 was sent twice

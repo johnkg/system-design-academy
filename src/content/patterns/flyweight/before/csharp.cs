@@ -6,11 +6,12 @@ public static class Program
 {
     public static void Main()
     {
+        const int Trees = 1000, TextureChars = 10_000;
         var trees = new List<Tree>();
-        for (int i = 0; i < 1000; i++)
+        for (int i = 0; i < Trees; i++)
         {
             bool oak = i % 2 == 1;
-            trees.Add(new Tree(i, i * 2, oak ? "Oak" : "Pine", oak ? "green" : "dark green", new string('x', 10_000)));
+            trees.Add(new Tree(i, i * 2, oak ? "Oak" : "Pine", oak ? "green" : "dark green", new string('x', TextureChars)));
         }
         Console.WriteLine($"{trees.Count} trees each holding its own 10,000-char texture");
         // Memory scales with the number of trees, not the number of species.

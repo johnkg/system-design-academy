@@ -4,6 +4,8 @@
 import sys
 
 TTL = 10000  # lease length
+INITIAL_VALUE = 100
+RETRY_AFTER = 500  # how long A waits before it takes the lock again
 
 
 class LockService:
@@ -34,7 +36,7 @@ class LockService:
 class Storage:
     def __init__(self, fencing):
         self.fencing = fencing
-        self.value = 100
+        self.value = INITIAL_VALUE
         self.max_token = 0
 
     def accept(self, token):  # the heart of fencing: remember the highest token, refuse any lower one
@@ -69,7 +71,7 @@ def run(name, fencing, failover):
     lock.release("B")
     accepted = store.write(token_a, seen_by_a + 1)           # A writes the stale result
     if not accepted:                                         # A learns it lost the lock and starts again
-        t = lock.acquire("A", a_writes + 500)
+        t = lock.acquire("A", a_writes + RETRY_AFTER)
         store.write(t, store.read(t) + 1)
         lock.release("A")
     print(f"{name}: tokens A={token_a} B={token_b}; stale write {'accepted' if accepted else 'rejected'}; final value {store.value} (expected 102)")

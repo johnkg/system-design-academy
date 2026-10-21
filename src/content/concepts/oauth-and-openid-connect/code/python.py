@@ -81,7 +81,7 @@ print("first token still valid:", str(server.tokens["at-1"]).lower())
 
 ok, code2 = server.authorize("printshop", REDIRECT, CHALLENGE, "S256", 10)
 check("stolen code, no verifier", server.token(code2, "printshop", REDIRECT, "", 11), False)
-check("stolen code, guessed verifier", server.token(code2, "printshop", REDIRECT, "x" * 43, 11), False)
+check("stolen code, guessed verifier", server.token(code2, "printshop", REDIRECT, "x" * len(VERIFIER), 11), False)
 check("redeem with other redirect_uri", server.token(code2, "printshop", "https://evil.test/cb", VERIFIER, 12), False)
 check("legit client still succeeds", server.token(code2, "printshop", REDIRECT, VERIFIER, 13), True)
 

@@ -2,6 +2,14 @@
 // least-recently-used eviction, expiry by TTL, and the choice of joining a fetch that is already under way.
 const TTL = 20000, EDGE_CAP = 200, SHIELD_CAP = 500, POPS = 4, REQUESTS = 20000;
 const EDGE_SHIELD = 16, ORIGIN_TRIP = 80, ORIGIN_WORK = 30; // milliseconds: edge to shield and back, origin round trip, origin processing
+const SEED = 99;
+const MAX_GAP_MS = 3; // requests arrive 1..3 ms apart
+const UNIFORM_RANGE = 10000; // u is uniform in 0..9999
+const KEY_DIVISOR = 2000000000; // u^3 / KEY_DIVISOR gives keys 0..499
+const HERD_REQUESTS = 100; // herd demo: requests in the first 100 ms, all for one key
+const HERD_KEY = 7;
+const HERD_FETCH_MS = 110;
+const HERD_CACHE_CAP = 10;
 
 class Cache {
   constructor(cap) { this.cap = cap; this.items = new Map(); this.tick = 0; this.hits = 0; this.joined = 0; this.misses = 0; }
@@ -26,14 +34,14 @@ class Cache {
 }
 
 function simulate(shielded, coalesce) {
-  let seed = 99;
+  let seed = SEED;
   const next = () => { seed = (Math.imul(seed, 1664525) + 1013904223) >>> 0; return seed >>> 8; };
   const edges = Array.from({ length: POPS }, () => new Cache(EDGE_CAP)), shield = new Cache(SHIELD_CAP);
   let now = 0, origin = 0, totalWait = 0;
   const fromOrigin = () => { origin++; return ORIGIN_TRIP + ORIGIN_WORK; };
   for (let i = 0; i < REQUESTS; i++) {
-    now += 1 + (next() % 3);
-    const u = next() % 10000, key = Math.floor((u * u * u) / 2000000000);          // cubing a uniform number favours low keys: a few popular objects
+    now += 1 + (next() % MAX_GAP_MS);
+    const u = next() % UNIFORM_RANGE, key = Math.floor((u * u * u) / KEY_DIVISOR);          // cubing a uniform number favours low keys: a few popular objects
     const edge = edges[next() % POPS];
     totalWait += edge.lookup(key, now, coalesce, () => (shielded ? EDGE_SHIELD + shield.lookup(key, now, coalesce, fromOrigin) : fromOrigin()));
   }
@@ -44,8 +52,8 @@ function simulate(shielded, coalesce) {
 
 // 100 requests for a new object arrive within 100 ms while its fetch takes 110 ms.
 function herd(coalesce) {
-  const cache = new Cache(10); let fetches = 0;
-  for (let t = 0; t < 100; t++) cache.lookup(7, t, coalesce, () => { fetches++; return 110; });
+  const cache = new Cache(HERD_CACHE_CAP); let fetches = 0;
+  for (let t = 0; t < HERD_REQUESTS; t++) cache.lookup(HERD_KEY, t, coalesce, () => { fetches++; return HERD_FETCH_MS; });
   return fetches;
 }
 

@@ -1,6 +1,9 @@
 # Flyweight in Python. Trees share one TreeType per species.
 from dataclasses import dataclass
 
+TEXTURE_SIZE = 10_000  # characters in one species' texture
+TREES = 1000
+
 
 @dataclass(frozen=True)
 class TreeType:  # Flyweight: intrinsic, immutable, shared
@@ -42,7 +45,7 @@ class Forest:  # Client
         self._trees = []
 
     def plant(self, x, y, name, color):
-        tree_type = TreeTypeFactory.get(name, color, "x" * 10_000)  # big texture, created once per species
+        tree_type = TreeTypeFactory.get(name, color, "x" * TEXTURE_SIZE)  # big texture, created once per species
         self._trees.append(Tree(x, y, tree_type))
 
     @property
@@ -51,6 +54,6 @@ class Forest:  # Client
 
 
 forest = Forest()
-for i in range(1000):
+for i in range(TREES):
     forest.plant(i, i * 2, "Oak" if i % 2 else "Pine", "green" if i % 2 else "dark green")
 print(f"{forest.size} trees, {TreeTypeFactory.count()} shared TreeType objects")

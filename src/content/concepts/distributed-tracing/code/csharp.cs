@@ -6,6 +6,8 @@ using System.Linq;
 
 public static class Program
 {
+    // Simulated work per service, in milliseconds.
+    const int PaymentMs = 1800, OrdersBeforeMs = 20, OrdersAfterMs = 30, GatewayEachSideMs = 10;
     static int clock; // milliseconds
     static readonly List<Span> Spans = new();
 
@@ -29,25 +31,25 @@ public static class Program
     static void PaymentService(string header)
     {
         var span = StartSpan("payment", FromHeader(header));
-        Work(1800); // the slow part
+        Work(PaymentMs); // the slow part
         EndSpan(span);
     }
 
     static void OrderService(string header)
     {
         var span = StartSpan("orders", FromHeader(header));
-        Work(20);
+        Work(OrdersBeforeMs);
         PaymentService(ToHeader(span)); // pass the context on
-        Work(30);
+        Work(OrdersAfterMs);
         EndSpan(span);
     }
 
     static void Gateway()
     {
         var span = StartSpan("gateway");
-        Work(10);
+        Work(GatewayEachSideMs);
         OrderService(ToHeader(span));
-        Work(10);
+        Work(GatewayEachSideMs);
         EndSpan(span);
     }
 

@@ -16,11 +16,14 @@ public static class Program
 
 public class Checkout
 {
+    const decimal Percent20Factor = 0.8m; // 20% off: pay 80%
+    const decimal Flat15Off = 15m;
+
     public decimal Total(decimal[] prices, string kind)
     {
         decimal sum = prices.Sum();
-        if (kind == "percent20") return sum * 0.8m;
-        if (kind == "flat15") return Math.Max(0, sum - 15);
+        if (kind == "percent20") return sum * Percent20Factor;
+        if (kind == "flat15") return Math.Max(0, sum - Flat15Off);
         // Every new promotion adds another branch right here.
         return sum;
     }

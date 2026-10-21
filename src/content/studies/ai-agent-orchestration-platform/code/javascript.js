@@ -6,6 +6,7 @@ const TOOLS = {
   calc: { risky: false, cost: 60 },
   deploy: { risky: true, cost: 200 },
 };
+const FINISH_COST = 50; // the model call that decides to finish
 
 // The outside world: it counts how many times each tool really ran, and remembers the keys it has seen.
 class World {
@@ -35,7 +36,7 @@ function runAgent(o) {
     const rec = o.log[i];
     if (rec) { if (rec.act.tool === 'finish') return 'done'; continue; } // already done before a crash: skip it, do not run it again
     const act = POLICIES[o.policy](i);
-    if (act.tool === 'finish') { o.log.push({ act, result: 'done', cost: 50 }); return 'done'; }
+    if (act.tool === 'finish') { o.log.push({ act, result: 'done', cost: FINISH_COST }); return 'done'; }
     const n = o.log.length;
     if (n >= 2 && [o.log[n - 1], o.log[n - 2]].every((r) => r.act.tool === act.tool && r.act.arg === act.arg)) return 'loop';
     if (TOOLS[act.tool].risky && !o.approve(act)) return 'denied';

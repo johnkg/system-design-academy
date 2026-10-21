@@ -14,9 +14,10 @@ public static class Program
     const long FlopsPerUs = 200_000_000;           // 200 TFLOP/s achievable
     const long FlopsPerToken = 16_000_000_000;     // 2 x parameters per generated token
     const long MaxBatch = 256;
+    const long BitsPerByte = 8, UsPerMs = 1000;
 
     // 2 (K and V) x layers x kv_heads x head_dim x bytes per value
-    static long KvBytesPerToken(long kvHeads, long bits) => 2 * Layers * kvHeads * HeadDim * bits / 8;
+    static long KvBytesPerToken(long kvHeads, long bits) => 2 * Layers * kvHeads * HeadDim * bits / BitsPerByte;
     static long MaxSequences(long kvPerToken, long ctx) => Math.Min(MaxBatch, (Usable - Weights) / (kvPerToken * ctx));
 
     // One decode step reads every weight once plus every sequence's whole KV cache.
@@ -26,7 +27,7 @@ public static class Program
         long computeUs = batch * FlopsPerToken / FlopsPerUs;
         return (Math.Max(memoryUs, computeUs), memoryUs >= computeUs ? "memory" : "compute");
     }
-    static long PrefillMs(long ctx) => ctx * FlopsPerToken / FlopsPerUs / 1000;
+    static long PrefillMs(long ctx) => ctx * FlopsPerToken / FlopsPerUs / UsPerMs;
     static void Check(bool ok, string msg) { if (!ok) { Console.Error.WriteLine("invariant violated: " + msg); Environment.Exit(1); } }
 
     public static void Main()

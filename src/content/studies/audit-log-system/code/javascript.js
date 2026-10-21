@@ -18,11 +18,18 @@ const link = (prev, e) => fnv(`${prev}|${dataOf(e)}`);
 
 // Append-only: each entry stores the hash of the entry before it.
 const BLOCK = 250;
+const DOCS = 50; // documents the demo actions target
+const START_TIME = 1700000000; // Unix seconds of the first entry
+const ENTRY_GAP_S = 3; // entries are about 3 s apart, with up to 2 s of jitter
+const ENTRIES = 1000;
+const EDIT_AT = 300; // the entry an attacker edits
+const TRUNCATE_TO = 900;
+const PROVE_SEQ = 777; // the entry the inclusion proof is for
 function build(count) {
   const log = [];
   let prev = '00000000';
   for (let seq = 0; seq < count; seq++) {
-    const e = { seq, actor: actors[random(4)], action: actions[random(5)], target: `doc-${random(50)}`, time: 1700000000 + seq * 3 + random(3) };
+    const e = { seq, actor: actors[random(actors.length)], action: actions[random(actions.length)], target: `doc-${random(DOCS)}`, time: START_TIME + seq * ENTRY_GAP_S + random(ENTRY_GAP_S) };
     e.hash = link(prev, e);
     prev = e.hash;
     log.push(e);
@@ -78,29 +85,29 @@ function checkProof(hash, proof, root) {
   return hash === root;
 }
 
-const log = build(1000);
+const log = build(ENTRIES);
 const cps = checkpoints(log);
 console.log(`entries: ${log.length}, checkpoints at: ${cps.map((c) => c.end).join(', ')}`);
 console.log(`head ${log[999].hash}, last root ${cps[3].root}`);
 console.log(`intact: chain ${verifyChain(log)}, checkpoints ${verifyCheckpoints(log, cps)}`);
 
 const edited = log.map((e) => ({ ...e }));
-edited[300].actor = 'mallory';
+edited[EDIT_AT].actor = 'mallory';
 const editChain = verifyChain(edited);
 console.log(`edit entry 300: chain breaks at ${editChain}`);
 
-let prev = edited[299].hash; // a clean rewrite: recompute every later hash
-for (let i = 300; i < edited.length; i++) { edited[i].hash = link(prev, edited[i]); prev = edited[i].hash; }
+let prev = edited[EDIT_AT - 1].hash; // a clean rewrite: recompute every later hash
+for (let i = EDIT_AT; i < edited.length; i++) { edited[i].hash = link(prev, edited[i]); prev = edited[i].hash; }
 const rewriteChain = verifyChain(edited);
 const rewriteCp = verifyCheckpoints(edited, cps);
 console.log(`rewrite from 300: chain ${rewriteChain}, checkpoints disagree at ${rewriteCp}`);
 
-const dropped = log.slice(0, 900);
+const dropped = log.slice(0, TRUNCATE_TO);
 console.log(`truncate to 900: chain ${verifyChain(dropped)}, checkpoints disagree at ${verifyCheckpoints(dropped, cps)}`);
 
-const proof = proveEntry(log, 777);
-const okProof = checkProof(log[777].hash, proof, cps[3].root);
+const proof = proveEntry(log, PROVE_SEQ);
+const okProof = checkProof(log[PROVE_SEQ].hash, proof, cps[3].root);
 const badProof = checkProof(fnv('forged'), proof, cps[3].root);
 console.log(`proof for entry 777: ${proof.length} hashes, genuine ${okProof}, forged ${badProof}`);
 
-if (editChain !== 300 || rewriteChain !== -1 || rewriteCp !== 500 || verifyCheckpoints(dropped, cps) !== 1000 || !okProof || badProof) process.exit(1);
+if (editChain !== EDIT_AT || rewriteChain !== -1 || rewriteCp !== 500 || verifyCheckpoints(dropped, cps) !== ENTRIES || !okProof || badProof) process.exit(1);
