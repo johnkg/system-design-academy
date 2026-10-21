@@ -65,36 +65,47 @@ import PlaygroundShell from '../../components/PlaygroundShell.astro';
     const GW_CAP = 6000, AUTH_CAP = 25000, REDIS_CAP = 100000, CONSUMERS = 100, LIMIT = 1000;
     const fmt = (n: number) => Math.round(n).toLocaleString('en-US');
     const ms = (n: number) => (n < 10 ? n.toFixed(2) : n < 100 ? n.toFixed(1) : String(Math.round(n)));
+    const LIM = { ticks: 100, syncEvery: 10, seed: 77, abuserPerTick: 30, goodPerTick: 9 }; // rate-limit run: one second in 100 ticks, sync every 10 ticks
+    const STORM = { steps: 100, perSec: 10, workPerReq: 0.12, rejectCost: 0.2, slowFrom: 20, slowTo: 70, baseSuccess: 0.98, refill: 0.1, cap: 0.2, okShare: 0.95, okLoad: 1.1 }; // retry-storm run: 100 steps of 100 ms, upstream slow in steps 20..69, retry budget refills 10% and holds 20% of new requests, recovered at 95% success under 1.1x load
+    const MAX_QUEUE = 20, QUEUE_EXP = 4; // queueing delay multiplier on gateway CPU
+    const CPU_MS = { proxy: 0.16, plugins: 0.03, jwt: 0.08, cache: 0.02, localLimit: 0.01 }; // gateway CPU per request
+    const AUTH_MS = { timeout: 100, base: 1.5, wait: 0.5 }; // remote auth call: base latency plus queueing
+    const REDIS_MS = { base: 0.4, wait: 0.1, maxRho: 0.99 };
+    const SYNCS_PER_S = 10; // synced limiter pushes counts 10 times a second
+    const CACHE_HIT = 0.6;
+    const BAD = { authRho: 0.9, gwRho: 0.8, overPct: 25, warnOverPct: 5, goodSuccess: 0.9, badSuccess: 0.5, stormPeak: 2 };
+    const CHART = { x0: 10, w: 286, floor: 74, h: 64, top: 4.2 }; // SVG plot box (matches the markup) and y-axis top in multiples of normal load
+    // linear congruential generator (Numerical Recipes constants)
     const lcg = (s: number) => () => (s = (s * 1664525 + 1013904223) % 4294967296) / 4294967296;
 
     // Rate limiting: one second in 100 ticks. The abusive consumer sends 30 requests a tick, the well-behaved one 9, each to a random instance.
     function limiter(mode: string, n: number) {
-      const rnd = lcg(77); const mk = () => new Array(n).fill(0);
+      const rnd = lcg(LIM.seed); const mk = () => new Array(n).fill(0);
       const loc: Record<string, number[]> = { a: mk(), l: mk() }; const snap: Record<string, number[]> = { a: mk(), l: mk() };
       const glob: Record<string, number> = { a: 0, l: 0 }; const adm: Record<string, number> = { a: 0, l: 0 };
       const split = Math.floor(LIMIT / n);
-      for (let t = 0; t < 100; t++) {
-        if (mode === 'sync' && t % 10 === 0) for (const k of ['a', 'l']) { for (let i = 0; i < n; i++) { glob[k] += loc[k][i]; loc[k][i] = 0; } snap[k].fill(glob[k]); }
-        for (const [k, per] of [['a', 30], ['l', 9]] as [string, number][]) for (let j = 0; j < per; j++) {
+      for (let t = 0; t < LIM.ticks; t++) {
+        if (mode === 'sync' && t % LIM.syncEvery === 0) for (const k of ['a', 'l']) { for (let i = 0; i < n; i++) { glob[k] += loc[k][i]; loc[k][i] = 0; } snap[k].fill(glob[k]); }
+        for (const [k, per] of [['a', LIM.abuserPerTick], ['l', LIM.goodPerTick]] as [string, number][]) for (let j = 0; j < per; j++) {
           const i = Math.floor(rnd() * n); let ok: boolean;
           if (mode === 'central') { ok = glob[k] < LIMIT; if (ok) glob[k]++; }
           else { ok = mode === 'local' ? loc[k][i] < LIMIT : mode === 'split' ? loc[k][i] < split : snap[k][i] + loc[k][i] < LIMIT; if (ok) loc[k][i]++; }
           if (ok) adm[k]++;
         }
       }
-      return { abuser: adm.a, rejectedGood: 900 - adm.l };
+      return { abuser: adm.a, rejectedGood: LIM.goodPerTick * LIM.ticks - adm.l };
     }
 
     // Retry storm: 100 intervals of 100 ms. The upstream has 0.12 units of work per request per second of traffic (2,400 at 20,000 a second), a request costs `slow` units, and refusing an attempt costs 0.2.
     function storm(policy: string, slow: number, traffic: number, hit: number) {
-      const A = (traffic * (1 - hit)) / 10; const B = traffic * 0.12; const REJ = 0.2; const LV = 4;
+      const A = (traffic * (1 - hit)) / STORM.perSec; const B = traffic * STORM.workPerReq; const REJ = STORM.rejectCost; const LV = 4; // LV: first attempt plus up to 3 retries
       let att: number[] = new Array(LV).fill(0); let tokens = 0; let okSum = 0; let newSum = 0; let peak = 1; let recover = -1;
       const load: number[] = []; const good: number[] = [];
-      for (let t = 0; t < 100; t++) {
-        const f = t >= 20 && t < 70 ? slow : 1;
+      for (let t = 0; t < STORM.steps; t++) {
+        const f = t >= STORM.slowFrom && t < STORM.slowTo ? slow : 1;
         att[0] = A; const X = att.reduce((a, b) => a + b, 0);
-        const served = Math.max(0, Math.min(X, (B - REJ * X) / (f - REJ))); const p = X === 0 ? 1 : served / X; const succ = p * 0.98;
-        tokens = Math.min(tokens + 0.1 * A, 0.2 * A);
+        const served = Math.max(0, Math.min(X, (B - REJ * X) / (f - REJ))); const p = X === 0 ? 1 : served / X; const succ = p * STORM.baseSuccess;
+        tokens = Math.min(tokens + STORM.refill * A, STORM.cap * A);
         const next: number[] = new Array(LV).fill(0);
         if (policy !== 'none') {
           const fail = att.map((a) => a * (1 - succ)); const eligible = fail.slice(0, LV - 1).reduce((a, b) => a + b, 0);
@@ -103,33 +114,33 @@ import PlaygroundShell from '../../components/PlaygroundShell.astro';
           if (policy === 'budget') tokens -= eligible * r;
         }
         const ok = X * succ; load.push(X / A); good.push(ok / A);
-        if (t >= 20 && t < 70) { okSum += ok; newSum += A; peak = Math.max(peak, X / A); }
-        if (t >= 70 && recover < 0 && ok / A > 0.95 && X / A < 1.1) recover = t - 70;
+        if (t >= STORM.slowFrom && t < STORM.slowTo) { okSum += ok; newSum += A; peak = Math.max(peak, X / A); }
+        if (t >= STORM.slowTo && recover < 0 && ok / A > STORM.okShare && X / A < STORM.okLoad) recover = t - STORM.slowTo;
         att = next;
       }
       return { success: okSum / newSum, peak, recover, load, good };
     }
 
     function model(c: { auth: string; limit: string; cache: boolean; n: number; traffic: number; k: number; retry: string }) {
-      const rhoG = c.traffic / (c.n * GW_CAP); const queue = rhoG >= 1 ? 20 : Math.min(20, 1 + Math.pow(rhoG, 4) / (1 - rhoG));
+      const rhoG = c.traffic / (c.n * GW_CAP); const queue = rhoG >= 1 ? MAX_QUEUE : Math.min(MAX_QUEUE, 1 + Math.pow(rhoG, QUEUE_EXP) / (1 - rhoG));
       const gwFail = rhoG >= 1 ? 1 - 1 / rhoG : 0;
-      const cpu = (0.16 + 0.03 + (c.auth === 'jwt' ? 0.08 : 0) + (c.cache ? 0.02 : 0) + (c.limit === 'central' ? 0 : 0.01)) * queue;
+      const cpu = (CPU_MS.proxy + CPU_MS.plugins + (c.auth === 'jwt' ? CPU_MS.jwt : 0) + (c.cache ? CPU_MS.cache : 0) + (c.limit === 'central' ? 0 : CPU_MS.localLimit)) * queue;
       const rhoA = c.auth === 'remote' ? c.traffic / AUTH_CAP : 0;
       const authFail = rhoA >= 1 ? 1 - 1 / rhoA : 0;
-      const authMs = c.auth === 'jwt' ? 0 : rhoA >= 1 ? 100 : Math.min(100, 1.5 + 0.5 / (1 - rhoA));
+      const authMs = c.auth === 'jwt' ? 0 : rhoA >= 1 ? AUTH_MS.timeout : Math.min(AUTH_MS.timeout, AUTH_MS.base + AUTH_MS.wait / (1 - rhoA));
       const distinct = (r: number) => CONSUMERS * (1 - Math.exp(-r / CONSUMERS));
-      const redisOps = c.limit === 'central' ? c.traffic : c.limit === 'sync' ? c.n * 10 * distinct(c.traffic / c.n / 10) : 0;
+      const redisOps = c.limit === 'central' ? c.traffic : c.limit === 'sync' ? c.n * SYNCS_PER_S * distinct(c.traffic / c.n / SYNCS_PER_S) : 0;
       const rhoR = redisOps / REDIS_CAP;
-      const limMs = c.limit === 'central' ? 0.4 + 0.1 / (1 - Math.min(rhoR, 0.99)) : 0;
+      const limMs = c.limit === 'central' ? REDIS_MS.base + REDIS_MS.wait / (1 - Math.min(rhoR, REDIS_MS.maxRho)) : 0;
       const total = cpu + authMs + limMs;
-      const lq = limiter(c.limit, c.n); const st = storm(c.retry, c.k, c.traffic, c.cache ? 0.6 : 0);
+      const lq = limiter(c.limit, c.n); const st = storm(c.retry, c.k, c.traffic, c.cache ? CACHE_HIT : 0);
       const rhoLose = c.n > 1 ? c.traffic / ((c.n - 1) * GW_CAP) : Infinity;
       return { rhoG, gwFail, cpu, rhoA, authFail, authMs, redisOps, rhoR, limMs, total, lq, st, rhoLose };
     }
 
     const byId = (s: string) => q<HTMLSelectElement>(s).value;
     const num = (s: string) => Number(q<HTMLInputElement>(s).value);
-    const lineOf = (v: number[], max: number) => v.map((y, i) => `${(10 + (i * 286) / 99).toFixed(1)},${(74 - (Math.min(y, max) / max) * 64).toFixed(1)}`).join(' ');
+    const lineOf = (v: number[], max: number) => v.map((y, i) => `${(CHART.x0 + (i * CHART.w) / (STORM.steps - 1)).toFixed(1)},${(CHART.floor - (Math.min(y, max) / max) * CHART.h).toFixed(1)}`).join(' ');
     let frame = 0;
     function draw() {
       const c = { auth: byId('[data-auth]'), limit: byId('[data-limit]'), cache: byId('[data-cache]') === 'on', n: num('[data-n]'), traffic: num('[data-traffic]'), k: num('[data-k]'), retry: byId('[data-retry]') };
@@ -150,25 +161,25 @@ import PlaygroundShell from '../../components/PlaygroundShell.astro';
       ];
       q('[data-o2]').textContent = parts.join('; ');
       q('[data-n2]').textContent = `each gateway instance ${Math.round(m.rhoG * 100)}% busy; ` + (c.n === 1 ? 'with one instance, its failure is a total outage' : `if one instance dies the other ${c.n - 1} run at ${Math.round(m.rhoLose * 100)}%`);
-      set('[data-b2]', m.rhoA >= 0.9 || m.rhoG >= 0.8 || m.rhoLose >= 1 ? 'var(--bad)' : 'var(--good)');
+      set('[data-b2]', m.rhoA >= BAD.authRho || m.rhoG >= BAD.gwRho || m.rhoLose >= 1 ? 'var(--bad)' : 'var(--good)');
 
       // 3: quota accuracy
       const over = Math.round(((m.lq.abuser - LIMIT) / LIMIT) * 100);
-      q('[data-o3]').textContent = `abuser: ${fmt(m.lq.abuser)} of 3,000 admitted, limit ${fmt(LIMIT)}`;
-      q('[data-n3]').textContent = `${over > 0 ? `${over}% over the limit` : over < 0 ? `${-over}% under the limit` : 'exactly at the limit'}; ${m.lq.rejectedGood} of 900 requests from a well-behaved consumer wrongly rejected`;
-      set('[data-b3]', over > 25 || m.lq.rejectedGood > 0 ? 'var(--bad)' : over > 5 ? 'var(--accent)' : 'var(--good)');
+      q('[data-o3]').textContent = `abuser: ${fmt(m.lq.abuser)} of ${fmt(LIM.abuserPerTick * LIM.ticks)} admitted, limit ${fmt(LIMIT)}`;
+      q('[data-n3]').textContent = `${over > 0 ? `${over}% over the limit` : over < 0 ? `${-over}% under the limit` : 'exactly at the limit'}; ${m.lq.rejectedGood} of ${LIM.goodPerTick * LIM.ticks} requests from a well-behaved consumer wrongly rejected`;
+      set('[data-b3]', over > BAD.overPct || m.lq.rejectedGood > 0 ? 'var(--bad)' : over > BAD.warnOverPct ? 'var(--accent)' : 'var(--good)');
 
       // 4: slow upstream
       const s = m.st;
       q('[data-o4]').textContent = c.k === 1 ? 'no slowdown' : `${(s.success * 100).toFixed(0)}% of requests succeed, upstream load up to ${s.peak.toFixed(1)}x`;
-      q('[data-n4]').textContent = c.k === 1 ? `normal operation: ${(s.success * 100).toFixed(0)}% succeed because 2% of attempts fail by chance` : s.recover <= 1 ? 'back to normal as soon as the slowdown ends' : `after the slowdown ends it needs ${(s.recover / 10).toFixed(1)} s more to recover`;
-      set('[data-b4]', c.k === 1 || (s.success > 0.9) ? 'var(--good)' : s.success > 0.5 ? 'var(--accent)' : 'var(--bad)');
+      q('[data-n4]').textContent = c.k === 1 ? `normal operation: ${(s.success * 100).toFixed(0)}% succeed because ${Math.round((1 - STORM.baseSuccess) * 100)}% of attempts fail by chance` : s.recover <= 1 ? 'back to normal as soon as the slowdown ends' : `after the slowdown ends it needs ${(s.recover / STORM.perSec).toFixed(1)} s more to recover`;
+      set('[data-b4]', c.k === 1 || (s.success > BAD.goodSuccess) ? 'var(--good)' : s.success > BAD.badSuccess ? 'var(--accent)' : 'var(--bad)');
 
-      const top = 4.2;
+      const top = CHART.top;
       q('[data-load]').setAttribute('points', lineOf(s.load, top)); q('[data-ok]').setAttribute('points', lineOf(s.good, top));
       q('[data-top]').textContent = `${top.toFixed(1)}x normal`;
-      q<SVGElement>('[data-one]').setAttribute('y1', String(74 - (1 / top) * 64)); q<SVGElement>('[data-one]').setAttribute('y2', String(74 - (1 / top) * 64));
-      q('[data-svg]').setAttribute('aria-label', `Over 10 seconds the upstream receives up to ${s.peak.toFixed(1)} times its normal load, and ${(s.success * 100).toFixed(0)}% of requests succeed during the slowdown`);
+      q<SVGElement>('[data-one]').setAttribute('y1', String(CHART.floor - (1 / top) * CHART.h)); q<SVGElement>('[data-one]').setAttribute('y2', String(CHART.floor - (1 / top) * CHART.h));
+      q('[data-svg]').setAttribute('aria-label', `Over ${STORM.steps / STORM.perSec} seconds the upstream receives up to ${s.peak.toFixed(1)} times its normal load, and ${(s.success * 100).toFixed(0)}% of requests succeed during the slowdown`);
 
       // verdict
       const issues: string[] = [];
@@ -177,10 +188,10 @@ import PlaygroundShell from '../../components/PlaygroundShell.astro';
       else if (m.rhoLose >= 1) issues.push(`Losing one instance would overload the remaining ${c.n - 1} (${Math.round(m.rhoLose * 100)}% of capacity), and the failure would spread.`);
       if (m.authFail > 0) issues.push(`The identity service is overloaded at ${Math.round(m.rhoA * 100)}% of its capacity, so ${Math.round(m.authFail * 100)}% of requests fail at authentication. Verify tokens locally.`);
       else if (c.auth === 'remote') issues.push(`Calling the identity service for every request adds ${ms(m.authMs)} ms and puts ${fmt(c.traffic)} calls a second on it, which is ${Math.round(m.rhoA * 100)}% of its capacity.`);
-      if (over > 25) issues.push(`The quota is ${over}% over the limit: ${m.lq.abuser > 2000 ? 'with the whole limit on each instance, the real limit is the limit times the number of instances' : 'instances act on stale totals for up to one sync interval'}.`);
+      if (over > BAD.overPct) issues.push(`The quota is ${over}% over the limit: ${m.lq.abuser > 2 * LIMIT /* far beyond one limit: each instance applies the whole limit */ ? 'with the whole limit on each instance, the real limit is the limit times the number of instances' : 'instances act on stale totals for up to one sync interval'}.`);
       if (m.lq.rejectedGood > 0) issues.push(`An even split wrongly rejected ${m.lq.rejectedGood} requests of a consumer who stayed under the limit, because traffic is never perfectly even.`);
-      if (c.k > 1 && c.retry === 'retry' && s.peak > 2) issues.push(`Retry storm: the slow upstream receives up to ${s.peak.toFixed(1)} times its normal load and ${(s.success * 100).toFixed(0)}% of requests succeed${s.recover > 1 ? `, and it takes ${(s.recover / 10).toFixed(1)} s more to recover once it is fast again` : ''}.`);
-      else if (c.k > 1 && s.success < 0.5) issues.push(`The slow upstream cannot keep up, and ${(100 - s.success * 100).toFixed(0)}% of requests fail. The ${c.retry === 'budget' ? 'retry budget keeps the load at most ' + s.peak.toFixed(1) + ' times normal' : 'failures are not made worse by retries'}, but the gateway cannot create capacity. Turn the cache on, or shed load.`);
+      if (c.k > 1 && c.retry === 'retry' && s.peak > BAD.stormPeak) issues.push(`Retry storm: the slow upstream receives up to ${s.peak.toFixed(1)} times its normal load and ${(s.success * 100).toFixed(0)}% of requests succeed${s.recover > 1 ? `, and it takes ${(s.recover / STORM.perSec).toFixed(1)} s more to recover once it is fast again` : ''}.`);
+      else if (c.k > 1 && s.success < BAD.badSuccess) issues.push(`The slow upstream cannot keep up, and ${(100 - s.success * 100).toFixed(0)}% of requests fail. The ${c.retry === 'budget' ? 'retry budget keeps the load at most ' + s.peak.toFixed(1) + ' times normal' : 'failures are not made worse by retries'}, but the gateway cannot create capacity. Turn the cache on, or shed load.`);
       const out = q('[data-verdict]'); const bad = issues.length > 0; out.classList.toggle('bad', bad);
       out.textContent = bad ? issues.join(' ') : `Healthy: ${ms(m.total)} ms added per request, the quota is within ${Math.abs(over)}% of the limit, and the upstream copes${c.k > 1 ? ` with a ${c.k}x slowdown (${(s.success * 100).toFixed(0)}% succeed, peak ${s.peak.toFixed(1)}x load)` : ''}.`;
     }

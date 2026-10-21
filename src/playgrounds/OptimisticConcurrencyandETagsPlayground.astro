@@ -48,6 +48,14 @@ import PlaygroundShell from '../components/PlaygroundShell.astro';
     makespanMs: number; events: string[];
   }
   const EDITS = 12; const TICK_MS = 10; const MAX_RETRY = 8; const READ_T = 1;
+  const SEED_MIX = { mult: 7919, add: 17 }; // spreads the seed choice
+  const START_TICKS = 10; // clients start within the first 10 ticks
+  const GAP = { min: 3, span: 12 }, THINK = { min: 3, span: 8 }; // ticks between edits, and spent editing after a read
+  const BACKOFF_MAX_EXP = 4; // retry backoff grows as 2^attempt up to 2^4 ticks
+  const MAX_TICKS = 200000; // safety stop
+  const MAX_EVENTS = 12, READ_EVENTS = 4; // events kept for the log, and how many of them may be reads
+  const MS_PER_S = 1000;
+  // mulberry32 seeded PRNG
   function prng(seed: number) { let s = seed >>> 0; return () => { s = (s + 0x6d2b79f5) >>> 0; let t = s; t = Math.imul(t ^ (t >>> 15), t | 1); t ^= t + Math.imul(t ^ (t >>> 7), t | 61); return ((t ^ (t >>> 14)) >>> 0) / 4294967296; }; }
 
   interface Client {
@@ -56,17 +64,17 @@ import PlaygroundShell from '../components/PlaygroundShell.astro';
   }
 
   function simulate(p: Params): Result {
-    const rnd = prng(p.seed * 7919 + 17);
+    const rnd = prng(p.seed * SEED_MIX.mult + SEED_MIX.add);
     const M = p.records; const per = Math.min(p.perEdit, M); const timeoutTicks = Math.round(p.timeout / TICK_MS);
     const value = new Array<number>(M).fill(0); const ver = new Array<number>(M).fill(0);
     const holder = new Array<number>(M).fill(-1); const queue: number[][] = Array.from({ length: M }, () => []);
-    const clients: Client[] = Array.from({ length: p.clients }, (_, id) => ({ id, phase: 'idle', timer: Math.floor(rnd() * 10), done: 0, recs: [], snap: [], start: 0, attempt: 0, lockIdx: 0, waitStart: 0, held: [] }));
+    const clients: Client[] = Array.from({ length: p.clients }, (_, id) => ({ id, phase: 'idle', timer: Math.floor(rnd() * START_TICKS), done: 0, recs: [], snap: [], start: 0, attempt: 0, lockIdx: 0, waitStart: 0, held: [] }));
     const r: Result = { strategy: p.strategy, expected: 0, final: 0, lost: 0, acked: 0, failed: 0, conflicts: 0, retries: 0, gaveUp: 0, rejected: 0, timeouts: 0, deadlocks: 0, avgMs: 0, worstMs: 0, perSec: 0, avgWaitMs: 0, worstWaitMs: 0, makespanMs: 0, events: [] };
     let latSum = 0; let waitSum = 0; let waitN = 0; let t = 0; let ackedWrites = 0;
-    const log = (s: string) => { if (r.events.length < 12) r.events.push(`t=${t * TICK_MS} ms  ${s}`); };
+    const log = (s: string) => { if (r.events.length < MAX_EVENTS) r.events.push(`t=${t * TICK_MS} ms  ${s}`); };
     const name = (c: Client) => `Agent ${c.id + 1}`;
     const recName = (c: Client) => c.recs.map((x) => `#${x + 1}`).join(' + ');
-    const finishEdit = (c: Client, gap = true) => { c.done++; c.phase = c.done >= EDITS ? 'done' : 'idle'; c.timer = gap ? 3 + Math.floor(rnd() * 12) : 0; };
+    const finishEdit = (c: Client, gap = true) => { c.done++; c.phase = c.done >= EDITS ? 'done' : 'idle'; c.timer = gap ? GAP.min + Math.floor(rnd() * GAP.span) : 0; };
     const release = (c: Client) => { c.held.forEach((x) => { holder[x] = -1; }); c.held = []; };
     const beginRead = (c: Client) => { c.phase = 'reading'; c.timer = READ_T; };
     const cycle = (c: Client) => {
@@ -79,7 +87,7 @@ import PlaygroundShell from '../components/PlaygroundShell.astro';
     };
     const ack = (c: Client) => { const lat = t - c.start + 1; latSum += lat; r.worstMs = Math.max(r.worstMs, lat * TICK_MS); r.acked++; ackedWrites += c.recs.length; finishEdit(c); };
 
-    while (clients.some((c) => c.phase !== 'done') && t < 200000) {
+    while (clients.some((c) => c.phase !== 'done') && t < MAX_TICKS) {
       const order = clients.map((c) => c.id);
       for (let i = order.length - 1; i > 0; i--) { const j = Math.floor(rnd() * (i + 1)); [order[i], order[j]] = [order[j], order[i]]; }
       for (const id of order) {
@@ -107,8 +115,8 @@ import PlaygroundShell from '../components/PlaygroundShell.astro';
         if (c.phase === 'reading') {
           if (--c.timer > 0) continue;
           c.snap = c.recs.map((x) => [value[x], ver[x]]);
-          if (r.events.length < 4) log(`${name(c)} reads customer ${recName(c)} (v${c.snap.map((s) => s[1]).join(', v')})`);
-          c.phase = 'thinking'; c.timer = 3 + Math.floor(rnd() * 8); continue;
+          if (r.events.length < READ_EVENTS) log(`${name(c)} reads customer ${recName(c)} (v${c.snap.map((s) => s[1]).join(', v')})`);
+          c.phase = 'thinking'; c.timer = THINK.min + Math.floor(rnd() * THINK.span); continue;
         }
         if (c.phase === 'backoff') { if (--c.timer <= 0) beginRead(c); continue; }
         if (c.phase === 'thinking') {
@@ -128,7 +136,7 @@ import PlaygroundShell from '../components/PlaygroundShell.astro';
             else {
               c.attempt++;
               if (c.attempt > MAX_RETRY) { log(`${name(c)} gave up after ${MAX_RETRY} retries`); r.gaveUp++; r.failed++; finishEdit(c); }
-              else { r.retries++; log(`${name(c)} save refused (412) on customer #${x + 1}: re-read and retry #${c.attempt}`); c.phase = 'backoff'; c.timer = 1 + Math.floor(rnd() * 2 ** Math.min(c.attempt, 4)); }
+              else { r.retries++; log(`${name(c)} save refused (412) on customer #${x + 1}: re-read and retry #${c.attempt}`); c.phase = 'backoff'; c.timer = 1 + Math.floor(rnd() * 2 ** Math.min(c.attempt, BACKOFF_MAX_EXP)); }
             }
           }
         }
@@ -137,7 +145,7 @@ import PlaygroundShell from '../components/PlaygroundShell.astro';
     }
     r.expected = ackedWrites; r.final = value.reduce((a, b) => a + b, 0); r.lost = r.expected - r.final;
     r.avgMs = r.acked ? Math.round((latSum * TICK_MS) / r.acked) : 0;
-    r.makespanMs = t * TICK_MS; r.perSec = Math.round(((r.final / per) * 1000) / Math.max(1, r.makespanMs) * 10) / 10;
+    r.makespanMs = t * TICK_MS; r.perSec = Math.round(((r.final / per) * MS_PER_S) / Math.max(1, r.makespanMs) * 10) / 10;
     r.avgWaitMs = waitN ? Math.round((waitSum * TICK_MS) / waitN) : 0;
     return r;
   }

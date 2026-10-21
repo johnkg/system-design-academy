@@ -59,7 +59,14 @@ import PlaygroundShell from '../../components/PlaygroundShell.astro';
       { name: 'flaky-1', kind: 'flaky' }, { name: 'flaky-2', kind: 'flaky' },
       { name: 'down-1', kind: 'down' }, { name: 'down-2', kind: 'down' },
     ];
-    // A deterministic number in [0,1) for (event, attempt, purpose), so every option sees the same luck.
+    const RETRY = { fixedS: 5, baseS: 5, capS: 160 }; // fixed retry every 5 s, or exponential backoff from 5 s capped at 160 s with full jitter
+    const SALT = { flaky: 1, slow: 2, backoff: 9 }; // luck() purpose for each random draw
+    const FLAKY_EP = EPS.findIndex((e) => e.name === 'flaky-1'); // fails at random; flaky-2 is down until OUTAGE ends
+    const FLAKY_FAIL = 0.4;
+    const SLOW_S = { min: 3, span: 5 }; // slow endpoints answer in 3..7 s
+    const FAST_S = 10; // a healthy event should arrive within 10 s
+    const BAD = { onTime: 0.95, dropped: 10, waste: 0.5 };
+    // A deterministic number in [0,1) for (event, attempt, purpose), so every option sees the same luck (prime mix, then the murmur3 finalizer).
     const luck = (a: number, b: number, c: number) => { let h = Math.imul(a * 7919 + b * 104729 + c * 1299709 + 12345, 2654435761) >>> 0; h ^= h >>> 15; h = Math.imul(h, 2246822519) >>> 0; h ^= h >>> 13; h = Math.imul(h, 3266489917) >>> 0; h ^= h >>> 16; return (h >>> 0) / 4294967296; };
     function simulate(pool: string, retry: string, breaker: boolean, timeout: number) {
       const jobs: any[] = [];
@@ -72,7 +79,7 @@ import PlaygroundShell from '../../components/PlaygroundShell.astro';
           const j = r.job; const s = st[j.ep]; s.inflight--; if (r.probe) s.probe = false;
           if (r.ok) { j.state = 'ok'; j.done = t; s.fails = 0; s.open = false; } else {
             s.fails++; if (breaker && (s.open || s.fails >= TRIP)) { s.open = true; s.openAt = t; }
-            if (retry !== 'none' && j.tries < MAXTRY) { const n = j.tries; j.ready = t + (retry === 'fixed' ? 5 : 1 + Math.floor(luck(j.id, n, 9) * Math.min(160, 5 * 2 ** (n - 1)))); j.state = 'wait'; } else j.state = 'dropped';
+            if (retry !== 'none' && j.tries < MAXTRY) { const n = j.tries; j.ready = t + (retry === 'fixed' ? RETRY.fixedS : 1 + Math.floor(luck(j.id, n, SALT.backoff) * Math.min(RETRY.capS, RETRY.baseS * 2 ** (n - 1)))); j.state = 'wait'; } else j.state = 'dropped';
           }
           return false;
         });
@@ -84,8 +91,8 @@ import PlaygroundShell from '../../components/PlaygroundShell.astro';
           const j = pool === 'shared' ? cand.reduce((a, b) => (older(a, b) ? b : a)) : cand.reduce((a, b) => { const ia = st[a.ep].inflight; const ib = st[b.ep].inflight; return ib < ia || (ib === ia && older(a, b)) ? b : a; });
           const s = st[j.ep]; const e = EPS[j.ep]; j.tries++;
           let hold = 1; let ok = true; let receipt = true;
-          if (e.kind === 'flaky') { ok = j.ep === 6 ? luck(j.id, j.tries, 1) >= 0.4 : t >= OUTAGE; }
-          else if (e.kind === 'slow') { const L = 3 + Math.floor(luck(j.id, j.tries, 2) * 5); if (L > timeout) { hold = timeout; ok = false; } else hold = L; }
+          if (e.kind === 'flaky') { ok = j.ep === FLAKY_EP ? luck(j.id, j.tries, SALT.flaky) >= FLAKY_FAIL : t >= OUTAGE; }
+          else if (e.kind === 'slow') { const L = SLOW_S.min + Math.floor(luck(j.id, j.tries, SALT.slow) * SLOW_S.span); if (L > timeout) { hold = timeout; ok = false; } else hold = L; }
           else if (e.kind === 'down') { hold = timeout; ok = false; receipt = false; }
           if (receipt && (ok || e.kind === 'slow')) j.receipts++;
           const probe = breaker && s.open; if (probe) s.probe = true;
@@ -99,7 +106,7 @@ import PlaygroundShell from '../../components/PlaygroundShell.astro';
       const hj = jobs.filter((j) => EPS[j.ep].kind === 'healthy'); const hd = hj.filter((j) => j.state === 'ok').map((j) => j.done - j.pub);
       const sum = (f: (r: any) => number) => rows.reduce((a, r) => a + f(r), 0);
       return {
-        rows, healthyTotal: hj.length, healthyFast: hd.filter((d) => d <= 10).length, healthyMed: med(hd), healthyMax: hd.length ? Math.max(...hd) : 0,
+        rows, healthyTotal: hj.length, healthyFast: hd.filter((d) => d <= FAST_S).length, healthyMed: med(hd), healthyMax: hd.length ? Math.max(...hd) : 0,
         delivered: sum((r) => r.ok), afterRetry: jobs.filter((j) => j.state === 'ok' && j.tries > 1).length, dropped: sum((r) => r.dropped), pending: sum((r) => r.pending),
         dups: jobs.reduce((a, j) => a + Math.max(0, j.receipts - 1), 0), wasted: sum((r) => (r.kind === 'down' ? r.ws : 0)), workTotal: sum((r) => r.ws), total: jobs.length,
       };
@@ -114,21 +121,21 @@ import PlaygroundShell from '../../components/PlaygroundShell.astro';
     function draw() {
       const pool = q<HTMLSelectElement>('[data-pool]').value; const retry = q<HTMLSelectElement>('[data-retry]').value; const to = Number(q<HTMLSelectElement>('[data-to]').value); const cb = q<HTMLInputElement>('[data-cb]').checked;
       const key = `${pool}|${retry}|${to}|${cb}`; let r = cache.get(key); if (!r) { r = simulate(pool, retry, cb, to); cache.set(key, r); }
-      const share = r.wasted / r.workTotal; const hol = r.healthyFast < r.healthyTotal * 0.95;
+      const share = r.wasted / r.workTotal; const hol = r.healthyFast < r.healthyTotal * BAD.onTime;
       q('[data-o1]').textContent = `${r.healthyFast} of ${r.healthyTotal}`; q('[data-n1]').textContent = `median ${r.healthyMed} s, slowest ${r.healthyMax} s`;
       q('[data-o2]').textContent = fmt(r.afterRetry); q('[data-n2]').textContent = `of ${fmt(r.delivered)} delivered in all`;
-      q('[data-o3]').textContent = fmt(r.dropped); q('[data-n3]').textContent = r.pending ? `plus ${fmt(r.pending)} still waiting or retrying at 10 minutes` : 'nothing is left waiting';
+      q('[data-o3]').textContent = fmt(r.dropped); q('[data-n3]').textContent = r.pending ? `plus ${fmt(r.pending)} still waiting or retrying at ${HORIZON / 60} minutes` : 'nothing is left waiting';
       q('[data-o4]').textContent = fmt(r.dups); q('[data-n4]').textContent = r.dups ? 'extra copies that receivers must dedupe by event id' : 'no attempt timed out after the receiver had the event';
       q('[data-o5]').textContent = `${fmt(r.wasted)} worker-seconds`; q('[data-n5]').textContent = `${Math.round(share * 100)}% of the ${fmt(r.workTotal)} used in all`;
       const col = (id: string, v: string) => q<HTMLElement>(id).style.setProperty('--c', v);
-      col('[data-b1]', hol ? 'var(--bad)' : 'var(--good)'); col('[data-b2]', 'var(--accent)'); col('[data-b3]', r.dropped >= 10 ? 'var(--bad)' : 'var(--good)'); col('[data-b4]', r.dups ? 'var(--role-4)' : 'var(--good)'); col('[data-b5]', share > 0.5 ? 'var(--bad)' : 'var(--good)');
+      col('[data-b1]', hol ? 'var(--bad)' : 'var(--good)'); col('[data-b2]', 'var(--accent)'); col('[data-b3]', r.dropped >= BAD.dropped ? 'var(--bad)' : 'var(--good)'); col('[data-b4]', r.dups ? 'var(--role-4)' : 'var(--good)'); col('[data-b5]', share > BAD.waste ? 'var(--bad)' : 'var(--good)');
       KINDS.forEach(([k], i) => { const w = r!.rows.filter((x) => x.kind === k).reduce((a, x) => a + x.ws, 0); segs[i].style.width = `${(w / r!.workTotal) * 100}%`; legendTxt[i].t.textContent = `${k} endpoints ${fmt(w)} s`; });
       r.rows.forEach((x, i) => { const v = [x.name, `${x.ok} of ${x.total}`, String(x.dropped), String(x.pending), x.ok ? `${x.med} s` : '-', `${fmt(x.ws)} s`]; v.forEach((t, j) => (cells[i][j].textContent = t)); });
       const out = q('[data-verdict]');
-      const bad = hol || share > 0.5 || r.dropped >= 10; out.classList.toggle('bad', bad);
-      const a = hol ? `Head-of-line blocking: the healthy endpoints answer in 1 s, but only ${r.healthyFast} of ${r.healthyTotal} events arrive within 10 s, because every worker is tied up waiting for slow and dead endpoints.` : `The healthy endpoints are isolated from the bad ones: ${r.healthyFast} of ${r.healthyTotal} events arrive within 10 s.`;
-      const b = share > 0.5 ? ` Dead endpoints burn ${Math.round(share * 100)}% of all worker time, on attempts that cannot succeed.` : ` Dead endpoints cost only ${Math.round(share * 100)}% of the worker time.`;
-      const c = r.dropped >= 10 ? ` ${fmt(r.dropped)} events are dropped for good.` : r.dropped ? ` Only ${r.dropped} event is dropped.` : ' No event is lost.';
+      const bad = hol || share > BAD.waste || r.dropped >= BAD.dropped; out.classList.toggle('bad', bad);
+      const a = hol ? `Head-of-line blocking: the healthy endpoints answer in 1 s, but only ${r.healthyFast} of ${r.healthyTotal} events arrive within ${FAST_S} s, because every worker is tied up waiting for slow and dead endpoints.` : `The healthy endpoints are isolated from the bad ones: ${r.healthyFast} of ${r.healthyTotal} events arrive within ${FAST_S} s.`;
+      const b = share > BAD.waste ? ` Dead endpoints burn ${Math.round(share * 100)}% of all worker time, on attempts that cannot succeed.` : ` Dead endpoints cost only ${Math.round(share * 100)}% of the worker time.`;
+      const c = r.dropped >= BAD.dropped ? ` ${fmt(r.dropped)} events are dropped for good.` : r.dropped ? ` Only ${r.dropped} event is dropped.` : ' No event is lost.';
       out.textContent = a + b + c + (r.pending ? ` ${fmt(r.pending)} wait for endpoints that are paused or still being retried.` : '');
     }
     root.addEventListener('input', draw); root.addEventListener('change', draw);

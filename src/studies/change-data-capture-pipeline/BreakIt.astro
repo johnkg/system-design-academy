@@ -64,17 +64,27 @@ const ROWS = [['src', 'Source table'], ['dw', 'Dual-write'], ['pl', 'Polling'], 
     const q = <T extends HTMLElement>(s: string) => root.querySelector<T>(s)!;
     const KEYS = 10; const TICKS = 60; const SVC = 0.5;
     type Op = { ts: number; key: number; kind: string; value: number | null; rollback: boolean; sinkFail: boolean; jit: boolean; slow: boolean; commit: number; lsn: number };
-    let seed = 77; const rnd = () => ((seed = (seed * 1664525 + 1013904223) % 4294967296) / 4294967296);
+    const SEED = 77;
+    const DELETE_RATE = 0.3; // share of writes to an existing key that delete it
+    const VALUE = { min: 100, span: 900 }; // row values 100..999
+    const ROLLBACK_RATE = 0.06, SINK_FAIL_RATE = 0.06; // transactions rolled back; dual writes that fail at the sink
+    const JITTER = { rate: 0.2, delayS: 3 }, NET_S = 0.1; // dual writes delayed in the network, and the base network delay
+    const SLOW = { rate: 0.2, window: 5, delayS: 4 }; // long transactions commit 4 s late (only when the next 5 ops leave the key alone)
+    const BATCH = 10; // offsets committed every 10 events
+    const SCAN = { endS: 120, stepS: 0.5 }; // backlog scan for the replication slot
+    const POLL_END_S = 80;
+    // linear congruential generator (Numerical Recipes constants)
+    let seed = SEED; const rnd = () => ((seed = (seed * 1664525 + 1013904223) % 4294967296) / 4294967296);
     const state = new Map<number, number>(); const ops: Op[] = [];
     for (let ts = 0; ts < TICKS; ts++) {
       const key = 1 + Math.floor(rnd() * KEYS); const has = state.has(key);
-      const kind = !has ? 'insert' : rnd() < 0.3 ? 'delete' : 'update';
-      const value = 100 + Math.floor(rnd() * 900);
-      const rollback = rnd() < 0.06; const sinkFail = rnd() < 0.06; const jit = rnd() < 0.2; const slowWant = rnd() < 0.2;
+      const kind = !has ? 'insert' : rnd() < DELETE_RATE ? 'delete' : 'update';
+      const value = VALUE.min + Math.floor(rnd() * VALUE.span);
+      const rollback = rnd() < ROLLBACK_RATE; const sinkFail = rnd() < SINK_FAIL_RATE; const jit = rnd() < JITTER.rate; const slowWant = rnd() < SLOW.rate;
       if (!rollback) { if (kind === 'delete') state.delete(key); else state.set(key, value); }
       ops.push({ ts, key, kind, value: kind === 'delete' ? null : value, rollback, sinkFail, jit, slow: slowWant, commit: ts, lsn: 0 });
     }
-    ops.forEach((o, i) => { o.slow = o.slow && !o.rollback && !ops.slice(i + 1, i + 6).some((p) => p.key === o.key); o.commit = o.ts + (o.slow ? 4 : 0); });
+    ops.forEach((o, i) => { o.slow = o.slow && !o.rollback && !ops.slice(i + 1, i + 1 + SLOW.window).some((p) => p.key === o.key); o.commit = o.ts + (o.slow ? SLOW.delayS : 0); });
     const truth = state;
     const LOG = ops.filter((o) => !o.rollback).sort((a, b) => a.commit - b.commit || a.ts - b.ts).map((o, i) => ({ ...o, lsn: i + 1 }));
     const N = LOG.length;
@@ -86,7 +96,7 @@ const ROWS = [['src', 'Source table'], ['dw', 'Dual-write'], ['pl', 'Polling'], 
     type P = { crash: number; down: number; policy: string; idem: boolean; poll: number; drop: boolean; cap: number };
     function cdc(p: P) {
       const X = Math.min(p.crash, N); const crashes = p.down > 0;
-      const commitAfter = (j: number) => (p.policy === 'every' ? j : p.policy === 'batch' ? Math.floor(j / 10) * 10 : p.policy === 'before' ? j : 0);
+      const commitAfter = (j: number) => (p.policy === 'every' ? j : p.policy === 'batch' ? Math.floor(j / BATCH) * BATCH : p.policy === 'before' ? j : 0);
       const delivered: { lsn: number; t: number; replay: boolean }[] = []; const steps: [number, number][] = [[0, 0]];
       let prev = 0; let committed = 0; let tc = -1; let tr = -1; let purged = 0;
       const run = (j: number, t0: number, replay: boolean) => {
@@ -125,12 +135,12 @@ const ROWS = [['src', 'Source table'], ['dw', 'Dual-write'], ['pl', 'Polling'], 
       const lags = delivered.filter((d) => !d.replay).map((d) => d.t - LOG[d.lsn - 1].commit);
       const availAt = (t: number) => LOG.filter((e) => e.commit <= t).length; const commitAt = (t: number) => steps.reduce((m, s) => (s[0] <= t ? Math.max(m, s[1]) : m), 0);
       let peak = 0; let peakAt = 0; let fullAt = -1; const blocked = new Set<number>();
-      for (let t = 0; t <= 120; t += 0.5) { const r = availAt(t) - commitAt(t); if (r > peak) { peak = r; peakAt = t; } if (!p.drop && r > p.cap) { if (fullAt < 0) fullAt = t; if (t < TICKS) blocked.add(Math.floor(t)); } }
+      for (let t = 0; t <= SCAN.endS; t += SCAN.stepS) { const r = availAt(t) - commitAt(t); if (r > peak) { peak = r; peakAt = t; } if (!p.drop && r > p.cap) { if (fullAt < 0) fullAt = t; if (t < TICKS) blocked.add(Math.floor(t)); } }
       const rejected = p.drop ? 0 : LOG.filter((e) => blocked.has(e.commit)).length;
       return { view, rows, ...compare(view), dupRows, dupDeliveries: delivered.filter((d) => d.replay).length, dupIgnored, backwards, lost, purged, tc, tr, peak, peakAt, fullAt, rejected, lagAvg: lags.reduce((a, b) => a + b, 0) / lags.length, lagMax: Math.max(...lags) };
     }
     function dual(tc: number, tr: number) {
-      const arr = ops.map((o) => ({ ...o, arr: o.ts + (o.jit ? 3 : 0) + 0.1 })).sort((a, b) => a.arr - b.arr || a.ts - b.ts);
+      const arr = ops.map((o) => ({ ...o, arr: o.ts + (o.jit ? JITTER.delayS : 0) + NET_S })).sort((a, b) => a.arr - b.arr || a.ts - b.ts);
       const m = new Map<number, number>(); const lastTs = new Map<number, number>(); let dropped = 0; let phantom = 0; let swapped = 0;
       for (const o of arr) {
         if (o.sinkFail || (tc >= 0 && o.ts >= tc && o.ts < tr)) { dropped++; continue; }
@@ -144,7 +154,7 @@ const ROWS = [['src', 'Source table'], ['dw', 'Dual-write'], ['pl', 'Polling'], 
     function poll(every: number, tc: number, tr: number) {
       const m = new Map<number, number>(); const db = new Map<number, { v: number; upd: number }>(); const got = new Set<string>(); const lags: number[] = [];
       let cursor = -1; let idx = 0;
-      for (let t = 0; t <= 80; t++) {
+      for (let t = 0; t <= POLL_END_S; t++) {
         while (idx < LOG.length && LOG[idx].commit <= t) { const e = LOG[idx++]; if (e.kind === 'delete') db.delete(e.key); else db.set(e.key, { v: e.value as number, upd: e.ts }); }
         if (t % every !== 0 || (tc >= 0 && t >= tc && t < tr)) continue;
         let mx = cursor;

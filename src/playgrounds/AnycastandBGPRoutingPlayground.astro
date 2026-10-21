@@ -93,6 +93,16 @@ import PlaygroundShell from '../components/PlaygroundShell.astro';
   const P2C: [string, string][] = [['T1', 'RW'], ['T1', 'RU'], ['T1', 'RA'], ['T2', 'RE'], ['T2', 'RS'], ['T2', 'RU']];
   const P2P: [string, string][] = [['T1', 'T2'], ['RW', 'RE'], ['RE', 'RU'], ['RA', 'RU']];
   const PREF: Record<string, number> = { customer: 200, peer: 100, provider: 50 };
+  const ORIGIN_PREF = 1000; // an origin's own announcement outranks any learned route
+  const MAX_ROUNDS = 60; // propagation rounds before giving up on convergence
+  const AGG_LEN = 23, SPECIFIC_LEN = 24; // prefix lengths: 192.0.2.0/23 aggregate, /24 more-specifics
+  const EARTH_RADIUS_KM = 6371;
+  const RTT_BASE_MS = 4, KM_PER_RTT_MS = 65; // fixed overhead, then fibre distance per ms of round trip
+  const JITTER_SEED = 7;
+  const DETECT_S = { hold: 90, bfd: 1 }; // seconds to notice a dead site: BGP hold timer vs BFD
+  const CONV_JITTER = { min: 0.35, span: 0.65 }; // each network converges after min..min+span of the convergence time
+  const FLOWS_PER_ATTEMPT_S = 10; // one new connection attempt per second per 10 flows
+  const FLOWS_PER_GBPS = 100;
 
   const ASN: Record<string, number> = { ...TRANSIT };
   const NB: Record<string, { id: string; rel: string }[]> = {};
@@ -107,12 +117,12 @@ import PlaygroundShell from '../components/PlaygroundShell.astro';
   // ROA for 192.0.2.0/23: origin AS 64500 only, up to maxLength.
   const roaValid = (origin: number, len: number, maxLen: number) => origin === ORIGIN_ASN && len <= maxLen;
   const rank = (r: Route): number[] => [-r.pref, r.path.length, r.via == null ? 0 : ASN[r.via]];
-  const better = (a: Route, b: Route) => { const x = rank(a), y = rank(b); for (let i = 0; i < 3; i++) if (x[i] !== y[i]) return x[i] < y[i]; return false; };
+  const better = (a: Route, b: Route) => { const x = rank(a), y = rank(b); for (let i = 0; i < x.length; i++) if (x[i] !== y[i]) return x[i] < y[i]; return false; };
 
   function propagate(origins: string[], len: number, maxLen: number, rov: (n: string) => boolean) {
     const best: Record<string, Route> = {}; const alts: Record<string, Route[]> = {};
-    origins.forEach((o) => { best[o] = { origin: o, path: [], pref: 1000, via: null }; });
-    for (let it = 0; it < 60; it++) {
+    origins.forEach((o) => { best[o] = { origin: o, path: [], pref: ORIGIN_PREF, via: null }; });
+    for (let it = 0; it < MAX_ROUNDS; it++) {
       let changed = false;
       for (const node of NODES) {
         if (origins.includes(node)) continue;
@@ -139,9 +149,9 @@ import PlaygroundShell from '../components/PlaygroundShell.astro';
   const km = (a: { lat: number; lon: number }, b: { lat: number; lon: number }) => {
     const d = Math.PI / 180; const dl = (b.lat - a.lat) * d, dn = (b.lon - a.lon) * d;
     const h = Math.sin(dl / 2) ** 2 + Math.cos(a.lat * d) * Math.cos(b.lat * d) * Math.sin(dn / 2) ** 2;
-    return 2 * 6371 * Math.asin(Math.sqrt(h));
+    return 2 * EARTH_RADIUS_KM * Math.asin(Math.sqrt(h));
   };
-  const rtt = (c: Client, s: Site) => Math.round(4 + km(c, s) / 65);
+  const rtt = (c: Client, s: Site) => Math.round(RTT_BASE_MS + km(c, s) / KM_PER_RTT_MS);
   function why(alts: Route[]) {
     if (alts.length < 2) return 'only route';
     const [x, y] = alts.slice().sort((a, b) => (better(a, b) ? -1 : better(b, a) ? 1 : 0));
@@ -154,25 +164,26 @@ import PlaygroundShell from '../components/PlaygroundShell.astro';
   function routeAll(cfg: Cfg): Routed[] {
     const up = SITES.filter((s) => cfg.sites[s.id]).map((s) => 'S' + s.id);
     const rov = cfg.rov === 'all' ? () => true : cfg.rov === 'tier1' ? (n: string) => n === 'T1' || n === 'T2' : () => false;
-    const maxLen = cfg.deagg ? 24 : 23;
-    const p23 = propagate(up, 23, maxLen, rov);
-    const p24 = propagate([...(cfg.hijack ? ['HJK'] : []), ...(cfg.deagg ? up : [])], 24, maxLen, rov);
+    const maxLen = cfg.deagg ? SPECIFIC_LEN : AGG_LEN;
+    const p23 = propagate(up, AGG_LEN, maxLen, rov);
+    const p24 = propagate([...(cfg.hijack ? ['HJK'] : []), ...(cfg.deagg ? up : [])], SPECIFIC_LEN, maxLen, rov);
     return CLIENTS.map((c) => {
       const r24 = p24.best[c.id], r23 = p23.best[c.id]; const r = r24 || r23;
       if (!r) return { c, none: true };
       const src = r24 ? p24 : p23;
-      return { c, hijacked: r.origin === 'HJK', site: r.origin === 'HJK' ? undefined : r.origin.slice(1), len: r24 ? 24 : 23, path: r.path,
+      return { c, hijacked: r.origin === 'HJK', site: r.origin === 'HJK' ? undefined : r.origin.slice(1), len: r24 ? SPECIFIC_LEN : AGG_LEN, path: r.path,
         reason: r24 && r23 ? 'longest prefix: /24 beats /23' : why(src.alts[c.id]) };
     });
   }
+  // mulberry32 seeded PRNG
   function mulberry32(a: number) { return () => { a |= 0; a = (a + 0x6d2b79f5) | 0; let t = Math.imul(a ^ (a >>> 15), 1 | a); t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t; return ((t ^ (t >>> 14)) >>> 0) / 4294967296; }; }
   interface Row { c: Client; r: Routed; base: Routed; rtt: number | null; delta: number; moved: boolean; delay: number; blackout: number; broken: number; failed: number }
   function analyze(cfg: Cfg, p: Params) {
     const base = routeAll(defaults()); const cur = routeAll(cfg);
-    const rnd = mulberry32(7); const detect = p.mode === 'hold' ? 90 : p.mode === 'bfd' ? 1 : 0;
+    const rnd = mulberry32(JITTER_SEED); const detect = p.mode === 'hold' ? DETECT_S.hold : p.mode === 'bfd' ? DETECT_S.bfd : 0;
     const upSites = SITES.filter((s) => cfg.sites[s.id]);
     const rows: Row[] = cur.map((r, i) => {
-      const f = 0.35 + 0.65 * rnd(); const c = r.c; const b = base[i];
+      const f = CONV_JITTER.min + CONV_JITTER.span * rnd(); const c = r.c; const b = base[i];
       const row: Row = { c, r, base: b, rtt: null, delta: 0, moved: false, delay: 0, blackout: 0, broken: 0, failed: 0 };
       if (r.none || r.hijacked) return row;
       const mine = SITES.find((s) => s.id === r.site)!;
@@ -183,15 +194,15 @@ import PlaygroundShell from '../components/PlaygroundShell.astro';
         const crash = detect > 0 && !cfg.sites[b.site!];
         row.broken = crash ? c.flows : Math.round((c.flows * p.longPct) / 100);
         row.blackout = crash ? detect + row.delay : 0;
-        row.failed = Math.round((c.flows / 10) * row.blackout);
+        row.failed = Math.round((c.flows / FLOWS_PER_ATTEMPT_S) * row.blackout);
       }
       return row;
     });
     const load: Record<string, number> = {}; SITES.forEach((s) => (load[s.id] = 0));
     const atk = (c: Client) => (p.botnet === 'asia' ? (c.id === 'BOM' || c.id === 'TYO' ? p.attack / 2 : 0) : p.attack / CLIENTS.length);
-    rows.forEach((w) => { if (w.r.site) load[w.r.site] += w.c.flows / 100 + atk(w.c); });
+    rows.forEach((w) => { if (w.r.site) load[w.r.site] += w.c.flows / FLOWS_PER_GBPS + atk(w.c); });
     let served = 0, total = 0;
-    rows.forEach((w) => { const g = w.c.flows / 100; total += g; if (w.r.site) served += g * Math.min(1, SITES.find((s) => s.id === w.r.site)!.cap / load[w.r.site]); });
+    rows.forEach((w) => { const g = w.c.flows / FLOWS_PER_GBPS; total += g; if (w.r.site) served += g * Math.min(1, SITES.find((s) => s.id === w.r.site)!.cap / load[w.r.site]); });
     const captured = rows.filter((w) => w.r.hijacked);
     const flowsAll = rows.reduce((a, w) => a + w.c.flows, 0);
     return {
@@ -208,8 +219,12 @@ import PlaygroundShell from '../components/PlaygroundShell.astro';
   const NS = 'http://www.w3.org/2000/svg';
   const fmt = (x: number) => (Math.round(x * 10) / 10).toFixed(1);
   const num = (x: number) => String(Math.round(x)).replace(/\B(?=(\d{3})+(?!\d))/g, ',');
-  const mx = (lon: number) => 10 + (lon + 135) * 1.34;
-  const my = (lat: number) => 10 + (58 - lat) * 2.1;
+  const MAP = { pad: 10, west: -135, north: 58, xPerDeg: 1.34, yPerDeg: 2.1 }; // equirectangular map projection into the SVG
+  const mx = (lon: number) => MAP.pad + (lon - MAP.west) * MAP.xPerDeg;
+  const my = (lat: number) => MAP.pad + (MAP.north - lat) * MAP.yPerDeg;
+  const GRID_LONS = [-120, -60, 0, 60, 120], GRID_LATS = [-20, 0, 20, 40];
+  const TABLE_COLS = 6;
+  const TIMELINE_MAX_S = 240;
 
   document.querySelectorAll<HTMLElement>('[data-acs]').forEach((root) => {
     const q = <T extends Element>(s: string) => root.querySelector<T>(s)!;
@@ -225,8 +240,8 @@ import PlaygroundShell from '../components/PlaygroundShell.astro';
     // Map, built once.
     const map = q<SVGSVGElement>('[data-map]');
     const mk = (tag: string, attrs: Record<string, string>, parent: Element = map) => { const e = document.createElementNS(NS, tag); Object.entries(attrs).forEach(([k, v]) => e.setAttribute(k, v)); parent.appendChild(e); return e; };
-    [-120, -60, 0, 60, 120].forEach((lon) => mk('line', { x1: String(mx(lon)), x2: String(mx(lon)), y1: '10', y2: '180', class: 'acs-grid' }));
-    [-20, 0, 20, 40].forEach((lat) => mk('line', { x1: '10', x2: '390', y1: String(my(lat)), y2: String(my(lat)), class: 'acs-grid' }));
+    GRID_LONS.forEach((lon) => mk('line', { x1: String(mx(lon)), x2: String(mx(lon)), y1: '10', y2: '180', class: 'acs-grid' }));
+    GRID_LATS.forEach((lat) => mk('line', { x1: '10', x2: '390', y1: String(my(lat)), y2: String(my(lat)), class: 'acs-grid' }));
     const lines: Record<string, SVGElement> = {};
     CLIENTS.forEach((c) => { lines[c.id] = mk('line', { x1: String(mx(c.lon)), y1: String(my(c.lat)), x2: String(mx(c.lon)), y2: String(my(c.lat)), class: 'acs-line' }); });
     CLIENTS.forEach((c) => {
@@ -255,7 +270,7 @@ import PlaygroundShell from '../components/PlaygroundShell.astro';
     const cells: Record<string, HTMLElement[]> = {};
     CLIENTS.forEach((c) => {
       const tr = document.createElement('tr'); const tds: HTMLElement[] = [];
-      for (let i = 0; i < 6; i++) { const td = document.createElement('td'); tr.appendChild(td); tds.push(td); }
+      for (let i = 0; i < TABLE_COLS; i++) { const td = document.createElement('td'); tr.appendChild(td); tds.push(td); }
       tds[0].textContent = `${c.name} (AS ${c.asn})`; q('[data-rows]').appendChild(tr); cells[c.id] = tds;
     });
     const tl: Record<string, { row: HTMLElement; bar: HTMLElement; txt: HTMLElement }> = {};
@@ -309,7 +324,7 @@ import PlaygroundShell from '../components/PlaygroundShell.astro';
       });
 
       // timeline: seconds since the withdrawal, scale 0..240 s
-      const scale = 240;
+      const scale = TIMELINE_MAX_S;
       CLIENTS.forEach((c) => {
         const w = a.rows.find((x) => x.c.id === c.id)!; const e = tl[c.id];
         e.row.hidden = !w.moved; if (!w.moved) return;
@@ -338,15 +353,15 @@ import PlaygroundShell from '../components/PlaygroundShell.astro';
           (crash ? `The site died: ${num(a.broken)} connections reset at once and ${num(a.failed)} new connection attempts failed while packets were black-holed.`
             : `The site kept answering until routes moved, so no attempts failed, but ${num(a.broken)} long-lived connections (${p.longPct}% of flows) were reset on the new site.`);
       const hjOut = q<HTMLElement>('[data-hijackout]');
-      hjOut.textContent = !cfg.hijack ? 'No hijack. Rogue AS 64499 is not announcing.'
-        : `Rogue AS 64499 announces 192.0.2.0/24: ${a.capturedN} of ${a.rows.length} networks (${a.capturedPct}% of connections) send traffic to it. ` +
+      hjOut.textContent = !cfg.hijack ? `No hijack. Rogue AS ${HIJACKER.asn} is not announcing.`
+        : `Rogue AS ${HIJACKER.asn} announces 192.0.2.0/24: ${a.capturedN} of ${a.rows.length} networks (${a.capturedPct}% of connections) send traffic to it. ` +
           (cfg.rov === 'all' ? 'Every AS validates RPKI, so the invalid /24 is dropped.' : cfg.rov === 'tier1' ? 'Only the tier-1s validate: the rogue AS\'s own transit and its peers still accept the route.' : 'Nobody validates, so the more specific /24 wins wherever it is heard.') +
           (cfg.deagg ? ' Our own /24s tie on length, so path length and tie-breakers decide.' : '');
       hjOut.classList.toggle('bad', a.capturedN > 0);
       const ddos = q<HTMLElement>('[data-ddos]');
       const busiest = SITES.reduce((m, s) => (a.load[s.id] > a.load[m.id] ? s : m), SITES[0]);
       ddos.textContent = p.attack === 0 ? `No attack. Busiest site: ${busiest.id}, ${fmt(a.load[busiest.id])} of ${busiest.cap} Gbps.`
-        : `${p.attack} Gbps flood, ${p.botnet === 'asia' ? 'concentrated in Mumbai and Tokyo' : 'spread over all 9 networks'}. Busiest site: ${busiest.id}, ${fmt(a.load[busiest.id])} of ${busiest.cap} Gbps. ` +
+        : `${p.attack} Gbps flood, ${p.botnet === 'asia' ? 'concentrated in Mumbai and Tokyo' : `spread over all ${CLIENTS.length} networks`}. Busiest site: ${busiest.id}, ${fmt(a.load[busiest.id])} of ${busiest.cap} Gbps. ` +
           (a.saturated.length ? `Saturated: ${a.saturated.join(', ')}. ` : 'No site saturated. ') + `Legitimate traffic served: ${a.servedPct}%.`;
       ddos.classList.toggle('bad', a.saturated.length > 0);
     }

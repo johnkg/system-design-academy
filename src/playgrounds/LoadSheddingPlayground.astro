@@ -100,12 +100,19 @@ import PlaygroundShell from '../components/PlaygroundShell.astro';
   interface Sim { S: Sec[]; rec: number | null; skipped: number }
   const STEP_MS = 100; const PER_SEC = 10; const CAP_MU = 1000; const REQ_MU = 100; const N_SEC = 120; const SPIKE_AT = 10; const BASE = 60; const CAPACITY = 100;
   const AD_TARGET_MS = 300; const AD_START = 100;
+  const AD = { min: 5, cut: 0.7, max: 1000, step: 2 }; // adaptive limit: multiply by 0.7 on a latency breach, add 2 under pressure, within 5..1000
+  const MAX_TRIES = 3; // first attempt plus two retries
+  const BACKOFF = { firstSec: 0.5, jitterMin: 0.5 }; // exponential backoff from 0.5 s, times a jitter of 0.5..1.5
+  const JITTER_SLOTS = 1000;
+  const EPS = 1e-9; // keeps floor() from losing an arrival to rounding
+  const CRITICAL_EVERY = 5; // one request in five is critical
+  const RECOVERED = 0.95; // good throughput back at 95% of normal
 
   function simulate(p: Params): Sim {
     const T = Math.round(p.timeoutSec * PER_SEC); const steps = N_SEC * PER_SEC;
     const spikeStart = SPIKE_AT * PER_SEC; const spikeEnd = (SPIKE_AT + p.spikeLen) * PER_SEC;
     const rejectMu = Math.round((REQ_MU * p.rejectPct) / 100);
-    const maxTries = p.retry === 'none' ? 1 : 3;
+    const maxTries = p.retry === 'none' ? 1 : MAX_TRIES;
     const qs = [{ a: [] as Attempt[], h: 0 }, { a: [] as Attempt[], h: 0 }]; // 0 critical, 1 everyone else
     const len = (k: number) => qs[k].a.length - qs[k].h; const total = () => len(0) + len(1);
     const due = new Map<number, Retried[]>(); const dl = new Map<number, Attempt[]>();
@@ -115,8 +122,8 @@ import PlaygroundShell from '../components/PlaygroundShell.astro';
     const fail = (a: Attempt, i: number, why: string) => { // the client learns at step i that this attempt failed
       a.state = why;
       if (a.tries < maxTries) {
-        const jit = (((a.lid * 2654435761) >>> 0) % 1000) / 1000;
-        const d = p.retry === 'naive' ? 1 : Math.max(1, Math.round(PER_SEC * 0.5 * 2 ** (a.tries - 1) * (0.5 + jit)));
+        const jit = (((a.lid * 2654435761) >>> 0) % JITTER_SLOTS) / JITTER_SLOTS; // Knuth multiplicative hash of the request id
+        const d = p.retry === 'naive' ? 1 : Math.max(1, Math.round(PER_SEC * BACKOFF.firstSec * 2 ** (a.tries - 1) * (BACKOFF.jitterMin + jit)));
         add(due, i + d, { lid: a.lid, cls: a.cls, tries: a.tries + 1 });
       }
     };
@@ -125,9 +132,9 @@ import PlaygroundShell from '../components/PlaygroundShell.astro';
       for (const a of dl.get(i) ?? []) if (a.state === 'wait') fail(a, i, 'timeout');
       dl.delete(i);
       const rate = i >= spikeStart && i < spikeEnd ? CAPACITY * p.mult : BASE;
-      acc += rate / PER_SEC; const n = Math.floor(acc + 1e-9); acc -= n;
+      acc += rate / PER_SEC; const n = Math.floor(acc + EPS); acc -= n;
       const arr: Retried[] = [];
-      for (let k = 0; k < n; k++) { const lid = nextId++; arr.push({ lid, cls: lid % 5 === 0 ? 0 : 1, tries: 1 }); }
+      for (let k = 0; k < n; k++) { const lid = nextId++; arr.push({ lid, cls: lid % CRITICAL_EVERY === 0 ? 0 : 1, tries: 1 }); }
       for (const r of due.get(i) ?? []) arr.push(r);
       due.delete(i);
       let budget = CAP_MU + debt;
@@ -157,14 +164,14 @@ import PlaygroundShell from '../components/PlaygroundShell.astro';
       }
       debt = Math.min(0, budget);
       if (p.policy === 'adaptive' && (i + 1) % PER_SEC === 0) {
-        if (winBreach) adLimit = Math.max(5, Math.floor(Math.min(adLimit, total() + 1) * 0.7));
-        else if (winPressure || total() > adLimit / 2) adLimit = Math.min(1000, adLimit + 2);
+        if (winBreach) adLimit = Math.max(AD.min, Math.floor(Math.min(adLimit, total() + 1) * AD.cut));
+        else if (winPressure || total() > adLimit / 2) adLimit = Math.min(AD.max, adLimit + AD.step);
         winBreach = false; winPressure = false;
       }
       if ((i + 1) % PER_SEC === 0) s.queue = total();
     }
     let rec: number | null = null; const end = SPIKE_AT + p.spikeLen;
-    for (let t = end; t + 2 < N_SEC; t++) if (S[t].good >= BASE * 0.95 && S[t + 1].good >= BASE * 0.95 && S[t + 2].good >= BASE * 0.95) { rec = t - end; break; }
+    for (let t = end; t + 2 < N_SEC; t++) if (S[t].good >= BASE * RECOVERED && S[t + 1].good >= BASE * RECOVERED && S[t + 2].good >= BASE * RECOVERED) { /* three good seconds in a row */ rec = t - end; break; }
     return { S, rec, skipped };
   }
 
@@ -182,6 +189,9 @@ import PlaygroundShell from '../components/PlaygroundShell.astro';
   }
   // </core>
 
+  const GOOD_BAD = 0.7; // good throughput under 70% of normal is red
+  const WASTE_BAD = 100; // wasted requests before the box turns red
+  const TICK_MS = 60; // animation step per simulated second
   const NOTES: Record<Policy, string> = {
     fifo: 'Accept everything, serve oldest first. Nothing is refused, so nothing is protected: the queue grows without limit and the oldest requests are the ones whose callers have already left.',
     bounded: 'Reject at once (HTTP 503 or 429) when more than the limit are in the system; accepted requests wait at most limit / capacity. Safe only if that wait is below the client timeout.',
@@ -217,8 +227,10 @@ import PlaygroundShell from '../components/PlaygroundShell.astro';
       q<HTMLInputElement>('[data-limit]').disabled = p.policy === 'fifo' || p.policy === 'adaptive';
       q('[data-policynote]').textContent = NOTES[p.policy];
       // Charts: scales come from the whole run so the picture does not jump while it plays.
-      const maxOff = Math.max(...S.map((s) => s.offered)); const ymax1 = Math.max(120, Math.min(maxOff, 400)) * 1.05;
-      const y1 = (v: number) => 128 - (Math.min(v, ymax1) / ymax1) * 124;
+      const C1 = { floor: 128, h: 124, minY: 120, maxY: 400, headroom: 1.05 }, C2 = { floor: 96, h: 92, headroom: 1.1, minQ: 50 }; // SVG plot boxes (match the markup)
+      const MS_PER_S = 1000;
+      const maxOff = Math.max(...S.map((s) => s.offered)); const ymax1 = Math.max(C1.minY, Math.min(maxOff, C1.maxY)) * C1.headroom;
+      const y1 = (v: number) => C1.floor - (Math.min(v, ymax1) / ymax1) * C1.h;
       q('[data-ymax1]').textContent = `${Math.round(ymax1)} req/s`;
       const sx = ((SPIKE_AT * W) / N_SEC); const sw = (p.spikeLen * W) / N_SEC;
       for (const k of ['1', '2', '3']) { const r = q(`[data-spike${k}]`); r.setAttribute('x', sx.toFixed(1)); r.setAttribute('width', sw.toFixed(1)); }
@@ -228,12 +240,12 @@ import PlaygroundShell from '../components/PlaygroundShell.astro';
       q('[data-wasted]').setAttribute('d', path(n, (t) => S[t].wasted, y1));
       const gd = path(n, (t) => S[t].good, y1);
       q('[data-good]').setAttribute('d', gd);
-      q('[data-goodarea]').setAttribute('d', gd ? `${gd}L${X(n - 1)},128L${X(0)},128Z` : '');
-      const ymax2 = p.timeoutSec * 1000 * 1.1; const y2 = (v: number) => 96 - (Math.min(v, ymax2) / ymax2) * 92;
-      q('[data-to]').setAttribute('y1', y2(p.timeoutSec * 1000).toFixed(1)); q('[data-to]').setAttribute('y2', y2(p.timeoutSec * 1000).toFixed(1));
+      q('[data-goodarea]').setAttribute('d', gd ? `${gd}L${X(n - 1)},${C1.floor}L${X(0)},${C1.floor}Z` : '');
+      const ymax2 = p.timeoutSec * MS_PER_S * C2.headroom; const y2 = (v: number) => C2.floor - (Math.min(v, ymax2) / ymax2) * C2.h;
+      q('[data-to]').setAttribute('y1', y2(p.timeoutSec * MS_PER_S).toFixed(1)); q('[data-to]').setAttribute('y2', y2(p.timeoutSec * MS_PER_S).toFixed(1));
       q('[data-toline]').textContent = `${p.timeoutSec} s`;
       q('[data-lat]').setAttribute('d', path(n, (t) => (S[t].good ? S[t].latSum / S[t].good : null), y2));
-      const ymax3 = Math.max(50, ...S.map((s) => s.queue)) * 1.05; const y3 = (v: number) => 96 - (v / ymax3) * 92;
+      const ymax3 = Math.max(C2.minQ, ...S.map((s) => s.queue)) * C1.headroom; const y3 = (v: number) => C2.floor - (v / ymax3) * C2.h;
       q('[data-q]').setAttribute('d', path(n, (t) => S[t].queue, y3));
       q('[data-qmax]').textContent = fmt(Math.max(0, ...S.slice(0, n).map((s) => s.queue)));
       for (const k of ['1', '2', '3']) { const c = q(`[data-cur${k}]`); c.setAttribute('x1', X(n - 1)); c.setAttribute('x2', X(n - 1)); }
@@ -242,11 +254,11 @@ import PlaygroundShell from '../components/PlaygroundShell.astro';
       q('[data-clock]').textContent = `second ${n} of ${N_SEC}${n > SPIKE_AT && n <= SPIKE_AT + p.spikeLen ? ' (spike)' : ''}`;
       q('[data-good-v]').textContent = m.span ? `${fmt(m.goodRate)} req/s` : 'n/a';
       q('[data-good-n]').textContent = m.span ? `of ${fmt(m.offeredRate)} req/s offered, normal is ${BASE}` : 'spike not reached yet';
-      q<HTMLElement>('[data-goodbox]').style.setProperty('--c', m.span && m.goodRate < BASE * 0.7 ? 'var(--bad)' : 'var(--role-3)');
+      q<HTMLElement>('[data-goodbox]').style.setProperty('--c', m.span && m.goodRate < BASE * GOOD_BAD ? 'var(--bad)' : 'var(--role-3)');
       q('[data-lat-v]').textContent = m.good ? `${fmt(m.latMs)} ms` : 'none';
       q('[data-waste-v]').textContent = fmt(m.wasted);
       q('[data-waste-n]').textContent = `${Math.round(m.wastedShare * 100)}% of all work done${res.skipped ? `; ${fmt(res.skipped)} stale requests skipped free` : ''}`;
-      q<HTMLElement>('[data-wastebox]').style.setProperty('--c', m.wasted > 100 ? 'var(--bad)' : 'var(--border)');
+      q<HTMLElement>('[data-wastebox]').style.setProperty('--c', m.wasted > WASTE_BAD ? 'var(--bad)' : 'var(--border)');
       q('[data-rej-v]').textContent = fmt(m.rejected);
       q('[data-rej-n]').textContent = m.span ? `server ${Math.round(m.busy * 100)}% busy in the spike, rejections included` : 'before the spike';
       q('[data-crit-v]').textContent = `${Math.round(m.critShare * 100)}%`;
@@ -263,7 +275,7 @@ import PlaygroundShell from '../components/PlaygroundShell.astro';
     }
     function stop() { window.clearInterval(timer); timer = undefined; running = false; }
     function advance() { if (shown >= N_SEC) stop(); else shown++; schedule(); }
-    function clock() { window.clearInterval(timer); timer = undefined; if (running && onScreen && !document.hidden) timer = window.setInterval(advance, 60); }
+    function clock() { window.clearInterval(timer); timer = undefined; if (running && onScreen && !document.hidden) timer = window.setInterval(advance, TICK_MS); }
     q('[data-run]').addEventListener('click', () => {
       if (running) { stop(); schedule(); return; }
       if (shown >= N_SEC) shown = 1;

@@ -28,39 +28,46 @@ import PlaygroundShell from '../../components/PlaygroundShell.astro';
   document.querySelectorAll<HTMLElement>('[data-phb]').forEach((root) => {
     const q = <T extends HTMLElement>(s: string) => root.querySelector<T>(s)!;
     const TICKS = 1000; const ROW_CAP = 1000; const INSERT_CAP = 10000; const TIMEOUT = 2;
-    let seed = 77; const rnd = () => ((seed = (seed * 1664525 + 1013904223) % 4294967296) / 4294967296);
-    const jitter = Array.from({ length: TICKS }, () => 0.8 + 0.4 * rnd());
+    const SEED = 77;
+    const TICK_S = 0.01, TICK_MS = 10, TICKS_PER_S = 100, MS_PER_S = 1000; // 1000 ticks of 10 ms
+    const JITTER = { min: 0.8, span: 0.4 }; // per-tick traffic noise: 0.8x..1.2x
+    const PROFILE = { start: 0.3, ramp: 0.7, peakEndS: 8, tail: 0.5 }; // traffic climbs from 30% to full in the first second, halves after 8 s
+    const MILLION = 1e6, SCAN_ROWS_PER_S = 5e6; // existing likes are given in millions; COUNT(*) scans 5M rows a second
+    const READ_BAD_MS = 200;
+    // linear congruential generator (Numerical Recipes constants)
+    let seed = SEED; const rnd = () => ((seed = (seed * 1664525 + 1013904223) % 4294967296) / 4294967296);
+    const jitter = Array.from({ length: TICKS }, () => JITTER.min + JITTER.span * rnd());
     const fmt = (n: number) => Math.round(n).toLocaleString('en-US');
     type R = { done: number; rej: number; avg: number; max: number; lag: number; writes: number };
     function simulate(rate: number, shards: number, windowMs: number, existing: number) {
-      const profile = (s: number) => Math.min(1, 0.3 + 0.7 * s) * (s < 8 ? 1 : 0.5);
+      const profile = (s: number) => Math.min(1, PROFILE.start + PROFILE.ramp * s) * (s < PROFILE.peakEndS ? 1 : PROFILE.tail);
       const arr: number[] = []; let total = 0;
-      for (let i = 0; i < TICKS; i++) { const a = Math.round(rate * 0.01 * profile(i / 100) * jitter[i]); arr.push(a); total += a; }
+      for (let i = 0; i < TICKS; i++) { const a = Math.round(rate * TICK_S * profile(i / TICKS_PER_S) * jitter[i]); arr.push(a); total += a; }
       // A queue served at a fixed number of updates per second; a like that would wait over 2 seconds times out.
       function queue(cap: number): R {
         let b = 0; let done = 0; let rej = 0; let waitSum = 0; let maxW = 0; let acc = 0; let maxLag = 0;
         for (let i = 0; i < TICKS; i++) {
           b += arr[i]; let a = arr[i];
           const limit = cap * TIMEOUT; if (b > limit) { const r = b - limit; rej += r; a -= Math.min(a, r); b = limit; }
-          const s = Math.min(b, cap * 0.01); b -= s; done += s;
+          const s = Math.min(b, cap * TICK_S); b -= s; done += s;
           if (b > maxLag) maxLag = b;
           const w = b / cap; waitSum += a * w; acc += a; if (w > maxW) maxW = w;
         }
-        return { done: Math.round(done), rej: Math.round(rej), avg: acc ? (waitSum / acc) * 1000 : 0, max: maxW * 1000, lag: Math.round(maxLag), writes: Math.round(done) };
+        return { done: Math.round(done), rej: Math.round(rej), avg: acc ? (waitSum / acc) * MS_PER_S : 0, max: maxW * MS_PER_S, lag: Math.round(maxLag), writes: Math.round(done) };
       }
       const A = queue(INSERT_CAP); const B = queue(ROW_CAP); const C = queue(shards * ROW_CAP);
       // D: likes are added to a memory buffer at once, and one write per window adds the whole batch to the counter.
-      const every = Math.max(1, Math.round(windowMs / 10)); let buf: number[] = []; let maxBuf = 0; let done = 0; let waitSum = 0; let maxW = 0; let flushes = 0;
+      const every = Math.max(1, Math.round(windowMs / TICK_MS)); let buf: number[] = []; let maxBuf = 0; let done = 0; let waitSum = 0; let maxW = 0; let flushes = 0;
       for (let i = 0; i < TICKS; i++) {
         buf.push(arr[i]);
         const cur = buf.reduce((x, y) => x + y, 0); if (cur > maxBuf) maxBuf = cur;
         if ((i + 1) % every === 0) {
-          buf.forEach((n, j) => { const wt = (buf.length - j) * 10; waitSum += n * wt; if (n > 0 && wt > maxW) maxW = wt; });
+          buf.forEach((n, j) => { const wt = (buf.length - j) * TICK_MS; waitSum += n * wt; if (n > 0 && wt > maxW) maxW = wt; });
           done += buf.reduce((x, y) => x + y, 0); buf = []; flushes++;
         }
       }
       const D: R = { done, rej: 0, avg: waitSum / Math.max(1, done), max: maxW, lag: maxBuf, writes: flushes };
-      const readMs = ((existing * 1e6 + A.done) / 5e6) * 1000;
+      const readMs = ((existing * MILLION + A.done) / SCAN_ROWS_PER_S) * MS_PER_S;
       return { total, A, B, C, D, readMs };
     }
     function draw() {
@@ -69,7 +76,7 @@ import PlaygroundShell from '../../components/PlaygroundShell.astro';
       q('[data-rval]').textContent = fmt(rate); q('[data-eval]').textContent = String(e);
       const r = simulate(rate, k, t, e);
       const rows: [R, string][] = [
-        [r.A, `count scans ${fmt(e * 1e6 + r.A.done)} rows: ${fmt(r.readMs)} ms per read`],
+        [r.A, `count scans ${fmt(e * MILLION + r.A.done)} rows: ${fmt(r.readMs)} ms per read`],
         [r.B, 'a read is one row'],
         [r.C, `a read sums ${k} rows`],
         [r.D, 'a read is one row'],
@@ -79,7 +86,7 @@ import PlaygroundShell from '../../components/PlaygroundShell.astro';
         q(`[data-o${n}]`).textContent = `${fmt(x.done)} of ${fmt(r.total)} likes counted`;
         q(`[data-n${n}]`).textContent = `wait ${fmt(x.avg)} ms on average, ${fmt(x.max)} ms at worst` + (x.rej > 0 ? `; ${fmt(x.rej)} timed out` : '');
         q(`[data-m${n}]`).textContent = `count behind by up to ${fmt(x.lag)}; ${fmt(x.writes)} database writes; ${readNote}`;
-        const bad = x.rej > 0 || (i === 0 && r.readMs > 200);
+        const bad = x.rej > 0 || (i === 0 && r.readMs > READ_BAD_MS);
         q<HTMLElement>(`[data-b${n}]`).style.setProperty('--c', bad ? 'var(--bad)' : 'var(--good)');
       });
       const out = q('[data-verdict]'); const bad = r.B.rej > 0 || r.C.rej > 0 || r.A.rej > 0; out.classList.toggle('bad', bad);

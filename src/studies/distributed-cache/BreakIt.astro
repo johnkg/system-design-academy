@@ -42,34 +42,41 @@ import PlaygroundShell from '../../components/PlaygroundShell.astro';
   document.querySelectorAll<HTMLElement>('[data-dcb]').forEach((root) => {
     const q = <T extends HTMLElement>(s: string) => root.querySelector<T>(s)!;
     const SPAN = 20000; const CAP = 1000; const TO = 2000; const HIT = 2; const POLL = 25; const NODES = 6; const BUCKET = 500; const NB = SPAN / BUCKET;
+    const SEED = 99, MS_PER_S = 1000;
+    const HOT_SHARE = 0.5; // half of all requests are for the one hot key
+    const MOVED_MOD = (NODES - 1) / NODES; // modulo routing remaps 5 of 6 keys when a node dies
+    const FAILOVER_LOSS = 0.02; // a replica failover loses 2% of keys
+    const JITTER_MS = 10000; // TTL jitter spreads expiry over 10 s
+    const MIN_BAR_PCT = 2;
     const STRATS = [
       { id: 'none', name: 'No protection' }, { id: 'jitter', name: 'TTL jitter' }, { id: 'flight', name: 'Single flight (per server)' },
       { id: 'lock', name: 'Lock (one in the fleet)' }, { id: 'swr', name: 'Stale-while-revalidate' }, { id: 'combo', name: 'Jitter + lock + stale' },
     ];
     type Res = { q: number; peak: number; fail: number; slow: number; maxLat: number; buckets: number[]; cold: number };
     function simulate(event: string, routing: string, rate: number, keys: number, servers: number, dbMs: number): Record<string, Res> {
-      let seed = 99; const rnd = () => ((seed = (seed * 1664525 + 1013904223) % 4294967296) / 4294967296);
+      // linear congruential generator (Numerical Recipes constants)
+      let seed = SEED; const rnd = () => ((seed = (seed * 1664525 + 1013904223) % 4294967296) / 4294967296);
       const u = Array.from({ length: keys }, () => rnd());
       const own = Array.from({ length: keys }, (_, k) => (k === 0 ? 0 : Math.floor(rnd() * NODES)));
       const mv = Array.from({ length: keys }, () => rnd());
       const lost = Array.from({ length: keys }, () => rnd());
-      const n = Math.floor((rate * SPAN) / 1000);
+      const n = Math.floor((rate * SPAN) / MS_PER_S);
       const rk = new Int32Array(n); const rs = new Int32Array(n);
-      for (let i = 0; i < n; i++) { rk[i] = keys === 1 || rnd() < 0.5 ? 0 : 1 + Math.floor(rnd() * (keys - 1)); rs[i] = Math.floor(rnd() * servers); }
-      const cold = (k: number) => (event === 'ttl' ? true : event === 'dead' ? k === 0 || (routing === 'mod' ? mv[k] < 5 / 6 : own[k] === 0) : k !== 0 && lost[k] < 0.02);
+      for (let i = 0; i < n; i++) { rk[i] = keys === 1 || rnd() < HOT_SHARE ? 0 : 1 + Math.floor(rnd() * (keys - 1)); rs[i] = Math.floor(rnd() * servers); }
+      const cold = (k: number) => (event === 'ttl' ? true : event === 'dead' ? k === 0 || (routing === 'mod' ? mv[k] < MOVED_MOD : own[k] === 0) : k !== 0 && lost[k] < FAILOVER_LOSS);
       let coldKeys = 0; for (let k = 0; k < keys; k++) if (cold(k)) coldKeys++;
       const out: Record<string, Res> = {};
       for (const { id: s } of STRATS) {
         const jit = s === 'jitter' || s === 'combo';
         const exp = new Float64Array(keys).fill(Infinity); const fill = new Float64Array(keys).fill(Infinity);
-        for (let k = 0; k < keys; k++) if (cold(k)) exp[k] = event === 'ttl' && jit ? u[k] * 10000 : 0;
+        for (let k = 0; k < keys; k++) if (cold(k)) exp[k] = event === 'ttl' && jit ? u[k] * JITTER_MS : 0;
         const flight = new Float64Array(servers * keys).fill(-1); const lockEnd = new Float64Array(keys).fill(-1); const refreshed = new Uint8Array(keys);
         let dbFree = 0; let qs = 0; let fail = 0; let slow = 0; let maxLat = 0;
         const buckets: number[] = new Array(NB).fill(0);
-        const query = (t: number) => { const st = Math.max(t, dbFree); dbFree = st + 1000 / CAP; qs++; buckets[Math.min(NB - 1, Math.floor(t / BUCKET))]++; return st + dbMs; };
+        const query = (t: number) => { const st = Math.max(t, dbFree); dbFree = st + MS_PER_S / CAP; qs++; buckets[Math.min(NB - 1, Math.floor(t / BUCKET))]++; return st + dbMs; };
         const stale = event === 'ttl';
         for (let i = 0; i < n; i++) {
-          const t = (i * 1000) / rate; const k = rk[i]; const sv = rs[i];
+          const t = (i * MS_PER_S) / rate; const k = rk[i]; const sv = rs[i];
           let lat = HIT;
           if (t >= exp[k] && t < fill[k]) {
             if ((s === 'swr' || s === 'combo') && stale) {
@@ -86,7 +93,7 @@ import PlaygroundShell from '../../components/PlaygroundShell.astro';
           if (lat > 100) slow++;
           if (lat > maxLat) maxLat = lat;
         }
-        out[s] = { q: qs, peak: Math.max(...buckets) * (1000 / BUCKET), fail, slow, maxLat, buckets, cold: coldKeys };
+        out[s] = { q: qs, peak: Math.max(...buckets) * (MS_PER_S / BUCKET), fail, slow, maxLat, buckets, cold: coldKeys };
       }
       return out;
     }
@@ -109,14 +116,14 @@ import PlaygroundShell from '../../components/PlaygroundShell.astro';
       q('[data-rval]').textContent = fmt(rate); q('[data-sval]').textContent = String(servers); q('[data-msval]').textContent = String(dbMs);
       q<HTMLSelectElement>('[data-rt]').disabled = ev !== 'dead';
       const r = simulate(ev, rt, rate, keys, servers, dbMs);
-      const top = Math.max(CAP / (1000 / BUCKET), ...STRATS.map((s) => Math.max(...r[s.id].buckets)));
+      const top = Math.max(CAP / (MS_PER_S / BUCKET), ...STRATS.map((s) => Math.max(...r[s.id].buckets)));
       STRATS.forEach((s, i) => {
         const x = r[s.id]; const c = cards[i];
         c.o.textContent = `${fmt(x.q)} database ${x.q === 1 ? "query" : "queries"}`;
         c.nn.textContent = `busiest second: ${fmt(x.peak)} per second. ${fmt(x.slow)} requests over 100 ms, worst ${fmt(x.maxLat)} ms, ${fmt(x.fail)} timed out`;
         const bad = x.fail > 0 || x.peak > CAP;
         c.box.style.setProperty('--c', bad ? 'var(--bad)' : x.slow === 0 ? 'var(--good)' : 'var(--accent)');
-        x.buckets.forEach((b, j) => { c.cells[j].style.height = `${Math.max(2, (b / top) * 100)}%`; c.cells[j].classList.toggle('over', b * (1000 / BUCKET) > CAP); });
+        x.buckets.forEach((b, j) => { c.cells[j].style.height = `${Math.max(MIN_BAR_PCT, (b / top) * 100)}%`; c.cells[j].classList.toggle('over', b * (MS_PER_S / BUCKET) > CAP); });
       });
       const none = r.none; const lock = r.lock; const flight = r.flight; const swr = r.swr; const jit = r.jitter;
       const out = q('[data-verdict]'); out.classList.toggle('bad', none.peak > CAP || none.fail > 0);

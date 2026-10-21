@@ -45,22 +45,33 @@ import PlaygroundShell from '../../components/PlaygroundShell.astro';
     const q = <T extends HTMLElement>(s: string) => root.querySelector<T>(s)!;
     const N = 2000; const CACHES = 200000; const PROPAGATION = 5; const LOOKUP_RATE = 0.1; const MISS_MS = 30; const REQ_PER_S = 1000; const FARM = 1000; const LIMIT = 5;
     const MARKS: [string, number][] = [['10 s', 10], ['30 s', 30], ['1 min', 60], ['2 min', 120], ['5 min', 300], ['10 min', 600], ['20 min', 1200], ['40 min', 2400], ['1 hour', 3600], ['65 min', 3900]];
-    let seed = 53; const rnd = () => ((seed = (seed * 1664525 + 1013904223) % 4294967296) / 4294967296);
+    const SEED = 53;
+    const HOUR_S = 3600, DAY_S = 86400;
+    const TTL_FLOOR = { min: 300, ignore: HOUR_S }; // resolvers that raise short TTLs to 5 minutes, or ignore them and keep an hour
+    const P95 = 0.95;
+    const PROBE_LOSS = 0.01; // chance a probe to a healthy server is lost
+    const BYTES = { query: 70, answer: 1400, slip: 90 }; // spoofed query, full answer, truncated RRL "slip" answer
+    const BITS_PER_BYTE = 8, GBIT = 1e9;
+    const SLIP = 2; // RRL answers one in two limited queries with a truncated reply
+    const KQPS = 1000; // the attack slider is in thousands of queries per second
+    const BAD = { failoverS: 90, qps: 3000, loadRatio: 1.5, miss: 0.1, falsePerDay: 0.1, amplification: 2, limited: 0.05 };
+    // linear congruential generator (Numerical Recipes constants)
+    let seed = SEED; const rnd = () => ((seed = (seed * 1664525 + 1013904223) % 4294967296) / 4294967296);
     const phase = Array.from({ length: N }, () => rnd()); // where each resolver is in its cache cycle when the server fails
     const dur = (s: number) => (s < 90 ? `${Math.round(s)} s` : s < 5400 ? `${Math.round(s / 60)} min` : `${(s / 3600).toFixed(1)} h`);
     const num = (n: number) => Math.round(n).toLocaleString('en-US');
     function model(ttl: number, iv: number, th: number, mode: string, rrl: string, atk: number) {
-      const eff = mode === 'respect' ? ttl : mode === 'min' ? Math.max(ttl, 300) : Math.max(ttl, 3600);
+      const eff = mode === 'respect' ? ttl : mode === 'min' ? Math.max(ttl, TTL_FLOOR.min) : Math.max(ttl, TTL_FLOOR.ignore);
       const ready = iv * th + PROPAGATION;
       const sw = phase.map((u) => { const p = u * eff; return ready + ((((p - ready) % eff) + eff) % eff); }); // when each resolver first sees the healthy answer
       const sorted = [...sw].sort((a, b) => a - b);
-      const mean = sw.reduce((a, b) => a + b, 0) / N; const p95 = sorted[Math.floor(N * 0.95)]; const max = sorted[N - 1];
+      const mean = sw.reduce((a, b) => a + b, 0) / N; const p95 = sorted[Math.floor(N * P95)]; const max = sorted[N - 1];
       const share = MARKS.map(([, t]) => sw.filter((s) => s > t).length / N);
-      const qps = CACHES / eff; const base = CACHES / 3600;
+      const qps = CACHES / eff; const base = CACHES / HOUR_S;
       const miss = 1 / (1 + LOOKUP_RATE * eff);
-      const falsePerDay = (86400 / iv) * Math.pow(0.01, th);
-      const attackerGbps = (atk * 70 * 8) / 1e9;
-      const victimGbps = rrl === 'off' ? (atk * 1400 * 8) / 1e9 : ((LIMIT * 1400 + ((atk - LIMIT) / 2) * 90) * 8) / 1e9;
+      const falsePerDay = (DAY_S / iv) * Math.pow(PROBE_LOSS, th);
+      const attackerGbps = (atk * BYTES.query * BITS_PER_BYTE) / GBIT;
+      const victimGbps = rrl === 'off' ? (atk * BYTES.answer * BITS_PER_BYTE) / GBIT : ((LIMIT * BYTES.answer + ((atk - LIMIT) / SLIP) * BYTES.slip) * BITS_PER_BYTE) / GBIT;
       const farmRate = FARM / eff;
       const limited = rrl === 'on' ? Math.max(0, 1 - LIMIT / farmRate) : 0;
       return { eff, ready, mean, p95, max, share, qps, base, miss, falsePerDay, attackerGbps, victimGbps, farmRate, limited, failed: mean * REQ_PER_S };
@@ -74,23 +85,23 @@ import PlaygroundShell from '../../components/PlaygroundShell.astro';
     });
     function draw() {
       const ttl = Number(q<HTMLSelectElement>('[data-ttl]').value); const iv = Number(q<HTMLSelectElement>('[data-iv]').value); const th = Number(q<HTMLSelectElement>('[data-th]').value);
-      const mode = q<HTMLSelectElement>('[data-mode]').value; const rrl = q<HTMLSelectElement>('[data-rrl]').value; const atk = Number(q<HTMLInputElement>('[data-atk]').value) * 1000;
-      q('[data-atkval]').textContent = num(atk / 1000);
+      const mode = q<HTMLSelectElement>('[data-mode]').value; const rrl = q<HTMLSelectElement>('[data-rrl]').value; const atk = Number(q<HTMLInputElement>('[data-atk]').value) * KQPS;
+      q('[data-atkval]').textContent = num(atk / KQPS);
       const m = model(ttl, iv, th, mode, rrl, atk);
       bars.forEach((b, i) => { const pc = m.share[i] * 100; b.fill.style.width = `${pc}%`; b.p.textContent = `${pc.toFixed(pc > 0 && pc < 10 ? 1 : 0)}%`; });
       const set = (k: number, out: string, note: string, bad: boolean) => { q(`[data-o${k}]`).textContent = out; q(`[data-n${k}]`).textContent = note; q<HTMLElement>(`[data-b${k}]`).style.setProperty('--c', bad ? 'var(--bad)' : 'var(--good)'); };
-      set(1, `${dur(m.mean)} on average`, `worst ${dur(m.max)}, 95th percentile ${dur(m.p95)}; ${num(m.failed)} failed requests. Detection and publishing take ${dur(m.ready)}; resolvers hold the old answer for up to ${dur(m.eff)}.`, m.mean > 90);
-      set(2, `${num(m.qps)} queries/s`, m.qps > m.base * 1.5 ? `${num(m.qps / m.base)} times the load of a 1-hour TTL (${num(m.base)} per second)` : 'the minimum: resolvers keep answers for an hour', m.qps > 3000);
-      set(3, `${(m.miss * 100).toFixed(m.miss < 0.01 ? 2 : 1)}% of lookups miss`, `+${(m.miss * MISS_MS).toFixed(1)} ms on average; ${m.miss > 0.01 ? `the slowest 1% of lookups wait ${MISS_MS} ms for the name server` : 'the 99th percentile is a cache hit'}`, m.miss > 0.1);
-      set(4, m.falsePerDay >= 1 ? `${num(m.falsePerDay)} per day` : m.falsePerDay >= 0.1 ? `${m.falsePerDay.toFixed(1)} per day` : `1 in ${num(1 / m.falsePerDay)} days`, `a healthy server is marked down after ${th === 1 ? 'one lost probe' : `${th} lost probes in a row`}`, m.falsePerDay >= 0.1);
-      set(5, `${m.victimGbps.toFixed(m.victimGbps < 1 ? 2 : 1)} Gbps`, `${(m.victimGbps / m.attackerGbps).toFixed(2)} times the ${m.attackerGbps.toFixed(2)} Gbps the attacker sent`, m.victimGbps > m.attackerGbps * 2);
-      set(6, rrl === 'on' ? `${Math.round(m.limited * 100)}% of queries limited` : rrl === 'allow' ? 'not limited' : 'not limited (RRL off)', `${m.farmRate.toFixed(m.farmRate < 10 ? 2 : 1)} queries per second for one name from one prefix, against a limit of ${LIMIT}`, m.limited > 0.05);
+      set(1, `${dur(m.mean)} on average`, `worst ${dur(m.max)}, 95th percentile ${dur(m.p95)}; ${num(m.failed)} failed requests. Detection and publishing take ${dur(m.ready)}; resolvers hold the old answer for up to ${dur(m.eff)}.`, m.mean > BAD.failoverS);
+      set(2, `${num(m.qps)} queries/s`, m.qps > m.base * BAD.loadRatio ? `${num(m.qps / m.base)} times the load of a 1-hour TTL (${num(m.base)} per second)` : 'the minimum: resolvers keep answers for an hour', m.qps > BAD.qps);
+      set(3, `${(m.miss * 100).toFixed(m.miss < 0.01 ? 2 : 1)}% of lookups miss`, `+${(m.miss * MISS_MS).toFixed(1)} ms on average; ${m.miss > 0.01 ? `the slowest 1% of lookups wait ${MISS_MS} ms for the name server` : 'the 99th percentile is a cache hit'}`, m.miss > BAD.miss);
+      set(4, m.falsePerDay >= 1 ? `${num(m.falsePerDay)} per day` : m.falsePerDay >= 0.1 ? `${m.falsePerDay.toFixed(1)} per day` : `1 in ${num(1 / m.falsePerDay)} days`, `a healthy server is marked down after ${th === 1 ? 'one lost probe' : `${th} lost probes in a row`}`, m.falsePerDay >= BAD.falsePerDay);
+      set(5, `${m.victimGbps.toFixed(m.victimGbps < 1 ? 2 : 1)} Gbps`, `${(m.victimGbps / m.attackerGbps).toFixed(2)} times the ${m.attackerGbps.toFixed(2)} Gbps the attacker sent`, m.victimGbps > m.attackerGbps * BAD.amplification);
+      set(6, rrl === 'on' ? `${Math.round(m.limited * 100)}% of queries limited` : rrl === 'allow' ? 'not limited' : 'not limited (RRL off)', `${m.farmRate.toFixed(m.farmRate < 10 ? 2 : 1)} queries per second for one name from one prefix, against a limit of ${LIMIT}`, m.limited > BAD.limited);
       const cause = m.ready > m.eff ? `the health check needs ${dur(m.ready)} to find the failure and publish it, which is longer than the ${dur(m.eff)} cache` : `the health check took only ${dur(m.ready)}, and the rest is resolver caches holding the old address${mode === 'respect' ? '' : mode === 'min' ? ' because they raise short TTLs to 5 minutes' : ' because they ignore short TTLs'}`;
-      const fo = m.mean > 90 ? `Users keep hitting the dead server for ${dur(m.mean)} on average and ${dur(m.max)} at worst: ${cause}.`
+      const fo = m.mean > BAD.failoverS ? `Users keep hitting the dead server for ${dur(m.mean)} on average and ${dur(m.max)} at worst: ${cause}.`
         : `Users recover in ${dur(m.mean)} on average and ${dur(m.max)} at worst. The price is ${num(m.qps)} queries per second at the name servers (${num(m.qps / m.base)} times a 1-hour TTL) and ${(m.miss * 100).toFixed(0)}% of lookups waiting for a cache miss.`;
-      const at = rrl === 'off' ? `The spoofed flood of ${num(atk / 1000)}k queries per second turns into ${m.victimGbps.toFixed(1)} Gbps aimed at the victim, ${(m.victimGbps / m.attackerGbps).toFixed(0)} times what the attacker sent.`
-        : `With RRL the victim gets ${m.victimGbps.toFixed(2)} Gbps instead of ${((atk * 1400 * 8) / 1e9).toFixed(1)}.${rrl === 'on' && m.limited > 0.05 ? ` But the big resolver farm loses ${Math.round(m.limited * 100)}% of its answers, because a short TTL makes it ask more often than the limit allows.` : rrl === 'allow' ? ' The big resolvers are exempt, so real traffic is not touched.' : ''}`;
-      const out = q('[data-verdict]'); out.classList.toggle('bad', m.mean > 90 || rrl === 'off' || m.limited > 0.05); out.textContent = `${fo} ${at}`;
+      const at = rrl === 'off' ? `The spoofed flood of ${num(atk / KQPS)}k queries per second turns into ${m.victimGbps.toFixed(1)} Gbps aimed at the victim, ${(m.victimGbps / m.attackerGbps).toFixed(0)} times what the attacker sent.`
+        : `With RRL the victim gets ${m.victimGbps.toFixed(2)} Gbps instead of ${((atk * BYTES.answer * BITS_PER_BYTE) / GBIT).toFixed(1)}.${rrl === 'on' && m.limited > BAD.limited ? ` But the big resolver farm loses ${Math.round(m.limited * 100)}% of its answers, because a short TTL makes it ask more often than the limit allows.` : rrl === 'allow' ? ' The big resolvers are exempt, so real traffic is not touched.' : ''}`;
+      const out = q('[data-verdict]'); out.classList.toggle('bad', m.mean > BAD.failoverS || rrl === 'off' || m.limited > BAD.limited); out.textContent = `${fo} ${at}`;
     }
     root.addEventListener('input', draw); root.addEventListener('change', draw);
     draw();

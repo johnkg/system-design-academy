@@ -55,34 +55,50 @@ import PlaygroundShell from '../../components/PlaygroundShell.astro';
     const q = <T extends HTMLElement>(s: string) => root.querySelector<T>(s)!;
     // CORE-START
     const INTERVAL = 15; const METRICS = 40; const SAMPLE_SERIES = 60; const SAMPLE_POINTS = 240;
+    const HOUR_S = 3600; const DAY_S = 86400; const HOURS_PER_DAY = 24; const BITS_PER_BYTE = 8; const MS_PER_S = 1000; const NS_PER_MS = 1e6;
+    // Bit costs per point: raw is a 64-bit timestamp plus a 64-bit float; the first point of a chunk stores both in 96 bits;
+    // Gorilla spends 1 bit on a repeated value, 2 + window bits when the XOR fits the previous window, and 13 + window bits (control, 5-bit lead, 6-bit length) otherwise.
+    const BITS = { raw: 128, first: 96, value: 64, word: 32, smallDelta: 8, bigDelta: 16, smallDeltaMax: 128, same: 1, reuse: 2, newWindow: 13, maxLead: 31 };
+    const RAW_BYTES = BITS.raw / BITS_PER_BYTE;
+    const SAMPLE = { seed: 11, kinds: [0, 0, 1, 0, 1, 2], counterStart: 1000, gaugeBase: 40, startT: 1700000000, step: 0.25, counterMaxStep: 4, noiseBase: 30, noiseRange: 100000, noiseScale: 1000, lateOneIn: 8 }; // seeded sample series: 0 steady gauge, 1 counter, 2 noisy gauge
+    const HEAD_BLOCKS = 1.5; // blocks of recent points kept in memory
+    const BLOCK_INDEX_B = 24; // bytes per series per block for the block's own index
+    const ROLLUP_FIELDS = 4; // a rollup point stores four aggregates
+    const QUERY = { openMsPerSeriesBlock: 0.0006, diskBps: 2e9, parallel: 8 }; // cost to open a block per series, disk read rate, query threads
+    const FIVE_MIN_S = 300;
+    const BUDGET_MS = 10000; // dashboard latency budget
+    const BLOWUP = 10; // series multiplier that counts as a cardinality explosion
+    const DISK_WARN_B = 20e12; // disk use that turns the card red
     const dv = new DataView(new ArrayBuffer(8));
     const ctz32 = (x: number) => 31 - Math.clz32(x & -x);
+    // Gorilla delta-of-delta buckets: 1, 9, 12, 16 or 36 bits.
     const dodBits = (d: number) => (d === 0 ? 1 : d >= -63 && d <= 64 ? 9 : d >= -255 && d <= 256 ? 12 : d >= -2047 && d <= 2048 ? 16 : 36);
     // Count the bits each encoding needs for the same seeded points (no bits are written, only counted).
     function sampleCosts() {
-      let seed = 11; const rnd = (n: number) => { seed = (seed * 1664525 + 1013904223) % 4294967296; return Math.floor(seed / 65536) % n; };
+      let seed = SAMPLE.seed; const rnd = (n: number) => { // Numerical Recipes LCG
+        seed = (seed * 1664525 + 1013904223) % 4294967296; return Math.floor(seed / 65536) % n; };
       let rawBits = 0; let deltaBits = 0; let gorBits = 0; let points = 0;
       for (let s = 0; s < SAMPLE_SERIES; s++) {
-        const kind = [0, 0, 1, 0, 1, 2][s % 6]; let v = kind === 1 ? 1000 : 40 + s; let t = 1700000000; let prevDelta = 0;
+        const kind = SAMPLE.kinds[s % SAMPLE.kinds.length]; let v = kind === 1 ? SAMPLE.counterStart : SAMPLE.gaugeBase + s; let t = SAMPLE.startT; let prevDelta = 0;
         let prevHi = 0; let prevLo = 0; let lead = -1; let len = 0;
         for (let i = 0; i < SAMPLE_POINTS; i++) {
-          if (kind === 0) { if (rnd(2) === 0) v += (rnd(3) - 1) * 0.25; } // steady gauge: moves in quarter steps half the time
-          else if (kind === 1) v += rnd(4); // counter: grows by small whole numbers
-          else v = 30 + rnd(100000) / 1000; // noisy gauge: arbitrary decimals at every scrape
-          const nt = i === 0 ? t : t + INTERVAL + (rnd(8) === 0 ? 1 : 0);
+          if (kind === 0) { if (rnd(2) === 0) v += (rnd(3) - 1) * SAMPLE.step; } // steady gauge: moves in quarter steps half the time
+          else if (kind === 1) v += rnd(SAMPLE.counterMaxStep); // counter: grows by small whole numbers
+          else v = SAMPLE.noiseBase + rnd(SAMPLE.noiseRange) / SAMPLE.noiseScale; // noisy gauge: arbitrary decimals at every scrape
+          const nt = i === 0 ? t : t + INTERVAL + (rnd(SAMPLE.lateOneIn) === 0 ? 1 : 0);
           const delta = nt - t; const dod = delta - prevDelta; t = nt; prevDelta = delta;
           dv.setFloat64(0, v); const hi = dv.getUint32(0); const lo = dv.getUint32(4);
-          points++; rawBits += 128;
-          if (i === 0) { deltaBits += 96; gorBits += 96; prevHi = hi; prevLo = lo; continue; }
-          deltaBits += (delta < 128 ? 8 : 16) + 64; gorBits += dodBits(dod);
+          points++; rawBits += BITS.raw;
+          if (i === 0) { deltaBits += BITS.first; gorBits += BITS.first; prevHi = hi; prevLo = lo; continue; }
+          deltaBits += (delta < BITS.smallDeltaMax ? BITS.smallDelta : BITS.bigDelta) + BITS.value; gorBits += dodBits(dod);
           const xh = (hi ^ prevHi) >>> 0; const xl = (lo ^ prevLo) >>> 0; prevHi = hi; prevLo = lo;
-          if (xh === 0 && xl === 0) { gorBits += 1; continue; } // same value as before: one bit
-          const l = Math.min(xh ? Math.clz32(xh) : 32 + Math.clz32(xl), 31); const tz = xl ? ctz32(xl) : 32 + ctz32(xh);
-          if (lead >= 0 && l >= lead && tz >= 64 - lead - len) gorBits += 2 + len; // fits the previous window of meaningful bits
-          else { const m = 64 - l - tz; gorBits += 13 + m; lead = l; len = m; }
+          if (xh === 0 && xl === 0) { gorBits += BITS.same; continue; } // same value as before: one bit
+          const l = Math.min(xh ? Math.clz32(xh) : BITS.word + Math.clz32(xl), BITS.maxLead); const tz = xl ? ctz32(xl) : BITS.word + ctz32(xh);
+          if (lead >= 0 && l >= lead && tz >= BITS.value - lead - len) gorBits += BITS.reuse + len; // fits the previous window of meaningful bits
+          else { const m = BITS.value - l - tz; gorBits += BITS.newWindow + m; lead = l; len = m; }
         }
       }
-      return { raw: rawBits / points / 8, delta: deltaBits / points / 8, gorilla: gorBits / points / 8 } as Record<string, number>;
+      return { raw: rawBits / points / BITS_PER_BYTE, delta: deltaBits / points / BITS_PER_BYTE, gorilla: gorBits / points / BITS_PER_BYTE } as Record<string, number>;
     }
     const DECODE_NS: Record<string, number> = { raw: 3, delta: 8, gorilla: 25 };
     const LABELS: Record<string, { name: string; values: number }> = { none: { name: 'no extra label', values: 1 }, endpoint: { name: 'endpoint', values: 40 }, customer: { name: 'customer_id', values: 2000 }, user: { name: 'user_id', values: 50000 } };
@@ -97,20 +113,20 @@ import PlaygroundShell from '../../components/PlaygroundShell.astro';
     function model(cfg: Cfg, cost: Record<string, number>) {
       const bpp = cost[cfg.codec]; const d = LABELS[cfg.label].values;
       const reqSeries = cfg.hosts * d; const series = cfg.hosts * (METRICS - 1) + reqSeries;
-      const headPts = 360 * cfg.blockH; // 1.5 blocks of points at one point per 15 s
+      const headPts = HEAD_BLOCKS * (HOUR_S / INTERVAL) * cfg.blockH; // 1.5 blocks of points at one point per 15 s
       const indexMem = series * INDEX_B; const headMem = series * headPts * bpp; const mem = indexMem + headMem;
       const tiers = TIERS[cfg.tiers]; let disk = 0; let blockIdx = 0;
       tiers.forEach((t) => {
         const bh = t.res === INTERVAL ? cfg.blockH : ROLLUP_BLOCK_H[t.res];
-        blockIdx += Math.ceil((t.days * 24) / bh) * series * 24; // each block repeats its own index entries, about 24 bytes per series
-        disk += series * (86400 / t.res) * t.days * bpp * (t.res === INTERVAL ? 1 : 4);
+        blockIdx += Math.ceil((t.days * HOURS_PER_DAY) / bh) * series * BLOCK_INDEX_B; // each block repeats its own index entries, about 24 bytes per series
+        disk += series * (DAY_S / t.res) * t.days * bpp * (t.res === INTERVAL ? 1 : ROLLUP_FIELDS);
       });
       const tier = tiers.find((t) => t.days >= cfg.rangeDays); const used = tier ?? tiers[tiers.length - 1];
       const availDays = Math.min(cfg.rangeDays, used.days);
       const bh = used.res === INTERVAL ? cfg.blockH : ROLLUP_BLOCK_H[used.res];
-      const blocks = used.res === INTERVAL ? Math.ceil(Math.max(0, availDays * 24 - 1.5 * cfg.blockH) / bh) + 1 : Math.ceil((availDays * 24) / bh); // +1 is the in-memory head
-      const points = (reqSeries * availDays * 86400) / used.res; const bytesRead = points * bpp;
-      const ms = (blocks * reqSeries * 0.0006 + (points * DECODE_NS[cfg.codec]) / 1e6 + (bytesRead / 2e9) * 1000) / 8;
+      const blocks = used.res === INTERVAL ? Math.ceil(Math.max(0, availDays * HOURS_PER_DAY - HEAD_BLOCKS * cfg.blockH) / bh) + 1 : Math.ceil((availDays * HOURS_PER_DAY) / bh); // +1 is the in-memory head
+      const points = (reqSeries * availDays * DAY_S) / used.res; const bytesRead = points * bpp;
+      const ms = (blocks * reqSeries * QUERY.openMsPerSeriesBlock + (points * DECODE_NS[cfg.codec]) / NS_PER_MS + (bytesRead / QUERY.diskBps) * MS_PER_S) / QUERY.parallel;
       return { bpp, d, reqSeries, series, indexMem, headMem, mem, disk, blockIdx, used, covered: !!tier, availDays, blocks, points, ms };
     }
     // CORE-END
@@ -120,12 +136,12 @@ import PlaygroundShell from '../../components/PlaygroundShell.astro';
     const fmtB = (b: number) => (b >= 1e12 ? `${(b / 1e12).toFixed(1)} TB` : b >= 1e9 ? `${(b / 1e9).toFixed(1)} GB` : b >= 1e6 ? `${(b / 1e6).toFixed(0)} MB` : `${(b / 1e3).toFixed(0)} KB`);
     const fmtT = (ms: number) => (ms < 1000 ? `${Math.max(1, Math.round(ms))} ms` : ms < 60000 ? `${(ms / 1000).toFixed(1)} s` : ms < 3.6e6 ? `${Math.round(ms / 60000)} min` : ms < 8.64e7 ? `${Math.round(ms / 3.6e6)} hours` : `${Math.round(ms / 8.64e7)} days`);
     const fmtP = (p: number) => (p >= 1e9 ? `${(p / 1e9).toFixed(1)} billion` : p >= 1e6 ? `${(p / 1e6).toFixed(1)} million` : fmtN(p));
-    const tierName = (res: number) => (res === 15 ? 'raw 15 s points' : res === 300 ? '5-minute rollups' : '1-hour rollups');
+    const tierName = (res: number) => (res === INTERVAL ? `raw ${INTERVAL} s points` : res === FIVE_MIN_S ? '5-minute rollups' : '1-hour rollups');
     function draw() {
       const cfg: Cfg = { codec: q<HTMLSelectElement>('[data-codec]').value, hosts: Number(q<HTMLInputElement>('[data-hosts]').value), label: q<HTMLSelectElement>('[data-label]').value, tiers: q<HTMLSelectElement>('[data-tiers]').value, blockH: Number(q<HTMLSelectElement>('[data-block]').value), rangeDays: Number(q<HTMLSelectElement>('[data-range]').value) };
       q('[data-hostsval]').textContent = String(cfg.hosts);
       const m = model(cfg, cost); const base = model({ ...cfg, label: 'none' }, cost);
-      q('[data-o1]').textContent = `${m.bpp.toFixed(1)} bytes`; q('[data-n1]').textContent = `${(16 / m.bpp).toFixed(1)} times smaller than raw (16 bytes). Measured on ${SAMPLE_SERIES * SAMPLE_POINTS} seeded points.`;
+      q('[data-o1]').textContent = `${m.bpp.toFixed(1)} bytes`; q('[data-n1]').textContent = `${(RAW_BYTES / m.bpp).toFixed(1)} times smaller than raw (${RAW_BYTES} bytes). Measured on ${SAMPLE_SERIES * SAMPLE_POINTS} seeded points.`;
       q('[data-o2]').textContent = `${fmtN(m.series)} series, ${fmtB(m.mem)}`;
       const nodes = Math.ceil(m.mem / NODE);
       q('[data-n2]').textContent = `index ${fmtB(m.indexMem)} plus head points ${fmtB(m.headMem)}. ${nodes === 1 ? 'Fits on one node.' : `Needs ${nodes} nodes just to hold the series.`}`;
@@ -133,13 +149,13 @@ import PlaygroundShell from '../../components/PlaygroundShell.astro';
       q('[data-n3]').textContent = `${m.blocks} blocks opened, ${fmtP(m.points)} points decoded from ${tierName(m.used.res)}${m.covered ? '' : `. Only ${m.availDays} of ${cfg.rangeDays} days exist`}.`;
       q('[data-o4]').textContent = fmtB(m.disk); q('[data-n4]').textContent = `of which block indexes ${fmtB(m.blockIdx)}. One copy.`;
       q('[data-o5]').textContent = `${fmtN(base.series)} series, ${fmtB(base.mem)}`; q('[data-n5]').textContent = `${base.reqSeries === m.reqSeries ? 'This is the same system.' : `The label multiplies the request counter by ${fmtN(m.d)}: ${fmtN(m.series / base.series)} times the series and ${fmtN(m.mem / base.mem)} times the memory.`}`;
-      const slow = m.ms > 10000; const tooBig = nodes > 1; const blow = m.series / base.series >= 10;
+      const slow = m.ms > BUDGET_MS; const tooBig = nodes > 1; const blow = m.series / base.series >= BLOWUP;
       const color = (el: string, bad: boolean) => q<HTMLElement>(el).style.setProperty('--c', bad ? 'var(--bad)' : 'var(--good)');
-      color('[data-b1]', false); color('[data-b2]', tooBig); color('[data-b3]', slow || !m.covered); color('[data-b4]', m.disk > 20e12); color('[data-b5]', false);
+      color('[data-b1]', false); color('[data-b2]', tooBig); color('[data-b3]', slow || !m.covered); color('[data-b4]', m.disk > DISK_WARN_B); color('[data-b5]', false);
       const parts: string[] = [];
       if (blow) parts.push(`${LABELS[cfg.label].name} gives the request counter ${fmtN(m.d)} values on each of ${cfg.hosts} hosts, so ${fmtN(base.series)} series become ${fmtN(m.series)}. Every one needs its index entry and head chunk whether or not it is ever queried.`);
       if (tooBig) parts.push(`The series alone need ${fmtB(m.mem)} of memory, more than one node can use.`);
-      if (slow) parts.push(`The dashboard decodes ${fmtP(m.points)} points and would take about ${fmtT(m.ms)}, past a 10 second budget. Rollups only coarsen time and keep every series, so fewer series is the real fix.`);
+      if (slow) parts.push(`The dashboard decodes ${fmtP(m.points)} points and would take about ${fmtT(m.ms)}, past a ${BUDGET_MS / MS_PER_S} second budget. Rollups only coarsen time and keep every series, so fewer series is the real fix.`);
       if (!m.covered) parts.push(`The retention rule keeps only ${m.used.days} days, so a ${cfg.rangeDays}-day dashboard shows a truncated graph.`);
       const out = q('[data-verdict]'); const bad = parts.length > 0; out.classList.toggle('bad', bad);
       out.textContent = bad ? parts.join(' ') : `Healthy: ${fmtN(m.series)} series fit in ${fmtB(m.mem)}, and the dashboard reads ${fmtP(m.points)} points from ${tierName(m.used.res)} in about ${fmtT(m.ms)}.`;

@@ -35,23 +35,34 @@ import PlaygroundShell from '../components/PlaygroundShell.astro';
   interface Req { u: number; out: number; prompt: number; at: number }
   interface Opts { mode: 'static' | 'continuous'; maxBatch: number; queueLimit: number; chunked: boolean }
   const BASE = 20; const PER = 1; const CHUNK = 256; const N = 80; const SEED = 7; const COLS = 48;
+  const MS_PER_S = 1000;
+  const JITTER_RANGE = 1000; // arrival-gap draw is 0..999, scaled to 0..2x the mean gap
+  const SHORT_PCT = 80; // % of requests with a short answer
+  const OUT = { shortMin: 16, shortSpan: 48, longMin: 200, longSpan: 200 }; // answer length, tokens
+  const LONG_PROMPT_EVERY = 10; // one request in this many has a long prompt
+  const PROMPT = { longMin: 2000, longSpan: 2000, shortMin: 64, shortSpan: 900 }; // prompt length, tokens
+  const PREFILL_TOK_PER_MS = 10; // prompt tokens prefilled per millisecond of step time
+  const CLEAR_WIN = 1.2; // throughput ratio that counts as one scheduler clearly winning
+  const IDLE_WARN_PCT = 50; // idle slot share that triggers the "over half empty" note
+  const STALL_MS = 300; // a step this long counts as a stall
   function makeWorkload(n: number, seed: number) {
     let s = seed >>> 0;
+    // LCG (Numerical Recipes constants)
     const next = () => { s = (Math.imul(s, 1664525) + 1013904223) >>> 0; return s >>> 8; };
     const w: { u: number; out: number; prompt: number }[] = [];
     for (let i = 0; i < n; i++) {
-      const u = next() % 1000; const r = next() % 100;
-      const out = r < 80 ? 16 + (next() % 48) : 200 + (next() % 200);
-      const prompt = next() % 10 === 0 ? 2000 + (next() % 2000) : 64 + (next() % 900);
+      const u = next() % JITTER_RANGE; const r = next() % 100;
+      const out = r < SHORT_PCT ? OUT.shortMin + (next() % OUT.shortSpan) : OUT.longMin + (next() % OUT.longSpan);
+      const prompt = next() % LONG_PROMPT_EVERY === 0 ? PROMPT.longMin + (next() % PROMPT.longSpan) : PROMPT.shortMin + (next() % PROMPT.shortSpan);
       w.push({ u, out, prompt });
     }
     return w;
   }
   function arrivals(w: { u: number; out: number; prompt: number }[], rate: number): Req[] {
-    let t = 0; const mean = 1000 / rate;
-    return w.map((r) => { t += Math.floor((r.u * 2 * mean) / 1000); return { ...r, at: t }; });
+    let t = 0; const mean = MS_PER_S / rate;
+    return w.map((r) => { t += Math.floor((r.u * 2 * mean) / JITTER_RANGE); return { ...r, at: t }; });
   }
-  const pcost = (tok: number) => Math.floor((tok + 9) / 10);
+  const pcost = (tok: number) => Math.floor((tok + PREFILL_TOK_PER_MS - 1) / PREFILL_TOK_PER_MS); // ms, rounded up
   function simulate(reqs: Req[], o: Opts) {
     const n = reqs.length; const fin = new Array<number>(n).fill(-1); const shed = new Array<boolean>(n).fill(false);
     let t = 0; let nx = 0; let steps = 0; let tokens = 0; let longest = 0;
@@ -86,11 +97,11 @@ import PlaygroundShell from '../components/PlaygroundShell.astro';
     const pct = (q: number) => (lat.length ? lat[Math.floor(((lat.length - 1) * q) / 100)] : 0);
     return {
       done: lat.length, shed: shed.filter(Boolean).length, tokens, steps, makespan: t, trace,
-      tps: t ? Math.floor((tokens * 1000) / t) : 0, p50: pct(50), p95: pct(95),
+      tps: t ? Math.floor((tokens * MS_PER_S) / t) : 0, p50: pct(50), p95: pct(95),
       idle: steps ? Math.floor(100 - (100 * tokens) / (steps * o.maxBatch)) : 0, longest,
     };
   }
-  const sec = (ms: number) => (ms / 1000).toFixed(1) + ' s';
+  const sec = (ms: number) => (ms / MS_PER_S).toFixed(1) + ' s';
   const SIZES = [1, 2, 4, 8, 16, 32, 64];
   const base = makeWorkload(N, SEED);
 
@@ -117,12 +128,12 @@ import PlaygroundShell from '../components/PlaygroundShell.astro';
       const other = simulate(reqs, { ...o, mode: o.mode === 'static' ? 'continuous' : 'static' });
       const notes: string[] = [];
       if (o.maxBatch === 1) notes.push('Batch size 1 is no batching: every step reads all the weights for a single sequence, so the GPU is busy but moves only about ' + r.tps + ' tokens/s.');
-      else if (o.mode === 'static' && other.tps > r.tps * 1.2) notes.push('Static batching: ' + r.idle + '% of slots idle. Short answers sit finished inside the batch until the longest one ends. Continuous batching would give ' + other.tps + ' tokens/s and p95 ' + sec(other.p95) + ' on the same traffic.');
-      else if (o.mode === 'continuous' && r.tps > other.tps * 1.2) notes.push('Continuous batching refills a slot the moment a sequence finishes: ' + r.tps + ' tokens/s against ' + other.tps + ' for static batching, p95 ' + sec(r.p95) + ' against ' + sec(other.p95) + '.');
+      else if (o.mode === 'static' && other.tps > r.tps * CLEAR_WIN) notes.push('Static batching: ' + r.idle + '% of slots idle. Short answers sit finished inside the batch until the longest one ends. Continuous batching would give ' + other.tps + ' tokens/s and p95 ' + sec(other.p95) + ' on the same traffic.');
+      else if (o.mode === 'continuous' && r.tps > other.tps * CLEAR_WIN) notes.push('Continuous batching refills a slot the moment a sequence finishes: ' + r.tps + ' tokens/s against ' + other.tps + ' for static batching, p95 ' + sec(r.p95) + ' against ' + sec(other.p95) + '.');
       else notes.push('At this load the two schedulers are close, so the scheduler is not what limits you.');
       if (r.shed > 0) notes.push(r.shed + ' of ' + reqs.length + ' requests were rejected by the queue limit; the accepted ones have bounded latency.');
-      if (o.mode === 'continuous' && r.idle >= 50) notes.push('Over half the slots are empty: the queue is shorter than the batch, so a bigger max batch buys nothing here.');
-      if (r.longest >= 300) notes.push('Longest step ' + r.longest + ' ms: a long prompt stalled every running user' + (o.mode === 'continuous' ? '; chunked prefill would spread it out.' : '.'));
+      if (o.mode === 'continuous' && r.idle >= IDLE_WARN_PCT) notes.push('Over half the slots are empty: the queue is shorter than the batch, so a bigger max batch buys nothing here.');
+      if (r.longest >= STALL_MS) notes.push('Longest step ' + r.longest + ' ms: a long prompt stalled every running user' + (o.mode === 'continuous' ? '; chunked prefill would spread it out.' : '.'));
       return notes.join(' ');
     }
     function draw() {

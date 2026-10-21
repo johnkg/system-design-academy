@@ -46,18 +46,31 @@ import PlaygroundShell from '../../components/PlaygroundShell.astro';
   document.querySelectorAll<HTMLElement>('[data-dqb]').forEach((root) => {
     const q = <T extends HTMLElement>(s: string) => root.querySelector<T>(s)!;
     const HW = 168; const WEEKS = 5; const START = HW * (WEEKS - 1);
-    let seed = 4242; const rnd = (n: number) => { seed = (seed * 1664525 + 1013904223) % 4294967296; return Math.floor(seed / 65536) % n; };
+    const SEED = 4242; const DAY_H = 24; const WEEK_D = 7;
+    const WEEKEND_FROM = 5; const WEEKEND_PCT = 40; // Saturday and Sunday carry 40% of the weekday volume
+    const NOISE = { base: 950, span: 101 }; // per-mille noise on each hour, 95%..105%
+    const FAULTS = { // incidents injected into the last week
+      outage: { day: 2, from: 13, to: 16, pct: 35 }, double: { day: 4, hour: 3, factor: 4 },
+      mild: { day: 0, hours: [10, 11], pct: 85 }, short: { day: 5, hour: 14, pct: 35 },
+    };
+    const FIXED_FLOOR = 200; // rows per hour below which the fixed check fires
+    const MAD_SCALE_PCT = 148; const MIN_SPREAD_PCT = 3; // MAD x 1.48 estimates the standard deviation; spread never below 3% of the median
+    const OPEN_AFTER = 2; const CLOSE_AFTER = 3; // breaker opens after 2 flagged hours in a row, closes after 3 clean ones
+    const MAX_FALSE = 2; const MAX_MISSED = 2; const MAX_LEAKED = 2; const LEAK_OK = 1; const MAX_COLLATERAL = 5; // verdict thresholds, hours
+    // LCG, upper bits
+    let seed = SEED; const rnd = (n: number) => { seed = (seed * 1664525 + 1013904223) % 4294967296; return Math.floor(seed / 65536) % n; };
     const SHAPE = [120, 90, 70, 60, 60, 80, 150, 300, 520, 700, 820, 900, 880, 860, 900, 940, 880, 760, 600, 480, 380, 300, 220, 160];
     const series: number[] = []; const incident: boolean[] = [];
     for (let t = 0; t < HW * WEEKS; t++) {
-      const hour = t % 24; const day = Math.floor(t / 24) % 7;
-      let v = Math.floor((SHAPE[hour] * (day >= 5 ? 40 : 100)) / 100); v = Math.floor((v * (950 + rnd(101))) / 1000);
+      const hour = t % DAY_H; const day = Math.floor(t / DAY_H) % WEEK_D;
+      let v = Math.floor((SHAPE[hour] * (day >= WEEKEND_FROM ? WEEKEND_PCT : 100)) / 100); v = Math.floor((v * (NOISE.base + rnd(NOISE.span))) / 1000);
       let bad = false;
       if (t >= START) {
-        if (day === 2 && hour >= 13 && hour <= 16) { v = Math.floor((v * 35) / 100); bad = true; }
-        if (day === 4 && hour === 3) { v *= 4; bad = true; }
-        if (day === 0 && (hour === 10 || hour === 11)) { v = Math.floor((v * 85) / 100); bad = true; }
-        if (day === 5 && hour === 14) { v = Math.floor((v * 35) / 100); bad = true; }
+        const { outage, double, mild, short } = FAULTS;
+        if (day === outage.day && hour >= outage.from && hour <= outage.to) { v = Math.floor((v * outage.pct) / 100); bad = true; }
+        if (day === double.day && hour === double.hour) { v *= double.factor; bad = true; }
+        if (day === mild.day && mild.hours.includes(hour)) { v = Math.floor((v * mild.pct) / 100); bad = true; }
+        if (day === short.day && hour === short.hour) { v = Math.floor((v * short.pct) / 100); bad = true; }
       }
       series.push(v); incident.push(bad);
     }
@@ -67,11 +80,11 @@ import PlaygroundShell from '../../components/PlaygroundShell.astro';
     const variance = Math.floor(hist.reduce((s, x) => s + (x - mean) * (x - mean), 0) / hist.length);
     function flagged(det: string, k: number, t: number) {
       const x = series[t];
-      if (det === 'fixed') return x < 200;
+      if (det === 'fixed') return x < FIXED_FLOOR;
       if (det === 'global') return (x - mean) * (x - mean) > k * k * variance;
       const same: number[] = []; for (let w = 1; w < WEEKS; w++) same.push(series[t - w * HW]);
       const med = median(same); const mad = median(same.map((y) => Math.abs(y - med)));
-      return Math.abs(x - med) * 100 > k * Math.max(mad * 148, med * 3);
+      return Math.abs(x - med) * 100 > k * Math.max(mad * MAD_SCALE_PCT, med * MIN_SPREAD_PCT);
     }
     function run(det: string, k: number, br: string) {
       let open = false; let bad = 0; let good = 0; let held = 0; let collateral = 0; let leaked = 0; let missed = 0; let incidents = 0;
@@ -81,7 +94,7 @@ import PlaygroundShell from '../../components/PlaygroundShell.astro';
         if (incident[t]) { incidents++; if (!f) missed++; }
         let h = false;
         if (br === 'one') h = f;
-        else if (br === 'open2') { if (f) { bad++; good = 0; } else { good++; bad = 0; } if (!open && bad >= 2) open = true; else if (open && good >= 3) open = false; h = open; }
+        else if (br === 'open2') { if (f) { bad++; good = 0; } else { good++; bad = 0; } if (!open && bad >= OPEN_AFTER) open = true; else if (open && good >= CLOSE_AFTER) open = false; h = open; }
         heldAt.push(h);
         if (h) { held++; if (!incident[t]) collateral++; } else if (incident[t]) leaked++;
       }
@@ -99,19 +112,19 @@ import PlaygroundShell from '../../components/PlaygroundShell.astro';
       q<HTMLInputElement>('[data-k]').disabled = det === 'fixed';
       const r = run(det, k, br);
       const caught = r.incidents - r.missed;
-      set(1, `${r.pagesTrue + r.pagesFalse} (${r.pagesFalse} false)`, `${r.pagesTrue} true and ${r.pagesFalse} false`, r.pagesFalse > 2 ? 'var(--bad)' : 'var(--accent)');
-      set(2, `${caught} of ${r.incidents}`, `${r.missed} slipped through unseen`, r.missed === 0 ? 'var(--good)' : r.missed > 2 ? 'var(--bad)' : 'var(--accent)');
-      set(3, `${r.leaked} of ${r.incidents}`, br === 'off' ? 'no hold, so every bad hour is loaded' : 'bad hours not held back', r.leaked <= 1 ? 'var(--good)' : 'var(--bad)');
-      set(4, `${r.collateral}`, `${r.held} hours held in all`, r.collateral > 5 ? 'var(--bad)' : 'var(--accent)');
+      set(1, `${r.pagesTrue + r.pagesFalse} (${r.pagesFalse} false)`, `${r.pagesTrue} true and ${r.pagesFalse} false`, r.pagesFalse > MAX_FALSE ? 'var(--bad)' : 'var(--accent)');
+      set(2, `${caught} of ${r.incidents}`, `${r.missed} slipped through unseen`, r.missed === 0 ? 'var(--good)' : r.missed > MAX_MISSED ? 'var(--bad)' : 'var(--accent)');
+      set(3, `${r.leaked} of ${r.incidents}`, br === 'off' ? 'no hold, so every bad hour is loaded' : 'bad hours not held back', r.leaked <= LEAK_OK ? 'var(--good)' : 'var(--bad)');
+      set(4, `${r.collateral}`, `${r.held} hours held in all`, r.collateral > MAX_COLLATERAL ? 'var(--bad)' : 'var(--accent)');
       cells.forEach((c, i) => { c.classList.toggle('flag', r.flags[i]); c.classList.toggle('held', r.heldAt[i]); });
       strip.setAttribute('aria-label', `Last week: ${r.flags.filter(Boolean).length} flagged hours, ${r.held} held back, ${r.incidents} really bad`);
-      const out = q('[data-verdict]'); const bad = r.pagesFalse > 2 || r.missed > 2 || r.leaked > 2 || r.collateral > 5; out.classList.toggle('bad', bad);
+      const out = q('[data-verdict]'); const bad = r.pagesFalse > MAX_FALSE || r.missed > MAX_MISSED || r.leaked > MAX_LEAKED || r.collateral > MAX_COLLATERAL; out.classList.toggle('bad', bad);
       out.textContent = det === 'global' ? `The global mean and spread flagged nothing: its lower bound is below zero, so a drop in rows can never trip it, and the daily rhythm hides the rest.`
-        : det === 'fixed' && r.pagesFalse > 2 ? `${r.pagesFalse} false pages: a fixed floor cannot tell a quiet night or weekend from a failure, and it misses a double load and a mild drop.`
-        : r.pagesFalse > 2 ? `${r.pagesFalse} false pages: at sensitivity ${k} ordinary noise trips the check, and ${br === 'off' ? 'owners learn to ignore it' : `${r.collateral} healthy hours are held back for nothing`}.`
-        : r.leaked > 2 ? (br === 'off' ? `${caught} of ${r.incidents} bad hours are seen and the owners are paged, but nothing stops the load, so all ${r.leaked} bad hours are already in the dashboards. An alert without a hold is only a notification.`
+        : det === 'fixed' && r.pagesFalse > MAX_FALSE ? `${r.pagesFalse} false pages: a fixed floor cannot tell a quiet night or weekend from a failure, and it misses a double load and a mild drop.`
+        : r.pagesFalse > MAX_FALSE ? `${r.pagesFalse} false pages: at sensitivity ${k} ordinary noise trips the check, and ${br === 'off' ? 'owners learn to ignore it' : `${r.collateral} healthy hours are held back for nothing`}.`
+        : r.leaked > MAX_LEAKED ? (br === 'off' ? `${caught} of ${r.incidents} bad hours are seen and the owners are paged, but nothing stops the load, so all ${r.leaked} bad hours are already in the dashboards. An alert without a hold is only a notification.`
           : `Bad hours are seen, but the breaker needs two flagged hours in a row, so ${r.leaked} of them still leak: the first hour of each incident, and any single-hour one.`)
-        : r.missed > 2 ? `Quiet, but ${r.missed} bad hours are missed: sensitivity ${k} is too coarse for a 15% drop.`
+        : r.missed > MAX_MISSED ? `Quiet, but ${r.missed} bad hours are missed: sensitivity ${k} is too coarse for a ${100 - FAULTS.mild.pct}% drop.`
         : `${r.pagesFalse} false pages, ${caught} of ${r.incidents} bad hours caught and ${r.leaked} reaching the dashboards, at the price of ${r.collateral} healthy hours held.`;
     }
     root.addEventListener('input', draw); root.addEventListener('change', draw);

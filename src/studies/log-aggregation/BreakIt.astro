@@ -54,16 +54,31 @@ import PlaygroundShell from '../../components/PlaygroundShell.astro';
     const q = <T extends HTMLElement>(s: string) => root.querySelector<T>(s)!;
     const T = 100; const BURST_FROM = 30; const BURST_TO = 50; const BASE = 2000; const PEAK = 12000; const MAXT = 700;
     const NAMES = ['debug', 'info', 'warning', 'error'];
+    const LEVELS = NAMES.length, DEBUG = 0, INFO = 1, WARN = 2, ERROR = 3;
+    const SEED = 13;
+    const INDEXER = { full: { raw: 8000, vis: 1 }, lean: { raw: 20000, vis: 5 } }; // lines/s at unlimited batch; seconds until a shipped line is searchable
+    const REQ_OVERHEAD_S = 0.05; // fixed cost per bulk request
+    const HIST_SLACK_S = 60;
+    const SAMPLE = { debugFill: 0.6, debugKeep: 10, infoFill: 0.9, infoKeep: 2 }; // over 60% full keep 1 in 10 debug lines, over 90% keep 1 in 2 info lines
+    const MIX = { burst: [10, 20, 50], base: [2, 8, 40] }; // cumulative % of error, warning, info lines (rest debug)
+    const MAX_BATCH_WAIT_S = 5;
+    const DAY_S = 86400, BYTES_PER_LINE = 300, GB = 1e9;
+    const RATIO: Record<number, number> = { 100: 4, 1000: 7 }; const RATIO_MAX = 9; // compression by batch size
+    const STORE = { days: 30, copies: 2, ssdUsdGbMonth: 0.1, objUsdGbMonth: 0.023, hotShare: 0.03 }; // 30-day retention; lean mode keeps 3% hot on SSD
+    const SEARCHABLE_OK_S = 15;
+    const SPARK = { dx: 2, floor: 60, h: 58 }; // buffer-depth sparkline in SVG units
     function simulate(size: number, policy: string, batch: number, mode: string) {
-      let seed = 13; const rnd = () => ((seed = (seed * 1664525 + 1013904223) % 4294967296) / 4294967296);
-      const raw = mode === 'full' ? 8000 : 20000; const rate = batch / (0.05 + batch / raw); const vis = mode === 'full' ? 1 : 5;
+      // linear congruential generator (Numerical Recipes constants)
+      let seed = SEED; const rnd = () => ((seed = (seed * 1664525 + 1013904223) % 4294967296) / 4294967296);
+      const ix = mode === 'full' ? INDEXER.full : INDEXER.lean;
+      const raw = ix.raw; const rate = batch / (REQ_OVERHEAD_S + batch / raw); const vis = ix.vis;
       const qs: number[][] = [[], [], [], []]; const heads = [0, 0, 0, 0]; const lenOf = (l: number) => qs[l].length - heads[l];
       const arrT: number[] = []; let len = 0; let seq = 0; let sampleCtr = 0;
-      const lost = [0, 0, 0, 0]; const sent = [0, 0, 0, 0]; const hist = new Array(MAXT + 60).fill(0); let shipped = 0; let worst = 0; const depth: number[] = [];
+      const lost = [0, 0, 0, 0]; const sent = [0, 0, 0, 0]; const hist = new Array(MAXT + HIST_SLACK_S).fill(0); let shipped = 0; let worst = 0; const depth: number[] = [];
       const pop = (l: number) => { const s = qs[l][heads[l]++]; len--; return s; };
-      const oldestLevel = (from = 0) => { let b = -1, bs = Infinity; for (let l = from; l < 4; l++) if (lenOf(l) > 0 && qs[l][heads[l]] < bs) { bs = qs[l][heads[l]]; b = l; } return b; };
+      const oldestLevel = (from = 0) => { let b = -1, bs = Infinity; for (let l = from; l < LEVELS; l++) if (lenOf(l) > 0 && qs[l][heads[l]] < bs) { bs = qs[l][heads[l]]; b = l; } return b; };
       const offer = (l: number, t: number) => {
-        if (policy === 'sample') { if (l === 0 && len >= 0.6 * size && (sampleCtr++ % 10) !== 0) { lost[0]++; return; } if (l === 1 && len >= 0.9 * size && (sampleCtr++ % 2) !== 0) { lost[1]++; return; } }
+        if (policy === 'sample') { if (l === DEBUG && len >= SAMPLE.debugFill * size && (sampleCtr++ % SAMPLE.debugKeep) !== 0) { lost[DEBUG]++; return; } if (l === INFO && len >= SAMPLE.infoFill * size && (sampleCtr++ % SAMPLE.infoKeep) !== 0) { lost[INFO]++; return; } }
         if (len >= size) {
           if (policy === 'newest') { lost[l]++; return; }
           if (policy === 'oldest') { lost[oldestLevel()]++; pop(oldestLevel()); }
@@ -74,10 +89,10 @@ import PlaygroundShell from '../../components/PlaygroundShell.astro';
       let carry = 0;
       for (let t = 0; t < T + MAXT && (t < T || len > 0); t++) {
         if (t < T) { const n = t >= BURST_FROM && t < BURST_TO ? PEAK : BASE; const burst = n === PEAK;
-          for (let i = 0; i < n; i++) { const r = rnd() * 100; const l = burst ? (r < 10 ? 3 : r < 20 ? 2 : r < 50 ? 1 : 0) : (r < 2 ? 3 : r < 8 ? 2 : r < 40 ? 1 : 0); offer(l, t); } }
+          for (let i = 0; i < n; i++) { const r = rnd() * 100; const c = burst ? MIX.burst : MIX.base; const l = r < c[0] ? ERROR : r < c[1] ? WARN : r < c[2] ? INFO : DEBUG; offer(l, t); } }
         carry += rate; let cap = Math.floor(carry); carry -= cap;
         while (cap > 0 && len > 0) { const l = oldestLevel(); const s = pop(l); cap--; sent[l]++; shipped++;
-          const arr = arrT[s]; const nArr = arr >= BURST_FROM && arr < BURST_TO ? PEAK : BASE; const d = (t - arr) + Math.min(5, batch / nArr) + vis; const b = Math.min(hist.length - 1, Math.floor(d)); hist[b]++; if (d > worst) worst = d; }
+          const arr = arrT[s]; const nArr = arr >= BURST_FROM && arr < BURST_TO ? PEAK : BASE; const d = (t - arr) + Math.min(MAX_BATCH_WAIT_S, batch / nArr) + vis; const b = Math.min(hist.length - 1, Math.floor(d)); hist[b]++; if (d > worst) worst = d; }
         if (t < T) depth.push(len);
       }
       let acc = 0, median = 0; for (let b = 0; b < hist.length; b++) { acc += hist[b]; if (acc >= shipped / 2) { median = b; break; } }
@@ -89,27 +104,27 @@ import PlaygroundShell from '../../components/PlaygroundShell.astro';
       const size = Number(q<HTMLSelectElement>('[data-size]').value); const policy = q<HTMLSelectElement>('[data-policy]').value;
       const batch = Number(q<HTMLSelectElement>('[data-batch]').value); const mode = q<HTMLSelectElement>('[data-mode]').value;
       const r = simulate(size, policy, batch, mode);
-      const lost = r.lost.reduce((a, b) => a + b, 0); const total = lost + r.shipped; const errs = r.lost[3];
+      const lost = r.lost.reduce((a, b) => a + b, 0); const total = lost + r.shipped; const errs = r.lost[ERROR];
       q('[data-o1]').textContent = `${fmt(lost)} of ${fmt(total)}`;
-      q('[data-n1]').textContent = lost === 0 ? 'nothing was dropped' : `${Math.round((lost / total) * 1000) / 10}%: debug ${fmt(r.lost[0])}, info ${fmt(r.lost[1])}, warning ${fmt(r.lost[2])}, error ${fmt(r.lost[3])}`;
+      q('[data-n1]').textContent = lost === 0 ? 'nothing was dropped' : `${Math.round((lost / total) * 1000) / 10}%: debug ${fmt(r.lost[0])}, info ${fmt(r.lost[1])}, warning ${fmt(r.lost[2])}, error ${fmt(r.lost[ERROR])}`;
       q('[data-o2]').textContent = fmt(errs);
-      q('[data-n2]').textContent = errs === 0 ? 'every error reached the index' : `${Math.round((errs / (errs + r.sent[3])) * 1000) / 10}% of the errors are gone`;
+      q('[data-n2]').textContent = errs === 0 ? 'every error reached the index' : `${Math.round((errs / (errs + r.sent[ERROR])) * 1000) / 10}% of the errors are gone`;
       q('[data-o3]').textContent = `median ${secs(r.median)}`;
       q('[data-n3]').textContent = `worst ${secs(r.worst)}; the indexer takes ${fmt(r.rate)} lines per second`;
-      const gbDay = (r.shipped / T) * 86400 * 300 / 1e9; const ratio = batch === 100 ? 4 : batch === 1000 ? 7 : 9;
-      const cost = mode === 'full' ? gbDay * 30 * 2 * 0.1 : (gbDay / ratio) * 30 * 0.023 + gbDay * 0.03 * 30 * 2 * 0.1;
+      const gbDay = (r.shipped / T) * DAY_S * BYTES_PER_LINE / GB; const ratio = RATIO[batch] ?? RATIO_MAX;
+      const cost = mode === 'full' ? gbDay * STORE.days * STORE.copies * STORE.ssdUsdGbMonth : (gbDay / ratio) * STORE.days * STORE.objUsdGbMonth + gbDay * STORE.hotShare * STORE.days * STORE.copies * STORE.ssdUsdGbMonth;
       q('[data-o4]').textContent = `$${fmt(cost)} per month`;
-      q('[data-n4]').textContent = `${fmt(gbDay)} GB per day stored, ${mode === 'full' ? 'on SSD with 2 copies' : `compressed ${ratio}:1 in object storage`}`;
-      q('[data-line]').setAttribute('points', r.depth.map((d, i) => `${i * 2},${(60 - Math.min(1, d / size) * 58).toFixed(1)}`).join(' '));
+      q('[data-n4]').textContent = `${fmt(gbDay)} GB per day stored, ${mode === 'full' ? `on SSD with ${STORE.copies} copies` : `compressed ${ratio}:1 in object storage`}`;
+      q('[data-line]').setAttribute('points', r.depth.map((d, i) => `${i * SPARK.dx},${(SPARK.floor - Math.min(1, d / size) * SPARK.h).toFixed(1)}`).join(' '));
       const good = (v: boolean) => (v ? 'var(--good)' : 'var(--bad)');
       q<HTMLElement>('[data-b1]').style.setProperty('--c', good(lost === 0));
       q<HTMLElement>('[data-b2]').style.setProperty('--c', good(errs === 0));
-      q<HTMLElement>('[data-b3]').style.setProperty('--c', good(r.worst <= 15));
+      q<HTMLElement>('[data-b3]').style.setProperty('--c', good(r.worst <= SEARCHABLE_OK_S));
       q<HTMLElement>('[data-b4]').style.setProperty('--c', 'var(--accent)');
-      const out = q('[data-verdict]'); const bad = errs > 0 || lost > 0 || r.worst > 15; out.classList.toggle('bad', bad);
+      const out = q('[data-verdict]'); const bad = errs > 0 || lost > 0 || r.worst > SEARCHABLE_OK_S; out.classList.toggle('bad', bad);
       out.textContent = errs > 0 ? `${fmt(errs)} errors were lost, along with ${fmt(r.lost[0])} debug lines. A buffer that drops without looking at the level loses exactly the lines you need during an incident. ${policy === 'oldest' ? 'Dropping the oldest instead erases the start of the incident, where the cause usually is.' : 'Choose "sample by level" or a faster indexer.'}`
         : lost > 0 ? `No error was lost. ${fmt(lost)} lines were dropped on purpose, ${fmt(r.lost[0])} of them debug, to keep the buffer from overflowing. You trade volume for the lines that matter.`
-        : r.worst > 15 ? `Nothing was lost, but the buffer filled up and the worst line took ${secs(r.worst)} to become searchable. A big buffer turns loss into delay: during an incident you would be looking at logs from long ago.`
+        : r.worst > SEARCHABLE_OK_S ? `Nothing was lost, but the buffer filled up and the worst line took ${secs(r.worst)} to become searchable. A big buffer turns loss into delay: during an incident you would be looking at logs from long ago.`
         : `Nothing was lost and every line was searchable within ${secs(r.worst)}. The burst fitted in the buffer, or the indexer kept up with it.`;
     }
     let queued = false;

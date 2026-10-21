@@ -59,14 +59,21 @@ import PlaygroundShell from '../components/PlaygroundShell.astro';
   const DAY = 86400; const DETECT = 300; const LAG = 1; const COPY_MBPS = 200; const REPLAY_MBPS = 50;
   const OVERHEAD = 120; const ORDERS_PER_MIN = 40; const BASE_ROWS = 1200000; const FAILOVER = 60; const FIRST = 7200;
   const BAD_CHANCE = 0.3;
+  const SEC_PER_MIN = 60; const SEC_PER_H = 3600; const MB_PER_GB = 1024;
+  const INCIDENT_OFFSET_S = 20; // the incident happens 20 s into the chosen minute
+  const BACKUPS_PER_DAY_6H = 4; // the six-hourly schedule
+  const TARGET_S = { early: 600, after: 60 }; // restore targets 10 min before or 1 min after the incident
+  const MAX_TRIES = 5; // backups tried before giving up
+  const LOSS_OK_S = 60; // losing up to a minute counts as fine
   interface Params { kind: string; sched: string; wal: boolean; intv: number; target: string; gb: number; walmb: number; verify: boolean; where: string; min: number; seed: number }
+  // mulberry32 PRNG
   function mulberry32(a: number) { return () => { a |= 0; a = (a + 0x6d2b79f5) | 0; let t = Math.imul(a ^ (a >>> 15), 1 | a); t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t; return ((t ^ (t >>> 14)) >>> 0) / 4294967296; }; }
-  const ordersAt = (t: number) => BASE_ROWS + Math.floor((ORDERS_PER_MIN * t) / 60);
-  const corrupt = (seed: number, t: number) => mulberry32(seed * 7919 + Math.floor(t / 3600) * 104729 + 17)() < BAD_CHANCE;
+  const ordersAt = (t: number) => BASE_ROWS + Math.floor((ORDERS_PER_MIN * t) / SEC_PER_MIN);
+  const corrupt = (seed: number, t: number) => mulberry32(seed * 7919 + Math.floor(t / SEC_PER_H) * 104729 + 17)() < BAD_CHANCE;
   function simulate(p: Params) {
-    const I = p.min * 60 + 20;
-    const period = p.sched === 'daily' ? DAY : DAY / 4;
-    const copySec = (p.gb * 1024) / COPY_MBPS;
+    const I = p.min * SEC_PER_MIN + INCIDENT_OFFSET_S;
+    const period = p.sched === 'daily' ? DAY : DAY / BACKUPS_PER_DAY_6H;
+    const copySec = (p.gb * MB_PER_GB) / COPY_MBPS;
     const r: any = { I, ok: true, reason: '', B: 0, Teff: 0, tried: [] as { t: number; bad: boolean }[], attempts: 0, replayed: false };
     const pre = p.kind === 'delete' ? ordersAt(I - 1) : ordersAt(I);
     r.pre = pre;
@@ -77,29 +84,29 @@ import PlaygroundShell from '../components/PlaygroundShell.astro';
     // how far can we get
     let T: number;
     if (!p.wal) T = I; else if (p.kind === 'loss') T = Math.floor(I / p.intv) * p.intv;
-    else T = p.target === 'before' ? I - 1 : p.target === 'early' ? I - 600 : p.target === 'after' ? I + 60 : I + DETECT;
+    else T = p.target === 'before' ? I - 1 : p.target === 'early' ? I - TARGET_S.early : p.target === 'after' ? I + TARGET_S.after : I + DETECT;
     r.T = T;
     // newest usable base backup at or before T (without WAL: at or before the incident)
     const limit = p.wal ? T : I;
     let k = Math.floor((limit - FIRST) / period); let found = false;
-    for (let n = 0; n < 5; n++, k--) {
+    for (let n = 0; n < MAX_TRIES; n++, k--) {
       const t = FIRST + k * period; const bad = !p.verify && corrupt(p.seed, t);
       r.tried.push({ t, bad });
       if (bad) { r.attempts++; continue; }
       r.B = t; found = true; break;
     }
-    if (!found) { r.ok = false; r.reason = 'None of the last 5 backups could be restored.'; return r; }
+    if (!found) { r.ok = false; r.reason = `None of the last ${MAX_TRIES} backups could be restored.`; return r; }
     r.Teff = p.wal ? T : r.B;
     const window = p.wal ? r.Teff - r.B : 0;
-    r.replayMB = (p.walmb * window) / 60; r.replaySec = r.replayMB / REPLAY_MBPS; r.copySec = copySec;
+    r.replayMB = (p.walmb * window) / SEC_PER_MIN; r.replaySec = r.replayMB / REPLAY_MBPS; r.copySec = copySec;
     r.rto = r.attempts * copySec + copySec + r.replaySec + OVERHEAD;
     r.replayed = p.kind === 'delete' && p.wal && r.Teff >= I;
     if (!p.wal) r.rows = ordersAt(r.B);
-    else if (p.kind === 'delete') r.rows = r.Teff < I ? ordersAt(r.Teff) : Math.floor((ORDERS_PER_MIN * (r.Teff - I)) / 60);
+    else if (p.kind === 'delete') r.rows = r.Teff < I ? ordersAt(r.Teff) : Math.floor((ORDERS_PER_MIN * (r.Teff - I)) / SEC_PER_MIN);
     else r.rows = ordersAt(r.Teff);
     r.lostRows = Math.max(0, pre - r.rows);
     r.lostSec = r.replayed ? null : I - r.Teff;
-    r.discarded = p.kind === 'delete' && !r.replayed ? Math.floor((ORDERS_PER_MIN * DETECT) / 60) : 0;
+    r.discarded = p.kind === 'delete' && !r.replayed ? Math.floor((ORDERS_PER_MIN * DETECT) / SEC_PER_MIN) : 0;
     return r;
   }
   // ---- formatting ----
@@ -119,13 +126,13 @@ import PlaygroundShell from '../components/PlaygroundShell.astro';
     function draw() {
       queued = false;
       const p = params(); const r = simulate(p);
-      set('[data-timeval]', hm(p.min * 60)); set('[data-walmbval]', `${n0(p.walmb)} MB/min`); set('[data-seedval]', `scenario ${idx + 1}`);
+      set('[data-timeval]', hm(p.min * SEC_PER_MIN)); set('[data-walmbval]', `${n0(p.walmb)} MB/min`); set('[data-seedval]', `scenario ${idx + 1}`);
       q<HTMLSelectElement>('[data-target]').disabled = !p.wal || p.kind === 'loss';
       q<HTMLSelectElement>('[data-intv]').disabled = !p.wal;
       q<HTMLSelectElement>('[data-where]').disabled = p.kind !== 'loss';
       // timeline
-      const period = p.sched === 'daily' ? DAY : DAY / 4; const marks = Math.round(DAY / period);
-      for (let i = 0; i < 4; i++) {
+      const period = p.sched === 'daily' ? DAY : DAY / BACKUPS_PER_DAY_6H; const marks = Math.round(DAY / period);
+      for (let i = 0; i < BACKUPS_PER_DAY_6H; i++) {
         const m = q(`[data-b${i}]`); const t = FIRST + i * period; m.style.display = i < marks ? '' : 'none';
         m.style.left = pct(t); const used = r.ok !== false && r.B === t; const bad = r.tried.some((x: any) => x.t === t && x.bad);
         m.style.background = bad ? 'var(--bad)' : used ? 'var(--accent)' : 'var(--muted)';
@@ -149,7 +156,7 @@ import PlaygroundShell from '../components/PlaygroundShell.astro';
       set('[data-rowsnote]', r.replayed ? 'the DELETE was replayed too' : `before the incident there were ${n0(r.pre)}`);
       set('[data-rpo]', r.lostSec == null ? 'everything' : dur(r.lostSec)); set('[data-rponote]', r.replayed ? `${n0(r.lostRows)} rows still gone` : r.lostRows ? `${n0(r.lostRows)} orders to re-create` : 'about nothing to re-create');
       set('[data-rto]', dur(r.rto)); set('[data-rtonote]', `copy ${dur(r.copySec)}${r.attempts ? ` x${r.attempts + 1}` : ''} + replay ${dur(r.replaySec || 0)} + checks ${dur(OVERHEAD)}`);
-      const bad = r.replayed || r.lostRows > 0 && r.lostSec != null && r.lostSec > 60;
+      const bad = r.replayed || r.lostRows > 0 && r.lostSec != null && r.lostSec > LOSS_OK_S;
       out.classList.toggle('bad', !!bad);
       out.textContent = r.replayed ? `Restored to ${hms(r.Teff)}: the DELETE is part of that history, so the table is ${r.rows ? 'nearly empty' : 'empty'} again. Pick a target before ${hms(r.I)}.`
         : `Back after ${dur(r.rto)} with ${n0(r.rows)} orders; ${dur(r.lostSec as number)} of work lost.${p.kind === 'delete' ? ` Orders placed after the mistake and before it was noticed (about ${r.discarded}) are discarded unless exported first.` : ''}${!p.wal ? ' Without an archived log the restore point is the backup time.' : ''}`;

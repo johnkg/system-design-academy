@@ -71,11 +71,28 @@ import PlaygroundShell from '../components/PlaygroundShell.astro';
   const END = 160000; const CRASH_BEAT = 140; const CRASH_MS = 140000;
   const PAUSE_BEATS: [number, number] = [60, 65]; const BLIP_BEATS: [number, number] = [100, 104];
   const PAUSE_MS: [number, number] = [60000, 65000]; const BLIP_MS: [number, number] = [100000, 104000];
+  const STEP_MS = 100; // simulation tick and score resolution
+  const BEAT_MS = 1000; // heartbeat (or SWIM round) interval
+  const PER_MILLE = 1000; // lcg draws are taken modulo 1000; probabilities below are per mille
+  const BASE_DELAY_MS = 20; // minimum one-way network delay
+  const SPIKE = { baseMs: 400, rangeMs: 2000 }; // a delay spike adds 400 ms plus up to 2 s
+  const BLIP_LOSS = 700; // per mille of packets lost during the network blip
+  const GRACE = { pauseMs: 2000, blipMs: 3000 }; // how long after a fault a false alarm is still blamed on it
+  const PRIOR_INTERVALS = [750, 1250]; // ms, seed samples for the phi window (mean 1 s)
+  const PHI_WINDOW = 100; // intervals kept for the phi mean and deviation
+  const MIN_SD_MS = 100; // floor on the interval standard deviation
+  const PHI_APPROX = { a: 1.5976, b: 0.070566 }; // logistic approximation of the normal CDF
+  const PHI_MIN_P = 1e-16; const PHI_CAP = 16; // phi when p underflows (-log10 of PHI_MIN_P)
+  const SCORE_CAP = 1.5; // plotted score is clamped at 1.5x the verdict line
+  const INDIRECT_PROBES = 3; // SWIM indirect pings per round
+  const PROBE_TIMEOUT_MS = 500; // round trip allowed for a direct or indirect probe
+  const SWEEP = { fixedMs: { from: 1000, to: 12000, step: 500 }, phi: { from: 1, to: 16 }, swimMs: { from: 1000, to: 10000, step: 1000 } };
   const LEVELS: Record<string, { j: number; sp: number }> = { low: { j: 5, sp: 0 }, medium: { j: 20, sp: 15 }, high: { j: 50, sp: 50 } };
   type Cls = 'pause' | 'blip' | 'other';
   interface Span { start: number; verdictAt: number; clearedAt: number; falseAlarm: boolean }
   interface Result { contacts: number[]; score: number[]; spans: Span[]; fp: number; fpBy: Record<Cls, number>; detect: number; raised: number; refuted: number }
 
+  // Numerical Recipes LCG; returns the high 16 bits.
   function lcg(seed: number) {
     let s = seed >>> 0;
     return () => { s = (Math.imul(s, 1664525) + 1013904223) >>> 0; return s >>> 16; };
@@ -83,18 +100,18 @@ import PlaygroundShell from '../components/PlaygroundShell.astro';
   function genTrace(seed: number, lv: string): number[] {
     const next = lcg(seed * 7919 + 13); const { j, sp } = LEVELS[lv]; const arr: number[] = [];
     for (let k = 0; k < CRASH_BEAT; k++) {
-      const a = (next() % 1000) + (next() % 1000) + (next() % 1000) + (next() % 1000);
-      const s = next() % 1000; const x = next() % 2000; const l = next() % 1000;
+      const a = (next() % PER_MILLE) + (next() % PER_MILLE) + (next() % PER_MILLE) + (next() % PER_MILLE);
+      const s = next() % PER_MILLE; const x = next() % SPIKE.rangeMs; const l = next() % PER_MILLE;
       if (k >= PAUSE_BEATS[0] && k < PAUSE_BEATS[1]) continue;
-      if (k >= BLIP_BEATS[0] && k < BLIP_BEATS[1] && l < 700) continue;
-      let d = 20 + Math.floor((j * a) / 1000); if (s < sp) d += 400 + x;
-      arr.push(1000 * k + d);
+      if (k >= BLIP_BEATS[0] && k < BLIP_BEATS[1] && l < BLIP_LOSS) continue;
+      let d = BASE_DELAY_MS + Math.floor((j * a) / PER_MILLE); if (s < sp) d += SPIKE.baseMs + x;
+      arr.push(BEAT_MS * k + d);
     }
     return arr.sort((p, q) => p - q);
   }
   function classify(t: number): Cls {
-    if (t >= PAUSE_MS[0] && t < PAUSE_MS[1] + 2000) return 'pause';
-    if (t >= BLIP_MS[0] && t < BLIP_MS[1] + 3000) return 'blip';
+    if (t >= PAUSE_MS[0] && t < PAUSE_MS[1] + GRACE.pauseMs) return 'pause';
+    if (t >= BLIP_MS[0] && t < BLIP_MS[1] + GRACE.blipMs) return 'blip';
     return 'other';
   }
   function finish(contacts: number[], score: number[], spans: Span[], detect: number, raised: number, refuted: number): Result {
@@ -104,11 +121,11 @@ import PlaygroundShell from '../components/PlaygroundShell.astro';
   }
   // Fixed timeout or phi accrual over the arrival times.
   function runHeartbeat(arr: number[], kind: 'fixed' | 'phi', param: number): Result {
-    const buf = [750, 1250]; let sum = 2000; let sq = 750 * 750 + 1250 * 1250;
+    const buf = [...PRIOR_INTERVALS]; let sum = PRIOR_INTERVALS.reduce((a, b) => a + b, 0); let sq = PRIOR_INTERVALS.reduce((a, b) => a + b * b, 0);
     let ai = 0; let last = -1; let open: Span | null = null; const spans: Span[] = []; const score: number[] = [];
-    for (let t = 0; t <= END; t += 100) {
+    for (let t = 0; t <= END; t += STEP_MS) {
       while (ai < arr.length && arr[ai] <= t) {
-        if (last >= 0) { const iv = arr[ai] - last; buf.push(iv); sum += iv; sq += iv * iv; if (buf.length > 100) { const o = buf.shift()!; sum -= o; sq -= o * o; } }
+        if (last >= 0) { const iv = arr[ai] - last; buf.push(iv); sum += iv; sq += iv * iv; if (buf.length > PHI_WINDOW) { const o = buf.shift()!; sum -= o; sq -= o * o; } }
         last = arr[ai++];
         if (open) { open.clearedAt = t; open.falseAlarm = true; open = null; }
       }
@@ -116,12 +133,12 @@ import PlaygroundShell from '../components/PlaygroundShell.astro';
       const diff = t - last; let v: number; let bad: boolean;
       if (kind === 'fixed') { v = diff / param; bad = diff > param; }
       else {
-        const n = buf.length; const m = sum / n; const sd = Math.max(Math.sqrt(Math.max(0, sq / n - m * m)), 100);
-        const y = (diff - m) / sd; const e = Math.exp(-y * (1.5976 + 0.070566 * y * y));
+        const n = buf.length; const m = sum / n; const sd = Math.max(Math.sqrt(Math.max(0, sq / n - m * m)), MIN_SD_MS);
+        const y = (diff - m) / sd; const e = Math.exp(-y * (PHI_APPROX.a + PHI_APPROX.b * y * y));
         const p = diff > m ? e / (1 + e) : 1 - 1 / (1 + e);
-        const phi = p < 1e-16 ? 16 : -Math.log10(p); v = phi / param; bad = phi >= param;
+        const phi = p < PHI_MIN_P ? PHI_CAP : -Math.log10(p); v = phi / param; bad = phi >= param;
       }
-      score.push(Math.min(v, 1.5));
+      score.push(Math.min(v, SCORE_CAP));
       if (bad && !open) { open = { start: t, verdictAt: t, clearedAt: -1, falseAlarm: false }; spans.push(open); }
     }
     const detect = open ? open.start - last : -1;
@@ -130,17 +147,17 @@ import PlaygroundShell from '../components/PlaygroundShell.astro';
   // SWIM-style probing: direct ping, 3 indirect probes, suspicion timer, refutation by the target.
   function runSwim(seed: number, lv: string, S: number, scope: string): Result {
     const r = lcg(seed * 104729 + 5); const { j, sp } = LEVELS[lv];
-    const leg = () => { const a = (r() % 1000) + (r() % 1000) + (r() % 1000) + (r() % 1000); const s = r() % 1000; const x = r() % 2000; return 20 + Math.floor((j * a) / 1000) + (s < sp ? 400 + x : 0); };
-    const score = new Array<number>(END / 100 + 1).fill(0); const spans: Span[] = []; const contacts: number[] = [];
+    const leg = () => { const a = (r() % PER_MILLE) + (r() % PER_MILLE) + (r() % PER_MILLE) + (r() % PER_MILLE); const s = r() % PER_MILLE; const x = r() % SPIKE.rangeMs; return BASE_DELAY_MS + Math.floor((j * a) / PER_MILLE) + (s < sp ? SPIKE.baseMs + x : 0); };
+    const score = new Array<number>(END / STEP_MS + 1).fill(0); const spans: Span[] = []; const contacts: number[] = [];
     let open: Span | null = null; let lastOk = 0; let detect = -1; let raised = 0; let refuted = 0;
-    const ramp = (a: number, b: number) => { for (let t = a; t <= b && t <= END; t += 100) score[t / 100] = Math.min(1, (t - a) / S); };
-    for (let rd = 1; rd * 1000 <= END; rd++) {
-      const tr = rd * 1000; const loss = r() % 1000; const d1 = leg(); const d2 = leg(); const il: number[] = [];
-      for (let p = 0; p < 3; p++) il.push(leg() + leg() + leg() + leg());
+    const ramp = (a: number, b: number) => { for (let t = a; t <= b && t <= END; t += STEP_MS) score[t / STEP_MS] = Math.min(1, (t - a) / S); };
+    for (let rd = 1; rd * BEAT_MS <= END; rd++) {
+      const tr = rd * BEAT_MS; const loss = r() % PER_MILLE; const d1 = leg(); const d2 = leg(); const il: number[] = [];
+      for (let p = 0; p < INDIRECT_PROBES; p++) il.push(leg() + leg() + leg() + leg());
       const up = tr < CRASH_MS && !(tr >= PAUSE_MS[0] && tr < PAUSE_MS[1]);
       const inBlip = tr >= BLIP_MS[0] && tr < BLIP_MS[1];
-      const direct = !(inBlip && loss < 700) && d1 + d2 <= 500;
-      const indirect = !(inBlip && scope === 'segment') && il.some((x) => x <= 500);
+      const direct = !(inBlip && loss < BLIP_LOSS) && d1 + d2 <= PROBE_TIMEOUT_MS;
+      const indirect = !(inBlip && scope === 'segment') && il.some((x) => x <= PROBE_TIMEOUT_MS);
       const ok = up && (direct || indirect);
       if (open && open.verdictAt < 0 && tr >= open.start + S) {
         open.verdictAt = open.start + S; ramp(open.start, open.verdictAt);
@@ -149,7 +166,7 @@ import PlaygroundShell from '../components/PlaygroundShell.astro';
       if (ok) {
         contacts.push(tr); lastOk = tr;
         if (open) { if (open.verdictAt < 0) { refuted++; ramp(open.start, tr); } open.clearedAt = tr; open = null; }
-      } else if (!open) { open = { start: tr + 1000, verdictAt: -1, clearedAt: -1, falseAlarm: false }; spans.push(open); raised++; }
+      } else if (!open) { open = { start: tr + BEAT_MS, verdictAt: -1, clearedAt: -1, falseAlarm: false }; spans.push(open); raised++; }
     }
     return finish(contacts, score, spans, detect, raised, refuted);
   }
@@ -166,9 +183,9 @@ import PlaygroundShell from '../components/PlaygroundShell.astro';
   interface Point { x: number; y: number; param: number }
   function sweep(arr: number[], seed: number, lv: string, scope: string) {
     const fixed: Point[] = []; const phi: Point[] = []; const swim: Point[] = [];
-    for (let T = 1000; T <= 12000; T += 500) { const r = runHeartbeat(arr, 'fixed', T); if (r.detect >= 0) fixed.push({ x: r.detect, y: r.fp, param: T }); }
-    for (let p = 1; p <= 16; p++) { const r = runHeartbeat(arr, 'phi', p); if (r.detect >= 0) phi.push({ x: r.detect, y: r.fp, param: p }); }
-    for (let S = 1000; S <= 10000; S += 1000) { const r = runSwim(seed, lv, S, scope); if (r.detect >= 0) swim.push({ x: r.detect, y: r.fp, param: S }); }
+    for (let T = SWEEP.fixedMs.from; T <= SWEEP.fixedMs.to; T += SWEEP.fixedMs.step) { const r = runHeartbeat(arr, 'fixed', T); if (r.detect >= 0) fixed.push({ x: r.detect, y: r.fp, param: T }); }
+    for (let p = SWEEP.phi.from; p <= SWEEP.phi.to; p++) { const r = runHeartbeat(arr, 'phi', p); if (r.detect >= 0) phi.push({ x: r.detect, y: r.fp, param: p }); }
+    for (let S = SWEEP.swimMs.from; S <= SWEEP.swimMs.to; S += SWEEP.swimMs.step) { const r = runSwim(seed, lv, S, scope); if (r.detect >= 0) swim.push({ x: r.detect, y: r.fp, param: S }); }
     return { fixed, phi, swim };
   }
 
@@ -181,46 +198,55 @@ import PlaygroundShell from '../components/PlaygroundShell.astro';
     if (parent) parent.appendChild(n);
     return n;
   }
-  const secs = (ms: number) => (ms / 1000).toFixed(1);
+  const MS_PER_S = 1000;
+  const secs = (ms: number) => (ms / MS_PER_S).toFixed(1);
+  const SCORE_PX = 80; // timeline pixels per unit of score (1 = verdict)
+  const REFUTED_MARK_SCORE = 0.3; // height of a refuted-suspicion marker
+  const TL_TOP = 14; const TL_TICK_S = 20; const MAX_MARKERS = 40; // timeline layout
+  const TO = { xMaxMs: 13000, y0: 170, h: 150, tickMaxS: 12, tickStepS: 2, tickStepN: 2, selLabelMaxX: 520 }; // trade-off chart layout
+  const TABLE_COLS = 6;
+  const HEAD_MAX = END / STEP_MS; // playhead slider positions
+  const PLAY = { intervalMs: 100, stepTicks: 10, stepButtonTicks: 50 }; // playback speed and Step size
+  const SEED_MAX = 999;
 
   document.querySelectorAll<HTMLElement>('[data-fd]').forEach((root) => {
     const q = <T extends Element>(s: string) => root.querySelector<T>(s)!;
     const reduce = typeof matchMedia === 'function' && matchMedia('(prefers-reduced-motion: reduce)').matches;
     const tl = q<SVGSVGElement>('[data-tl]'); const to = q<SVGSVGElement>('[data-to]');
     const X0 = 36; const X1 = 590; const tx = (ms: number) => X0 + ((X1 - X0) * ms) / END;
-    const YB = 180; const ys = (v: number) => YB - 80 * Math.min(v, 1.5);
+    const YB = 180; const ys = (v: number) => YB - SCORE_PX * Math.min(v, SCORE_CAP);
     let res: Result; let sw: ReturnType<typeof sweep>; let choice = CHOICES[0]; let playTimer: number | undefined; let onScreen = true; let raf = 0;
     let headTick = 0;
 
     // Timeline, built once.
     const band = (a: number, b: number, label: string, colour: string) => {
-      el('rect', { x: tx(a), y: 14, width: tx(b) - tx(a), height: YB - 14, fill: colour, opacity: 0.16 }, tl);
+      el('rect', { x: tx(a), y: TL_TOP, width: tx(b) - tx(a), height: YB - TL_TOP, fill: colour, opacity: 0.16 }, tl);
       el('text', { x: tx(a) + 3, y: 11, 'font-size': 10, fill: 'var(--muted)' }, tl, label);
     };
     band(PAUSE_MS[0], PAUSE_MS[1], 'GC pause', 'var(--role-3)'); band(BLIP_MS[0], BLIP_MS[1], 'blip', 'var(--role-1)');
-    el('line', { x1: tx(CRASH_MS), x2: tx(CRASH_MS), y1: 14, y2: YB, stroke: 'var(--bad)', 'stroke-width': 2 }, tl);
+    el('line', { x1: tx(CRASH_MS), x2: tx(CRASH_MS), y1: TL_TOP, y2: YB, stroke: 'var(--bad)', 'stroke-width': 2 }, tl);
     el('text', { x: tx(CRASH_MS) + 3, y: 11, 'font-size': 10, fill: 'var(--muted)' }, tl, 'crash');
     el('line', { x1: X0, x2: X1, y1: ys(1), y2: ys(1), stroke: 'var(--bad)', 'stroke-dasharray': '5 4', 'stroke-width': 1 }, tl);
     el('text', { x: 2, y: ys(1) + 3, 'font-size': 9, fill: 'var(--muted)' }, tl, 'verdict');
     el('text', { x: 2, y: YB + 3, 'font-size': 9, fill: 'var(--muted)' }, tl, '0');
     el('line', { x1: X0, x2: X1, y1: YB, y2: YB, stroke: 'var(--border)' }, tl);
-    for (let s = 0; s <= 160; s += 20) { el('line', { x1: tx(s * 1000), x2: tx(s * 1000), y1: YB, y2: YB + 4, stroke: 'var(--muted)' }, tl); el('text', { x: tx(s * 1000), y: YB + 15, 'font-size': 10, 'text-anchor': 'middle', fill: 'var(--muted)' }, tl, `${s}s`); }
+    for (let s = 0; s <= END / MS_PER_S; s += TL_TICK_S) { el('line', { x1: tx(s * MS_PER_S), x2: tx(s * MS_PER_S), y1: YB, y2: YB + 4, stroke: 'var(--muted)' }, tl); el('text', { x: tx(s * MS_PER_S), y: YB + 15, 'font-size': 10, 'text-anchor': 'middle', fill: 'var(--muted)' }, tl, `${s}s`); }
     el('text', { x: X0, y: 214, 'font-size': 10, fill: 'var(--muted)' }, tl, 'ticks above the axis: heartbeats (or SWIM acks) seen by the monitor');
     const beats = el('path', { fill: 'none', stroke: 'var(--role-2)', 'stroke-width': 1 }, tl);
     const line = el('polyline', { fill: 'none', stroke: 'var(--accent)', 'stroke-width': 2 }, tl);
     const markers: { g: Element; c: Element; t: Element }[] = [];
-    for (let i = 0; i < 40; i++) {
+    for (let i = 0; i < MAX_MARKERS; i++) {
       const g = el('g', { visibility: 'hidden' }, tl); const c = el('circle', { r: 5, 'stroke-width': 2 }, g); const t = el('text', { 'font-size': 9, 'text-anchor': 'middle', fill: 'var(--text)' }, g);
       markers.push({ g, c, t });
     }
-    const cursor = el('line', { y1: 14, y2: YB, stroke: 'var(--text)', 'stroke-width': 1 }, tl);
+    const cursor = el('line', { y1: TL_TOP, y2: YB, stroke: 'var(--text)', 'stroke-width': 1 }, tl);
 
     // Trade-off chart, built once.
-    const TX0 = 40; const TX1 = 580; const tox = (ms: number) => TX0 + ((TX1 - TX0) * Math.min(ms, 13000)) / 13000;
-    const YMAX = 8; const toy = (n: number) => 170 - (150 * Math.min(n, YMAX)) / YMAX;
-    el('line', { x1: TX0, x2: TX1, y1: 170, y2: 170, stroke: 'var(--border)' }, to); el('line', { x1: TX0, x2: TX0, y1: 20, y2: 170, stroke: 'var(--border)' }, to);
-    for (let s = 0; s <= 12; s += 2) { el('text', { x: tox(s * 1000), y: 186, 'font-size': 10, 'text-anchor': 'middle', fill: 'var(--muted)' }, to, `${s}s`); }
-    for (let n = 0; n <= YMAX; n += 2) { el('text', { x: TX0 - 6, y: toy(n) + 3, 'font-size': 10, 'text-anchor': 'end', fill: 'var(--muted)' }, to, n === YMAX ? `${n}+` : String(n)); }
+    const TX0 = 40; const TX1 = 580; const tox = (ms: number) => TX0 + ((TX1 - TX0) * Math.min(ms, TO.xMaxMs)) / TO.xMaxMs;
+    const YMAX = 8; const toy = (n: number) => TO.y0 - (TO.h * Math.min(n, YMAX)) / YMAX;
+    el('line', { x1: TX0, x2: TX1, y1: TO.y0, y2: TO.y0, stroke: 'var(--border)' }, to); el('line', { x1: TX0, x2: TX0, y1: TO.y0 - TO.h, y2: TO.y0, stroke: 'var(--border)' }, to);
+    for (let s = 0; s <= TO.tickMaxS; s += TO.tickStepS) { el('text', { x: tox(s * MS_PER_S), y: 186, 'font-size': 10, 'text-anchor': 'middle', fill: 'var(--muted)' }, to, `${s}s`); }
+    for (let n = 0; n <= YMAX; n += TO.tickStepN) { el('text', { x: TX0 - 6, y: toy(n) + 3, 'font-size': 10, 'text-anchor': 'end', fill: 'var(--muted)' }, to, n === YMAX ? `${n}+` : String(n)); }
     el('text', { x: (TX0 + TX1) / 2, y: 204, 'font-size': 10, 'text-anchor': 'middle', fill: 'var(--muted)' }, to, 'time to detect the crash (lower is better)');
     el('text', { x: 12, y: 95, 'font-size': 10, fill: 'var(--muted)', transform: 'rotate(-90 12 95)', 'text-anchor': 'middle' }, to, 'false alarms');
     const series = [
@@ -238,7 +264,7 @@ import PlaygroundShell from '../components/PlaygroundShell.astro';
 
     // Table, built once.
     const tbody = q<HTMLElement>('[data-table] tbody'); const rows: HTMLTableRowElement[] = [];
-    CHOICES.forEach(() => { const tr = document.createElement('tr'); for (let i = 0; i < 6; i++) tr.appendChild(document.createElement('td')); tbody.appendChild(tr); rows.push(tr); });
+    CHOICES.forEach(() => { const tr = document.createElement('tr'); for (let i = 0; i < TABLE_COLS; i++) tr.appendChild(document.createElement('td')); tbody.appendChild(tr); rows.push(tr); });
 
     function stateAt(ms: number) {
       for (const s of res.spans) {
@@ -248,10 +274,10 @@ import PlaygroundShell from '../components/PlaygroundShell.astro';
       return 'ALIVE';
     }
     function drawCursor() {
-      const ms = Number(q<HTMLInputElement>('[data-head]').value) * 100;
+      const ms = Number(q<HTMLInputElement>('[data-head]').value) * STEP_MS;
       cursor.setAttribute('x1', String(tx(ms))); cursor.setAttribute('x2', String(tx(ms)));
       let last = -1; for (let i = 0; i < res.contacts.length && res.contacts[i] <= ms; i++) last = res.contacts[i];
-      const v = res.score[Math.min(res.score.length - 1, Math.floor(ms / 100))];
+      const v = res.score[Math.min(res.score.length - 1, Math.floor(ms / STEP_MS))];
       const what = choice.kind === 'swim' ? 'progress of suspicion timer' : choice.kind === 'phi' ? `phi ${(v * choice.param).toFixed(1)} of ${choice.param}` : `silence ${last >= 0 ? secs(ms - last) : '-'} s of ${secs(choice.param)} s`;
       q('[data-now]').textContent = `t = ${secs(ms)} s | last ${choice.kind === 'swim' ? 'ack' : 'heartbeat'}: ${last >= 0 ? `${secs(ms - last)} s ago` : 'none yet'} | ${what} (${(v * 100).toFixed(0)}% of verdict) | state: ${stateAt(ms)}`;
     }
@@ -265,25 +291,25 @@ import PlaygroundShell from '../components/PlaygroundShell.astro';
         if (!s) { m.g.setAttribute('visibility', 'hidden'); return; }
         const t = s.verdictAt >= 0 ? s.verdictAt : s.start; const isFalse = s.falseAlarm || (s.verdictAt < 0 && s.clearedAt >= 0);
         const raisedOnly = s.verdictAt < 0;
-        m.g.setAttribute('visibility', 'visible'); m.g.setAttribute('transform', `translate(${tx(t).toFixed(1)} ${ys(raisedOnly ? 0.3 : 1).toFixed(1)})`);
+        m.g.setAttribute('visibility', 'visible'); m.g.setAttribute('transform', `translate(${tx(t).toFixed(1)} ${ys(raisedOnly ? REFUTED_MARK_SCORE : 1).toFixed(1)})`);
         m.c.setAttribute('fill', raisedOnly ? 'var(--surface)' : isFalse ? 'var(--bad)' : 'var(--text)');
         m.c.setAttribute('stroke', raisedOnly ? 'var(--muted)' : 'var(--bad)');
         m.t.setAttribute('y', '-8'); m.t.textContent = raisedOnly ? 'refuted' : isFalse ? 'false' : 'dead';
       });
       // stats
-      q('[data-detect]').textContent = res.detect >= 0 ? `${(res.detect / 1000).toFixed(2)} s` : 'not detected';
+      q('[data-detect]').textContent = res.detect >= 0 ? `${(res.detect / MS_PER_S).toFixed(2)} s` : 'not detected';
       q('[data-fp]').textContent = String(res.fp);
       q('[data-fpnote]').textContent = `GC pause: ${res.fpBy.pause} | blip: ${res.fpBy.blip} | jitter or warm-up: ${res.fpBy.other}`;
       q('[data-raised]').textContent = String(res.raised);
       q('[data-raisednote]').textContent = choice.kind === 'swim' ? `${res.refuted} cleared by the target's refutation before the timer ran out` : 'no grace period: every suspicion is a verdict';
       // trade-off
       series.forEach((s, i) => { lines[i].setAttribute('points', sw[s.key].map((p) => `${tox(p.x).toFixed(1)},${toy(p.y).toFixed(1)}`).join(' ')); });
-      if (res.detect >= 0) { selRing.setAttribute('visibility', 'visible'); selRing.setAttribute('cx', tox(res.detect).toFixed(1)); selRing.setAttribute('cy', toy(res.fp).toFixed(1)); selText.setAttribute('visibility', 'visible'); selText.setAttribute('x', String(Math.min(tox(res.detect) + 10, 520))); selText.setAttribute('y', (toy(res.fp) - 10).toFixed(1)); selText.textContent = `selected: ${res.fp} false, ${secs(res.detect)} s`; }
+      if (res.detect >= 0) { selRing.setAttribute('visibility', 'visible'); selRing.setAttribute('cx', tox(res.detect).toFixed(1)); selRing.setAttribute('cy', toy(res.fp).toFixed(1)); selText.setAttribute('visibility', 'visible'); selText.setAttribute('x', String(Math.min(tox(res.detect) + 10, TO.selLabelMaxX))); selText.setAttribute('y', (toy(res.fp) - 10).toFixed(1)); selText.textContent = `selected: ${res.fp} false, ${secs(res.detect)} s`; }
       else { selRing.setAttribute('visibility', 'hidden'); selText.setAttribute('visibility', 'hidden'); }
       // table
       CHOICES.forEach((c, i) => {
         const r = c.id === choice.id ? res : runChoice(c, trace, Number(q<HTMLInputElement>('[data-seed]').value), lv, q<HTMLSelectElement>('[data-scope]').value);
-        const cells = rows[i].children; cells[0].textContent = c.label; cells[1].textContent = r.detect >= 0 ? `${(r.detect / 1000).toFixed(2)} s` : 'not detected';
+        const cells = rows[i].children; cells[0].textContent = c.label; cells[1].textContent = r.detect >= 0 ? `${(r.detect / MS_PER_S).toFixed(2)} s` : 'not detected';
         cells[2].textContent = String(r.fp); cells[3].textContent = String(r.fpBy.pause); cells[4].textContent = String(r.fpBy.blip); cells[5].textContent = String(r.fpBy.other);
         rows[i].style.fontWeight = c.id === choice.id ? '700' : '400';
       });
@@ -292,27 +318,27 @@ import PlaygroundShell from '../components/PlaygroundShell.astro';
     let trace: number[] = [];
     function recompute() {
       const lv = q<HTMLSelectElement>('[data-jit]').value; const scope = q<HTMLSelectElement>('[data-scope]').value;
-      const seed = Math.max(1, Math.min(999, Math.floor(Number(q<HTMLInputElement>('[data-seed]').value) || 1)));
+      const seed = Math.max(1, Math.min(SEED_MAX, Math.floor(Number(q<HTMLInputElement>('[data-seed]').value) || 1)));
       choice = CHOICES.find((c) => c.id === q<HTMLSelectElement>('[data-det]').value) || CHOICES[0];
       trace = genTrace(seed, lv); res = runChoice(choice, trace, seed, lv, scope); sw = sweep(trace, seed, lv, scope);
       draw();
     }
     function schedule() { if (raf) return; raf = requestAnimationFrame(() => { raf = 0; drawCursor(); }); }
-    function setHead(v: number) { q<HTMLInputElement>('[data-head]').value = String(Math.max(0, Math.min(1600, v))); schedule(); }
+    function setHead(v: number) { q<HTMLInputElement>('[data-head]').value = String(Math.max(0, Math.min(HEAD_MAX, v))); schedule(); }
     function stop() { if (playTimer !== undefined) { window.clearInterval(playTimer); playTimer = undefined; } q('[data-play]').textContent = 'Play'; }
     function play() {
       stop(); if (reduce || !onScreen || document.hidden) return;
       q('[data-play]').textContent = 'Pause';
       playTimer = window.setInterval(() => {
-        headTick = Number(q<HTMLInputElement>('[data-head]').value) + 10;
-        if (headTick >= 1600) { setHead(1600); stop(); return; }
+        headTick = Number(q<HTMLInputElement>('[data-head]').value) + PLAY.stepTicks;
+        if (headTick >= HEAD_MAX) { setHead(HEAD_MAX); stop(); return; }
         setHead(headTick);
-      }, 100);
+      }, PLAY.intervalMs);
     }
     ['[data-det]', '[data-jit]', '[data-scope]', '[data-seed]'].forEach((s) => q(s).addEventListener('change', recompute));
     q('[data-head]').addEventListener('input', () => { stop(); schedule(); });
-    q('[data-play]').addEventListener('click', () => { if (playTimer !== undefined) stop(); else { if (Number(q<HTMLInputElement>('[data-head]').value) >= 1600) setHead(0); play(); } });
-    q('[data-step]').addEventListener('click', () => { stop(); setHead(Number(q<HTMLInputElement>('[data-head]').value) + 50); });
+    q('[data-play]').addEventListener('click', () => { if (playTimer !== undefined) stop(); else { if (Number(q<HTMLInputElement>('[data-head]').value) >= HEAD_MAX) setHead(0); play(); } });
+    q('[data-step]').addEventListener('click', () => { stop(); setHead(Number(q<HTMLInputElement>('[data-head]').value) + PLAY.stepButtonTicks); });
     q('[data-reset]').addEventListener('click', () => { stop(); q<HTMLSelectElement>('[data-det]').value = 'fixed2'; q<HTMLSelectElement>('[data-jit]').value = 'high'; q<HTMLSelectElement>('[data-scope]').value = 'link'; q<HTMLInputElement>('[data-seed]').value = '1'; setHead(0); recompute(); });
     if (reduce) { const b = q<HTMLButtonElement>('[data-play]'); b.disabled = true; b.title = 'Disabled because you prefer reduced motion; use Step or the Playhead'; }
     if (typeof IntersectionObserver === 'function') new IntersectionObserver(([en]) => { onScreen = en.isIntersecting; if (!onScreen) stop(); }).observe(root);

@@ -50,12 +50,17 @@ interface Run { work: Work; pairs: number[]; k: number }
 
 const RPP_C = 40; const RPP_O = 100; // rows per 8 kB page
 const W_COST = { seq: 1, rand: 4, tuple: 0.01, cmp: 0.0025, hash: 0.005 };
+const DATA_SEED = 20240611;
+const STALE_GROWTH = 20; // stale statistics: the tables grew 20x since the last ANALYZE
+const PAIR_KEY = 100000; // result pairs packed as orderId * 100000 + customerId
+const VERDICT = { sameCost: 1.05, misestimate: 3, badRatio: 1.5 }; // within 5% counts as cheapest; off by 3x is a bad estimate; 1.5x the best is red
 const SCALES = {
   tiny: { nC: 12, nO: 40, h: 1, quota: { IS: 1, NL: 2, US: 5 } },
   large: { nC: 1000, nO: 20000, h: 2, quota: { IS: 3, NL: 50, US: 400 } },
 };
 const OLD_SEL = 0.002; // what the country filter selected when statistics were last gathered
 
+// mulberry32 seeded PRNG
 function mulberry32(a: number) {
   return () => { a = (a + 0x6d2b79f5) | 0; let t = Math.imul(a ^ (a >>> 15), 1 | a); t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t; return ((t ^ (t >>> 14)) >>> 0) / 4294967296; };
 }
@@ -67,11 +72,11 @@ const log2c = (n: number) => (n <= 1 ? 0 : Math.ceil(Math.log2(n)));
 const round = (x: number) => Math.floor(x + 0.5);
 
 function buildData(scale: Scale, storage: TableLayout): Data {
-  const sc = SCALES[scale]; const rnd = mulberry32(20240611);
+  const sc = SCALES[scale]; const rnd = mulberry32(DATA_SEED);
   const countries: string[] = [];
   const others = ['DE', 'FR', 'BR'];
   for (const [c, n] of Object.entries(sc.quota)) for (let i = 0; i < n; i++) countries.push(c);
-  for (let i = 0; countries.length < sc.nC; i++) countries.push(others[i % 3]);
+  for (let i = 0; countries.length < sc.nC; i++) countries.push(others[i % others.length]);
   for (let i = countries.length - 1; i > 0; i--) { const j = Math.floor(rnd() * (i + 1)); [countries[i], countries[j]] = [countries[j], countries[i]]; }
   // arrival order: customer ids are skewed, so a few customers have many orders
   let rows = Array.from({ length: sc.nO }, (_, i) => { const u = rnd(); return { id: i + 1, cid: 1 + Math.floor(sc.nC * u * u) }; });
@@ -86,7 +91,7 @@ function buildData(scale: Scale, storage: TableLayout): Data {
 // What the optimiser believes. Stale: tables grew 20x since the last ANALYZE and the country was rare back then.
 function makeStats(d: Data, country: Country, stale: boolean): Stats {
   if (!stale) return { nC: d.nC, nO: d.nO, ndv: d.ndv, sel: d.count[country] / d.nC, stale };
-  return { nC: Math.max(1, Math.floor(d.nC / 20)), nO: Math.max(1, Math.floor(d.nO / 20)), ndv: Math.max(1, Math.floor(d.ndv / 20)), sel: OLD_SEL, stale };
+  return { nC: Math.max(1, Math.floor(d.nC / STALE_GROWTH)), nO: Math.max(1, Math.floor(d.nO / STALE_GROWTH)), ndv: Math.max(1, Math.floor(d.ndv / STALE_GROWTH)), sel: OLD_SEL, stale };
 }
 const estK = (s: Stats) => Math.max(1, round(s.nC * s.sel));
 const estM = (s: Stats) => round((estK(s) * s.nO) / s.ndv);
@@ -132,7 +137,7 @@ function execute(v: Variant, d: Data, country: Country): Run {
   w.seq = d.pC; w.tuples = d.nC;
   const outer: number[] = []; d.countries.forEach((c, i) => { if (c === country) outer.push(i + 1); }); // ids in primary-key order
   const k = outer.length;
-  const emit = (orderId: number, cid: number) => pairs.push(orderId * 100000 + cid);
+  const emit = (orderId: number, cid: number) => pairs.push(orderId * PAIR_KEY + cid);
   if (v === 'nl') {
     w.seq += d.pO; w.tuples += d.nO;
     for (const c of outer) for (let p = 0; p < d.nO; p++) { w.cmp++; if (d.cids[p] === c) emit(d.orderIds[p], c); }
@@ -232,9 +237,9 @@ document.querySelectorAll<HTMLElement>('[data-qp]').forEach((root) => {
     const same = cs.every((c) => { const r = results.get(c.variant)!; const r0 = results.get(cs[0].variant)!; return r.pairs.length === r0.pairs.length && r.pairs.every((x, i) => x === r0.pairs[i]); });
     const bestCost = cost(results.get(best!)!.work); const ratio = cost(run.work) / bestCost;
     const parts = [same ? `All ${cs.length} methods returned the same ${fmt(run.pairs.length)} rows, so only the work differs.` : 'MISMATCH: the methods disagree (this is a bug).'];
-    parts.push(ratio < 1.05 ? `${label(pick.variant, d)} is also the cheapest in reality.` : `${label(pick.variant, d)} cost ${ratio.toFixed(1)}x the best method (${label(best!, d)}).`);
-    if (estK(s) * 3 <= run.k || run.k * 3 <= estK(s)) parts.push(`The planner expected ${fmt(estK(s))} customer row${estK(s) === 1 ? '' : 's'} and found ${fmt(run.k)}: ${stale ? 'stale statistics. ANALYZE the tables.' : 'a bad estimate.'}`);
-    v.textContent = parts.join(' '); v.classList.toggle('bad', ratio >= 1.5 || !same);
+    parts.push(ratio < VERDICT.sameCost ? `${label(pick.variant, d)} is also the cheapest in reality.` : `${label(pick.variant, d)} cost ${ratio.toFixed(1)}x the best method (${label(best!, d)}).`);
+    if (estK(s) * VERDICT.misestimate <= run.k || run.k * VERDICT.misestimate <= estK(s)) parts.push(`The planner expected ${fmt(estK(s))} customer row${estK(s) === 1 ? '' : 's'} and found ${fmt(run.k)}: ${stale ? 'stale statistics. ANALYZE the tables.' : 'a bad estimate.'}`);
+    v.textContent = parts.join(' '); v.classList.toggle('bad', ratio >= VERDICT.badRatio || !same);
   }
   const schedule = () => { if (!frame) frame = requestAnimationFrame(render); };
   const change = () => { ran = null; schedule(); };

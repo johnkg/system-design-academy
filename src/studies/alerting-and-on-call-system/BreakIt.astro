@@ -35,15 +35,21 @@ import PlaygroundShell from '../../components/PlaygroundShell.astro';
   document.querySelectorAll<HTMLElement>('[data-asb]').forEach((root) => {
     const q = <T extends HTMLElement>(s: string) => root.querySelector<T>(s)!;
     const T = 90; const SERVICES = ['checkout', 'search', 'batch'];
+    const SEED = 11; const CPU_ALERTS = 6; const CPU_FLAP = 0.25; // noisy cpu-high rules, chance each minute is over the threshold
+    const OUTAGE = { from: 20, to: 49 }; const HOSTS = 30; // database outage minutes; hosts raising symptom alerts
+    const PAY = { from: 30, to: 44 }; // the real payments fault, minutes
+    const GROUP_INTERVAL = 5; // minutes between notifications of one group
+    const PAGE_MIN = 2; // minutes an engineer spends on one page
+    const DETECT_GOAL_MIN = 5; const MAX_PAGES = 10; // payments must be handled within 5 min; more pages than this is not calm
     type Alert = { name: string; service: string; sev: string; cond: boolean[] };
     // The alert conditions are built once, so every setting is judged on the same minute-by-minute data.
     const alerts: Alert[] = [];
-    let seed = 11; const rnd = () => ((seed = (seed * 1664525 + 1013904223) % 4294967296) / 4294967296);
+    let seed = SEED; const rnd = () => /* LCG */ ((seed = (seed * 1664525 + 1013904223) % 4294967296) / 4294967296);
     const add = (name: string, service: string, sev: string, from: number, to: number) => alerts.push({ name, service, sev, cond: Array.from({ length: T }, (_, m) => m >= from && m <= to) });
-    for (let i = 0; i < 6; i++) alerts.push({ name: 'cpu-high', service: SERVICES[i % 3], sev: 'warning', cond: Array.from({ length: T }, () => rnd() < 0.25) });
-    add('db-down', 'database', 'critical', 20, 49);
-    for (let h = 0; h < 30; h++) { add('latency', SERVICES[h % 3], 'warning', 20, 49); add('errors', SERVICES[h % 3], 'critical', 20, 49); add('timeouts', SERVICES[h % 3], 'warning', 20, 49); }
-    add('payments-errors', 'payments', 'critical', 30, 44);
+    for (let i = 0; i < CPU_ALERTS; i++) alerts.push({ name: 'cpu-high', service: SERVICES[i % SERVICES.length], sev: 'warning', cond: Array.from({ length: T }, () => rnd() < CPU_FLAP) });
+    add('db-down', 'database', 'critical', OUTAGE.from, OUTAGE.to);
+    for (let h = 0; h < HOSTS; h++) { const s = SERVICES[h % SERVICES.length]; add('latency', s, 'warning', OUTAGE.from, OUTAGE.to); add('errors', s, 'critical', OUTAGE.from, OUTAGE.to); add('timeouts', s, 'warning', OUTAGE.from, OUTAGE.to); }
+    add('payments-errors', 'payments', 'critical', PAY.from, PAY.to);
     const SYMPTOMS = ['latency', 'errors', 'timeouts'];
     type Fire = { m: number; idx: number; a: Alert };
     type Note = { t: number; pay: boolean; noise: boolean };
@@ -53,7 +59,7 @@ import PlaygroundShell from '../../components/PlaygroundShell.astro';
       fires.sort((x, y) => x.m - y.m || x.idx - y.idx);
       const db = fires.find((f) => f.a.name === 'db-down');
       let kept = fires; let inhibited = 0;
-      if (inhibit && db) kept = fires.filter((f) => { const hide = SYMPTOMS.includes(f.a.name) && f.m >= db.m && f.m <= 49; if (hide) inhibited++; return !hide; });
+      if (inhibit && db) kept = fires.filter((f) => { const hide = SYMPTOMS.includes(f.a.name) && f.m >= db.m && f.m <= OUTAGE.to; if (hide) inhibited++; return !hide; });
       const paged = routing === 'critical' ? kept.filter((f) => f.a.sev === 'critical') : kept;
       const chat = kept.length - paged.length;
       let notes: Note[] = [];
@@ -64,7 +70,7 @@ import PlaygroundShell from '../../components/PlaygroundShell.astro';
         groups.forEach((evs) => {
           let last: number | null = null; let i = 0;
           while (i < evs.length) {
-            const t: number = last === null ? evs[i].m : Math.max(evs[i].m, last + 5);
+            const t: number = last === null ? evs[i].m : Math.max(evs[i].m, last + GROUP_INTERVAL);
             const batch: Fire[] = []; while (i < evs.length && evs[i].m <= t) batch.push(evs[i++]);
             notes.push({ t, pay: batch.some((f) => f.a.name === 'payments-errors'), noise: batch.every((f) => f.a.name === 'cpu-high') }); last = t;
           }
@@ -72,8 +78,8 @@ import PlaygroundShell from '../../components/PlaygroundShell.astro';
       }
       notes.sort((a, b) => a.t - b.t);
       let free = 0; let payStart = -1; let payNote = -1;
-      notes.forEach((n) => { const s = Math.max(n.t, free); free = s + 2; if (n.pay && payStart < 0) { payStart = s; payNote = n.t; } });
-      return { raw: fires.length, inhibited, chat, pages: notes.length, noise: notes.filter((n) => n.noise).length, need: notes.length * 2, payStart, payNote };
+      notes.forEach((n) => { const s = Math.max(n.t, free); free = s + PAGE_MIN; if (n.pay && payStart < 0) { payStart = s; payNote = n.t; } });
+      return { raw: fires.length, inhibited, chat, pages: notes.length, noise: notes.filter((n) => n.noise).length, need: notes.length * PAGE_MIN, payStart, payNote };
     }
     const paint = (sel: string, color: string) => q<HTMLElement>(sel).style.setProperty('--c', color);
     function draw() {
@@ -81,19 +87,19 @@ import PlaygroundShell from '../../components/PlaygroundShell.astro';
       const routing = q<HTMLSelectElement>('[data-route]').value; const inhibit = q<HTMLInputElement>('[data-inhibit]').checked;
       q('[data-forval]').textContent = String(wait);
       const r = simulate(wait, grouping, inhibit, routing);
-      const delay = r.payStart - 30; const queueWait = r.payStart - r.payNote; const groupWait = r.payNote - (30 + wait);
+      const delay = r.payStart - PAY.from; const queueWait = r.payStart - r.payNote; const groupWait = r.payNote - (PAY.from + wait);
       q('[data-o1]').textContent = `${r.raw} alerts`; q('[data-n1]').textContent = `${r.inhibited} hidden by inhibition`;
       q('[data-o2]').textContent = `${r.pages} pages`; q('[data-n2]').textContent = `${r.noise} only from CPU noise, ${r.chat} sent to chat instead`;
       q('[data-o3]').textContent = `${r.need} minutes`; q('[data-n3]').textContent = r.need > T ? `more than the ${T} minutes there are` : `of the ${T} minutes`;
       q('[data-o4]').textContent = delay === 0 ? 'handled at once' : `handled ${delay} min after the fault`;
       q('[data-n4]').textContent = `${wait} waiting to fire, ${groupWait} in grouping, ${queueWait} behind other pages`;
-      const inTime = delay <= 5; const calm = r.pages <= 10;
+      const inTime = delay <= DETECT_GOAL_MIN; const calm = r.pages <= MAX_PAGES;
       paint('[data-b1]', 'var(--accent)'); paint('[data-b2]', calm ? 'var(--good)' : 'var(--bad)'); paint('[data-b3]', r.need <= T / 2 ? 'var(--good)' : 'var(--bad)'); paint('[data-b4]', inTime ? 'var(--good)' : 'var(--bad)');
       const out = q('[data-verdict]'); out.classList.toggle('bad', !(inTime && calm));
       let text: string;
-      if (inTime && calm) text = `Good: the payments page was handled ${delay === 0 ? 'at once' : `${delay} minutes after the fault`} and the engineer received only ${r.pages} pages in the 90 minutes.`;
-      else if (inTime) text = `The payments page was in time (${delay} minutes), but ${r.pages} pages in 90 minutes is more than a person can act on. It worked only because the pager was not yet full.`;
-      else if (queueWait >= 2) text = `Missed: the payments page was handled ${delay} minutes after the fault${r.payStart > 44 ? ', after the incident was already over' : ''}. It waited ${queueWait} minutes behind other pages${r.noise > 0 ? `, ${r.noise} of which were only CPU noise` : ''}. This is alert fatigue: the real page is one among many.`;
+      if (inTime && calm) text = `Good: the payments page was handled ${delay === 0 ? 'at once' : `${delay} minutes after the fault`} and the engineer received only ${r.pages} pages in the ${T} minutes.`;
+      else if (inTime) text = `The payments page was in time (${delay} minutes), but ${r.pages} pages in ${T} minutes is more than a person can act on. It worked only because the pager was not yet full.`;
+      else if (queueWait >= PAGE_MIN) text = `Missed: the payments page was handled ${delay} minutes after the fault${r.payStart > PAY.to ? ', after the incident was already over' : ''}. It waited ${queueWait} minutes behind other pages${r.noise > 0 ? `, ${r.noise} of which were only CPU noise` : ''}. This is alert fatigue: the real page is one among many.`;
       else text = `Late: the payments page took ${delay} minutes, and ${wait} of them were spent waiting before the rule fired. A long wait removes noise but delays real pages, so it has to stay below the detection goal.`;
       out.textContent = text;
     }

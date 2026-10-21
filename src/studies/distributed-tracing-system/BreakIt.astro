@@ -42,25 +42,39 @@ import PlaygroundShell from '../../components/PlaygroundShell.astro';
   document.querySelectorAll<HTMLElement>('[data-tcb]').forEach((root) => {
     const q = <T extends HTMLElement>(s: string) => root.querySelector<T>(s)!;
     const N = 20000; const WINDOW = 200; const PROD_TRACES = 100e6; const SPAN_BYTES = 500; const MEM_PER_SPAN = 2000; const SLOW = 2; const PLANT = 7777;
+    const RATE = { error: 0.005, errorOrSlow: 0.015, async: 0.08 }; // share of traces with an error, an error or slowness (so 1% slow), an async tail span
+    const DUR = { slow: [2.5, 9], error: [0.1, 3], normal: [0.05, 0.9] }; // root duration in s: [base, random range]
+    const SPANS = { min: 8, range: 25 }; // spans per trace: 8 to 32
+    const CHILD_END = { min: 0.15, range: 0.85 }; // a child span ends at 15% to 100% of the root duration
+    const ARRIVAL_DELAY = { min: 0.1, range: 1.4 }; // s between a span ending and reaching the collector
+    const ASYNC_END = { min: 5, range: 35 }; // s, when the async worker span ends
+    const PLANT_TRACE = { dur: 6, spans: 24, asyncEnd: 9, asyncDelay: 0.5 }; // the one request the reader has to find
+    const UINT32 = 4294967296; const BASELINE_SALT = 99991; // second independent hash per trace
+    const BASELINE_KEEP = 0.01; // tail sampler also keeps 1% of ordinary traces
+    const DAY_S = 86400;
+    const BUFFERED_SPANS = 20; // average spans held per buffered trace
+    const GOOD_SHARE_PCT = 95; const STORAGE_WARN_B = 5e11; const INCOMPLETE_WARN = 0.1; // card thresholds
+    // integer hash (murmur3-style finalizer)
     const mix = (x: number) => { let h = Math.imul(x ^ 0x9e3779b9, 2654435761) >>> 0; h ^= h >>> 15; h = Math.imul(h, 2246822519) >>> 0; h ^= h >>> 13; return h >>> 0; };
     type Span = { end: number; arr: number; err: boolean; root: boolean };
     type Trace = { id: number; error: boolean; slow: boolean; n: number; spans: Span[]; h: number; b: number; first: number };
+    // Numerical Recipes LCG
     let seed = 1234567; const rnd = () => ((seed = (seed * 1664525 + 1013904223) % 4294967296) / 4294967296);
     const traces: Trace[] = [];
     for (let id = 0; id < N; id++) {
       const start = rnd() * WINDOW; const r = rnd();
-      const error = id === PLANT || r < 0.005; const slow = !error && r < 0.015;
-      const dur = id === PLANT ? 6 : slow ? 2.5 + rnd() * 9 : error ? 0.1 + rnd() * 3 : 0.05 + rnd() * rnd() * 0.9;
-      const n = id === PLANT ? 24 : 8 + Math.floor(rnd() * 25);
-      const hasAsync = id === PLANT || rnd() < 0.08; const errAt = Math.floor(rnd() * n);
+      const error = id === PLANT || r < RATE.error; const slow = !error && r < RATE.errorOrSlow;
+      const dur = id === PLANT ? PLANT_TRACE.dur : slow ? DUR.slow[0] + rnd() * DUR.slow[1] : error ? DUR.error[0] + rnd() * DUR.error[1] : DUR.normal[0] + rnd() * rnd() * DUR.normal[1];
+      const n = id === PLANT ? PLANT_TRACE.spans : SPANS.min + Math.floor(rnd() * SPANS.range);
+      const hasAsync = id === PLANT || rnd() < RATE.async; const errAt = Math.floor(rnd() * n);
       const spans: Span[] = [];
       for (let k = 0; k < n; k++) {
-        let end = k === 0 ? dur : dur * (0.15 + 0.85 * rnd()); let delay = 0.1 + rnd() * 1.4; let err = error && k === errAt;
-        if (hasAsync && k === n - 1) { end = id === PLANT ? 9 : 5 + rnd() * 35; delay = id === PLANT ? 0.5 : 0.1 + rnd() * 1.4; err = error && (id === PLANT || k === errAt || errAt === n - 1); }
+        let end = k === 0 ? dur : dur * (CHILD_END.min + CHILD_END.range * rnd()); let delay = ARRIVAL_DELAY.min + rnd() * ARRIVAL_DELAY.range; let err = error && k === errAt;
+        if (hasAsync && k === n - 1) { end = id === PLANT ? PLANT_TRACE.asyncEnd : ASYNC_END.min + rnd() * ASYNC_END.range; delay = id === PLANT ? PLANT_TRACE.asyncDelay : ARRIVAL_DELAY.min + rnd() * ARRIVAL_DELAY.range; err = error && (id === PLANT || k === errAt || errAt === n - 1); }
         if (id === PLANT) err = k === n - 1;
         spans.push({ end, arr: start + end + delay, err, root: k === 0 });
       }
-      traces.push({ id, error, slow, n, spans, h: mix(id) / 4294967296, b: mix(id + 99991) / 4294967296, first: Math.min(...spans.map((s) => s.arr)) });
+      traces.push({ id, error, slow, n, spans, h: mix(id) / UINT32, b: mix(id + BASELINE_SALT) / UINT32, first: Math.min(...spans.map((s) => s.arr)) });
     }
     const errTotal = traces.filter((t) => t.error).length; const slowTotal = traces.filter((t) => t.slow).length;
     function run(head: number, tail: boolean, wait: number) {
@@ -72,7 +86,7 @@ import PlaygroundShell from '../../components/PlaygroundShell.astro';
         if (tail) {
           const dec = t.first + wait; ev.push([t.first, 1], [dec, -1]);
           const seen = t.spans.filter((s) => s.arr <= dec); const root = seen.find((s) => s.root);
-          hasErr = seen.some((s) => s.err); keep = hasErr || (root !== undefined && root.end > SLOW) || t.b < 0.01; stored = seen.length;
+          hasErr = seen.some((s) => s.err); keep = hasErr || (root !== undefined && root.end > SLOW) || t.b < BASELINE_KEEP; stored = seen.length;
         }
         if (!keep) continue;
         kept++; keptSpans += stored; if (t.error) errKept++; if (t.slow) slowKept++; if (stored < t.n) incomplete++;
@@ -80,7 +94,7 @@ import PlaygroundShell from '../../components/PlaygroundShell.astro';
       }
       let cur = 0; let peak = 0; ev.sort((a, b) => a[0] - b[0] || a[1] - b[1]); for (const e of ev) { cur += e[1]; peak = Math.max(peak, cur); }
       const perDay = PROD_TRACES / N;
-      return { kept, errKept, slowKept, incomplete, bytes: keptSpans * perDay * SPAN_BYTES, prodPeak: peak * (PROD_TRACES / 86400) / (N / WINDOW), plant };
+      return { kept, errKept, slowKept, incomplete, bytes: keptSpans * perDay * SPAN_BYTES, prodPeak: peak * (PROD_TRACES / DAY_S) / (N / WINDOW), plant };
     }
     const sizeText = (b: number) => (b >= 1e12 ? `${(b / 1e12).toFixed(1)} TB` : b >= 1e10 ? `${Math.round(b / 1e9)} GB` : `${(b / 1e9).toFixed(1)} GB`);
     const pct = (f: number) => (f > 0 && f < 0.01 ? '<1%' : `${Math.round(100 * f)}%`);
@@ -95,21 +109,21 @@ import PlaygroundShell from '../../components/PlaygroundShell.astro';
       q('[data-o1]').textContent = `${sizeText(r.bytes)} a day`; q('[data-n1]').textContent = `${pct(r.bytes / full)} of keeping everything (${sizeText(full)})`;
       q('[data-o2]').textContent = `${badKept} of ${bad} (${share}%)`; q('[data-n2]').textContent = `${r.errKept} of ${errTotal} errors, ${r.slowKept} of ${slowTotal} slow`;
       q('[data-o3]').textContent = r.kept ? `${r.incomplete} of ${r.kept}` : 'none kept'; q('[data-n3]').textContent = tail ? 'kept, but some spans arrived after the decision' : 'the decision is in the trace context, so every span is stored';
-      const memBytes = r.prodPeak * 20 * MEM_PER_SPAN;
+      const memBytes = r.prodPeak * BUFFERED_SPANS * MEM_PER_SPAN;
       q('[data-o4]').textContent = tail ? `${count(r.prodPeak)} traces (${memBytes >= 1e9 ? `${(memBytes / 1e9).toFixed(1)} GB` : `${Math.round(memBytes / 1e6)} MB`})` : '0';
       q('[data-n4]').textContent = tail ? `at the busiest moment, across all collectors, waiting ${wait} s each` : 'no buffering: the app decided before sending anything';
       const p = r.plant; const found = p.kept && p.hasErr && p.stored === p.n;
-      q('[data-o5]').textContent = !p.kept ? 'not stored' : found ? 'found, all 24 spans' : p.hasErr ? `kept, ${p.stored} of ${p.n} spans` : `kept, error span missing (${p.stored} of ${p.n})`;
+      q('[data-o5]').textContent = !p.kept ? 'not stored' : found ? `found, all ${PLANT_TRACE.spans} spans` : p.hasErr ? `kept, ${p.stored} of ${p.n} spans` : `kept, error span missing (${p.stored} of ${p.n})`;
       q('[data-n5]').textContent = !p.kept ? (tail && head === 1 ? 'dropped by the sampler: it looked ordinary at decision time' : 'thrown away before anyone knew it was bad') : found ? 'search error=true or the trace id and open it' : 'you see that it was slow, not why';
-      const good = share >= 95;
-      q<HTMLElement>('[data-b1]').style.setProperty('--c', r.bytes > 5e11 ? 'var(--bad)' : 'var(--accent)');
+      const good = share >= GOOD_SHARE_PCT;
+      q<HTMLElement>('[data-b1]').style.setProperty('--c', r.bytes > STORAGE_WARN_B ? 'var(--bad)' : 'var(--accent)');
       q<HTMLElement>('[data-b2]').style.setProperty('--c', good ? 'var(--good)' : 'var(--bad)');
-      q<HTMLElement>('[data-b3]').style.setProperty('--c', r.incomplete > 0.1 * r.kept ? 'var(--bad)' : 'var(--accent)');
+      q<HTMLElement>('[data-b3]').style.setProperty('--c', r.incomplete > INCOMPLETE_WARN * r.kept ? 'var(--bad)' : 'var(--accent)');
       q<HTMLElement>('[data-b4]').style.setProperty('--c', 'var(--accent)');
       q<HTMLElement>('[data-b5]').style.setProperty('--c', found ? 'var(--good)' : 'var(--bad)');
       const out = q('[data-verdict]'); out.classList.toggle('bad', !found);
       out.textContent = found
-        ? (tail ? `An engineer can find it. The sampler held the trace for ${wait} s, saw the error and kept all 24 spans, and the whole day costs ${sizeText(r.bytes)} and about ${count(r.prodPeak)} buffered traces.` : `An engineer can find it, but only because everything is kept: ${sizeText(r.bytes)} a day, with every normal request stored too.`)
+        ? (tail ? `An engineer can find it. The sampler held the trace for ${wait} s, saw the error and kept all ${PLANT_TRACE.spans} spans, and the whole day costs ${sizeText(r.bytes)} and about ${count(r.prodPeak)} buffered traces.` : `An engineer can find it, but only because everything is kept: ${sizeText(r.bytes)} a day, with every normal request stored too.`)
         : !p.kept ? (tail && head < 1 ? `Not findable. Head sampling dropped this request at ${Math.round(head * 100)}% before the tail sampler could see it, so tail sampling only rescued ${badKept} of ${bad} bad traces.` : tail ? `Not findable. With a ${wait} s wait the sampler decided before the root span or the late async error arrived, so the trace looked ordinary and was dropped.` : `Not findable. The request was chosen at random at the start, before it failed, so it was thrown away with ${100 - Math.round(head * 100)}% of everything else. Only ${share}% of bad traces survive.`)
           : `Half found: the trace was kept because it was slow, but the sampler decided after ${wait} s, before the error span from the async worker arrived. You can see the slowness and not the cause.`;
     }

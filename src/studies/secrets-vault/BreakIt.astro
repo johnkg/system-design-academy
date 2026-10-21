@@ -39,19 +39,28 @@ import PlaygroundShell from '../../components/PlaygroundShell.astro';
     const ROT: Record<string, number> = { '5m': 5 / 60, '1h': 1, '1d': 24, '7d': 168, '30d': 720, '90d': 2160, '365d': 8760, never: Infinity };
     const DET: Record<string, number> = { '1h': 1, '1d': 24, '7d': 168, '30d': 720, '180d': 4320 };
     const WORKLOADS = 2000; const RPS = 50;
+    const RESPOND_H = { shared: 24, key: 4, lease: 5 / 60 }; // hours to revoke after noticing
+    const HAND_SYSTEMS = { shared: 40, key: 6 }; // systems changed by hand per rotation
+    const P_SYSTEM_OK = 0.99; // chance one hand-changed system survives a rotation
+    const P_LEASE_FAIL = 1e-5; // chance an automatic lease rotation breaks something
+    const VAULT_OUTAGE = { min: 30, perYear: 4 }; // vault outages: 30 minutes, 4 a year
+    const H_PER_YEAR = 8760, MIN_PER_H = 60, SEC_PER_H = 3600;
+    const LEASE_REFRESH = 2 / 3; // clients renew a lease after two thirds of its TTL
+    const CACHE_REFRESH_S = 300; // cached static secrets are re-read every 5 minutes
+    const BAD = { worstH: 24, yearly: 0.1 };
     // hours of attacker access, systems changed by hand, chance one rotation breaks something
     function model(type: string, rotH: number, detH: number) {
-      const respond = type === 'shared' ? 24 : type === 'key' ? 4 : 5 / 60; // hours to revoke after noticing
-      const systems = type === 'shared' ? 40 : type === 'key' ? 6 : 0;
+      const respond = type === 'shared' ? RESPOND_H.shared : type === 'key' ? RESPOND_H.key : RESPOND_H.lease; // hours to revoke after noticing
+      const systems = type === 'shared' ? HAND_SYSTEMS.shared : type === 'key' ? HAND_SYSTEMS.key : 0;
       const c = detH + respond; // the leak is noticed and revoked after c hours
       const worst = Math.min(rotH, c);
       const avg = c >= rotH ? rotH / 2 : c - (c * c) / (2 * rotH); // average of min(time to next rotation, c) for a uniform leak moment
-      const perYear = rotH === Infinity ? 0 : 8760 / rotH;
-      const pRot = type === 'dynamic' ? 1e-5 : 1 - Math.pow(0.99, systems);
+      const perYear = rotH === Infinity ? 0 : H_PER_YEAR / rotH;
+      const pRot = type === 'dynamic' ? P_LEASE_FAIL : 1 - Math.pow(P_SYSTEM_OK, systems);
       let yearly = 1 - Math.pow(1 - pRot, perYear);
-      if (type === 'dynamic') { const ttlMin = rotH * 60; const perIncident = Math.min(1, Math.max(0, 1 - ttlMin / 30)); yearly = 1 - (1 - yearly) * Math.pow(1 - perIncident, 4); }
+      if (type === 'dynamic') { const ttlMin = rotH * MIN_PER_H; const perIncident = Math.min(1, Math.max(0, 1 - ttlMin / VAULT_OUTAGE.min)); yearly = 1 - (1 - yearly) * Math.pow(1 - perIncident, VAULT_OUTAGE.perYear); }
       const readsNo = WORKLOADS * RPS;
-      const refreshSec = type === 'dynamic' ? (rotH === Infinity ? Infinity : rotH * 3600 * (2 / 3)) : 300;
+      const refreshSec = type === 'dynamic' ? (rotH === Infinity ? Infinity : rotH * SEC_PER_H * LEASE_REFRESH) : CACHE_REFRESH_S;
       const readsCache = refreshSec === Infinity ? 0 : WORKLOADS / refreshSec;
       return { worst, avg, systems, pRot, perYear, yearly, readsNo, readsCache };
     }
@@ -74,14 +83,14 @@ import PlaygroundShell from '../../components/PlaygroundShell.astro';
       q('[data-n3]').textContent = m.perYear === 0 ? 'it is never rotated, so it never breaks, and it never ends either' : `${pct(m.yearly)} chance of at least one in a year (${num(m.perYear)} rotations a year)`;
       q('[data-o4]').textContent = num(m.readsNo); q('[data-n4]').textContent = `${WORKLOADS.toLocaleString('en-US')} workloads x ${RPS} requests per second, one read each`;
       q('[data-o5]').textContent = num(m.readsCache); q('[data-n5]').textContent = m.readsCache === 0 ? 'read once at start-up' : `${Math.round(m.readsNo / m.readsCache).toLocaleString('en-US')} times fewer, but cached reads are not audited one by one`;
-      q<HTMLElement>('[data-b1]').style.setProperty('--c', m.worst <= 24 ? 'var(--good)' : 'var(--bad)');
+      q<HTMLElement>('[data-b1]').style.setProperty('--c', m.worst <= BAD.worstH ? 'var(--good)' : 'var(--bad)');
       q<HTMLElement>('[data-b2]').style.setProperty('--c', m.systems === 0 ? 'var(--good)' : 'var(--bad)');
-      q<HTMLElement>('[data-b3]').style.setProperty('--c', m.yearly < 0.1 ? 'var(--good)' : 'var(--bad)');
+      q<HTMLElement>('[data-b3]').style.setProperty('--c', m.yearly < BAD.yearly ? 'var(--good)' : 'var(--bad)');
       q<HTMLElement>('[data-b4]').style.setProperty('--c', 'var(--bad)'); q<HTMLElement>('[data-b5]').style.setProperty('--c', 'var(--good)');
-      const out = q('[data-verdict]'); const bad = m.worst > 24 || m.yearly >= 0.1; out.classList.toggle('bad', bad);
-      out.textContent = m.worst > 24 && m.yearly >= 0.1 ? `Both bad: the attacker has up to ${dur(m.worst)}, and rotating is risky enough that people will put it off. That is how static secrets end up never being rotated.`
-        : m.worst > 24 ? `The attacker has up to ${dur(m.worst)}. Rotating more often only helps until it is shorter than the time to notice, so also shorten the detection delay or use a lease.`
-        : m.yearly >= 0.1 ? `The attacker is limited to ${dur(m.worst)}, but the yearly chance of a rotation outage is ${pct(m.yearly)}. ${type === 'dynamic' ? 'The lease is shorter than a vault outage, so workloads lose their database access when the vault is down.' : 'Rotating by hand this often breaks things.'}`
+      const out = q('[data-verdict]'); const bad = m.worst > BAD.worstH || m.yearly >= BAD.yearly; out.classList.toggle('bad', bad);
+      out.textContent = m.worst > BAD.worstH && m.yearly >= BAD.yearly ? `Both bad: the attacker has up to ${dur(m.worst)}, and rotating is risky enough that people will put it off. That is how static secrets end up never being rotated.`
+        : m.worst > BAD.worstH ? `The attacker has up to ${dur(m.worst)}. Rotating more often only helps until it is shorter than the time to notice, so also shorten the detection delay or use a lease.`
+        : m.yearly >= BAD.yearly ? `The attacker is limited to ${dur(m.worst)}, but the yearly chance of a rotation outage is ${pct(m.yearly)}. ${type === 'dynamic' ? 'The lease is shorter than a vault outage, so workloads lose their database access when the vault is down.' : 'Rotating by hand this often breaks things.'}`
         : `The attacker is limited to ${dur(m.worst)} and rotation is safe (${pct(m.yearly)} chance of an outage in a year). ${type === 'dynamic' ? 'Every workload holds a different credential, so one leak gives access to one workload.' : ''}`;
     }
     root.addEventListener('change', draw);

@@ -9,7 +9,10 @@ interface Section { id: string; label: string; text: string; concepts?: Ref[] }
 interface Q { question: string; options: string[]; answer: number; explanation: string }
 
 const STOP = new Set('about above after again also another because before being between both could does doing each from have having into just more most much must only other over same should since some such than that their them then there these they this those through under until very want what when where which while with without would your will been were was are and the for not but can its you our out any all one two how why who'.split(' '));
-const words = (t: string) => new Set(t.toLowerCase().replace(/[^a-z0-9 ]+/g, ' ').split(/\s+/).filter((w) => w.length >= 4 && !STOP.has(w)));
+const MIN_WORD = 4; // shorter words are mostly grammar, so they do not tell sections apart
+const words = (t: string) => new Set(t.toLowerCase().replace(/[^a-z0-9 ]+/g, ' ').split(/\s+/).filter((w) => w.length >= MIN_WORD && !STOP.has(w)));
+// Long sections share more words with anything, so the score divides by a gentle power of the section's size (at least SMALL_SECTION words).
+const SMALL_SECTION = 8, LENGTH_DAMPING = 0.35;
 
 function best(q: Q, sections: Section[]) {
   const want = words(`${q.question} ${q.options[q.answer]} ${q.explanation} ${q.explanation}`);
@@ -18,7 +21,7 @@ function best(q: Q, sections: Section[]) {
     const have = words(s.text);
     let shared = 0;
     for (const w of want) if (have.has(w)) shared++;
-    const v = shared / Math.pow(Math.max(have.size, 8), 0.35); // long sections should not win just for being long
+    const v = shared / Math.pow(Math.max(have.size, SMALL_SECTION), LENGTH_DAMPING);
     if (v > score) { score = v; top = s; }
   }
   return top;

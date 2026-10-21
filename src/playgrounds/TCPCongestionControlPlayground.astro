@@ -70,15 +70,30 @@ import PlaygroundShell from '../components/PlaygroundShell.astro';
   const MSS = 1460; const IW = 10; const INF = 1e9; const MAXR = 20000;
   const NAMES: Record<Algo, string> = { reno: 'Reno-like AIMD', cubic: 'CUBIC', bbr: 'BBR-like' };
 
+  const BYTES_PER_MBIT_MS = 125; // 1 Mbit/s for 1 ms carries 125 bytes
+  const BITS_PER_BYTE = 8, KBIT_PER_MBIT = 1000;
+  const TENTHS = 10; // throughput is kept in tenths of a Mbit/s
+  const KBPS_PER_TENTH = 100; // bits per ms (kbit/s) in one tenth of a Mbit/s
+  const BP = 10000; // loss rate is given in basis points
+  const RTO = { minMs: 200, rtts: 3 }; // retransmission timeout: at least 200 ms or 3 RTTs
+  const DUPACK_MIN = 4; // fewer delivered segments than this cannot trigger fast retransmit, so it is a timeout
+  const BBR = { bwWindow: 10, growthPct: 125, fullRounds: 3, minCwnd: 4, probeStart: 2, gains: [125, 75, 100, 100, 100, 100, 100, 100] }; // max-filter over 10 rounds; startup ends after 3 rounds without 25% growth; probe-bandwidth gain cycle in %
+  const CUBIC = { betaNum: 7, betaDen: 10, kScale: 750000000, cNum: 4, cDen: 10000000000 }; // beta 0.7, C 0.4: K = cbrt(wmax * 0.75e9) ms, growth 4 * dt^3 / 1e10 segments
+  const ICBRT_HI = 2000000; // search ceiling for the integer cube root
+  const PLOT = { x0: 48, w: 542, y0: 196, h: 186, minY: 10, headroom: 1.1 }; // SVG plot box (matches the markup)
+  const SEQ_SHOWN = 14; // rounds listed in the cwnd sequence
+  const VERDICT = { rwndNum: 9, rwndDen: 10, bloatRtts: 4, ssPct: 90, idlePct: 20 }; // rwnd under 90% of BDP, queue over a quarter RTT, 90% in slow start, under 20% of the link
+  // Park-Miller minimal standard LCG
   function makeRng(seed: number) { let s = Math.max(1, seed); return () => { s = (s * 48271) % 2147483647; return s; }; }
-  function icbrt(n: number) { let lo = 0; let hi = 2000000; while (lo < hi) { const m = Math.floor((lo + hi + 1) / 2); if (m * m * m <= n) lo = m; else hi = m - 1; } return lo; }
+  // integer cube root by binary search
+  function icbrt(n: number) { let lo = 0; let hi = ICBRT_HI; while (lo < hi) { const m = Math.floor((lo + hi + 1) / 2); if (m * m * m <= n) lo = m; else hi = m - 1; } return lo; }
 
   function simulate(p: Params): Result {
-    const bdp = Math.max(1, Math.floor(p.mbps * 125 * p.rtt / MSS));
+    const bdp = Math.max(1, Math.floor(p.mbps * BYTES_PER_MBIT_MS * p.rtt / MSS));
     const buf = Math.floor(bdp * p.bufPct / 100);
     const total = Math.ceil(p.fileBytes / MSS);
     const rwnd = Math.max(2, Math.floor(p.rwndBytes / MSS));
-    const rto = Math.max(200, 3 * p.rtt);
+    const rto = Math.max(RTO.minMs, RTO.rtts * p.rtt);
     const rnd = makeRng(p.seed);
     const rounds: Round[] = [];
     let remaining = total; let cwnd = IW; let ssthresh = INF; let t = 0; let retrans = 0;
@@ -89,7 +104,7 @@ import PlaygroundShell from '../components/PlaygroundShell.astro';
       const queue = Math.min(Math.max(sent - bdp, 0), buf);
       const overflow = Math.max(sent - bdp - buf, 0);
       let rand = 0;
-      if (p.lossBp > 0) for (let i = 0; i < sent; i++) if (rnd() % 10000 < p.lossBp) rand++;
+      if (p.lossBp > 0) for (let i = 0; i < sent; i++) if (rnd() % BP < p.lossBp) rand++;
       const lost = Math.min(sent, overflow + rand);
       const qd = Math.floor(queue * p.rtt / bdp);
       let T = p.rtt + qd;
@@ -99,26 +114,26 @@ import PlaygroundShell from '../components/PlaygroundShell.astro';
       remaining -= delivered; retrans += lost;
       if (p.algo === 'bbr') {
         const est = Math.floor(delivered * p.rtt / T);
-        win.push(est); if (win.length > 10) win.shift();
+        win.push(est); if (win.length > BBR.bwWindow) win.shift();
         bw = Math.max(...win);
         if (mode === 'startup') {
-          if (bw * 100 >= fullBw * 125) { fullBw = bw; fullCnt = 0; } else fullCnt++;
-          if (fullCnt >= 3) { mode = 'drain'; cwnd = Math.max(4, bw); }
+          if (bw * 100 >= fullBw * BBR.growthPct) { fullBw = bw; fullCnt = 0; } else fullCnt++;
+          if (fullCnt >= BBR.fullRounds) { mode = 'drain'; cwnd = Math.max(BBR.minCwnd, bw); }
           else cwnd = Math.min(2 * cwnd, 2 * Math.max(bw, IW));
-        } else if (mode === 'drain') { mode = 'probe'; cyc = 2; cwnd = Math.max(4, bw); }
-        else { const g = [125, 75, 100, 100, 100, 100, 100, 100][cyc]; cyc = (cyc + 1) % 8; cwnd = Math.max(4, Math.floor(bw * g / 100)); }
+        } else if (mode === 'drain') { mode = 'probe'; cyc = BBR.probeStart; cwnd = Math.max(BBR.minCwnd, bw); }
+        else { const g = BBR.gains[cyc]; cyc = (cyc + 1) % BBR.gains.length; cwnd = Math.max(BBR.minCwnd, Math.floor(bw * g / 100)); }
       } else if (lost > 0) {
         wmax = cwnd;
-        ssthresh = Math.max(2, p.algo === 'cubic' ? Math.floor(cwnd * 7 / 10) : Math.floor(cwnd / 2));
-        if (sent - lost < 4) { event = 'timeout'; T += rto; cwnd = 1; epoch = -1; }
-        else { event = 'fast'; cwnd = ssthresh; epoch = t + T; kMs = icbrt(wmax * 750000000); }
+        ssthresh = Math.max(2, p.algo === 'cubic' ? Math.floor(cwnd * CUBIC.betaNum / CUBIC.betaDen) : Math.floor(cwnd / 2));
+        if (sent - lost < DUPACK_MIN) { event = 'timeout'; T += rto; cwnd = 1; epoch = -1; }
+        else { event = 'fast'; cwnd = ssthresh; epoch = t + T; kMs = icbrt(wmax * CUBIC.kScale); }
       } else if (cwnd < rwnd) {
         if (cwnd < ssthresh) cwnd = Math.min(cwnd * 2, Math.max(ssthresh, 2));
         else if (p.algo === 'reno') cwnd += 1;
         else {
-          if (epoch < 0) { epoch = t; kMs = icbrt(wmax * 750000000); }
+          if (epoch < 0) { epoch = t; kMs = icbrt(wmax * CUBIC.kScale); }
           const dt = (t + T - epoch) + p.rtt - kMs; const a = Math.abs(dt);
-          const c = Math.floor(4 * a * a * a / 10000000000);
+          const c = Math.floor(CUBIC.cNum * a * a * a / CUBIC.cDen);
           const target = dt < 0 ? wmax - c : wmax + c;
           if (target > cwnd) cwnd += Math.min(target - cwnd, Math.floor(cwnd / 2));
         }
@@ -138,11 +153,11 @@ import PlaygroundShell from '../components/PlaygroundShell.astro';
       if (x.event === 'timeout') timeouts++; if (x.event === 'fast') fast++;
     }
     return { time, ssPct: time ? Math.floor(ss * 100 / time) : 0, maxQ, avgQ: time ? Math.floor(qSum / time) : 0, lost, timeouts, fast,
-      mbps10: time ? Math.floor(deliv * MSS * 8 / time / 100) : 0, rounds: Math.min(upto, r.rounds.length) };
+      mbps10: time ? Math.floor(deliv * MSS * BITS_PER_BYTE / time / KBPS_PER_TENTH) : 0, rounds: Math.min(upto, r.rounds.length) };
   }
 
   const fmtMs = (ms: number) => (ms >= 10000 ? (ms / 1000).toFixed(1) + ' s' : ms.toLocaleString('en-US') + ' ms');
-  const fmtMbps = (m10: number) => (m10 / 10).toFixed(1) + ' Mbit/s';
+  const fmtMbps = (m10: number) => (m10 / TENTHS).toFixed(1) + ' Mbit/s';
 
   document.querySelectorAll<HTMLElement>('[data-tcp]').forEach((root) => {
     const q = <T extends Element>(s: string) => root.querySelector<T>(s)!;
@@ -181,16 +196,16 @@ import PlaygroundShell from '../components/PlaygroundShell.astro';
       const upto = Math.max(1, Math.min(r.rounds.length, val('[data-scrub]')));
       const s = stats(r, upto); const last = r.rounds[upto - 1]; const finished = upto >= r.rounds.length;
       setText('[data-scrubval]', `${upto} of ${r.rounds.length}`);
-      const idealMs = Math.floor(p.fileBytes * 8 / (p.mbps * 1000));
+      const idealMs = Math.floor(p.fileBytes * BITS_PER_BYTE / (p.mbps * KBIT_PER_MBIT));
       setText('[data-time]', fmtMs(s.time)); setText('[data-timenote]', finished ? (r.done ? `${s.rounds} round trips; ideal at line rate ${fmtMs(idealMs)}` : `stopped after ${MAXR.toLocaleString('en-US')} rounds, not finished`) : `so far, after round ${upto}`);
-      setText('[data-tput]', fmtMbps(s.mbps10)); setText('[data-tputnote]', `${Math.floor(s.mbps10 / 10 * 100 / p.mbps)}% of the ${p.mbps >= 1000 ? '1 Gbit/s' : p.mbps + ' Mbit/s'} link`);
+      setText('[data-tput]', fmtMbps(s.mbps10)); setText('[data-tputnote]', `${Math.floor(s.mbps10 / TENTHS * 100 / p.mbps)}% of the ${p.mbps >= 1000 ? '1 Gbit/s' : p.mbps + ' Mbit/s'} link`);
       setText('[data-ss]', s.ssPct + '%'); setText('[data-ssnote]', p.algo === 'bbr' ? 'BBR startup phase' : 'before the first loss or ssthresh');
       setText('[data-retx]', String(s.lost)); setText('[data-retxnote]', `${s.fast} fast retransmit, ${s.timeouts} timeout events`);
       setText('[data-qd]', s.maxQ + ' ms'); setText('[data-qdnote]', `peak; average ${s.avgQ} ms on top of ${p.rtt} ms RTT`);
 
       let maxC = 1; for (let i = 0; i < upto; i++) if (r.rounds[i].cwnd > maxC) maxC = r.rounds[i].cwnd;
-      const yMax = Math.max(maxC, r.bdp, 10) * 1.1; const full = Math.max(1, r.time);
-      const X = (t: number) => 48 + (t / full) * 542; const Y = (c: number) => 196 - (c / yMax) * 186;
+      const yMax = Math.max(maxC, r.bdp, PLOT.minY) * PLOT.headroom; const full = Math.max(1, r.time);
+      const X = (t: number) => PLOT.x0 + (t / full) * PLOT.w; const Y = (c: number) => PLOT.y0 - (c / yMax) * PLOT.h;
       let d = ''; let m = '';
       for (let i = 0; i < upto; i++) {
         const x = r.rounds[i];
@@ -208,13 +223,13 @@ import PlaygroundShell from '../components/PlaygroundShell.astro';
       place('[data-lrw]', '[data-trw]', r.rwnd, `rwnd ${r.rwnd}`);
       setText('[data-ymax]', String(Math.floor(yMax))); setText('[data-xmax]', fmtMs(r.time));
       q('[data-chart]').setAttribute('aria-label', `Congestion window over ${fmtMs(r.time)}: ${NAMES[p.algo]}, peak cwnd ${maxC} segments, BDP ${r.bdp} segments`);
-      const seq: string[] = []; for (let i = 0; i < Math.min(upto, 14); i++) seq.push(r.rounds[i].cwnd + (r.rounds[i].event === 'timeout' ? '!' : r.rounds[i].lost > 0 ? '*' : ''));
-      setText('[data-seq]', `cwnd per round: ${seq.join(' ')}${upto > 14 ? ' ...' : ''}   (* loss, ! timeout; round ${upto} phase: ${last.phase})`);
+      const seq: string[] = []; for (let i = 0; i < Math.min(upto, SEQ_SHOWN); i++) seq.push(r.rounds[i].cwnd + (r.rounds[i].event === 'timeout' ? '!' : r.rounds[i].lost > 0 ? '*' : ''));
+      setText('[data-seq]', `cwnd per round: ${seq.join(' ')}${upto > SEQ_SHOWN ? ' ...' : ''}   (* loss, ! timeout; round ${upto} phase: ${last.phase})`);
       const verdict = !r.done ? 'The transfer did not finish within the round limit; try a larger BDP (more bandwidth or RTT) or a smaller file.'
-        : r.rwnd * 10 < r.bdp * 9 ? `The receive window (${r.rwnd} segments) is smaller than the BDP (${r.bdp}): throughput is capped at rwnd / RTT whatever cwnd would allow.`
-        : s.avgQ * 4 > p.rtt ? `The queue averages ${s.avgQ} ms (peak ${s.maxQ} ms) on top of the ${p.rtt} ms RTT: that is bufferbloat.`
-        : s.ssPct >= 90 && finished ? `The transfer ended almost entirely inside slow start (${s.ssPct}% of the time): the round-trip count, not the bandwidth, decided the time.`
-        : p.algo !== 'bbr' && s.mbps10 * 100 < p.mbps * 10 * 20 && p.lossBp > 0 ? 'Random loss is read as congestion: each loss halves a small window, so the link stays mostly idle.'
+        : r.rwnd * VERDICT.rwndDen < r.bdp * VERDICT.rwndNum ? `The receive window (${r.rwnd} segments) is smaller than the BDP (${r.bdp}): throughput is capped at rwnd / RTT whatever cwnd would allow.`
+        : s.avgQ * VERDICT.bloatRtts > p.rtt ? `The queue averages ${s.avgQ} ms (peak ${s.maxQ} ms) on top of the ${p.rtt} ms RTT: that is bufferbloat.`
+        : s.ssPct >= VERDICT.ssPct && finished ? `The transfer ended almost entirely inside slow start (${s.ssPct}% of the time): the round-trip count, not the bandwidth, decided the time.`
+        : p.algo !== 'bbr' && s.mbps10 * 100 < p.mbps * TENTHS * VERDICT.idlePct && p.lossBp > 0 ? 'Random loss is read as congestion: each loss halves a small window, so the link stays mostly idle.'
         : 'The window tracks the path: compare the three rows in the table.';
       setText('[data-verdict]', finished ? verdict : 'Replaying: totals above cover rounds 1 to ' + upto + ' only.');
     }

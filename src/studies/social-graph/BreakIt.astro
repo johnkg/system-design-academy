@@ -40,18 +40,25 @@ import PlaygroundShell from '../../components/PlaygroundShell.astro';
     // --- model start
     type Ctx = { shards: number; edges: number; fetches: number; perShard: number[]; maxLen: number; maxId: number };
     const N = 3000; const CELEBS = 3;
-    let seed = 11; const rnd = (n: number) => { seed = (Math.imul(seed, 1664525) + 1013904223) >>> 0; return Math.floor(seed / 65536) % n; };
+    const GRAPH_SEED = 11;
+    const FRIENDS_EACH = 8, CELEB_PCT = 25, NEAR_SPAN = 40; // links per user; 25% go to a celebrity, the rest to one of the next 40 ids
+    const PICK = { from: 100, regular: [10, 20], follower: [12, 20] }; // example users: first id from 100 with a friend count in range
+    const BITS_PER_WORD = 32; // bitmap words for the intersection
+    const TARGET_OFFSET = N / 2; // the degrees search looks for a user half the id space away
+    // linear congruential generator (Numerical Recipes constants), integer in 0..n-1
+    let seed = GRAPH_SEED; const rnd = (n: number) => { seed = (Math.imul(seed, 1664525) + 1013904223) >>> 0; return Math.floor(seed / 65536) % n; };
     const sets: Set<number>[] = Array.from({ length: N }, () => new Set<number>());
     const link = (a: number, b: number) => { if (a !== b) { sets[a].add(b); sets[b].add(a); } };
     // Neighbours live near each other, and 1 in 4 friendships points to one of 3 celebrities.
-    for (let u = CELEBS; u < N; u++) for (let i = 0; i < 8; i++) link(u, rnd(100) < 25 ? rnd(CELEBS) : (u + 1 + rnd(40)) % N);
+    for (let u = CELEBS; u < N; u++) for (let i = 0; i < FRIENDS_EACH; i++) link(u, rnd(100) < CELEB_PCT ? rnd(CELEBS) : (u + 1 + rnd(NEAR_SPAN)) % N);
     const P = (x: number) => (x * 1237 + 411) % N; // scatter the ids, so that neighbours do not have neighbouring ids
     const adj: number[][] = new Array(N);
     sets.forEach((s, u) => { adj[P(u)] = [...s].map(P).sort((a, b) => a - b); });
-    const CELEB_IDS = [0, 1, 2].map(P); const isCeleb = (v: number) => CELEB_IDS.includes(v);
-    const pick = (pred: (u: number) => boolean) => { for (let u = 100; u < N; u++) if (pred(u)) return u; return 100; };
-    const REGULAR = pick((u) => !adj[u].some(isCeleb) && adj[u].length >= 10 && adj[u].length <= 20);
-    const FOLLOWER = pick((u) => adj[u].filter(isCeleb).length === 1 && adj[u].length >= 12 && adj[u].length <= 20);
+    const CELEB_IDS = Array.from({ length: CELEBS }, (_, i) => i).map(P); const isCeleb = (v: number) => CELEB_IDS.includes(v);
+    const pick = (pred: (u: number) => boolean) => { for (let u = PICK.from; u < N; u++) if (pred(u)) return u; return PICK.from; };
+    const REGULAR = pick((u) => !adj[u].some(isCeleb) && adj[u].length >= PICK.regular[0] && adj[u].length <= PICK.regular[1]);
+    const FOLLOWER = pick((u) => adj[u].filter(isCeleb).length === 1 && adj[u].length >= PICK.follower[0] && adj[u].length <= PICK.follower[1]);
+    // integer hash (murmur3-style finalizer)
     const mix = (id: number) => { let h = Math.imul(id, 2654435761) >>> 0; h ^= h >>> 15; h = Math.imul(h, 2246822519) >>> 0; h ^= h >>> 13; return h >>> 0; };
     const sample = (list: number[], cap: number) => (list.length <= cap ? list : Array.from({ length: cap }, (_, i) => list[Math.floor((i * list.length) / cap)]));
     const makeCtx = (shards: number): Ctx => ({ shards, edges: 0, fetches: 0, perShard: new Array(shards).fill(0), maxLen: 0, maxId: -1 });
@@ -94,12 +101,12 @@ import PlaygroundShell from '../../components/PlaygroundShell.astro';
       while (i < x.length && j < y.length) { merge++; if (x[i] === y[j]) { common++; i++; j++; } else if (x[i] < y[j]) i++; else j++; }
       const small = x.length <= y.length ? x : y; const big = x.length <= y.length ? y : x; let probe = 0;
       for (const v of small) { let lo = 0; let hi = big.length; while (lo < hi) { probe++; const m = (lo + hi) >> 1; if (big[m] < v) lo = m + 1; else hi = m; } }
-      return { merge, probe, common, words: Math.ceil(N / 32), sizes: [x.length, y.length] };
+      return { merge, probe, common, words: Math.ceil(N / BITS_PER_WORD), sizes: [x.length, y.length] };
     }
     function run(who: string, capSel: number, search: string, shards: number) {
       const u = who === 'regular' ? REGULAR : FOLLOWER; const cap = capSel === 0 ? Infinity : capSel;
       const full = fof(u, Infinity, shards); const f = fof(u, cap, shards);
-      const target = (u + 1500) % N; const d = search === 'both' ? both(u, target, shards) : plain(u, target, shards);
+      const target = (u + TARGET_OFFSET) % N; const d = search === 'both' ? both(u, target, shards) : plain(u, target, shards);
       const person = full.top.find((v) => !isCeleb(v)) as number; const celeb = who === 'regular' ? CELEB_IDS[0] : (adj[u].find(isCeleb) as number);
       const kept = f.strong.filter((v) => full.strong.includes(v)).length;
       return { u, f, strongTotal: full.strong.length, kept, target, d, person, celeb, mPerson: intersect(u, person), mCeleb: intersect(u, celeb) };
@@ -107,6 +114,7 @@ import PlaygroundShell from '../../components/PlaygroundShell.astro';
     // --- model end
     const num = (n: number) => n.toLocaleString('en-US');
     const tone = (id: string, c: string) => q<HTMLElement>(id).style.setProperty('--c', c);
+    const BAD = { edges: 1000, hotPct: 70, hotEdges: 500, searchEdges: 10000 }; // entries read per query; share of reads on one shard
     function draw() {
       const who = q<HTMLSelectElement>('[data-who]').value; const capSel = Number(q<HTMLSelectElement>('[data-cap]').value);
       const search = q<HTMLSelectElement>('[data-search]').value; const shards = Number(q<HTMLSelectElement>('[data-shards]').value);
@@ -125,16 +133,16 @@ import PlaygroundShell from '../../components/PlaygroundShell.astro';
       t('3', `${r.kept} of ${r.strongTotal} strong`, capSel === 0 || r.kept === r.strongTotal ? 'nothing was cut, so every suggestion that shares 2 or more friends is found' : `${r.strongTotal - r.kept} suggestions that share 2 or more friends were lost with the limit`);
       t('4', `${num(r.d.ctx.edges)} entries scanned`, `${num(r.d.nodes)} people reached, ${r.d.dist} hops from #${r.u} to #${r.target}${search === 'both' ? ' (searching from both ends)' : ''}`);
       t('5', `merge ${r.mPerson.merge}, probe ${r.mPerson.probe}, bitmap ${r.mPerson.words} words`, `with person #${r.person} (${r.mPerson.sizes[1]} friends, ${r.mPerson.common} in common). With celebrity #${r.celeb} (${num(r.mCeleb.sizes[1])} friends): merge ${num(r.mCeleb.merge)}, probe ${r.mCeleb.probe}, bitmap ${r.mCeleb.words} words`);
-      tone('[data-b1]', cached ? 'var(--good)' : c.edges > 1000 ? 'var(--bad)' : 'var(--accent)');
-      tone('[data-b2]', !cached && hotPct >= 70 && c.edges > 500 ? 'var(--bad)' : 'var(--accent)');
+      tone('[data-b1]', cached ? 'var(--good)' : c.edges > BAD.edges ? 'var(--bad)' : 'var(--accent)');
+      tone('[data-b2]', !cached && hotPct >= BAD.hotPct && c.edges > BAD.hotEdges ? 'var(--bad)' : 'var(--accent)');
       tone('[data-b3]', r.kept === r.strongTotal ? 'var(--good)' : 'var(--bad)');
-      tone('[data-b4]', r.d.ctx.edges > 10000 ? 'var(--bad)' : 'var(--accent)');
+      tone('[data-b4]', r.d.ctx.edges > BAD.searchEdges ? 'var(--bad)' : 'var(--accent)');
       tone('[data-b5]', 'var(--accent)');
-      const out = q('[data-verdict]'); const bad = !cached && ((hotPct >= 70 && c.edges > 500) || r.d.ctx.edges > 10000);
+      const out = q('[data-verdict]'); const bad = !cached && ((hotPct >= BAD.hotPct && c.edges > BAD.hotEdges) || r.d.ctx.edges > BAD.searchEdges);
       out.classList.toggle('bad', bad);
       out.textContent = cached ? 'A cache hit hides the cost, but the cache must be refilled after every change in the friend list, and the person who follows a celebrity pays the full price on every miss.'
-        : hotPct >= 70 && c.edges > 500 ? `${hotPct}% of the reads land on shard ${hotIdx + 1}, because one celebrity list of ${num(c.maxLen)} entries lives there. Adding shards does not help, since a single list is never split. Limit the entries read from any one list.`
-        : r.d.ctx.edges > 10000 ? `The friend-of-friend query is cheap here, but the plain degrees search scanned ${num(r.d.ctx.edges)} entries. Searching from both ends meets in the middle.`
+        : hotPct >= BAD.hotPct && c.edges > BAD.hotEdges ? `${hotPct}% of the reads land on shard ${hotIdx + 1}, because one celebrity list of ${num(c.maxLen)} entries lives there. Adding shards does not help, since a single list is never split. Limit the entries read from any one list.`
+        : r.d.ctx.edges > BAD.searchEdges ? `The friend-of-friend query is cheap here, but the plain degrees search scanned ${num(r.d.ctx.edges)} entries. Searching from both ends meets in the middle.`
         : capSel !== 0 && r.kept < r.strongTotal ? `The limit cut the reads to ${num(c.edges)} entries and kept ${r.kept} of ${r.strongTotal} strong suggestions. That is the price of the limit: some real mutual connections are missed.`
         : 'Cheap and exact: nobody here has a list long enough to matter.';
     }

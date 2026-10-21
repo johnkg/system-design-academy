@@ -37,21 +37,30 @@ import PlaygroundShell from '../../components/PlaygroundShell.astro';
   document.querySelectorAll<HTMLElement>('[data-evb]').forEach((root) => {
     const q = <T extends HTMLElement>(s: string) => root.querySelector<T>(s)!;
     const TRIALS = 400;
+    const SEED = 7;
+    const PM = 1000; // case outcomes drawn per mille
+    const BASE_PASS = 700; // the current prompt passes 70% of cases
+    const NEW_PASS = { better: 720, worse: 680, same: 700 }; // the candidate's pass rate, per mille
+    const NOISE = 200; // the candidate's draw sits within +-100 of the current one's (the outcomes are correlated)
+    const Z95 = 1.96; // two-sided 95% normal quantile
+    const MARGIN = 0.02; // a regression under 2 points is acceptable
+    const WRONG_BAD = 0.05, WIDE_POINTS = 6, SAFE_SHIP = 0.8; // over 5% wrong decisions; interval over 6 points; under 80% shipped
     let pending = 0;
     function simulate(truth: string, n: number, method: string, rule: string) {
-      let seed = 7; const rnd = (m: number) => { seed = (seed * 1664525 + 1013904223) % 4294967296; return Math.floor(seed / 65536) % m; };
-      const thr = truth === 'better' ? 720 : truth === 'worse' ? 680 : 700;
+      // linear congruential generator (Numerical Recipes constants), integer in 0..m-1
+      let seed = SEED; const rnd = (m: number) => { seed = (seed * 1664525 + 1013904223) % 4294967296; return Math.floor(seed / 65536) % m; };
+      const thr = truth === 'better' ? NEW_PASS.better : truth === 'worse' ? NEW_PASS.worse : NEW_PASS.same;
       let ship = 0; let wrong = 0; let width = 0;
       for (let t = 0; t < TRIALS; t++) {
         let b = 0; let c = 0; let fixed = 0; let broken = 0;
         for (let i = 0; i < n; i++) {
-          const u = rnd(1000); const x = u < 700 ? 1 : 0; const y = u + rnd(200) - 100 < thr ? 1 : 0;
+          const u = rnd(PM); const x = u < BASE_PASS ? 1 : 0; const y = u + rnd(NOISE) - NOISE / 2 < thr ? 1 : 0;
           b += x; c += y; if (y > x) fixed++; if (x > y) broken++;
         }
         const diff = (c - b) / n; const p1 = b / n; const p2 = c / n;
         const se = method === 'paired' ? Math.sqrt(Math.max(fixed + broken - (fixed - broken) ** 2 / n, 0)) / n : Math.sqrt((p1 * (1 - p1) + p2 * (1 - p2)) / n);
-        width += 2 * 1.96 * se;
-        const ok = rule === 'naive' ? diff >= 0 : diff - 1.96 * se > -0.02;
+        width += 2 * Z95 * se;
+        const ok = rule === 'naive' ? diff >= 0 : diff - Z95 * se > -MARGIN;
         if (ok) ship++;
         if ((ok && truth === 'worse') || (!ok && truth === 'better')) wrong++;
       }
@@ -69,10 +78,10 @@ import PlaygroundShell from '../../components/PlaygroundShell.astro';
       q('[data-n2]').textContent = truth === 'worse' ? 'a worse prompt was shipped' : truth === 'better' ? 'a better prompt was blocked' : 'none possible, the prompts are equal';
       q('[data-o3]').textContent = `${r.width.toFixed(1)} points wide`; q('[data-n3]').textContent = `at ${n} cases, ${method === 'paired' ? 'paired' : 'separate pass rates'}`;
       q<HTMLElement>('[data-b1]').style.setProperty('--c', 'var(--accent)');
-      q<HTMLElement>('[data-b2]').style.setProperty('--c', r.wrong > TRIALS * 0.05 ? 'var(--bad)' : 'var(--good)');
-      q<HTMLElement>('[data-b3]').style.setProperty('--c', r.width > 6 ? 'var(--bad)' : 'var(--accent)');
-      const out = q('[data-verdict]'); const bad = r.wrong > TRIALS * 0.05; out.classList.toggle('bad', bad);
-      if (truth === 'same') out.textContent = rule === 'naive' ? `The prompts are equal, yet ${pct(r.ship)} ship: a naive gate is a coin flip, and the team would believe it found a win or a loss. An interval gate ships only when it can show there is no meaningful regression.` : `The prompts are equal, and ${pct(r.ship)} ship. ${r.ship < TRIALS * 0.8 ? 'The interval is too wide to prove it is safe, so the gate blocks harmless changes. More cases or a paired comparison would fix that.' : 'The interval is narrow enough to show there is no regression of more than 2 points.'}`;
+      q<HTMLElement>('[data-b2]').style.setProperty('--c', r.wrong > TRIALS * WRONG_BAD ? 'var(--bad)' : 'var(--good)');
+      q<HTMLElement>('[data-b3]').style.setProperty('--c', r.width > WIDE_POINTS ? 'var(--bad)' : 'var(--accent)');
+      const out = q('[data-verdict]'); const bad = r.wrong > TRIALS * WRONG_BAD; out.classList.toggle('bad', bad);
+      if (truth === 'same') out.textContent = rule === 'naive' ? `The prompts are equal, yet ${pct(r.ship)} ship: a naive gate is a coin flip, and the team would believe it found a win or a loss. An interval gate ships only when it can show there is no meaningful regression.` : `The prompts are equal, and ${pct(r.ship)} ship. ${r.ship < TRIALS * SAFE_SHIP ? 'The interval is too wide to prove it is safe, so the gate blocks harmless changes. More cases or a paired comparison would fix that.' : 'The interval is narrow enough to show there is no regression of more than 2 points.'}`;
       else if (truth === 'worse') out.textContent = bad ? `A real 2-point regression shipped in ${r.wrong} of ${TRIALS} comparisons (${pct(r.wrong)}). The noise at ${n} cases (an interval ${r.width.toFixed(1)} points wide) is bigger than the effect, so the gate cannot see it.` : `A real 2-point regression shipped in only ${r.wrong} of ${TRIALS} comparisons (${pct(r.wrong)}). ${rule === 'ci' ? 'The gate needs the whole interval above minus 2 points, which a true minus 2 rarely reaches.' : 'At this size the naive gate sees the drop most of the time.'}`;
       else out.textContent = bad ? `A better prompt was blocked in ${r.wrong} of ${TRIALS} comparisons (${pct(r.wrong)}). The interval is ${r.width.toFixed(1)} points wide, so the gate cannot prove the gain is safe. More cases, or a paired comparison, narrow it.` : `A better prompt was blocked in only ${r.wrong} of ${TRIALS} comparisons. The interval is ${r.width.toFixed(1)} points wide, narrow enough to see a gain of 2 points.`;
     }

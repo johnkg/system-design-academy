@@ -48,8 +48,11 @@ import PlaygroundShell from '../../components/PlaygroundShell.astro';
   document.querySelectorAll<HTMLElement>('[data-wsb]').forEach((root) => {
     const q = <T extends HTMLElement>(s: string) => root.querySelector<T>(s)!;
     const T = 180; const BUCKET = 10;
+    const THRASH = { overloadX: 3, capDiv: 4 }; // without shedding, over 3x capacity the gateway completes only a quarter
+    const MAX_BACKOFF_S = 60; const READY_SHARE = 0.99; const STORM_X = 10; // attempts per client that count as a retry storm
     const cache = new Map<string, { per: number[]; total: number; t99: number; connected: number; thrash: number }>();
     function sim(strategy: string, N: number, cap: number, shed: boolean) {
+      // Numerical Recipes LCG
       let seed = 7; const rnd = (k: number) => { seed = (seed * 1664525 + 1013904223) % 4294967296; return Math.floor(seed / 65536) % k; };
       const next = new Int32Array(N); const fails = new Int32Array(N); const done = new Uint8Array(N);
       const per = new Array<number>(T).fill(0); let connected = 0; let total = 0; let t99 = -1; let thrash = 0;
@@ -57,17 +60,17 @@ import PlaygroundShell from '../../components/PlaygroundShell.astro';
         const idx: number[] = [];
         for (let i = 0; i < N; i++) if (!done[i] && next[i] <= t) idx.push(i);
         const a = idx.length; per[t] = a; total += a;
-        const over = !shed && a > 3 * cap; const eff = over ? Math.floor(cap / 4) : cap; if (over) thrash++;
+        const over = !shed && a > THRASH.overloadX * cap; const eff = over ? Math.floor(cap / THRASH.capDiv) : cap; if (over) thrash++;
         let ok = 0;
         for (const i of idx) {
           if (ok < eff) { ok++; done[i] = 1; connected++; }
           else {
             fails[i]++; const n = fails[i];
-            const d = strategy === 'fixed' ? 1 : strategy === 'exp' ? Math.min(60, 2 ** (n - 1)) : 1 + rnd(Math.min(60, 2 ** n));
+            const d = strategy === 'fixed' ? 1 : strategy === 'exp' ? Math.min(MAX_BACKOFF_S, 2 ** (n - 1)) : 1 + rnd(Math.min(MAX_BACKOFF_S, 2 ** n));
             next[i] = t + d;
           }
         }
-        if (t99 < 0 && connected >= N * 0.99) t99 = t + 1;
+        if (t99 < 0 && connected >= N * READY_SHARE) t99 = t + 1;
       }
       return { per, total, t99, connected, thrash };
     }
@@ -81,7 +84,7 @@ import PlaygroundShell from '../../components/PlaygroundShell.astro';
       const r = cache.get(key)!;
       const ok = r.t99 >= 0;
       q('[data-o1]').textContent = ok ? `${r.t99} s` : `not within ${T} s`;
-      q('[data-n1]').textContent = ok ? `the minimum possible is ${Math.ceil((N * 0.99) / cap)} s at ${fmt(cap)} per second` : `${fmt(r.connected)} of ${fmt(N)} connected after ${T} s`;
+      q('[data-n1]').textContent = ok ? `the minimum possible is ${Math.ceil((N * READY_SHARE) / cap)} s at ${fmt(cap)} per second` : `${fmt(r.connected)} of ${fmt(N)} connected after ${T} s`;
       q('[data-o2]').textContent = fmt(r.total);
       q('[data-n2]').textContent = `${(r.total / N).toFixed(1)} attempts per client`;
       q('[data-o3]').textContent = shed ? 'none (excess refused cheaply)' : `${r.thrash} of ${T}`;
@@ -90,11 +93,11 @@ import PlaygroundShell from '../../components/PlaygroundShell.astro';
       const max = Math.max(...buckets, 1);
       bars.forEach((b, i) => { b.style.height = `${Math.max(2, Math.round(100 * Math.sqrt(buckets[i] / max)))}%`; });
       q<HTMLElement>('[data-b1]').style.setProperty('--c', ok ? 'var(--accent)' : 'var(--bad)');
-      q<HTMLElement>('[data-b2]').style.setProperty('--c', r.total > N * 10 ? 'var(--bad)' : 'var(--accent)');
+      q<HTMLElement>('[data-b2]').style.setProperty('--c', r.total > N * STORM_X ? 'var(--bad)' : 'var(--accent)');
       q<HTMLElement>('[data-b3]').style.setProperty('--c', !shed && r.thrash > 0 ? 'var(--bad)' : 'var(--good)');
-      const out = q('[data-verdict]'); out.classList.toggle('bad', !ok || r.total > N * 10);
+      const out = q('[data-verdict]'); out.classList.toggle('bad', !ok || r.total > N * STORM_X);
       out.textContent = !ok ? `Not recovered: after ${T} seconds only ${fmt(r.connected)} of ${fmt(N)} clients are connected. ${s === 'exp' ? 'Without jitter the clients stay in lockstep: every wave is as large as the last, so each one overloads the gateway, and between waves its capacity sits idle.' : 'The gateway cannot clear the backlog because the attempts keep arriving faster than it can handle them.'}`
-        : r.total > N * 10 ? `Connected in ${r.t99} s, but with ${fmt(r.total)} attempts, ${(r.total / N).toFixed(0)} per client. Most of the work was refused handshakes that took capacity from the ones that could have succeeded.`
+        : r.total > N * STORM_X ? `Connected in ${r.t99} s, but with ${fmt(r.total)} attempts, ${(r.total / N).toFixed(0)} per client. Most of the work was refused handshakes that took capacity from the ones that could have succeeded.`
         : `Connected in ${r.t99} s with ${fmt(r.total)} attempts, ${(r.total / N).toFixed(1)} per client. ${s === 'jitter' ? 'Random delays spread the retries so the gateway sees a stream, not waves.' : (shed ? 'Excess attempts were refused cheaply, so the gateway always used its full handshake rate.' : 'The gateway never reached the overload threshold, so no handshake capacity was wasted.')}`;
     }
     root.addEventListener('change', draw);

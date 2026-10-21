@@ -53,9 +53,26 @@ import PlaygroundShell from '../components/PlaygroundShell.astro';
 </PlaygroundShell>
 <script>
   const MODELS: Record<number, [number, number]> = { 7: [32, 4096], 13: [40, 5120], 70: [80, 8192], 175: [96, 12288], 405: [126, 16384] };
+  // Integer model. Memory is in tenths of a GB, model size P in billions of parameters, times in ms, shares in tenths of a percent.
+  const X10 = 10; const PER_MILLE = 1000;
+  const MEM10 = { weight: 20, grad: 20, optim: 120, act: 5, overhead: 40 }; // tenths of a GB per billion params (bf16 weights and grads, fp32 Adam state); overhead is fixed per GPU
+  const RECOMPUTE_ACT_DIV = 8; // recompute keeps 1/8 of the activations
+  const ZERO = { optim: 1, grad: 2, weight: 3 }; // ZeRO stage from which each kind of state is sharded
+  const FLOPS_PER_PARAM = { train: 6, recompute: 8 }; // per token, forward plus backward (plus a second forward)
+  const TOKENS_PER_MB = 4096; // tokens per microbatch
+  const GPU_TFLOPS = 200; const PEAK_TFLOPS = 400; // achieved and peak per GPU; GFLOP / TFLOP/s = ms
+  const NODE_GPUS = 8; const NVLINK_GBPS = 300; // GPUs per node and intra-node bandwidth
+  const TP_ALLREDUCES = 4; const RING = 2; const BF16_BYTES = 2; // all-reduces per layer per microbatch, ring all-reduce traffic factor
+  const PARAMS_PER_B = 1000000000; const GBPS_TO_B_PER_MS = 1000000;
+  const DP_PASSES = { allReduce: 2, zero3: 3 }; // gradient sync passes; ZeRO-3 also all-gathers weights
+  const OVERLAP = { num: 2, den: 3 }; // with overlap the backward pass (2/3 of compute) hides the gradient sync
+  const CKPT = { bytesPerParam: 14, writeGBps: 50, gpuMtbfH: 50000, restartS: 600 }; // checkpoint size and write speed, per-GPU MTBF, restart cost
+  const SEC_PER_MIN = 60; const SEC_PER_H = 3600;
+  const LIMITS = { bubble: 150, comm: 250, mfu: 300 }; // per mille: max bubble, max exposed comm, min MFU
+  const BAR_HEADROOM = 1.05;
   const div = (a: number, b: number) => Math.floor((a + Math.floor(b / 2)) / b);
-  const f1 = (x10: number) => `${Math.floor(x10 / 10)}.${x10 % 10}`;
-  const gb = (x10: number) => `${Math.floor(x10 / 10).toLocaleString('en-US')}.${x10 % 10}`;
+  const f1 = (x10: number) => `${Math.floor(x10 / X10)}.${x10 % X10}`;
+  const gb = (x10: number) => `${Math.floor(x10 / X10).toLocaleString('en-US')}.${x10 % X10}`;
 
   interface Cfg { P: number; N: number; mem: number; net: number; stage: number; tp: number; pp: number; m: number; recompute: boolean; overlap: boolean }
   interface Plan { valid: boolean; dp: number; parts: number[]; total: number; fits: boolean; comp: number; bubble: number; tpMs: number; dpMs: number; dpExposed: number; step: number; comm: number; bub: number; mfu: number }
@@ -65,38 +82,38 @@ import PlaygroundShell from '../components/PlaygroundShell.astro';
     const empty = { valid: false, dp: 0, parts: [0, 0, 0, 0, 0], total: 0, fits: false, comp: 0, bubble: 0, tpMs: 0, dpMs: 0, dpExposed: 0, step: 1, comm: 0, bub: 0, mfu: 0 };
     if (mp > c.N || c.N % mp !== 0) return empty;
     const dp = c.N / mp; const [L, h] = MODELS[c.P];
-    const w = div(20 * c.P, mp * (c.stage >= 3 ? dp : 1));
-    const g = div(20 * c.P, mp * (c.stage >= 2 ? dp : 1));
-    const o = div(120 * c.P, mp * (c.stage >= 1 ? dp : 1));
-    let a = div(5 * c.P, c.tp); if (c.recompute) a = div(a, 8);
-    const total = w + g + o + a + 40;
-    const comp = div((c.recompute ? 8 : 6) * c.P * c.m * 4096, mp * 200);
+    const w = div(MEM10.weight * c.P, mp * (c.stage >= ZERO.weight ? dp : 1));
+    const g = div(MEM10.grad * c.P, mp * (c.stage >= ZERO.grad ? dp : 1));
+    const o = div(MEM10.optim * c.P, mp * (c.stage >= ZERO.optim ? dp : 1));
+    let a = div(MEM10.act * c.P, c.tp); if (c.recompute) a = div(a, RECOMPUTE_ACT_DIV);
+    const total = w + g + o + a + MEM10.overhead;
+    const comp = div((c.recompute ? FLOPS_PER_PARAM.recompute : FLOPS_PER_PARAM.train) * c.P * c.m * TOKENS_PER_MB, mp * GPU_TFLOPS);
     const bubble = c.pp > 1 ? div(comp * (c.pp - 1), c.m) : 0;
-    const tpMs = c.tp > 1 ? div(L * c.m * 4 * 2 * (c.tp - 1) * 4096 * h * 2, c.tp * c.pp * (c.tp <= 8 ? 300 : c.net) * 1000000) : 0;
-    const grad = div(2 * c.P * 1000000000, mp);
-    const dpBytes = div((c.stage >= 3 ? 3 : 2) * (dp - 1) * grad, dp);
-    const dpMs = dp > 1 ? div(dpBytes, (c.N <= 8 ? 300 : c.net) * 1000000) : 0;
-    const dpExposed = c.overlap ? Math.max(0, dpMs - div(2 * comp, 3)) : dpMs;
+    const tpMs = c.tp > 1 ? div(L * c.m * TP_ALLREDUCES * RING * (c.tp - 1) * TOKENS_PER_MB * h * BF16_BYTES, c.tp * c.pp * (c.tp <= NODE_GPUS ? NVLINK_GBPS : c.net) * GBPS_TO_B_PER_MS) : 0;
+    const grad = div(BF16_BYTES * c.P * PARAMS_PER_B, mp);
+    const dpBytes = div((c.stage >= ZERO.weight ? DP_PASSES.zero3 : DP_PASSES.allReduce) * (dp - 1) * grad, dp);
+    const dpMs = dp > 1 ? div(dpBytes, (c.N <= NODE_GPUS ? NVLINK_GBPS : c.net) * GBPS_TO_B_PER_MS) : 0;
+    const dpExposed = c.overlap ? Math.max(0, dpMs - div(OVERLAP.num * comp, OVERLAP.den)) : dpMs;
     const step = comp + bubble + tpMs + dpExposed;
-    return { valid: true, dp, parts: [w, g, o, a, 40], total, fits: total <= c.mem * 10, comp, bubble, tpMs, dpMs, dpExposed, step,
-      comm: div((tpMs + dpExposed) * 1000, step), bub: div(bubble * 1000, step), mfu: div(div(6 * c.P * c.m * 4096, mp * 400) * 1000, step) };
+    return { valid: true, dp, parts: [w, g, o, a, MEM10.overhead], total, fits: total <= c.mem * X10, comp, bubble, tpMs, dpMs, dpExposed, step,
+      comm: div((tpMs + dpExposed) * PER_MILLE, step), bub: div(bubble * PER_MILLE, step), mfu: div(div(FLOPS_PER_PARAM.train * c.P * c.m * TOKENS_PER_MB, mp * PEAK_TFLOPS) * PER_MILLE, step) };
   }
   function ckpt(P: number, N: number, minutes: number) {
-    const C = Math.max(1, div(14 * P, 50)); const mtbf = div(50000 * 3600, N); const t = minutes * 60;
-    const pm = div(C * 1000, t) + div((div(t, 2) + 600) * 1000, mtbf);
+    const C = Math.max(1, div(CKPT.bytesPerParam * P, CKPT.writeGBps)); const mtbf = div(CKPT.gpuMtbfH * SEC_PER_H, N); const t = minutes * SEC_PER_MIN;
+    const pm = div(C * PER_MILLE, t) + div((div(t, 2) + CKPT.restartS) * PER_MILLE, mtbf);
     return { C, mtbf, pm, best: Math.floor(Math.sqrt(2 * C * mtbf)) };
   }
   function verdict(c: Cfg, p: Plan): { text: string; bad: boolean } {
     if (!p.valid) return { text: `Invalid layout: tensor parallel (${c.tp}) x pipeline stages (${c.pp}) = ${c.tp * c.pp} must divide the ${c.N} GPUs.`, bad: true };
     if (!p.fits) {
-      const hint = c.stage < 3 ? 'Shard more state (raise the ZeRO stage)' : !c.recompute ? 'Turn on activation recompute' : 'Split the model with tensor or pipeline parallelism, or use more or bigger GPUs';
+      const hint = c.stage < ZERO.weight ? 'Shard more state (raise the ZeRO stage)' : !c.recompute ? 'Turn on activation recompute' : 'Split the model with tensor or pipeline parallelism, or use more or bigger GPUs';
       return { text: `Out of memory: ${gb(p.total)} GB needed per GPU, ${c.mem} GB available. ${hint}.`, bad: true };
     }
     const mfu = `MFU ${f1(p.mfu)}%`;
-    if (c.tp > 8) return { text: `Fits, but slow (${mfu}): a tensor-parallel group of ${c.tp} spans nodes, so every layer's all-reduce runs on the slower network. Keep tensor parallel within a node.`, bad: true };
-    if (p.bub > 150) return { text: `Fits, but ${f1(p.bub)}% of the step is pipeline bubble (${mfu}). Raise microbatches or use fewer stages.`, bad: true };
-    if (p.comm > 250) return { text: `Fits, but communication-bound: ${f1(p.comm)}% of the step is exposed communication (${mfu}). Use more microbatches per step, overlap, a faster network, or a lower ZeRO stage.`, bad: true };
-    if (p.mfu < 300) return { text: `Fits, but utilisation is low (${mfu}). Most time is spent outside useful math; check the split above.`, bad: true };
+    if (c.tp > NODE_GPUS) return { text: `Fits, but slow (${mfu}): a tensor-parallel group of ${c.tp} spans nodes, so every layer's all-reduce runs on the slower network. Keep tensor parallel within a node.`, bad: true };
+    if (p.bub > LIMITS.bubble) return { text: `Fits, but ${f1(p.bub)}% of the step is pipeline bubble (${mfu}). Raise microbatches or use fewer stages.`, bad: true };
+    if (p.comm > LIMITS.comm) return { text: `Fits, but communication-bound: ${f1(p.comm)}% of the step is exposed communication (${mfu}). Use more microbatches per step, overlap, a faster network, or a lower ZeRO stage.`, bad: true };
+    if (p.mfu < LIMITS.mfu) return { text: `Fits, but utilisation is low (${mfu}). Most time is spent outside useful math; check the split above.`, bad: true };
     return { text: `Fits and runs well: ${gb(p.total)} GB per GPU, ${mfu}, ${f1(p.comm)}% communication, ${f1(p.bub)}% bubble.`, bad: false };
   }
 
@@ -127,9 +144,9 @@ import PlaygroundShell from '../components/PlaygroundShell.astro';
       q<HTMLElement>('[data-stepbox]').style.setProperty('--c', p.valid ? 'var(--role-1)' : 'var(--border)');
       if (p.valid) {
         q('[data-memtext]').textContent = `${gb(p.total)} GB of ${c.mem} GB: ${p.fits ? 'FITS' : 'OUT OF MEMORY'} (data-parallel degree ${p.dp}) | ` + p.parts.map((x, i) => `${MEM_NAMES[i]} ${gb(x)}`).join(', ');
-        const scale = Math.max(p.total, c.mem * 10) * 1.05;
+        const scale = Math.max(p.total, c.mem * X10) * BAR_HEADROOM;
         p.parts.forEach((x, i) => { memSegs[i].style.flexBasis = `${(x * 100) / scale}%`; });
-        cap.style.left = `${(c.mem * 1000) / scale}%`;
+        cap.style.left = `${(c.mem * X10 * 100) / scale}%`;
         const parts = [p.comp, p.bubble, p.tpMs, p.dpExposed];
         q('[data-steptext]').textContent = `step ${p.step.toLocaleString('en-US')} ms | MFU ${f1(p.mfu)}% | communication ${f1(p.comm)}% | bubble ${f1(p.bub)}% | ` + parts.map((x, i) => `${STEP_NAMES[i]} ${x.toLocaleString('en-US')} ms`).join(', ');
         parts.forEach((x, i) => { stepSegs[i].style.flexBasis = `${(x * 100) / p.step}%`; });
@@ -138,8 +155,8 @@ import PlaygroundShell from '../components/PlaygroundShell.astro';
         memSegs.forEach((s) => { s.style.flexBasis = '0%'; }); stepSegs.forEach((s) => { s.style.flexBasis = '0%'; });
       }
       const k = ckpt(c.P, c.N, num('[data-ckpt]'));
-      q('[data-ckpttext]').textContent = `a failure about every ${f1(Math.floor(k.mtbf / 360))} h | checkpoint write ${k.C} s | overhead ${f1(k.pm)}% of the run`;
-      q('[data-ckptnote]').textContent = `Overhead = time spent saving + expected lost work and restart per failure. The best interval is about ${Math.max(1, Math.round(k.best / 60))} min (sqrt(2 x write time x MTBF)).`;
+      q('[data-ckpttext]').textContent = `a failure about every ${f1(Math.floor(k.mtbf / (SEC_PER_H / X10)))} h | checkpoint write ${k.C} s | overhead ${f1(k.pm)}% of the run`;
+      q('[data-ckptnote]').textContent = `Overhead = time spent saving + expected lost work and restart per failure. The best interval is about ${Math.max(1, Math.round(k.best / SEC_PER_MIN))} min (sqrt(2 x write time x MTBF)).`;
       const out = q('[data-verdict]'); out.textContent = v.text; out.classList.toggle('bad', v.bad);
     }
     function schedule() {

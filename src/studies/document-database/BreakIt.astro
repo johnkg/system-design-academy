@@ -37,6 +37,11 @@ import PlaygroundShell from '../../components/PlaygroundShell.astro';
       { name: 'Customer id, hashed', targeted: 'one' },
       { name: 'Customer id + hashed suffix', targeted: 'compound' },
     ];
+    const SEED = 77;
+    const WEIGHT = { zipfTop: 10000, even: 50 }; // customer c's insert weight: 10000 / (c + 1) when skewed, else 50 each
+    const SALT = { customer: 7919, suffix: 31 }; // hash inputs for the hashed customer key and the compound suffix
+    const HOT = 1.5; // a shard with 1.5x its fair share is hot
+    // integer hash (murmur3-style finalizer)
     const mix = (x: number) => { let h = Math.imul(x + 1, 2654435761) >>> 0; h ^= h >>> 15; h = Math.imul(h, 2246822519) >>> 0; h ^= h >>> 13; return h >>> 0; };
     // Build the five boxes once, each with MAXSHARDS bars. Later draws only change text, heights and classes.
     const grid = q('[data-grid]');
@@ -54,9 +59,10 @@ import PlaygroundShell from '../../components/PlaygroundShell.astro';
     const cache = new Map<string, number[][]>();
     function simulate(s: number, zipf: boolean): number[][] {
       const id = `${s}-${zipf}`; const hit = cache.get(id); if (hit) return hit;
-      let seed = 77; const rnd = (n: number) => { seed = (Math.imul(seed, 1664525) + 1013904223) >>> 0; return (seed >>> 8) % n; };
+      // linear congruential generator (Numerical Recipes constants), integer in 0..n-1
+      let seed = SEED; const rnd = (n: number) => { seed = (Math.imul(seed, 1664525) + 1013904223) >>> 0; return (seed >>> 8) % n; };
       const cum: number[] = []; let t = 0;
-      for (let c = 0; c < CUSTOMERS; c++) { t += zipf ? Math.floor(10000 / (c + 1)) : 50; cum.push(t); }
+      for (let c = 0; c < CUSTOMERS; c++) { t += zipf ? Math.floor(WEIGHT.zipfTop / (c + 1)) : WEIGHT.even; cum.push(t); }
       const customerOf = () => { const r = rnd(t); let lo = 0; let hi = CUSTOMERS - 1; while (lo < hi) { const m = (lo + hi) >> 1; if (cum[m] > r) hi = m; else lo = m + 1; } return lo; };
       const load = KEYS.map(() => new Array(s).fill(0));
       for (let i = 0; i < INSERTS; i++) {
@@ -64,8 +70,8 @@ import PlaygroundShell from '../../components/PlaygroundShell.astro';
         load[0][s - 1]++; // every new timestamp is larger than all earlier ones, so it lands in the last range
         load[1][mix(i) % s]++;
         load[2][Math.floor((c * s) / CUSTOMERS)]++;
-        load[3][mix(c * 7919) % s]++;
-        load[4][mix(i * 31 + c) % s]++;
+        load[3][mix(c * SALT.customer) % s]++;
+        load[4][mix(i * SALT.suffix + c) % s]++;
       }
       cache.set(id, load); return load;
     }
@@ -75,7 +81,7 @@ import PlaygroundShell from '../../components/PlaygroundShell.astro';
       const share: number[] = []; const cap: number[] = [];
       load.forEach((l, k) => {
         const max = Math.max(...l); const pct = (max * 100) / INSERTS; share.push(pct); cap.push(Math.round(CAP / (pct / 100)));
-        const b = boxes[k]; const hot = pct > ideal * 1.5;
+        const b = boxes[k]; const hot = pct > ideal * HOT;
         b.o.textContent = `busiest shard: ${Math.round(pct)}% of inserts`;
         b.n.textContent = `the cluster can take ${cap[k].toLocaleString('en-US')} writes per second (even would be ${(CAP * s).toLocaleString('en-US')})`;
         const t = KEYS[k].targeted;
@@ -86,7 +92,7 @@ import PlaygroundShell from '../../components/PlaygroundShell.astro';
           if (i < s) { sp.style.height = `${Math.max(2, Math.round((l[i] * 100) / INSERTS))}%`; sp.classList.toggle('hot', l[i] === max && hot); }
         });
       });
-      const out = q('[data-verdict]'); const worst = share.indexOf(Math.max(...share)); const bad = share[worst] > ideal * 1.5; out.classList.toggle('bad', bad);
+      const out = q('[data-verdict]'); const worst = share.indexOf(Math.max(...share)); const bad = share[worst] > ideal * HOT; out.classList.toggle('bad', bad);
       out.textContent = bad
         ? `Hot shard: "${KEYS[worst].name}" sends ${Math.round(share[worst])}% of inserts to one of ${s} shards, so the cluster is limited to ${cap[worst].toLocaleString('en-US')} writes per second instead of ${(CAP * s).toLocaleString('en-US')}. The balancer cannot fix this, because it moves chunks and the load follows the key.`
         : `Every key is within 1.5 times the even share of ${Math.round(ideal)}% here. The difference is in queries: only the keys with a customer prefix answer a one-customer query from a single shard.`;

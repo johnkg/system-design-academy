@@ -15,6 +15,7 @@ const hasDotnet = spawnSync('dotnet', ['--version']).status === 0;
 if (!hasDotnet) console.warn('! dotnet not found: C# samples will be skipped');
 if (!hasDotnet && process.env.CI) { console.error('FAIL dotnet is required in CI, or the C# samples would go unchecked'); process.exit(1); }
 
+const SAMPLE_TIMEOUT_MS = 180_000; // a first C# compile can take a minute on a slow runner
 const env = { ...process.env, DOTNET_NOLOGO: '1', DOTNET_CLI_TELEMETRY_OPTOUT: '1' };
 const commands = {
   '.js': (f) => ['node', [f]],
@@ -26,7 +27,7 @@ const run = ([cmd, argv]) =>
   new Promise((resolve) => {
     const child = spawn(cmd, argv, { env });
     let stdout = '', stderr = '';
-    const timer = setTimeout(() => child.kill('SIGKILL'), 180_000);
+    const timer = setTimeout(() => child.kill('SIGKILL'), SAMPLE_TIMEOUT_MS);
     child.stdout.on('data', (d) => (stdout += d));
     child.stderr.on('data', (d) => (stderr += d));
     // `dotnet run` prints compiler hints and warnings on stdout, but only when it actually compiles (never on a cached run),
@@ -56,7 +57,8 @@ for (const root of roots) for (const slug of readdirSync(root)) {
 
 let failed = 0, ran = 0, mismatched = 0;
 const queue = groups.flatMap((g) => g.files.map((f) => ({ g, ...f })));
-const workers = Math.max(2, Math.min(cpus().length, 6));
+const MIN_WORKERS = 2, MAX_WORKERS = 6; // dotnet compiles are memory-hungry, so more than six in parallel slows a runner down
+const workers = Math.max(MIN_WORKERS, Math.min(cpus().length, MAX_WORKERS));
 await Promise.all(Array.from({ length: workers }, async () => {
   for (let job; (job = queue.shift()); ) {
     const res = await run(job.cmd);

@@ -34,6 +34,17 @@ import PlaygroundShell from '../../components/PlaygroundShell.astro';
     // ---- simulation (pure functions; the page only calls them) ----
     //#sim-start
     const G = 24; const SPEED = 2;
+    const RESTAURANTS = 12; const REST_SPREAD = 5; // restaurants sit within +-2 cells of a centre
+    const ORDER_WINDOW_MIN = 30; const PREP = { min: 9, range: 9 }; // orders arrive over 30 min; food takes 9 to 17 min
+    const FAR = 1e9; // larger than any distance
+    const HORIZON_MIN = 400; // stop simulating after this
+    const BATCH = { restMax: 4, custMax: 8 }; // two orders share a courier when restaurants and customers are this close
+    const LOOKAHEAD_MIN = 4; // window assignment also plans orders ready up to 4 min after the next window
+    const UNAVAILABLE = 1e6; // cost for a courier who is busy past the window
+    const WEIGHTS = { foodWait: 1.5, drive: 0.5, busy: 0.5 }; // window cost: food waiting counts 1.5x, courier waiting 1x
+    const MAP_PX = 240;
+    const WORSE_X = 1.25; // 25% slower than the best is bad
+    const PLENTIFUL = 0.3; // couriers per order above which couriers are plentiful
     type P = { x: number; y: number };
     type O = { id: number; placed: number; rest: P; cust: P; ready: number };
     type C = { pos: P; free: number; moving: number; wait: number };
@@ -41,13 +52,14 @@ import PlaygroundShell from '../../components/PlaygroundShell.astro';
     const dist = (a: P, b: P) => Math.abs(a.x - b.x) + Math.abs(a.y - b.y);
     const tt = (a: P, b: P) => dist(a, b) / SPEED;
     function makeWorld(seed0: number, nOrders: number, nCouriers: number) {
+      // Numerical Recipes LCG
       let seed = seed0; const rnd = () => ((seed = (seed * 1664525 + 1013904223) % 4294967296) / 4294967296);
       const centres = [{ x: 5, y: 6 }, { x: 17, y: 8 }, { x: 11, y: 18 }];
       const clamp = (v: number) => Math.max(0, Math.min(G - 1, v));
-      const rests: P[] = Array.from({ length: 12 }, (_, i) => { const c = centres[i % 3]; return { x: clamp(c.x + Math.floor(rnd() * 5) - 2), y: clamp(c.y + Math.floor(rnd() * 5) - 2) }; });
+      const rests: P[] = Array.from({ length: RESTAURANTS }, (_, i) => { const c = centres[i % centres.length]; return { x: clamp(c.x + Math.floor(rnd() * REST_SPREAD) - 2), y: clamp(c.y + Math.floor(rnd() * REST_SPREAD) - 2) }; });
       const orders: O[] = Array.from({ length: nOrders }, (_, id) => {
-        const placed = Math.floor(rnd() * 30); const rest = rests[Math.floor(rnd() * rests.length)];
-        return { id, placed, rest, cust: { x: Math.floor(rnd() * G), y: Math.floor(rnd() * G) }, ready: placed + 9 + Math.floor(rnd() * 9) };
+        const placed = Math.floor(rnd() * ORDER_WINDOW_MIN); const rest = rests[Math.floor(rnd() * rests.length)];
+        return { id, placed, rest, cust: { x: Math.floor(rnd() * G), y: Math.floor(rnd() * G) }, ready: placed + PREP.min + Math.floor(rnd() * PREP.range) };
       }).sort((a, b) => a.placed - b.placed || a.id - b.id);
       const couriers: C[] = Array.from({ length: nCouriers }, () => ({ pos: { x: Math.floor(rnd() * G), y: Math.floor(rnd() * G) }, free: 0, moving: 0, wait: 0 }));
       return { rests, orders, couriers };
@@ -88,24 +100,24 @@ import PlaygroundShell from '../../components/PlaygroundShell.astro';
     }
     type Pend = { o: O; since: number };
     function nearestIdle(couriers: C[], t: number, at: P): C | null {
-      let best: C | null = null; let bd = 1e9;
+      let best: C | null = null; let bd = FAR;
       for (const c of couriers) if (c.free <= t) { const d = dist(c.pos, at); if (d < bd) { bd = d; best = c; } }
       return best;
     }
     function run(strategy: string, world: { orders: O[]; couriers: C[] }, W: number) {
       const couriers: C[] = world.couriers.map((c) => ({ ...c })); const orders = world.orders; const st: S = { deliv: 0, food: 0, n: 0, end: 0 };
       let next = 0; let pending: Pend[] = [];
-      for (let t = 0; t < 400 && st.n < orders.length; t++) {
+      for (let t = 0; t < HORIZON_MIN && st.n < orders.length; t++) {
         while (next < orders.length && orders[next].placed <= t) pending.push({ o: orders[next++], since: t });
         if (strategy === 'greedy') {
           pending = pending.filter((u) => { const c = nearestIdle(couriers, t, u.o.rest); if (!c) return true; commit(c, t, [u.o], st); return false; });
         } else if (strategy === 'batch') {
           const used = new Set<number>(); const units: { os: O[]; since: number }[] = [];
           for (let i = 0; i < pending.length; i++) {
-            if (used.has(i)) continue; let bj = -1; let bd = 1e9;
+            if (used.has(i)) continue; let bj = -1; let bd = FAR;
             for (let j = i + 1; j < pending.length; j++) {
               if (used.has(j)) continue; const a = pending[i].o; const b = pending[j].o; const dr = dist(a.rest, b.rest); const dc = dist(a.cust, b.cust);
-              if (dr <= 4 && dc <= 8 && dr + dc < bd) { bd = dr + dc; bj = j; }
+              if (dr <= BATCH.restMax && dc <= BATCH.custMax && dr + dc < bd) { bd = dr + dc; bj = j; }
             }
             if (bj >= 0) { used.add(i); used.add(bj); units.push({ os: [pending[i].o, pending[bj].o], since: Math.min(pending[i].since, pending[bj].since) }); }
           }
@@ -115,15 +127,15 @@ import PlaygroundShell from '../../components/PlaygroundShell.astro';
           for (const u of units) { const c = nearestIdle(couriers, t, u.os[0].rest); if (!c) { u.os.forEach((o) => left.push({ o, since: u.since })); continue; } commit(c, t, u.os, st); }
           pending = [...waiting, ...left];
         } else if (t % W === 0) {
-          const due = pending.filter((u) => u.o.ready - t <= W + 4).sort((a, b) => a.o.ready - b.o.ready).slice(0, couriers.length);
+          const due = pending.filter((u) => u.o.ready - t <= W + LOOKAHEAD_MIN).sort((a, b) => a.o.ready - b.o.ready).slice(0, couriers.length);
           if (due.length) {
             const cost = due.map((u) => couriers.map((c) => {
-              const avail = Math.max(c.free, t); if (avail > t + W) return 1e6;
+              const avail = Math.max(c.free, t); if (avail > t + W) return UNAVAILABLE;
               const arr = avail + tt(c.pos, u.o.rest); const pk = Math.max(arr, u.o.ready);
-              return (pk - u.o.ready) * 1.5 + (pk - arr) + tt(c.pos, u.o.rest) * 0.5 + (avail - t) * 0.5;
+              return (pk - u.o.ready) * WEIGHTS.foodWait + (pk - arr) + tt(c.pos, u.o.rest) * WEIGHTS.drive + (avail - t) * WEIGHTS.busy;
             }));
             const got = new Set<Pend>();
-            hungarian(cost).forEach((j, i) => { if (j >= 0 && cost[i][j] < 1e6) { commit(couriers[j], t, [due[i].o], st); got.add(due[i]); } });
+            hungarian(cost).forEach((j, i) => { if (j >= 0 && cost[i][j] < UNAVAILABLE) { commit(couriers[j], t, [due[i].o], st); got.add(due[i]); } });
             pending = pending.filter((u) => !got.has(u));
           }
         }
@@ -136,10 +148,10 @@ import PlaygroundShell from '../../components/PlaygroundShell.astro';
     // ---- page ----
     const NS = 'http://www.w3.org/2000/svg';
     const map = q<SVGSVGElement>('[data-map]');
-    const cell = 240 / G;
+    const cell = MAP_PX / G;
     const mk = (tag: string, attrs: Record<string, string | number>) => { const e = document.createElementNS(NS, tag) as SVGElement; for (const k in attrs) { if (k === 'fill' || k === 'stroke') e.style.setProperty(k, String(attrs[k])); else e.setAttribute(k, String(attrs[k])); } return e; };
     function drawMap(w: { rests: P[]; orders: O[]; couriers: C[] }) {
-      const parts: Element[] = [mk('rect', { x: 0, y: 0, width: 240, height: 240, fill: 'var(--surface-2)', stroke: 'var(--border)' })];
+      const parts: Element[] = [mk('rect', { x: 0, y: 0, width: MAP_PX, height: MAP_PX, fill: 'var(--surface-2)', stroke: 'var(--border)' })];
       w.orders.forEach((o) => parts.push(mk('circle', { cx: (o.cust.x + 0.5) * cell, cy: (o.cust.y + 0.5) * cell, r: 1.6, fill: 'var(--muted)', opacity: 0.55 })));
       w.rests.forEach((r) => parts.push(mk('rect', { x: r.x * cell + 1, y: r.y * cell + 1, width: cell - 2, height: cell - 2, fill: 'var(--accent)' })));
       w.couriers.forEach((c) => parts.push(mk('circle', { cx: (c.pos.x + 0.5) * cell, cy: (c.pos.y + 0.5) * cell, r: 3.4, fill: 'var(--good)', stroke: 'var(--bg)', 'stroke-width': 1 })));
@@ -156,12 +168,12 @@ import PlaygroundShell from '../../components/PlaygroundShell.astro';
         const k = i + 1;
         q(`[data-o${k}]`).textContent = `${r.deliv.toFixed(1)} min per order`;
         q(`[data-n${k}]`).textContent = `food waiting ${r.food.toFixed(1)} min, courier utilisation ${Math.round(r.util * 100)}%, couriers waiting at counters ${r.wait.toFixed(1)} min per order, last delivery at minute ${Math.round(r.end)}`;
-        q<HTMLElement>(`[data-b${k}]`).style.setProperty('--c', r.deliv === bestDeliv ? 'var(--good)' : r.deliv > bestDeliv * 1.25 ? 'var(--bad)' : 'var(--accent)');
+        q<HTMLElement>(`[data-b${k}]`).style.setProperty('--c', r.deliv === bestDeliv ? 'var(--good)' : r.deliv > bestDeliv * WORSE_X ? 'var(--bad)' : 'var(--accent)');
       });
       const wi = res.findIndex((r) => r.deliv === bestDeliv); const g = res[0];
-      const out = q('[data-verdict]'); out.classList.toggle('bad', g.deliv > bestDeliv * 1.25);
+      const out = q('[data-verdict]'); out.classList.toggle('bad', g.deliv > bestDeliv * WORSE_X);
       const foodBest = res.findIndex((r) => r.food === bestFood);
-      out.textContent = `${names[wi]} gives the shortest delivery: ${bestDeliv.toFixed(1)} min, against ${g.deliv.toFixed(1)} min for nearest courier (${Math.round((1 - bestDeliv / g.deliv) * 100)}% less). ${foodBest === wi ? 'It also has the least food waiting' : `The least food waiting is with ${names[foodBest]}`} (${bestFood.toFixed(1)} min). ${nc >= 0.3 * no ? 'Couriers are plentiful, so what matters is arriving when the food is ready.' : 'Couriers are scarce, so orders queue, and what matters is how much each courier trip carries.'}`;
+      out.textContent = `${names[wi]} gives the shortest delivery: ${bestDeliv.toFixed(1)} min, against ${g.deliv.toFixed(1)} min for nearest courier (${Math.round((1 - bestDeliv / g.deliv) * 100)}% less). ${foodBest === wi ? 'It also has the least food waiting' : `The least food waiting is with ${names[foodBest]}`} (${bestFood.toFixed(1)} min). ${nc >= PLENTIFUL * no ? 'Couriers are plentiful, so what matters is arriving when the food is ready.' : 'Couriers are scarce, so orders queue, and what matters is how much each courier trip carries.'}`;
     }
     let queued = false;
     const schedule = () => { if (!queued) { queued = true; requestAnimationFrame(() => { queued = false; draw(); }); } };

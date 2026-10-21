@@ -1,13 +1,15 @@
 import { defineCollection, z } from 'astro:content';
 import { glob } from 'astro/loaders';
 
-// Self-check shown at the end of a page: scenario questions with one best answer each (three per page).
+// Self-check shown at the end of a page: scenario questions with one best answer each.
+export const QUIZ_QUESTIONS = 3; // per page
+export const QUIZ_OPTIONS = 4; // per question
 const quizSchema = z.array(z.object({
   question: z.string(),
-  options: z.array(z.string()).length(4),
-  answer: z.number().int().min(0).max(3),
+  options: z.array(z.string()).length(QUIZ_OPTIONS),
+  answer: z.number().int().min(0).max(QUIZ_OPTIONS - 1),
   explanation: z.string(),
-})).min(3).max(3).optional();
+})).length(QUIZ_QUESTIONS).optional();
 
 const patterns = defineCollection({
   // One folder per pattern; the folder name is the slug.

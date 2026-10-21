@@ -36,8 +36,12 @@ import PlaygroundShell from '../../components/PlaygroundShell.astro';
     const q = <T extends HTMLElement>(s: string) => root.querySelector<T>(s)!;
     type F = [string, number];
     type Tx = { base: number; remove: string[]; add: F[]; rows: number };
+    const SEED = 11; const ROUNDS = 10; const COMPACT_ROUND = 5; // write rounds; the round in which compaction runs
+    const SMALL_FILE = 30; // files with fewer rows are compacted
+    const BATCH = { min: 10, span: 40 }; // rows per writer commit
+    const DELETED_ROWS = 5; // rows a concurrent delete removes from the file being compacted
     function sim(mode: string, W: number, comp: string) {
-      let seed = 11; const rnd = (n: number) => { seed = (Math.imul(seed, 1664525) + 1013904223) >>> 0; return (seed >>> 8) % n; };
+      let seed = SEED; const rnd = (n: number) => { seed = (Math.imul(seed, 1664525) + 1013904223) >>> 0; return (seed >>> 8) % n; };
       const snaps: F[][] = [[]]; let seq = 0; const head = () => snaps.length - 1;
       const mk = (rows: number): F => [`f${++seq}`, rows];
       let expected = 0, rejected = 0, wasted = 0, rebases = 0, replans = 0;
@@ -51,7 +55,7 @@ import PlaygroundShell from '../../components/PlaygroundShell.astro';
           tx.base = head(); rebases++;
         }
       }
-      const plan = (): Tx => { const base = head(); const small = snaps[base].filter(([, r]) => r < 30); const rows = small.reduce((s, [, r]) => s + r, 0); return { base, remove: small.map(([n]) => n), add: [mk(rows)], rows }; };
+      const plan = (): Tx => { const base = head(); const small = snaps[base].filter(([, r]) => r < SMALL_FILE); const rows = small.reduce((s, [, r]) => s + r, 0); return { base, remove: small.map(([n]) => n), add: [mk(rows)], rows }; };
       const settle = (first: Tx, again: () => Tx) => {
         let tx = first;
         for (;;) {
@@ -61,10 +65,10 @@ import PlaygroundShell from '../../components/PlaygroundShell.astro';
           wasted += tx.rows; tx = again();
         }
       };
-      for (let r = 0; r < 10; r++) {
+      for (let r = 0; r < ROUNDS; r++) {
         const base = head(); const writers: Tx[] = [];
-        const compTx = comp !== 'none' && r === 5 ? plan() : null;
-        for (let w = 0; w < W; w++) { const rows = 10 + rnd(40); expected += rows; writers.push({ base, remove: [], add: [mk(rows)], rows }); }
+        const compTx = comp !== 'none' && r === COMPACT_ROUND ? plan() : null;
+        for (let w = 0; w < W; w++) { const rows = BATCH.min + rnd(BATCH.span); expected += rows; writers.push({ base, remove: [], add: [mk(rows)], rows }); }
         if (mode === 'abort') {
           let pending = writers;
           while (pending.length) {
@@ -75,8 +79,8 @@ import PlaygroundShell from '../../components/PlaygroundShell.astro';
         } else for (const tx of writers) commit(tx);
         if (compTx && comp === 'delete' && compTx.remove.length) {
           const victim = compTx.remove[0];
-          expected -= 5;
-          const mkDel = (): Tx => { const b = head(); const v = (snaps[b].find(([n]) => n === victim) || snaps[compTx.base].find(([n]) => n === victim))!; return { base: b, remove: [victim], add: [mk(v[1] - 5)], rows: v[1] - 5 }; };
+          expected -= DELETED_ROWS;
+          const mkDel = (): Tx => { const b = head(); const v = (snaps[b].find(([n]) => n === victim) || snaps[compTx.base].find(([n]) => n === victim))!; return { base: b, remove: [victim], add: [mk(v[1] - DELETED_ROWS)], rows: v[1] - DELETED_ROWS }; };
           const d = mkDel(); d.base = compTx.base;
           settle(d, mkDel);
         }

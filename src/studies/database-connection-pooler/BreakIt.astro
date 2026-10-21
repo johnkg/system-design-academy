@@ -35,19 +35,26 @@ import PlaygroundShell from '../../components/PlaygroundShell.astro';
   document.querySelectorAll<HTMLElement>('[data-cpb]').forEach((root) => {
     const q = <T extends HTMLElement>(s: string) => root.querySelector<T>(s)!;
     const MAXC = 200; const CPI = 10; const RPI = 60; const WAIT = 1000; const KNEE = 24; const THR = 48; const T = 6000;
+    const THRASH_SCALE = 64; // active queries past THR at which throughput halves
+    const ARRIVAL_MS = 1000; const MS_PER_S = 1000; // all requests arrive within the first second
+    const DRAWS_PER_REQ = 4; // hash draws per request: arrival, client connection, work, stateful
+    const STATEFUL_SHARE = 0.15; // requests that rely on session state
+    const MB_PER_CONN = 10; // server memory per open connection
+    const SERVED_OK = 0.9; const SLOW_MS = 500; // card thresholds
+    // 2D integer hash (murmur3-style finalizer) to a number in [0, 1)
     const mix = (a: number, b: number) => { let h = (Math.imul(a + 1, 2654435761) ^ Math.imul(b + 7, 2246822519)) >>> 0; h ^= h >>> 15; h = Math.imul(h, 2246822519) >>> 0; h ^= h >>> 13; h = Math.imul(h, 3266489917) >>> 0; h ^= h >>> 16; return (h >>> 0) / 4294967296; };
     // Work done per millisecond by the database when k queries are active: full speed up to KNEE, then a loss of speed as k passes THR.
-    const rate = (k: number) => (k === 0 ? 0 : Math.min(k, KNEE) / (1 + Math.pow(Math.max(0, k - THR) / 64, 2)));
+    const rate = (k: number) => (k === 0 ? 0 : Math.min(k, KNEE) / (1 + Math.pow(Math.max(0, k - THR) / THRASH_SCALE, 2)));
     const pct = (a: number[], p: number) => { if (!a.length) return 0; const s = a.slice().sort((x, y) => x - y); return s[Math.min(s.length - 1, Math.floor(s.length * p))]; };
     function sim(mode: string, A: number, S: number, qms: number) {
       let slots: number[]; let open = 0;
       if (mode === 'transaction') slots = [S];
       else { let left = mode === 'direct' ? MAXC : S; slots = []; for (let i = 0; i < A; i++) { const s = Math.min(CPI, left); slots.push(s); left -= s; } open = Math.min(mode === 'direct' ? MAXC : S, A * CPI); }
       const G = slots.length; const queues: any[][] = Array.from({ length: G }, () => []); const head = new Array(G).fill(0); const busy = new Array(G).fill(0);
-      const arr: any[][] = Array.from({ length: 1000 }, () => []);
+      const arr: any[][] = Array.from({ length: ARRIVAL_MS }, () => []);
       for (let i = 0; i < A; i++) for (let j = 0; j < RPI; j++) {
-        const t = Math.floor(mix(i, j * 4) * 1000);
-        arr[t].push({ g: mode === 'transaction' ? 0 : i, c: i * CPI + Math.floor(mix(i, j * 4 + 1) * CPI), w: qms * (0.5 + mix(i, j * 4 + 2)), st: mix(i, j * 4 + 3) < 0.15, t0: t, sid: 0 });
+        const t = Math.floor(mix(i, j * DRAWS_PER_REQ) * ARRIVAL_MS);
+        arr[t].push({ g: mode === 'transaction' ? 0 : i, c: i * CPI + Math.floor(mix(i, j * DRAWS_PER_REQ + 1) * CPI), w: qms * (0.5 + mix(i, j * DRAWS_PER_REQ + 2)), st: mix(i, j * DRAWS_PER_REQ + 3) < STATEFUL_SHARE, t0: t, sid: 0 });
       }
       let active: any[] = []; let served = 0; let errNoConn = 0; let errWait = 0; let peak = 0; let wrong = 0; let flagged = 0; let nextId = 0; let lastActive = 0;
       const freeIds: number[] = []; const last = new Map<number, number>(); const lat: number[] = []; const waits: number[] = [];
@@ -58,7 +65,7 @@ import PlaygroundShell from '../../components/PlaygroundShell.astro';
           for (const r of active) r.w -= p;
           active = active.filter((r) => { if (r.w <= 0) { busy[r.g]--; if (mode === 'transaction') freeIds.push(r.sid); lat.push(t + 1 - r.t0); served++; lastActive = t + 1; return false; } return true; });
         }
-        if (t < 1000) for (const r of arr[t]) { if (slots[r.g] === 0) { errNoConn++; continue; } queues[r.g].push(r); }
+        if (t < ARRIVAL_MS) for (const r of arr[t]) { if (slots[r.g] === 0) { errNoConn++; continue; } queues[r.g].push(r); }
         for (let g = 0; g < G; g++) {
           const qu = queues[g];
           while (head[g] < qu.length && t - qu[head[g]].t0 >= WAIT) { head[g]++; errWait++; }
@@ -75,7 +82,7 @@ import PlaygroundShell from '../../components/PlaygroundShell.astro';
         if (active.length > peak) peak = active.length;
       }
       if (mode === 'transaction') open = nextId;
-      return { total: A * RPI, served, errNoConn, errWait, peak, open, p50: pct(lat, 0.5), p95: pct(lat, 0.95), w95: pct(waits, 0.95), wrong, flagged, tput: Math.round(served / (Math.max(lastActive, 1000) / 1000)), cut: slots.filter((s) => s === 0).length };
+      return { total: A * RPI, served, errNoConn, errWait, peak, open, p50: pct(lat, 0.5), p95: pct(lat, 0.95), w95: pct(waits, 0.95), wrong, flagged, tput: Math.round(served / (Math.max(lastActive, ARRIVAL_MS) / MS_PER_S)), cut: slots.filter((s) => s === 0).length };
     }
     const fmt = (n: number) => Math.round(n).toLocaleString('en-US');
     function draw() {
@@ -86,10 +93,10 @@ import PlaygroundShell from '../../components/PlaygroundShell.astro';
       const r = sim(mode, A, S, qms); const errors = r.errNoConn + r.errWait; const thrash = r.peak > THR;
       const set = (k: number, o: string, n: string, bad: boolean) => { q(`[data-o${k}]`).textContent = o; q(`[data-n${k}]`).textContent = n; q<HTMLElement>(`[data-b${k}]`).style.setProperty('--c', bad ? 'var(--bad)' : 'var(--good)'); };
       const wanted = A * CPI;
-      set(1, `${fmt(r.open)} (limit ${MAXC})`, mode === 'direct' ? `${fmt(wanted)} wanted by ${A} instances, about ${fmt(r.open * 10)} MB of memory` : `${fmt(wanted)} client connections share them, about ${fmt(r.open * 10)} MB of memory`, mode === 'direct' && wanted > MAXC);
-      set(2, `${fmt(r.tput)} requests/s`, `${fmt(r.served)} of ${fmt(r.total)} served, at most ${fmt(r.peak)} queries running at once${thrash ? ' (the database is thrashing)' : ''}`, thrash || r.served < r.total * 0.9);
-      set(3, `${fmt(r.p50)} ms median, ${fmt(r.p95)} ms 95th`, `a single query takes about ${qms} ms`, r.p95 > 500);
-      set(4, `${fmt(r.w95)} ms (95th percentile)`, mode === 'direct' ? 'waiting for a connection inside each app' : 'waiting in the pooler queue, 1000 ms at most', r.w95 >= 500);
+      set(1, `${fmt(r.open)} (limit ${MAXC})`, mode === 'direct' ? `${fmt(wanted)} wanted by ${A} instances, about ${fmt(r.open * MB_PER_CONN)} MB of memory` : `${fmt(wanted)} client connections share them, about ${fmt(r.open * MB_PER_CONN)} MB of memory`, mode === 'direct' && wanted > MAXC);
+      set(2, `${fmt(r.tput)} requests/s`, `${fmt(r.served)} of ${fmt(r.total)} served, at most ${fmt(r.peak)} queries running at once${thrash ? ' (the database is thrashing)' : ''}`, thrash || r.served < r.total * SERVED_OK);
+      set(3, `${fmt(r.p50)} ms median, ${fmt(r.p95)} ms 95th`, `a single query takes about ${qms} ms`, r.p95 > SLOW_MS);
+      set(4, `${fmt(r.w95)} ms (95th percentile)`, mode === 'direct' ? 'waiting for a connection inside each app' : `waiting in the pooler queue, ${WAIT} ms at most`, r.w95 >= SLOW_MS);
       set(5, `${fmt(errors)} of ${fmt(r.total)}`, errors === 0 ? 'none' : `${fmt(r.errNoConn)} got no connection, ${fmt(r.errWait)} waited too long`, errors > 0);
       const out = q('[data-verdict]'); const parts: string[] = [];
       if (mode === 'direct' && r.errNoConn > 0) parts.push(`The apps want ${fmt(wanted)} connections but max_connections is ${MAXC}, so ${r.cut} of ${A} instances got none and ${fmt(r.errNoConn)} requests failed with too many clients.`);

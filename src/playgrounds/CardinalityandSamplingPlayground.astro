@@ -52,10 +52,16 @@ import PlaygroundShell from '../components/PlaygroundShell.astro';
   const LABELS: Record<string, number> = { route: 20, status: 5, region: 6, customer: 1000000 };
   const SERVER_SERIES = 20000000; // roughly what a 64 GB metrics server holds at 3 KB per series
 
+  const STREAM = { scale: 100000, errorBelow: 200, slowBelow: 1200, errMs: 1500, errRangeMs: 2500, slowRangeMs: 2200, fastMs: 20, fastStepMs: 60 }; // per 100,000: 0.2% errors, 1% slow; latency ranges in ms
+  const UINT32 = 4294967296; const Z95 = 1.96; const P99 = 99; const HIST_BUCKETS = 14;
+  const SERVER_BYTES = 64e9; const WARN_DIV = 20; // series above 1/20 of a server count as heavy
+  const DAY_S = 86400; const KB_PER_GB = 1e6;
+  // murmur3 32-bit finalizer
   function mix(x: number): number {
     x = Math.imul(x ^ (x >>> 16), 0x85ebca6b); x = Math.imul(x ^ (x >>> 13), 0xc2b2ae35);
     return (x ^ (x >>> 16)) >>> 0;
   }
+  // mulberry32 PRNG (returns raw 32-bit integers)
   function mulberry32(seed: number): () => number {
     let a = seed >>> 0;
     return () => {
@@ -69,15 +75,15 @@ import PlaygroundShell from '../components/PlaygroundShell.astro';
   function makeStream(n: number, seed: number): Ev[] {
     const rng = mulberry32(seed); const out: Ev[] = [];
     for (let i = 0; i < n; i++) {
-      const id = rng(); const u = rng() % 100000; let ms: number; let err = false;
-      if (u < 200) { err = true; ms = 1500 + (rng() % 2500); }
-      else if (u < 1200) ms = SLOW_MS + (rng() % 2200);
-      else ms = 20 + (rng() % 60) + (rng() % 60) + (rng() % 60);
+      const id = rng(); const u = rng() % STREAM.scale; let ms: number; let err = false;
+      if (u < STREAM.errorBelow) { err = true; ms = STREAM.errMs + (rng() % STREAM.errRangeMs); }
+      else if (u < STREAM.slowBelow) ms = SLOW_MS + (rng() % STREAM.slowRangeMs);
+      else ms = STREAM.fastMs + (rng() % STREAM.fastStepMs) + (rng() % STREAM.fastStepMs) + (rng() % STREAM.fastStepMs);
       out.push({ id, err, ms });
     }
     return out;
   }
-  const headKeep = (id: number, d: number, salt = 0x9e3779b9) => mix((id ^ salt) >>> 0) < Math.floor(4294967296 / d);
+  const headKeep = (id: number, d: number, salt = 0x9e3779b9) => mix((id ^ salt) >>> 0) < Math.floor(UINT32 / d);
   const interesting = (e: Ev) => e.err || e.ms >= SLOW_MS;
   function weightedQuantile(items: [number, number][], pct: number): number {
     const s = items.slice().sort((a, b) => a[0] - b[0]);
@@ -88,7 +94,7 @@ import PlaygroundShell from '../components/PlaygroundShell.astro';
   }
   function wilson(k: number, n: number): [number, number] {
     if (n === 0) return [0, 1];
-    const z = 1.96; const p = k / n; const d = 1 + (z * z) / n;
+    const z = Z95; const p = k / n; const d = 1 + (z * z) / n;
     const c = (p + (z * z) / (2 * n)) / d; const h = (z * Math.sqrt((p * (1 - p)) / n + (z * z) / (4 * n * n))) / d;
     return [Math.max(0, c - h), c + h];
   }
@@ -101,13 +107,13 @@ import PlaygroundShell from '../components/PlaygroundShell.astro';
     for (const e of kept) { est += wOf(e); if (!(tail && interesting(e))) normal++; }
     const se = Math.sqrt(normal * d * (d - 1));
     let rate: number; let lo: number; let hi: number;
-    if (tail) { rate = est ? errsKept / est : 0; lo = errsKept / (est + 1.96 * se); hi = est - 1.96 * se > 0 ? errsKept / (est - 1.96 * se) : 1; }
+    if (tail) { rate = est ? errsKept / est : 0; lo = errsKept / (est + Z95 * se); hi = est - Z95 * se > 0 ? errsKept / (est - Z95 * se) : 1; }
     else { rate = kept.length ? errsKept / kept.length : 0; [lo, hi] = wilson(errsKept, kept.length); }
     const three = (s1: number, s2: number, s3: number) => stream.filter((e) => headKeep(e.id, d, s1) && headKeep(e.id, d, s2) && headKeep(e.id, d, s3)).length;
     return {
       kept: kept.length, errsKept, trueErrors: stream.filter((e) => e.err).length, est, se, rate, lo, hi,
-      p99: weightedQuantile(kept.map((e) => [e.ms, wOf(e)]), 99), naive: weightedQuantile(kept.map((e) => [e.ms, 1]), 99),
-      trueP99: weightedQuantile(stream.map((e) => [e.ms, 1]), 99),
+      p99: weightedQuantile(kept.map((e) => [e.ms, wOf(e)]), P99), naive: weightedQuantile(kept.map((e) => [e.ms, 1]), P99),
+      trueP99: weightedQuantile(stream.map((e) => [e.ms, 1]), P99),
       consistent: stream.filter((e) => headKeep(e.id, d) && headKeep(e.id, d) && headKeep(e.id, d)).length,
       independent: three(1, 2, 3),
     };
@@ -115,7 +121,7 @@ import PlaygroundShell from '../components/PlaygroundShell.astro';
   function seriesFor(on: Record<string, boolean>): { total: number; parts: string[] } {
     let total = 1; const parts: string[] = [];
     for (const k of Object.keys(LABELS)) if (on[k]) { total *= LABELS[k]; parts.push(LABELS[k].toLocaleString('en-US')); }
-    if (on.hist) { total *= 14; parts.push('14'); }
+    if (on.hist) { total *= HIST_BUCKETS; parts.push(String(HIST_BUCKETS)); }
     return { total, parts };
   }
   function bytes(n: number): string {
@@ -142,8 +148,8 @@ import PlaygroundShell from '../components/PlaygroundShell.astro';
       out('series').textContent = fmt(total);
       out('formula').textContent = parts.length ? parts.join(' x ') : 'no labels: a single series';
       out('mem').textContent = bytes(mem);
-      out('memnote').textContent = `${(mem / 64e9 * 100).toFixed(mem / 64e9 < 0.01 ? 3 : 1)}% of a 64 GB server`;
-      const bad = total > SERVER_SERIES; const warn = total > SERVER_SERIES / 20;
+      out('memnote').textContent = `${(mem / SERVER_BYTES * 100).toFixed(mem / SERVER_BYTES < 0.01 ? 3 : 1)}% of a ${SERVER_BYTES / 1e9} GB server`;
+      const bad = total > SERVER_SERIES; const warn = total > SERVER_SERIES / WARN_DIV;
       box('series').style.setProperty('--c', bad ? 'var(--bad)' : warn ? 'var(--role-3)' : 'var(--role-2)');
       box('mem').style.setProperty('--c', bad ? 'var(--bad)' : warn ? 'var(--role-3)' : 'var(--role-2)');
       const el = out('labverdict'); el.classList.toggle('bad', bad);
@@ -164,16 +170,16 @@ import PlaygroundShell from '../components/PlaygroundShell.astro';
       out('errsnote').textContent = `${pct(r.errsKept / r.trueErrors, 1)} of error traces`;
       box('errs').style.setProperty('--c', r.errsKept === r.trueErrors ? 'var(--role-2)' : 'var(--bad)');
       out('count').textContent = `${fmt(r.est)} (${r.est >= N ? '+' : ''}${(((r.est - N) / N) * 100).toFixed(2)}%)`;
-      out('countnote').textContent = d === 1 ? 'exact: every event has weight 1' : `95% interval ${fmt(r.est - 1.96 * r.se)} to ${fmt(r.est + 1.96 * r.se)}; truth is ${fmt(N)}`;
+      out('countnote').textContent = d === 1 ? 'exact: every event has weight 1' : `95% interval ${fmt(r.est - Z95 * r.se)} to ${fmt(r.est + Z95 * r.se)}; truth is ${fmt(N)}`;
       out('rate').textContent = pct(r.rate, 3);
       out('ratenote').textContent = `95% interval ${pct(r.lo, 3)} to ${pct(r.hi, 3)}; truth ${pct(r.trueErrors / N, 3)}`;
       out('p99').textContent = `${r.p99} ms weighted`;
       out('p99note').textContent = `true ${r.trueP99} ms; unweighted kept traces ${r.naive} ms`;
       out('complete').textContent = tail ? fmt(r.kept) : `${fmt(r.consistent)} by trace id`;
       out('completenote').textContent = tail ? 'the collector sees whole traces and decides once' : `${fmt(r.independent)} if each service flips its own coin`;
-      const frac = r.kept / N; const gbDay = RPS * 86400 * TRACE_KB * frac / 1e6;
+      const frac = r.kept / N; const gbDay = RPS * DAY_S * TRACE_KB * frac / KB_PER_GB;
       out('cost').textContent = `${fmt(gbDay)} GB/day, $${fmt(gbDay * USD_PER_GB)}/day`;
-      out('costnote').textContent = tail ? `plus about ${(RPS * WAIT_S * TRACE_KB / 1e6).toFixed(1)} GB of collector memory to buffer ${WAIT_S} s` : 'no buffering needed: decided at the start';
+      out('costnote').textContent = tail ? `plus about ${(RPS * WAIT_S * TRACE_KB / KB_PER_GB).toFixed(1)} GB of collector memory to buffer ${WAIT_S} s` : 'no buffering needed: decided at the start';
       const el = out('verdict'); let bad = false; let msg: string;
       if (tail) msg = `Tail sampling kept all ${r.errsKept} error traces. Counts are rebuilt from weights (1 for interesting traces, ${d} for the rest). The unweighted p99 would be ${r.naive} ms against a true ${r.trueP99} ms.`;
       else if (d === 1) msg = 'Everything is kept: exact numbers and every error, at the full storage cost.';

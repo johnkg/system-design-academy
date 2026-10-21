@@ -42,23 +42,32 @@ import PlaygroundShell from '../../components/PlaygroundShell.astro';
   document.querySelectorAll<HTMLElement>('[data-zdm]').forEach((root) => {
     const q = <T extends HTMLElement>(s: string) => root.querySelector<T>(s)!;
     type Opt = { sync: string; verify: string; cut: string; gap: boolean };
+    const MIX = { of: 10, updateBelow: 6, insertBelow: 8 }; // workload: 60% updates, 20% inserts, 20% deletes
+    const VAL_RANGE = 1000; const ROWS = 1000; const CHUNK = 100; const CHUNKS = 10; // initial table and copy chunks
+    const WRITES_PER_TICK = 50; const DUAL_DROP_PCT = 3; // dual writes to the new database fail 3% of the time
+    const LOG = { catchUpLag: 30, applyPerTick: 80 }; // log replay stops chasing at 30 entries behind; applies 80 per second
+    const ID_PROBE = 50; const ID_GAP = 1000; // new ids checked for collisions; gap left above the old maximum
+    const NEW_WRITES = 200; // writes after the flip
+    const PROD = { rows: 5e6, copyRowsPerS: 200 }; const SEC_PER_H = 3600; // full-size table and copy speed
+    const FLIP_S = 2; const DOWNTIME_OK_S = 60;
       function simulate(o: Opt) {
+    // Numerical Recipes LCG
     let seed = 7; const random = (n: number) => { seed = (seed * 1664525 + 1013904223) % 4294967296; return Math.floor(seed / 65536) % n; };
     class Db { rows: Map<number, number>; log: any[]; nextId: number; constructor() { this.rows = new Map<number, number>(); this.log = [] as any[]; this.nextId = 1; }
       set(id: number, v: number) { this.rows.set(id, v); this.log.push({ op: 'set', id, val: v }); }
       del(id: number) { this.rows.delete(id); this.log.push({ op: 'del', id }); }
       apply(e: any) { this.nextId = Math.max(this.nextId, e.id + 1); if (e.op === 'set') this.rows.set(e.id, e.val); else this.rows.delete(e.id); } }
-    const workload = (db: Db, n: number) => { for (let i = 0; i < n; i++) { const r = random(10); if (r < 6) db.set(1 + random(db.nextId - 1), random(1000)); else if (r < 8) { const id = db.nextId++; db.set(id, random(1000)); } else db.del(1 + random(db.nextId - 1)); } };
+    const workload = (db: Db, n: number) => { for (let i = 0; i < n; i++) { const r = random(MIX.of); if (r < MIX.updateBelow) db.set(1 + random(db.nextId - 1), random(VAL_RANGE)); else if (r < MIX.insertBelow) { const id = db.nextId++; db.set(id, random(VAL_RANGE)); } else db.del(1 + random(db.nextId - 1)); } };
     const bad = (a: Db, b: Db) => { const ids: number[] = []; for (let id = 1; id < Math.max(a.nextId, b.nextId); id++) if ((a.rows.get(id) ?? -1) !== (b.rows.get(id) ?? -1)) ids.push(id); return ids; };
-    const src = new Db(); for (let i = 0; i < 1000; i++) src.set(src.nextId++, random(1000)); src.log = [];
+    const src = new Db(); for (let i = 0; i < ROWS; i++) src.set(src.nextId++, random(VAL_RANGE)); src.log = [];
     const snap = new Map<number, number>(src.rows), snapNext = src.nextId, dst = new Db();
-    const copy = (t: number) => { for (let id = 1 + t * 100; id < 101 + t * 100; id++) if (snap.has(id)) dst.rows.set(id, snap.get(id)!); };
+    const copy = (t: number) => { for (let id = 1 + t * CHUNK; id < 1 + CHUNK + t * CHUNK; id++) if (snap.has(id)) dst.rows.set(id, snap.get(id)!); };
     let applied = 0, lag = 0, ticks = 0;
-    if (o.sync === 'stop') { for (let t = 0; t < 10; t++) copy(t); dst.nextId = src.nextId; }
-    else if (o.sync === 'dual') { for (let t = 0; t < 10; t++) { copy(t); const from = src.log.length; workload(src, 50); for (const e of src.log.slice(from)) if (random(100) >= 3) dst.apply(e); } dst.nextId = Math.max(dst.nextId, src.nextId); }
-    else { for (let t = 0; t < 10; t++) { copy(t); workload(src, 50); } while (src.log.length - applied >= 30) { workload(src, 50); for (let k = 0; k < 80 && applied < src.log.length; k++) dst.apply(src.log[applied++]); ticks++; } lag = src.log.length - applied; dst.nextId = Math.max(dst.nextId, src.nextId); }
+    if (o.sync === 'stop') { for (let t = 0; t < CHUNKS; t++) copy(t); dst.nextId = src.nextId; }
+    else if (o.sync === 'dual') { for (let t = 0; t < CHUNKS; t++) { copy(t); const from = src.log.length; workload(src, WRITES_PER_TICK); for (const e of src.log.slice(from)) if (random(100) >= DUAL_DROP_PCT) dst.apply(e); } dst.nextId = Math.max(dst.nextId, src.nextId); }
+    else { for (let t = 0; t < CHUNKS; t++) { copy(t); workload(src, WRITES_PER_TICK); } while (src.log.length - applied >= LOG.catchUpLag) { workload(src, WRITES_PER_TICK); for (let k = 0; k < LOG.applyPerTick && applied < src.log.length; k++) dst.apply(src.log[applied++]); ticks++; } lag = src.log.length - applied; dst.nextId = Math.max(dst.nextId, src.nextId); }
     // verification, before the flip
-    const chunkOf = (id: number) => Math.floor((id - 1) / 100);
+    const chunkOf = (id: number) => Math.floor((id - 1) / CHUNK);
     const drain = o.cut !== 'big';
     if (o.sync === 'log' && drain) while (applied < src.log.length) dst.apply(src.log[applied++]);
     const found = { chunks: 0, count: 0 };
@@ -68,15 +77,15 @@ import PlaygroundShell from '../../components/PlaygroundShell.astro';
     else if (o.verify === 'sums') { for (const id of ids) { if (src.rows.has(id)) dst.rows.set(id, src.rows.get(id)!); else dst.rows.delete(id); } }
     dst.nextId = Math.max(dst.nextId, src.nextId);
     const diverged = bad(src, dst).length;
-    let clash = 0; for (let k = 0; k < 50; k++) if (src.rows.has(snapNext + k)) clash++;
+    let clash = 0; for (let k = 0; k < ID_PROBE; k++) if (src.rows.has(snapNext + k)) clash++;
     if (o.gap) clash = 0; else dst.nextId = snapNext;
-    if (o.gap) dst.nextId = src.nextId + 1000;
-    dst.log = []; workload(dst, 200);
+    if (o.gap) dst.nextId = src.nextId + ID_GAP;
+    dst.log = []; workload(dst, NEW_WRITES);
     const rev = o.cut === 'reverse';
     if (rev) for (const e of dst.log) src.apply(e);
     const lost = rev ? 0 : dst.log.length;
-    const hours = 5e6 / 200 / 3600;
-    const freezeS = o.cut === 'big' ? 0 : 2 + (o.sync === 'log' ? lag / 80 : 0);
+    const hours = PROD.rows / PROD.copyRowsPerS / SEC_PER_H;
+    const freezeS = o.cut === 'big' ? 0 : FLIP_S + (o.sync === 'log' ? lag / LOG.applyPerTick : 0);
     return { diverged, lost, lag, clash, found, hours, freezeS, rollbackOff: bad(src, dst).length };
 }
 
@@ -85,18 +94,18 @@ import PlaygroundShell from '../../components/PlaygroundShell.astro';
       const sync = q<HTMLSelectElement>('[data-sync]').value; const verify = q<HTMLSelectElement>('[data-verify]').value; const cut = q<HTMLSelectElement>('[data-cut]').value; const gap = q<HTMLInputElement>('[data-gap]').checked;
       const r = simulate({ sync, verify, cut, gap });
       const stop = sync === 'stop';
-      const downS = stop ? r.hours * 3600 + r.freezeS : r.freezeS;
+      const downS = stop ? r.hours * SEC_PER_H + r.freezeS : r.freezeS;
       const downTxt = stop ? `${r.hours.toFixed(1)} hours` : `${r.freezeS.toFixed(r.freezeS % 1 ? 2 : 0)} seconds`;
       const probs: string[] = [];
-      if (downS > 60) probs.push(`the service was read-only for ${r.hours.toFixed(1)} hours`);
+      if (downS > DOWNTIME_OK_S) probs.push(`the service was read-only for ${r.hours.toFixed(1)} hours`);
       if (r.diverged > 0) probs.push(`${r.diverged} rows differ between the two databases`);
-      if (r.clash > 0) probs.push(`${r.clash} of the first 50 new ids hit live rows`);
+      if (r.clash > 0) probs.push(`${r.clash} of the first ${ID_PROBE} new ids hit live rows`);
       if (r.lost > 0) probs.push(`a rollback would lose ${r.lost} writes`);
-      set(1, downTxt, stop ? 'every write waits for the whole copy' : cut === 'big' ? 'no freeze, so the writes still in the log are dropped' : `2 seconds to flip${sync === 'log' ? ` plus ${r.lag} entries drained at 80 per second` : ''}`, downS > 60 ? 'var(--bad)' : 'var(--good)');
+      set(1, downTxt, stop ? 'every write waits for the whole copy' : cut === 'big' ? 'no freeze, so the writes still in the log are dropped' : `${FLIP_S} seconds to flip${sync === 'log' ? ` plus ${r.lag} entries drained at ${LOG.applyPerTick} per second` : ''}`, downS > DOWNTIME_OK_S ? 'var(--bad)' : 'var(--good)');
       set(2, `${r.diverged} rows`, verify === 'none' ? `nobody looked; ${r.found.chunks} chunks were actually wrong` : verify === 'counts' ? `counts found ${r.found.count} missing or extra rows; changed values slip through` : `${r.found.chunks} wrong chunks found and re-copied`, r.diverged ? 'var(--bad)' : 'var(--good)');
-      set(3, `${r.lost} writes`, cut === 'reverse' ? 'the old database received every new write, so it is current' : 'the old database never saw the 200 new writes', r.lost ? 'var(--bad)' : 'var(--good)');
+      set(3, `${r.lost} writes`, cut === 'reverse' ? 'the old database received every new write, so it is current' : `the old database never saw the ${NEW_WRITES} new writes`, r.lost ? 'var(--bad)' : 'var(--good)');
       set(4, sync === 'log' ? `${r.lag} entries` : 'none', sync === 'log' ? (cut === 'big' ? 'flipped without draining: these writes are lost' : 'drained during the freeze, so nothing is lost') : 'there is no change log to be behind on', sync === 'log' && cut === 'big' ? 'var(--bad)' : 'var(--accent)');
-      set(5, `${r.clash} of 50`, gap ? 'the new counter starts 1,000 above the old maximum' : 'the new counter restarts at the snapshot value, 1,001', r.clash ? 'var(--bad)' : 'var(--good)');
+      set(5, `${r.clash} of ${ID_PROBE}`, gap ? 'the new counter starts 1,000 above the old maximum' : 'the new counter restarts at the snapshot value, 1,001', r.clash ? 'var(--bad)' : 'var(--good)');
       const out = q('[data-verdict]'); out.classList.toggle('bad', probs.length > 0);
       out.textContent = probs.length ? `Not safe to flip: ${probs.join('; ')}.` : `Clean migration: ${downTxt} of write downtime, 0 rows different, 0 writes lost if you roll back, and no id collisions.`;
     }

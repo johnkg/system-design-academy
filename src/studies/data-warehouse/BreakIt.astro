@@ -43,6 +43,13 @@ import PlaygroundShell from '../../components/PlaygroundShell.astro';
     ];
     const PARTS = 100; const ROWS_PER_PART = 1e8; const ROW_OVERHEAD = 24; const ROW_PAGE_RATIO = 1.8;
     const idx = (n: string) => COLS.findIndex((c) => c[0] === n);
+    const DATE_COL = idx('event_date');
+    const GB = 1e9, TB = 1e12, HOUR = 3600;
+    const NODE_GBPS = { warm: 3, cold: 0.6 }; // scan throughput per node, GB/s: SSD cache vs object storage
+    const ROW_SCAN_FACTOR = 0.4; // a row store decodes 40% as fast as a column store
+    const QUERY_OVERHEAD_S = 0.2, GROUP_BY_S = 0.5; // fixed planning time, extra for the group-by
+    const SCAN_USD_PER_TB = 5, NODE_USD_PER_HOUR = 4;
+    const TONE = { readBad: 0.5, readGood: 0.1, timeBadS: 60, timeGoodS: 5, costBad: 5, costGood: 0.1 }; // share of table read, seconds, dollars
     const QUERIES: Record<string, { days: number; cols: string[]; filter: boolean; group: boolean; label: string }> = {
       sum7: { days: 7, cols: ['amount'], filter: true, group: false, label: 'the sum' },
       group30: { days: 30, cols: ['amount', 'country', 'event_date'], filter: true, group: true, label: 'the group-by' },
@@ -55,14 +62,14 @@ import PlaygroundShell from '../../components/PlaygroundShell.astro';
       const partsRead = prune ? qy.days : PARTS;
       let needed: number[] = [];
       if (c.layout === 'row') needed = COLS.map((_, i) => i); // a row is stored whole, so every column is read
-      else { needed = qy.cols.map(idx); if (qy.filter && !prune && !needed.includes(1)) needed.push(1); } // without pruning the date column is needed to filter
+      else { needed = qy.cols.map(idx); if (qy.filter && !prune && !needed.includes(DATE_COL)) needed.push(DATE_COL); } // without pruning the date column is needed to filter
       const rawRow = COLS.reduce((s, x) => s + x[1], 0) + ROW_OVERHEAD;
       const perRow = c.layout === 'row' ? rawRow / (compressed ? ROW_PAGE_RATIO : 1) : needed.reduce((s, i) => s + (compressed ? COLS[i][2] : COLS[i][1]), 0);
       const tableRow = c.layout === 'row' ? rawRow / (compressed ? ROW_PAGE_RATIO : 1) : COLS.reduce((s, x) => s + (compressed ? x[2] : x[1]), 0);
       const bytes = partsRead * ROWS_PER_PART * perRow; const table = PARTS * ROWS_PER_PART * tableRow;
-      const tp = (c.cache === 'warm' ? 3 : 0.6) * (c.layout === 'row' ? 0.4 : 1) * 1e9;
-      const time = bytes / (c.nodes * tp) + 0.2 + (qy.group ? 0.5 : 0);
-      return { partsRead, needed, bytes, table, time, scanCost: (bytes / 1e12) * 5, nodeCost: time * c.nodes * (4 / 3600), prune };
+      const tp = (c.cache === 'warm' ? NODE_GBPS.warm : NODE_GBPS.cold) * (c.layout === 'row' ? ROW_SCAN_FACTOR : 1) * GB;
+      const time = bytes / (c.nodes * tp) + QUERY_OVERHEAD_S + (qy.group ? GROUP_BY_S : 0);
+      return { partsRead, needed, bytes, table, time, scanCost: (bytes / TB) * SCAN_USD_PER_TB, nodeCost: time * c.nodes * (NODE_USD_PER_HOUR / HOUR), prune };
     }
     const fmtB = (b: number) => (b >= 1e12 ? `${(b / 1e12).toFixed(2)} TB` : b >= 1e9 ? `${(b / 1e9).toFixed(b >= 1e11 ? 0 : 1)} GB` : `${(b / 1e6).toFixed(0)} MB`);
     const fmtT = (t: number) => (t >= 3600 ? `${(t / 3600).toFixed(1)} h` : t >= 60 ? `${(t / 60).toFixed(1)} min` : `${t.toFixed(1)} s`);
@@ -103,17 +110,17 @@ import PlaygroundShell from '../../components/PlaygroundShell.astro';
       q('[data-o2]').textContent = `${r.partsRead} of ${PARTS}`; q('[data-n2]').textContent = r.partsRead === PARTS ? (cfg.prune === 'on' && !qy.filter ? 'no date filter, so nothing can be skipped' : 'all days read') : `${PARTS - r.partsRead} skipped by their min/max date`;
       q('[data-o3]').textContent = fmtT(r.time); q('[data-n3]').textContent = `${cfg.nodes} node${cfg.nodes > 1 ? 's' : ''}, ${cfg.cache === 'warm' ? 'SSD cache' : 'object storage'}`;
       q('[data-o4]').textContent = fmtD(r.scanCost); q('[data-n4]').textContent = `${fmtD(r.nodeCost)} if billed by node-time instead of bytes scanned`;
-      tone(q('[data-b1]'), r.bytes / r.table > 0.5 ? 'var(--bad)' : r.bytes / r.table < 0.1 ? 'var(--good)' : 'var(--accent)');
+      tone(q('[data-b1]'), r.bytes / r.table > TONE.readBad ? 'var(--bad)' : r.bytes / r.table < TONE.readGood ? 'var(--good)' : 'var(--accent)');
       tone(q('[data-b2]'), r.partsRead === PARTS ? 'var(--bad)' : 'var(--good)');
-      tone(q('[data-b3]'), r.time > 60 ? 'var(--bad)' : r.time < 5 ? 'var(--good)' : 'var(--accent)');
-      tone(q('[data-b4]'), r.scanCost > 5 ? 'var(--bad)' : r.scanCost < 0.1 ? 'var(--good)' : 'var(--accent)');
+      tone(q('[data-b3]'), r.time > TONE.timeBadS ? 'var(--bad)' : r.time < TONE.timeGoodS ? 'var(--good)' : 'var(--accent)');
+      tone(q('[data-b4]'), r.scanCost > TONE.costBad ? 'var(--bad)' : r.scanCost < TONE.costGood ? 'var(--good)' : 'var(--accent)');
 
-      const out = q('[data-verdict]'); out.classList.toggle('bad', r.time > 60);
+      const out = q('[data-verdict]'); out.classList.toggle('bad', r.time > TONE.timeBadS);
       let t: string;
-      if (isBase) t = `Baseline: the row store reads every column of ${r.partsRead} partitions, ${fmtB(r.bytes)} in all, takes ${fmtT(r.time)} and costs ${fmtD(r.scanCost)} at $5 per TB scanned. Change one setting at a time to see what each one buys.`;
+      if (isBase) t = `Baseline: the row store reads every column of ${r.partsRead} partitions, ${fmtB(r.bytes)} in all, takes ${fmtT(r.time)} and costs ${fmtD(r.scanCost)} at $${SCAN_USD_PER_TB} per TB scanned. Change one setting at a time to see what each one buys.`;
       else {
         t = `Reads ${fmtB(r.bytes)} instead of ${fmtB(base.bytes)} (${fmtX(base.bytes / r.bytes)} times less) and finishes about ${fmtX(base.time / r.time)} times faster than the plain row store.`;
-        if (cfg.layout === 'column' && cfg.query === 'star7') t += ` select * needs all 20 columns, so the layout cannot skip anything. Only compression and pruning help, and a row store with the same settings reads ${fmtB(sameParts.bytes)}, just ${fmtX(sameParts.bytes / r.bytes)} times more.`;
+        if (cfg.layout === 'column' && cfg.query === 'star7') t += ` select * needs all ${COLS.length} columns, so the layout cannot skip anything. Only compression and pruning help, and a row store with the same settings reads ${fmtB(sameParts.bytes)}, just ${fmtX(sameParts.bytes / r.bytes)} times more.`;
         else if (cfg.layout === 'column') t += ` It skips ${COLS.length - r.needed.length} of ${COLS.length} columns, so the cost follows the columns you ask for, not the width of the table.`;
         else t += ' A row store still has to read every column of every row it touches.';
         if (cfg.prune === 'on' && !qy.filter) t += ' There is no date filter on this query, so pruning has nothing to skip.';

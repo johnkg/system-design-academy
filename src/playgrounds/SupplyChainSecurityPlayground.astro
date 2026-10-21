@@ -56,22 +56,28 @@ import PlaygroundShell from '../components/PlaygroundShell.astro';
   interface Cfg { policy: 'floating' | 'lockfile' | 'pinned'; kind: 'release' | 'tamper'; every: number; minAge: number; detect: number; integrity: boolean; scoped: boolean; noScripts: boolean; reviewer: boolean; seed: number }
   interface Tree { total: number; direct: number; target: number; dependents: number; viaDirect: number; depth: number }
   const H = 60; const ATTACK = 10; const CVE = 12; const REVIEW = 21; const RESPONSE = 2; const N = 400; const DIRECT = 12;
+  const DIRECT_FANOUT = 3; // each direct dependency pulls in 3 packages
+  const P_TWO_DEPS = 0.55; // otherwise a package has 2 deps with this chance, else 1 or 3 evenly
+  const ATTACH_WEIGHT = 3; // preferential attachment: weight per existing dependent
+  const TARGET_SHARE_DIV = 4; // the attacked package is used by about a quarter of the tree
+  const BUILDS = { min: 4, span: 9 }; // builds per day, 4..12
+  const MAX_SEED = 99; const CVE_LATE_DAYS = 7; // CVE fix later than this is marked bad
 
   function mulberry32(a: number) {
     return () => { a = (a + 0x6d2b79f5) | 0; let t = Math.imul(a ^ (a >>> 15), 1 | a); t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t; return ((t ^ (t >>> 14)) >>> 0) / 4294967296; };
   }
 
   function makeTree(seed: number): Tree {
-    const rnd = mulberry32(seed * 7919 + 13);
+    const rnd = mulberry32(seed * 7919 + 13); // spread the small seeds apart
     const deps: number[][] = Array.from({ length: N }, () => []);
     const indeg = new Array(N).fill(0);
     for (let i = 0; i < N - 1; i++) {
-      const k = i < DIRECT ? 3 : rnd() < 0.55 ? 2 : rnd() < 0.5 ? 1 : 3;
+      const k = i < DIRECT ? DIRECT_FANOUT : rnd() < P_TWO_DEPS ? 2 : rnd() < 0.5 ? 1 : 3;
       for (let t = 0; t < k; t++) {
         // preferential attachment: popular libraries (already depended on) attract more dependents
-        let w = 0; for (let j = i + 1; j < N; j++) w += 1 + 3 * indeg[j];
+        let w = 0; for (let j = i + 1; j < N; j++) w += 1 + ATTACH_WEIGHT * indeg[j];
         let r = rnd() * w; let pick = N - 1;
-        for (let j = i + 1; j < N; j++) { r -= 1 + 3 * indeg[j]; if (r <= 0) { pick = j; break; } }
+        for (let j = i + 1; j < N; j++) { r -= 1 + ATTACH_WEIGHT * indeg[j]; if (r <= 0) { pick = j; break; } }
         if (!deps[i].includes(pick)) { deps[i].push(pick); indeg[pick]++; }
       }
     }
@@ -83,7 +89,7 @@ import PlaygroundShell from '../components/PlaygroundShell.astro';
       const seen = new Set<number>(); const stack = [...parents[t]];
       while (stack.length) { const x = stack.pop()!; if (seen.has(x)) continue; seen.add(x); stack.push(...parents[x]); }
       // "a popular package": the one used by about a quarter of the tree (a library used by everything is rarer than the headlines suggest)
-      if (best < 0 || Math.abs(seen.size - N / 4) < Math.abs(best - N / 4)) { best = seen.size; target = t; bestSet = seen; }
+      if (best < 0 || Math.abs(seen.size - N / TARGET_SHARE_DIV) < Math.abs(best - N / TARGET_SHARE_DIV)) { best = seen.size; target = t; bestSet = seen; }
     }
     const dist = new Array(N).fill(-1); let frontier: number[] = []; for (let i = 0; i < DIRECT; i++) { dist[i] = 1; frontier.push(i); }
     while (frontier.length) { const nx: number[] = []; for (const x of frontier) for (const d of deps[x]) if (dist[d] < 0) { dist[d] = dist[x] + 1; nx.push(d); } frontier = nx; }
@@ -92,8 +98,8 @@ import PlaygroundShell from '../components/PlaygroundShell.astro';
   }
 
   function buildsPerDay(seed: number): number[] {
-    const rnd = mulberry32(seed * 104729 + 7);
-    return Array.from({ length: H }, () => 4 + Math.floor(rnd() * 9));
+    const rnd = mulberry32(seed * 104729 + 7); // a second stream, independent of the tree
+    return Array.from({ length: H }, () => BUILDS.min + Math.floor(rnd() * BUILDS.span));
   }
 
   // The days on which the dependency set is re-resolved for this policy.
@@ -162,7 +168,7 @@ import PlaygroundShell from '../components/PlaygroundShell.astro';
     let queued = false;
 
     function read(): Cfg {
-      const seed = Math.min(99, Math.max(1, Math.floor(num('[data-seed]')) || 1));
+      const seed = Math.min(MAX_SEED, Math.max(1, Math.floor(num('[data-seed]')) || 1));
       return { policy: q<HTMLSelectElement>('[data-policy]').value as Cfg['policy'], kind: q<HTMLSelectElement>('[data-kind]').value as Cfg['kind'], every: num('[data-every]'), minAge: num('[data-age]'), detect: num('[data-detect]'), integrity: chk('[data-integrity]'), scoped: chk('[data-scoped]'), noScripts: chk('[data-noscripts]'), reviewer: chk('[data-reviewer]'), seed };
     }
     const plural = (n: number, w: string) => `${n} ${w}${n === 1 ? '' : 's'}`;
@@ -187,7 +193,7 @@ import PlaygroundShell from '../components/PlaygroundShell.astro';
         ev.style.setProperty('--c', colour);
         ev.title = `day ${d}${d === ATTACK ? ': malicious publish' : d === r.yank ? ': yanked' : d === CVE ? ': CVE fix published' : ''}${resolve ? ' (dependencies re-resolved)' : ''}`;
       }
-      strip.setAttribute('aria-label', `Builds per day for 60 days: ${r.badBuilds} of ${r.totalBuilds} pulled the bad version, ${r.failedBuilds} failed closed.`);
+      strip.setAttribute('aria-label', `Builds per day for ${H} days: ${r.badBuilds} of ${r.totalBuilds} pulled the bad version, ${r.failedBuilds} failed closed.`);
 
       q('[data-bad]').textContent = c.kind === 'release' || r.failedBuilds === 0 ? `${r.badBuilds} of ${r.totalBuilds} builds` : `${r.badBuilds} bad, ${r.failedBuilds} failed closed`;
       q('[data-badnote]').textContent = r.badBuilds > 0
@@ -195,9 +201,9 @@ import PlaygroundShell from '../components/PlaygroundShell.astro';
         : r.failedBuilds > 0 ? `every download of the swapped file failed the recorded hash, so ${r.failedBuilds} builds stopped instead of shipping it. Loud, but nothing bad ran.` : 'no build resolved the bad version before it was yanked.';
       q<HTMLElement>('[data-box=bad]').style.setProperty('--c', r.badBuilds > 0 ? 'var(--bad)' : 'var(--role-2)');
 
-      q('[data-cve]').textContent = r.cve.adopted < 0 ? 'not adopted within 60 days' : `adopted on day ${r.cve.adopted}: ${plural(r.cve.delay, 'day')} late`;
+      q('[data-cve]').textContent = r.cve.adopted < 0 ? `not adopted within ${H} days` : `adopted on day ${r.cve.adopted}: ${plural(r.cve.delay, 'day')} late`;
       q('[data-cvenote]').textContent = `fix published day ${CVE}; ${r.cve.vulnBuilds} builds shipped the vulnerable version in the meantime.`;
-      q<HTMLElement>('[data-box=cve]').style.setProperty('--c', r.cve.delay > 7 || r.cve.delay < 0 ? 'var(--bad)' : r.cve.delay > 0 ? 'var(--role-3)' : 'var(--role-2)');
+      q<HTMLElement>('[data-box=cve]').style.setProperty('--c', r.cve.delay > CVE_LATE_DAYS || r.cve.delay < 0 ? 'var(--bad)' : r.cve.delay > 0 ? 'var(--role-3)' : 'var(--role-2)');
 
       const u = r.confusion.unscoped; const s = r.confusion.scoped;
       q('[data-conf1]').textContent = u.hit ? `Unscoped: SUCCEEDS on day ${u.day}` : 'Unscoped: blocked';
@@ -210,7 +216,7 @@ import PlaygroundShell from '../components/PlaygroundShell.astro';
 
       const bits: string[] = [];
       bits.push(r.badBuilds > 0 ? `${r.badBuilds} builds took the bad code` : r.failedBuilds > 0 ? `0 builds took the bad code (${r.failedBuilds} failed closed)` : 'the malicious release never reached a build');
-      bits.push(r.cve.adopted < 0 ? 'the real CVE fix was not adopted in 60 days' : r.cve.delay === 0 ? 'the real CVE fix landed the day it was published' : `the real CVE fix landed ${plural(r.cve.delay, 'day')} late`);
+      bits.push(r.cve.adopted < 0 ? `the real CVE fix was not adopted in ${H} days` : r.cve.delay === 0 ? 'the real CVE fix landed the day it was published' : `the real CVE fix landed ${plural(r.cve.delay, 'day')} late`);
       q('[data-verdict]').textContent = `This policy: ${bits.join('; ')}.`;
       q('[data-verdict]').classList.toggle('bad', r.badBuilds > 0);
     }

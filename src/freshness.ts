@@ -18,7 +18,8 @@ function parse(log: string, keepFirst: boolean) {
 
 export function pageDates(): Dates {
   if (cache) return cache;
-  const run = (args: string[]) => execFileSync('git', args, { encoding: 'utf8', maxBuffer: 64 * 1024 * 1024, stdio: ['ignore', 'pipe', 'ignore'] });
+  const MAX_GIT_OUTPUT = 64 * 1024 * 1024; // bytes: the full history of src/content is a few MB, so this leaves ample room
+  const run = (args: string[]) => execFileSync('git', args, { encoding: 'utf8', maxBuffer: MAX_GIT_OUTPUT, stdio: ['ignore', 'pipe', 'ignore'] });
   try {
     const updated = parse(run(['log', '--format=@%cs', '--name-only', '--no-renames', '--', 'src/content']), true);
     const added = parse(run(['log', '--diff-filter=A', '--format=@%cs', '--name-only', '--no-renames', '--', 'src/content']), false);

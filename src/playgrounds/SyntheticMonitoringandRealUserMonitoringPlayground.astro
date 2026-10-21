@@ -50,7 +50,13 @@ interface Params { seed: number; interval: number; locations: number; n: number;
 const P_BLIP = 0.004, P_FAIL = 0.9, BLOCK = 0.12;
 const LCP_MEDIAN = 1700, LCP_SIGMA = 0.45, FAULT_FACTOR = 3, POOR = 4000;
 const RUM_WINDOW = 15, RUM_LAG = 3, RUM_MIN = 20, RUM_HOLD = 3;
+const MIN_PER_H = 60, HOURS_PER_DAY = 24;
+const PEAK_HOUR = 20, NIGHT_FLOOR = 0.1; // local hour of peak traffic; traffic share left at the quietest hour
+const Z_SD = 0.5774; // standard deviation of the sum of four uniforms (approximate normal draw)
+const LATE_SYNTH_MIN = 15; // a synthetic alert later than this into the fault is blamed on a coincident blip
+const CHART = { x0: 10, w: 700, tickH: 3 }, ROW_Y = { s: 22, r: 52 }; // timeline svg layout
 
+// mulberry32 PRNG
 function mulberry32(a: number) {
   return function () {
     a |= 0; a = (a + 0x6d2b79f5) | 0;
@@ -60,16 +66,16 @@ function mulberry32(a: number) {
   };
 }
 function views(r: number, t: number) {
-  const hour = (((t / 60 + REGIONS[r].tz) % 24) + 24) % 24;
-  const c = (1 + Math.cos((2 * Math.PI * (hour - 20)) / 24)) / 2;
-  return Math.round(REGIONS[r].peak * (0.1 + 0.9 * c * c));
+  const hour = (((t / MIN_PER_H + REGIONS[r].tz) % HOURS_PER_DAY) + HOURS_PER_DAY) % HOURS_PER_DAY;
+  const c = (1 + Math.cos((2 * Math.PI * (hour - PEAK_HOUR)) / HOURS_PER_DAY)) / 2;
+  return Math.round(REGIONS[r].peak * (NIGHT_FLOOR + (1 - NIGHT_FLOOR) * c * c));
 }
 const faulted = (scope: string, r: number, t: number) => t >= FAULT_START && t < FAULT_END && (scope === 'global' || r === BRAZIL);
 function p75(a: number[]) { const s = [...a].sort((x, y) => x - y); return s[Math.ceil(0.75 * s.length) - 1]; }
 
 function world(seed: number) {
   const g = mulberry32(seed * 977 + 13); const blip: number[][] = [], fail: number[][] = [];
-  for (let r = 0; r < 5; r++) { blip.push([]); fail.push([]); for (let t = 0; t < DAY; t++) { blip[r].push(g()); fail[r].push(g()); } }
+  for (let r = 0; r < REGIONS.length; r++) { blip.push([]); fail.push([]); for (let t = 0; t < DAY; t++) { blip[r].push(g()); fail[r].push(g()); } }
   return { seed, blip, fail };
 }
 function synthetic(w: World, p: Params) {
@@ -98,13 +104,13 @@ function synthetic(w: World, p: Params) {
   return { detect, falseAlarms, checks, marks };
 }
 function lcpSample(g: () => number, slow: boolean) {
-  const z = ((g() + g() + g() + g() - 2) / 0.5774);
+  const z = ((g() + g() + g() + g() - 2) / Z_SD);
   return LCP_MEDIAN * (slow ? FAULT_FACTOR : 1) * Math.exp(LCP_SIGMA * z);
 }
 function rum(w: World, p: Params) {
   if (!p.rumOn) return { detect: -1, falseAlarms: 0, samples: 0, faultSamples: [], base: [], marks: [] };
   const rate = p.sampling; const perMin: number[][][] = []; let samples = 0; const faultSamples: number[] = [], base: number[] = [];
-  for (let r = 0; r < 5; r++) {
+  for (let r = 0; r < REGIONS.length; r++) {
     perMin.push([]);
     for (let t = 0; t < DAY; t++) {
       const g = mulberry32(w.seed * 100003 + r * 1447 + t * 7 + 1);
@@ -116,7 +122,7 @@ function rum(w: World, p: Params) {
     }
   }
   let detect = -1, falseAlarms = 0; const marks: Mark[] = [];
-  for (let r = 0; r < 5; r++) {
+  for (let r = 0; r < REGIONS.length; r++) {
     let run = 0, open = false;
     for (let t = 0; t < DAY; t++) {
       const hi = t - RUM_LAG, lo = hi - RUM_WINDOW + 1; let all: number[] = [];
@@ -137,7 +143,7 @@ function simulate(p: Params) {
   const w = world(p.seed); const s = synthetic(w, p); const u = rum(w, p);
   const dets = [s.detect, u.detect].filter((x) => x >= 0); const first = dets.length ? Math.min(...dets) : -1;
   let before = 0, total = 0;
-  for (let t = FAULT_START; t < FAULT_END; t++) for (let r = 0; r < 5; r++) if (faulted(p.scope, r, t)) {
+  for (let t = FAULT_START; t < FAULT_END; t++) for (let r = 0; r < REGIONS.length; r++) if (faulted(p.scope, r, t)) {
     total += views(r, t); if (first < 0 || t < first) before += views(r, t);
   }
   return { s, u, first, before, total };
@@ -145,7 +151,7 @@ function simulate(p: Params) {
 
   // ---- DOM ----
   const SVGNS = 'http://www.w3.org/2000/svg';
-  const hhmm = (t: number) => String(Math.floor(t / 60)).padStart(2, '0') + ':' + String(t % 60).padStart(2, '0');
+  const hhmm = (t: number) => String(Math.floor(t / MIN_PER_H)).padStart(2, '0') + ':' + String(t % MIN_PER_H).padStart(2, '0');
   const fmt = (n: number) => n.toLocaleString('en-US');
   document.querySelectorAll<HTMLElement>('[data-sm]').forEach((root) => {
     const q = <T extends Element>(s: string) => root.querySelector<T>(s)!;
@@ -164,7 +170,7 @@ function simulate(p: Params) {
       frame = 0;
       const p = params(); const r = simulate(p);
       q('[data-locsval]').textContent = String(p.locations);
-      q('[data-locnames]').textContent = 'Probing from: ' + REGIONS.slice(0, p.locations).map((x) => x.name).join(', ') + (p.locations < 5 ? ' (none in Brazil)' : '') + '. Needs ' + Math.min(p.n, p.locations) + ' failing location' + (Math.min(p.n, p.locations) > 1 ? 's' : '') + ' to alert.';
+      q('[data-locnames]').textContent = 'Probing from: ' + REGIONS.slice(0, p.locations).map((x) => x.name).join(', ') + (p.locations <= BRAZIL ? ' (none in Brazil)' : '') + '. Needs ' + Math.min(p.n, p.locations) + ' failing location' + (Math.min(p.n, p.locations) > 1 ? 's' : '') + ' to alert.';
       q<HTMLInputElement | HTMLSelectElement>('[data-sampling]').disabled = !p.rumOn;
       const after = (t: number) => '+' + (t - FAULT_START) + ' min (' + hhmm(t) + ')';
       q('[data-sdet]').textContent = r.s.detect < 0 ? 'outage never detected' : 'detected ' + after(r.s.detect);
@@ -180,21 +186,21 @@ function simulate(p: Params) {
       if (r.first < 0) parts.push('Nobody was alerted. Users found out from support tickets, after the whole outage.');
       else parts.push('First alert came from ' + (r.u.detect < 0 || (r.s.detect >= 0 && r.s.detect <= r.u.detect) ? 'the synthetic probes' : 'RUM') + ' ' + (r.first - FAULT_START) + (r.first - FAULT_START === 1 ? ' minute' : ' minutes') + ' in.');
       if (p.scope === 'brazil' && r.s.detect < 0) {
-        if (p.locations < 5) parts.push('No probe runs in Brazil, so every synthetic check passed.');
+        if (p.locations <= BRAZIL) parts.push('No probe runs in Brazil, so every synthetic check passed.');
         else if (Math.min(p.n, p.locations) > 1) parts.push('Only the Brazil probe fails, and the rule needs ' + Math.min(p.n, p.locations) + ' locations, so it stays quiet.');
       }
-      if (p.scope === 'brazil' && r.s.detect > FAULT_START + 15 && Math.min(p.n, p.locations) > 1) parts.push('The synthetic alert only fired when an unrelated blip joined the Brazil failure.');
-      if (p.rumOn && r.u.detect < 0 && p.scope === 'brazil') parts.push('RUM stayed silent: too few sampled page views from Brazil at night to reach 20 in the window.');
+      if (p.scope === 'brazil' && r.s.detect > FAULT_START + LATE_SYNTH_MIN && Math.min(p.n, p.locations) > 1) parts.push('The synthetic alert only fired when an unrelated blip joined the Brazil failure.');
+      if (p.rumOn && r.u.detect < 0 && p.scope === 'brazil') parts.push('RUM stayed silent: too few sampled page views from Brazil at night to reach ' + RUM_MIN + ' in the window.');
       if (r.s.falseAlarms > 0) parts.push(r.s.falseAlarms + ' false alarm' + (r.s.falseAlarms === 1 ? '' : 's') + ' would have woken someone for nothing.');
       q('[data-verdict]').textContent = parts.join(' ');
       const svg = q<SVGElement>('[data-svg]'); svg.replaceChildren();
-      const X = (t: number) => 10 + (t / DAY) * 700;
+      const X = (t: number) => CHART.x0 + (t / DAY) * CHART.w;
       mark(svg, 'rect', { class: 'sm-band', x: String(X(FAULT_START)), y: '4', width: String(X(FAULT_END) - X(FAULT_START)), height: '66' });
-      for (let h = 0; h <= 24; h += 3) { mark(svg, 'line', { class: 'sm-tick', x1: String(X(h * 60)), x2: String(X(h * 60)), y1: '70', y2: '75' }); mark(svg, 'text', { class: 'sm-lbl', x: String(X(h * 60)), y: '90', 'text-anchor': 'middle' }, String(h).padStart(2, '0')); }
-      mark(svg, 'line', { class: 'sm-row', x1: '10', x2: '710', y1: '22', y2: '22' });
-      mark(svg, 'line', { class: 'sm-row', x1: '10', x2: '710', y1: '52', y2: '52' });
+      for (let h = 0; h <= HOURS_PER_DAY; h += CHART.tickH) { mark(svg, 'line', { class: 'sm-tick', x1: String(X(h * MIN_PER_H)), x2: String(X(h * MIN_PER_H)), y1: '70', y2: '75' }); mark(svg, 'text', { class: 'sm-lbl', x: String(X(h * MIN_PER_H)), y: '90', 'text-anchor': 'middle' }, String(h).padStart(2, '0')); }
+      mark(svg, 'line', { class: 'sm-row', x1: '10', x2: '710', y1: String(ROW_Y.s), y2: String(ROW_Y.s) });
+      mark(svg, 'line', { class: 'sm-row', x1: '10', x2: '710', y1: String(ROW_Y.r), y2: String(ROW_Y.r) });
       const dots = (marks: { t: number; kind: string }[], y: number, cls: string) => marks.forEach((m) => mark(svg, 'circle', { class: 'sm-dot ' + cls + (m.kind === 'hit' ? ' hit' : ' miss'), cx: String(X(m.t)), cy: String(y), r: m.kind === 'hit' ? '6' : '3.5' }));
-      dots(r.s.marks, 22, 'sm-s'); dots(r.u.marks, 52, 'sm-r');
+      dots(r.s.marks, ROW_Y.s, 'sm-s'); dots(r.u.marks, ROW_Y.r, 'sm-r');
     }
     const schedule = () => { if (!frame) frame = requestAnimationFrame(draw); };
     root.querySelectorAll('select, input[type="range"], input[type="checkbox"]').forEach((el) => { el.addEventListener('input', schedule); el.addEventListener('change', schedule); });

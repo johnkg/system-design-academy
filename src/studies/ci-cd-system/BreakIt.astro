@@ -42,8 +42,10 @@ import PlaygroundShell from '../../components/PlaygroundShell.astro';
 <script>
   type Opts = { pool: string; cache: boolean; shards: number; fair: boolean; flaky: string };
   // SIM-START
+// mulberry32 seeded PRNG
 const mulberry32 = (a: number) => (): number => { a |= 0; a = (a + 0x6d2b79f5) | 0; let t = Math.imul(a ^ (a >>> 15), 1 | a); t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t; return ((t ^ (t >>> 14)) >>> 0) / 4294967296; };
-const DAY = 36000; // 10 hours in seconds
+const HOUR = 3600, MINUTE = 60; // seconds
+const DAY = 10 * HOUR; // 10-hour working day in seconds
 const TEAMS = [
   { name: 'Monorepo', tests: 1440, build: 300 },
   { name: 'Payments', tests: 720, build: 180 },
@@ -52,16 +54,26 @@ const TEAMS = [
   { name: 'Data', tests: 720, build: 180 },
   { name: 'Infra', tests: 480, build: 120 },
 ];
-const PRICE = 0.17 / 3600; // dollars per runner-second (a 4-vCPU VM at $0.17 per hour)
+const RUNNER_USD_PER_HOUR = 0.17; // a 4-vCPU VM
+const PRICE = RUNNER_USD_PER_HOUR / HOUR; // dollars per runner-second
+const COMMIT_SEED = 7;
+const GAUSS_SD = 0.58; // standard deviation of a sum of four uniforms (sqrt(4/12))
+const LAST_COMMIT_S = 600; // no commits in the last 10 minutes of the day
+const DEP_CHANGE_RATE = 0.08; // share of commits that change dependencies
+const BROKEN_RATE = 0.05; // share of commits with a real bug
+const SEED_RANGE = 1e9; // per-commit seeds are drawn from 0..1e9
+const MONO = { steady: 60, bursts: [6000, 19800, 31200], burstSize: 100, burstSpreadS: 720 }; // monorepo: commits spread over the day, plus three bursts (start second, commits, spread)
+const SMALL = { commits: 130, peakShare: 0.7, peaks: [9000, 25200], peakSdS: HOUR, minis: 2, miniRangeS: 30000, miniFromS: 2000, miniSize: 12, miniSpreadS: 360 }; // each small team: commits, 70% around two daily peaks, plus two mini bursts
 function makeCommits() {
-  const rnd = mulberry32(7); const out: any[] = [];
-  const gauss = () => (rnd() + rnd() + rnd() + rnd() - 2) / 0.58;
-  const add = (t: number, team: number) => out.push({ t: Math.max(0, Math.min(DAY - 600, Math.floor(t))), team, deps: rnd() < 0.08, broken: rnd() < 0.05, seed: Math.floor(rnd() * 1e9), depth: 0 });
-  for (let i = 0; i < 60; i++) add(rnd() * DAY, 0);
-  for (const c of [6000, 19800, 31200]) for (let i = 0; i < 100; i++) add(c + rnd() * 720, 0);
+  const rnd = mulberry32(COMMIT_SEED); const out: any[] = [];
+  const gauss = () => (rnd() + rnd() + rnd() + rnd() - 2) / GAUSS_SD;
+  const add = (t: number, team: number) => out.push({ t: Math.max(0, Math.min(DAY - LAST_COMMIT_S, Math.floor(t))), team, deps: rnd() < DEP_CHANGE_RATE, broken: rnd() < BROKEN_RATE, seed: Math.floor(rnd() * SEED_RANGE), depth: 0 });
+  for (let i = 0; i < MONO.steady; i++) add(rnd() * DAY, 0);
+  for (const c of MONO.bursts) for (let i = 0; i < MONO.burstSize; i++) add(c + rnd() * MONO.burstSpreadS, 0);
   for (let team = 1; team < TEAMS.length; team++) {
-    for (let i = 0; i < 130; i++) add(rnd() < 0.7 ? (rnd() < 0.5 ? 9000 : 25200) + gauss() * 3600 : rnd() * DAY, team);
-    for (const c of [rnd() * 30000 + 2000, rnd() * 30000 + 2000]) for (let i = 0; i < 12; i++) add(c + rnd() * 360, team);
+    for (let i = 0; i < SMALL.commits; i++) add(rnd() < SMALL.peakShare ? (rnd() < 0.5 ? SMALL.peaks[0] : SMALL.peaks[1]) + gauss() * SMALL.peakSdS : rnd() * DAY, team);
+    const minis: number[] = []; for (let k = 0; k < SMALL.minis; k++) minis.push(rnd() * SMALL.miniRangeS + SMALL.miniFromS);
+    for (const c of minis) for (let i = 0; i < SMALL.miniSize; i++) add(c + rnd() * SMALL.miniSpreadS, team);
   }
   return out.sort((a, b) => a.t - b.t || a.team - b.team);
 }
@@ -76,6 +88,13 @@ class Heap { a: any[] = []; push(x: any) { const a = this.a; a.push(x); let i = 
   get size() { return this.a.length; } }
 const pct = (arr: number[], p: number) => { if (!arr.length) return 0; const s = [...arr].sort((x, y) => x - y); return s[Math.floor(p * (s.length - 1))]; };
 const HIT = 20, MISS = 150, SETUP = 20, FLAKE = 0.15;
+const TICK_S = 30; // autoscaler evaluation interval
+const MAX_IMBALANCE = 0.25; // a shard can get up to 25% more than its even share of tests
+const SHARD_OVERHEAD_S = 15; // per-shard startup when tests are split
+const PKG_WORK_S = 60; // packaging step after all tests pass
+const MAX_RETRIES = 2; // automatic retries of a failed test job
+const QUARANTINE_AFTER = 3; // fail-then-pass detections before the flaky test is quarantined
+const RERUN = { share: 0.7, delayS: 300 }; // share of false-red builds a developer reruns, and after how long
 
 function simulate(o: Opts) { // o: pool, cache(bool), shards, fair(bool), flaky: 'none'|'off'|'retry'|'quar'
   const pool = POOLS[o.pool]; const S = o.shards; const retryOn = o.flaky === 'retry' || o.flaky === 'quar';
@@ -91,7 +110,7 @@ function simulate(o: Opts) { // o: pool, cache(bool), shards, fair(bool), flaky:
   let quarantined = false; let now = 0; let rid = 0; let finished = 0; let total = COMMITS.length;
   const newRunner = (t: number): any => ({ id: rid++, born: t, since: t });
   if (pool.fixed) { for (let i = 0; i < pool.fixed; i++) { const r = newRunner(0); idle.push(r); } alive = pool.fixed; }
-  else { for (let i = 0; i < pool.min; i++) idle.push(newRunner(0)); alive = pool.min; push(30, 'tick'); }
+  else { for (let i = 0; i < pool.min; i++) idle.push(newRunner(0)); alive = pool.min; push(TICK_S, 'tick'); }
   COMMITS.forEach((c) => push(c.t, 'arrive', c));
   const enqueue = (job: any, t: number) => { job.enq = t; queues[job.b.team].push(job); queued++; };
   const pick = (): number => { let best = -1;
@@ -107,12 +126,12 @@ function simulate(o: Opts) { // o: pool, cache(bool), shards, fair(bool), flaky:
       push(t + job.dur, 'done', job); } };
   const newBuild = (c: any, t: number) => { const rng = mulberry32(c.seed); const team = TEAMS[c.team];
     const ver = (c.deps && c.depth === 0) ? ++version[c.team] : version[c.team];
-    const b = { c, team: c.team, t0: t, ver, d: [rng(), rng(), rng()], rr: rng(), imb: Array.from({ length: S }, () => (S > 1 ? rng() * 0.25 : 0)), left: S, failed: false, flakeFail: false, real: false, retried: false, busy: 0, rerun: c.depth > 0 };
+    const b = { c, team: c.team, t0: t, ver, d: [rng(), rng(), rng()], rr: rng(), imb: Array.from({ length: S }, () => (S > 1 ? rng() * MAX_IMBALANCE : 0)), left: S, failed: false, flakeFail: false, real: false, retried: false, busy: 0, rerun: c.depth > 0 };
     enqueue({ b, kind: 'build', work: team.build, attempt: 0 }, t); };
   const finishBuild = (b: any, t: number, ok: boolean) => { stats.builds++; finished++; stats.last = t; durs.push(t - b.t0);
     if (ok) { stats.pass++; if (b.retried) stats.hidden++; } else if (b.real) stats.redReal++; else stats.redFalse++;
     if (b.rerun) stats.wasted += b.busy;
-    if (!ok && !b.real && b.rr < 0.7) { stats.reruns++; total++; push(t + 300, 'arrive', { t: t + 300, team: b.team, deps: false, broken: false, seed: (b.c.seed * 7919 + 13) % 1000000007, depth: b.c.depth + 1 }); } };
+    if (!ok && !b.real && b.rr < RERUN.share) { stats.reruns++; total++; push(t + RERUN.delayS, 'arrive', { t: t + RERUN.delayS, team: b.team, deps: false, broken: false, seed: (b.c.seed * 7919 + 13) % 1000000007 /* LCG step: new seed for the rerun */, depth: b.c.depth + 1 }); } };
   for (;;) {
     if (!ev.size) break; const [t, , type, d] = ev.pop(); now = t;
     if (type === 'arrive') { newBuild(d, t); dispatch(t); }
@@ -121,20 +140,20 @@ function simulate(o: Opts) { // o: pool, cache(bool), shards, fair(bool), flaky:
       const demand = busy + queued; const have = alive + nBoot; const want = Math.min(pool.max, Math.max(pool.min, demand));
       if (want > have) for (let i = 0; i < want - have; i++) { nBoot++; push(t + pool.start, 'ready', { born: t }); }
       if (queued === 0) for (let i = idle.length - 1; i >= 0 && alive > pool.min; i--) if (t - idle[i].since >= pool.idle) { billed += t - idle[i].born; idle.splice(i, 1); alive--; }
-      if (t < DAY || finished < total) push(t + 30, 'tick');
+      if (t < DAY || finished < total) push(t + TICK_S, 'tick');
     }
     else if (type === 'done') {
       const job = d; const b = job.b; running[b.team]--; busy--; job.r.since = t; idle.push(job.r); b.busy += job.dur;
-      if (job.kind === 'build') { populated.add(`${b.team}:${b.ver}`); for (let s = 0; s < S; s++) { const imb = b.imb[s]; enqueue({ b, kind: 'test', shard: s, work: Math.floor(TEAMS[b.team].tests / S * (1 + imb)) + (S > 1 ? 15 : 0), attempt: 0 }, t); } }
+      if (job.kind === 'build') { populated.add(`${b.team}:${b.ver}`); for (let s = 0; s < S; s++) { const imb = b.imb[s]; enqueue({ b, kind: 'test', shard: s, work: Math.floor(TEAMS[b.team].tests / S * (1 + imb)) + (S > 1 ? SHARD_OVERHEAD_S : 0), attempt: 0 }, t); } }
       else if (job.kind === 'test') {
         const flakeHit = flakyOn && job.shard === 0 && !(o.flaky === 'quar' && quarantined) && b.d[job.attempt] < FLAKE;
         const realHit = b.c.broken && job.shard === (b.c.seed % S);
         const fail = flakeHit || realHit;
-        if (fail && retryOn && job.attempt < 2) { stats.retried++; stats.wasted += job.dur; b.retried = true; if (flakeHit && !realHit) job.pendingFlake = true; const nj = { b, kind: 'test', shard: job.shard, work: job.work, attempt: job.attempt + 1, fromFlake: flakeHit && !realHit || job.fromFlake }; enqueue(nj, t); }
+        if (fail && retryOn && job.attempt < MAX_RETRIES) { stats.retried++; stats.wasted += job.dur; b.retried = true; if (flakeHit && !realHit) job.pendingFlake = true; const nj = { b, kind: 'test', shard: job.shard, work: job.work, attempt: job.attempt + 1, fromFlake: flakeHit && !realHit || job.fromFlake }; enqueue(nj, t); }
         else {
-          if (!fail && job.fromFlake && job.attempt > 0) { stats.detections++; if (o.flaky === 'quar' && stats.detections >= 3 && !quarantined) { quarantined = true; stats.quarAt = stats.builds; } }
+          if (!fail && job.fromFlake && job.attempt > 0) { stats.detections++; if (o.flaky === 'quar' && stats.detections >= QUARANTINE_AFTER && !quarantined) { quarantined = true; stats.quarAt = stats.builds; } }
           if (fail) { b.failed = true; if (realHit) b.real = true; }
-          if (--b.left === 0) { if (b.failed) finishBuild(b, t, false); else enqueue({ b, kind: 'pkg', work: 60, attempt: 0 }, t); }
+          if (--b.left === 0) { if (b.failed) finishBuild(b, t, false); else enqueue({ b, kind: 'pkg', work: PKG_WORK_S, attempt: 0 }, t); }
         }
       }
       else { finishBuild(b, t, true); }
@@ -151,35 +170,38 @@ function simulate(o: Opts) { // o: pool, cache(bool), shards, fair(bool), flaky:
     const q = <T extends HTMLElement>(s: string) => root.querySelector<T>(s)!;
     const sel = (s: string) => q<HTMLSelectElement>(s).value;
     const num = (n: number) => Math.round(n).toLocaleString('en-US');
-    const secs = (n: number) => (n < 120 ? `${Math.round(n)} s` : `${(n / 60).toFixed(1)} min`);
+    const SECS_UNTIL_MIN = 120; // show seconds below 2 minutes
+    const P50 = 0.5, P95 = 0.95;
+    const BAD = { waitP95S: 300, buildP95S: 1800, idleShare: 0.5, trust: 0.9, wasteShare: 0.04, smallWaitS: 120 }; // red thresholds
+    const secs = (n: number) => (n < SECS_UNTIL_MIN ? `${Math.round(n)} s` : `${(n / MINUTE).toFixed(1)} min`);
     const usd = (n: number) => `$${Math.round(n).toLocaleString('en-US')}`;
     const color = (id: string, bad: boolean) => q<HTMLElement>(id).style.setProperty('--c', bad ? 'var(--bad)' : 'var(--good)');
     function draw() {
       const o: Opts = { pool: sel('[data-pool]'), cache: sel('[data-cache]') === '1', shards: Number(sel('[data-shards]')), fair: sel('[data-fair]') === '1', flaky: sel('[data-flaky]') };
       const r = simulate(o); const s = r.stats;
-      const p50 = pct(r.waits, 0.5); const p95 = pct(r.waits, 0.95); const small = pct(r.waitsSmall, 0.95); const big = pct(r.waitsBig, 0.95);
+      const p50 = pct(r.waits, P50); const p95 = pct(r.waits, P95); const small = pct(r.waitsSmall, P95); const big = pct(r.waitsBig, P95);
       const cost = r.billed * PRICE; const busy = r.busySec * PRICE; const idleCost = cost - busy; const idleShare = idleCost / cost;
       const red = s.redReal + s.redFalse; const trust = red === 0 ? 1 : s.redReal / red;
       q('[data-o1]').textContent = `median ${secs(p50)} · p95 ${secs(p95)}`;
       q('[data-n1]').textContent = `p95 for the five small teams ${secs(small)}, for the monorepo ${secs(big)}`;
-      q('[data-o2]').textContent = `median ${secs(pct(r.durs, 0.5))} · p95 ${secs(pct(r.durs, 0.95))}`;
-      q('[data-n2]').textContent = `${num(s.builds)} builds, the last result at minute ${num(r.T / 60)}`;
+      q('[data-o2]').textContent = `median ${secs(pct(r.durs, P50))} · p95 ${secs(pct(r.durs, P95))}`;
+      q('[data-n2]').textContent = `${num(s.builds)} builds, the last result at minute ${num(r.T / MINUTE)}`;
       q('[data-o3]').textContent = `${usd(cost)}`;
-      q('[data-n3]').textContent = `busy ${num(r.busySec / 60)} min (${usd(busy)}) plus idle ${num(r.billed / 60 - r.busySec / 60)} min (${usd(idleCost)}), ${Math.round(idleShare * 100)}% of paid time idle`;
+      q('[data-n3]').textContent = `busy ${num(r.busySec / MINUTE)} min (${usd(busy)}) plus idle ${num(r.billed / MINUTE - r.busySec / MINUTE)} min (${usd(idleCost)}), ${Math.round(idleShare * 100)}% of paid time idle`;
       q('[data-o4]').textContent = o.cache ? `${Math.round((100 * r.hits) / r.lookups)}%` : '0% (cache off)';
       q('[data-n4]').textContent = o.cache ? `${num(r.hits)} of ${num(r.lookups)} dependency restores were hits` : `all ${num(r.lookups)} restores downloaded from scratch`;
       q('[data-o5]').textContent = `${Math.round(trust * 100)}% real`;
       q('[data-n5]').textContent = o.flaky === 'none' ? `${s.redReal} red builds, all real bugs` : `${s.redReal} real red, ${s.redFalse} false red, ${s.hidden} green only after a retry`;
       q('[data-o6]').textContent = `${Math.round((100 * s.wasted) / r.busySec)}% of busy time`;
       q('[data-n6]').textContent = `${num(s.retried)} job retries, ${num(s.reruns)} developer reruns` + (o.flaky === 'quar' && s.quarAt > 0 ? `, test quarantined after build ${s.quarAt}` : '');
-      color('[data-b1]', p95 > 300); color('[data-b2]', pct(r.durs, 0.95) > 1800); color('[data-b3]', idleShare > 0.5);
-      color('[data-b4]', !o.cache); color('[data-b5]', trust < 0.9); color('[data-b6]', s.wasted / r.busySec > 0.04);
-      const bad = p95 > 300 || trust < 0.9 || idleShare > 0.5;
+      color('[data-b1]', p95 > BAD.waitP95S); color('[data-b2]', pct(r.durs, P95) > BAD.buildP95S); color('[data-b3]', idleShare > BAD.idleShare);
+      color('[data-b4]', !o.cache); color('[data-b5]', trust < BAD.trust); color('[data-b6]', s.wasted / r.busySec > BAD.wasteShare);
+      const bad = p95 > BAD.waitP95S || trust < BAD.trust || idleShare > BAD.idleShare;
       const out = q('[data-verdict]'); out.classList.toggle('bad', bad);
       const parts: string[] = [];
-      parts.push(p95 > 300 ? `Runners are scarce in the bursts: the p95 queue wait is ${secs(p95)}.` : `The pool keeps up: the p95 queue wait is ${secs(p95)}.`);
+      parts.push(p95 > BAD.waitP95S ? `Runners are scarce in the bursts: the p95 queue wait is ${secs(p95)}.` : `The pool keeps up: the p95 queue wait is ${secs(p95)}.`);
       if (o.fair && small < p95) parts.push(`Fair share protects the small teams (p95 ${secs(small)}) while the monorepo that caused the burst waits ${secs(big)}.`);
-      else if (!o.fair && small > 120) parts.push(`First come, first served makes the small teams wait ${secs(small)} behind the monorepo bursts.`);
+      else if (!o.fair && small > BAD.smallWaitS) parts.push(`First come, first served makes the small teams wait ${secs(small)} behind the monorepo bursts.`);
       parts.push(`The bill is ${usd(cost)}, of which ${usd(idleCost)} is idle time.`);
       if (o.flaky === 'off') parts.push(`The flaky test turned ${s.redFalse} good builds red, so only ${Math.round(trust * 100)}% of red builds are real and developers reran ${s.reruns}.`);
       else if (o.flaky === 'retry') parts.push(`Auto-retry hides the flaky test (${Math.round(trust * 100)}% of red builds are real), but ${s.hidden} builds passed only after a retry and nobody is told.`);

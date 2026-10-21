@@ -74,12 +74,20 @@ import PlaygroundShell from '../components/PlaygroundShell.astro';
   };
   const PRE = [10, 10, 10]; const POST = 5; const BACKOFF = 25; const USER = 2000; const MIN_LEFT = 50; const RETRY_MIN = 100;
   const N = 400; const GAP = 50; const SEED = 7; const POOL_C = 30;
+  const B_EXTRA = { min: 900, range: 600 }; // ms B adds when it is slow
+  const MAX_ATTEMPTS = 3; // DB attempts drawn per request (first try plus up to two retries)
+  const DB_MS = { fast: 20, fastRange: 60, slow: 2500, slowRange: 6500 }; // DB latency: 20-80 ms normally, 2.5-9 s when slow
+  const LAST_HOP = 2; const DB_HOP = 3; // hop indexes: A, B, C, then the DB
+  const GANTT_ROWS = 6; // three services plus up to three DB tries
+  const AXIS = { minMs: 2500, stepMs: 500 }; // timeline scale
+  const MS_PER_S = 1000;
 
   function makeRequests(n: number, gap: number, seed: number): Req[] {
+    // Park-Miller minimal standard LCG
     let x = seed; const r = () => (x = (x * 48271) % 2147483647) / 2147483647; const out: Req[] = [];
     for (let i = 0; i < n; i++) {
-      const bSlow = r(); const bExtra = 900 + Math.floor(r() * 600); const at: Attempt[] = [];
-      for (let k = 0; k < 3; k++) { const s = r(); const a = r(); at.push({ s, fast: 20 + Math.floor(a * 60), slow: 2500 + Math.floor(a * 6500) }); }
+      const bSlow = r(); const bExtra = B_EXTRA.min + Math.floor(r() * B_EXTRA.range); const at: Attempt[] = [];
+      for (let k = 0; k < MAX_ATTEMPTS; k++) { const s = r(); const a = r(); at.push({ s, fast: DB_MS.fast + Math.floor(a * DB_MS.fastRange), slow: DB_MS.slow + Math.floor(a * DB_MS.slowRange) }); }
       out.push({ id: i, t0: i * gap, bSlow, bExtra, at });
     }
     return out;
@@ -95,15 +103,15 @@ import PlaygroundShell from '../components/PlaygroundShell.astro';
       let t = start + PRE[h] + (h === 1 ? bExtra : 0);
       if (t > cutoff) { iv.end = cutoff; return iv; }
       let ok = false;
-      if (h < 2) {
+      if (h < LAST_HOP) {
         const giveUp = Math.min(dl ? D : t + m.t[h], cutoff);
         const c = run(h + 1, t, cutFor(giveUp));
         if (c.ok && c.end <= giveUp) { ok = true; t = c.end; } else { if (c.end > giveUp) c.callerLeft = giveUp; t = Math.min(c.end, giveUp); }
       } else {
         for (let i = 0; i <= cfg.retries; i++) {
-          const s = t; const giveUp = Math.min(dl ? Math.min(s + m.t[2], D) : s + m.t[2], cutoff);
+          const s = t; const giveUp = Math.min(dl ? Math.min(s + m.t[LAST_HOP], D) : s + m.t[LAST_HOP], cutoff);
           const a = req.at[i]; const nat = s + (a.s < cfg.slowShare ? a.slow : a.fast);
-          const db = mk(3, s); db.end = Math.min(nat, cutFor(giveUp));
+          const db = mk(DB_HOP, s); db.end = Math.min(nat, cutFor(giveUp));
           if (nat <= giveUp) { db.ok = true; ok = true; t = nat; break; }
           if (db.end > giveUp) db.callerLeft = giveUp;
           t = giveUp;
@@ -130,7 +138,7 @@ import PlaygroundShell from '../components/PlaygroundShell.astro';
       if (r.good) good++;
       for (const iv of r.ivs) {
         const o = Math.max(0, iv.end - iv.callerLeft); if (o > 0) { orphanCalls++; orphanMs += o; }
-        if (iv.end > iv.start) { ev.push([iv.start, 1], [iv.end, -1]); if (iv.hop === 2) evC.push([iv.start, 1], [iv.end, -1]); }
+        if (iv.end > iv.start) { ev.push([iv.start, 1], [iv.end, -1]); if (iv.hop === LAST_HOP) evC.push([iv.start, 1], [iv.end, -1]); }
       }
     }
     const rs = res.map((r) => r.resp).sort((a, b) => a - b);
@@ -153,7 +161,7 @@ import PlaygroundShell from '../components/PlaygroundShell.astro';
       const tr = document.createElement('tr'); const th = document.createElement('th'); th.scope = 'row'; th.textContent = MODES[id].label; tr.append(th);
       cmpCells[id] = [0, 1, 2, 3].map(() => { const td = document.createElement('td'); tr.append(td); return td; }); tr.dataset.mode = id; cmpBody.append(tr);
     });
-    const rows = Array.from({ length: 6 }, () => {
+    const rows = Array.from({ length: GANTT_ROWS }, () => {
       const row = document.createElement('div'); row.className = 'td-row';
       const label = document.createElement('span'); label.className = 'pg-mono td-label';
       const track = document.createElement('div'); track.className = 'td-track';
@@ -176,9 +184,9 @@ import PlaygroundShell from '../components/PlaygroundShell.astro';
       if (first) { const p = all.res.find(isProblem); selected = p ? all.res.indexOf(p) : 0; first = false; q<HTMLInputElement>('[data-req]').value = String(selected); }
       q('[data-reqval]').textContent = String(selected);
       q('[data-good]').textContent = `${((100 * all.good) / all.n).toFixed(1)}% (${all.good} of ${all.n})`;
-      q('[data-goodnote]').textContent = `${all.n - all.good} missed the user's 2 s`;
+      q('[data-goodnote]').textContent = `${all.n - all.good} missed the user's ${USER / MS_PER_S} s`;
       q('[data-orph]').textContent = String(all.orphanCalls);
-      q('[data-orphnote]').textContent = `${(all.orphanMs / 1000).toFixed(1)} thread-seconds spent after the caller left`;
+      q('[data-orphnote]').textContent = `${(all.orphanMs / MS_PER_S).toFixed(1)} thread-seconds spent after the caller left`;
       q('[data-peak]').textContent = String(all.peak);
       const full = all.peakC >= POOL_C;
       q('[data-peaknote]').textContent = `threads and connections; C alone peaks at ${all.peakC} of ${POOL_C} workers${full ? ': pool exhausted' : ''}`;
@@ -194,13 +202,13 @@ import PlaygroundShell from '../components/PlaygroundShell.astro';
     }
     function drawGantt(c: Cfg) {
       const r = simulate(c, REQS[selected]); const t0 = REQS[selected].t0;
-      const maxEnd = Math.max(...r.ivs.map((iv) => iv.end)) - t0; const scale = Math.max(2500, Math.ceil(maxEnd / 500) * 500);
-      q('[data-axis]').textContent = `${scale} ms from arrival; the line marks the user leaving at 2000 ms`;
+      const maxEnd = Math.max(...r.ivs.map((iv) => iv.end)) - t0; const scale = Math.max(AXIS.minMs, Math.ceil(maxEnd / AXIS.stepMs) * AXIS.stepMs);
+      q('[data-axis]').textContent = `${scale} ms from arrival; the line marks the user leaving at ${USER} ms`;
       const pct = (v: number) => `${Math.max(0, Math.min(100, ((v - t0) / scale) * 100)).toFixed(2)}%`;
       const lines: string[] = []; let dbn = 0;
       rows.forEach((rw, i) => {
         const iv = r.ivs[i]; rw.row.hidden = !iv; if (!iv) return;
-        const name = iv.hop === 3 ? `DB try ${++dbn}` : HOPNAME[iv.hop]; rw.label.textContent = name;
+        const name = iv.hop === DB_HOP ? `DB try ${++dbn}` : HOPNAME[iv.hop]; rw.label.textContent = name;
         const splitAt = Math.min(iv.end, iv.callerLeft); const orph = Math.max(0, iv.end - iv.callerLeft);
         const ok = rw.ok; ok.style.left = pct(iv.start); ok.style.width = `calc(${pct(splitAt)} - ${pct(iv.start)})`; ok.style.background = HOPCOL[iv.hop];
         rw.bad.style.left = pct(Math.max(iv.start, splitAt)); rw.bad.style.width = `calc(${pct(iv.end)} - ${pct(Math.max(iv.start, splitAt))})`; rw.bad.hidden = orph <= 0;
@@ -209,7 +217,7 @@ import PlaygroundShell from '../components/PlaygroundShell.astro';
       });
       const v = q('[data-verdict]');
       v.classList.toggle('bad', !r.good);
-      v.textContent = r.good ? `Request ${selected}: answered in ${fmtMs(r.resp)}, inside the user's 2 s.` : r.late ? `Request ${selected}: A answered at ${fmtMs(r.resp)}, but the user left at 2 s. The whole chain's work was wasted.` : `Request ${selected}: failed at ${fmtMs(r.resp)} ${r.resp >= USER ? '(the user already left)' : '(an error or degraded answer reached the user in time)'}.`;
+      v.textContent = r.good ? `Request ${selected}: answered in ${fmtMs(r.resp)}, inside the user's ${USER / MS_PER_S} s.` : r.late ? `Request ${selected}: A answered at ${fmtMs(r.resp)}, but the user left at ${USER / MS_PER_S} s. The whole chain's work was wasted.` : `Request ${selected}: failed at ${fmtMs(r.resp)} ${r.resp >= USER ? '(the user already left)' : '(an error or degraded answer reached the user in time)'}.`;
       q('[data-spans]').textContent = lines.join('\n');
       gantt.setAttribute('aria-label', `Timeline of request ${selected}: ${lines.join('; ')}`);
     }

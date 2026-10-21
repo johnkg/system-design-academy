@@ -70,6 +70,12 @@ import PlaygroundShell from '../../components/PlaygroundShell.astro';
     const TICKS = 120, CRASH_T = 20, PAUSE_T = 60, C = 3, S = 9, KEYS = 10000, VN = 16, FAN = 3, K_IND = 3, PIG = 24;
     type Upd = { j: number; type: number; inc: number; left: number };
     type Params = { n: number; proto: string; det: string; thr: number; loss: number; pause: number };
+    const EWMA_ALPHA = 0.1; // weight of the newest heartbeat gap in the mean
+    const LOG10_E = 0.4342945; // phi for exponential gaps = (silence / mean) * log10(e)
+    const RETRANSMIT_X = 4; // SWIM piggybacks each update 4 * log10(n + 1) times
+    const MSG_BYTES = { header: 60, update: 16, counter: 12 }; // bytes per message, per piggybacked update, per gossiped counter
+    const BYTES_PER_KB = 1000;
+    // integer hash (murmur3-style finalizer)
     const mix = (x: number): number => { let h = Math.imul(x ^ 0x9e3779b9, 2246822519) >>> 0; h ^= h >>> 15; h = Math.imul(h, 3266489917) >>> 0; h ^= h >>> 13; h = Math.imul(h, 668265263) >>> 0; h ^= h >>> 16; return h >>> 0; };
     const ringCache: Record<number, number[]> = {};
     function ownership(n: number): number[] {
@@ -88,7 +94,8 @@ import PlaygroundShell from '../../components/PlaygroundShell.astro';
     function simulate(p: Params) {
       const { n, proto, det, thr, loss, pause } = p;
       let seed = 12345 + n;
-      const rnd = (): number => { seed = (seed + 0x6D2B79F5) | 0; let t = Math.imul(seed ^ (seed >>> 15), 1 | seed); t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t; return ((t ^ (t >>> 14)) >>> 0) / 4294967296; };
+      const rnd = (): number => { // mulberry32
+        seed = (seed + 0x6D2B79F5) | 0; let t = Math.imul(seed ^ (seed >>> 15), 1 | seed); t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t; return ((t ^ (t >>> 14)) >>> 0) / 4294967296; };
       const lost = (): boolean => rnd() < loss;
       const crashed = (x: number, t: number): boolean => x === C && t >= CRASH_T;
       const paused = (x: number, t: number): boolean => x === S && t >= PAUSE_T && t < PAUSE_T + pause;
@@ -99,8 +106,8 @@ import PlaygroundShell from '../../components/PlaygroundShell.astro';
       const flagged = new Uint8Array(n), ringOut = new Uint8Array(n);
       const crashSeen: number[] = [], slowSeen: number[] = [];
       const last = new Int32Array(n * n), mean = new Float64Array(n * n).fill(1), cnt = new Int32Array(n * n);
-      const hit = (o: number, j: number, t: number) => { const a = o * n + j; const gap = t - last[a]; if (gap > 0) mean[a] = Math.max(1, 0.9 * mean[a] + 0.1 * gap); last[a] = t; };
-      const isDead = (o: number, j: number, t: number): boolean => { const el = t - last[o * n + j]; return det === 'phi' ? (el / mean[o * n + j]) * 0.4342945 > thr : el > thr; };
+      const hit = (o: number, j: number, t: number) => { const a = o * n + j; const gap = t - last[a]; if (gap > 0) mean[a] = Math.max(1, (1 - EWMA_ALPHA) * mean[a] + EWMA_ALPHA * gap); last[a] = t; };
+      const isDead = (o: number, j: number, t: number): boolean => { const el = t - last[o * n + j]; return det === 'phi' ? (el / mean[o * n + j]) * LOG10_E > thr : el > thr; };
       const judge = (o: number, t: number) => {
         for (let j = 0; j < n; j++) if (j !== o) {
           const a = o * n + j; const d = isDead(o, j, t) ? 2 : 0;
@@ -111,7 +118,7 @@ import PlaygroundShell from '../../components/PlaygroundShell.astro';
       // SWIM state
       const known = new Int32Array(n * n), since = new Int32Array(n * n), selfInc = new Int32Array(n), refute = new Uint8Array(n);
       const buf: Upd[][] = Array.from({ length: n }, () => []);
-      const R = 4 * Math.ceil(Math.log10(n + 1));
+      const R = RETRANSMIT_X * Math.ceil(Math.log10(n + 1));
       const perm = Array.from({ length: n }, () => ({ list: [] as number[], i: 0 }));
       const enqueue = (x: number, j: number, type: number, inc: number) => { const e = buf[x].find((u) => u.j === j); if (e) { e.type = type; e.inc = inc; e.left = R; } else buf[x].push({ j, type, inc, left: R }); };
       const apply = (x: number, j: number, type: number, inc: number, t: number) => {
@@ -125,21 +132,21 @@ import PlaygroundShell from '../../components/PlaygroundShell.astro';
       const send = (from: number, to: number, t: number): boolean => {
         msgs++; const pg = take(from);
         const a0 = from * n + to; if (view[a0] === 1 && !pg.some((u) => u.j === to)) pg.unshift({ j: to, type: 1, inc: known[a0], left: 0 }); // buddy system: tell a suspect that it is suspected
-        bytes += 60 + 16 * pg.length;
+        bytes += MSG_BYTES.header + MSG_BYTES.update * pg.length;
         if (lost()) return false;
         pg.forEach((u) => apply(to, u.j, u.type, u.inc, t));
         return true;
       };
       for (let t = 0; t < TICKS; t++) {
         if (proto === 'a2a') {
-          for (let s = 0; s < n; s++) if (running(s, t)) for (let o = 0; o < n; o++) if (o !== s) { msgs++; bytes += 60; if (!lost() && !crashed(o, t)) hit(o, s, t); }
+          for (let s = 0; s < n; s++) if (running(s, t)) for (let o = 0; o < n; o++) if (o !== s) { msgs++; bytes += MSG_BYTES.header; if (!lost() && !crashed(o, t)) hit(o, s, t); }
           for (let o = 0; o < n; o++) if (running(o, t)) judge(o, t);
         } else if (proto === 'gossip') {
           for (let s = 0; s < n; s++) if (running(s, t)) { cnt[s * n + s]++; last[s * n + s] = t; }
           const snap = cnt.slice();
           for (let s = 0; s < n; s++) if (running(s, t)) for (let f = 0; f < FAN; f++) {
             let o = Math.floor(rnd() * (n - 1)); if (o >= s) o++;
-            msgs++; bytes += 60 + 12 * n;
+            msgs++; bytes += MSG_BYTES.header + MSG_BYTES.counter * n;
             if (lost() || crashed(o, t)) continue;
             for (let j = 0; j < n; j++) { const v = snap[s * n + j]; const a = o * n + j; if (v > cnt[a]) { cnt[a] = v; hit(o, j, t); } }
           }
@@ -180,7 +187,7 @@ import PlaygroundShell from '../../components/PlaygroundShell.astro';
         crashSeen.push(cs); slowSeen.push(ss);
       }
       let wrong = 0; for (let j = 0; j < n; j++) wrong += flagged[j];
-      return { detect: detectAt, wrong, accus, msgsPerNode: msgs / n / TICKS, kbPerNode: bytes / n / TICKS / 1000, ringEvents, moved, maxMis, crashSeen, slowSeen, flagged };
+      return { detect: detectAt, wrong, accus, msgsPerNode: msgs / n / TICKS, kbPerNode: bytes / n / TICKS / BYTES_PER_KB, ringEvents, moved, maxMis, crashSeen, slowSeen, flagged };
     }
     // SIM END
 
@@ -188,7 +195,10 @@ import PlaygroundShell from '../../components/PlaygroundShell.astro';
     // All-to-all is O(n^2) per round, so it is simulated with at most A2A_MAX nodes to keep the page responsive.
     // Its message cost does not depend on chance, so it is computed exactly for the chosen size.
     const A2A_MAX = 64;
-    const a2aCost = (n: number, pause: number) => { let s = 0; for (let t = 0; t < TICKS; t++) s += n - (t >= CRASH_T ? 1 : 0) - (t >= PAUSE_T && t < PAUSE_T + pause ? 1 : 0); const msgs = s * (n - 1); return { msgsPerNode: msgs / n / TICKS, kbPerNode: (msgs * 60) / n / TICKS / 1000 }; };
+    const CACHE_MAX = 40; // simulated results kept before the cache is cleared
+    const MISROUTE_OK = 0.0005; // misrouted share below this counts as healthy
+    const CHART = { xPerTick: 5, y0: 125, h: 120 }; // svg px
+    const a2aCost = (n: number, pause: number) => { let s = 0; for (let t = 0; t < TICKS; t++) s += n - (t >= CRASH_T ? 1 : 0) - (t >= PAUSE_T && t < PAUSE_T + pause ? 1 : 0); const msgs = s * (n - 1); return { msgsPerNode: msgs / n / TICKS, kbPerNode: (msgs * MSG_BYTES.header) / n / TICKS / BYTES_PER_KB }; };
     const cells = q('[data-cells]');
     for (let i = 0; i < MAXN; i++) { const c = document.createElement('div'); c.className = 'cmb-cell'; cells.append(c); }
     const cellEls = Array.from(cells.children) as HTMLElement[];
@@ -210,13 +220,13 @@ import PlaygroundShell from '../../components/PlaygroundShell.astro';
       setMode();
       const proto = sel('[data-proto]'); const det = proto === 'swim' ? 'fixed' : sel('[data-det]'); const n = Number(sel('[data-n]'));
       const thr = num('[data-thr]'); const loss = num('[data-loss]') / 100; const pause = num('[data-pause]');
-      q('[data-thrval]').textContent = det === 'phi' ? `phi ${thr} (about ${Math.round(thr / 0.4342945)} s of silence on a steady link)` : `${thr} s`;
+      q('[data-thrval]').textContent = det === 'phi' ? `phi ${thr} (about ${Math.round(thr / LOG10_E)} s of silence on a steady link)` : `${thr} s`;
       q('[data-thrlabel]').textContent = proto === 'swim' ? 'Suspicion timeout (seconds)' : det === 'phi' ? 'Phi threshold' : 'Silence before a node is declared dead (seconds)';
       q('[data-lossval]').textContent = `${Math.round(loss * 100)}%`; q('[data-pauseval]').textContent = pause === 0 ? 'none' : `${pause} s`;
       const simN = proto === 'a2a' ? Math.min(n, A2A_MAX) : n;
       const key = [proto, det, simN, thr, loss, pause].join('|');
       let r = cache.get(key);
-      if (!r) { r = simulate({ n: simN, proto, det, thr, loss, pause }); if (cache.size > 40) cache.clear(); cache.set(key, r); }
+      if (!r) { r = simulate({ n: simN, proto, det, thr, loss, pause }); if (cache.size > CACHE_MAX) cache.clear(); cache.set(key, r); }
       const cost = simN < n ? a2aCost(n, pause) : r;
       const healthy = simN - 1; const slowFlag = r.flagged[S] === 1; const otherWrong = r.wrong - (slowFlag ? 1 : 0);
       const maxSlow = Math.max(...r.slowSeen);
@@ -226,7 +236,7 @@ import PlaygroundShell from '../../components/PlaygroundShell.astro';
       q('[data-n2]').textContent = `${fmt(r.accus)} accusations in all. ${pause > 0 ? `The frozen node was called dead by up to ${maxSlow} nodes.` : 'No node was frozen.'}`;
       q('[data-o3]').textContent = cost.msgsPerNode.toFixed(1);
       q('[data-n3]').textContent = `${cost.kbPerNode.toFixed(1)} KB/s out of each node, ${fmt(cost.msgsPerNode * n)} messages a second in the whole cluster.`;
-      q('[data-o4]').textContent = `${fmt(r.moved)} of 10,000 (${(r.moved / 100).toFixed(1)}%)`;
+      q('[data-o4]').textContent = `${fmt(r.moved)} of ${fmt(KEYS)} (${(r.moved / (KEYS / 100)).toFixed(1)}%)`;
       q('[data-n4]').textContent = r.ringEvents > 0 ? `${r.ringEvents} needless removal${r.ringEvents > 1 ? 's' : ''} from the ring, with the keys moved out and back.` : 'The ring was never changed for a healthy node.';
       q('[data-o5]').textContent = `${(r.maxMis * 100).toFixed(1)}%`;
       q('[data-n5]').textContent = 'Share of requests sent away from a healthy owner, because some nodes believe it is dead.';
@@ -234,11 +244,11 @@ import PlaygroundShell from '../../components/PlaygroundShell.astro';
       q<HTMLElement>('[data-b2]').style.setProperty('--c', r.wrong === 0 ? 'var(--good)' : 'var(--bad)');
       q<HTMLElement>('[data-b3]').style.setProperty('--c', 'var(--accent)');
       q<HTMLElement>('[data-b4]').style.setProperty('--c', r.ringEvents === 0 ? 'var(--good)' : 'var(--bad)');
-      q<HTMLElement>('[data-b5]').style.setProperty('--c', r.maxMis < 0.0005 ? 'var(--good)' : 'var(--bad)');
-      const px = (t: number) => (t * 5).toFixed(0); const py = (v: number) => (125 - (v / healthy) * 120).toFixed(1);
+      q<HTMLElement>('[data-b5]').style.setProperty('--c', r.maxMis < MISROUTE_OK ? 'var(--good)' : 'var(--bad)');
+      const px = (t: number) => (t * CHART.xPerTick).toFixed(0); const py = (v: number) => (CHART.y0 - (v / healthy) * CHART.h).toFixed(1);
       q('[data-crashline]').setAttribute('points', r.crashSeen.map((v, t) => `${px(t)},${py(v)}`).join(' '));
       q('[data-slowline]').setAttribute('points', r.slowSeen.map((v, t) => `${px(t)},${py(v)}`).join(' '));
-      const bar = q('[data-pausebar]'); bar.setAttribute('x', String(PAUSE_T * 5)); bar.setAttribute('width', String(pause * 5));
+      const bar = q('[data-pausebar]'); bar.setAttribute('x', String(PAUSE_T * CHART.xPerTick)); bar.setAttribute('width', String(pause * CHART.xPerTick));
       q('[data-chart]').setAttribute('aria-label', `Nodes that think the crashed node is dead: ${r.crashSeen[TICKS - 1]} of ${healthy} at the end. Nodes that think the frozen node is dead: at most ${maxSlow}.`);
       cellEls.forEach((el, i) => {
         el.hidden = i >= simN;
@@ -248,7 +258,7 @@ import PlaygroundShell from '../../components/PlaygroundShell.astro';
       });
       cells.setAttribute('aria-label', `The cluster at the end of the run: 1 crashed node and ${r.wrong} healthy nodes that were declared dead.`);
       const out = q('[data-verdict]');
-      const crashText = r.detect >= 0 ? `The crash at 20 s was known to all ${healthy} other nodes after ${r.detect} s.` : 'The crash had not reached every node by the end of the run.';
+      const crashText = r.detect >= 0 ? `The crash at ${CRASH_T} s was known to all ${healthy} other nodes after ${r.detect} s.` : 'The crash had not reached every node by the end of the run.';
       const slowText = pause > 0 ? (slowFlag ? `The frozen node, paused ${pause} s, was declared dead by up to ${maxSlow} nodes.` : `The frozen node, paused ${pause} s, was never declared dead.`) : '';
       const lossText = otherWrong > 0 ? `${otherWrong} other healthy node${otherWrong > 1 ? 's were' : ' was'} accused only because packets were lost.` : '';
       const ringText = r.ringEvents > 0 ? `The ring moved ${fmt(r.moved)} keys for nothing.` : 'No data was moved for a healthy node.';

@@ -80,6 +80,15 @@ import PlaygroundShell from '../../components/PlaygroundShell.astro';
     const q = <T extends HTMLElement | SVGElement>(s: string) => root.querySelector<T>(s)!;
     const L = 500, MU = 1500, QMAX = 600, TICKS = 60, F0 = 10, F1 = 30, PROBES = 20, SVC = 20, OWN = 5, BUDGET = 0.2;
     const BACKOFF = [25, 50, 100];
+    const MAX_RETRIES = 3;
+    const BISECT_STEPS = 40; // bisection steps to find the retry share that fits the budget
+    const FAST_FAIL_MS = { blocked: 0.5, err: 3, rej: 1 }; // time to fail when the breaker blocks, C errors, or C's queue rejects
+    const EPS = 1e-9;
+    const SLOW_FACTOR = 4; // a slow C serves 4x fewer requests, each 4x slower
+    const ERR_RATE = 0.3; // share of requests a failing C errors
+    const BRK = { minCalls: 20, failShare: 0.5, firstOpenS: 2, maxOpenS: 16, resetS: 10, closeOk: 0.8 }; // breaker opens at 50% failures over 20+ calls, open time doubles from 2 s to 16 s if it trips again within 10 s, closes once 80% of probes succeed
+    const LONG_AGO = -99;
+    const MS_PER_S = 1000;
     const PROXY: Record<string, number> = { lib: 0.1, ambient: 0.7, sidecar: 1.0 };
     const TIMEOUT: Record<string, number> = { none: 30000, t250: 250, t1000: 1000 };
     const clamp = (x: number, a: number, b: number) => Math.max(a, Math.min(b, x));
@@ -89,12 +98,12 @@ import PlaygroundShell from '../../components/PlaygroundShell.astro';
 
     // The outcome of one hop that retries: success probability, number of tries made, mean times.
     function level(att: Att, retry: string) {
-      const R = retry === 'none' ? 0 : 3; const f = 1 - att.s; const fr = Math.max(0, f - (att.nr || 0)); let g = 1;
+      const R = retry === 'none' ? 0 : MAX_RETRIES; const f = 1 - att.s; const fr = Math.max(0, f - (att.nr || 0)); let g = 1;
       if (retry === 'budget') {
         const extra = (x: number) => { let sum = 0, p = 1; for (let k = 1; k <= R; k++) { p *= x * fr; sum += p; } return sum; };
-        if (extra(1) > BUDGET) { let lo = 0, hi = 1; for (let i = 0; i < 40; i++) { const m = (lo + hi) / 2; if (extra(m) > BUDGET) hi = m; else lo = m; } g = lo; }
+        if (extra(1) > BUDGET) { let lo = 0, hi = 1; for (let i = 0; i < BISECT_STEPS; i++) { const m = (lo + hi) / 2; if (extra(m) > BUDGET) hi = m; else lo = m; } g = lo; }
       }
-      const back = (k: number) => (retry === 'budget' ? BACKOFF[Math.min(k, 2)] : 0);
+      const back = (k: number) => (retry === 'budget' ? BACKOFF[Math.min(k, BACKOFF.length - 1)] : 0);
       let S = 0, tries = 0, tSucc = 0, tFail = 0, pFail = 0, reach = 1, delay = 0;
       for (let k = 0; k <= R; k++) {
         tries += reach; S += reach * att.s; tSucc += reach * att.s * (delay + att.dOK);
@@ -107,12 +116,12 @@ import PlaygroundShell from '../../components/PlaygroundShell.astro';
     function simulate(cfg: Cfg) {
       const H = cfg.depth - 1, T = TIMEOUT[cfg.timeout], pi = PROXY[cfg.proxy];
       let b = 0; let prev: St = { ok: 1, to: 0, err: 0, rej: 0, dOK: SVC, block: 0 };
-      let brk = { open: false, since: 0, trips: 0, dur: 2 }; let closedAt = -99;
+      let brk = { open: false, since: 0, trips: 0, dur: BRK.firstOpenS }; let closedAt = LONG_AGO;
       const rows: { t: number; load: number; cap: number; success: number; lat: number; amp: number; open: boolean }[] = [];
       const tree = (st: St) => {
         const att0: Att = {
           s: (1 - st.block) * st.ok, nr: st.block, dOK: st.dOK + pi,
-          dF: st.block * 0.5 + ((1 - st.block) * (st.to * (T + pi) + st.err * (3 + pi) + st.rej * (1 + pi))) / Math.max(1e-9, st.to + st.err + st.rej),
+          dF: st.block * FAST_FAIL_MS.blocked + ((1 - st.block) * (st.to * (T + pi) + st.err * (FAST_FAIL_MS.err + pi) + st.rej * (FAST_FAIL_MS.rej + pi))) / Math.max(EPS, st.to + st.err + st.rej),
         };
         let att = att0; const tries: number[] = [];
         for (let h = H; h >= 1; h--) {
@@ -126,17 +135,17 @@ import PlaygroundShell from '../../components/PlaygroundShell.astro';
       };
       for (let t = 0; t < TICKS; t++) {
         const inF = t >= F0 && t < F1;
-        const mu = cfg.fault === 'slow' && inF ? MU / 4 : MU, svc = cfg.fault === 'slow' && inF ? SVC * 4 : SVC;
-        const e = inF ? (cfg.fault === 'err' ? 0.3 : cfg.fault === 'down' ? 1 : 0) : 0;
+        const mu = cfg.fault === 'slow' && inF ? MU / SLOW_FACTOR : MU, svc = cfg.fault === 'slow' && inF ? SVC * SLOW_FACTOR : SVC;
+        const e = inF ? (cfg.fault === 'err' ? ERR_RATE : cfg.fault === 'down' ? 1 : 0) : 0;
         const t1 = tree(prev); const A = L * t1.total; const passed = brk.open ? Math.min(A, PROBES) : A;
         const arr = passed * (1 - e); const acc = Math.min(arr, Math.max(0, QMAX - b + mu)); const rej = arr - acc; const qn = Math.max(0, b + acc - mu);
-        const lo = (b / mu) * 1000, hi = (qn / mu) * 1000;
+        const lo = (b / mu) * MS_PER_S, hi = (qn / mu) * MS_PER_S;
         const fok = hi > lo ? clamp((T - svc - lo) / (hi - lo), 0, 1) : svc + lo <= T ? 1 : 0;
-        b = qn; const tot = Math.max(1e-9, passed);
+        b = qn; const tot = Math.max(EPS, passed);
         const st: St = { ok: (acc * fok) / tot, to: (acc * (1 - fok)) / tot, err: (passed * e) / tot, rej: rej / tot, dOK: svc + (lo + hi) / 2, block: A > 0 ? 1 - passed / A : 0 };
         if (cfg.breaker) {
-          if (!brk.open && passed >= 20 && 1 - st.ok > 0.5) { const trips = t - closedAt > 10 ? 1 : brk.trips + 1; brk = { open: true, since: t, trips, dur: Math.min(16, 2 * 2 ** (trips - 1)) }; }
-          else if (brk.open && t - brk.since >= brk.dur) { if (st.ok >= 0.8) { brk = { ...brk, open: false, since: t }; closedAt = t; st.block = 0; } else brk.since = t; }
+          if (!brk.open && passed >= BRK.minCalls && 1 - st.ok > BRK.failShare) { const trips = t - closedAt > BRK.resetS ? 1 : brk.trips + 1; brk = { open: true, since: t, trips, dur: Math.min(BRK.maxOpenS, BRK.firstOpenS * 2 ** (trips - 1)) }; }
+          else if (brk.open && t - brk.since >= brk.dur) { if (st.ok >= BRK.closeOk) { brk = { ...brk, open: false, since: t }; closedAt = t; st.block = 0; } else brk.since = t; }
         }
         const t2 = tree(st); prev = st;
         rows.push({ t, load: passed, cap: mu, success: t2.S, lat: t2.dOK, amp: t1.total, open: brk.open });
@@ -161,38 +170,42 @@ import PlaygroundShell from '../../components/PlaygroundShell.astro';
 
     const fmt = (n: number) => Math.round(n).toLocaleString('en-US');
     const pct = (x: number) => `${Math.round(x * 100)}%`;
+    const AFTER_FROM = 40; // "after" is measured from second 40, once things had time to settle
+    const BASE_TICK = 5; // a healthy second before the fault
+    const OK = { recovered: 0.95, anySuccess: 0.01, good: 0.9, stuck: 0.5, stormAmp: 5 };
+    const SUCC_Y = { floor: 50, h: 48 }; // success chart in SVG units
     function draw() {
       const cfg: Cfg = { depth: Number(q<HTMLSelectElement>('[data-depth]').value), fault: q<HTMLSelectElement>('[data-fault]').value, retry: q<HTMLSelectElement>('[data-retry]').value, timeout: q<HTMLSelectElement>('[data-timeout]').value, breaker: q<HTMLInputElement>('[data-brk]').checked, proxy: q<HTMLSelectElement>('[data-proxy]').value };
       const rows = simulate(cfg); const H = cfg.depth - 1;
-      const during = rows.filter((r) => r.t >= F0 && r.t < F1), after = rows.filter((r) => r.t >= 40);
+      const during = rows.filter((r) => r.t >= F0 && r.t < F1), after = rows.filter((r) => r.t >= AFTER_FROM);
       const avg = (a: typeof rows, f: (r: (typeof rows)[0]) => number) => a.reduce((x, r) => x + f(r), 0) / a.length;
       const succDuring = avg(during, (r) => r.success), succAfter = avg(after, (r) => r.success);
       const total = during.reduce((x, r) => x + r.load, 0), peak = Math.max(...rows.map((r) => r.load));
-      let rec = -1; for (let t = F1; t < TICKS; t++) if (rows.slice(t).every((r) => r.success >= 0.95)) { rec = t - F1; break; }
-      const okRows = during.filter((r) => r.success > 0.01); const latDuring = okRows.length ? avg(okRows, (r) => r.lat) : -1;
-      const base = rows[5].lat; const hopMs = PROXY[cfg.proxy] * H;
+      let rec = -1; for (let t = F1; t < TICKS; t++) if (rows.slice(t).every((r) => r.success >= OK.recovered)) { rec = t - F1; break; }
+      const okRows = during.filter((r) => r.success > OK.anySuccess); const latDuring = okRows.length ? avg(okRows, (r) => r.lat) : -1;
+      const base = rows[BASE_TICK].lat; const hopMs = PROXY[cfg.proxy] * H;
       const amp = total / (L * (F1 - F0));
       q('[data-o1]').textContent = `peak ${fmt(peak)} per second`;
-      q('[data-n1]').textContent = `${fmt(total)} in the 20 s fault, ${amp.toFixed(1)} times the ${fmt(L * (F1 - F0))} the users sent; C can serve ${fmt(MU / (cfg.fault === 'slow' ? 4 : 1))} per second`;
+      q('[data-n1]').textContent = `${fmt(total)} in the ${F1 - F0} s fault, ${amp.toFixed(1)} times the ${fmt(L * (F1 - F0))} the users sent; C can serve ${fmt(MU / (cfg.fault === 'slow' ? SLOW_FACTOR : 1))} per second`;
       q('[data-o2]').textContent = `${pct(succDuring)} during the fault, ${pct(succAfter)} after`;
       q('[data-n2]').textContent = rec === 0 ? 'healthy again as soon as C was fixed' : rec > 0 ? `healthy again ${rec} s after the fix` : 'never recovers by itself';
       q('[data-o3]').textContent = `${Math.round(base)} ms healthy, ${latDuring < 0 ? 'no successes' : `${fmt(latDuring)} ms in the fault`}`;
-      q('[data-n3]').textContent = latDuring < 0 ? 'every request failed during the fault' : `about ${fmt((L * latDuring) / 1000)} requests in flight at A during the fault, against ${fmt((L * base) / 1000)} when healthy`;
+      q('[data-n3]').textContent = latDuring < 0 ? 'every request failed during the fault' : `about ${fmt((L * latDuring) / MS_PER_S)} requests in flight at A during the fault, against ${fmt((L * base) / MS_PER_S)} when healthy`;
       q('[data-o4]').textContent = `${hopMs.toFixed(1)} ms of ${Math.round(base)} ms (${Math.round((hopMs / base) * 100)}%)`;
       q('[data-n4]').textContent = `${H} hop${H > 1 ? 's' : ''} at ${PROXY[cfg.proxy].toFixed(1)} ms; the worst case is a retry storm, not the proxy`;
       q<SVGPolylineElement>('[data-load]').setAttribute('points', rows.map((r) => `${X(r.t).toFixed(1)},${YL(r.load).toFixed(1)}`).join(' '));
       q<SVGPolylineElement>('[data-cap]').setAttribute('points', rows.map((r) => `${X(r.t).toFixed(1)},${YL(r.cap).toFixed(1)}`).join(' '));
-      q<SVGPolylineElement>('[data-succ]').setAttribute('points', rows.map((r) => `${X(r.t).toFixed(1)},${(50 - r.success * 48).toFixed(1)}`).join(' '));
+      q<SVGPolylineElement>('[data-succ]').setAttribute('points', rows.map((r) => `${X(r.t).toFixed(1)},${(SUCC_Y.floor - r.success * SUCC_Y.h).toFixed(1)}`).join(' '));
       rows.forEach((r, i) => bars[i].setAttribute('visibility', r.open ? 'visible' : 'hidden'));
-      const stuck = succAfter < 0.5; const storm = amp >= 5;
+      const stuck = succAfter < OK.stuck; const storm = amp >= OK.stormAmp;
       q<HTMLElement>('[data-b1]').style.setProperty('--c', storm ? 'var(--bad)' : 'var(--good)');
-      q<HTMLElement>('[data-b2]').style.setProperty('--c', stuck ? 'var(--bad)' : succDuring > 0.9 ? 'var(--good)' : 'var(--accent)');
+      q<HTMLElement>('[data-b2]').style.setProperty('--c', stuck ? 'var(--bad)' : succDuring > OK.good ? 'var(--good)' : 'var(--accent)');
       q<HTMLElement>('[data-b3]').style.setProperty('--c', 'var(--accent)');
       q<HTMLElement>('[data-b4]').style.setProperty('--c', 'var(--accent)');
       const out = q('[data-verdict]'); out.classList.toggle('bad', stuck);
-      out.textContent = stuck ? `Retry storm. Each try fails, so each hop sends ${cfg.retry === 'imm' ? '4' : 'several'} tries and the multiplication over ${H} hop${H > 1 ? 's' : ''} sends C up to ${fmt(peak)} attempts per second. After the fix at second 30 its queue is still full of requests the callers have given up on, so nothing succeeds: the chain stays down until the traffic is cut off.`
+      out.textContent = stuck ? `Retry storm. Each try fails, so each hop sends ${cfg.retry === 'imm' ? String(MAX_RETRIES + 1) : 'several'} tries and the multiplication over ${H} hop${H > 1 ? 's' : ''} sends C up to ${fmt(peak)} attempts per second. After the fix at second ${F1} its queue is still full of requests the callers have given up on, so nothing succeeds: the chain stays down until the traffic is cut off.`
         : storm ? `A storm formed (${amp.toFixed(1)} times the user traffic reached C), but it ended ${rec > 0 ? `${rec} s` : 'at once'} after the fix. ${cfg.timeout === 'none' ? 'With no timeout the callers wait instead of retrying, so users see slow responses rather than errors.' : 'A longer timeout or a breaker would have kept it smaller.'}`
-        : succDuring >= 0.95 ? `Users barely notice: ${pct(succDuring)} of requests succeed during the fault and C receives only ${amp.toFixed(1)} times the user traffic.`
+        : succDuring >= OK.recovered ? `Users barely notice: ${pct(succDuring)} of requests succeed during the fault and C receives only ${amp.toFixed(1)} times the user traffic.`
         : `No storm: C received ${amp.toFixed(1)} times the user traffic. ${pct(1 - succDuring)} of user requests failed during the fault${cfg.fault === 'slow' ? (cfg.timeout === 'none' ? ', because C could not serve all of them' : ', because C fell behind and its queue made the replies arrive after the timeout') : cfg.fault === 'down' ? ', because C was down and a retry cannot help' : ''}, and the chain recovered ${rec > 0 ? `${rec} s` : 'at once'} after the fix.`;
     }
     root.addEventListener('input', draw); root.addEventListener('change', draw);

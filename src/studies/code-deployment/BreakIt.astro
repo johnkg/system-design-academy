@@ -44,11 +44,17 @@ import PlaygroundShell from '../../components/PlaygroundShell.astro';
   document.querySelectorAll<HTMLElement>('[data-cdb]').forEach((root) => {
     const q = <T extends HTMLElement>(s: string) => root.querySelector<T>(s)!;
     const N = 1000; const USERS = 100000; const REQ = 3; const BASE = 0.002; const GATE = 2; const MINREQ = 400; const HUMAN = 40; const TICK = 30; const PER = (USERS / N) * REQ;
-    let seed = 4242; const rnd = () => ((seed = (seed * 1664525 + 1013904223) % 4294967296) / 4294967296);
-    const Z = Array.from({ length: 3000 }, () => (rnd() + rnd() + rnd() + rnd() - 2) / Math.sqrt(4 / 12)); // roughly normal sampling noise, fixed in advance
+    const SEED = 4242; const NOISE_SAMPLES = 3000; const MAX_TICKS = 2500;
+    const TICKS_PER_MIN = 2; // one tick is 30 s
+    const ROLLBACK_TICKS = 2; // a rollback takes two ticks; half the new hosts are back in the second
+    const ALERT_WINDOW = 2; // ticks of error counts the gate looks at
+    const MANY_USERS = 2000; const LATE_SHARE = 0.5; const WIDE_SHARE = 0.25; // verdict thresholds: users hit; share of hosts on the bad version
+    const CHART_MIN_TICKS = 20;
+    let seed = SEED; const rnd = () => ((seed = (seed * 1664525 + 1013904223) % 4294967296) / 4294967296);
+    const Z = Array.from({ length: NOISE_SAMPLES }, () => (rnd() + rnd() + rnd() + rnd() - 2) / Math.sqrt(4 / 12)); // roughly normal sampling noise, fixed in advance
     type Res = { users: number; detect: number | null; manual: boolean; full: number | null; done: number | null; peak: number; expo: number[]; rb: number; lastServe: number };
     function rollout(canaryPct: number, batchPct: number, bakeMin: number, thr: number, bug: number, rampMin: number): Res {
-      const bakeT = Math.round(bakeMin * 2); const ramp = Math.round(rampMin * 2);
+      const bakeT = Math.round(bakeMin * TICKS_PER_MIN); const ramp = Math.round(rampMin * TICKS_PER_MIN);
       const c = canaryPct > 0 ? Math.max(1, Math.round((N * canaryPct) / 100)) : 0;
       const B = Math.max(1, Math.round((N * batchPct) / 100));
       const sizes: number[] = []; let left = N;
@@ -60,9 +66,9 @@ import PlaygroundShell from '../../components/PlaygroundShell.astro';
       const rateOf = (i: number, t: number) => { const age = t - (starts[i] + 1) + 1; return (bug / 100) * (ramp > 0 ? Math.min(1, age / ramp) : 1); };
       const hist: { req: number; err: number }[] = []; const expo: number[] = [];
       let rb = -1; let manual = false; let lam = 0; let peak = 0;
-      for (let t = 1; t < 2500; t++) {
+      for (let t = 1; t < MAX_TICKS; t++) {
         let f = 1;
-        if (rb >= 0) { const k = t - rb; if (k >= 3) break; f = k === 1 ? 1 : 0.5; }
+        if (rb >= 0) { const k = t - rb; if (k > ROLLBACK_TICKS) break; f = k === 1 ? 1 : 0.5; }
         const lim = rb < 0 ? t : rb + 1; // hosts that were already installing when the rollback began still come up
         let s = 0; let weighted = 0; let expected = 0;
         sizes.forEach((sz, i) => { if (starts[i] + 1 <= lim) { s += sz; const r = rateOf(i, t); weighted += sz * r; expected += sz * (BASE + r); } });
@@ -71,12 +77,12 @@ import PlaygroundShell from '../../components/PlaygroundShell.astro';
         if (rb < 0) {
           const req = s * PER; const p = expected / s; const err = expected * PER + Z[t] * Math.sqrt(req * p * (1 - p));
           hist.push({ req, err });
-          const w = hist.slice(-2); const wr = w.reduce((a, h) => a + h.req, 0); const we = w.reduce((a, h) => a + h.err, 0);
+          const w = hist.slice(-ALERT_WINDOW); const wr = w.reduce((a, h) => a + h.req, 0); const we = w.reduce((a, h) => a + h.err, 0);
           if (t <= monitorEnd && wr >= MINREQ && we / wr > thr / 100) rb = t;
           else if (t === monitorEnd + HUMAN && bug > 0) { rb = t; manual = true; }
         }
       }
-      return { users: USERS * (1 - Math.exp(-lam)), detect: rb >= 0 ? rb * TICK : null, manual, full: rb < 0 || rb >= lastServe ? lastServe * TICK : null, done: rb >= 0 ? (rb + 2) * TICK : null, peak, expo, rb, lastServe };
+      return { users: USERS * (1 - Math.exp(-lam)), detect: rb >= 0 ? rb * TICK : null, manual, full: rb < 0 || rb >= lastServe ? lastServe * TICK : null, done: rb >= 0 ? (rb + ROLLBACK_TICKS) * TICK : null, peak, expo, rb, lastServe };
     }
     const mmss = (s: number) => `${Math.floor(s / 60)}:${String(s % 60).padStart(2, '0')}`;
     const fmt = (n: number) => Math.round(n).toLocaleString('en-US');
@@ -88,24 +94,24 @@ import PlaygroundShell from '../../components/PlaygroundShell.astro';
       q('[data-bakeval]').textContent = String(bake); q('[data-thrval]').textContent = String(thr); q('[data-bugval]').textContent = String(bug);
       const r = rollout(c, b, bake, thr, bug, ramp);
       const falseAlarm = bug === 0 && r.detect !== null;
-      const late = r.detect !== null && !r.manual && r.peak >= 0.5 && !falseAlarm;
-      q('[data-o1]').textContent = fmt(r.users); q('[data-n1]').textContent = bug === 0 ? 'the release has no bug' : `${(r.users / 1000).toFixed(1)}% of all 100,000 users`;
+      const late = r.detect !== null && !r.manual && r.peak >= LATE_SHARE && !falseAlarm;
+      q('[data-o1]').textContent = fmt(r.users); q('[data-n1]').textContent = bug === 0 ? 'the release has no bug' : `${(r.users / (USERS / 100)).toFixed(1)}% of all ${fmt(USERS)} users`;
       q('[data-o2]').textContent = r.detect === null ? 'not needed' : mmss(r.detect);
       q('[data-n2]').textContent = r.detect === null ? 'no alarm, and nothing was wrong' : r.manual ? 'noticed by a person: the gate never tripped' : falseAlarm ? 'a false alarm' : `the gate tripped; rollback finished at ${mmss(r.done as number)}`;
       q('[data-o3]').textContent = r.full === null ? 'never' : mmss(r.full);
       q('[data-n3]').textContent = r.full === null ? 'stopped and rolled back before the last batch' : r.detect === null ? 'every host is on the new version' : 'every host reached the new version before the rollback';
       q('[data-o4]').textContent = `${Math.round(r.peak * 100)}%`; q('[data-n4]').textContent = `${fmt(r.peak * N)} of ${fmt(N)} hosts`;
       const sad = r.manual || late || falseAlarm;
-      q<HTMLElement>('[data-b1]').style.setProperty('--c', r.users > 2000 ? 'var(--bad)' : 'var(--good)');
+      q<HTMLElement>('[data-b1]').style.setProperty('--c', r.users > MANY_USERS ? 'var(--bad)' : 'var(--good)');
       q<HTMLElement>('[data-b2]').style.setProperty('--c', r.manual || falseAlarm ? 'var(--bad)' : 'var(--good)');
       q<HTMLElement>('[data-b3]').style.setProperty('--c', 'var(--accent)');
-      q<HTMLElement>('[data-b4]').style.setProperty('--c', r.peak >= 0.25 ? 'var(--bad)' : 'var(--good)');
-      const n = r.expo.length; const total = Math.max(n, 20);
+      q<HTMLElement>('[data-b4]').style.setProperty('--c', r.peak >= WIDE_SHARE ? 'var(--bad)' : 'var(--good)');
+      const n = r.expo.length; const total = Math.max(n, CHART_MIN_TICKS);
       line.setAttribute('points', r.expo.map((e, i) => `${(10 + (286 * (i + 1)) / total).toFixed(1)},${(74 - 60 * e).toFixed(1)}`).join(' '));
       line.style.setProperty('stroke', sad ? 'var(--bad)' : 'var(--good)');
       endLabel.textContent = mmss(total * TICK);
       const out = q('[data-verdict]'); out.classList.toggle('bad', sad);
-      out.textContent = falseAlarm ? `The release was fine, but a threshold of ${thr}% sits inside normal noise (0.2% of requests fail anyway, and small samples wobble), so the gate rolled it back at ${mmss(r.detect as number)}. Too tight a gate blocks every release.`
+      out.textContent = falseAlarm ? `The release was fine, but a threshold of ${thr}% sits inside normal noise (${BASE * 100}% of requests fail anyway, and small samples wobble), so the gate rolled it back at ${mmss(r.detect as number)}. Too tight a gate blocks every release.`
         : r.detect === null ? (bug === 0 ? `A good release went out to every host in ${mmss(r.full as number)} and nothing tripped. That is what the gates are meant to allow.` : 'The bug is so mild that it stays under the gate and nobody sees it in this window.')
         : r.manual ? `Nothing tripped the gate: the bug fails at most ${bug}% of requests, ${bug <= thr ? 'which is under' : 'but it had not grown past'} the ${thr}% threshold while the gates were looking. The release reached every host at ${mmss(r.full as number)} and a person noticed 20 minutes later, after ${fmt(r.users)} users saw errors. Lengthen the bake or tighten the threshold.`
         : late ? `The gate worked, but late: by ${mmss(r.detect as number)} the new version was on ${Math.round(r.peak * 100)}% of the hosts and ${fmt(r.users)} users had seen errors. A smaller first batch or a longer bake would have caught it while it was still on a few hosts.`

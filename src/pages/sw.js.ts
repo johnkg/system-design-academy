@@ -6,7 +6,7 @@ import { base } from '../lib';
 //  - Hashed build files (/_astro/): cache first, they never change under the same name.
 //  - Everything else on this site: stale while revalidate.
 // The cache name carries the build time, so each deploy starts a fresh cache and the old ones are deleted on activate.
-const build = Date.now().toString(36);
+const build = Date.now().toString(36); // base 36 keeps the cache name short
 
 export const GET: APIRoute = () => {
   const source = `

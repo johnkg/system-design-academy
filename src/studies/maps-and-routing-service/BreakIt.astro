@@ -57,21 +57,33 @@ import PlaygroundShell from '../../components/PlaygroundShell.astro';
     const W = 18, H = 12, N = W * H;
     const SRC = 11 * W + 0, DST = 0 * W + 17;
     const id = (x, y) => y * W + x;
+    const ARTERIAL_S = 80, STREET_S = 160; // seconds to drive one block on an arterial or a side street
+    const ARTERIAL_EVERY = { row: 4, col: 6 }; // every 4th row and 6th column is an arterial
+    const BARRIER_X = 8; // column boundary only arterial rows cross
+    const JITTER = { mul: 7, mod: 5, stepS: 4 }; // deterministic per-edge variation: (i * 7 % 5) * 4 s
+    const ZONE = { x0: 5, x1: 12, y0: 3, y1: 8, startMin: 6, rampMin: 14, extra: 2 }; // congestion zone: slows to 3x over 14 minutes from minute 6
+    const INCIDENT = { x0: 11, x1: 12, y0: 0, y1: 1, fromMin: 14, mult: 5 }; // road closure: 5x slower from minute 14
+    const WITNESS_LIMIT = 30; // nodes a witness search may settle before giving up
+    const SEC_PER_MIN = 60;
+    const RENDER_DELAY_MS = 15; // let the "Working..." text paint first
+    const MAP = { pad: 12, cell: 20 }; // svg px
+    const ART_MAX_S = 100; // jittered arterials stay below this, side streets above
+    const ETA_ERR = { badMin: 8, goodMin: 5 };
     const edges = []; // [a,b,base]
     for (let y = 0; y < H; y++) for (let x = 0; x < W; x++) {
-      if (x + 1 < W) { if (!(x === 8 && y % 4 !== 0)) edges.push([id(x, y), id(x + 1, y), y % 4 === 0 ? 80 : 160]); }
-      if (y + 1 < H) edges.push([id(x, y), id(x, y + 1), x % 6 === 0 ? 80 : 160]);
+      if (x + 1 < W) { if (!(x === BARRIER_X && y % ARTERIAL_EVERY.row !== 0)) edges.push([id(x, y), id(x + 1, y), y % ARTERIAL_EVERY.row === 0 ? ARTERIAL_S : STREET_S]); }
+      if (y + 1 < H) edges.push([id(x, y), id(x, y + 1), x % ARTERIAL_EVERY.col === 0 ? ARTERIAL_S : STREET_S]);
     }
     const mid = (e) => { const a = edges[e][0], b = edges[e][1]; return [((a % W) + (b % W)) / 2, (Math.floor(a / W) + Math.floor(b / W)) / 2]; };
     // congestion: a zone in the middle slows from minute 4 to 16, and one incident closes a road from minute 9
     const mult = (e, tMin) => {
       const [mx, my] = mid(e); let m = 1;
-      if (mx >= 5 && mx <= 12 && my >= 3 && my <= 8) { const r = Math.min(1, Math.max(0, (tMin - 6) / 14)); m = 1 + 2 * r; }
-      if (tMin >= 14 && mx >= 11 && mx <= 12 && my >= 0 && my <= 1) m = Math.max(m, 5);
+      if (mx >= ZONE.x0 && mx <= ZONE.x1 && my >= ZONE.y0 && my <= ZONE.y1) { const r = Math.min(1, Math.max(0, (tMin - ZONE.startMin) / ZONE.rampMin)); m = 1 + ZONE.extra * r; }
+      if (tMin >= INCIDENT.fromMin && mx >= INCIDENT.x0 && mx <= INCIDENT.x1 && my >= INCIDENT.y0 && my <= INCIDENT.y1) m = Math.max(m, INCIDENT.mult);
       return m;
     };
     const adj = Array.from({ length: N }, () => []);
-    edges.forEach((e, i) => { e[2] += (i * 7 % 5) * 4; });
+    edges.forEach((e, i) => { e[2] += (i * JITTER.mul % JITTER.mod) * JITTER.stepS; });
     edges.forEach((e, i) => { adj[e[0]].push([e[1], i]); adj[e[1]].push([e[0], i]); });
     const cost = (e, tMin) => Math.round(edges[e][2] * mult(e, tMin));
 
@@ -80,7 +92,7 @@ import PlaygroundShell from '../../components/PlaygroundShell.astro';
       pop() { const a = this.a, t = a[0], l = a.pop(); if (a.length) { a[0] = l; let i = 0; for (;;) { let c = 2 * i + 1; if (c >= a.length) break; if (c + 1 < a.length && a[c + 1][0] < a[c][0]) c++; if (a[i][0] <= a[c][0]) break; [a[i], a[c]] = [a[c], a[i]]; i = c; } } return t; }
       get size() { return this.a.length; } peek() { return this.a[0][0]; } }
 
-    const heur = (v, t) => (Math.abs((v % W) - (t % W)) + Math.abs(Math.floor(v / W) - Math.floor(t / W))) * 80;
+    const heur = (v, t) => (Math.abs((v % W) - (t % W)) + Math.abs(Math.floor(v / W) - Math.floor(t / W))) * ARTERIAL_S; // fastest block cost keeps the estimate admissible
     function search(s, t, w, useH) { // w[e]: cost of each edge
       const dist = new Array(N).fill(Infinity), prev = new Array(N).fill(-1), done = new Array(N).fill(false), h = new Heap(); let settled = 0; const order = [];
       dist[s] = 0; h.push(useH ? heur(s, t) : 0, s);
@@ -97,7 +109,7 @@ import PlaygroundShell from '../../components/PlaygroundShell.astro';
       const contracted = new Array(N).fill(false), level = new Array(N).fill(0); let work = 0, shortcuts = 0;
       function witness(u, x, limit, skip) { // dist from u to x avoiding skip, bounded
         const d = new Map([[u, 0]]), h = new Heap(); h.push(0, u); let n = 0;
-        while (h.size && n < 30) { const [k, a] = h.pop(); if (k > d.get(a)) continue; n++; work++; if (a === x || k > limit) break;
+        while (h.size && n < WITNESS_LIMIT) { const [k, a] = h.pop(); if (k > d.get(a)) continue; n++; work++; if (a === x || k > limit) break;
           for (const [b, [c]] of out[a]) { if (b === skip || contracted[b]) continue; const nd = k + c; if (nd < (d.has(b) ? d.get(b) : Infinity)) { d.set(b, nd); h.push(nd, b); } } }
         return d.has(x) ? d.get(x) : Infinity;
       }
@@ -133,18 +145,18 @@ import PlaygroundShell from '../../components/PlaygroundShell.astro';
     }
     const edgeOf = new Map(); edges.forEach((e, i) => { edgeOf.set(e[0] * N + e[1], i); edgeOf.set(e[1] * N + e[0], i); });
     function trip(alg, refreshMin, reroute) {
-      const snapAt = (tSec) => (refreshMin ? Math.floor(tSec / 60 / refreshMin) * refreshMin : 0);
+      const snapAt = (tSec) => (refreshMin ? Math.floor(tSec / SEC_PER_MIN / refreshMin) * refreshMin : 0);
       let ch = null, queries = 0, settledTotal = 0, rebuilds = 0, buildWork = 0, snapKey = -1, w = null, firstOrder = null;
       const plan = (from, tSec) => {
         const k = snapAt(tSec); if (k !== snapKey) { snapKey = k; w = edges.map((_, e) => cost(e, k)); if (alg === 'ch') { ch = buildCH(w); rebuilds++; buildWork += ch.work; } }
         const r = alg === 'ch' ? queryCH(ch, from, DST) : search(from, DST, w, alg === 'astar');
         queries++; settledTotal += r.settled; if (!firstOrder) firstOrder = r.order; return r;
       };
-      let t = 0, cur = SRC, route = plan(cur, 0), eta = route.cost, reroutes = 0, i = 0, nextRefresh = refreshMin ? refreshMin * 60 : Infinity, nextMin = 0; const first = route.path.slice(), driven = [SRC], marks = [];
+      let t = 0, cur = SRC, route = plan(cur, 0), eta = route.cost, reroutes = 0, i = 0, nextRefresh = refreshMin ? refreshMin * SEC_PER_MIN : Infinity, nextMin = 0; const first = route.path.slice(), driven = [SRC], marks = [];
       while (cur !== DST) {
-        if (reroute && t >= nextRefresh) { while (nextRefresh <= t) nextRefresh += refreshMin * 60; const r = plan(cur, t); if (r.path.join() !== route.path.slice(i).join()) { reroutes++; } route = r; i = 0; }
-        while (t >= nextMin * 60) { marks.push({ t, rest: route.path.slice(i), k: snapAt(t * 1) }); nextMin++; }
-        const nx = route.path[i + 1]; t += cost(edgeOf.get(cur * N + nx), t / 60); cur = nx; i++; driven.push(cur);
+        if (reroute && t >= nextRefresh) { while (nextRefresh <= t) nextRefresh += refreshMin * SEC_PER_MIN; const r = plan(cur, t); if (r.path.join() !== route.path.slice(i).join()) { reroutes++; } route = r; i = 0; }
+        while (t >= nextMin * SEC_PER_MIN) { marks.push({ t, rest: route.path.slice(i), k: snapAt(t * 1) }); nextMin++; }
+        const nx = route.path[i + 1]; t += cost(edgeOf.get(cur * N + nx), t / SEC_PER_MIN); cur = nx; i++; driven.push(cur);
       }
       // the ETA the app would show each minute: remaining cost of the current route under the latest snapshot
       let errSum = 0; for (const m of marks) { let rem = 0; for (let j = 0; j + 1 < m.rest.length; j++) rem += cost(edgeOf.get(m.rest[j] * N + m.rest[j + 1]), m.k); errSum += Math.abs(m.t + rem - t); }
@@ -153,11 +165,11 @@ import PlaygroundShell from '../../components/PlaygroundShell.astro';
 
     const q = (s) => root.querySelector(s);
     const NS = 'http://www.w3.org/2000/svg';
-    const px = (v) => 12 + (v % W) * 20, py = (v) => 12 + Math.floor(v / W) * 20;
+    const px = (v) => MAP.pad + (v % W) * MAP.cell, py = (v) => MAP.pad + Math.floor(v / W) * MAP.cell;
     const mk = (tag, attrs, parent) => { const el = document.createElementNS(NS, tag); for (const k in attrs) el.setAttribute(k, attrs[k]); parent.append(el); return el; };
     const svg = q('[data-map]');
-    mk('rect', { class: 'mrb-zone', x: 12 + 5 * 20 - 10, y: 12 + 3 * 20 - 10, width: 7 * 20 + 20, height: 5 * 20 + 20 }, svg);
-    edges.forEach((e) => mk('line', { class: 'mrb-road' + (e[2] < 100 ? ' art' : ''), x1: px(e[0]), y1: py(e[0]), x2: px(e[1]), y2: py(e[1]) }, svg));
+    mk('rect', { class: 'mrb-zone', x: MAP.pad + ZONE.x0 * MAP.cell - MAP.cell / 2, y: MAP.pad + ZONE.y0 * MAP.cell - MAP.cell / 2, width: (ZONE.x1 - ZONE.x0) * MAP.cell + MAP.cell, height: (ZONE.y1 - ZONE.y0) * MAP.cell + MAP.cell }, svg);
+    edges.forEach((e) => mk('line', { class: 'mrb-road' + (e[2] < ART_MAX_S ? ' art' : ''), x1: px(e[0]), y1: py(e[0]), x2: px(e[1]), y2: py(e[1]) }, svg));
     const dots = Array.from({ length: N }, (_, v) => mk('circle', { class: 'mrb-dot', cx: px(v), cy: py(v), r: 3 }, svg));
     const firstLine = mk('polyline', { class: 'mrb-first', points: '' }, svg), drivenLine = mk('polyline', { class: 'mrb-driven', points: '' }, svg);
     mk('rect', { class: 'mrb-end', x: px(SRC) - 5, y: py(SRC) - 5, width: 10, height: 10 }, svg); mk('circle', { class: 'mrb-end', cx: px(DST), cy: py(DST), r: 6 }, svg);
@@ -173,7 +185,7 @@ import PlaygroundShell from '../../components/PlaygroundShell.astro';
       setTimeout(() => {
         if (my !== token) return;
         show(cached(alg, ref, rr), alg, ref, req, rr);
-      }, 15);
+      }, RENDER_DELAY_MS);
     }
     function show(r, alg, ref, req, rr) {
       dots.forEach((d, v) => d.classList.remove('seen')); r.firstOrder.forEach((v) => dots[v].classList.add('seen'));
@@ -181,7 +193,7 @@ import PlaygroundShell from '../../components/PlaygroundShell.astro';
       const base = cached('astar', ref, rr).settledPerQuery;
       const first = r.firstOrder.length, perBuild = r.rebuilds ? r.buildWork / r.rebuilds : 0;
       const perReq = r.settledPerQuery + perBuild / req;
-      const errMin = r.meanErr / 60, etaMin = r.eta / 60, actMin = r.actual / 60;
+      const errMin = r.meanErr / SEC_PER_MIN, etaMin = r.eta / SEC_PER_MIN, actMin = r.actual / SEC_PER_MIN;
       q('[data-o1]').textContent = first + ' of ' + N; q('[data-n1]').textContent = alg === 'dijkstra' ? 'spreads in every direction until it reaches the destination' : alg === 'astar' ? 'the estimate steers the search toward the destination' : 'searches upward from both ends of the trip and meets in the middle';
       q('[data-o2]').textContent = alg === 'ch' ? fmt(perBuild) + ' units' : 'none'; q('[data-n2]').textContent = alg === 'ch' ? 'rebuilt ' + r.rebuilds + (r.rebuilds === 1 ? ' time' : ' times') + ' on this trip, because new traffic changes the edge weights the shortcuts were made from' : 'edge weights are just read, so a new snapshot costs nothing extra';
       q('[data-o3]').textContent = fmt(perReq); q('[data-n3]').textContent = 'average over ' + r.queries + (r.queries === 1 ? ' query' : ' queries') + ' on the trip, with ' + fmt(req) + ' requests sharing each snapshot';
@@ -189,14 +201,14 @@ import PlaygroundShell from '../../components/PlaygroundShell.astro';
       q('[data-o5]').textContent = String(r.reroutes); q('[data-n5]').textContent = rr ? (ref ? 'route checked ' + r.queries + (r.queries === 1 ? ' time' : ' times') + ' on this trip' : 'no refresh while driving, so nothing to react to') : 'rerouting is off, the driver follows the first route';
       const col = (el, c) => q(el).style.setProperty('--c', c);
       col('[data-b1]', 'var(--accent)'); col('[data-b2]', alg === 'ch' && perReq > base ? 'var(--bad)' : 'var(--accent)');
-      col('[data-b3]', 'var(--accent)'); col('[data-b4]', errMin > 8 ? 'var(--bad)' : errMin < 5 ? 'var(--good)' : 'var(--accent)'); col('[data-b5]', 'var(--accent)');
-      const v = q('[data-verdict]'); const bad = errMin > 8 || (alg === 'ch' && perReq > base);
+      col('[data-b3]', 'var(--accent)'); col('[data-b4]', errMin > ETA_ERR.badMin ? 'var(--bad)' : errMin < ETA_ERR.goodMin ? 'var(--good)' : 'var(--accent)'); col('[data-b5]', 'var(--accent)');
+      const v = q('[data-verdict]'); const bad = errMin > ETA_ERR.badMin || (alg === 'ch' && perReq > base);
       v.classList.toggle('bad', bad);
       const parts = [];
       if (alg === 'ch' && perReq > base) parts.push('The hierarchy loses here: rebuilding it costs ' + fmt(perBuild) + ' units and only ' + fmt(req) + ' requests share each snapshot, which is ' + fmt(perBuild / req) + ' per request on top of ' + Math.round(r.settledPerQuery) + ' for the query itself, more than the ' + Math.round(base) + ' that A* needs. It pays off only when very many requests share one rebuild.');
       else if (alg === 'ch') parts.push('The hierarchy pays off: ' + Math.round(r.settledPerQuery) + ' intersections per query, and the rebuild is spread over ' + fmt(req) + ' requests, ' + fmt(perReq) + ' per request against ' + Math.round(base) + ' for A*.');
       else parts.push('Each query visits about ' + Math.round(r.settledPerQuery) + ' of ' + N + ' intersections' + (alg === 'dijkstra' ? ', and a continent has tens of millions of intersections, and the same search would settle a large share of them.' : ', fewer than Dijkstra, but a continent is still far too big for it.'));
-      if (errMin > 8) parts.push('The ETA is off by ' + errMin.toFixed(1) + ' minutes on average, because traffic data ' + (ref ? 'is up to ' + ref + ' minutes old' : 'was read once, at departure') + '.');
+      if (errMin > ETA_ERR.badMin) parts.push('The ETA is off by ' + errMin.toFixed(1) + ' minutes on average, because traffic data ' + (ref ? 'is up to ' + ref + ' minutes old' : 'was read once, at departure') + '.');
       else parts.push('The ETA stays within ' + errMin.toFixed(1) + ' minutes on average.');
       v.textContent = parts.join(' ');
     }

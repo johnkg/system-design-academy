@@ -34,12 +34,22 @@ import PlaygroundShell from '../components/PlaygroundShell.astro';
 <script>
   const N = 2000, CLUSTERS = 24, K = 10, Q = 40, TAG = 3, STEP = 600, RERANK = 40;
   const NS = 'http://www.w3.org/2000/svg';
+  const DATA_SEED = 12345;
+  const SPACE = { span: 8000, margin: 1000 }; // cluster centres fall in 1000..8999 on each axis
+  const JITTER = { range: 1601, center: 2400 }; // sum of three draws in 0..1600, centred: -2400..2400
+  const KMEANS_ITERS = 6;
+  const ID_SLOTS = 4096; // sort keys pack distance * ID_SLOTS + id (ids < 4096)
+  const VECTORS = 10000000, MB = 1000000; // memory estimate: 10M vectors of 768 dims
+  const BYTES = { full: 3072, pq: 96, id: 8 }; // float32 x 768, PQ code, id per vector
+  const RECALL = { good: 95, poor: 80 }; // % thresholds in the verdict
+  const PLOT = { pad: 10, size: 380, h: 400 }; // scatter plot in SVG units
   function makeData() {
-    let seed = 12345;
+    let seed = DATA_SEED;
+    // Park-Miller minimal standard LCG
     const rnd = () => (seed = (seed * 48271) % 2147483647);
     const cx = [], cy = [];
-    for (let c = 0; c < CLUSTERS; c++) { cx.push((rnd() % 8000) + 1000); cy.push((rnd() % 8000) + 1000); }
-    const jitter = () => (rnd() % 1601) + (rnd() % 1601) + (rnd() % 1601) - 2400;
+    for (let c = 0; c < CLUSTERS; c++) { cx.push((rnd() % SPACE.span) + SPACE.margin); cy.push((rnd() % SPACE.span) + SPACE.margin); }
+    const jitter = () => (rnd() % JITTER.range) + (rnd() % JITTER.range) + (rnd() % JITTER.range) - JITTER.center;
     const px = [], py = [], tag = [];
     for (let i = 0; i < N; i++) { const t = i % CLUSTERS; tag.push(t); px.push(cx[t] + jitter()); py.push(cy[t] + jitter()); }
     const qs = [];
@@ -47,6 +57,7 @@ import PlaygroundShell from '../components/PlaygroundShell.astro';
     return { px, py, tag, qs };
   }
   const D = makeData();
+  const MATCHING = D.tag.filter((t) => t === TAG).length; // rows that pass the filter
   const d2 = (ax, ay, bx, by) => (ax - bx) * (ax - bx) + (ay - by) * (ay - by);
   const coarse = (v) => Math.floor(v / STEP + 0.5) * STEP;
   const indexCache = new Map();
@@ -55,7 +66,7 @@ import PlaygroundShell from '../components/PlaygroundShell.astro';
     const { px, py } = D; const mx = [], my = [];
     for (let c = 0; c < nlist; c++) { mx.push(px[Math.floor((c * N) / nlist)]); my.push(py[Math.floor((c * N) / nlist)]); }
     const nearest = (x, y) => { let b = 0, bd = d2(x, y, mx[0], my[0]); for (let c = 1; c < nlist; c++) { const d = d2(x, y, mx[c], my[c]); if (d < bd) { bd = d; b = c; } } return b; };
-    for (let it = 0; it < 6; it++) {
+    for (let it = 0; it < KMEANS_ITERS; it++) {
       const sx = new Array(nlist).fill(0), sy = new Array(nlist).fill(0), n = new Array(nlist).fill(0);
       for (let i = 0; i < N; i++) { const c = nearest(px[i], py[i]); sx[c] += px[i]; sy[c] += py[i]; n[c]++; }
       for (let c = 0; c < nlist; c++) if (n[c] > 0) { mx[c] = Math.floor(sx[c] / n[c]); my[c] = Math.floor(sy[c] / n[c]); }
@@ -68,9 +79,9 @@ import PlaygroundShell from '../components/PlaygroundShell.astro';
   // filter: -1 none, otherwise the tag a result must carry. Returns the K best ids by key (distance, id).
   function exactTop(q, filter) {
     const cand = [];
-    for (let i = 0; i < N; i++) if (filter < 0 || D.tag[i] === filter) cand.push(d2(q[0], q[1], D.px[i], D.py[i]) * 4096 + i);
+    for (let i = 0; i < N; i++) if (filter < 0 || D.tag[i] === filter) cand.push(d2(q[0], q[1], D.px[i], D.py[i]) * ID_SLOTS + i);
     cand.sort((a, b) => a - b);
-    return cand.slice(0, K).map((v) => v % 4096);
+    return cand.slice(0, K).map((v) => v % ID_SLOTS);
   }
   // opts: { nlist, nprobe, store: exact|pq|pqr, filter: none|pre|post }
   function annQuery(q, opts) {
@@ -85,14 +96,14 @@ import PlaygroundShell from '../components/PlaygroundShell.astro';
       if (scanFilter >= 0 && D.tag[i] !== scanFilter) continue;
       scanned++;
       const x = opts.store === 'exact' ? D.px[i] : coarse(D.px[i]), y = opts.store === 'exact' ? D.py[i] : coarse(D.py[i]);
-      cand.push(d2(qx, qy, x, y) * 4096 + i);
+      cand.push(d2(qx, qy, x, y) * ID_SLOTS + i);
     }
     cand.sort((a, b) => a - b);
     let top; let reads = 0;
     if (opts.store === 'pqr') {
-      const best = cand.slice(0, RERANK).map((v) => v % 4096); reads = best.length;
-      top = best.map((i) => d2(q[0], q[1], D.px[i], D.py[i]) * 4096 + i).sort((a, b) => a - b).slice(0, K).map((v) => v % 4096);
-    } else top = cand.slice(0, K).map((v) => v % 4096);
+      const best = cand.slice(0, RERANK).map((v) => v % ID_SLOTS); reads = best.length;
+      top = best.map((i) => d2(q[0], q[1], D.px[i], D.py[i]) * ID_SLOTS + i).sort((a, b) => a - b).slice(0, K).map((v) => v % ID_SLOTS);
+    } else top = cand.slice(0, K).map((v) => v % ID_SLOTS);
     if (opts.filter === 'post') top = top.filter((i) => D.tag[i] === tagFilter);
     return { top, probed, work: scanned + opts.nlist, reads };
   }
@@ -107,21 +118,21 @@ import PlaygroundShell from '../components/PlaygroundShell.astro';
     return { hits, total: Q * K, avgWork: Math.floor(work / Q), avgReads: Math.floor(reads / Q), returned };
   }
   function memory(store) { // MB for 10M vectors of 768 dims
-    const V = 10000000;
-    if (store === 'exact') return { ram: Math.floor((V * (3072 + 8)) / 1000000), ssd: 0 };
-    if (store === 'pq') return { ram: Math.floor((V * (96 + 8)) / 1000000), ssd: 0 };
-    return { ram: Math.floor((V * (96 + 8)) / 1000000), ssd: Math.floor((V * 3072) / 1000000) };
+    const V = VECTORS;
+    if (store === 'exact') return { ram: Math.floor((V * (BYTES.full + BYTES.id)) / MB), ssd: 0 };
+    if (store === 'pq') return { ram: Math.floor((V * (BYTES.pq + BYTES.id)) / MB), ssd: 0 };
+    return { ram: Math.floor((V * (BYTES.pq + BYTES.id)) / MB), ssd: Math.floor((V * BYTES.full) / MB) };
   }
   const fmtMB = (mb) => (mb >= 1000 ? (mb / 1000).toFixed(1) + ' GB' : mb + ' MB');
   function verdictFor(o, r) {
     const pct = Math.floor((r.hits * 100) / r.total);
     if (o.filter === 'post') return `Post-filtering throws away most of the top 10: only ${r.returned} of ${r.total} wanted results came back (${pct}% recall). The filter has to run inside the search, or you must over-fetch a lot.`;
-    if (o.filter === 'pre') return pct < 95
-      ? `Pre-filtering keeps the results valid (${r.returned} of ${r.total}) but recall is only ${pct}%: the few matching points are spread over many cells, so a low nprobe misses them. With a filter this selective, an exact scan of the 84 matching rows is cheaper and perfect.`
-      : `Recall ${pct}% with only ${r.avgWork} computations, but that needs nearly every list probed. With 84 matching rows, scanning them exactly costs about the same and needs no index.`;
+    if (o.filter === 'pre') return pct < RECALL.good
+      ? `Pre-filtering keeps the results valid (${r.returned} of ${r.total}) but recall is only ${pct}%: the few matching points are spread over many cells, so a low nprobe misses them. With a filter this selective, an exact scan of the ${MATCHING} matching rows is cheaper and perfect.`
+      : `Recall ${pct}% with only ${r.avgWork} computations, but that needs nearly every list probed. With ${MATCHING} matching rows, scanning them exactly costs about the same and needs no index.`;
     if (r.avgWork >= N) return `Scanning ${r.avgWork} distance computations per query costs more than the exact scan (${N}) and is no better. At this nprobe the index has stopped paying off.`;
-    if (pct < 80) return `Recall ${pct}%: roughly 1 in ${Math.max(2, Math.round(100 / (100 - pct)))} true neighbours is missed. Raise nprobe, use re-ranking, or accept the loss only if the application tolerates it.`;
-    if (pct < 95) return `Recall ${pct}% at ${r.avgWork} computations (${Math.floor((r.avgWork * 100) / N)}% of an exact scan). Often acceptable, but compare against your target recall on real queries.`;
+    if (pct < RECALL.poor) return `Recall ${pct}%: roughly 1 in ${Math.max(2, Math.round(100 / (100 - pct)))} true neighbours is missed. Raise nprobe, use re-ranking, or accept the loss only if the application tolerates it.`;
+    if (pct < RECALL.good) return `Recall ${pct}% at ${r.avgWork} computations (${Math.floor((r.avgWork * 100) / N)}% of an exact scan). Often acceptable, but compare against your target recall on real queries.`;
     return `Recall ${pct}% at ${r.avgWork} computations (${Math.floor((r.avgWork * 100) / N)}% of an exact scan). Good operating point. Going higher mostly adds cost.`;
   }
   document.querySelectorAll('[data-vs]').forEach((root) => {
@@ -129,12 +140,12 @@ import PlaygroundShell from '../components/PlaygroundShell.astro';
     const val = (s) => Number(q(s).value);
     const circles = []; let qMark = null; let scheduled = false;
     const svg = q('[data-svg]');
-    let lo = 1e9, hi = -1e9;
+    let lo = Infinity, hi = -Infinity;
     for (let i = 0; i < N; i++) { lo = Math.min(lo, D.px[i], D.py[i]); hi = Math.max(hi, D.px[i], D.py[i]); }
-    const sc = (v) => 10 + ((v - lo) / (hi - lo)) * 380;
+    const sc = (v) => PLOT.pad + ((v - lo) / (hi - lo)) * PLOT.size;
     for (let i = 0; i < N; i++) {
       const c = document.createElementNS(NS, 'circle');
-      c.setAttribute('cx', String(sc(D.px[i]))); c.setAttribute('cy', String(400 - sc(D.py[i]))); c.setAttribute('r', '2');
+      c.setAttribute('cx', String(sc(D.px[i]))); c.setAttribute('cy', String(PLOT.h - sc(D.py[i]))); c.setAttribute('r', '2');
       svg.appendChild(c); circles.push(c);
     }
     const ring = document.createElementNS(NS, 'g'); svg.appendChild(ring);
@@ -171,7 +182,7 @@ import PlaygroundShell from '../components/PlaygroundShell.astro';
       const got = new Set(res.top); let missed = 0;
       for (const i of truth) {
         const e = document.createElementNS(NS, 'circle');
-        e.setAttribute('cx', String(sc(D.px[i]))); e.setAttribute('cy', String(400 - sc(D.py[i]))); e.setAttribute('r', '5');
+        e.setAttribute('cx', String(sc(D.px[i]))); e.setAttribute('cy', String(PLOT.h - sc(D.py[i]))); e.setAttribute('r', '5');
         e.setAttribute('fill', 'none'); e.setAttribute('stroke-width', '2');
         const ok = got.has(i); if (!ok) missed++;
         e.setAttribute('stroke', ok ? 'var(--text)' : 'var(--bad)');

@@ -63,14 +63,22 @@ import PlaygroundShell from '../components/PlaygroundShell.astro';
     laptop: { text: 'how long can I send back a laptop after delivery', answerable: true },
     drone: { text: 'what is the refund window for a drone', answerable: false },
   };
+  const MIN_STEM_LEN = 3; // words this short keep a trailing s
+  const IDF_SCALE = 4096; // fixed-point scale for the idf ratio
+  const TOK_PER_10_WORDS = 13; const CHUNK_OVERHEAD_TOK = 6; // about 1.3 tokens per word, plus a header per chunk
+  const RERANK_WINDOW = 12; // words in the sliding window the reranker scores
+  const TF_CAP = 2; // repeats of a term beyond this add nothing
+  const RERANK_POOL = 8; const RERANK_WEIGHT = 4; // candidates reranked; window score weight against the first score
+  const MIN_STEP = 10; // overlap must leave each chunk at least this many new words
   const STOP = new Set('how can i a an the of to is are in on and or for after you your with by it'.split(' '));
-  const stem = (w: string) => (w.length > 3 && w.endsWith('s') ? w.slice(0, -1) : w);
+  const stem = (w: string) => (w.length > MIN_STEM_LEN && w.endsWith('s') ? w.slice(0, -1) : w);
   const words = (t: string) => t.toLowerCase().replace(/[^a-z0-9 ]/g, ' ').split(' ').filter(Boolean);
   const terms = (q: string) => [...new Set(words(q).filter((w) => !STOP.has(w)).map(stem))];
   const wide = (ts: string[]) => [...new Set([...ts, 'return', 'day'])];
   const bitlen = (x: number) => { let n = 0; while (x > 0) { n++; x = Math.floor(x / 2); } return n; };
-  function idfOf(n: number, df: number) { const x = Math.floor((4096 * n) / df); const b = bitlen(x) - 1; return 2 * b + (b >= 1 ? Math.floor(x / 2 ** (b - 1)) % 2 : 0); }
-  const tokensOf = (w: number) => Math.floor((w * 13 + 9) / 10) + 6;
+  // idf as a fixed-point log2 in half steps: 2 x the bit length plus the next bit
+  function idfOf(n: number, df: number) { const x = Math.floor((IDF_SCALE * n) / df); const b = bitlen(x) - 1; return 2 * b + (b >= 1 ? Math.floor(x / 2 ** (b - 1)) % 2 : 0); }
+  const tokensOf = (w: number) => Math.floor((w * TOK_PER_10_WORDS + 9) / 10) + CHUNK_OVERHEAD_TOK; // tenths rounded up
 
   function chunkAll(docs: Doc[], size: number, overlap: number): Chunk[] {
     const out: Chunk[] = [];
@@ -84,7 +92,7 @@ import PlaygroundShell from '../components/PlaygroundShell.astro';
     }
     return out;
   }
-  function windowScore(stems: string[], ts: string[], idf: Record<string, number>, win = 12) {
+  function windowScore(stems: string[], ts: string[], idf: Record<string, number>, win = RERANK_WINDOW) {
     let best = 0;
     for (let s = 0; s < stems.length; s++) { let sc = 0; const part = stems.slice(s, s + win); for (const t of ts) if (part.includes(t)) sc += idf[t] ?? 0; if (sc > best) best = sc; }
     return best;
@@ -96,11 +104,11 @@ import PlaygroundShell from '../components/PlaygroundShell.astro';
     const idf: Record<string, number> = {};
     for (const t of ext) { const df = chunks.filter((c) => c.stems.includes(t)).length; if (df) idf[t] = idfOf(chunks.length, df); }
     const allowed = chunks.filter((c) => !(o.acl && c.flag === 'restricted'));
-    for (const c of allowed) { c.score = 0; for (const t of ts) { const tf = c.stems.filter((x) => x === t).length; if (tf) c.score += (idf[t] ?? 0) * Math.min(tf, 2); } }
+    for (const c of allowed) { c.score = 0; for (const t of ts) { const tf = c.stems.filter((x) => x === t).length; if (tf) c.score += (idf[t] ?? 0) * Math.min(tf, TF_CAP); } }
     const byScore = (a: Chunk, b: Chunk) => b.score - a.score || (a.id < b.id ? -1 : 1);
     let ranked = allowed.filter((c) => c.score > 0).sort(byScore);
     const firstTop = ranked.length ? ranked[0].score : 0;
-    if (o.rerank) { const cand = ranked.slice(0, 8); for (const c of cand) c.score = windowScore(c.stems, ext, idf) * 4 + Math.floor(c.score / 4); ranked = cand.sort(byScore); }
+    if (o.rerank) { const cand = ranked.slice(0, RERANK_POOL); for (const c of cand) c.score = windowScore(c.stems, ext, idf) * RERANK_WEIGHT + Math.floor(c.score / RERANK_WEIGHT); ranked = cand.sort(byScore); }
     const top = ranked.slice(0, o.k);
     const ctx: Chunk[] = []; const dropped: Chunk[] = []; let used = 0;
     for (const c of top) { const t = tokensOf(c.words.length); if (used + t <= o.budget) { ctx.push(c); used += t; } else dropped.push(c); }
@@ -151,7 +159,7 @@ import PlaygroundShell from '../components/PlaygroundShell.astro';
     }
     let raf = 0;
     function opts(): Opts {
-      const size = num('[data-size]'); const overlap = Math.min(num('[data-overlap]'), size - 10);
+      const size = num('[data-size]'); const overlap = Math.min(num('[data-overlap]'), size - MIN_STEP);
       const qq = QUERIES[q<HTMLSelectElement>('[data-q]').value];
       return { answerable: qq.answerable, query: qq.text, size, overlap, k: num('[data-k]'), rerank: chk('[data-rerank]'), rewrite: chk('[data-rewrite]'), budget: num('[data-budget]'), stale: chk('[data-stale]'), acl: chk('[data-acl]'), minScore: num('[data-min]') };
     }

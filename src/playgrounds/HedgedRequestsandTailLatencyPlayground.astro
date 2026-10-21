@@ -37,6 +37,21 @@ import PlaygroundShell from '../components/PlaygroundShell.astro';
 <script>
   // ---- Pure model: seeded LCG, integer milliseconds, no DOM ----
   const TAIL_BP = 100; // 1% in basis points
+  const BP = 10000, PM = 1000, PCT_TO_PM = 10; // basis points and per-mille in a whole
+  const SCALE = 1000; // service-time multiplier in thousandths: 1000 = nominal load
+  const MAX_TAIL_BP = 5000; // the slow share cannot exceed 50%
+  const FAST = { base: 6, spread: 5 }; // fast reply: 6 ms plus two draws of 0..4 ms, times the multiplier
+  const SLOW = { min: 200, span: 801 }; // slow reply: 200..1000 ms
+  const FAST_COMBOS = FAST.spread * FAST.spread;
+  const DRAWS_PER_CALL = 3; // latencies pre-drawn for up to three replicas
+  const BUDGET = { cap: 10000, earn: 50, cost: 1000 }; // hedge token bucket: each call earns 50, a hedge costs 1000
+  const BUDGET_PCT = (BUDGET.earn * 100) / BUDGET.cost; // 5% of calls may hedge
+  const SOLVE = { rounds: 8, calls: 20000, seed: 777 }; // fixed-point iteration for the load that hedges add
+  const RUN_SEED = 12345;
+  const MAX_UTIL_PM = 980; // utilisation is capped at 98%
+  const OVERLOAD_SCALE = 3000; // service time 3x nominal counts as overload
+  const P_FAST = 0.99; // chance one backend call is fast (1 - TAIL_BP)
+  const MIN_BAR_PCT = 0.6; // non-empty histogram bars stay visible
   const N_REQ = 2000;
   const EDGES = [20, 50, 100, 200, 400, 700];
   const BUCKETS = ['under 20 ms', '20 to 49 ms', '50 to 99 ms', '100 to 199 ms', '200 to 399 ms', '400 to 699 ms', '700 ms and up'];
@@ -45,17 +60,18 @@ import PlaygroundShell from '../components/PlaygroundShell.astro';
   interface Run { p50: number; p95: number; p99: number; delay: number; s: number; extraPm: number; hit: number; still: number; hist: number[]; eff: number }
   interface Pair { base: Run; hedged: Run; overloaded: boolean }
 
+  // linear congruential generator (Numerical Recipes constants), top 24 bits
   const lcg = (seed: number) => { let s = seed >>> 0; return () => { s = (Math.imul(s, 1664525) + 1013904223) >>> 0; return s >>> 8; }; };
-  const tailBp = (s: number) => Math.min(5000, Math.floor((TAIL_BP * s) / 1000));
-  const isTail = (r1: number, s: number) => r1 % 10000 < tailBp(s);
-  const latency = (r1: number, r2: number, r3: number, s: number) => isTail(r1, s) ? 200 + (r2 % 801) : Math.max(1, Math.floor(((6 + (r2 % 5) + (r3 % 5)) * s) / 1000));
+  const tailBp = (s: number) => Math.min(MAX_TAIL_BP, Math.floor((TAIL_BP * s) / SCALE));
+  const isTail = (r1: number, s: number) => r1 % BP < tailBp(s);
+  const latency = (r1: number, r2: number, r3: number, s: number) => isTail(r1, s) ? SLOW.min + (r2 % SLOW.span) : Math.max(1, Math.floor(((FAST.base + (r2 % FAST.spread) + (r3 % FAST.spread)) * s) / SCALE));
 
   function delayFor(pct: number, s: number): number {
     const tb = tailBp(s); const pts: [number, number][] = [];
-    for (let a = 0; a < 5; a++) for (let b = 0; b < 5; b++) pts.push([Math.floor(((6 + a + b) * s) / 1000), (10000 - tb) * 801]);
-    for (let k = 0; k < 801; k++) pts.push([200 + k, tb * 25]);
+    for (let a = 0; a < FAST.spread; a++) for (let b = 0; b < FAST.spread; b++) pts.push([Math.floor(((FAST.base + a + b) * s) / SCALE), (BP - tb) * SLOW.span]);
+    for (let k = 0; k < SLOW.span; k++) pts.push([SLOW.min + k, tb * FAST_COMBOS]);
     pts.sort((x, y) => x[0] - y[0]);
-    const total = 25 * 801 * 10000; let cum = 0;
+    const total = FAST_COMBOS * SLOW.span * BP; let cum = 0;
     for (const [v, w] of pts) { cum += w; if (cum * 100 >= pct * total) return Math.max(1, v); }
     return pts[pts.length - 1][0];
   }
@@ -63,54 +79,54 @@ import PlaygroundShell from '../components/PlaygroundShell.astro';
   interface St { tokens: number; budget: boolean }
   function shardCall(next: () => number, st: St, delay: number, R: number, s: number): [number, number, boolean] {
     const t: number[] = []; let tail1 = false;
-    for (let k = 0; k < 3; k++) { const r1 = next(); const r2 = next(); const r3 = next(); if (k === 0) tail1 = isTail(r1, s); t.push(latency(r1, r2, r3, s)); }
+    for (let k = 0; k < DRAWS_PER_CALL; k++) { const r1 = next(); const r2 = next(); const r3 = next(); if (k === 0) tail1 = isTail(r1, s); t.push(latency(r1, r2, r3, s)); }
     let done = t[0]; let hedges = 0;
-    st.tokens = Math.min(10000, st.tokens + 50);
+    st.tokens = Math.min(BUDGET.cap, st.tokens + BUDGET.earn);
     for (let k = 1; k < R && delay > 0 && done > k * delay; k++) {
-      if (st.budget && st.tokens < 1000) break;
-      if (st.budget) st.tokens -= 1000;
+      if (st.budget && st.tokens < BUDGET.cost) break;
+      if (st.budget) st.tokens -= BUDGET.cost;
       hedges++; done = Math.min(done, k * delay + t[k]);
     }
     return [done, hedges, tail1];
   }
 
   function solve(pct: number, o: Opts, R: number, rho: number) {
-    let s = 1000; let extra = 0; let eff = rho * 10;
+    let s = SCALE; let extra = 0; let eff = rho * PCT_TO_PM;
     if (pct === 0) return { s, delay: 0, extra, eff };
-    const d0 = delayFor(pct, 1000);
-    for (let it = 0; it < 8; it++) {
-      const d = o.adaptive ? delayFor(pct, s) : d0; const next = lcg(777); const st: St = { tokens: 0, budget: o.budget }; let h = 0;
-      for (let i = 0; i < 20000; i++) h += shardCall(next, st, d, R, s)[1];
-      extra = Math.floor((h * 1000) / 20000);
-      eff = Math.min(980, Math.floor((rho * (1000 + extra)) / 100));
-      s = Math.floor(((1000 - rho * 10) * 1000) / (1000 - eff));
+    const d0 = delayFor(pct, SCALE);
+    for (let it = 0; it < SOLVE.rounds; it++) {
+      const d = o.adaptive ? delayFor(pct, s) : d0; const next = lcg(SOLVE.seed); const st: St = { tokens: 0, budget: o.budget }; let h = 0;
+      for (let i = 0; i < SOLVE.calls; i++) h += shardCall(next, st, d, R, s)[1];
+      extra = Math.floor((h * PM) / SOLVE.calls);
+      eff = Math.min(MAX_UTIL_PM, Math.floor((rho * (PM + extra)) / 100));
+      s = Math.floor(((PM - rho * PCT_TO_PM) * SCALE) / (PM - eff));
     }
     return { s, delay: o.adaptive ? delayFor(pct, s) : d0, extra, eff };
   }
 
   function run(fanout: number, pct: number, R: number, rho: number, o: Opts): Run {
     const { s, delay, eff } = solve(pct, o, R, rho);
-    const next = lcg(12345); const st: St = { tokens: 0, budget: o.budget }; const lat: number[] = []; const hist = BUCKETS.map(() => 0);
+    const next = lcg(RUN_SEED); const st: St = { tokens: 0, budget: o.budget }; const lat: number[] = []; const hist = BUCKETS.map(() => 0);
     let hedges = 0; let hit = 0; let still = 0;
     for (let i = 0; i < N_REQ; i++) {
       let worst = 0; let slow = false;
       for (let j = 0; j < fanout; j++) { const [l, h, t] = shardCall(next, st, delay, R, s); if (l > worst) worst = l; hedges += h; if (t) slow = true; }
-      lat.push(worst); if (slow) hit++; if (worst >= 200) still++;
+      lat.push(worst); if (slow) hit++; if (worst >= SLOW.min) still++;
       let b = 0; while (b < EDGES.length && worst >= EDGES[b]) b++;
       hist[b]++;
     }
     lat.sort((a, b) => a - b);
-    const p = (q: number) => lat[Math.floor((q * N_REQ + 99) / 100) - 1];
-    return { p50: p(50), p95: p(95), p99: p(99), delay, s, extraPm: Math.floor((hedges * 1000) / (N_REQ * fanout)), hit: Math.floor((hit * 1000) / N_REQ), still: Math.floor((still * 1000) / N_REQ), hist, eff };
+    const p = (q: number) => lat[Math.floor((q * N_REQ + 99) / 100) - 1]; // nearest-rank percentile (integer ceiling)
+    return { p50: p(50), p95: p(95), p99: p(99), delay, s, extraPm: Math.floor((hedges * PM) / (N_REQ * fanout)), hit: Math.floor((hit * PM) / N_REQ), still: Math.floor((still * PM) / N_REQ), hist, eff };
   }
 
   function simulate(fanout: number, pct: number, R: number, rho: number, o: Opts): Pair {
     const base = run(fanout, 0, R, rho, o);
     const hedged = pct === 0 ? base : run(fanout, pct, R, rho, o);
-    return { base, hedged, overloaded: pct > 0 && hedged.s >= 3000 };
+    return { base, hedged, overloaded: pct > 0 && hedged.s >= OVERLOAD_SCALE };
   }
-  const theoryPm = (f: number) => Math.round((1 - Math.pow(0.99, f)) * 1000);
-  const pm = (v: number) => `${Math.floor(v / 10)}.${v % 10}%`;
+  const theoryPm = (f: number) => Math.round((1 - Math.pow(P_FAST, f)) * PM);
+  const pm = (v: number) => `${Math.floor(v / PCT_TO_PM)}.${v % PCT_TO_PM}%`;
   const pctText = (n: number) => (n * 100 / N_REQ).toFixed(1) + '%';
 
   // ---- UI: build the DOM once, then only update it ----
@@ -138,30 +154,30 @@ import PlaygroundShell from '../components/PlaygroundShell.astro';
       const { base, hedged, overloaded } = simulate(fan, pct, R, rho, o);
       const on = pct > 0;
       q('[data-policy]').textContent = on
-        ? `Send the request to a second replica if the first has not answered after ${hedged.delay} ms${R === 3 ? ' (and a third after twice that)' : ''}; take the first answer. The delay is the p${pct} of one backend, ${o.adaptive ? 're-measured under the current load' : 'measured once at nominal load and then frozen'}${o.budget ? '; hedges beyond 5% of calls are shed' : ''}.`
+        ? `Send the request to a second replica if the first has not answered after ${hedged.delay} ms${R === 3 ? ' (and a third after twice that)' : ''}; take the first answer. The delay is the p${pct} of one backend, ${o.adaptive ? 're-measured under the current load' : 'measured once at nominal load and then frozen'}${o.budget ? `; hedges beyond ${BUDGET_PCT}% of calls are shed` : ''}.`
         : 'No hedging: every shard call goes to one replica and the user request waits for the slowest of the shards.';
       q('[data-lat]').textContent = `${hedged.p50} / ${hedged.p95} / ${hedged.p99} ms`;
       q('[data-latnote]').textContent = on ? `no hedging: ${base.p50} / ${base.p95} / ${base.p99} ms` : 'hedging is off';
       q('[data-hit]').textContent = pm(hedged.hit);
-      q('[data-hitnote]').textContent = `theory 1 - 0.99^${fan} = ${pm(theoryPm(fan))}${on ? ` · no hedging: ${pm(base.hit)}` : ''}`;
+      q('[data-hitnote]').textContent = `theory 1 - ${P_FAST}^${fan} = ${pm(theoryPm(fan))}${on ? ` · no hedging: ${pm(base.hit)}` : ''}`;
       q('[data-still]').textContent = pm(hedged.still);
       q('[data-extra]').textContent = on ? `+${pm(hedged.extraPm)}` : '+0.0%';
-      q('[data-extranote]').textContent = on ? `backend utilisation ${Math.floor(hedged.eff / 10)}% (was ${rho}%)` : 'one call per shard';
+      q('[data-extranote]').textContent = on ? `backend utilisation ${Math.floor(hedged.eff / PCT_TO_PM)}% (was ${rho}%)` : 'one call per shard';
       q('[data-delay]').textContent = on ? `${hedged.delay} ms` : 'none';
-      q('[data-delaynote]').textContent = on ? `backends ${(hedged.s / 1000).toFixed(2)}x slower than nominal` : 'no second request is sent';
+      q('[data-delaynote]').textContent = on ? `backends ${(hedged.s / SCALE).toFixed(2)}x slower than nominal` : 'no second request is sent';
       q<HTMLElement>('[data-extrabox]').style.setProperty('--c', overloaded ? 'var(--bad)' : 'var(--role-4)');
       const verdict = q('[data-verdict]');
       let text: string; let bad = false;
       if (!on) text = `No hedging: ${pm(base.hit)} of user requests touched a slow backend and waited for it. The more shards a request waits for, the more often the slowest one is a tail call.`;
-      else if (overloaded) { bad = true; text = `Overloaded: the hedges add ${pm(hedged.extraPm)} load, utilisation reaches ${Math.floor(hedged.eff / 10)}%, every backend slows ${(hedged.s / 1000).toFixed(1)}x, so even more calls pass the delay and hedge too. p99 went from ${base.p99} to ${hedged.p99} ms: hedging made it worse.`; }
-      else if (hedged.p99 * 2 > base.p99) { bad = true; text = `Hedging barely helped: p99 is ${hedged.p99} ms against ${base.p99} ms for ${pm(hedged.extraPm)} extra load. ${o.budget ? 'The 5% budget ran out before most tail calls could be hedged, so the tail is mostly still there.' : 'The delay is too long for this tail.'}`; }
+      else if (overloaded) { bad = true; text = `Overloaded: the hedges add ${pm(hedged.extraPm)} load, utilisation reaches ${Math.floor(hedged.eff / PCT_TO_PM)}%, every backend slows ${(hedged.s / SCALE).toFixed(1)}x, so even more calls pass the delay and hedge too. p99 went from ${base.p99} to ${hedged.p99} ms: hedging made it worse.`; }
+      else if (hedged.p99 * 2 > base.p99) { bad = true; text = `Hedging barely helped: p99 is ${hedged.p99} ms against ${base.p99} ms for ${pm(hedged.extraPm)} extra load. ${o.budget ? `The ${BUDGET_PCT}% budget ran out before most tail calls could be hedged, so the tail is mostly still there.` : 'The delay is too long for this tail.'}`; }
       else if (hedged.p99 < base.p99) text = `Hedging cut p99 from ${base.p99} to ${hedged.p99} ms for ${pm(hedged.extraPm)} extra load.`;
-      else { bad = true; text = `Hedging did not help here: p99 is ${hedged.p99} ms against ${base.p99} ms. ${o.budget ? 'The 5% budget ran out before most tail calls could be hedged.' : 'The delay is too long or the backends are saturated.'}`; }
+      else { bad = true; text = `Hedging did not help here: p99 is ${hedged.p99} ms against ${base.p99} ms. ${o.budget ? `The ${BUDGET_PCT}% budget ran out before most tail calls could be hedged.` : 'The delay is too long or the backends are saturated.'}`; }
       verdict.textContent = text; verdict.classList.toggle('bad', bad);
       rows.forEach((r, i) => {
         const fa = base.hist[i] * 100 / N_REQ; const fb = hedged.hist[i] * 100 / N_REQ;
-        r.a.bar.style.width = fa > 0 ? `calc((100% - 9.5rem) * ${Math.max(fa, 0.6) / 100})` : '0'; r.a.val.textContent = `${fa.toFixed(1)}% no hedging`;
-        r.b.bar.style.width = fb > 0 ? `calc((100% - 9.5rem) * ${Math.max(fb, 0.6) / 100})` : '0'; r.b.val.textContent = `${fb.toFixed(1)}% hedged`;
+        r.a.bar.style.width = fa > 0 ? `calc((100% - 9.5rem) * ${Math.max(fa, MIN_BAR_PCT) / 100})` : '0'; r.a.val.textContent = `${fa.toFixed(1)}% no hedging`;
+        r.b.bar.style.width = fb > 0 ? `calc((100% - 9.5rem) * ${Math.max(fb, MIN_BAR_PCT) / 100})` : '0'; r.b.val.textContent = `${fb.toFixed(1)}% hedged`;
       });
       hist.setAttribute('aria-label', `Histogram of user request latency. No hedging: ${base.hist.map((c, i) => `${BUCKETS[i]} ${pctText(c)}`).join(', ')}. With the selected hedging: ${hedged.hist.map((c, i) => `${BUCKETS[i]} ${pctText(c)}`).join(', ')}.`);
     }

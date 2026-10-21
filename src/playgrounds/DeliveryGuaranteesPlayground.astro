@@ -48,7 +48,14 @@ import PlaygroundShell from '../components/PlaygroundShell.astro';
   interface Opts { seed: number; rate: number; window: number; cardKey: boolean; idemProducer: boolean }
 
   const N = 12;
-  const amountOf = (id: number) => 10 + ((id * 7) % 30);
+  const AMOUNT = { min: 10, step: 7, span: 30 }; // payment amounts spread over $10..$39
+  const PM = 1000; // fault rates are per mille
+  const FAULT_MIX = { crashBefore: 30, crashMid: 55, crashAfter: 80 }; // cumulative % of faults; the rest are lost acks
+  const SALT = { dup: 1000, gap: 1001 }; // hash inputs for the producer's duplicate send and where it lands
+  const DUP_MAX_GAP = 6; // a duplicate lands up to 6 positions after the original
+  const MAX_ATTEMPTS = 50;
+  const PCT_TO_PM = 10;
+  const amountOf = (id: number) => AMOUNT.min + ((id * AMOUNT.step) % AMOUNT.span);
   const INTENDED = Array.from({ length: N }, (_, i) => amountOf(i)).reduce((a, b) => a + b, 0);
   const STYLES: { id: Style; label: string }[] = [
     { id: 'ack-before', label: 'Ack before processing' },
@@ -57,6 +64,7 @@ import PlaygroundShell from '../components/PlaygroundShell.astro';
     { id: 'transactional', label: 'Transactional (offset in DB)' },
   ];
 
+  // integer mix of (seed, a, b) by prime multipliers, then three LCG steps (Numerical Recipes constants)
   function hash(seed: number, a: number, b: number): number {
     let x = (Math.imul(seed, 7919) + Math.imul(a, 104729) + Math.imul(b, 1299709) + 12345) >>> 0;
     for (let i = 0; i < 3; i++) x = (Math.imul(x, 1664525) + 1013904223) >>> 0;
@@ -64,17 +72,17 @@ import PlaygroundShell from '../components/PlaygroundShell.astro';
   }
   function fault(seed: number, pos: number, attempt: number, rate: number): string {
     const x = hash(seed, pos, attempt);
-    if ((x >>> 16) % 1000 >= rate) return 'ok';
+    if ((x >>> 16) % PM >= rate) return 'ok';
     const s = (x >>> 8) % 100;
-    return s < 30 ? 'crashBefore' : s < 55 ? 'crashMid' : s < 80 ? 'crashAfter' : 'lostAck';
+    return s < FAULT_MIX.crashBefore ? 'crashBefore' : s < FAULT_MIX.crashMid ? 'crashMid' : s < FAULT_MIX.crashAfter ? 'crashAfter' : 'lostAck';
   }
   // The log the broker holds: the producer may append a second copy of an event when its send ack is lost.
   function buildLog(seed: number, rate: number, idemProducer: boolean): number[] {
     const log = Array.from({ length: N }, (_, i) => i);
     if (idemProducer) return log;
     for (let i = 0; i < N; i++) {
-      if (((hash(seed, i, 1000) >>> 16) % 1000) < rate) {
-        const at = log.indexOf(i) + 1 + ((hash(seed, i, 1001) >>> 8) % 6);
+      if (((hash(seed, i, SALT.dup) >>> 16) % PM) < rate) {
+        const at = log.indexOf(i) + 1 + ((hash(seed, i, SALT.gap) >>> 8) % DUP_MAX_GAP);
         log.splice(Math.min(at, log.length), 0, i);
       }
     }
@@ -105,7 +113,7 @@ import PlaygroundShell from '../components/PlaygroundShell.astro';
         snap(`${tag}: charged and recorded${f === 'ok' ? '' : '; the later crash or lost ack changes nothing, the offset was already committed'}.`, 'ok');
         continue;
       }
-      for (let attempt = 0; attempt < 50; attempt++) {
+      for (let attempt = 0; attempt < MAX_ATTEMPTS; attempt++) {
         const f = fault(o.seed, pos, attempt, o.rate); const a = attempt ? `, retry ${attempt}` : '';
         if (f === 'crashBefore') { snap(`${tag}${a}: crashed before processing, redelivered.`, 'warn'); continue; }
         if (style === 'ack-after+dedupe' && dedupe.includes(id)) {
@@ -140,7 +148,7 @@ import PlaygroundShell from '../components/PlaygroundShell.astro';
     const lis: HTMLLIElement[] = []; const chips: HTMLButtonElement[] = [];
     const rowCells = new Map<Style, HTMLTableRowElement>();
     const opts = (): Opts => ({
-      seed: Number(q<HTMLSelectElement>('[data-seed]').value), rate: Number(q<HTMLInputElement>('[data-rate]').value) * 10,
+      seed: Number(q<HTMLSelectElement>('[data-seed]').value), rate: Number(q<HTMLInputElement>('[data-rate]').value) * PCT_TO_PM,
       window: q<HTMLSelectElement>('[data-window]').value === 'all' ? Infinity : Number(q<HTMLSelectElement>('[data-window]').value),
       cardKey: q<HTMLInputElement>('[data-key]').checked, idemProducer: q<HTMLInputElement>('[data-idem]').checked,
     });

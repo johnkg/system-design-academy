@@ -43,38 +43,45 @@ import PlaygroundShell from '../../components/PlaygroundShell.astro';
   document.querySelectorAll<HTMLElement>('[data-cpb]').forEach((root) => {
     const q = <T extends HTMLElement>(s: string) => root.querySelector<T>(s)!;
     const TRIALS = 20; const LOOP = 10000; const HOT = 3000; const COST_US = 100;
+    const SEED = 11, US_PER_S = 1e6;
+    const PM = 1000; // shares are kept in tenths of a percent
+    const TRUE_PM = (HOT * PM) / LOOP; // the hot function's real share: 300 = 30.0%
+    const TOLERANCE_PM = 50; // a profile within 5 points of the truth is close
+    const US_PER_PCT = US_PER_S / 100; // microseconds per second that make 1% of a core
+    const TENTHS = 10;
     // Runs the sampler and returns, for each trial, the estimated share of the hot function in tenths of a percent.
     function run(hz: number, jitter: boolean, procs: number, dur: number): { est: number[]; samples: number } {
-      let seed = 11; const rnd = () => { seed = (Math.imul(seed, 1664525) + 1013904223) >>> 0; return seed / 4294967296; };
-      const period = Math.floor(1e6 / hz); const est: number[] = []; let samples = 0;
+      // linear congruential generator (Numerical Recipes constants)
+      let seed = SEED; const rnd = () => { seed = (Math.imul(seed, 1664525) + 1013904223) >>> 0; return seed / 4294967296; };
+      const period = Math.floor(US_PER_S / hz); const est: number[] = []; let samples = 0;
       for (let t = 0; t < TRIALS; t++) {
         let hot = 0; let n = 0;
         for (let p = 0; p < procs; p++) {
-          let time = Math.floor(rnd() * LOOP); const end = time + dur * 1e6;
+          let time = Math.floor(rnd() * LOOP); const end = time + dur * US_PER_S;
           while (time < end) { n++; if (time % LOOP < HOT) hot++; time += jitter ? Math.floor(period / 2 + rnd() * period) : period; }
         }
-        est.push(Math.floor((hot * 1000) / n)); if (t === 0) samples = n;
+        est.push(Math.floor((hot * PM) / n)); if (t === 0) samples = n;
       }
       return { est, samples };
     }
-    const pct = (v: number) => `${(v / 10).toFixed(1)}%`;
+    const pct = (v: number) => `${(v / TENTHS).toFixed(1)}%`;
     let queued = false;
     function draw() {
       queued = false;
       const hz = Number(q<HTMLSelectElement>('[data-hz]').value); const jitter = q<HTMLSelectElement>('[data-jit]').value === 'jitter';
       const procs = Number(q<HTMLSelectElement>('[data-procs]').value); const dur = Number(q<HTMLSelectElement>('[data-dur]').value);
       const { est, samples } = run(hz, jitter, procs, dur);
-      const within = est.filter((e) => Math.abs(e - 300) <= 50).length; const lo = Math.min(...est); const hi = Math.max(...est);
-      const overhead = (hz * COST_US) / 1e4;
-      q('[data-o1]').textContent = `${pct(lo)} to ${pct(hi)}`; q('[data-n1]').textContent = `across ${TRIALS} profiles, the first reads ${pct(est[0])}; the truth is 30.0%`;
+      const within = est.filter((e) => Math.abs(e - TRUE_PM) <= TOLERANCE_PM).length; const lo = Math.min(...est); const hi = Math.max(...est);
+      const overhead = (hz * COST_US) / US_PER_PCT;
+      q('[data-o1]').textContent = `${pct(lo)} to ${pct(hi)}`; q('[data-n1]').textContent = `across ${TRIALS} profiles, the first reads ${pct(est[0])}; the truth is ${pct(TRUE_PM)}`;
       q('[data-o2]').textContent = `${within} of ${TRIALS}`; q('[data-n2]').textContent = `${samples.toLocaleString('en-US')} samples in each profile`;
-      q('[data-o3]').textContent = `${overhead.toFixed(1)}% of a core`; q('[data-n3]').textContent = `${hz} samples per second, 100 microseconds each, per process`;
+      q('[data-o3]').textContent = `${overhead.toFixed(1)}% of a core`; q('[data-n3]').textContent = `${hz} samples per second, ${COST_US} microseconds each, per process`;
       q<HTMLElement>('[data-b1]').style.setProperty('--c', within === TRIALS ? 'var(--good)' : 'var(--bad)');
       q<HTMLElement>('[data-b2]').style.setProperty('--c', within === TRIALS ? 'var(--good)' : 'var(--bad)');
       q<HTMLElement>('[data-b3]').style.setProperty('--c', overhead <= 1 ? 'var(--good)' : 'var(--accent)');
       const out = q('[data-verdict]'); const bad = within < TRIALS; out.classList.toggle('bad', bad);
-      out.textContent = !bad ? `Every profile is within 5 points of the truth. ${jitter ? 'Random intervals keep the sampler from locking onto the loop, so even one process is enough.' : `A period of ${Math.floor(1e6 / hz)} microseconds drifts across the 10,000 microsecond loop instead of landing on one moment.`}`
-        : `Only ${within} of ${TRIALS} profiles are close: a fixed period of ${Math.floor(1e6 / hz)} microseconds ${10000 % Math.floor(1e6 / hz) === 0 || Math.floor(1e6 / hz) % 10000 === 0 ? 'divides the loop evenly, so each process samples the same moment every time' : 'repeats too closely with the loop'}, and the share is off by up to ${Math.max(hi - 300, 300 - lo) / 10} points. More rate does not help; randomising the interval or merging many processes does.`;
+      out.textContent = !bad ? `Every profile is within ${TOLERANCE_PM / TENTHS} points of the truth. ${jitter ? 'Random intervals keep the sampler from locking onto the loop, so even one process is enough.' : `A period of ${Math.floor(US_PER_S / hz)} microseconds drifts across the ${LOOP.toLocaleString('en-US')} microsecond loop instead of landing on one moment.`}`
+        : `Only ${within} of ${TRIALS} profiles are close: a fixed period of ${Math.floor(US_PER_S / hz)} microseconds ${LOOP % Math.floor(US_PER_S / hz) === 0 || Math.floor(US_PER_S / hz) % LOOP === 0 ? 'divides the loop evenly, so each process samples the same moment every time' : 'repeats too closely with the loop'}, and the share is off by up to ${Math.max(hi - TRUE_PM, TRUE_PM - lo) / TENTHS} points. More rate does not help; randomising the interval or merging many processes does.`;
     }
     const schedule = () => { if (!queued) { queued = true; requestAnimationFrame(draw); } };
     root.addEventListener('change', schedule);

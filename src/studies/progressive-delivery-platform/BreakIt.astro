@@ -35,30 +35,40 @@ import PlaygroundShell from '../../components/PlaygroundShell.astro';
   document.querySelectorAll<HTMLElement>('[data-pdb]').forEach((root) => {
     const q = <T extends HTMLElement>(s: string) => root.querySelector<T>(s)!;
     const RELEASES = 100; const RPS = 100; const MAXS = 3;
-    let seed = 4242; const u = () => ((seed = (seed * 1664525 + 1013904223) % 4294967296) / 4294967296);
-    const gauss = () => Math.sqrt(-2 * Math.log(1 - u())) * Math.cos(2 * Math.PI * u());
+    const SEED = 4242;
+    const BASE_ERR = 0.01, BAD_ERR = 0.02; // error rate of a good release and of a bad one
+    const BLIP = { every: 5, bump: 0.015 }; // every 5th release hits a 1.5-point blip that affects canary and baseline alike
+    const MIN_CANARY_N = 300; // the z test waits until the canary has 300 requests
+    const FIXED_LIMIT = 0.015; // fixed rule: stop above 1.5% errors
+    const Z = { z164: 1.645, z233: 2.326 }; // one-sided 95% and 99% critical values
+    const MIN_S = 60; // seconds per minute
+    const MISSED_MIN = 30; // a missed bad release runs at full traffic for 30 minutes before someone notices
+    const TOO_MANY_FALSE = 10;
+    // linear congruential generator (Numerical Recipes constants)
+    let seed = SEED; const u = () => ((seed = (seed * 1664525 + 1013904223) % 4294967296) / 4294967296);
+    const gauss = () => /* Box-Muller */ Math.sqrt(-2 * Math.log(1 - u())) * Math.cos(2 * Math.PI * u());
     // The same random draws are reused for every setting, so only the setting changes the outcome.
     const noise = Array.from({ length: 2 * RELEASES }, () => Array.from({ length: MAXS }, () => [gauss(), gauss()]));
     const PLANS: Record<string, number[]> = { three: [1, 10, 50], two: [10, 50], one: [50] };
     function simulate(rule: string, plan: string, bake: number, blip: boolean) {
       const stages = PLANS[plan]; let falseStops = 0; let missed = 0; let extra = 0;
       for (let r = 0; r < 2 * RELEASES; r++) {
-        const bad = r >= RELEASES; const trueRate = bad ? 0.02 : 0.01; let stopped = false;
-        const blipStage = blip && r % 5 === 0 ? Math.floor(r / 5) % stages.length : -1;
+        const bad = r >= RELEASES; const trueRate = bad ? BAD_ERR : BASE_ERR; let stopped = false;
+        const blipStage = blip && r % BLIP.every === 0 ? Math.floor(r / BLIP.every) % stages.length : -1;
         for (let s = 0; s < stages.length && !stopped; s++) {
-          const total = RPS * 60 * bake; let nc = Math.floor((total * stages[s]) / 100); let mult = 1;
-          if (rule === 'z233') while (nc * mult < 300) mult *= 2; // not enough data: wait longer
+          const total = RPS * MIN_S * bake; let nc = Math.floor((total * stages[s]) / 100); let mult = 1;
+          if (rule === 'z233') while (nc * mult < MIN_CANARY_N) mult *= 2; // not enough data: wait longer
           nc *= mult; const nb = total * mult - nc;
-          const bump = s === blipStage ? 0.015 : 0; const pc = trueRate + bump; const pb = 0.01 + bump;
+          const bump = s === blipStage ? BLIP.bump : 0; const pc = trueRate + bump; const pb = BASE_ERR + bump;
           const ec = Math.max(0, nc * pc + Math.sqrt(nc * pc * (1 - pc)) * noise[r][s][0]);
           const eb = Math.max(0, nb * pb + Math.sqrt(nb * pb * (1 - pb)) * noise[r][s][1]);
           let stop: boolean;
-          if (rule === 'fixed') stop = ec / nc > 0.015;
-          else { const p = (ec + eb) / (nc + nb); const se = Math.sqrt(p * (1 - p) * (1 / nc + 1 / nb)); const z = (ec / nc - eb / nb) / se; stop = z > (rule === 'z164' ? 1.645 : 2.326); }
-          if (bad) extra += nc * 0.01;
+          if (rule === 'fixed') stop = ec / nc > FIXED_LIMIT;
+          else { const p = (ec + eb) / (nc + nb); const se = Math.sqrt(p * (1 - p) * (1 / nc + 1 / nb)); const z = (ec / nc - eb / nb) / se; stop = z > (rule === 'z164' ? Z.z164 : Z.z233); }
+          if (bad) extra += nc * (BAD_ERR - BASE_ERR); // extra errors the bad release caused
           if (stop) { stopped = true; if (!bad) falseStops++; }
         }
-        if (bad && !stopped) { missed++; extra += RPS * 60 * 30 * 0.01; }
+        if (bad && !stopped) { missed++; extra += RPS * MIN_S * MISSED_MIN * (BAD_ERR - BASE_ERR); }
       }
       return { falseStops, missed, avgExtra: Math.round(extra / RELEASES) };
     }
@@ -68,17 +78,17 @@ import PlaygroundShell from '../../components/PlaygroundShell.astro';
       q('[data-bakeval]').textContent = String(bake);
       const r = simulate(rule, plan, bake, blip);
       q('[data-o1]').textContent = `${r.falseStops} of ${RELEASES}`;
-      q('[data-n1]').textContent = r.falseStops >= 10 ? 'teams will start to bypass the platform' : 'rare enough to be trusted';
+      q('[data-n1]').textContent = r.falseStops >= TOO_MANY_FALSE ? 'teams will start to bypass the platform' : 'rare enough to be trusted';
       q('[data-o2]').textContent = `${r.missed} of ${RELEASES}`;
       q('[data-n2]').textContent = r.missed > 0 ? 'the regression was not seen in time' : 'every bad release was stopped';
       q('[data-o3]').textContent = r.avgExtra.toLocaleString('en-US');
       q('[data-n3]').textContent = 'on average, including 30 minutes for any that got through';
-      q<HTMLElement>('[data-b1]').style.setProperty('--c', r.falseStops >= 10 ? 'var(--bad)' : 'var(--good)');
+      q<HTMLElement>('[data-b1]').style.setProperty('--c', r.falseStops >= TOO_MANY_FALSE ? 'var(--bad)' : 'var(--good)');
       q<HTMLElement>('[data-b2]').style.setProperty('--c', r.missed > 0 ? 'var(--bad)' : 'var(--good)');
       q<HTMLElement>('[data-b3]').style.setProperty('--c', 'var(--accent)');
-      const out = q('[data-verdict]'); const bad = r.falseStops >= 10 || r.missed > 0; out.classList.toggle('bad', bad);
+      const out = q('[data-verdict]'); const bad = r.falseStops >= TOO_MANY_FALSE || r.missed > 0; out.classList.toggle('bad', bad);
       out.textContent = r.missed > 0 ? `${r.missed} bad releases reached everyone: each stage had too little data to separate a 2% error rate from a 1% one. Lengthen the bake or use bigger stages.`
-        : r.falseStops >= 10 ? `Nothing bad got through, but ${r.falseStops} good releases were stopped. ${rule === 'fixed' ? 'A fixed limit cannot tell a blip that hits everyone from a bad release.' : 'Each check has a chance of a false alarm, and several checks add up. A higher z limit lowers it.'}`
+        : r.falseStops >= TOO_MANY_FALSE ? `Nothing bad got through, but ${r.falseStops} good releases were stopped. ${rule === 'fixed' ? 'A fixed limit cannot tell a blip that hits everyone from a bad release.' : 'Each check has a chance of a false alarm, and several checks add up. A higher z limit lowers it.'}`
         : `Only ${r.falseStops} good releases were stopped and every bad one was caught, at about ${r.avgExtra.toLocaleString('en-US')} extra failed requests each.`;
     }
     root.addEventListener('input', draw); root.addEventListener('change', draw);

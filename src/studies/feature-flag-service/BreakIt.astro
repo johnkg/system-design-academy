@@ -65,6 +65,15 @@ const BARS = 24;
   document.querySelectorAll<HTMLElement>('[data-ffb]').forEach((root) => {
     const q = <T extends HTMLElement>(s: string) => root.querySelector<T>(s)!;
     const N = 20000; const EDGES = 50; const RATE = 10; const DOWN_AT = 10; const COLD_EVERY = 20; const USERS = 3000; const REQS = 12; const BARS = 24;
+    const SEC_PER_MIN = 60;
+    const APPLY_S = { poll: 0.1, cdn: 0.3, cdnCold: 0.2, streamMin: 0.2, streamRange: 0.6 }; // time from receiving a ruleset to using it
+    const RECONNECT_JITTER_S = 5; // streaming clients reconnect within 5 s of the service returning
+    const COLD_RETRY_MAX_S = 30; // a cold SDK retries at most every 30 s
+    const ROLLOUT = { before: 0.1, after: 0.3 }; // the rollout goes from 10% to 30%
+    const ROLLOUT_MIN_WINDOW_S = 3; // users' requests are spread over at least 3 s
+    const BAR_MIN_PCT = 2;
+    const WARN = { killS: 30, reqs: 5e6, pollRps: 1000, stormRps: 2000, flickPct: 10, fastPollS: 15 }; // card and verdict thresholds
+    // Numerical Recipes LCG
     let seed = 77; const rnd = () => ((seed = (seed * 1664525 + 1013904223) % 4294967296) / 4294967296);
     const arr = (n: number) => Array.from({ length: n }, rnd);
     const U = arr(N); const CU = arr(N); const D = arr(N); const CJ = arr(N); const UE = arr(EDGES);
@@ -75,7 +84,7 @@ const BARS = 24;
     const fmtM = (n: number) => (n >= 1e5 ? `${(n / 1e6).toFixed(1)} million` : `${fmtN(n)}`);
     const dur = (s: number) => (s < 1 ? 'under 1 s' : s < 120 ? `${s.toFixed(s < 10 ? 1 : 0)} s` : s < 7200 ? `${(s / 60).toFixed(1)} min` : `${(s / 3600).toFixed(1)} h`);
     function simulate(mode: string, P: number, T: number, outMin: number, cold: string, bucketing: string) {
-      const up = DOWN_AT + outMin * 60; // the moment the service is back (equal to the failure time when there is no outage)
+      const up = DOWN_AT + outMin * SEC_PER_MIN; // the moment the service is back (equal to the failure time when there is no outage)
       const inOut = (t: number) => outMin > 0 && t >= DOWN_AT && t < up;
       const skip = (t: number) => (inOut(t) ? t + P * Math.ceil((up - t) / P) : t); // a failed poll is simply tried again one interval later
       const avail = UE.map((u) => { const a = u * T; return inOut(a) ? up + 1 : a; }); // when each edge cache gets the new ruleset
@@ -84,9 +93,9 @@ const BARS = 24;
       let onSec = 0; let wrongSec = 0;
       for (let i = 0; i < N; i++) {
         const phi = U[i] * P; let t: number;
-        if (mode === 'poll') { t = skip(phi) + 0.1; hit(phi + P * Math.ceil((up - phi) / P)); }
-        else if (mode === 'cdn') { const a = avail[i % EDGES]; t = phi; if (t < a) t += P * Math.ceil((a - t) / P); t += 0.3; }
-        else { t = 0.2 + D[i] * 0.6; if (outMin > 0) hit(up + CJ[i] * 5); }
+        if (mode === 'poll') { t = skip(phi) + APPLY_S.poll; hit(phi + P * Math.ceil((up - phi) / P)); }
+        else if (mode === 'cdn') { const a = avail[i % EDGES]; t = phi; if (t < a) t += P * Math.ceil((a - t) / P); t += APPLY_S.cdn; }
+        else { t = APPLY_S.streamMin + D[i] * APPLY_S.streamRange; if (outMin > 0) hit(up + CJ[i] * RECONNECT_JITTER_S); }
         tNew[i] = t; tOff[i] = t; onSec += t;
       }
       if (mode === 'cdn') for (let e = 0; e < EDGES; e++) hit(avail[e]);
@@ -94,11 +103,11 @@ const BARS = 24;
       if (outMin > 0) for (let i = 0; i < N; i += COLD_EVERY) {
         coldCount++; const warmOn = Math.min(tNew[i], DOWN_AT); onSec += warmOn - tNew[i];
         if (mode === 'cdn') {
-          const a = avail[i % EDGES]; let t = DOWN_AT + 0.2;
-          if (a > DOWN_AT) { const phi = DOWN_AT + CU[i] * P; t = phi + P * Math.max(0, Math.ceil((a - phi) / P)) + 0.3; }
+          const a = avail[i % EDGES]; let t = DOWN_AT + APPLY_S.cdnCold;
+          if (a > DOWN_AT) { const phi = DOWN_AT + CU[i] * P; t = phi + P * Math.max(0, Math.ceil((a - phi) / P)) + APPLY_S.cdn; }
           onSec += t - DOWN_AT; tOff[i] = t;
         } else {
-          const ready = up + (mode === 'stream' ? CJ[i] * 5 : CU[i] * Math.min(P, 30)); hit(ready);
+          const ready = up + (mode === 'stream' ? CJ[i] * RECONNECT_JITTER_S : CU[i] * Math.min(P, COLD_RETRY_MAX_S)); hit(ready);
           if (cold === 'closed') { wrongSec += ready - DOWN_AT; tOff[i] = warmOn; }
           else if (cold === 'open') { wrongSec += ready - DOWN_AT; onSec += ready - DOWN_AT; tOff[i] = ready; }
           else { onSec += ready - DOWN_AT; tOff[i] = ready; }
@@ -108,13 +117,13 @@ const BARS = 24;
       let peak = 0; hits.forEach((v) => { if (v > peak) peak = v; });
       const steady = mode === 'poll' ? N / P : mode === 'cdn' ? Math.min(EDGES / T, N / P) : 0;
       // The rollout: the same propagation, seen by simulated users who hit random instances.
-      const sw = [...tNew].sort((a, b) => a - b); const W = Math.max(sw[Math.ceil(0.99 * N) - 1], 3);
+      const sw = [...tNew].sort((a, b) => a - b); const W = Math.max(sw[Math.ceil(0.99 * N) - 1], ROLLOUT_MIN_WINDOW_S);
       let lost = 0; let flick = 0; let overlapN = 0; let overlapD = 0;
       for (let u = 0; u < USERS; u++) {
-        const ev = (fresh: boolean, r: number) => (bucketing === 'random' ? r < (fresh ? 0.3 : 0.1) : bucketing === 'resalt' ? (fresh ? B2[u] < 0.3 : B1[u] < 0.1) : B1[u] < (fresh ? 0.3 : 0.1));
+        const ev = (fresh: boolean, r: number) => (bucketing === 'random' ? r < (fresh ? ROLLOUT.after : ROLLOUT.before) : bucketing === 'resalt' ? (fresh ? B2[u] < ROLLOUT.after : B1[u] < ROLLOUT.before) : B1[u] < (fresh ? ROLLOUT.after : ROLLOUT.before));
         const before = ev(false, BR[u]); const after = ev(true, AR[u]);
         if (before && !after) lost++;
-        if (after) { overlapD++; if (bucketing === 'shared' ? B1[u] < 0.3 : BO[u] < 0.3) overlapN++; }
+        if (after) { overlapD++; if (bucketing === 'shared' ? B1[u] < ROLLOUT.after : BO[u] < ROLLOUT.after) overlapN++; }
         const reqs = UT[u].map((f, k) => ({ t: f * W, i: Math.floor(UI[u][k] * N), r: UR[u][k] })).sort((a, b) => a.t - b.t);
         let prev: boolean | null = null; let fl = false;
         for (const x of reqs) { const on = ev(x.t >= tNew[x.i], x.r); if (prev === true && on === false) fl = true; prev = on; }
@@ -129,10 +138,10 @@ const BARS = 24;
       const r = simulate(mode, P, T, outMin, cold, bk);
       // cumulative share of instances that no longer serve the broken feature
       const max = Math.max(r.max, 1);
-      let j = 0; bars.forEach((b, k) => { const x = (max * (k + 1)) / BARS; while (j < N && r.sorted[j] <= x) j++; b.style.height = `${Math.max(2, (j / N) * 100)}%`; });
+      let j = 0; bars.forEach((b, k) => { const x = (max * (k + 1)) / BARS; while (j < N && r.sorted[j] <= x) j++; b.style.height = `${Math.max(BAR_MIN_PCT, (j / N) * 100)}%`; });
       q('[data-max]').textContent = dur(max);
       q('[data-o1]').textContent = `half: ${dur(r.p50)}, 99%: ${dur(r.p99)}`; q('[data-n1]').textContent = `the last instance: ${dur(r.max)}`;
-      q('[data-o2]').textContent = fmtM(r.req); q('[data-n2]').textContent = `20,000 instances at ${RATE} requests per second each, counted until each one switches`;
+      q('[data-o2]').textContent = fmtM(r.req); q('[data-n2]').textContent = `${fmtN(N)} instances at ${RATE} requests per second each, counted until each one switches`;
       q('[data-o3]').textContent = mode === 'stream' ? `${fmtN(N)} open connections` : `${r.steady < 10 ? r.steady.toFixed(1) : fmtN(r.steady)} requests per second`;
       q('[data-n3]').textContent = mode === 'stream' ? (outMin > 0 ? `reconnect storm after the outage: ${fmtN(r.peak)} requests per second` : `one push of ${fmtN(N)} messages for the change`) : `busiest second after the change: ${fmtN(r.peak)}${mode === 'cdn' ? ' (the cache keeps the SDKs off the service)' : ''}`;
       if (outMin === 0) { q('[data-o4]').textContent = 'no outage'; q('[data-n4]').textContent = 'a new SDK simply fetches the ruleset'; }
@@ -144,17 +153,17 @@ const BARS = 24;
       const lostPct = (r.lost / USERS) * 100; const flickPct = (r.flick / USERS) * 100;
       q('[data-o5]').textContent = `${fmtN(r.lost)} of ${fmtN(USERS)} users lose it`; q('[data-n5]').textContent = `${flickPct.toFixed(0)}% see it go back off during the spread; ${(r.overlap * 100).toFixed(0)}% of them also have another 30% flag`;
       const bad = (el: string, v: boolean) => q<HTMLElement>(el).style.setProperty('--c', v ? 'var(--bad)' : 'var(--good)');
-      bad('[data-b1]', r.p99 > 30); bad('[data-b2]', r.req > 5e6); bad('[data-b3]', (mode === 'poll' && r.steady > 1000) || (mode === 'stream' && outMin > 0 && r.peak > 2000)); bad('[data-b4]', (mode !== 'cdn' && outMin > 0 && cold !== 'bundled')); bad('[data-b5]', r.lost > 0 || flickPct > 10);
+      bad('[data-b1]', r.p99 > WARN.killS); bad('[data-b2]', r.req > WARN.reqs); bad('[data-b3]', (mode === 'poll' && r.steady > WARN.pollRps) || (mode === 'stream' && outMin > 0 && r.peak > WARN.stormRps)); bad('[data-b4]', (mode !== 'cdn' && outMin > 0 && cold !== 'bundled')); bad('[data-b5]', r.lost > 0 || flickPct > WARN.flickPct);
       const out = q('[data-verdict]');
       const msgs: string[] = [];
-      if (r.p99 > 30) msgs.push(`The kill switch took ${dur(r.p99)} to reach 99% of the fleet, and the broken feature answered ${fmtM(r.req)} requests meanwhile${outMin > 0 && mode !== 'stream' ? ', because the outage stopped the polls that came after second 10' : ''}.`);
+      if (r.p99 > WARN.killS) msgs.push(`The kill switch took ${dur(r.p99)} to reach 99% of the fleet, and the broken feature answered ${fmtM(r.req)} requests meanwhile${outMin > 0 && mode !== 'stream' ? `, because the outage stopped the polls that came after second ${DOWN_AT}` : ''}.`);
       else msgs.push(`The kill switch reached 99% of the fleet in ${dur(r.p99)}.`);
       if (mode === 'stream' && outMin > 0) msgs.push(`Streaming delivered the change before the service failed, but the return of the service brought ${fmtN(r.peak)} reconnects in one second.`);
-      if (mode === 'poll' && P <= 15) msgs.push(`Polling every ${P} s costs the service ${fmtN(r.steady)} requests per second all the time.`);
+      if (mode === 'poll' && P <= WARN.fastPollS) msgs.push(`Polling every ${P} s costs the service ${fmtN(r.steady)} requests per second all the time.`);
       if (bk === 'random' || bk === 'resalt') msgs.push(`Without a stable hash, ${fmtN(r.lost)} users lost a feature they had (${lostPct.toFixed(0)}%).`);
       else if (bk === 'shared') msgs.push('A shared salt never takes anyone back, but the same users land in every rollout, so the other flag overlaps 100% and experiments are biased.');
       else msgs.push(`With a stable hash nobody loses the feature, but ${flickPct.toFixed(0)}% of users still saw it switch off while instances disagreed.`);
-      out.textContent = msgs.join(' '); out.classList.toggle('bad', r.p99 > 30 || r.lost > 0);
+      out.textContent = msgs.join(' '); out.classList.toggle('bad', r.p99 > WARN.killS || r.lost > 0);
     }
     root.addEventListener('input', draw); root.addEventListener('change', draw);
     draw();

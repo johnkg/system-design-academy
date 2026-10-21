@@ -46,20 +46,24 @@ pages.sort();
 const targets = pages.filter((p) => p.includes(only));
 
 // Serve dist/ with `astro preview` (our own child process, stopped at the end). The site may live under a base path.
-const port = 4400 + Math.floor(Math.random() * 400);
+const PORT_BASE = 4400, PORT_SPREAD = 400; // a random port, so parallel runs on one machine do not collide
+const port = PORT_BASE + Math.floor(Math.random() * PORT_SPREAD);
 const preview = spawn('npx', ['astro', 'preview', '--port', String(port), '--host', '127.0.0.1'], { cwd: root, stdio: 'ignore' });
 const stop = () => { try { preview.kill('SIGTERM'); } catch { /* already gone */ } };
 process.on('exit', stop);
 const origin = `http://127.0.0.1:${port}`;
-for (let i = 0; i < 60; i++) {
-  try { if ((await fetch(origin + '/')).status < 500) break; } catch { /* not up yet */ }
-  await new Promise((r) => setTimeout(r, 500));
+const START_TRIES = 60, START_POLL_MS = 500; // wait up to 30 s for the preview server
+const SERVER_ERROR = 500; // any status below this means the server is up
+for (let i = 0; i < START_TRIES; i++) {
+  try { if ((await fetch(origin + '/')).status < SERVER_ERROR) break; } catch { /* not up yet */ }
+  await new Promise((r) => setTimeout(r, START_POLL_MS));
 }
 const base = (() => { try { return new URL(process.env.BASE ? `http://x${process.env.BASE}/` : origin + '/').pathname.replace(/\/$/, ''); } catch { return ''; } })();
 
 const executablePath = existsSync('/opt/pw-browsers/chromium-1194/chrome-linux/chrome') ? '/opt/pw-browsers/chromium-1194/chrome-linux/chrome' : undefined;
 const browser = await playwright.chromium.launch({ executablePath });
 
+const CONTROL_TIMEOUT_MS = 500; // a control that does not respond in this time is skipped, not a failure
 async function exercise(page) {
   // Set every select to each option and every range to its extremes, then press each playground button once.
   const zones = page.locator('.playground, [data-player], [data-grow]');
@@ -67,26 +71,30 @@ async function exercise(page) {
     const zone = zones.nth(z);
     for (const sel of await zone.locator('select').all()) {
       const values = await sel.locator('option').evaluateAll((o) => o.map((x) => x.value));
-      for (const v of values) await sel.selectOption(v, { timeout: 500 }).catch(() => {});
+      for (const v of values) await sel.selectOption(v, { timeout: CONTROL_TIMEOUT_MS }).catch(() => {});
     }
     for (const r of await zone.locator('input[type=range]').all()) {
-      for (const attr of ['min', 'max']) { const v = await r.getAttribute(attr); if (v !== null) await r.fill(v, { timeout: 500 }).catch(() => {}); }
+      for (const attr of ['min', 'max']) { const v = await r.getAttribute(attr); if (v !== null) await r.fill(v, { timeout: CONTROL_TIMEOUT_MS }).catch(() => {}); }
     }
-    for (const btn of await zone.locator('button:not([disabled])').all()) await btn.click({ timeout: 500 }).catch(() => {});
+    for (const btn of await zone.locator('button:not([disabled])').all()) await btn.click({ timeout: CONTROL_TIMEOUT_MS }).catch(() => {});
   }
 }
 
+// Two passes per page: a desktop in light mode, and 320 px (a 1280 px screen at 400% zoom, WCAG 1.4.10) in dark mode.
+const DESKTOP = 1280, REFLOW = 320, VIEW_HEIGHT = 900;
+const LOG_CHARS = 160; // console errors are cut to this length in the report
+const PARALLEL_PAGES = 4;
 async function check(path) {
   const problems = [];
-  for (const [width, scheme] of [[1280, 'light'], [320, 'dark']]) {
-    const page = await browser.newPage({ viewport: { width, height: 900 }, colorScheme: scheme });
+  for (const [width, scheme] of [[DESKTOP, 'light'], [REFLOW, 'dark']]) {
+    const page = await browser.newPage({ viewport: { width, height: VIEW_HEIGHT }, colorScheme: scheme });
     page.on('pageerror', (e) => problems.push(`[${width}] script error: ${e.message}`));
-    page.on('console', (m) => { if (m.type() === 'error') problems.push(`[${width}] console error: ${m.text().slice(0, 160)}`); });
+    page.on('console', (m) => { if (m.type() === 'error') problems.push(`[${width}] console error: ${m.text().slice(0, LOG_CHARS)}`); });
     try {
       await page.goto(origin + base + path, { waitUntil: 'load' });
       if (font) await page.addStyleTag({ content: `html, body, button, input, select, textarea { font-family: '${font}', sans-serif !important }` });
       // WCAG 1.4.12: content must survive these user overrides without clipping or sideways scrolling.
-      if (width === 320) await page.addStyleTag({ content: '* { line-height: 1.5 !important; letter-spacing: .12em !important; word-spacing: .16em !important } p { margin-bottom: 2em !important }' });
+      if (width === REFLOW) await page.addStyleTag({ content: '* { line-height: 1.5 !important; letter-spacing: .12em !important; word-spacing: .16em !important } p { margin-bottom: 2em !important }' });
       await exercise(page);
       if (await page.evaluate(() => document.documentElement.scrollWidth > document.documentElement.clientWidth)) problems.push(`[${width}] horizontal scroll`);
       if (axeSource) { // both passes: light at desktop width, and dark at 320px, so both palettes are contrast-checked
@@ -112,7 +120,7 @@ async function checkTwice(path) {
 
 const queue = [...targets];
 const failures = [];
-await Promise.all(Array.from({ length: 4 }, async () => {
+await Promise.all(Array.from({ length: PARALLEL_PAGES }, async () => {
   for (let path; (path = queue.shift()); ) {
     const problems = await checkTwice(path);
     if (problems.length) { failures.push({ path, problems }); console.error(`FAIL ${path}\n  ${problems.slice(0, 6).join('\n  ')}`); }

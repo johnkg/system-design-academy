@@ -69,12 +69,14 @@ for (const s of kinds.studies) {
 for (const s of kinds.patterns) if (!meta[`patterns/${s}`].quiz) err(`patterns/${s}`, 'no quiz');
 
 // 3. Quiz sanity (the schema already checks shapes: this is about meaning and style).
+const OPTIONS = 4; // per question, as in src/content.config.ts
+const MAX_LONGEST_SHARE = 35; // % of questions whose correct option may be the single longest (chance is 100 / OPTIONS)
 const positional = /\b([Oo]ption|[Aa]nswer|[Cc]hoice) [A-D]\b|\b[Tt]he (first|second|third|fourth|last|top|bottom) (option|choice)\b|\([A-D]\)/;
-const dist = { positions: [0, 0, 0, 0], longest: 0, total: 0 };
+const dist = { positions: Array(OPTIONS).fill(0), longest: 0, total: 0 };
 for (const [id, m] of Object.entries(meta)) {
   (m.quiz ?? []).forEach((q, i) => {
     const w = `${id} quiz #${i + 1}`;
-    if (new Set(q.options.map((o) => o.trim().toLowerCase())).size !== 4) err(w, 'two options are identical');
+    if (new Set(q.options.map((o) => o.trim().toLowerCase())).size !== OPTIONS) err(w, 'two options are identical');
     if (!q.question.trim().endsWith('?')) warn(w, 'question does not end with a question mark');
     if (positional.test([q.question, q.explanation, ...q.options].join(" || "))) err(w, 'refers to an option by position, but options are shown shuffled');
     if (/[—–]/.test(`${q.question} ${q.explanation} ${q.options.join(' ')}`)) warn(w, 'contains a dash character (house style prefers commas or full stops)');
@@ -84,7 +86,7 @@ for (const [id, m] of Object.entries(meta)) {
   });
 }
 const share = dist.total ? Math.round((100 * dist.longest) / dist.total) : 0;
-if (share > 35) err('quizzes', `the correct option is the single longest in ${share}% of questions (limit 35%, chance is 25%)`);
+if (share > MAX_LONGEST_SHARE) err('quizzes', `the correct option is the single longest in ${share}% of questions (limit ${MAX_LONGEST_SHARE}%, chance is ${100 / OPTIONS}%)`);
 
 
 // 4. The what's-new page: every link in the changelog must point at a real page.

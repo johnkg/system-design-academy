@@ -55,12 +55,21 @@ import PlaygroundShell from '../../components/PlaygroundShell.astro';
     type Node = { capC: number; capM: number; cpu: number; mem: number; pods: Pod[]; dead: boolean };
     const SIZES = [8, 16, 32, 16, 8, 32, 16, 16, 8, 16]; const RESTART = 8; const HB = 10;
     const TYPES = [[1, 2, 0.3], [2, 4, 0.25], [4, 4, 0.15], [1, 16, 0.2], [4, 24, 0.1]];
-    let seed = 11; const rnd = () => ((seed = (seed * 1664525 + 1013904223) % 4294967296) / 4294967296);
-    const POOL: Pod[] = Array.from({ length: 100 }, (_, id) => { let u = rnd(); let k = 0; while (k < TYPES.length - 1 && u >= TYPES[k][2]) { u -= TYPES[k][2]; k++; } return { id, cpu: TYPES[k][0], mem: TYPES[k][1] }; });
-    const fresh = (): Node[] => SIZES.map((c) => ({ capC: c, capM: c * 4, cpu: c, mem: c * 4, pods: [], dead: false }));
+    const SEED = 11; const POOL_SIZE = 100; const GB_PER_CPU = 4; // pods drawn; node memory per CPU
+    const BEST_NORM = { cpu: 16, mem: 64 }; // best-fit scales leftover CPU and GB to a comparable size
+    const SCORE_EPS = 1e-12; // ties keep the earlier node
+    const MIN_POD = { cpu: 1, mem: 2 }; // smallest pod: free room below this is stranded
+    const HB_SEED = 77; const MIN_DELAY_S = 0.05; const SPIKE = { min: 5, span: 20 }; // heartbeat delay floor; congestion spike seconds
+    const HEALTHY_NODES = 200; const HB_COUNT = 360; // nodes and heartbeats (one hour) checked for false alarms
+    const DEATHS = 200; const HB_LOOKBACK = 6; // simulated node deaths; heartbeats before the death that may still arrive
+    const NO_HEARTBEAT = -1e9;
+    const STRANDED_BAD = 60; const SLOW_RECOVERY_S = 45; // verdict thresholds
+    let seed = SEED; const rnd = () => ((seed = (seed * 1664525 + 1013904223) % 4294967296) / 4294967296);
+    const POOL: Pod[] = Array.from({ length: POOL_SIZE }, (_, id) => { let u = rnd(); let k = 0; while (k < TYPES.length - 1 && u >= TYPES[k][2]) { u -= TYPES[k][2]; k++; } return { id, cpu: TYPES[k][0], mem: TYPES[k][1] }; });
+    const fresh = (): Node[] => SIZES.map((c) => ({ capC: c, capM: c * GB_PER_CPU, cpu: c, mem: c * GB_PER_CPU, pods: [], dead: false }));
     function score(p: Pod, policy: string, n: Node) {
       const fc = (n.cpu - p.cpu) / n.capC; const fm = (n.mem - p.mem) / n.capM;
-      if (policy === 'best') return -((n.cpu - p.cpu) / 16 + (n.mem - p.mem) / 64);
+      if (policy === 'best') return -((n.cpu - p.cpu) / BEST_NORM.cpu + (n.mem - p.mem) / BEST_NORM.mem);
       if (policy === 'spread') return fc + fm;
       if (policy === 'balanced') return -Math.abs(fc - fm);
       return 0;
@@ -73,7 +82,7 @@ import PlaygroundShell from '../../components/PlaygroundShell.astro';
         for (let i = 0; i < nodes.length; i++) {
           const n = nodes[i]; if (n.dead || n.cpu < p.cpu || n.mem < p.mem) continue;
           if (policy === 'first') { best = i; break; }
-          const s = score(p, policy, n); if (s > bs + 1e-12) { bs = s; best = i; }
+          const s = score(p, policy, n); if (s > bs + SCORE_EPS) { bs = s; best = i; }
         }
         if (best < 0) pending.push(p); else { const n = nodes[best]; n.cpu -= p.cpu; n.mem -= p.mem; n.pods.push(p); }
       }
@@ -85,29 +94,29 @@ import PlaygroundShell from '../../components/PlaygroundShell.astro';
       return {
         cpuU: live.reduce((s, n) => s + n.capC - n.cpu, 0) / capC, memU: live.reduce((s, n) => s + n.capM - n.mem, 0) / capM,
         inUse: live.filter((n) => n.pods.length).length,
-        strCpu: live.reduce((s, n) => s + (n.mem < 2 ? n.cpu : 0), 0), strMem: live.reduce((s, n) => s + (n.cpu < 1 ? n.mem : 0), 0),
+        strCpu: live.reduce((s, n) => s + (n.mem < MIN_POD.mem ? n.cpu : 0), 0), strMem: live.reduce((s, n) => s + (n.cpu < MIN_POD.cpu ? n.mem : 0), 0),
       };
     }
     const NET: Record<string, { m: number; sp: number; dr: number }> = { calm: { m: 0.1, sp: 0.0005, dr: 0.0005 }, congested: { m: 0.8, sp: 0.01, dr: 0.01 }, flaky: { m: 1.5, sp: 0.03, dr: 0.06 } };
     function heartbeats(net: string, grace: number) {
-      const c = NET[net]; let s = 77; const r = () => ((s = (s * 1664525 + 1013904223) % 4294967296) / 4294967296);
-      const delay = () => 0.05 - c.m * Math.log(1 - r()) + (r() < c.sp ? 5 + r() * 20 : 0);
+      const c = NET[net]; let s = HB_SEED; const r = () => ((s = (s * 1664525 + 1013904223) % 4294967296) / 4294967296);
+      const delay = () => MIN_DELAY_S - c.m * Math.log(1 - r()) + (r() < c.sp ? SPIKE.min + r() * SPIKE.span : 0);
       let falseEv = 0; let flapping = 0;
-      for (let n = 0; n < 200; n++) {
+      for (let n = 0; n < HEALTHY_NODES; n++) {
         const arr: number[] = [];
-        for (let i = 0; i < 360; i++) { const d = delay(); if (r() < c.dr) continue; arr.push(i * HB + d); }
+        for (let i = 0; i < HB_COUNT; i++) { const d = delay(); if (r() < c.dr) continue; arr.push(i * HB + d); }
         arr.sort((a, b) => a - b); let mine = 0;
         for (let i = 1; i < arr.length; i++) if (arr[i] - arr[i - 1] > grace) mine++;
         falseEv += mine; if (mine > 0) flapping++;
       }
       const res: number[] = [];
-      for (let k = 0; k < 200; k++) {
-        const phase = r() * HB; let lastArr = -1e9; // the node dies at time phase; heartbeat 0 was sent at time 0
-        for (let i = -6; i <= 0; i++) { const d = delay(); const dropped = r() < c.dr; if (!dropped) lastArr = Math.max(lastArr, i * HB + d); }
+      for (let k = 0; k < DEATHS; k++) {
+        const phase = r() * HB; let lastArr = NO_HEARTBEAT; // the node dies at time phase; heartbeat 0 was sent at time 0
+        for (let i = -HB_LOOKBACK; i <= 0; i++) { const d = delay(); const dropped = r() < c.dr; if (!dropped) lastArr = Math.max(lastArr, i * HB + d); }
         res.push(Math.max(phase, lastArr + grace) - phase + RESTART);
       }
       res.sort((a, b) => a - b);
-      return { falseEv, flapping, median: res[100], worst: res[199] };
+      return { falseEv, flapping, median: res[DEATHS / 2], worst: res[DEATHS - 1] };
     }
     function run(policy: string, podCount: number, kill: boolean) {
       const nodes = fresh(); const pods = POOL.slice(0, podCount);
@@ -158,12 +167,12 @@ import PlaygroundShell from '../../components/PlaygroundShell.astro';
       q('[data-o5]').textContent = `${h.median.toFixed(0)} s typical, ${h.worst.toFixed(0)} s worst`;
       q('[data-n5]').textContent = `${grace} s grace + ${RESTART} s to start elsewhere, minus time since the last heartbeat`;
       q('[data-o6]').textContent = fmt(h.falseEv);
-      q('[data-n6]').textContent = `${h.flapping} of 200 healthy nodes hit it; about ${fmt(h.falseEv * r.perNode)} needless pod restarts`;
+      q('[data-n6]').textContent = `${h.flapping} of ${HEALTHY_NODES} healthy nodes hit it; about ${fmt(h.falseEv * r.perNode)} needless pod restarts`;
       color('[data-b1]', 'var(--accent)');
       color('[data-b2]', r.pending.length ? 'var(--bad)' : 'var(--good)');
-      color('[data-b3]', b.strCpu + b.strMem / 4 > 60 ? 'var(--bad)' : 'var(--accent)');
+      color('[data-b3]', b.strCpu + b.strMem / GB_PER_CPU > STRANDED_BAD ? 'var(--bad)' : 'var(--accent)');
       color('[data-b4]', kill && r.after.length ? 'var(--bad)' : 'var(--accent)');
-      color('[data-b5]', h.median > 45 ? 'var(--bad)' : 'var(--accent)');
+      color('[data-b5]', h.median > SLOW_RECOVERY_S ? 'var(--bad)' : 'var(--accent)');
       color('[data-b6]', h.falseEv > 0 ? 'var(--bad)' : 'var(--good)');
       const out = q('[data-verdict]'); const bad = r.pending.length > 0 || h.falseEv > 0 || (kill && r.after.length > 0); out.classList.toggle('bad', bad);
       const parts: string[] = [];

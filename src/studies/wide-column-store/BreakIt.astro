@@ -35,12 +35,18 @@ import PlaygroundShell from '../../components/PlaygroundShell.astro';
     const OPS = 2000; const KEYS = 40; const N = 5; const BACK = 1200; const FAIL = 300; const HINT_WINDOW = 100; const LOSS = 10;
     type Cell = { ver: number; del: boolean; t: number };
     type Hint = { node: number; key: number; cell: Cell; at: number; exp: number };
-    let seed = 7; const rnd = (n: number) => { seed = (seed * 1664525 + 1013904223) % 4294967296; return Math.floor(seed / 65536) % n; };
+    const SEED = 7; const RF = 3; // copies of every row (reps below lists three nodes)
+    const WRITE_PCT = 55; const DELETE_FROM = 40; // rolls below 55 write, and from 40 on the write is a delete
+    const HOT = { fromKey: 30, from: 500, to: 700, delRoll: 50, readRoll: 99 }; // keys 30+ are deleted during ops 500..699, then only read
+    const PICK_SPAN = 6; // random start offset when choosing which live copies a read contacts
+    const GC_EVERY = 10; const HINT_DELAY = 10; // ops between tombstone collections; delay before a hint is replayed
+    // LCG, upper bits
+    let seed = SEED; const rnd = (n: number) => { seed = (seed * 1664525 + 1013904223) % 4294967296; return Math.floor(seed / 65536) % n; };
     // The operations and the random losses are generated once, so every setting faces exactly the same workload.
     const script = Array.from({ length: OPS }, (_, i) => {
       const key = rnd(KEYS); let roll = rnd(100);
-      if (key >= 30 && i >= 500) roll = i < 700 ? 50 : 99;
-      return { key, roll, lost: [rnd(100), rnd(100), rnd(100)], pick: rnd(6) };
+      if (key >= HOT.fromKey && i >= HOT.from) roll = i < HOT.to ? HOT.delRoll : HOT.readRoll;
+      return { key, roll, lost: [rnd(100), rnd(100), rnd(100)], pick: rnd(PICK_SPAN) };
     });
     function simulate(w: number, r: number, down: number, repair: string, grace: number) {
       const data: Map<number, Cell>[] = Array.from({ length: N }, () => new Map());
@@ -61,13 +67,13 @@ import PlaygroundShell from '../../components/PlaygroundShell.astro';
           if (x.at <= i && up(x.node, i)) { apply(x.node, x.key, x.cell); return false; }
           return true;
         });
-        if (i % 10 === 0) for (const m of data) for (const [k, c] of Array.from(m)) if (c.del && i - c.t > grace) m.delete(k);
+        if (i % GC_EVERY === 0) for (const m of data) for (const [k, c] of Array.from(m)) if (c.del && i - c.t > grace) m.delete(k);
         const op = script[i]; const k = op.key; const rs = reps(k);
-        if (op.roll < 55) {
-          const cell: Cell = { ver: i + 1, del: op.roll >= 40, t: i }; let acks = 0;
+        if (op.roll < WRITE_PCT) {
+          const cell: Cell = { ver: i + 1, del: op.roll >= DELETE_FROM, t: i }; let acks = 0;
           rs.forEach((n, j) => {
             if (up(n, i) && op.lost[j] >= LOSS) { apply(n, k, cell); acks++; }
-            else if (repair !== 'none') hints.push({ node: n, key: k, cell, at: up(n, i) ? i + 10 : 0, exp: i + HINT_WINDOW });
+            else if (repair !== 'none') hints.push({ node: n, key: k, cell, at: up(n, i) ? i + HINT_DELAY : 0, exp: i + HINT_WINDOW });
           });
           if (acks >= w) { res.wOk++; acked.set(k, cell); } else { res.wFail++; acked.delete(k); }
         } else {
@@ -89,6 +95,7 @@ import PlaygroundShell from '../../components/PlaygroundShell.astro';
       return res;
     }
     const names = ['', 'ONE', 'QUORUM', 'ALL'];
+    const MAX_REFUSED = 0.2; // share of refused writes or reads marked as a problem
     const fmt = (n: number) => n.toLocaleString('en-US');
     function draw() {
       const w = Number(q<HTMLSelectElement>('[data-w]').value); const r = Number(q<HTMLSelectElement>('[data-r]').value);
@@ -97,17 +104,17 @@ import PlaygroundShell from '../../components/PlaygroundShell.astro';
       q('[data-o1]').textContent = `${fmt(x.wOk)} of ${fmt(writes)}`; q('[data-n1]').textContent = x.wFail ? `${fmt(x.wFail)} refused: fewer than ${w} copies answered` : 'none refused';
       q('[data-o2]').textContent = `${fmt(x.rOk)} of ${fmt(reads)}`; q('[data-n2]').textContent = x.rFail ? `${fmt(x.rFail)} refused: fewer than ${r} live copies` : 'none refused';
       const old = x.stale - x.zombie;
-      q('[data-o3]').textContent = `${fmt(old)} of ${fmt(x.checked)}`; q('[data-n3]').textContent = `checked reads of rows with a known last write; W + R = ${w + r}, and 3 copies exist`;
+      q('[data-o3]').textContent = `${fmt(old)} of ${fmt(x.checked)}`; q('[data-n3]').textContent = `checked reads of rows with a known last write; W + R = ${w + r}, and ${RF} copies exist`;
       q('[data-o4]').textContent = `${fmt(x.zombie)}`; q('[data-n4]').textContent = 'reads of a row that had been deleted';
       const set = (id: string, bad: boolean) => q<HTMLElement>(id).style.setProperty('--c', bad ? 'var(--bad)' : 'var(--good)');
-      set('[data-b1]', x.wFail > writes * 0.2); set('[data-b2]', x.rFail > reads * 0.2); set('[data-b3]', old > 0); set('[data-b4]', x.zombie > 0);
-      const out = q('[data-verdict]'); const bad = x.zombie > 0 || old > 0 || x.rFail > 0 || x.wFail > writes * 0.2; out.classList.toggle('bad', bad);
+      set('[data-b1]', x.wFail > writes * MAX_REFUSED); set('[data-b2]', x.rFail > reads * MAX_REFUSED); set('[data-b3]', old > 0); set('[data-b4]', x.zombie > 0);
+      const out = q('[data-verdict]'); const bad = x.zombie > 0 || old > 0 || x.rFail > 0 || x.wFail > writes * MAX_REFUSED; out.classList.toggle('bad', bad);
       const msg: string[] = [];
       if (x.zombie > 0) msg.push(`${fmt(x.zombie)} reads brought back deleted rows. The returning node still held the old values, the other replicas had purged their tombstones after ${g} operations, and no consistency level can outvote a delete that nobody remembers. Remember deletes longer than any outage, or rebuild a node that was down for that long.`);
-      if (old > 0) msg.push(`${fmt(old)} reads returned an older version, because ${names[w]} writes and ${names[r]} reads do not have to meet on a common copy (W + R = ${w + r}, which is not more than 3).`);
+      if (old > 0) msg.push(`${fmt(old)} reads returned an older version, because ${names[w]} writes and ${names[r]} reads do not have to meet on a common copy (W + R = ${w + r}, which is not more than ${RF}).`);
       if (x.rFail > 0) msg.push(`${fmt(x.rFail)} reads were refused: some rows had fewer than ${r} live copies. Lower consistency would have served them, with the risk of old data.`);
-      if (x.wFail > writes * 0.2) msg.push(`${fmt(x.wFail)} writes were refused because ${names[w]} needs ${w} answers and some replicas were down or slow.`);
-      out.textContent = msg.length ? msg.join(' ') : `No wrong answers in these ${fmt(OPS)} operations${x.wFail ? ` (${fmt(x.wFail)} writes were refused and would be retried)` : ''}. ${w + r > 3 ? `W + R = ${w + r} is more than 3, so reads and writes share a copy, and ` : ''}deletes were not forgotten before the returning node was repaired.`;
+      if (x.wFail > writes * MAX_REFUSED) msg.push(`${fmt(x.wFail)} writes were refused because ${names[w]} needs ${w} answers and some replicas were down or slow.`);
+      out.textContent = msg.length ? msg.join(' ') : `No wrong answers in these ${fmt(OPS)} operations${x.wFail ? ` (${fmt(x.wFail)} writes were refused and would be retried)` : ''}. ${w + r > RF ? `W + R = ${w + r} is more than ${RF}, so reads and writes share a copy, and ` : ''}deletes were not forgotten before the returning node was repaired.`;
     }
     root.addEventListener('change', draw);
     draw();

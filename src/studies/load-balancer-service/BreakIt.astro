@@ -51,12 +51,21 @@ import PlaygroundShell from '../../components/PlaygroundShell.astro';
   document.querySelectorAll<HTMLElement>('[data-lbb]').forEach((root) => {
     const q = <T extends HTMLElement>(s: string) => root.querySelector<T>(s)!;
     const N = 4000; const RAMP = 8000; const M = 2003; const LAMBDA = 0.1167;
+    const LOAD_SEED = 7; const ROUTE_SEED = 99;
+    const SHORT_SHARE = 0.9; const SHORT_MS = 100; const LONG_MS = 1500; const MIN_DUR_MS = 5; // connection lengths
+    const CAPS_MIXED = [1, 1, 2, 2, 4]; const CAPS_EVEN = [2, 2, 2, 2, 2]; const NEW_CAP = 2; // backend sizes
+    const SLOTS_PER_CAP = 4; // concurrent connections per unit of backend size
+    const SLOW_START = { min: 0.1, rest: 0.9 }; // weight of a new backend ramps from 10% to 100%
+    const COLD = { speed: 0.2, rest: 0.8 }; // a cold backend starts at 20% speed
+    const P99 = 0.99; const MAX_BARS = 6;
+    const EVEN_LOAD = 1.2; const SLOW_WAIT_MS = 500; const MAGLEV_BETTER = 4; const SLOW_OK = 2.2; // verdict thresholds
+    // mix32: murmur3-style integer hash finalizer
     const mix32 = (x) => { let h = Math.imul(x ^ 0x9e3779b9, 2654435761) >>> 0; h ^= h >>> 15; h = Math.imul(h, 2246822519) >>> 0; h ^= h >>> 13; h = Math.imul(h, 3266489917) >>> 0; h ^= h >>> 16; return h >>> 0; };
     // The same seeded stream of connections is used for every setting: Poisson arrivals, 90% short (mean 100 ms) and 10% long (mean 1,500 ms).
     const LOAD = (() => {
-      let s = 7; const rnd = () => ((s = (Math.imul(s, 1664525) + 1013904223) >>> 0) / 4294967296);
+      let s = LOAD_SEED; const rnd = () => ((s = (Math.imul(s, 1664525) + 1013904223) >>> 0) / 4294967296);
       const list = []; let t = 0;
-      for (let i = 0; i < N; i++) { t += -Math.log(1 - rnd()) / LAMBDA; const dur = (rnd() < 0.9 ? 100 : 1500) * -Math.log(1 - rnd()); list.push({ t, dur: Math.max(5, dur), h: mix32(i + 1) }); }
+      for (let i = 0; i < N; i++) { t += -Math.log(1 - rnd()) / LAMBDA; const dur = (rnd() < SHORT_SHARE ? SHORT_MS : LONG_MS) * -Math.log(1 - rnd()); list.push({ t, dur: Math.max(MIN_DUR_MS, dur), h: mix32(i + 1) }); }
       return list;
     })();
     const hashName = (name) => name.split('').reduce((a, c) => (Math.imul(a, 31) + c.charCodeAt(0)) | 0, 7);
@@ -70,14 +79,14 @@ import PlaygroundShell from '../../components/PlaygroundShell.astro';
     const tableCache = {};
     const tableFor = (names) => { const k = names.join(','); return tableCache[k] || (tableCache[k] = maglev(names)); };
     function simulate(o) { // o: algo, mix, event, weighted, slowStart
-      const caps = o.mix === 'mixed' ? [1, 1, 2, 2, 4] : [2, 2, 2, 2, 2];
+      const caps = o.mix === 'mixed' ? CAPS_MIXED : CAPS_EVEN;
       const T = LOAD[N - 1].t; const te = T / 2;
-      const mk = (name, cap, added) => ({ name, cap, slots: 4 * cap, free: new Array(4 * cap).fill(0), fin: [], work: 0, cur: 0, n: 0, added, first: 0, sd: 0, sdn: 0 });
+      const mk = (name, cap, added) => ({ name, cap, slots: SLOTS_PER_CAP * cap, free: new Array(SLOTS_PER_CAP * cap).fill(0), fin: [], work: 0, cur: 0, n: 0, added, first: 0, sd: 0, sdn: 0 });
       const bs = caps.map((c, i) => mk('b' + i, c, false));
-      if (o.event === 'add') bs.push(mk('b5', 2, true));
-      let s = 99; const rnd = () => ((s = (Math.imul(s, 1664525) + 1013904223) >>> 0) / 4294967296);
+      if (o.event === 'add') bs.push(mk('b5', NEW_CAP, true));
+      let s = ROUTE_SEED; const rnd = () => ((s = (Math.imul(s, 1664525) + 1013904223) >>> 0) / 4294967296);
       const ramp = (t) => Math.min(1, Math.max(0, (t - te) / RAMP));
-      const wt = (b, t) => (o.weighted ? b.cap : 1) * (b.added && o.slowStart ? 0.1 + 0.9 * ramp(t) : 1);
+      const wt = (b, t) => (o.weighted ? b.cap : 1) * (b.added && o.slowStart ? SLOW_START.min + SLOW_START.rest * ramp(t) : 1);
       const removed = (b, t) => o.event === 'remove' && b === bs[0] && t >= te;
       const wait = []; const allc = []; let snap = null;
       for (const c of LOAD) {
@@ -92,14 +101,14 @@ import PlaygroundShell from '../../components/PlaygroundShell.astro';
         else { const i = Math.floor(rnd() * el.length); let j = Math.floor(rnd() * (el.length - 1)); if (j >= i) j++; const x = el[i]; const y = el[j]; b = (x.fin.length + 1) / wt(x, t) <= (y.fin.length + 1) / wt(y, t) ? x : y; }
         let k = 0; for (let i = 1; i < b.free.length; i++) if (b.free[i] < b.free[k]) k = i;
         const start = Math.max(t, b.free[k]);
-        const speed = b.added ? 0.2 + 0.8 * ramp(start) : 1; // a new backend is cold: 20% speed, back to full over 8 seconds
+        const speed = b.added ? COLD.speed + COLD.rest * ramp(start) : 1; // a new backend is cold: 20% speed, back to full over 8 seconds
         const fin = start + c.dur / speed; b.free[k] = fin; b.fin.push(fin); b.work += c.dur; b.n++;
         allc.push({ h: c.h, fin }); wait.push(start - t);
         if (b.added && t < te + RAMP) { b.sd += (fin - t) / c.dur; b.sdn++; }
       }
       const u = bs.map((b) => b.work / (b.slots * ((o.event === 'remove' && b === bs[0] ? te : T) - (b.added ? te : 0))));
       const mean = u.reduce((a, x) => a + x, 0) / u.length; const hot = u.indexOf(Math.max(...u));
-      const w99 = [...wait].sort((a, b) => a - b)[Math.floor(0.99 * (wait.length - 1))];
+      const w99 = [...wait].sort((a, b) => a - b)[Math.floor(P99 * (wait.length - 1))];
       let modulo = 0; let mag = 0; let forced = 0;
       const active = snap ? snap.length : 0;
       if (o.event !== 'none' && snap) {
@@ -111,7 +120,7 @@ import PlaygroundShell from '../../components/PlaygroundShell.astro';
       return { names: bs.map((b) => b.name + ' (x' + b.cap + ')'), u, imbalance: Math.max(...u) / mean, hot, w99, active, modulo, mag, forced, slow: nb && nb.sdn ? nb.sd / nb.sdn : 0, slowN: nb ? nb.sdn : 0 };
     }
 
-    const bars = Array.from({ length: 6 }, () => {
+    const bars = Array.from({ length: MAX_BARS }, () => {
       const row = document.createElement('div'); row.className = 'lbb-row';
       const name = document.createElement('span'); const track = document.createElement('span'); track.className = 'lbb-track'; track.setAttribute('aria-hidden', 'true');
       const fill = document.createElement('span'); fill.className = 'lbb-fill'; fill.style.display = 'block'; track.append(fill);
@@ -142,17 +151,17 @@ import PlaygroundShell from '../../components/PlaygroundShell.astro';
         if (event === 'add') { q('[data-o4]').textContent = `${a.slow.toFixed(1)}x slower, or ${b.slow.toFixed(1)}x with slow-start`; q('[data-n4]').textContent = `mean time to finish compared with a warm backend (1.0x); ${a.slowN} connections reached it, or ${b.slowN} with slow-start`; }
         else { q('[data-o4]').textContent = 'no new backend'; q('[data-n4]').textContent = 'choose add a cold backend'; }
       }
-      q<HTMLElement>('[data-b1]').style.setProperty('--c', a.imbalance < 1.2 ? 'var(--good)' : 'var(--bad)');
-      q<HTMLElement>('[data-b2]').style.setProperty('--c', a.w99 < 500 ? 'var(--good)' : 'var(--bad)');
-      q<HTMLElement>('[data-b3]').style.setProperty('--c', event === 'none' ? 'var(--accent)' : a.mag * 4 < a.modulo ? 'var(--good)' : 'var(--bad)');
-      q<HTMLElement>('[data-b4]').style.setProperty('--c', event !== 'add' ? 'var(--accent)' : b.slow < 2.2 ? 'var(--good)' : 'var(--bad)');
+      q<HTMLElement>('[data-b1]').style.setProperty('--c', a.imbalance < EVEN_LOAD ? 'var(--good)' : 'var(--bad)');
+      q<HTMLElement>('[data-b2]').style.setProperty('--c', a.w99 < SLOW_WAIT_MS ? 'var(--good)' : 'var(--bad)');
+      q<HTMLElement>('[data-b3]').style.setProperty('--c', event === 'none' ? 'var(--accent)' : a.mag * MAGLEV_BETTER < a.modulo ? 'var(--good)' : 'var(--bad)');
+      q<HTMLElement>('[data-b4]').style.setProperty('--c', event !== 'add' ? 'var(--accent)' : b.slow < SLOW_OK ? 'var(--good)' : 'var(--bad)');
       const parts: string[] = [];
-      parts.push(a.imbalance < 1.2 ? `Load is even (${a.imbalance.toFixed(2)}x).` : `Load is uneven (${a.imbalance.toFixed(2)}x): ${a.names[a.hot]} is the hot spot.`);
-      if (a.w99 >= 500) parts.push(`The slowest 1% wait ${fmtMs(a.w99)} for a slot.`);
+      parts.push(a.imbalance < EVEN_LOAD ? `Load is even (${a.imbalance.toFixed(2)}x).` : `Load is uneven (${a.imbalance.toFixed(2)}x): ${a.names[a.hot]} is the hot spot.`);
+      if (a.w99 >= SLOW_WAIT_MS) parts.push(`The slowest 1% wait ${fmtMs(a.w99)} for a slot.`);
       if (!weighted && mix === 'mixed') parts.push('The balancer treats a size-1 and a size-4 backend as equal' + (algo === 'lc' || algo === 'p2c' ? ', and only the connection counts partly make up for it.' : ', and nothing makes up for it.'));
       if (event !== 'none') parts.push(`On the change, a modulo hash breaks ${pct(a.modulo, a.active)} of live connections, a Maglev table ${pct(a.mag, a.active)}.`);
       if (event === 'add') parts.push(b.slow < a.slow ? `Slow-start cuts the cold backend's slowdown from ${a.slow.toFixed(1)}x to ${b.slow.toFixed(1)}x.` : 'Slow-start makes no difference here.');
-      const out = q('[data-verdict]'); out.classList.toggle('bad', a.imbalance >= 1.2 || a.w99 >= 500); out.textContent = parts.join(' ');
+      const out = q('[data-verdict]'); out.classList.toggle('bad', a.imbalance >= EVEN_LOAD || a.w99 >= SLOW_WAIT_MS); out.textContent = parts.join(' ');
     }
     let queued = false;
     const schedule = () => { if (queued) return; queued = true; requestAnimationFrame(() => { queued = false; draw(); }); };

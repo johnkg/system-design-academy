@@ -40,45 +40,55 @@ import PlaygroundShell from '../../components/PlaygroundShell.astro';
 <script>
   document.querySelectorAll<HTMLElement>('[data-slb]').forEach((root) => {
     const q = <T extends HTMLElement>(s: string) => root.querySelector<T>(s)!;
-    const END = 600 * 1000; const SLICES = 60;
+    const RUN_S = 600; const MS_PER_S = 1000; const END = RUN_S * MS_PER_S; const SLICES = 60; const SLICE_MS = END / SLICES;
+    const TRAFFIC = { steady: 40, burstPeriodS: 90, burstS: 8, burstRate: 150, quietRate: 15, spikesAt: [30, 270, 510], spikeS: 6, spikeRate: 250 }; // requests per second
+    const WORK_MS = { min: 50, range: 100 }; // handler time on a warm sandbox
+    const KEPT_FIRST = 1e12; // sort bonus so provisioned instances are picked first
+    const PRICE = { runMsPerMicro: 60, provMsPerMicro: 240, reqsPerMicro: 5 }; // micro-dollars: 1 per 60 ms run, per 240 ms provisioned, per 5 requests
+    const MICRO = 1e6;
+    const TAIL_X = 3; // p99 above 3x p50 is a cold-start tail
+    const COLD_WARN_DIV = 20; // more than 1 in 20 requests cold is bad
+    const BAR_MIN_PCT = 2;
     type Req = { t: number; ms: number; n: number };
     const cache: Record<string, Req[]> = {};
     function traffic(pattern: string): Req[] {
       if (cache[pattern]) return cache[pattern];
+      // Numerical Recipes LCG
       let seed = 7; const random = (n: number) => { seed = (seed * 1664525 + 1013904223) % 4294967296; return Math.floor(seed / 65536) % n; };
       const reqs: Req[] = [];
-      for (let s = 0; s < 600; s++) {
-        let rate = 40;
-        if (pattern === 'bursty') rate = s % 90 < 8 ? 150 : 15;
-        if (pattern === 'spiky') rate = [30, 270, 510].some((a) => s >= a && s < a + 6) ? 250 : 0;
-        for (let i = 0; i < rate; i++) reqs.push({ t: s * 1000 + random(1000), ms: 50 + random(100), n: reqs.length });
+      for (let s = 0; s < RUN_S; s++) {
+        let rate = TRAFFIC.steady;
+        if (pattern === 'bursty') rate = s % TRAFFIC.burstPeriodS < TRAFFIC.burstS ? TRAFFIC.burstRate : TRAFFIC.quietRate;
+        if (pattern === 'spiky') rate = TRAFFIC.spikesAt.some((a) => s >= a && s < a + TRAFFIC.spikeS) ? TRAFFIC.spikeRate : 0;
+        for (let i = 0; i < rate; i++) reqs.push({ t: s * MS_PER_S + random(MS_PER_S), ms: WORK_MS.min + random(WORK_MS.range), n: reqs.length });
       }
       return (cache[pattern] = reqs.sort((a, b) => a.t - b.t || a.n - b.n));
     }
     type Inst = { start: number; busy: number; kept: boolean };
     function simulate(reqs: Req[], idleS: number, prov: number, initMs: number, cap: number) {
-      const idle = idleS * 1000; const lives: [number, number][] = []; const hot = new Array(SLICES).fill(false);
+      const idle = idleS * MS_PER_S; const lives: [number, number][] = []; const hot = new Array(SLICES).fill(false);
       let pool: Inst[] = Array.from({ length: prov }, () => ({ start: 0, busy: 0, kept: true }));
       let cold = 0; let thr = 0; let billed = 0; let idleMs = 0; const lat: number[] = [];
       for (const r of reqs) {
         pool = pool.filter((x) => { const dead = !x.kept && x.busy <= r.t && x.busy + idle < r.t; if (dead) { idleMs += idle; lives.push([x.start, x.busy + idle]); } return !dead; });
         let best: Inst | null = null;
-        for (const x of pool) if (x.busy <= r.t && (!best || (x.kept ? 1e12 : 0) + x.busy > (best.kept ? 1e12 : 0) + best.busy)) best = x;
+        for (const x of pool) if (x.busy <= r.t && (!best || (x.kept ? KEPT_FIRST : 0) + x.busy > (best.kept ? KEPT_FIRST : 0) + best.busy)) best = x;
         if (best) { if (!best.kept) idleMs += r.t - best.busy; best.busy = r.t + r.ms; lat.push(r.ms); billed += r.ms; }
         else if (pool.length < cap) { cold++; pool.push({ start: r.t, busy: r.t + initMs + r.ms, kept: false }); lat.push(initMs + r.ms); billed += initMs + r.ms; }
-        else { thr++; hot[Math.min(SLICES - 1, Math.floor(r.t / 10000))] = true; }
+        else { thr++; hot[Math.min(SLICES - 1, Math.floor(r.t / SLICE_MS))] = true; }
       }
       for (const x of pool) { if (!x.kept) idleMs += Math.max(0, Math.min(idle, END - x.busy)); lives.push([x.start, x.kept ? END : Math.min(END, x.busy + idle)]); }
       lat.sort((a, b) => a - b);
+      // nearest-rank percentile
       const pct = (p: number) => (lat.length ? lat[Math.floor((lat.length * p + 99) / 100) - 1] : 0);
-      const run = Math.floor(billed / 60); const provFee = Math.floor((prov * END) / 240); const fee = Math.floor(lat.length / 5);
-      const counts = Array.from({ length: SLICES }, (_, i) => lives.filter(([a, b]) => a < (i + 1) * 10000 && b > i * 10000).length);
-      return { n: reqs.length, cold, thr, served: lat.length, p50: pct(50), p95: pct(95), p99: pct(99), idleS: Math.floor(idleMs / 1000), run, provFee, fee, cost: run + provFee + fee, counts, hot };
+      const run = Math.floor(billed / PRICE.runMsPerMicro); const provFee = Math.floor((prov * END) / PRICE.provMsPerMicro); const fee = Math.floor(lat.length / PRICE.reqsPerMicro);
+      const counts = Array.from({ length: SLICES }, (_, i) => lives.filter(([a, b]) => a < (i + 1) * SLICE_MS && b > i * SLICE_MS).length);
+      return { n: reqs.length, cold, thr, served: lat.length, p50: pct(50), p95: pct(95), p99: pct(99), idleS: Math.floor(idleMs / MS_PER_S), run, provFee, fee, cost: run + provFee + fee, counts, hot };
     }
     const bars = Array.from({ length: SLICES }, () => { const b = document.createElement('i'); q('[data-strip]').append(b); return b; });
     const num = (s: string) => Number(q<HTMLInputElement>(s).value);
     const fmt = (n: number) => n.toLocaleString('en-US');
-    const dollars = (micro: number) => `$${(micro / 1e6).toFixed(4)}`;
+    const dollars = (micro: number) => `$${(micro / MICRO).toFixed(4)}`;
     function draw() {
       const pat = q<HTMLSelectElement>('[data-pat]').value; const idleS = num('[data-idle]'); const prov = num('[data-prov]'); const init = num('[data-init]'); const cap = num('[data-cap]');
       ['idle', 'prov', 'init', 'cap'].forEach((k) => (q(`[data-${k}val]`).textContent = String(num(`[data-${k}]`))));
@@ -86,21 +96,21 @@ import PlaygroundShell from '../../components/PlaygroundShell.astro';
       q('[data-o1]').textContent = `${fmt(r.cold)} of ${fmt(r.n)} requests`;
       q('[data-n1]').textContent = r.cold === 0 ? 'every request found a warm sandbox' : `each added ${init} ms; ${(100 * r.cold / r.n).toFixed(1)}% of requests`;
       q('[data-o2]').textContent = `p50 ${r.p50} / p95 ${r.p95} / p99 ${r.p99} ms`;
-      q('[data-n2]').textContent = r.p99 > r.p50 * 3 ? 'the tail is cold starts, not slow code' : 'a warm request takes 50 to 149 ms';
+      q('[data-n2]').textContent = r.p99 > r.p50 * TAIL_X ? 'the tail is cold starts, not slow code' : `a warm request takes ${WORK_MS.min} to ${WORK_MS.min + WORK_MS.range - 1} ms`;
       q('[data-o3]').textContent = `${fmt(r.thr)} (${(100 * r.thr / r.n).toFixed(1)}%)`;
       q('[data-n3]').textContent = r.thr === 0 ? 'the cap was never reached' : `the cap of ${cap} was reached`;
       q('[data-o4]').textContent = dollars(r.cost);
       q('[data-n4]').textContent = `run time ${dollars(r.run)}, provisioned ${dollars(r.provFee)}, requests ${dollars(r.fee)}; ordinary warm sandboxes idled ${fmt(r.idleS)} s in total, paid by the platform`;
       const max = Math.max(1, ...r.counts);
-      bars.forEach((b, i) => { b.style.height = `${Math.max(2, Math.round((100 * r.counts[i]) / max))}%`; b.classList.toggle('hot', r.hot[i]); });
-      q('[data-strip]').setAttribute('aria-label', `Live sandboxes per 10 second slice, at most ${max}`);
-      q<HTMLElement>('[data-b1]').style.setProperty('--c', r.cold === 0 ? 'var(--good)' : r.cold > r.n / 20 ? 'var(--bad)' : 'var(--accent)');
-      q<HTMLElement>('[data-b2]').style.setProperty('--c', r.p99 > r.p50 * 3 ? 'var(--bad)' : 'var(--good)');
+      bars.forEach((b, i) => { b.style.height = `${Math.max(BAR_MIN_PCT, Math.round((100 * r.counts[i]) / max))}%`; b.classList.toggle('hot', r.hot[i]); });
+      q('[data-strip]').setAttribute('aria-label', `Live sandboxes per ${SLICE_MS / MS_PER_S} second slice, at most ${max}`);
+      q<HTMLElement>('[data-b1]').style.setProperty('--c', r.cold === 0 ? 'var(--good)' : r.cold > r.n / COLD_WARN_DIV ? 'var(--bad)' : 'var(--accent)');
+      q<HTMLElement>('[data-b2]').style.setProperty('--c', r.p99 > r.p50 * TAIL_X ? 'var(--bad)' : 'var(--good)');
       q<HTMLElement>('[data-b3]').style.setProperty('--c', r.thr > 0 ? 'var(--bad)' : 'var(--good)');
       q<HTMLElement>('[data-b4]').style.setProperty('--c', 'var(--accent)');
-      const out = q('[data-verdict]'); out.classList.toggle('bad', r.thr > 0 || r.p99 > r.p50 * 3);
+      const out = q('[data-verdict]'); out.classList.toggle('bad', r.thr > 0 || r.p99 > r.p50 * TAIL_X);
       out.textContent = r.thr > 0 ? `${fmt(r.thr)} requests were rejected: the platform needed more than ${cap} sandboxes at once, partly because ${r.cold} of them spent ${init} ms starting. Raise the cap, shorten the start, or keep sandboxes warm so that fewer are needed.`
-        : r.p99 > r.p50 * 3 ? `Nothing was rejected, but the slowest 1% of requests take ${r.p99} ms against ${r.p50} ms for the median: those requests paid for a cold start of ${init} ms.`
+        : r.p99 > r.p50 * TAIL_X ? `Nothing was rejected, but the slowest 1% of requests take ${r.p99} ms against ${r.p50} ms for the median: those requests paid for a cold start of ${init} ms.`
         : r.cold === 0 && prov > 0 ? `No cold starts: the ${prov} provisioned instances absorbed the load, and they cost ${dollars(r.provFee)} whether or not requests came.`
         : 'Warm sandboxes served everything quickly. Try spiky traffic, a short idle timeout or a slow start to see what breaks.';
     }

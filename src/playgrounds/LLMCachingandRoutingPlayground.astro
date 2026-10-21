@@ -46,26 +46,35 @@ import PlaygroundShell from '../components/PlaygroundShell.astro';
   const PRICE: Record<string, { in: number; out: number }> = { small: { in: 150, out: 600 }, large: { in: 3000, out: 15000 } };
   const IN_TOK = 800; const PREFIX = 600; const OUT_TOK = 150;
   const LAT: Record<string, number> = { small: 600, large: 2000, embed: 40, hit: 5 };
+  const TENANTS = 2; const FRESH = PH.length; // phrasing index for a one-off wording (gets random noise instead)
+  const NOISE_SPAN = 3; // noise per dimension is -1, 0 or +1
+  const MIX_PCT = { fresh: 40, hard: 30, smallRightOnHard: 25 }; // new wordings, hard questions, small model still right on a hard one
+  const CONF = { lowShare: 75, lowMax: 60, highMin: 70, highRange: 30 }; // small-model confidence: hard questions are usually below 60
+  const PER_MILLE = 1000; // similarity thresholds are in thousandths
+  const CACHED_PREFIX_DIV = 10; // a cached prompt prefix is billed at 1/10
+  const NANO = 1e9; // prices are in billionths of a dollar
+  const GOOD_SAVE_PCT = 20; const UNSAFE_WRONG_SHARE = 0.05;
   const DEFAULTS: Cfg = { cache: 'semantic', thr: 950, ttl: 0, isolate: true, route: 'large', escalate: 65, prefix: 'none' };
 
   function makeWorkload(seed: number, n: number): Q[] {
+    // Numerical Recipes LCG (high 16 bits)
     let s = seed >>> 0; const rnd = (m: number) => { s = (Math.imul(s, 1664525) + 1013904223) >>> 0; return (s >>> 16) % m; };
     const out: Q[] = [];
     for (let i = 0; i < n; i++) {
-      const tenant = rnd(2); const r = rnd(100); let intent = 0; let acc = 0;
-      for (let k = 0; k < 6; k++) { acc += WEIGHT[k]; if (r < acc) { intent = k; break; } }
-      let phrasing = rnd(3); const fresh = rnd(100) < 40; const noise = [rnd(3) - 1, rnd(3) - 1, rnd(3) - 1, rnd(3) - 1];
-      if (fresh) phrasing = 3;
-      const hard = rnd(100) < 30; const smallCorrect = hard ? rnd(100) < 25 : true;
-      const conf = hard ? (rnd(100) < 75 ? rnd(60) : 70 + rnd(30)) : 70 + rnd(30);
+      const tenant = rnd(TENANTS); const r = rnd(100); let intent = 0; let acc = 0;
+      for (let k = 0; k < WEIGHT.length; k++) { acc += WEIGHT[k]; if (r < acc) { intent = k; break; } }
+      let phrasing = rnd(PH.length); const fresh = rnd(100) < MIX_PCT.fresh; const noise = [rnd(NOISE_SPAN) - 1, rnd(NOISE_SPAN) - 1, rnd(NOISE_SPAN) - 1, rnd(NOISE_SPAN) - 1];
+      if (fresh) phrasing = FRESH;
+      const hard = rnd(100) < MIX_PCT.hard; const smallCorrect = hard ? rnd(100) < MIX_PCT.smallRightOnHard : true;
+      const conf = hard ? (rnd(100) < CONF.lowShare ? rnd(CONF.lowMax) : CONF.highMin + rnd(CONF.highRange)) : CONF.highMin + rnd(CONF.highRange);
       out.push({ i, tenant, intent, phrasing, noise, smallCorrect, conf });
     }
     return out;
   }
-  const vecOf = (q: Q) => VEC[q.intent].map((v, d) => v + (q.phrasing === 3 ? q.noise[d] : PH[q.phrasing][d]));
+  const vecOf = (q: Q) => VEC[q.intent].map((v, d) => v + (q.phrasing === FRESH ? q.noise[d] : PH[q.phrasing][d]));
   const dot = (a: number[], b: number[]) => a.reduce((t, v, d) => t + v * b[d], 0);
-  const simAtLeast = (a: number[], b: number[], thr: number) => { const d = dot(a, b); return d > 0 && d * d * 1000000 >= thr * thr * dot(a, a) * dot(b, b); };
-  const simPermille = (a: number[], b: number[]) => Math.floor(1000 * dot(a, b) / Math.sqrt(dot(a, a) * dot(b, b)));
+  const simAtLeast = (a: number[], b: number[], thr: number) => { const d = dot(a, b); return d > 0 && d * d * (PER_MILLE * PER_MILLE) >= thr * thr * dot(a, a) * dot(b, b); };
+  const simPermille = (a: number[], b: number[]) => Math.floor(PER_MILLE * dot(a, b) / Math.sqrt(dot(a, a) * dot(b, b)));
 
   interface Entry { tenant: number; vec: number[]; intent: number; ver: number; ok: boolean; at: number }
   function simulate(cfg: Cfg, work: Q[]) {
@@ -74,14 +83,14 @@ import PlaygroundShell from '../components/PlaygroundShell.astro';
     const version = (intent: number, i: number) => (CHANGED[intent] && i >= CHANGE_AT ? 1 : 0);
     const modelCost = (m: string) => {
       const p = PRICE[m]; let inCost = IN_TOK * p.in;
-      if (cfg.prefix === 'stable' && seenPrefix[m]) inCost = (IN_TOK - PREFIX) * p.in + Math.floor(PREFIX * p.in / 10);
+      if (cfg.prefix === 'stable' && seenPrefix[m]) inCost = (IN_TOK - PREFIX) * p.in + Math.floor(PREFIX * p.in / CACHED_PREFIX_DIV);
       if (cfg.prefix === 'stable') seenPrefix[m] = true;
       if (m === 'small') st.calls.small++; else st.calls.large++;
       return inCost + OUT_TOK * p.out;
     };
     for (const q of work) {
       st.base += IN_TOK * PRICE.large.in + OUT_TOK * PRICE.large.out;
-      const v = vecOf(q); const key = (cfg.isolate ? q.tenant : -1) + ':' + (q.phrasing === 3 ? 'u' + q.i : q.intent * 3 + q.phrasing); const ver = version(q.intent, q.i);
+      const v = vecOf(q); const key = (cfg.isolate ? q.tenant : -1) + ':' + (q.phrasing === FRESH ? 'u' + q.i : q.intent * PH.length + q.phrasing); const ver = version(q.intent, q.i);
       let hit: Entry | null = null;
       if (cfg.cache === 'exact') { const e = exact.get(key); if (e && (!cfg.ttl || q.i - e.at <= cfg.ttl)) hit = e; }
       else if (cfg.cache === 'semantic') {
@@ -120,15 +129,15 @@ import PlaygroundShell from '../components/PlaygroundShell.astro';
     const save = Math.floor(100 * (r.base - r.cost) / r.base); const wr = r.wrongTotal; const pct = (100 * wr / r.n).toFixed(0);
     const top = (Object.keys(r.wrong) as Array<keyof typeof r.wrong>).reduce((a, b) => (r.wrong[b] > r.wrong[a] ? b : a));
     if (cfg.prefix === 'volatile' && cfg.cache === 'none' && r.cost >= r.base) return 'The prefix cache never matches because the timestamp at the top changes every request, so the saving is 0. Move volatile content to the end of the prompt.';
-    if (cfg.prefix === 'stable' && cfg.cache === 'none' && cfg.route === 'large' && wr === 0) return `Saves ${save}% with identical answers: the 600-token shared prefix is billed at 10% after the first call. This only works while the prefix is byte-identical and traffic keeps the cache warm.`;
+    if (cfg.prefix === 'stable' && cfg.cache === 'none' && cfg.route === 'large' && wr === 0) return `Saves ${save}% with identical answers: the ${PREFIX}-token shared prefix is billed at ${100 / CACHED_PREFIX_DIV}% after the first call. This only works while the prefix is byte-identical and traffic keeps the cache warm.`;
     if (r.cost >= r.base && wr === 0) return 'Baseline: every request pays for the large model and none is cached. Change one setting at a time and watch cost against wrong answers.';
-    if (wr === 0) return save >= 20 ? `Saves ${save}% with no wrong answers on this workload. Real traffic needs the same check on labelled near-miss pairs.` : `No wrong answers, but only ${save}% saved: little repeats exactly or the cheap path is rarely used.`;
-    if (wr / r.n > 0.05) return `Saves ${save}% but serves ${wr} wrong answers (${pct}% of requests), mostly ${CAUSE[top]}. Not safe to ship as is: tighten the threshold, scope the cache, add expiry or escalate more.`;
+    if (wr === 0) return save >= GOOD_SAVE_PCT ? `Saves ${save}% with no wrong answers on this workload. Real traffic needs the same check on labelled near-miss pairs.` : `No wrong answers, but only ${save}% saved: little repeats exactly or the cheap path is rarely used.`;
+    if (wr / r.n > UNSAFE_WRONG_SHARE) return `Saves ${save}% but serves ${wr} wrong answers (${pct}% of requests), mostly ${CAUSE[top]}. Not safe to ship as is: tighten the threshold, scope the cache, add expiry or escalate more.`;
     return `Saves ${save}% with ${wr} wrong answers (${pct}% of requests), mostly ${CAUSE[top]}. Acceptable only if a wrong answer is cheap and you keep measuring it.`;
   }
 
   const work = makeWorkload(7, N);
-  const dollars = (nano: number) => '$' + (nano / 1e9).toFixed(3);
+  const dollars = (nano: number) => '$' + (nano / NANO).toFixed(3);
   document.querySelectorAll<HTMLElement>('[data-llm]').forEach((root) => {
     const q = <T extends HTMLElement>(s: string) => root.querySelector<T>(s)!;
     const strip = q('[data-strip]'); const cells: HTMLSpanElement[] = [];

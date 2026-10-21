@@ -52,6 +52,12 @@ import PlaygroundShell from '../components/PlaygroundShell.astro';
   ];
   const WAIT: [string, number][] = [['handler;db_query;socket_wait', 3000], ['handler;mutex_wait', 600]];
   const REG_FN = 'encode_loop'; const REG_EXTRA = 1000; const COST_US = 100; const MAX_N = 60000; const DIFF_US = 60;
+  const Z95_PTS = 196; // 1.96 standard errors, expressed in percentage points
+  const MIN_TRUST_SAMPLES = 5; const MAX_REL_ERR = 0.5; // below 5 hits or above +-50% the estimate is not trusted
+  const LABEL_MIN_SHARE = 0.06; // flame-graph bars narrower than this show only the name
+  const TOP_SELF = 3; // functions listed as the hottest by self time
+  const US_PER_S = 1e6; const OVERHEAD_WARN_PCT = 5; // profiler overhead above 5% of a core is marked bad
+  const CHECKPOINTS = [10, 100, 1000, 10000, MAX_N]; // sample counts in the error table (plus the current N)
   const NAMES = ['handler', 'auth', 'route', 'parse', 'regex_match', 'db_query', 'driver_decode', 'serialize', 'json_encode', 'encode_loop', 'audit_log', 'socket_wait', 'mutex_wait'];
 
   // microseconds per request by (merged) stack, for the mode, the regression flag and inlining
@@ -84,13 +90,13 @@ import PlaygroundShell from '../components/PlaygroundShell.astro';
     const c = new Int32Array(len); for (let i = 0; i < k; i++) c[s[i]]++; return c;
   }
   // 95% half-width in percentage points for k hits in n samples
-  function halfWidth(k: number, n: number): number { const p = k / n; return 196 * Math.sqrt(p * (1 - p) / n); }
+  function halfWidth(k: number, n: number): number { const p = k / n; return Z95_PTS * Math.sqrt(p * (1 - p) / n); }
   function verdict(name: string, k: number, n: number, truePct: number): string {
     if (truePct === 0 && k === 0) return `${name} has no frame in this profile (it is either not on the CPU in this mode, or inlined into its caller). A profile can only show what it samples and symbolizes.`;
     const est = (100 * k) / n;
     if (k === 0) return `${name} is truly ${truePct.toFixed(1)}% but got 0 of ${n} samples: it is invisible here. Raise the rate or the duration.`;
     const rel = (halfWidth(k, n) / est);
-    if (k < 5 || rel > 0.5) return `${name}: ${k} samples, estimate ${est.toFixed(1)}% plus or minus ${halfWidth(k, n).toFixed(1)} points (true ${truePct.toFixed(1)}%). Visible, but too few samples to trust the number.`;
+    if (k < MIN_TRUST_SAMPLES || rel > MAX_REL_ERR) return `${name}: ${k} samples, estimate ${est.toFixed(1)}% plus or minus ${halfWidth(k, n).toFixed(1)} points (true ${truePct.toFixed(1)}%). Visible, but too few samples to trust the number.`;
     return `${name}: ${k} samples, estimate ${est.toFixed(1)}% plus or minus ${halfWidth(k, n).toFixed(1)} points (true ${truePct.toFixed(1)}%). Measured well enough to act on.`;
   }
   // ---- DOM ----
@@ -131,7 +137,7 @@ import PlaygroundShell from '../components/PlaygroundShell.astro';
 
     NAMES.forEach((nm) => { const o = document.createElement('option'); o.value = nm; o.textContent = nm; if (nm === 'audit_log') o.selected = true; q('[data-watch]').appendChild(o); });
     const errBody = q('[data-err]'); const errRows: HTMLElement[][] = [];
-    for (let i = 0; i < 6; i++) { const tr = document.createElement('tr'); const cells: HTMLElement[] = []; for (let j = 0; j < 4; j++) { const td = document.createElement('td'); tr.appendChild(td); cells.push(td); } errBody.appendChild(tr); errRows.push([tr, ...cells]); }
+    for (let i = 0; i < CHECKPOINTS.length + 1; i++) { const tr = document.createElement('tr'); const cells: HTMLElement[] = []; for (let j = 0; j < 4; j++) { const td = document.createElement('td'); tr.appendChild(td); cells.push(td); } errBody.appendChild(tr); errRows.push([tr, ...cells]); }
     const fnBody = q('[data-fn]');
     list.forEach((n) => { const tr = document.createElement('tr'); const cells: HTMLElement[] = []; for (let j = 0; j < 5; j++) { const td = document.createElement('td'); tr.appendChild(td); cells.push(td); } n.row = tr; n.cells = cells; fnBody.appendChild(tr); });
 
@@ -169,10 +175,10 @@ import PlaygroundShell from '../components/PlaygroundShell.astro';
         let c = `var(--role-${(n.depth % 6) + 1})`;
         if (diff) c = delta > DIFF_US ? 'var(--bad)' : delta < -DIFF_US ? 'var(--good)' : 'var(--border)';
         n.bar.style.setProperty('--c', c);
-        n.bar.textContent = share >= 0.06 ? `${n.name} ${pc(share)}` : n.name;
+        n.bar.textContent = share >= LABEL_MIN_SHARE ? `${n.name} ${pc(share)}` : n.name;
         n.bar.title = `${n.name}: total ${pc(share)} (${n.total} samples), self ${pc(n.self / N)}; change vs baseline ${delta >= 0 ? '+' : ''}${Math.round(delta)} us per request`;
       });
-      const topSelf = list.filter((n) => n.self > 0).sort((a, b) => b.self - a.self).slice(0, 3).map((n) => `${n.name} ${pc(n.self / N)}`).join(', ');
+      const topSelf = list.filter((n) => n.self > 0).sort((a, b) => b.self - a.self).slice(0, TOP_SELF).map((n) => `${n.name} ${pc(n.self / N)}`).join(', ');
       q('[data-flame]').setAttribute('aria-label', `Flame graph of ${N} samples. Largest self time: ${topSelf}.`);
       q('[data-legend]').textContent = diff
         ? `Red: at least ${DIFF_US} microseconds per request more than the baseline (the same profile without the regression); green: that much less; grey: within noise. Width is still the share of samples; the x axis is not time.`
@@ -180,9 +186,9 @@ import PlaygroundShell from '../components/PlaygroundShell.astro';
 
       // header boxes
       q('[data-n]').textContent = `${N.toLocaleString('en-US')} samples`;
-      const ov = (rate * COST_US) / 10000;
+      const ov = (rate * COST_US) / (US_PER_S / 100);
       q('[data-ov]').textContent = `${ov.toFixed(2)}% of a core`;
-      q('[data-ovbox]').style.setProperty('--c', ov >= 5 ? 'var(--bad)' : 'var(--role-2)');
+      q('[data-ovbox]').style.setProperty('--c', ov >= OVERHEAD_WARN_PCT ? 'var(--bad)' : 'var(--role-2)');
       q('[data-req]').textContent = `${TT.toLocaleString('en-US')} us ${mode === 'wall' ? 'wall' : 'CPU'}`;
       q('[data-reqnote]').textContent = regress ? `baseline without the regression: ${TB.toLocaleString('en-US')} us` : 'no regression';
       q('[data-seedlabel]').textContent = `seed ${seed}`;
@@ -192,7 +198,7 @@ import PlaygroundShell from '../components/PlaygroundShell.astro';
       const flag = new Uint8Array(keys.length); keys.forEach((k, i) => { flag[i] = isW(k) ? 1 : 0; });
       let trueW = 0; keys.forEach((k, i) => { if (flag[i]) trueW += ws[i]; });
       const truePct = (100 * trueW) / TT;
-      const cps = [10, 100, 1000, 10000, 60000]; if (!cps.includes(N)) cps.push(N); cps.sort((a, b) => a - b);
+      const cps = [...CHECKPOINTS]; if (!cps.includes(N)) cps.push(N); cps.sort((a, b) => a - b);
       let hits = 0; let pos = 0;
       cps.forEach((k, r) => {
         for (; pos < k; pos++) hits += flag[st[pos]];

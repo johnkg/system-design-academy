@@ -53,7 +53,21 @@ import PlaygroundShell from '../components/PlaygroundShell.astro';
   interface Params { policy: Policy; metric: 'cpu' | 'rps'; target: number; warmup: number; cooldown: number; patient: boolean; min: number; max: number }
   interface Result { ready: number[]; total: number[]; util: number[]; dropped: number[]; over: number[]; actions: number[]; flaps: number[] }
   const CAP = 100; const N = 120; const SVG_W = 600; const SVG_H = 190;
+  const TRAFFIC_SEED = 7;
+  const TRAFFIC = { quiet: 200, rampFrom: 24, peakFrom: 34, peak: 1200, declineFrom: 50, declineEnd: 300, nightFrom: 72, night: 80, noiseMin: 0.92, noiseSpan: 0.16 }; // req/s by minute; noise is +-8%
+  const START_INSTANCES = 4;
+  const LONG_AGO = -99; // "no previous action" minute
+  const EPS = 1e-9; // keeps ceil() from rounding an exact ratio up
+  const STEP = { bigGap: 0.2, bigAdd: 3, inGap: 0.3 }; // step policy: +3 when 20 points over target, -1 when 30 under
+  const SCHEDULE = { from: 28, to: 64, instances: 12 }; // scheduled policy: 12 instances for minutes 28..63
+  const PATIENT_CALM_MIN = 5; // minutes of low demand before a patient scale-in
+  const FLAP_WINDOW_MIN = 12; // a reversal this soon counts as a flap
+  const SEC_PER_MIN = 60;
+  const LOAD_WARN_PCT = 85, FLAP_BAD = 6;
+  const CHART = { minY: 1400, headroom: 1.05, overH: 10 }; // y-axis floor in req/s, 5% top margin, height of the overload strip
+  const TICK_MS = 90; // animation step per simulated minute
 
+  // mulberry32 seeded PRNG
   function mulberry32(seed: number) {
     let a = seed >>> 0;
     return () => { a = (a + 0x6D2B79F5) >>> 0; let t = a; t = Math.imul(t ^ (t >>> 15), t | 1); t ^= t + Math.imul(t ^ (t >>> 7), t | 61); return ((t ^ (t >>> 14)) >>> 0) / 4294967296; };
@@ -62,20 +76,20 @@ import PlaygroundShell from '../components/PlaygroundShell.astro';
   function makeTraffic(seed: number): number[] {
     const rnd = mulberry32(seed); const out: number[] = [];
     for (let t = 0; t < N; t++) {
-      let base = 200;
-      if (t >= 24 && t < 34) base = 200 + (1000 * (t - 24)) / 10;
-      else if (t >= 34 && t < 50) base = 1200;
-      else if (t >= 50 && t < 72) base = 1200 - (900 * (t - 50)) / 22;
-      else if (t >= 72) base = 80;
-      out.push(Math.round(base * (0.92 + 0.16 * rnd())));
+      const T = TRAFFIC; let base = T.quiet;
+      if (t >= T.rampFrom && t < T.peakFrom) base = T.quiet + ((T.peak - T.quiet) * (t - T.rampFrom)) / (T.peakFrom - T.rampFrom);
+      else if (t >= T.peakFrom && t < T.declineFrom) base = T.peak;
+      else if (t >= T.declineFrom && t < T.nightFrom) base = T.peak - ((T.peak - T.declineEnd) * (t - T.declineFrom)) / (T.nightFrom - T.declineFrom);
+      else if (t >= T.nightFrom) base = T.night;
+      out.push(Math.round(base * (T.noiseMin + T.noiseSpan * rnd())));
     }
     return out;
   }
   // Cumulative series per minute: what the tier looked like at the end of each step.
   function simulate(p: Params, traffic: number[]): Result {
     const lo = Math.min(p.min, p.max); const hi = Math.max(p.min, p.max);
-    let ready = Math.max(lo, Math.min(hi, 4)); let pending: number[] = [];
-    let cool = 0; let calm = 0; let lastDir = 0; let lastAt = -99; let actions = 0; let flaps = 0;
+    let ready = Math.max(lo, Math.min(hi, START_INSTANCES)); let pending: number[] = [];
+    let cool = 0; let calm = 0; let lastDir = 0; let lastAt = LONG_AGO; let actions = 0; let flaps = 0;
     const r: Result = { ready: [], total: [], util: [], dropped: [], over: [], actions: [], flaps: [] };
     for (let t = 0; t < traffic.length; t++) {
       ready += pending.filter((x) => x <= t).length; pending = pending.filter((x) => x > t);
@@ -84,21 +98,21 @@ import PlaygroundShell from '../components/PlaygroundShell.astro';
       r.ready.push(ready); r.total.push(total); r.util.push(raw); r.dropped.push(drop); r.over.push(raw > 1 ? 1 : 0);
       const T = p.target / 100; const util = p.metric === 'cpu' ? Math.min(1, raw) : raw;
       let want = total;
-      if (p.policy === 'target') want = p.metric === 'cpu' ? Math.ceil((ready * util) / T - 1e-9) : Math.ceil(load / (CAP * T) - 1e-9);
-      else if (p.policy === 'step') want = util > T + 0.2 ? total + 3 : util > T ? total + 1 : util < T - 0.3 ? total - 1 : total;
-      else want = t >= 28 && t < 64 ? 12 : lo;
+      if (p.policy === 'target') want = p.metric === 'cpu' ? Math.ceil((ready * util) / T - EPS) : Math.ceil(load / (CAP * T) - EPS);
+      else if (p.policy === 'step') want = util > T + STEP.bigGap ? total + STEP.bigAdd : util > T ? total + 1 : util < T - STEP.inGap ? total - 1 : total;
+      else want = t >= SCHEDULE.from && t < SCHEDULE.to ? SCHEDULE.instances : lo;
       want = Math.max(lo, Math.min(hi, want));
       if (want < total) calm++; else calm = 0;
       if (cool > 0) cool--;
       else {
         let next = total;
         if (want > total) next = want;
-        else if (want < total && (!p.patient || calm >= 5)) next = p.patient ? total - 1 : want;
+        else if (want < total && (!p.patient || calm >= PATIENT_CALM_MIN)) next = p.patient ? total - 1 : want;
         if (next !== total) {
           const dir = next > total ? 1 : -1;
           if (dir > 0) for (let i = 0; i < next - total; i++) pending.push(t + 1 + p.warmup);
           else { let k = total - next; while (k > 0 && pending.length > 0) { pending.pop(); k--; } ready -= k; }
-          if (lastDir !== 0 && dir !== lastDir && t - lastAt <= 12) flaps++;
+          if (lastDir !== 0 && dir !== lastDir && t - lastAt <= FLAP_WINDOW_MIN) flaps++;
           lastDir = dir; lastAt = t; actions++; cool = p.cooldown;
         }
       }
@@ -110,14 +124,14 @@ import PlaygroundShell from '../components/PlaygroundShell.astro';
   document.querySelectorAll<HTMLElement>('[data-as]').forEach((root) => {
     const q = <T extends Element>(s: string) => root.querySelector<T>(s)!;
     const val = (s: string) => Number(q<HTMLInputElement>(s).value);
-    const traffic = makeTraffic(7);
+    const traffic = makeTraffic(TRAFFIC_SEED);
     const reduce = window.matchMedia('(prefers-reduced-motion: reduce)').matches;
     let res: Result; let shown = N; let timer: number | undefined; let onScreen = true; let raf = 0; let running = false;
     const SVGNS = 'http://www.w3.org/2000/svg';
     const overRects: SVGRectElement[] = [];
     for (let i = 0; i < N; i++) {
       const rc = document.createElementNS(SVGNS, 'rect');
-      rc.setAttribute('x', String((i * SVG_W) / N)); rc.setAttribute('y', String(SVG_H - 10)); rc.setAttribute('width', String(SVG_W / N)); rc.setAttribute('height', '10');
+      rc.setAttribute('x', String((i * SVG_W) / N)); rc.setAttribute('y', String(SVG_H - CHART.overH)); rc.setAttribute('width', String(SVG_W / N)); rc.setAttribute('height', String(CHART.overH));
       rc.setAttribute('fill', 'var(--bad)'); rc.setAttribute('opacity', '0');
       q('[data-overg]').appendChild(rc); overRects.push(rc);
     }
@@ -135,7 +149,7 @@ import PlaygroundShell from '../components/PlaygroundShell.astro';
       q('[data-minval]').textContent = String(pr.min); q('[data-maxval]').textContent = String(pr.max);
       const usesMetric = pr.policy !== 'scheduled';
       q<HTMLSelectElement>('[data-metric]').disabled = !usesMetric; q<HTMLInputElement>('[data-target]').disabled = !usesMetric;
-      const ymax = Math.max(1400, ...res.total.map((x) => x * CAP)) * 1.05;
+      const ymax = Math.max(CHART.minY, ...res.total.map((x) => x * CAP)) * CHART.headroom;
       const X = (i: number) => (((i + 0.5) * SVG_W) / N).toFixed(1); const Y = (v: number) => (SVG_H - 14 - (v / ymax) * (SVG_H - 20)).toFixed(1);
       const pts = (f: (i: number) => number) => Array.from({ length: shown }, (_, i) => `${X(i)},${Y(f(i))}`).join(' ');
       q('[data-demand]').setAttribute('points', pts((i) => traffic[i]));
@@ -144,20 +158,20 @@ import PlaygroundShell from '../components/PlaygroundShell.astro';
       overRects.forEach((rc, i) => rc.setAttribute('opacity', i < shown && res.over[i] ? '1' : '0'));
       const cur = q('[data-cursor]'); cur.setAttribute('x1', X(n - 1)); cur.setAttribute('x2', X(n - 1));
       let drop = 0; let cost = 0; let over = 0;
-      for (let i = 0; i < shown; i++) { drop += res.dropped[i] * 60; cost += res.total[i]; over += res.over[i]; }
+      for (let i = 0; i < shown; i++) { drop += res.dropped[i] * SEC_PER_MIN; cost += res.total[i]; over += res.over[i]; }
       const i = n - 1; const warming = res.total[i] - res.ready[i];
       q('[data-clock]').textContent = `minute ${shown} of ${N} · demand ${traffic[i]} req/s`;
       q('[data-inst]').textContent = String(res.total[i]);
       q('[data-instnote]').textContent = warming > 0 ? `${res.ready[i]} ready, ${warming} still warming up` : `${res.ready[i]} ready`;
       const load = Math.round(res.util[i] * 100); q('[data-load]').textContent = `${load}%`;
-      q<HTMLElement>('[data-loadbox]').style.setProperty('--c', load > 100 ? 'var(--bad)' : load > 85 ? 'var(--role-3)' : 'var(--good)');
+      q<HTMLElement>('[data-loadbox]').style.setProperty('--c', load > 100 ? 'var(--bad)' : load > LOAD_WARN_PCT ? 'var(--role-3)' : 'var(--good)');
       q('[data-drop]').textContent = drop.toLocaleString('en-US');
       q('[data-dropnote]').textContent = `${over} overloaded minute${over === 1 ? '' : 's'}`;
       q<HTMLElement>('[data-dropbox]').style.setProperty('--c', drop > 0 ? 'var(--bad)' : 'var(--good)');
       q('[data-cost]').textContent = cost.toLocaleString('en-US');
       q('[data-acts]').textContent = String(res.actions[i]);
-      q('[data-flapnote]').textContent = `${res.flaps[i]} flap${res.flaps[i] === 1 ? '' : 's'} (a reversal within 12 minutes)`;
-      q<HTMLElement>('[data-flapbox]').style.setProperty('--c', res.flaps[i] >= 6 ? 'var(--bad)' : 'var(--role-5)');
+      q('[data-flapnote]').textContent = `${res.flaps[i]} flap${res.flaps[i] === 1 ? '' : 's'} (a reversal within ${FLAP_WINDOW_MIN} minutes)`;
+      q<HTMLElement>('[data-flapbox]').style.setProperty('--c', res.flaps[i] >= FLAP_BAD ? 'var(--bad)' : 'var(--role-5)');
       q('[data-run]').textContent = running ? 'Pause' : 'Run';
       if (!running) q('[data-status]').textContent = `Minute ${shown} of ${N}: ${over} overloaded minute${over === 1 ? '' : 's'}, ${drop.toLocaleString('en-US')} dropped or slow requests, cost ${cost.toLocaleString('en-US')} instance-minutes, ${res.actions[i]} scaling actions.`;
     }
@@ -165,7 +179,7 @@ import PlaygroundShell from '../components/PlaygroundShell.astro';
     function advance() { if (shown >= N) { stop(); } else shown++; schedule(); }
     function clock() {
       window.clearInterval(timer); timer = undefined;
-      if (running && onScreen && !document.hidden) timer = window.setInterval(advance, 90);
+      if (running && onScreen && !document.hidden) timer = window.setInterval(advance, TICK_MS);
     }
     q('[data-run]').addEventListener('click', () => {
       if (running) { stop(); schedule(); return; }

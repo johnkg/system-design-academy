@@ -6,6 +6,8 @@ const rank = { beginner: 0, intermediate: 1, advanced: 2 } as const;
 type Level = keyof typeof rank;
 interface Node { slug: string; name: string; area: string; level: Level; href: string; first: string[]; next: string[]; studies: { slug: string; name: string; href: string }[] }
 
+
+const MAX_READ_FIRST = 4; // the most connected easier concepts shown as "read first"; more becomes a reading list
 export function buildGraph(concepts: any[], studies: any[]): Node[] {
   const by = new Map<string, any>(concepts.map((c) => [c.id, c]));
   const links = new Map<string, Set<string>>(concepts.map((c) => [c.id, new Set<string>()]));
@@ -23,7 +25,7 @@ export function buildGraph(concepts: any[], studies: any[]): Node[] {
   }
   const degree = (slug: string) => links.get(slug)?.size ?? 0;
   const first = (slug: string) => [...links.get(slug)!].filter((o) => rank[by.get(o).data.difficulty as Level] < rank[by.get(slug).data.difficulty as Level])
-    .sort((a, b) => degree(b) - degree(a) || a.localeCompare(b)).slice(0, 4);
+    .sort((a, b) => degree(b) - degree(a) || a.localeCompare(b)).slice(0, MAX_READ_FIRST);
   const firsts = new Map(concepts.map((c) => [c.id, first(c.id)]));
   return concepts.map((c) => ({
     slug: c.id, name: c.data.name, area: c.data.area, level: c.data.difficulty, href: url(`concepts/${c.id}/`),

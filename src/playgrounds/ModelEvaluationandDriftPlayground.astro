@@ -32,17 +32,26 @@ import PlaygroundShell from '../components/PlaygroundShell.astro';
 </PlaygroundShell>
 <script>
   const POOL = 4000, TRIALS = 300, T_OLD = 700, ROWS = 20, SCALE = 20;
+  const POOL_SEED = 20240601;
+  const SCORE_RANGE = 1000; const NOISE_SPAN = 301; const NOISE_HALF = 150; // item difficulty 0..999, model noise -150..150
+  const SCORE_PER_PT = 10; // one accuracy point moves the threshold by 10 score units
+  const Z95 = 1.96; // normal quantile for a 95% interval
+  const NONINF_MARGIN = 0.02; // non-inferiority gate tolerates a 2 point drop
+  const TRIAL_SEED = { base: 1000, step: 7919 }; const RUN_SEED = { base: 500000, step: 104729 };
+  const NOISE_BAND = 0.01; // true gaps inside +-1 point count as no real difference
+  const WRONG_DIV = 10; // more than one wrong call in 10 evals marks the gate as bad
+  // Park-Miller minimal-standard LCG
   function makePool() {
-    let x = 20240601; const r = () => (x = (x * 48271) % 2147483647);
+    let x = POOL_SEED; const r = () => (x = (x * 48271) % 2147483647);
     const z = [], no = [], nn = [];
-    for (let i = 0; i < POOL; i++) { z.push(r() % 1000); no.push((r() % 301) - 150); nn.push((r() % 301) - 150); }
+    for (let i = 0; i < POOL; i++) { z.push(r() % SCORE_RANGE); no.push((r() % NOISE_SPAN) - NOISE_HALF); nn.push((r() % NOISE_SPAN) - NOISE_HALF); }
     return { z, no, nn };
   }
   const P = makePool();
   const cache = new Map();
   function outcomes(deltaPts) {
     if (cache.has(deltaPts)) return cache.get(deltaPts);
-    const old = [], nw = []; let so = 0, sn = 0; const shift = deltaPts * 10;
+    const old = [], nw = []; let so = 0, sn = 0; const shift = deltaPts * SCORE_PER_PT;
     for (let i = 0; i < POOL; i++) {
       const o = P.z[i] + P.no[i] < T_OLD ? 1 : 0; const n = P.z[i] + P.nn[i] < T_OLD + shift ? 1 : 0;
       old.push(o); nw.push(n); so += o; sn += n;
@@ -58,15 +67,15 @@ import PlaygroundShell from '../components/PlaygroundShell.astro';
       const d = O.nw[i] - O.old[i]; if (d > 0) b++; else if (d < 0) c++;
     }
     const mean = (b - c) / n; const s2 = n > 1 ? (b + c - n * mean * mean) / (n - 1) : 0; const se = Math.sqrt(Math.max(0, s2) / n);
-    return { n, b, c, po: po / n, pn: pn / n, mean, lo: mean - 1.96 * se, hi: mean + 1.96 * se };
+    return { n, b, c, po: po / n, pn: pn / n, mean, lo: mean - Z95 * se, hi: mean + Z95 * se };
   }
-  const GATES = { point: (r) => r.mean >= 0, noninf: (r) => r.lo > -0.02, prove: (r) => r.lo > 0 };
+  const GATES = { point: (r) => r.mean >= 0, noninf: (r) => r.lo > -NONINF_MARGIN, prove: (r) => r.lo > 0 };
   function study(O, n, gate) {
     let ship = 0, wid = 0;
-    for (let t = 0; t < TRIALS; t++) { const r = evalSet(O, n, 1000 + t * 7919); if (GATES[gate](r)) ship++; wid += r.hi - r.lo; }
+    for (let t = 0; t < TRIALS; t++) { const r = evalSet(O, n, TRIAL_SEED.base + t * TRIAL_SEED.step); if (GATES[gate](r)) ship++; wid += r.hi - r.lo; }
     return { ship, width: wid / TRIALS };
   }
-  const runSeed = (run) => 500000 + run * 104729;
+  const runSeed = (run) => RUN_SEED.base + run * RUN_SEED.step;
   const pts = (v, d = 1) => (v * 100).toFixed(d);
   const signed = (v, d = 1) => (v > 0 ? '+' : '') + (v * 100).toFixed(d);
 
@@ -97,11 +106,11 @@ import PlaygroundShell from '../components/PlaygroundShell.astro';
       q('[data-onenote]').textContent = `eval #${run + 1}: the new model fixed ${one.b} items and broke ${one.c}; only those carry information. ${verdictOne} Gate: ${GATES[gate](one) ? 'ship' : 'block'}.`;
       const s = study(O, n, gate); const td = O.trueDiff;
       let wrongText; let note; let bad = false;
-      if (td <= -0.01) {
-        wrongText = `${s.ship} of ${TRIALS} (${Math.floor((s.ship * 100) / TRIALS)}%) shipped a real regression`; bad = s.ship * 10 > TRIALS;
+      if (td <= -NOISE_BAND) {
+        wrongText = `${s.ship} of ${TRIALS} (${Math.floor((s.ship * 100) / TRIALS)}%) shipped a real regression`; bad = s.ship * WRONG_DIV > TRIALS;
         note = `true gap ${signed(td)} pts; the gate should block it every time`;
-      } else if (td >= 0.01) {
-        const miss = TRIALS - s.ship; wrongText = `${miss} of ${TRIALS} (${Math.floor((miss * 100) / TRIALS)}%) blocked a real improvement`; bad = miss * 10 > TRIALS;
+      } else if (td >= NOISE_BAND) {
+        const miss = TRIALS - s.ship; wrongText = `${miss} of ${TRIALS} (${Math.floor((miss * 100) / TRIALS)}%) blocked a real improvement`; bad = miss * WRONG_DIV > TRIALS;
         note = `true gap ${signed(td)} pts; the gate should ship it every time`;
       } else {
         wrongText = `no wrong call: shipped ${s.ship} of ${TRIALS}`;
@@ -111,15 +120,15 @@ import PlaygroundShell from '../components/PlaygroundShell.astro';
       q('[data-gatebox]').style.setProperty('--c', bad ? 'var(--bad)' : 'var(--role-2)');
       q('[data-width]').textContent = `${pts(s.width)} pts`;
       const v = q('[data-verdict]'); v.classList.toggle('bad', bad);
-      if (td <= -0.01) v.textContent = bad
+      if (td <= -NOISE_BAND) v.textContent = bad
         ? `With ${n} items this gate lets a ${pts(-td)} point regression through ${Math.floor((s.ship * 100) / TRIALS)}% of the time. The interval is ${pts(s.width)} points wide, wider than the effect you are trying to see.`
         : `With ${n} items this gate catches the ${pts(-td)} point regression in ${TRIALS - s.ship} of ${TRIALS} evals. Interval width is ${pts(s.width)} points.`;
-      else if (td >= 0.01) v.textContent = bad
+      else if (td >= NOISE_BAND) v.textContent = bad
         ? `The new model really is ${pts(td)} points better, but with ${n} items this gate blocks it in ${Math.floor(((TRIALS - s.ship) * 100) / TRIALS)}% of evals. The set is too small to show the win, or the bar is too strict for its size.`
         : `The ${pts(td)} point improvement ships in ${s.ship} of ${TRIALS} evals. Interval width is ${pts(s.width)} points.`;
       else v.textContent = `The models are within noise (true gap ${signed(td, 2)} pts). Whatever one eval says, it is mostly luck: the interval is ${pts(s.width)} points wide.`;
       rows.forEach((r, k) => {
-        const e = evalSet(O, n, 1000 + k * 7919); const ship = GATES[gate](e);
+        const e = evalSet(O, n, TRIAL_SEED.base + k * TRIAL_SEED.step); const ship = GATES[gate](e);
         r.lab.textContent = `${String(k + 1).padStart(2, '0')} ${ship ? 'ship ' : 'block'}`;
         const a = pos(e.lo), b = pos(e.hi);
         r.bar.style.left = a + '%'; r.bar.style.width = Math.max(0.8, b - a) + '%';

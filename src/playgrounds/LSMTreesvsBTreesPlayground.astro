@@ -56,6 +56,9 @@ const metrics = [
   const MEM = 128; const FILE = 128; // LSM: memtable rows, rows per SSTable file
   const TIER_RUNS = 4; const L0_TRIGGER = 4; const L1_FILES = 8; const RATIO = 4; const FP_PCT = 1; // compaction shape, bloom false-positive rate
   const SCAN_SPAN = 200; // a scan covers 200 key values = 100 user ids
+  const PICK_TRIES = 40; // random draws spent looking for a key that exists
+  const WARMUP_DELETE_RATE = 0.1; // share of warm-up operations that delete a row
+  const MAX_TIERS = 12; // size tiers the tiered compactor checks
 
   type OpType = 0 | 1 | 2 | 3 | 4; // put, delete, point read (hit), point read (miss), scan
   interface Ops { type: Uint8Array; key: Int32Array }
@@ -78,12 +81,12 @@ const metrics = [
 
   // Engine-independent operation list, so both engines see exactly the same workload.
   function makeOps(opts: Options): { load: Ops; run: Ops } {
-    const rand = mulberry32(opts.seed * 7919 + 17); const present = new Uint8Array(KEYS);
+    const rand = mulberry32(opts.seed * 7919 + 17); /* spread the small seed numbers apart */ const present = new Uint8Array(KEYS);
     const any = () => Math.floor(rand() * KEYS);
-    const pickPresent = () => { for (let i = 0; i < 40; i++) { const r = any(); if (present[r]) return r; } return -1; };
+    const pickPresent = () => { for (let i = 0; i < PICK_TRIES; i++) { const r = any(); if (present[r]) return r; } return -1; };
     const load: Ops = { type: new Uint8Array(PRELOAD + WARMUP), key: new Int32Array(PRELOAD + WARMUP) }; // a bulk load, then a warm-up of overwrites and deletes
     for (let i = 0; i < PRELOAD + WARMUP; i++) {
-      const victim = i >= PRELOAD && rand() < 0.1 ? pickPresent() : -1;
+      const victim = i >= PRELOAD && rand() < WARMUP_DELETE_RATE ? pickPresent() : -1;
       if (victim >= 0) { load.type[i] = 1; present[victim] = 0; load.key[i] = victim * 2; } else { const r = any(); present[r] = 1; load.key[i] = r * 2; }
     }
     const mix = MIXES[opts.workload] ?? MIXES.write; const run: Ops = { type: new Uint8Array(opts.ops), key: new Int32Array(opts.ops) };
@@ -158,7 +161,7 @@ const metrics = [
     function compactTiered() {
       for (let again = true; again;) {
         again = false;
-        for (let t = 0; t < 12 && !again; t++) {
+        for (let t = 0; t < MAX_TIERS && !again; t++) {
           const group = runs.filter((r) => r.tier === t);
           if (group.length < TIER_RUNS) continue;
           const first = runs.indexOf(group[0]); const oldest = first + group.length === runs.length; // tiers never interleave: a group is contiguous
@@ -192,6 +195,7 @@ const metrics = [
       const entries = [...mem].sort((a, b) => a[0] - b[0]); const run = build(entries, 0); flushRows += entries.length; mem = new Map();
       if (style === 'tiered') { runs.unshift(run); compactTiered(); } else { l0.unshift(run); compactLeveled(); }
     }
+    // bloom-filter false positive: murmur3-style finalizer hash of (key, file id)
     function fp(k: number, id: number) { let h = Math.imul(k ^ Math.imul(id, 0x9e3779b1), 0x85ebca6b); h ^= h >>> 13; h = Math.imul(h, 0xc2b2ae35); h ^= h >>> 16; return (h >>> 0) % 100 < FP_PCT; }
     const lower = (a: Int32Array, x: number) => { let lo = 0; let hi = a.length; while (lo < hi) { const m = (lo + hi) >> 1; if (a[m] < x) lo = m + 1; else hi = m; } return lo; };
     function write(k: number, tomb: number) { walRows++; userWrites++; mem.set(k, tomb); if (mem.size >= MEM) flush(); }
@@ -256,6 +260,9 @@ const metrics = [
       workload: q<HTMLSelectElement>('[data-workload]').value, ops: Number(q<HTMLSelectElement>('[data-ops]').value), seed: Number(q<HTMLSelectElement>('[data-seed]').value),
       style: q<HTMLSelectElement>('[data-style]').value === 'leveled' ? 'leveled' : 'tiered', bloom: q<HTMLInputElement>('[data-bloom]').checked, missPct: Number(q<HTMLInputElement>('[data-miss]').value),
     });
+    const EQUAL_RATIO = 1.15; // closer than this reads as "about equal"
+    const MIN_DENOM = 0.05; // floor for the smaller value so a zero does not give an infinite ratio
+    const CACHE_MAX = 30; // simulated results kept before the cache is cleared
     const num = (x: number, digits: number, suffix: string) => (Number.isFinite(x) ? x.toFixed(digits) + suffix : 'n/a');
     function paint(id: string, b: number, l: number, digits: number, suffix: string) {
       const box = q('[data-metric="' + id + '"]'); const max = Math.max(Number.isFinite(b) ? b : 0, Number.isFinite(l) ? l : 0, 0.0001);
@@ -264,15 +271,15 @@ const metrics = [
       box.querySelector('[data-val="b"]')!.textContent = num(b, digits, suffix); box.querySelector('[data-val="l"]')!.textContent = num(l, digits, suffix);
       let verdict = 'no such operations in this workload';
       if (Number.isFinite(b) && Number.isFinite(l)) {
-        const ratio = Math.max(b, l) / Math.max(Math.min(b, l), 0.05);
-        verdict = ratio < 1.15 ? 'about equal' : (l < b ? 'LSM tree lower, ' : 'B-tree lower, ') + (ratio >= 10 ? Math.round(ratio) : ratio.toFixed(1)) + 'x less';
+        const ratio = Math.max(b, l) / Math.max(Math.min(b, l), MIN_DENOM);
+        verdict = ratio < EQUAL_RATIO ? 'about equal' : (l < b ? 'LSM tree lower, ' : 'B-tree lower, ') + (ratio >= 10 ? Math.round(ratio) : ratio.toFixed(1)) + 'x less';
       }
       box.querySelector('[data-verdict]')!.textContent = verdict;
     }
     function render() {
       q('[data-missval]').textContent = String(options().missPct);
       const o = options(); const key = JSON.stringify(o); let r = cache.get(key);
-      if (!r) { r = simulate(o); if (cache.size > 30) cache.clear(); cache.set(key, r); }
+      if (!r) { r = simulate(o); if (cache.size > CACHE_MAX) cache.clear(); cache.set(key, r); }
       const { btree: b, lsm: l } = r;
       paint('wa', b.wa, l.wa, 1, 'x'); paint('hit', b.hit, l.hit, 2, ''); paint('miss', b.miss, l.miss, 2, ''); paint('worst', b.worst, l.worst, 0, '');
       paint('scan', b.scan, l.scan, 1, ''); paint('space', b.space, l.space, 2, 'x');

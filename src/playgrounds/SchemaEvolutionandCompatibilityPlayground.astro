@@ -47,6 +47,15 @@ import PlaygroundShell from '../components/PlaygroundShell.astro';
   const SEV = ['ok', 'dropped', 'default', 'lost', 'wrong', 'crash'];
   const SEV_LABEL = ['OK', 'OK, extra data ignored', 'OK, default used', 'DATA SILENTLY LOST', 'WRONG VALUE', 'CRASH'];
   const BROKEN = 3; // severities from here up make a direction incompatible
+  const S = { dropped: 1, defaulted: 2, lost: 3, wrong: 4, crash: 5 }; // indices into SEV
+  const MSG_SEED = 7000; const ID_BASE = 1000; // per-message PRNG seed and order id offsets
+  const AMOUNT = { min: 1500, span: 900 }; const DISCOUNT = { base: 100, cycle: 5, step: 50 }; const TIP = { base: 150, cycle: 4, step: 25 }; // cents
+  const CURRENCIES = ['EUR', 'GBP', 'USD'];
+  const REFUND_EVERY = 4; // with a REFUNDED symbol, every 4th order is refunded
+  const TAG_MUL = 8; const WIRE_LEN = 2; // protobuf tag = field number << 3 | wire type; 2 = length-delimited
+  const WIRE_PREVIEW = 40; // bytes shown in the hex dump
+  const MATRIX_MSGS = 8; const MATRIX_SAMPLE = 3; // messages per matrix cell, which one is shown
+  const STEP_STRIDE = 10; const QUEUED_BASE = 500; // message ids per deploy step; offset of old messages still queued
   const SYMS = ['NEW', 'PAID', 'SHIPPED'];
   const BASE: Fld[] = [
     { key: 'id', name: 'id', num: 1, type: 'int' },
@@ -89,16 +98,17 @@ import PlaygroundShell from '../components/PlaygroundShell.astro';
     let a = seed >>> 0;
     return () => { a = (a + 0x6d2b79f5) >>> 0; let t = Math.imul(a ^ (a >>> 15), 1 | a); t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t; return ((t ^ (t >>> 14)) >>> 0) / 4294967296; };
   }
+  // LEB128 varint (7 bits per byte, high bit = more)
   function varint(o: number[], n: number) { while (n >= 128) { o.push((n % 128) | 128); n = Math.floor(n / 128); } o.push(n); }
   const zero = (f: Fld): Val => (f.type === 'int' ? 0 : f.type === 'str' ? '' : f.syms![0]);
   const fv = (v: Val | undefined) => (typeof v === 'string' ? `"${v}"` : String(v));
 
   /** One order. Only the fields the writer's schema knows are included. */
   function genMsg(i: number, w: Fld[]): Msg {
-    const r = mulberry32(7000 + i);
-    const base: Msg = { id: 1000 + i, amount: 1500 + Math.floor(r() * 900), discount: 100 + (i % 5) * 50, currency: ['EUR', 'GBP', 'USD'][i % 3], tip: 150 + (i % 4) * 25 };
+    const r = mulberry32(MSG_SEED + i);
+    const base: Msg = { id: ID_BASE + i, amount: AMOUNT.min + Math.floor(r() * AMOUNT.span), discount: DISCOUNT.base + (i % DISCOUNT.cycle) * DISCOUNT.step, currency: CURRENCIES[i % CURRENCIES.length], tip: TIP.base + (i % TIP.cycle) * TIP.step };
     const st = w.find((f) => f.key === 'status');
-    base.status = st && st.syms!.length > 3 && i % 4 === 3 ? 'REFUNDED' : SYMS[i % 3];
+    base.status = st && st.syms!.length > SYMS.length && i % REFUND_EVERY === REFUND_EVERY - 1 ? 'REFUNDED' : SYMS[i % SYMS.length];
     const m: Msg = {};
     for (const f of w) m[f.key] = f.type === 'str' && typeof base[f.key] === 'number' ? String(base[f.key]) : base[f.key];
     return m;
@@ -109,7 +119,7 @@ import PlaygroundShell from '../components/PlaygroundShell.astro';
     const o: number[] = [];
     for (const f of w) {
       const v = m[f.key];
-      if (fmt === 'proto') varint(o, f.num * 8 + (f.type === 'str' ? 2 : 0));
+      if (fmt === 'proto') varint(o, f.num * TAG_MUL + (f.type === 'str' ? WIRE_LEN : 0)); // avro below: zigzag of a non-negative n is 2n
       if (f.type === 'str') { const s = String(v); varint(o, fmt === 'avro' ? s.length * 2 : s.length); for (const c of s) o.push(c.charCodeAt(0)); }
       else if (f.type === 'enum') { const ix = f.syms!.indexOf(String(v)); varint(o, fmt === 'avro' ? ix * 2 : ix); }
       else varint(o, fmt === 'avro' ? Number(v) * 2 : Number(v));
@@ -122,7 +132,7 @@ import PlaygroundShell from '../components/PlaygroundShell.astro';
     let i = 0;
     const rv = () => { let v = 0, m = 1, b: number; do { b = bytes[i++]; v += (b & 127) * m; m *= 128; } while (b & 128); return v; };
     while (i < bytes.length) {
-      const tag = rv(); const num = Math.floor(tag / 8); const wt = tag % 8;
+      const tag = rv(); const num = Math.floor(tag / TAG_MUL); const wt = tag % TAG_MUL;
       if (wt === 0) seen[num] = { wt, v: rv() };
       else { const n = rv(); seen[num] = { wt, v: String.fromCharCode(...bytes.slice(i, i + n)) }; i += n; }
     }
@@ -187,23 +197,23 @@ import PlaygroundShell from '../components/PlaygroundShell.astro';
   /** Encode one message with the writer schema, decode it with the reader schema, and judge the result. */
   function evalOne(fmt: Fmt, w: Fld[], r: Fld[], i: number, tolerant: boolean): One {
     const msg = genMsg(i, w); const enc = encode(fmt, w, msg);
-    const hex = enc.text ?? (enc.bytes!.length > 40 ? enc.bytes!.slice(0, 40) : enc.bytes!).map((b) => b.toString(16).padStart(2, '0')).join(' ') + (enc.bytes!.length > 40 ? ' ...' : '');
+    const hex = enc.text ?? (enc.bytes!.length > WIRE_PREVIEW ? enc.bytes!.slice(0, WIRE_PREVIEW) : enc.bytes!).map((b) => b.toString(16).padStart(2, '0')).join(' ') + (enc.bytes!.length > WIRE_PREVIEW ? ' ...' : '');
     const dec = fmt === 'json' ? decodeJson(r, enc.text!, tolerant) : fmt === 'proto' ? decodeProto(r, enc.bytes!, tolerant) : decodeAvro(r, w, enc.bytes!, tolerant);
-    if (dec.crash) return { sev: 5, note: dec.crash, wire: hex, seen: 'error: ' + dec.crash };
+    if (dec.crash) return { sev: S.crash, note: dec.crash, wire: hex, seen: 'error: ' + dec.crash };
     let sev = 0; let note = 'every field matches what the writer meant';
     const bump = (s: number, n: string) => { if (s > sev) { sev = s; note = n; } };
     for (const rf of r) {
       const wf = w.find((x) => x.key === rf.key); const actual = dec.rec[rf.name]; const rdef = readerDefault(fmt, rf);
-      if (wf && dec.fallback && rf.type === 'enum' && !rf.syms!.includes(String(msg[wf.key]))) { bump(2, `status ${msg[wf.key]} is unknown to the reader and is routed to its default branch (${actual})`); continue; }
+      if (wf && dec.fallback && rf.type === 'enum' && !rf.syms!.includes(String(msg[wf.key]))) { bump(S.defaulted, `status ${msg[wf.key]} is unknown to the reader and is routed to its default branch (${actual})`); continue; }
       if (wf) {
         if (actual !== msg[wf.key]) {
-          if (actual === rdef) bump(3, `${rf.name}: ${fv(msg[wf.key])} was sent but the reader saw ${fv(rdef)}`);
-          else bump(4, `${rf.name} read as ${fv(actual)} but the writer meant ${wf.name}=${fv(msg[wf.key])}`);
+          if (actual === rdef) bump(S.lost, `${rf.name}: ${fv(msg[wf.key])} was sent but the reader saw ${fv(rdef)}`);
+          else bump(S.wrong, `${rf.name} read as ${fv(actual)} but the writer meant ${wf.name}=${fv(msg[wf.key])}`);
         }
-      } else if (actual !== rdef) bump(4, `${rf.name} read as ${fv(actual)}, but the writer sent that number as a different field`);
-      else bump(2, `${rf.name} was not sent, the reader used ${fv(rdef)}${fmt === 'proto' && rf.def !== undefined && rf.def !== rdef ? ' (proto cannot express the default ' + fv(rf.def) + ')' : ''}`);
+      } else if (actual !== rdef) bump(S.wrong, `${rf.name} read as ${fv(actual)}, but the writer sent that number as a different field`);
+      else bump(S.defaulted, `${rf.name} was not sent, the reader used ${fv(rdef)}${fmt === 'proto' && rf.def !== undefined && rf.def !== rdef ? ' (proto cannot express the default ' + fv(rf.def) + ')' : ''}`);
     }
-    for (const wf of w) if (!r.some((x) => x.key === wf.key)) bump(1, `${wf.name} is not known to the reader and was skipped`);
+    for (const wf of w) if (!r.some((x) => x.key === wf.key)) bump(S.dropped, `${wf.name} is not known to the reader and was skipped`);
     const seen = '{' + r.map((f) => `${f.name}: ${fv(dec.rec[f.name])}`).join(', ') + '}';
     return { sev, note, wire: hex, seen };
   }
@@ -222,8 +232,8 @@ import PlaygroundShell from '../components/PlaygroundShell.astro';
 
   /** The 2x2 matrix: writer version by reader version, 8 messages each. */
   function matrix(fmt: Fmt, change: string, tolerant: boolean) {
-    const v1 = BASE; const v2 = CHANGES[change].apply(BASE); const idx = range(0, 8);
-    const cell = (w: Fld[], r: Fld[]) => summarize(fmt, w, r, idx, tolerant, 3);
+    const v1 = BASE; const v2 = CHANGES[change].apply(BASE); const idx = range(0, MATRIX_MSGS);
+    const cell = (w: Fld[], r: Fld[]) => summarize(fmt, w, r, idx, tolerant, MATRIX_SAMPLE);
     return { oo: cell(v1, v1), on: cell(v1, v2), no: cell(v2, v1), nn: cell(v2, v2) };
   }
 
@@ -243,15 +253,15 @@ import PlaygroundShell from '../components/PlaygroundShell.astro';
   /** What one consumer decodes in one deploy step. */
   function consumerStep(fmt: Fmt, change: string, tolerant: boolean, step: number, prod: number, cons: number) {
     const v1 = BASE; const v2 = CHANGES[change].apply(BASE); const r = cons === 2 ? v2 : v1;
-    const a = summarize(fmt, prod === 2 ? v2 : v1, r, range(step * 10, fresh), tolerant, 0);
-    const b = summarize(fmt, v1, r, range(500 + step * 10, queued), tolerant, 0);
+    const a = summarize(fmt, prod === 2 ? v2 : v1, r, range(step * STEP_STRIDE, fresh), tolerant, 0);
+    const b = summarize(fmt, v1, r, range(QUEUED_BASE + step * STEP_STRIDE, queued), tolerant, 0);
     const counts = a.counts.map((c, k) => c + b.counts[k]);
-    return { counts, bad: counts[3] + counts[4] + counts[5], worstBad: counts[5] ? 'crash' : counts[4] ? 'wrong value' : 'lost data', defaulted: counts[2] };
+    return { counts, bad: counts[S.lost] + counts[S.wrong] + counts[S.crash], worstBad: counts[S.crash] ? 'crash' : counts[S.wrong] ? 'wrong value' : 'lost data', defaulted: counts[S.defaulted] };
   }
 
   function verdict(m: ReturnType<typeof matrix>, change: string, fmt: Fmt) {
     const back = m.on.worst < BROKEN; const fwd = m.no.worst < BROKEN;
-    const silent = [m.on, m.no].some((c) => c.worst === 3 || c.worst === 4);
+    const silent = [m.on, m.no].some((c) => c.worst === S.lost || c.worst === S.wrong);
     let order: string;
     if (back && fwd) order = 'Safe in any order: both directions are readable.';
     else if (back) order = 'Safe order: consumers first, then the producer. Producing the new shape before every reader is upgraded breaks the old readers.';
@@ -289,10 +299,11 @@ import PlaygroundShell from '../components/PlaygroundShell.astro';
     }
     // Build the rollout rows once.
     const rowHost = q('[data-rows]');
-    const rows = range(0, 5).map(() => {
+    const CONSUMERS = 3; // Billing, Shipping, Analytics; the last column holds the bad count
+    const rows = range(0, CONSUMERS + 2).map(() => { // start, producer, one row per consumer
       const tr = document.createElement('tr'); const tds: HTMLElement[] = [];
       const th = document.createElement('th'); th.scope = 'row'; tr.appendChild(th);
-      for (let k = 0; k < 4; k++) { const td = document.createElement('td'); tr.appendChild(td); tds.push(td); }
+      for (let k = 0; k < CONSUMERS + 1; k++) { const td = document.createElement('td'); tr.appendChild(td); tds.push(td); }
       rowHost.appendChild(tr); return { th, tds, tr };
     });
 
@@ -311,7 +322,7 @@ import PlaygroundShell from '../components/PlaygroundShell.astro';
           td.textContent = `v${cv}: ` + (r.bad ? `${r.bad} ${r.worstBad}` : r.defaulted ? `ok, ${r.defaulted} defaulted` : 'ok');
           td.className = r.bad ? 'se-bad' : 'se-ok';
         });
-        total += bad; row.tds[3].textContent = String(bad); row.tds[3].className = bad ? 'se-bad' : 'se-ok';
+        total += bad; row.tds[CONSUMERS].textContent = String(bad); row.tds[CONSUMERS].className = bad ? 'se-bad' : 'se-ok';
         row.tr.classList.toggle('se-now', k === shown - 1);
       });
       q('[data-total]').textContent = shown === 0 ? 'Press Step to deploy one service at a time.' : `Deployed ${shown} of ${plan.length} steps: ${total} bad of ${msgs} messages decoded so far.`;

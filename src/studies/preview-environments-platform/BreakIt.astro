@@ -40,46 +40,54 @@ import PlaygroundShell from '../../components/PlaygroundShell.astro';
   document.querySelectorAll<HTMLElement>('[data-peb]').forEach((root) => {
     const q = <T extends HTMLElement>(s: string) => root.querySelector<T>(s)!;
     const HOURS = 720;
-    let seed = 11; const rnd = (n: number) => { seed = (seed * 1664525 + 1013904223) % 4294967296; return Math.floor(seed / 65536) % n; };
+    const SEED = 11; const N_PRS = 60; const DAY_H = 24;
+    const WORK = { start: 9, end: 17, span: 8 }; // working hours in which people visit previews
+    const OPEN_DAYS = 26; const DUR_SPAN = 4; const MAX_VISITS = 3; // PRs open on days 0..25, stay 1..4 days, up to 2 visits a day
+    const CLOSE_ODDS = 5; const LEAK_ODDS = 8; // 1 in 5 PRs is abandoned, 1 in 8 leaks resources
+    const COST = { base: 0.001, db: 0.05, awake: 0.02 }; // dollars per preview-hour
+    const SLOW_EVERY = 3; // one visit in three lands on a node shared with a leaking preview
+    const BUDGET = 300; // dollars per month
+    // LCG, upper bits
+    let seed = SEED; const rnd = (n: number) => { seed = (seed * 1664525 + 1013904223) % 4294967296; return Math.floor(seed / 65536) % n; };
     type Pr = { create: number; last: number; closes: boolean; leaks: boolean; touches: number[] };
     // The same 60 pull requests for every setting. A touch is the hour in which someone visits the preview.
-    const prs: Pr[] = Array.from({ length: 60 }, () => {
-      const open = rnd(26); const dur = 1 + rnd(4); const closes = rnd(5) !== 0; const leaks = rnd(8) === 0; const touches = [open * 24 + 9];
-      for (let d = open; d <= open + dur; d++) { const n = rnd(3); for (let k = 0; k < n; k++) touches.push(d * 24 + 9 + rnd(8)); }
-      return { create: open * 24 + 9, last: (open + dur) * 24 + 17, closes, leaks, touches };
+    const prs: Pr[] = Array.from({ length: N_PRS }, () => {
+      const open = rnd(OPEN_DAYS); const dur = 1 + rnd(DUR_SPAN); const closes = rnd(CLOSE_ODDS) !== 0; const leaks = rnd(LEAK_ODDS) === 0; const touches = [open * DAY_H + WORK.start];
+      for (let d = open; d <= open + dur; d++) { const n = rnd(MAX_VISITS); for (let k = 0; k < n; k++) touches.push(d * DAY_H + WORK.start + rnd(WORK.span)); }
+      return { create: open * DAY_H + WORK.start, last: (open + dur) * DAY_H + WORK.end, closes, leaks, touches };
     });
     function run(cleanup: boolean, idle: number, ttl: number, quota: boolean, ownDb: boolean) {
       let cost = 0; let alive = 0; let broken = 0;
       const awakeAt = new Array(HOURS).fill(0); const leakAt = new Array(HOURS).fill(0);
       prs.forEach((p) => {
-        let end = HOURS; if (cleanup && p.closes) end = Math.min(end, p.last); if (ttl > 0) end = Math.min(end, p.create + ttl * 24);
+        let end = HOURS; if (cleanup && p.closes) end = Math.min(end, p.last); if (ttl > 0) end = Math.min(end, p.create + ttl * DAY_H);
         for (let h = p.create; h < end; h++) {
           const awake = idle < 0 || p.touches.some((t) => t <= h && h <= t + idle);
-          cost += 0.001 + (ownDb ? 0.05 : 0) + (awake ? 0.02 : 0);
+          cost += COST.base + (ownDb ? COST.db : 0) + (awake ? COST.awake : 0);
           if (awake) { awakeAt[h]++; if (p.leaks && !quota) leakAt[h] = 1; }
         }
         if (end >= HOURS) alive++;
         p.touches.forEach((t) => { if (t >= end) broken++; });
       });
       let slowed = 0;
-      prs.forEach((p, i) => p.touches.forEach((t, k) => { if (leakAt[t] && (i + k) % 3 === 0 && !p.leaks) slowed++; }));
+      prs.forEach((p, i) => p.touches.forEach((t, k) => { if (leakAt[t] && (i + k) % SLOW_EVERY === 0 && !p.leaks) slowed++; }));
       return { cost: Math.round(cost), alive, broken, slowed, peak: Math.max(...awakeAt) };
     }
     function draw() {
       const r = run(q<HTMLInputElement>('[data-pe-clean]').checked, Number(q<HTMLSelectElement>('[data-pe-idle]').value), Number(q<HTMLSelectElement>('[data-pe-ttl]').value), q<HTMLInputElement>('[data-pe-quota]').checked, q<HTMLSelectElement>('[data-pe-db]').value === 'own');
       q('[data-pe-o1]').textContent = `$${r.cost.toLocaleString('en-US')}`; q('[data-pe-n1]').textContent = 'awake time, disks and databases';
-      q('[data-pe-o2]').textContent = `${r.alive} of 60`; q('[data-pe-n2]').textContent = r.alive ? 'merged, closed or abandoned previews that still hold resources' : 'nothing is left behind';
+      q('[data-pe-o2]').textContent = `${r.alive} of ${N_PRS}`; q('[data-pe-n2]').textContent = r.alive ? 'merged, closed or abandoned previews that still hold resources' : 'nothing is left behind';
       q('[data-pe-o3]').textContent = String(r.peak); q('[data-pe-n3]').textContent = 'this sets how many machines the cluster needs';
       q('[data-pe-o4]').textContent = `${r.broken + r.slowed}`; q('[data-pe-n4]').textContent = `${r.broken} found the preview deleted, ${r.slowed} were slowed by a leaking neighbour`;
-      q<HTMLElement>('[data-pe-b1]').style.setProperty('--c', r.cost > 300 ? 'var(--bad)' : 'var(--good)');
+      q<HTMLElement>('[data-pe-b1]').style.setProperty('--c', r.cost > BUDGET ? 'var(--bad)' : 'var(--good)');
       q<HTMLElement>('[data-pe-b2]').style.setProperty('--c', r.alive > 0 ? 'var(--bad)' : 'var(--good)');
       q<HTMLElement>('[data-pe-b3]').style.setProperty('--c', 'var(--accent)');
       q<HTMLElement>('[data-pe-b4]').style.setProperty('--c', r.broken + r.slowed > 0 ? 'var(--bad)' : 'var(--good)');
       const issues: string[] = [];
       if (r.broken > 0) issues.push(`the time limit deleted previews that were still under review, so ${r.broken} visits failed`);
       if (r.slowed > 0) issues.push(`without a quota a leaking preview slowed ${r.slowed} visits to other previews`);
-      if (r.alive > 0) issues.push(`${r.alive} previews still hold resources on day 30`);
-      if (r.cost > 300) issues.push(`the bill is $${r.cost.toLocaleString('en-US')} for the month, with up to ${r.peak} previews awake together`);
+      if (r.alive > 0) issues.push(`${r.alive} previews still hold resources on day ${HOURS / DAY_H}`);
+      if (r.cost > BUDGET) issues.push(`the bill is $${r.cost.toLocaleString('en-US')} for the month, with up to ${r.peak} previews awake together`);
       const out = q('[data-pe-verdict]'); out.classList.toggle('bad', issues.length > 0);
       out.textContent = issues.length ? `Problems: ${issues.join('; ')}.` : `Healthy: $${r.cost} for the month, at most ${r.peak} previews awake together, nothing left behind and no visit disturbed.`;
     }

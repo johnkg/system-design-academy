@@ -42,6 +42,12 @@ import PlaygroundShell from '../components/PlaygroundShell.astro';
   const MINUTES = 30;
   const BASE_N = 6; // first minutes form the baseline
   const LATE_N = 5; // last minutes form the "now" value
+  const NOISE = 0.12; // multiplicative noise band: +-6% per sample
+  const ERROR_HIGH_PCT = 5, ERROR_UP_PCT = 0.8; // error ratio read as "high" at 5%, "up" after rising 0.8 points
+  const POOL_FULL_PCT = 97;
+  const MATRIX_SEED = 11; // seed the lookalike matrix is computed with
+  const ROUND_SEED = { base: 101, step: 37 }; // seed of round n = base + n * step
+  const SPARK = { w: 120, floor: 32, h: 30, headroom: 1.1 }; // sparkline geometry (matches the SVG viewBox) and 10% top margin
   const FAULT_IDS: FaultId[] = ['lock', 'pool', 'downstream', 'leak', 'deploy', 'spike'];
   const SEQUENCE: FaultId[] = ['downstream', 'pool', 'deploy', 'leak', 'lock', 'spike'];
   const M = (id: string, group: GroupId, title: string, tag: string, unit: string, base: number, digits: number, min: number, up = 1.5, down = 0.7): MetricDef => ({ id, group, title, tag, unit, base, digits, up, down, min });
@@ -86,6 +92,7 @@ import PlaygroundShell from '../components/PlaygroundShell.astro';
     spike: { name: 'Traffic spike beyond capacity', tell: 'the request rate triples while CPU and run queue saturate', cure: 'demand exceeds what the hosts can serve, so requests queue for CPU' },
   };
 
+  // mulberry32 seeded PRNG
   function mulberry32(seed: number) {
     let a = seed >>> 0;
     return () => { a = (a + 0x6d2b79f5) >>> 0; let t = a; t = Math.imul(t ^ (t >>> 15), t | 1); t ^= t + Math.imul(t ^ (t >>> 7), t | 61); return ((t ^ (t >>> 14)) >>> 0) / 4294967296; };
@@ -99,7 +106,7 @@ import PlaygroundShell from '../components/PlaygroundShell.astro';
       const to = fx.to[m.id] ?? m.base; const values: number[] = [];
       for (let t = 0; t < MINUTES; t++) {
         const ramp = clamp((t - fx.start) / fx.ramp, 0, 1);
-        let v = (m.base + (to - m.base) * ramp) * (1 + (rand() - 0.5) * 0.12);
+        let v = (m.base + (to - m.base) * ramp) * (1 + (rand() - 0.5) * NOISE);
         const cap = m.unit === '%' && m.id !== 'errors' ? 100 : Infinity;
         v = clamp(v, 0, cap);
         const f = Math.pow(10, m.digits); values.push(Math.round(v * f) / f);
@@ -113,8 +120,8 @@ import PlaygroundShell from '../components/PlaygroundShell.astro';
   // Turn a series into a coarse reading, like an engineer glancing at a graph: flat, up, down.
   function tokenOf(m: MetricDef, values: number[]): Token {
     const base = avgOf(values.slice(0, BASE_N)); const late = avgOf(values.slice(-LATE_N)); const delta = late - base;
-    if (m.id === 'errors') return late >= 5 ? 'high' : delta >= 0.8 ? 'up' : 'flat';
-    if (m.id === 'pool_util' && late >= 97) return 'full';
+    if (m.id === 'errors') return late >= ERROR_HIGH_PCT ? 'high' : delta >= ERROR_UP_PCT ? 'up' : 'flat';
+    if (m.id === 'pool_util' && late >= POOL_FULL_PCT) return 'full';
     if (late >= base * m.up && delta >= m.min) return 'up';
     if (late <= base * m.down && -delta >= m.min) return 'down';
     return 'flat';
@@ -158,7 +165,7 @@ import PlaygroundShell from '../components/PlaygroundShell.astro';
     const setSel = q<HTMLSelectElement>('[data-set]'); const guessSel = q<HTMLSelectElement>('[data-guess]');
     const verdictEl = q('[data-verdict]');
     let n = 0; let revealed = false; let data: Record<string, number[]> = {};
-    const fault = () => SEQUENCE[n % SEQUENCE.length]; const seed = () => 101 + n * 37;
+    const fault = () => SEQUENCE[n % SEQUENCE.length]; const seed = () => ROUND_SEED.base + n * ROUND_SEED.step;
     const groupColour: Record<GroupId, string> = { avg: 'var(--role-3)', red: 'var(--role-1)', use: 'var(--role-2)' };
 
     guessSel.innerHTML = '<option value="">Choose a suspect...</option>' + FAULT_IDS.map((f) => `<option value="${f}">${INFO[f].name}</option>`).join('');
@@ -182,7 +189,7 @@ import PlaygroundShell from '../components/PlaygroundShell.astro';
       const body = document.createElement('tbody');
       FAULT_IDS.forEach((f) => {
         const tr = document.createElement('tr'); tr.dataset.fault = f;
-        tr.innerHTML = `<th scope="row">${INFO[f].name}</th>` + sets.map((s) => { const c = cellOf(analyse(s, f, 11)); const k = c === 'Pinned' ? 'pin' : c === 'Invisible' ? 'inv' : 'amb'; return `<td class="rg-${k}" data-set="${s}">${c}</td>`; }).join('');
+        tr.innerHTML = `<th scope="row">${INFO[f].name}</th>` + sets.map((s) => { const c = cellOf(analyse(s, f, MATRIX_SEED)); const k = c === 'Pinned' ? 'pin' : c === 'Invisible' ? 'inv' : 'amb'; return `<td class="rg-${k}" data-set="${s}">${c}</td>`; }).join('');
         body.appendChild(tr);
       });
       table.appendChild(body); wrap.appendChild(table);
@@ -192,8 +199,8 @@ import PlaygroundShell from '../components/PlaygroundShell.astro';
       const set = setSel.value as SetId; const show = new Set(SETS[set].ids);
       cards.forEach((c) => {
         const vals = data[c.def.id]; c.box.hidden = !show.has(c.def.id);
-        const max = Math.max(...vals, c.def.base, 1) * 1.1;
-        c.line.setAttribute('points', vals.map((v, i) => `${((i * 120) / (MINUTES - 1)).toFixed(1)},${(32 - (v / max) * 30).toFixed(1)}`).join(' '));
+        const max = Math.max(...vals, c.def.base, 1) * SPARK.headroom;
+        c.line.setAttribute('points', vals.map((v, i) => `${((i * SPARK.w) / (MINUTES - 1)).toFixed(1)},${(SPARK.floor - (v / max) * SPARK.h).toFixed(1)}`).join(' '));
         const base = avgOf(vals.slice(0, BASE_N)); const late = avgOf(vals.slice(-LATE_N));
         c.nums.textContent = `was ${fmt(c.def, base)}, now ${fmt(c.def, late)}`;
         c.svg.setAttribute('aria-label', `${c.def.title}: was ${fmt(c.def, base)}, now ${fmt(c.def, late)}`);

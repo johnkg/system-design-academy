@@ -29,17 +29,22 @@ import PlaygroundShell from '../../components/PlaygroundShell.astro';
   document.querySelectorAll<HTMLElement>('[data-lsb]').forEach((root) => {
     const q = <T extends HTMLElement>(s: string) => root.querySelector<T>(s)!;
     const W = [10, 35, 30, 20, 5];
+    const SEED = 11; const JITTER = { base: 80, span: 41 }; // per-PoP audience is 80%..120% of its even share
+    const VIEWERS_PER_REQ = 2; // without coalescing, about one request per two waiting viewers
+    const BURST_MS = 150; const MS_PER_S = 1000; // requests for a new segment arrive within 150 ms
+    const SHIELD_CAP = 200000; const ORIGIN_CAP = 20000; // requests per second
+    const LAT = { baseS: 1.2, segments: 4 }; // glass-to-glass latency: fixed part plus four segments of buffer
     const fmt = (n: number) => n.toLocaleString('en-US');
     function simulate(V: number, E: number, coal: boolean, shield: boolean, seg: number) {
-      let seed = 11; const rnd = (n: number) => { seed = (Math.imul(seed, 1664525) + 1013904223) >>> 0; return (seed >>> 16) % n; };
+      let seed = SEED; const rnd = (n: number) => { seed = (Math.imul(seed, 1664525) + 1013904223) >>> 0; return (seed >>> 16) % n; };
       let edgeOut = 0;
-      for (let e = 0; e < E; e++) for (let r = 0; r < 5; r++) { const n = Math.floor((((V / E) * W[r]) / 100 * (80 + rnd(41))) / 100); if (n > 0) edgeOut += coal ? 1 : Math.ceil(n / 2); }
-      const rate = (c: number) => Math.floor((c * 1000) / 150);
-      const shieldIn = shield ? edgeOut : 0; const originIn = shield ? 5 : edgeOut;
+      for (let e = 0; e < E; e++) for (let r = 0; r < W.length; r++) { const n = Math.floor((((V / E) * W[r]) / 100 * (JITTER.base + rnd(JITTER.span))) / 100); if (n > 0) edgeOut += coal ? 1 : Math.ceil(n / VIEWERS_PER_REQ); }
+      const rate = (c: number) => Math.floor((c * MS_PER_S) / BURST_MS);
+      const shieldIn = shield ? edgeOut : 0; const originIn = shield ? W.length : edgeOut;
       const sRate = rate(shieldIn); const oRate = rate(originIn);
       const pass = (cap: number, x: number) => (x <= cap ? 100 : Math.floor((cap * 100) / x));
-      const pS = shield ? pass(200000, sRate) : 100; const pO = pass(20000, oRate);
-      return { edgeOut, shieldIn, sRate, originIn, oRate, pS, pO, late: 100 - Math.floor((pS * pO) / 100), lat: 1.2 + 4 * seg };
+      const pS = shield ? pass(SHIELD_CAP, sRate) : 100; const pO = pass(ORIGIN_CAP, oRate);
+      return { edgeOut, shieldIn, sRate, originIn, oRate, pS, pO, late: 100 - Math.floor((pS * pO) / 100), lat: LAT.baseS + LAT.segments * seg };
     }
     function draw() {
       const V = Number(q<HTMLSelectElement>('[data-v]').value); const E = Number(q<HTMLSelectElement>('[data-e]').value); const seg = Number(q<HTMLSelectElement>('[data-seg]').value);
@@ -48,9 +53,9 @@ import PlaygroundShell from '../../components/PlaygroundShell.astro';
       q('[data-o1]').textContent = `${fmt(s.edgeOut)} per segment`;
       q('[data-n1]').textContent = coal ? 'one per rendition and PoP' : 'one per waiting viewer';
       q('[data-o2]').textContent = shield ? `${fmt(s.sRate)} per second` : 'no shield';
-      q('[data-n2]').textContent = shield ? (s.pS === 100 ? 'within its 200,000 per second' : `over its 200,000 per second, serves ${s.pS}% in time`) : 'edges go straight to the origin';
+      q('[data-n2]').textContent = shield ? (s.pS === 100 ? `within its ${fmt(SHIELD_CAP)} per second` : `over its ${fmt(SHIELD_CAP)} per second, serves ${s.pS}% in time`) : 'edges go straight to the origin';
       q('[data-o3]').textContent = `${fmt(s.oRate)} per second`;
-      q('[data-n3]').textContent = `${fmt(s.originIn)} requests in 150 ms, capacity 20,000 per second` + (s.pO < 100 ? `, serves ${s.pO}% in time` : '');
+      q('[data-n3]').textContent = `${fmt(s.originIn)} requests in ${BURST_MS} ms, capacity ${fmt(ORIGIN_CAP)} per second` + (s.pO < 100 ? `, serves ${s.pO}% in time` : '');
       q('[data-o4]').textContent = `${s.late}%`;
       q('[data-n4]').textContent = `glass-to-glass latency ${s.lat.toFixed(1)} s with ${seg}-second segments`;
       const ok = s.late === 0;
@@ -60,9 +65,9 @@ import PlaygroundShell from '../../components/PlaygroundShell.astro';
       q<HTMLElement>('[data-b4]').style.setProperty('--c', ok ? 'var(--good)' : 'var(--bad)');
       const out = q('[data-verdict]'); out.classList.toggle('bad', !ok);
       out.textContent = ok
-        ? (shield ? `Healthy: the shield merges ${fmt(s.shieldIn)} edge requests into 5 for the origin, so the origin's load no longer depends on the audience.` : `Healthy for now: ${fmt(s.originIn)} requests in a burst is within what the origin can serve, but it grows with the number of PoPs. A shield makes it 5.`)
+        ? (shield ? `Healthy: the shield merges ${fmt(s.shieldIn)} edge requests into ${W.length} for the origin, so the origin's load no longer depends on the audience.` : `Healthy for now: ${fmt(s.originIn)} requests in a burst is within what the origin can serve, but it grows with the number of PoPs. A shield makes it 5.`)
         : (shield ? `Overloaded: without coalescing the edges forward one request per viewer, ${fmt(s.shieldIn)} of them, and the shield cannot absorb ${fmt(s.sRate)} per second. ${s.late}% of viewers are late and will stall.`
-          : `Overloaded: ${fmt(s.originIn)} requests hit the origin in 150 ms, ${fmt(s.oRate)} per second against 20,000. ${s.late}% of viewers are late and will stall. A shield would reduce this to 5 requests.`);
+          : `Overloaded: ${fmt(s.originIn)} requests hit the origin in ${BURST_MS} ms, ${fmt(s.oRate)} per second against ${fmt(ORIGIN_CAP)}. ${s.late}% of viewers are late and will stall. A shield would reduce this to ${W.length} requests.`);
     }
     root.addEventListener('input', draw); root.addEventListener('change', draw);
     draw();

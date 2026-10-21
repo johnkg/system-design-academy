@@ -52,7 +52,10 @@ import PlaygroundShell from '../../components/PlaygroundShell.astro';
       { name: 'inbox', required: false, timeout: 80, base: 15, spread: 30 },
     ];
     const N = 2000; const HANG = 8000; const TAIL = 250;
-    let seed = 2026; const rnd = () => ((seed = (seed * 1664525 + 1013904223) % 4294967296) / 4294967296);
+    const SEED = 2026; const TAIL_SHARE = 0.02; // 2% of calls pay the TAIL latency
+    const STALE_HIT = 0.9; // share of optional parts with a stale copy to fall back on
+    const P95 = 0.95; const P99 = 0.99; const SLOW_P95_MS = 1000;
+    let seed = SEED; const rnd = () => ((seed = (seed * 1664525 + 1013904223) % 4294967296) / 4294967296);
     // All random draws are made once, so changing a control changes only the policy, never the luck.
     const draws = Array.from({ length: N }, () => SERVICES.map(() => ({ a: rnd(), t: rnd(), h: rnd(), a2: rnd(), h2: rnd(), s: rnd() })));
     function simulate(mode: string, sick: number, hangPct: number) {
@@ -61,7 +64,7 @@ import PlaygroundShell from '../../components/PlaygroundShell.astro';
         const wait: number[] = []; const missing: boolean[] = []; let stale = 0;
         SERVICES.forEach((s, j) => {
           const d = draws[i][j];
-          let lat = s.base + Math.floor(d.a * s.spread) + (d.t < 0.02 ? TAIL : 0);
+          let lat = s.base + Math.floor(d.a * s.spread) + (d.t < TAIL_SHARE ? TAIL : 0);
           if (j === sick && d.h * 100 < hangPct) lat = HANG;
           let w = lat; let miss = false;
           if (mode === 'tmo' || mode === 'full') { w = Math.min(lat, s.timeout); miss = lat > s.timeout; } else miss = lat >= HANG;
@@ -71,7 +74,7 @@ import PlaygroundShell from '../../components/PlaygroundShell.astro';
             w = s.timeout + Math.min(hung2 ? HANG : lat2, s.timeout); miss = hung2 || lat2 > s.timeout;
           }
           wait.push(w); missing.push(miss);
-          if (miss && mode === 'full' && !s.required && d.s < 0.9) { missing[j] = false; stale++; }
+          if (miss && mode === 'full' && !s.required && d.s < STALE_HIT) { missing[j] = false; stale++; }
         });
         times.push(mode === 'seq' ? wait.reduce((a, b) => a + b, 0) : Math.max(...wait));
         const reqMiss = SERVICES.some((s, j) => s.required && missing[j]);
@@ -79,7 +82,7 @@ import PlaygroundShell from '../../components/PlaygroundShell.astro';
       }
       times.sort((a, b) => a - b);
       const pc = (p: number) => times[Math.floor(N * p)];
-      return { p50: pc(0.5), p95: pc(0.95), p99: pc(0.99), fresh, degraded, failed };
+      return { p50: pc(0.5), p95: pc(P95), p99: pc(P99), fresh, degraded, failed };
     }
     const fmt = (n: number) => Math.round(n).toLocaleString('en-US');
     const pct = (n: number) => `${((n / N) * 100).toFixed(1)}%`;
@@ -92,16 +95,16 @@ import PlaygroundShell from '../../components/PlaygroundShell.astro';
       q('[data-o2]').textContent = pct(r.fresh); q('[data-n2]').textContent = `${fmt(r.fresh)} of ${fmt(N)} opens`;
       q('[data-o3]').textContent = pct(r.degraded); q('[data-n3]').textContent = `${fmt(r.degraded)} opens with a part missing or old`;
       q('[data-o4]').textContent = pct(r.failed); q('[data-n4]').textContent = `${fmt(r.failed)} opens with a required part missing`;
-      q<HTMLElement>('[data-b1]').style.setProperty('--c', r.p95 > 1000 ? 'var(--bad)' : 'var(--accent)');
+      q<HTMLElement>('[data-b1]').style.setProperty('--c', r.p95 > SLOW_P95_MS ? 'var(--bad)' : 'var(--accent)');
       q<HTMLElement>('[data-b2]').style.setProperty('--c', 'var(--good)');
       q<HTMLElement>('[data-b3]').style.setProperty('--c', 'var(--role-4)');
       q<HTMLElement>('[data-b4]').style.setProperty('--c', r.failed > 0 ? 'var(--bad)' : 'var(--border)');
       q<HTMLElement>('[data-s1]').style.width = `${(r.fresh / N) * 100}%`; q<HTMLElement>('[data-s2]').style.width = `${(r.degraded / N) * 100}%`; q<HTMLElement>('[data-s3]').style.width = `${(r.failed / N) * 100}%`;
       q('[data-bar]').setAttribute('aria-label', `Complete ${pct(r.fresh)}, partial or stale ${pct(r.degraded)}, failed ${pct(r.failed)}`);
-      const out = q('[data-verdict]'); const bad = r.p95 > 1000 || r.failed > 0; out.classList.toggle('bad', bad);
+      const out = q('[data-verdict]'); const bad = r.p95 > SLOW_P95_MS || r.failed > 0; out.classList.toggle('bad', bad);
       const who = sick >= 0 ? names[sick] : 'nothing';
       let t: string;
-      if (r.p95 > 1000) t = `Too slow: 1 open in 20 takes ${fmt(r.p95)} ms or more. With no per-call timeout, a hung ${who} call holds the whole screen until the client gives up at 8,000 ms.`;
+      if (r.p95 > SLOW_P95_MS) t = `Too slow: 1 open in 20 takes ${fmt(r.p95)} ms or more. With no per-call timeout, a hung ${who} call holds the whole screen until the client gives up at ${fmt(HANG)} ms.`;
       else if (r.failed > 0 && (mode === 'tmo')) t = `Fast, but ${pct(r.failed)} of screens fail. A timeout turns a rare slow call to a required part into an error${sick === 1 ? ', and the hanging orders service adds many more' : ''}. A retry helps with slow calls, but not with a service that stays down.`;
       else if (r.failed > 0) t = `Fast, but ${pct(r.failed)} of screens fail. A required part cannot be skipped, and it hung on the first call and again on the retry.`;
       else if (mode === 'full') t = `Fast and never failing: required parts get a second try, and optional parts come from a stale copy when they time out. The price is that some screens show old data.`;

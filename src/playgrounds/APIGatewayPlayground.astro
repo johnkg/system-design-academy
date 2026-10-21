@@ -30,10 +30,16 @@ import PlaygroundShell from '../components/PlaygroundShell.astro';
 </PlaygroundShell>
 <script>
   const stageNames = ['Authenticate', 'Rate limit', 'Cache', 'Route and call'];
+  const BUCKET_SIZE = 10; // rate-limit token bucket capacity
+  const REFILL_WINDOW_MS = 10000; // the bucket refills fully over this window
+  const BREAKER_FAILS = 3; // consecutive payment timeouts that open the breaker
+  const BREAKER_OPEN_MS = 8000; // how long the breaker stays open
+  const CACHE_TTL_MS = 5000; // gateway cache lifetime of a GET response
+  const BURST_SIZE = 15; // requests sent by the burst button
   document.querySelectorAll<HTMLElement>('[data-gw]').forEach((root) => {
     const q = <T extends HTMLElement>(s: string) => root.querySelector<T>(s)!;
     const on = (s: string) => q<HTMLInputElement>(s).checked;
-    let tokens = 10; let last = performance.now(); let slow = false; let payFails = 0; let breakerUntil = 0;
+    let tokens = BUCKET_SIZE; let last = performance.now(); let slow = false; let payFails = 0; let breakerUntil = 0;
     const cache = new Map<string, number>(); const c = { total: 0, reached: 0, cached: 0, auth: 0, limited: 0, shed: 0 };
     const boxes = stageNames.map((n) => { const b = document.createElement('div'); b.className = 'pg-box off'; b.innerHTML = '<h3></h3><span class="pg-mono"></span>'; b.querySelector('h3')!.textContent = n; q('[data-stages]').appendChild(b); return { b, s: b.querySelector<HTMLElement>('span')! }; });
     function show(i: number, text: string, state: 'pass' | 'block' | 'skip') {
@@ -46,7 +52,7 @@ import PlaygroundShell from '../components/PlaygroundShell.astro';
       const done = (text: string) => { res = text; if (!quiet) { q('[data-res]').textContent = text; q('[data-res]').classList.toggle('bad', !text.startsWith('200')); } draw(); return text; };
       if (on('[data-auth]')) { if (kind === 'bad') { c.auth++; show(0, 'token rejected', 'block'); return done('401 Unauthorized: stopped at the gateway, no service was touched.'); } show(0, 'token valid', 'pass'); } else show(0, 'skipped (not checked)', 'skip');
       if (on('[data-limit]')) {
-        tokens = Math.min(10, tokens + ((now - last) / 10000) * 10); last = now;
+        tokens = Math.min(BUCKET_SIZE, tokens + ((now - last) / REFILL_WINDOW_MS) * BUCKET_SIZE); last = now;
         if (tokens < 1) { c.limited++; show(1, 'over the limit', 'block'); return done('429 Too Many Requests: stopped at the gateway.'); }
         tokens -= 1; show(1, `allowed (${tokens.toFixed(1)} left)`, 'pass');
       } else show(1, 'skipped', 'skip');
@@ -58,17 +64,17 @@ import PlaygroundShell from '../components/PlaygroundShell.astro';
       if (kind === 'pay') {
         if (on('[data-breaker]') && now < breakerUntil) { c.shed++; show(3, 'breaker open', 'block'); return done('503 Service Unavailable: the breaker failed fast, payments were not called.'); }
         c.reached++;
-        if (slow) { payFails++; if (on('[data-breaker]') && payFails >= 3) breakerUntil = now + 8000; show(3, 'payments timed out', 'block'); return done('504 Gateway Timeout: the payment service did not answer.'); }
+        if (slow) { payFails++; if (on('[data-breaker]') && payFails >= BREAKER_FAILS) breakerUntil = now + BREAKER_OPEN_MS; show(3, 'payments timed out', 'block'); return done('504 Gateway Timeout: the payment service did not answer.'); }
         payFails = 0; show(3, 'payment service', 'pass'); return done('200 OK: handled by the payment service.');
       }
       c.reached++; show(3, kind === 'users' ? 'user service' : kind === 'orders' ? 'order service' : 'a service', 'pass');
-      if (on('[data-cache]')) cache.set(key, now + 5000);
+      if (on('[data-cache]')) cache.set(key, now + CACHE_TTL_MS);
       return done(`200 OK: handled by the ${kind === 'users' ? 'user' : kind === 'orders' ? 'order' : 'backend'} service.`);
     }
     function draw() { q('[data-stats]').textContent = `requests: ${c.total} · reached a service: ${c.reached} · served from cache: ${c.cached} · rejected for the token: ${c.auth} · rate limited: ${c.limited} · failed fast by the breaker: ${c.shed}`; }
-    function reset() { tokens = 10; last = performance.now(); slow = false; payFails = 0; breakerUntil = 0; cache.clear(); Object.keys(c).forEach((k) => ((c as Record<string, number>)[k] = 0)); const b = q('[data-slow]'); b.setAttribute('aria-pressed', 'false'); b.textContent = 'Make payments slow'; boxes.forEach((_, i) => show(i, 'not reached', 'skip')); q('[data-res]').textContent = 'No request yet.'; q('[data-res]').classList.remove('bad'); draw(); }
+    function reset() { tokens = BUCKET_SIZE; last = performance.now(); slow = false; payFails = 0; breakerUntil = 0; cache.clear(); Object.keys(c).forEach((k) => ((c as Record<string, number>)[k] = 0)); const b = q('[data-slow]'); b.setAttribute('aria-pressed', 'false'); b.textContent = 'Make payments slow'; boxes.forEach((_, i) => show(i, 'not reached', 'skip')); q('[data-res]').textContent = 'No request yet.'; q('[data-res]').classList.remove('bad'); draw(); }
     root.querySelectorAll<HTMLElement>('[data-send]').forEach((b) => b.addEventListener('click', () => send(b.dataset.send!)));
-    q('[data-burst]').addEventListener('click', () => { let last = ''; for (let i = 0; i < 15; i++) last = send('users', true); q('[data-res]').textContent = `Last of 15: ${last}`; q('[data-res]').classList.toggle('bad', !last.startsWith('200')); });
+    q('[data-burst]').addEventListener('click', () => { let last = ''; for (let i = 0; i < BURST_SIZE; i++) last = send('users', true); q('[data-res]').textContent = `Last of ${BURST_SIZE}: ${last}`; q('[data-res]').classList.toggle('bad', !last.startsWith('200')); });
     q('[data-slow]').addEventListener('click', (e) => { slow = !slow; const b = e.currentTarget as HTMLElement; b.setAttribute('aria-pressed', String(slow)); b.textContent = slow ? 'Make payments healthy' : 'Make payments slow'; });
     q('[data-reset]').addEventListener('click', reset);
     reset();

@@ -82,7 +82,12 @@ import PlaygroundShell from '../components/PlaygroundShell.astro';
   const ADD_COL = 0.05; // seconds the metadata lock of ADD COLUMN is held
   const SAMPLE = 10; // seconds between lag samples
   const MAX_TICKS = 40000;
+  const LAG_BAD_S = 60; // replica lag above a minute is a problem
+  const SPARK = { w: 300, y0: 58, h: 56, yNone: 60, minTop: 10, headroom: 1.2 }; // sparkline svg layout and scale (seconds)
+  const FRAME_MS = 80; // animation interval
+  const STEP_TICKS = 60; // simulation ticks per Step click
 
+  // mulberry32 PRNG
   function mulberry32(a: number) {
     return () => { a = (a + 0x6d2b79f5) | 0; let t = Math.imul(a ^ (a >>> 15), 1 | a); t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t; return ((t ^ (t >>> 14)) >>> 0) / 4294967296; };
   }
@@ -178,11 +183,11 @@ import PlaygroundShell from '../components/PlaygroundShell.astro';
       q<HTMLInputElement>('[data-late]').disabled = m !== 'expand';
     }
     function sparkline() {
-      const h = sim.hist; const top = Math.max(10, sim.peakLag, params.maxLag * 1.2);
-      const stride = Math.max(1, Math.ceil(h.length / 300)); const pts: string[] = [];
-      for (let i = 0; i < h.length; i += stride) pts.push(`${((i / Math.max(1, h.length - 1)) * 300).toFixed(1)},${(58 - (h[i] / top) * 56).toFixed(1)}`);
+      const h = sim.hist; const top = Math.max(SPARK.minTop, sim.peakLag, params.maxLag * SPARK.headroom);
+      const stride = Math.max(1, Math.ceil(h.length / SPARK.w)); const pts: string[] = [];
+      for (let i = 0; i < h.length; i += stride) pts.push(`${((i / Math.max(1, h.length - 1)) * SPARK.w).toFixed(1)},${(SPARK.y0 - (h[i] / top) * SPARK.h).toFixed(1)}`);
       q('[data-line]').setAttribute('points', pts.join(' '));
-      const y = params.maxLag > 0 ? 58 - (params.maxLag / top) * 56 : 60;
+      const y = params.maxLag > 0 ? SPARK.y0 - (params.maxLag / top) * SPARK.h : SPARK.yNone;
       q('[data-limit]').setAttribute('y1', y.toFixed(1)); q('[data-limit]').setAttribute('y2', y.toFixed(1));
       q('[data-limit]').style.display = params.maxLag > 0 ? '' : 'none';
       q('[data-spark]').setAttribute('aria-label', `Replica lag over time, peak ${fmtDur(sim.peakLag)}`);
@@ -206,7 +211,7 @@ import PlaygroundShell from '../components/PlaygroundShell.astro';
       q('[data-ibox]').style.setProperty('--c', s.stale > 0 ? 'var(--bad)' : 'var(--role-5)');
       q('[data-stalenote]').textContent = p.method === 'expand' ? (s.dual ? (s.stale > 0 ? 'written before dual-write, never repaired' : 'dual-write is live: backfill and live writes agree') : 'dual-write is not live, rows behind the cursor go stale') : p.method === 'shadow' ? 'the change log wins over the copy' : 'nothing can diverge under a table lock';
       q('[data-lagnow]').textContent = `${fmtDur(lag)} (peak ${fmtDur(s.peakLag)})`;
-      q('[data-lbox]').style.setProperty('--c', s.peakLag > 60 ? 'var(--bad)' : s.pausedNow ? 'var(--role-3)' : 'var(--role-6)');
+      q('[data-lbox]').style.setProperty('--c', s.peakLag > LAG_BAD_S ? 'var(--bad)' : s.pausedNow ? 'var(--role-3)' : 'var(--role-6)');
       q('[data-lagnote]').textContent = p.method === 'naive' ? 'the replica replays the whole ALTER after the primary finishes' : p.maxLag > 0 ? `throttle paused the copy for ${fmtDur(s.paused)}` : 'no throttle: the copy runs flat out';
       q('[data-dur]').textContent = fmtDur(s.t);
       q('[data-durnote]').textContent = s.done ? 'migration finished' : 'simulated time elapsed';
@@ -215,7 +220,7 @@ import PlaygroundShell from '../components/PlaygroundShell.astro';
       if (!s.done) v.textContent = 'Press Run, Step or Finish.';
       else if (s.stale > 0) { v.textContent = `Do not switch reads: ${fmtN(s.stale)} rows have a stale first_name/last_name. The backfill only fills NULLs, so nothing will repair them. Redeploy with dual-write first, then verify and re-backfill.`; v.classList.add('bad'); }
       else if (p.method === 'naive') { v.textContent = `Writes were blocked for ${fmtDur(s.blocked)} (${fmtN(s.blockedWrites)} writes failed or timed out) and the replica needs about ${fmtDur(drainSeconds(s))} more to catch up.`; v.classList.add('bad'); }
-      else if (s.peakLag > 60) { v.textContent = `Data is correct, but replicas fell up to ${fmtDur(s.peakLag)} behind and need about ${fmtDur(drainSeconds(s))} more. Do not point replica reads at the new columns until they catch up. A lag limit prevents this.`; v.classList.add('bad'); }
+      else if (s.peakLag > LAG_BAD_S) { v.textContent = `Data is correct, but replicas fell up to ${fmtDur(s.peakLag)} behind and need about ${fmtDur(drainSeconds(s))} more. Do not point replica reads at the new columns until they catch up. A lag limit prevents this.`; v.classList.add('bad'); }
       else v.textContent = `Safe: no long lock, 0 inconsistent rows, peak replica lag ${fmtDur(s.peakLag)}. Verify, switch reads, stop writing the old column, then drop it.`;
       sparkline();
     }
@@ -228,7 +233,7 @@ import PlaygroundShell from '../components/PlaygroundShell.astro';
     }
     function clock() {
       window.clearInterval(timer); timer = undefined;
-      if (running && onScreen && !document.hidden) timer = window.setInterval(frame, 80);
+      if (running && onScreen && !document.hidden) timer = window.setInterval(frame, FRAME_MS);
     }
     function reset() { params = readParams(); sim = newSim(params); enable(); setRunning(false); draw(); }
     function finish() { runToEnd(sim, params); setRunning(false); draw(); }
@@ -238,7 +243,7 @@ import PlaygroundShell from '../components/PlaygroundShell.astro';
       if (reduce) { finish(); return; }
       setRunning(!running);
     });
-    q('[data-step]').addEventListener('click', () => { setRunning(false); for (let i = 0; i < 60 && !sim.done; i++) stepSim(sim, params); draw(); });
+    q('[data-step]').addEventListener('click', () => { setRunning(false); for (let i = 0; i < STEP_TICKS && !sim.done; i++) stepSim(sim, params); draw(); });
     q('[data-finish]').addEventListener('click', () => { if (sim.done) reset(); finish(); });
     q('[data-reset]').addEventListener('click', reset);
     ['[data-method]', '[data-batch]', '[data-lag]', '[data-late]'].forEach((s) => q(s).addEventListener('change', reset));

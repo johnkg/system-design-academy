@@ -56,8 +56,10 @@ import PlaygroundShell from '../components/PlaygroundShell.astro';
     keepsLease: boolean; failover: number;
   };
   const PAUSE_AT = 3;
+  const RENEW_DIVISOR = 3; // the holder renews every third of the lease length
+  const MAX_PAUSE_SEARCH = 60; // longest pause, in seconds, the safe-pause search tries
   function simulate(o: Opts): Result {
-    const L = o.len; const R = Math.max(1, Math.floor(L / 3));
+    const L = o.len; const R = Math.max(1, Math.floor(L / RENEW_DIVISOR));
     let renewals = 0; let last = 0;
     if (o.renew) for (let t = R; t < PAUSE_AT; t += R) { last = t; renewals++; }
     const expA = last + L; const wake = PAUSE_AT + o.pause;
@@ -109,7 +111,7 @@ import PlaygroundShell from '../components/PlaygroundShell.astro';
   }
   function bestPause(o: Opts): number {
     let best = -1;
-    for (let p = 0; p <= 60; p++) { if (simulate({ ...o, pause: p }).kind === 'corrupt') break; best = p; }
+    for (let p = 0; p <= MAX_PAUSE_SEARCH; p++) { if (simulate({ ...o, pause: p }).kind === 'corrupt') break; best = p; }
     return best;
   }
   // --- end model ---
@@ -119,12 +121,17 @@ import PlaygroundShell from '../components/PlaygroundShell.astro';
     const on = (s: string) => q<HTMLInputElement>(s).checked;
     const SVGNS = 'http://www.w3.org/2000/svg';
     const COLS = 28; const ROWS = 21; const CW = 11; const CH = 7; const X0 = 32; const Y0 = 6; // cell grid: lease 3..30, pause 0..40 step 2
+    const LEASE_MIN = 3; const LEASE_MAX = 30; const PAUSE_MAX = 40; const PAUSE_STEP = 2; // chart ranges, seconds
+    const AXIS_TICKS = 6; const LOG_SLOTS = 12; // timeline labels, event log rows
+    const EDGE_PCT = 12; // markers this close to either end of the timeline align inward
+    const MIN_TIMELINE_S = 20; const TIMELINE_PAD_S = 3; const S_PER_MIN = 60;
+    const SHOW_ALL = 1e9; // "events shown" value meaning every event
     const cells: SVGRectElement[] = [];
     const chart = q<SVGSVGElement>('[data-chart]');
     const mk = (n: string, a: Record<string, string>, txt?: string) => { const e = document.createElementNS(SVGNS, n); for (const k in a) e.setAttribute(k, a[k]); if (txt) e.textContent = txt; chart.appendChild(e); return e; };
     for (let r = 0; r < ROWS; r++) for (let c = 0; c < COLS; c++) cells.push(mk('rect', { x: String(X0 + c * CW), y: String(Y0 + (ROWS - 1 - r) * CH), width: String(CW - 1), height: String(CH - 1), rx: '1' }) as SVGRectElement);
-    for (const l of [3, 10, 20, 30]) mk('text', { x: String(X0 + (l - 3) * CW + CW / 2), y: String(Y0 + ROWS * CH + 11), 'text-anchor': 'middle', class: 'lf-tx' }, String(l));
-    for (const p of [0, 10, 20, 30, 40]) mk('text', { x: String(X0 - 5), y: String(Y0 + (ROWS - 1 - p / 2) * CH + 6), 'text-anchor': 'end', class: 'lf-tx' }, String(p));
+    for (const l of [3, 10, 20, 30]) mk('text', { x: String(X0 + (l - LEASE_MIN) * CW + CW / 2), y: String(Y0 + ROWS * CH + 11), 'text-anchor': 'middle', class: 'lf-tx' }, String(l));
+    for (const p of [0, 10, 20, 30, 40]) mk('text', { x: String(X0 - 5), y: String(Y0 + (ROWS - 1 - p / PAUSE_STEP) * CH + 6), 'text-anchor': 'end', class: 'lf-tx' }, String(p));
     mk('text', { x: String(X0 + (COLS * CW) / 2), y: String(Y0 + ROWS * CH + 24), 'text-anchor': 'middle', class: 'lf-tx' }, 'lease length (s)');
     mk('text', { x: '8', y: String(Y0 + 40), 'text-anchor': 'middle', class: 'lf-tx', transform: `rotate(-90 8 ${Y0 + 40})` }, 'pause (s)');
     const dot = mk('circle', { r: '4.5', class: 'lf-dot' });
@@ -132,9 +139,9 @@ import PlaygroundShell from '../components/PlaygroundShell.astro';
     const store = q<HTMLElement>('[data-store]'); const markers: Record<string, HTMLElement> = {};
     for (const id of ['A1', 'B1', 'A2']) { const m = document.createElement('span'); m.className = 'lf-mark'; m.hidden = true; store.appendChild(m); markers[id] = m; }
     const axis = q<HTMLElement>('[data-axis]'); const ticks: HTMLElement[] = [];
-    for (let i = 0; i < 6; i++) { const s = document.createElement('span'); axis.appendChild(s); ticks.push(s); }
+    for (let i = 0; i < AXIS_TICKS; i++) { const s = document.createElement('span'); axis.appendChild(s); ticks.push(s); }
     const logEl = q<HTMLElement>('[data-log]'); const items: HTMLElement[] = [];
-    for (let i = 0; i < 12; i++) { const li = document.createElement('li'); li.hidden = true; logEl.appendChild(li); items.push(li); }
+    for (let i = 0; i < LOG_SLOTS; i++) { const li = document.createElement('li'); li.hidden = true; logEl.appendChild(li); items.push(li); }
 
     let res: Result; let shown = 0; let queued = false;
     const opts = (): Opts => ({ len: num('[data-len]'), pause: num('[data-pause]'), renew: on('[data-renew]'), issue: on('[data-issue]'), check: on('[data-issue]') && on('[data-check]'), recheck: on('[data-recheck]'), where: q<HTMLSelectElement>('[data-where]').value });
@@ -157,7 +164,7 @@ import PlaygroundShell from '../components/PlaygroundShell.astro';
       const chk = q<HTMLInputElement>('[data-check]'); chk.disabled = !o.issue; if (!o.issue) chk.checked = false;
       q<HTMLSelectElement>('[data-where]').disabled = !o.recheck;
       const total = r.events.length; if (shown > total) shown = total;
-      const T = Math.max(20, r.wake, r.grantB ?? 0, r.expA) + 3;
+      const T = Math.max(MIN_TIMELINE_S, r.wake, r.grantB ?? 0, r.expA) + TIMELINE_PAD_S;
       const tNow = shown >= total ? T : shown === 0 ? 0 : r.events[shown - 1].t;
       seg('svcA', 0, r.keepsLease ? T : r.expA, T, tNow); seg('svcB', r.grantB ?? 0, r.grantB === null ? 0 : T, T, tNow);
       seg('pause', PAUSE_AT, r.wake, T, tNow); seg('belA', 0, r.endA === Infinity ? T : r.endA, T, tNow);
@@ -167,12 +174,12 @@ import PlaygroundShell from '../components/PlaygroundShell.astro';
       const put = (id: string, t: number, lane: number, state: 'ok' | 'rejected' | 'stale', visible: boolean) => {
         const m = markers[id]; m.hidden = !visible || t > tNow; if (m.hidden) return;
         const pct = (t / T) * 100; m.style.left = `${pct}%`; m.style.top = lane === 0 ? '2px' : '24px';
-        m.style.transform = pct < 12 ? 'none' : pct > 88 ? 'translateX(-100%)' : 'translateX(-50%)';
+        m.style.transform = pct < EDGE_PCT ? 'none' : pct > 100 - EDGE_PCT ? 'translateX(-100%)' : 'translateX(-50%)';
         m.textContent = `${id} ${state === 'ok' ? 'ok' : state === 'rejected' ? 'rejected' : 'STALE'}`; m.className = `lf-mark lf-${state}`;
       };
       put('A1', 1, 0, 'ok', true); put('B1', r.grantB ?? 0, 1, 'ok', r.grantB !== null);
       put('A2', r.wake, 0, r.aWrite === 'rejected' ? 'rejected' : r.aWrite === 'stale' ? 'stale' : 'ok', r.aWrite !== 'none');
-      ticks.forEach((s, i) => { const t = Math.round((T * i) / 5); s.textContent = `t=${t}`; s.style.left = `${(t / T) * 100}%`; });
+      ticks.forEach((s, i) => { const t = Math.round((T * i) / (AXIS_TICKS - 1)); s.textContent = `t=${t}`; s.style.left = `${(t / T) * 100}%`; });
       items.forEach((li, i) => {
         const e = r.events[i]; li.hidden = !e || i >= shown && shown < total; if (!e) return;
         li.textContent = `t=${e.t}: ${e.text}`; li.className = e.kind === 'bad' ? 'lf-bad' : '';
@@ -181,22 +188,22 @@ import PlaygroundShell from '../components/PlaygroundShell.astro';
       q<HTMLElement>('[data-act="step"]').setAttribute('aria-disabled', String(shown >= total));
       const v = shown >= total ? verdictText(r, o) : ['(step to the end)', 'var(--border)', 'The verdict appears after the last event.'];
       q('[data-verdict]').textContent = v[0]; q('[data-why]').textContent = v[2]; q<HTMLElement>('[data-verdictbox]').style.setProperty('--c', v[1]);
-      q('[data-costs]').textContent = `failover wait ${r.failover} s · ${r.renewals} renewals before the pause · one every ${r.interval} s (${Math.floor(60 / r.interval)}/min)`;
+      q('[data-costs]').textContent = `failover wait ${r.failover} s · ${r.renewals} renewals before the pause · one every ${r.interval} s (${Math.floor(S_PER_MIN / r.interval)}/min)`;
       // chart
-      for (let p = 0; p <= 40; p += 2) for (let l = 3; l <= 30; l++) { const k = simulate({ ...o, len: l, pause: p }).kind; cells[(p / 2) * COLS + (l - 3)].setAttribute('class', k === 'corrupt' ? 'lf-cb' : k === 'cutoff' ? 'lf-cc' : 'lf-cs'); }
-      dot.setAttribute('cx', String(X0 + (o.len - 3) * CW + CW / 2 - 0.5)); dot.setAttribute('cy', String(Y0 + (ROWS - 1 - o.pause / 2) * CH + CH / 2 - 0.5));
+      for (let p = 0; p <= PAUSE_MAX; p += PAUSE_STEP) for (let l = LEASE_MIN; l <= LEASE_MAX; l++) { const k = simulate({ ...o, len: l, pause: p }).kind; cells[(p / PAUSE_STEP) * COLS + (l - LEASE_MIN)].setAttribute('class', k === 'corrupt' ? 'lf-cb' : k === 'cutoff' ? 'lf-cc' : 'lf-cs'); }
+      dot.setAttribute('cx', String(X0 + (o.len - LEASE_MIN) * CW + CW / 2 - 0.5)); dot.setAttribute('cy', String(Y0 + (ROWS - 1 - o.pause / PAUSE_STEP) * CH + CH / 2 - 0.5));
       const best = bestPause(o);
-      const note = best >= 60 ? `At a lease length of ${o.len} s no pause up to 60 s corrupts the file.` : best < 0 ? `At a lease length of ${o.len} s even a zero pause corrupts the file.` : `At a lease length of ${o.len} s the file survives pauses up to ${best} s; a pause of ${best + 1} s corrupts it.`;
+      const note = best >= MAX_PAUSE_SEARCH ? `At a lease length of ${o.len} s no pause up to ${MAX_PAUSE_SEARCH} s corrupts the file.` : best < 0 ? `At a lease length of ${o.len} s even a zero pause corrupts the file.` : `At a lease length of ${o.len} s the file survives pauses up to ${best} s; a pause of ${best + 1} s corrupts it.`;
       q('[data-chartnote]').textContent = note;
       chart.setAttribute('aria-label', `Safe region chart, lease length 3 to 30 seconds against pause 0 to 40 seconds. ${note}`);
     }
     function schedule() { if (!queued) { queued = true; requestAnimationFrame(draw); } }
-    root.querySelectorAll('input, select').forEach((el) => el.addEventListener('input', () => { shown = 1e9; schedule(); }));
-    q('[data-where]').addEventListener('change', () => { shown = 1e9; schedule(); });
+    root.querySelectorAll('input, select').forEach((el) => el.addEventListener('input', () => { shown = SHOW_ALL; schedule(); }));
+    q('[data-where]').addEventListener('change', () => { shown = SHOW_ALL; schedule(); });
     q('[data-act="reset"]').addEventListener('click', () => { shown = 0; schedule(); });
     q('[data-act="step"]').addEventListener('click', () => { if (shown < res.events.length) { shown++; schedule(); } });
-    q('[data-act="run"]').addEventListener('click', () => { shown = 1e9; schedule(); });
-    shown = 1e9; draw();
+    q('[data-act="run"]').addEventListener('click', () => { shown = SHOW_ALL; schedule(); });
+    shown = SHOW_ALL; draw();
   });
 </script>
 <style is:global>

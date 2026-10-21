@@ -35,16 +35,21 @@ import PlaygroundShell from '../../components/PlaygroundShell.astro';
   document.querySelectorAll<HTMLElement>('[data-gdb]').forEach((root) => {
     const q = <T extends HTMLElement>(s: string) => root.querySelector<T>(s)!;
     const N = 1200; const COMMUNITIES = 8; const PER = N / COMMUNITIES; const START = 53; const CAP = 100; const BUDGET = 20;
-    let seed = 11; const rnd = (n: number) => { seed = (seed * 1664525 + 1013904223) % 4294967296; return Math.floor(seed / 65536) % n; };
+    const SEED = 11; const LOCAL_LINKS = 5; // friendships drawn inside a person's own community, plus one random
+    const SAMPLE_SIZE = 50; // edges read from a sampled supernode
+    const MS_PER_EDGE = 0.005; const ROUND_MS = 1; // cost model: edge reads on the busiest shard, network rounds
+    const HOT_PCT = 60; // share of reads on one shard that marks it hot
+    // LCG, upper bits
+    let seed = SEED; const rnd = (n: number) => { seed = (seed * 1664525 + 1013904223) % 4294967296; return Math.floor(seed / 65536) % n; };
     const adj: number[][] = Array.from({ length: N }, () => []);
     const comm = (i: number) => i % COMMUNITIES;
     const link = (a: number, b: number) => { if (a !== b && !adj[a].includes(b)) { adj[a].push(b); adj[b].push(a); } };
     for (let i = 1; i < N; i++) {
-      for (let j = 0; j < 5; j++) { const t = rnd(PER) * COMMUNITIES + comm(i); if (t > 0) link(i, t); }
+      for (let j = 0; j < LOCAL_LINKS; j++) { const t = rnd(PER) * COMMUNITIES + comm(i); if (t > 0) link(i, t); }
       link(i, 1 + rnd(N - 1));
     }
     for (let i = 1; i < N; i++) link(0, i); // node 0 is the celebrity
-    const mix = (id: number) => { let h = Math.imul(id, 2654435761) >>> 0; h ^= h >>> 15; h = Math.imul(h, 2246822519) >>> 0; h ^= h >>> 13; return h >>> 0; };
+    const mix = (id: number) => /* integer hash finalizer */ { let h = Math.imul(id, 2654435761) >>> 0; h ^= h >>> 15; h = Math.imul(h, 2246822519) >>> 0; h ^= h >>> 13; return h >>> 0; };
     const shardOf = (id: number, s: number, how: string) => (how === 'cluster' ? comm(id) % s : mix(id) % s);
     function run(s: number, how: string, sup: string, hops: number) {
       const seen = new Set<number>([START]); let frontier = [START]; let reads = 0; let remote = 0; let rounds = 0; const load = new Array(s).fill(0);
@@ -52,7 +57,7 @@ import PlaygroundShell from '../../components/PlaygroundShell.astro';
         const next: number[] = []; let anyRemote = false;
         for (const u of frontier) {
           let list = adj[u];
-          if (list.length > CAP) { if (sup === 'skip') continue; if (sup === 'sample') list = list.filter((_, i) => i % Math.floor(list.length / 50) === 0).slice(0, 50); }
+          if (list.length > CAP) { if (sup === 'skip') continue; if (sup === 'sample') list = list.filter((_, i) => i % Math.floor(list.length / SAMPLE_SIZE) === 0).slice(0, SAMPLE_SIZE); }
           load[shardOf(u, s, how)] += list.length;
           for (const v of list) { reads++; if (shardOf(u, s, how) !== shardOf(v, s, how)) { remote++; anyRemote = true; } if (!seen.has(v)) { seen.add(v); next.push(v); } }
         }
@@ -60,7 +65,7 @@ import PlaygroundShell from '../../components/PlaygroundShell.astro';
         frontier = next;
       }
       const max = Math.max(...load);
-      return { reads, reached: seen.size, remote, rounds, max, ms: max * 0.005 + rounds };
+      return { reads, reached: seen.size, remote, rounds, max, ms: max * MS_PER_EDGE + rounds * ROUND_MS };
     }
     const fmt = (n: number) => n.toLocaleString('en-US');
     const pct = (a: number, b: number) => (b === 0 ? 0 : Math.round((100 * a) / b));
@@ -74,12 +79,12 @@ import PlaygroundShell from '../../components/PlaygroundShell.astro';
       q('[data-o4]').textContent = `${r.ms.toFixed(1)} ms`; q('[data-n4]').textContent = `budget ${BUDGET} ms`;
       q<HTMLElement>('[data-b1]').style.setProperty('--c', 'var(--accent)');
       q<HTMLElement>('[data-b2]').style.setProperty('--c', 'var(--accent)');
-      q<HTMLElement>('[data-b3]').style.setProperty('--c', pct(r.max, r.reads) > 60 && s > 1 ? 'var(--bad)' : 'var(--accent)');
+      q<HTMLElement>('[data-b3]').style.setProperty('--c', pct(r.max, r.reads) > HOT_PCT && s > 1 ? 'var(--bad)' : 'var(--accent)');
       q<HTMLElement>('[data-b4]').style.setProperty('--c', slow ? 'var(--bad)' : 'var(--good)');
       const out = q('[data-verdict]'); out.classList.toggle('bad', slow);
       const incomplete = r.reached < full.reached;
-      const hot = s > 1 && pct(r.max, r.reads) > 60;
-      if (slow) out.textContent = sup === 'all' ? `Too slow: ${r.ms.toFixed(1)} ms against a budget of ${BUDGET} ms. Opening the celebrity's list adds its 1,199 edges to every hop that reaches it, so the walk reads ${fmt(r.reads)} edges. Skipping or sampling the supernode cuts this to ${fmt(run(s, how, 'skip', h).reads)} or ${fmt(run(s, how, 'sample', h).reads)}.` : `Still too slow at ${r.ms.toFixed(1)} ms: even without the supernode, ${h} hops read ${fmt(r.reads)} edges because the number of paths multiplies at each hop. Lower the depth or add shards.`;
+      const hot = s > 1 && pct(r.max, r.reads) > HOT_PCT;
+      if (slow) out.textContent = sup === 'all' ? `Too slow: ${r.ms.toFixed(1)} ms against a budget of ${BUDGET} ms. Opening the celebrity's list adds its ${fmt(N - 1)} edges to every hop that reaches it, so the walk reads ${fmt(r.reads)} edges. Skipping or sampling the supernode cuts this to ${fmt(run(s, how, 'skip', h).reads)} or ${fmt(run(s, how, 'sample', h).reads)}.` : `Still too slow at ${r.ms.toFixed(1)} ms: even without the supernode, ${h} hops read ${fmt(r.reads)} edges because the number of paths multiplies at each hop. Lower the depth or add shards.`;
       else out.textContent = `Within the budget at ${r.ms.toFixed(1)} ms with ${fmt(r.reads)} edges read.` + (incomplete ? ` The answer is incomplete: ${fmt(r.reached)} people are reached instead of ${fmt(full.reached)}, because the people who are only connected through the supernode are missed.` : ' Nothing was left out.') + (hot ? ` One shard does ${pct(r.max, r.reads)}% of the reading, because by community keeps the whole community of the starting person on it, so it would become a hot spot under real traffic.` : '');
     }
     root.addEventListener('input', draw); root.addEventListener('change', draw);
