@@ -2,11 +2,14 @@
 // every waiting player has a search window around their rating that widens each second, and two players match
 // when their rating gap fits inside both windows. We compare a fixed window with a widening one.
 
-let seed = 7;
+const SEED = 7, MIN_RATING = 400, DIE_SIDES = 600; // a rating is 400 plus three draws of 0..599
+const PLAYERS = 600, DRAIN_SECONDS = 120; // one player joins per second, then the queue drains
+let seed = SEED;
+// Linear congruential generator (Numerical Recipes constants), high 16 bits.
 const random = (n) => { seed = (seed * 1664525 + 1013904223) % 4294967296; return Math.floor(seed / 65536) % n; };
 
 // Ratings come from the sum of three dice, so most players are near the middle and a few are far out.
-const makeRatings = (count) => Array.from({ length: count }, () => 400 + random(600) + random(600) + random(600));
+const makeRatings = (count) => Array.from({ length: count }, () => MIN_RATING + random(DIE_SIDES) + random(DIE_SIDES) + random(DIE_SIDES));
 
 // The window is the base plus a step for each second waited, up to a cap. A step of 0 gives a fixed window.
 const windowOf = (policy, waited) => Math.min(policy.cap, policy.base + policy.step * waited);
@@ -42,12 +45,12 @@ function simulate(policy, ratings, arrivalSeconds, drainSeconds) {
 // How wide the widening window is after a few waits, so the reader can see the schedule.
 const schedule = (policy) => [0, 5, 20, 40].map((w) => `${w}s:${windowOf(policy, w)}`).join(' ');
 
-const ratings = makeRatings(600);
+const ratings = makeRatings(PLAYERS);
 const policies = [
   { name: 'fixed', base: 25, step: 0, cap: 25 },
   { name: 'widening', base: 25, step: 10, cap: 400 },
 ];
-const results = policies.map((p) => ({ p, r: simulate(p, ratings, 600, 120) }));
+const results = policies.map((p) => ({ p, r: simulate(p, ratings, PLAYERS, DRAIN_SECONDS) }));
 for (const { p, r } of results) {
   const avgGap = Math.floor(r.gapSum / r.matched);
   const avgWait = Math.floor(r.waitSum / (2 * r.matched));
@@ -56,5 +59,5 @@ for (const { p, r } of results) {
 console.log(`widening window by wait: ${schedule(policies[1])}`);
 const [fixed, widening] = results.map((x) => x.r);
 console.log(`widening finds ${widening.matched - fixed.matched} more matches and leaves ${fixed.left - widening.left} fewer players waiting`);
-if (2 * widening.matched + widening.left !== 600 || 2 * fixed.matched + fixed.left !== 600) process.exit(1);
+if (2 * widening.matched + widening.left !== PLAYERS || 2 * fixed.matched + fixed.left !== PLAYERS) process.exit(1);
 if (widening.matched <= fixed.matched || fixed.maxWait < widening.maxWait) process.exit(1);

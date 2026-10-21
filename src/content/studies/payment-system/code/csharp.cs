@@ -33,6 +33,7 @@ public class Provider
 
 public class PaymentService
 {
+    const int MaxAttempts = 3; // calls to the provider before the payment is marked unknown
     readonly Provider provider;
     public readonly Dictionary<string, Payment> Payments = new();
     public readonly List<Entry> Ledger = new();
@@ -45,7 +46,7 @@ public class PaymentService
         if (existing != null && existing.State == "succeeded") return existing; // a repeat of a finished request: same answer, no new charge
         var payment = existing ?? new Payment { Id = $"pay_{Payments.Count + 1}", AmountCents = amountCents };
         Payments[key] = payment; // saved BEFORE calling the provider, so a crash leaves a trace
-        for (int attempt = 1; attempt <= 3; attempt++)
+        for (int attempt = 1; attempt <= MaxAttempts; attempt++)
         {
             try
             {
@@ -72,11 +73,12 @@ public static class Program
 {
     public static int Main()
     {
+        const int Requests = 3; // the same request arrives three times
         var provider = new Provider();
         var service = new PaymentService(provider);
 
         // The shopper's browser sends the same request three times (a timeout, then two double-clicks) with one key.
-        var results = Enumerable.Range(1, 3).Select(_ => service.Pay("order-81-attempt-1", 2599)).ToList();
+        var results = Enumerable.Range(1, Requests).Select(_ => service.Pay("order-81-attempt-1", 2599)).ToList();
 
         long debits = service.Ledger.Sum(e => e.Debit);
         long credits = service.Ledger.Sum(e => e.Credit);

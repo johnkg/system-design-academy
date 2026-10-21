@@ -4,6 +4,8 @@ import math
 import sys
 
 CELL = 2  # cell size, in the same units as the coordinates (think of 2 km)
+MAX_RING = 50  # give up after this many rings
+SEED, DRIVERS, MAP_SIZE, MOVE = 42, 2000, 100, 5  # MOVE is enough to cross a cell boundary
 
 
 def cell_of(v):
@@ -33,7 +35,7 @@ class DriverIndex:
 
     # Search ring by ring around the rider's cell. Ring 0 is the rider's own cell, ring 1 the 8 cells around it, and so on.
     # Every cell in ring k is at least (k - 1) * CELL away, so once the best driver found is closer than that, stop.
-    def nearest(self, rider, max_ring=50):
+    def nearest(self, rider, max_ring=MAX_RING):
         cx, cy = cell_of(rider["x"]), cell_of(rider["y"])
         best, best_distance, examined = None, math.inf, 0
         for k in range(max_ring + 1):
@@ -55,20 +57,21 @@ class DriverIndex:
 
 
 # A reproducible set of 2,000 drivers on a 100 x 100 map.
-seed = 42
+seed = SEED
 
 
 def random():
+    """Linear congruential generator (Numerical Recipes constants), scaled to [0, 1)."""
     global seed
     seed = (seed * 1664525 + 1013904223) % 4294967296
     return seed / 4294967296
 
 
 drivers = []
-for i in range(2000):
+for i in range(DRIVERS):
     # x is drawn before y, as in the JavaScript object literal
-    x = random() * 100
-    y = random() * 100
+    x = random() * MAP_SIZE
+    y = random() * MAP_SIZE
     drivers.append({"id": i, "x": x, "y": y})
 
 index = DriverIndex()
@@ -76,7 +79,7 @@ for d in drivers:
     index.update(d)
 
 # A driver moves across a cell boundary: the next update files them under the new cell.
-index.update({"id": 0, "x": drivers[0]["x"] + 5, "y": drivers[0]["y"]})
+index.update({"id": 0, "x": drivers[0]["x"] + MOVE, "y": drivers[0]["y"]})
 
 
 def fmt(v):

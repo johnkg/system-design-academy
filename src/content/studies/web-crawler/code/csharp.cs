@@ -70,13 +70,14 @@ public static class Program
 
         const int Gap = 2; // seconds between requests to one site
         const int Workers = 2; // fetches that can run at the same moment
+        const int MaxSeconds = 60; // stop the crawl after this long
         var frontier = new Frontier(Gap);
         frontier.Add("http://a.com/");
 
         var fetched = new HashSet<string>();
         var lastTime = new Dictionary<string, int>();
         int tooSoon = 0;
-        for (int t = 0; t < 60 && frontier.Pending > 0; t++)
+        for (int t = 0; t < MaxSeconds && frontier.Pending > 0; t++)
         {
             for (int w = 0; w < Workers; w++)
             {

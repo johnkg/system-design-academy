@@ -12,11 +12,16 @@ SERVICES = [
     {'name': 'inbox', 'required': False, 'since': 1, 'timeout': 80, 'base': 15, 'spread': 30},
 ]
 RAW_EXTRA = 300  # bytes each service returns that this screen never shows
+SHOWN_BYTES = 12  # bytes of each service's reply that the screen does show
+HANG_PERCENT, HANG_MS = 3, 2000
+USERS, NEW_VERSION, OLD_VERSION, P95_BUDGET_MS = 20, 3, 2, 150
 
-seed = 7
+SEED = 7
+seed = SEED
 
 
 def rnd(n):
+    """Linear congruential generator (Numerical Recipes constants), high 16 bits."""
     global seed
     seed = (seed * 1664525 + 1013904223) % 4294967296
     return (seed // 65536) % n
@@ -24,7 +29,7 @@ def rnd(n):
 
 def latency(s):
     l = s['base'] + rnd(s['spread'])
-    return 2000 if rnd(100) < 3 else l  # 3% of calls hang
+    return HANG_MS if rnd(100) < HANG_PERCENT else l  # 3% of calls hang
 
 
 # FNV-1a, 32 bits: a cheap stand-in for the hash behind an ETag.
@@ -44,7 +49,7 @@ def handle(user, version):
     for s, ms in calls:
         if ms <= s['timeout']:
             parts.append(f"{s['name']}={(user * 7 + len(s['name'])) % 100}")
-            raw_bytes += RAW_EXTRA + 12
+            raw_bytes += RAW_EXTRA + SHOWN_BYTES
         elif s['required']:
             failed_required = True
         else:
@@ -59,7 +64,7 @@ last = {}
 times, seq = [], []
 ok = partial = errors = not_modified = shaped = wire = raw = 0
 for i in range(N):
-    user, version = i % 20, 3 if i % 2 == 0 else 2
+    user, version = i % USERS, NEW_VERSION if i % 2 == 0 else OLD_VERSION
     r = handle(user, version)
     times.append(r['parallel'])
     seq.append(r['sequential'])
@@ -88,5 +93,5 @@ print(f"requests {N}: {ok} ok ({partial} partial), {errors} failed")
 print(f"parallel mean {mean(times)} ms, p95 {p95} ms; one after another would average {mean(seq)} ms")
 print(f"not modified {not_modified}; bytes: {raw} from the services, {shaped} after shaping, {wire} on the wire")
 print(f"ETag of 'a=1': {etag_of('a=1')}")
-if p95 > 150 or mean(seq) <= mean(times) or shaped >= raw or wire >= shaped or ok + errors != N or not_modified == 0:
+if p95 > P95_BUDGET_MS or mean(seq) <= mean(times) or shaped >= raw or wire >= shaped or ok + errors != N or not_modified == 0:
     sys.exit(1)

@@ -8,14 +8,17 @@ const POOLED = 3, DEDICATED = 3; // shards 0..2 are shared; shard 3 belongs to t
 const dir = new Map();           // the tenant directory: tenant -> shard
 for (const t of names) dir.set(t, t === 'acme' ? DEDICATED : hash(t) % POOLED);
 
-let seed = 7;
+const SEED = 7, BIG_TENANT_ROWS = 40, SMALL_MIN_ROWS = 4, SMALL_ROW_SPREAD = 5; // small tenants have 4..8 rows
+const MIN_AMOUNT = 10, AMOUNT_SPREAD = 990;
+let seed = SEED;
+// Linear congruential generator (Numerical Recipes constants), high 16 bits.
 const rnd = (n) => { seed = (seed * 1664525 + 1013904223) % 4294967296; return Math.floor(seed / 65536) % n; };
 
 let shards = [[], [], [], []];
 let nextId = 1;
 for (const t of names) {
-  const count = t === 'acme' ? 40 : 4 + rnd(5);
-  for (let i = 0; i < count; i++) shards[dir.get(t)].push({ id: nextId++, tenant: t, amount: 10 + rnd(990) });
+  const count = t === 'acme' ? BIG_TENANT_ROWS : SMALL_MIN_ROWS + rnd(SMALL_ROW_SPREAD);
+  for (let i = 0; i < count; i++) shards[dir.get(t)].push({ id: nextId++, tenant: t, amount: MIN_AMOUNT + rnd(AMOUNT_SPREAD) });
 }
 
 // The right query always filters by tenant. The buggy one forgets, and returns the whole shard.

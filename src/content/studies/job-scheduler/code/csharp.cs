@@ -57,7 +57,9 @@ public static class Program
 
     public static int Main()
     {
-        var queue = new JobQueue(30, 3); // 30-second lease, at most 3 attempts
+        const int LeaseSeconds = 30, MaxAttempts = 3;
+        const int EndSeconds = 200, PollEvery = 10; // the workers poll every 10 s for 200 s
+        var queue = new JobQueue(LeaseSeconds, MaxAttempts);
         foreach (var id in new[] { "invoice-1", "invoice-2", "poison" }) queue.Add(id);
 
         // Script of what goes wrong: worker A dies without doing invoice-1, worker B does invoice-2 but dies before the ack.
@@ -67,7 +69,7 @@ public static class Program
             ["invoice-2"] = new[] { "crash after work" },
         };
         var log = new List<string>();
-        for (int now = 0; now <= 200; now += 10)
+        for (int now = 0; now <= EndSeconds; now += PollEvery)
         {
             var job = queue.Receive(now);
             if (job == null) continue;

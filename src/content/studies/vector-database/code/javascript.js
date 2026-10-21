@@ -2,21 +2,25 @@
 // k-means splits the vectors into lists, a query scans only the nearest lists, and we measure recall against an exact scan.
 const DIM = 8, N = 2000, LISTS = 16, K = 10, QUERIES = 50;
 
-let seed = 7;
+const SEED = 7, CLUSTERS = 24, KMEANS_ROUNDS = 5, FILTER_NPROBE = 2;
+const MAX_COMPONENT = 255, NOISE = 60; // components are bytes; a vector sits within +-60 of its cluster centre
+const SALE_EVERY = 10;                 // 10% of vectors carry the filter tag
+let seed = SEED;
+// Linear congruential generator (Numerical Recipes constants), top 24 bits.
 const rand = (n) => { seed = (Math.imul(seed, 1664525) + 1013904223) >>> 0; return (seed >>> 8) % n; };
 
 const dist = (a, b) => { let s = 0; for (let i = 0; i < DIM; i++) s += (a[i] - b[i]) ** 2; return s; }; // squared distance, integers only
-const clamp = (x) => Math.min(255, Math.max(0, x));
-const near = (c) => c.map((x) => clamp(x + rand(121) - 60));
+const clamp = (x) => Math.min(MAX_COMPONENT, Math.max(0, x));
+const near = (c) => c.map((x) => clamp(x + rand(2 * NOISE + 1) - NOISE));
 
-const centers = Array.from({ length: 24 }, () => Array.from({ length: DIM }, () => rand(256)));
-const vectors = Array.from({ length: N }, () => near(centers[rand(24)]));
-const tags = vectors.map((_, id) => (id % 10 === 0 ? 'sale' : 'other')); // 10% of vectors carry the filter tag
+const centers = Array.from({ length: CLUSTERS }, () => Array.from({ length: DIM }, () => rand(MAX_COMPONENT + 1)));
+const vectors = Array.from({ length: N }, () => near(centers[rand(CLUSTERS)]));
+const tags = vectors.map((_, id) => (id % SALE_EVERY === 0 ? 'sale' : 'other')); // 10% of vectors carry the filter tag
 
 // Training: a few rounds of k-means with integer centroids.
 let cents = Array.from({ length: LISTS }, (_, i) => vectors[i * (N / LISTS)].slice());
 const closest = (v, list) => list.reduce((best, c, i) => (dist(v, c) < dist(v, list[best]) ? i : best), 0);
-for (let round = 0; round < 5; round++) {
+for (let round = 0; round < KMEANS_ROUNDS; round++) {
   const sums = cents.map(() => new Array(DIM).fill(0)), counts = new Array(LISTS).fill(0);
   for (const v of vectors) { const c = closest(v, cents); counts[c]++; v.forEach((x, i) => (sums[c][i] += x)); }
   cents = cents.map((old, c) => (counts[c] ? sums[c].map((s) => Math.floor(s / counts[c])) : old));
@@ -50,8 +54,8 @@ if (last !== 100) process.exit(1);
 
 let post = 0, during = 0, duringHits = 0;
 for (const q of queries) {
-  post += search(q, 2).ids.filter(onSale).length;                       // filter after the search: only what is left of the top 10
-  const r = search(q, 2, onSale); during += r.ids.length;               // filter while scanning: the top 10 of the matching vectors
+  post += search(q, FILTER_NPROBE).ids.filter(onSale).length;                       // filter after the search: only what is left of the top 10
+  const r = search(q, FILTER_NPROBE, onSale); during += r.ids.length;               // filter while scanning: the top 10 of the matching vectors
   const truth = exact(q, onSale); duringHits += r.ids.filter((id) => truth.includes(id)).length;
 }
 console.log(`filter 'sale' (10%), nprobe 2: after the search ${hundredths(Math.floor((post * 100) / QUERIES))} results on average, during the scan ${hundredths(Math.floor((during * 100) / QUERIES))}`);

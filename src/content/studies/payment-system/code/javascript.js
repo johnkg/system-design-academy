@@ -1,6 +1,9 @@
 // Charging a card exactly once in JavaScript:
 // an idempotency key makes retries safe, and every successful charge is recorded as two balanced ledger entries.
 
+const MAX_ATTEMPTS = 3; // calls to the provider before the payment is marked unknown
+const REQUESTS = 3;     // the same request arrives three times
+
 class TimeoutError extends Error {}
 
 // A pretend payment provider. Like real ones it remembers the key of each charge, and its reply can be lost after the money moved.
@@ -21,7 +24,7 @@ class PaymentService {
     if (existing && existing.state === 'succeeded') return existing; // a repeat of a finished request: same answer, no new charge
     const payment = existing ?? { id: `pay_${this.payments.size + 1}`, state: 'processing', amountCents };
     this.payments.set(key, payment); // saved BEFORE calling the provider, so a crash leaves a trace
-    for (let attempt = 1; attempt <= 3; attempt++) {
+    for (let attempt = 1; attempt <= MAX_ATTEMPTS; attempt++) {
       try {
         const charge = this.provider.charge(key, amountCents); // the same key on every attempt
         payment.state = 'succeeded'; payment.chargeId = charge.id;
@@ -45,7 +48,7 @@ const provider = new Provider();
 const service = new PaymentService(provider);
 
 // The shopper's browser sends the same request three times (a timeout, then two double-clicks) with one key.
-const results = [1, 2, 3].map(() => service.pay({ key: 'order-81-attempt-1', amountCents: 2599 }));
+const results = Array.from({ length: REQUESTS }, () => service.pay({ key: 'order-81-attempt-1', amountCents: 2599 }));
 
 const debits = service.ledger.reduce((s, e) => s + e.debit, 0);
 const credits = service.ledger.reduce((s, e) => s + e.credit, 0);

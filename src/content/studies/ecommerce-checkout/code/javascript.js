@@ -3,7 +3,14 @@
 // failures are undone in reverse order, and every status change is also written to an outbox.
 
 const STOCK = 30, TTL = 3, BUYERS = 80, PER_TICK = 10;
-let seed = 11;
+const SEED = 11, TICKS = 12;
+const AFTER_ALL_HOLDS = 99; // a time when every hold has expired
+// Buyer behaviour, in percent: who never pays, gets declined, has shipping fail, or double-clicks.
+const NO_PAY_PERCENT = 30, DECLINE_PERCENT = 15, SHIP_FAIL_PERCENT = 10, DOUBLE_CLICK_PERCENT = 20;
+const PAY_DELAYS = 5; // a buyer pays 0..4 ticks after reserving
+const RELAY_CRASH_PERCENT = 10;
+let seed = SEED;
+// Linear congruential generator (Numerical Recipes constants), high 16 bits.
 const random = (n) => { seed = (seed * 1664525 + 1013904223) % 4294967296; return Math.floor(seed / 65536) % n; };
 
 class Inventory {
@@ -26,7 +33,8 @@ class Inventory {
 const buyers = [];
 for (let i = 0; i < BUYERS; i++) {
   const b = { key: `k${i}`, tick: Math.floor(i / PER_TICK) };
-  b.pays = random(100) >= 30; b.declined = random(100) < 15; b.delay = random(5); b.shipFails = random(100) < 10; b.double = random(100) < 20;
+  b.pays = random(100) >= NO_PAY_PERCENT; b.declined = random(100) < DECLINE_PERCENT; b.delay = random(PAY_DELAYS);
+  b.shipFails = random(100) < SHIP_FAIL_PERCENT; b.double = random(100) < DOUBLE_CLICK_PERCENT;
   buyers.push(b);
 }
 
@@ -51,7 +59,7 @@ function pay(order, b, now) { // the saga: reserve (done) -> charge -> ship, and
 }
 
 const waiting = [];
-for (let t = 0; t < 12; t++) {
+for (let t = 0; t < TICKS; t++) {
   inv.expire(t).forEach((id) => setStatus(byId.get(id), 'EXPIRED'));
   for (const b of buyers.filter((x) => x.tick === t)) {
     const order = place(b.key);
@@ -61,12 +69,12 @@ for (let t = 0; t < 12; t++) {
   }
   waiting.filter((w) => w.due === t).forEach((w) => pay(w.order, w.b, t));
 }
-inv.expire(99).forEach((id) => setStatus(byId.get(id), 'EXPIRED')); // the buyers who never paid
+inv.expire(AFTER_ALL_HOLDS).forEach((id) => setStatus(byId.get(id), 'EXPIRED')); // the buyers who never paid
 
 const bus = [];
 while (true) { // the relay: publish unsent rows, and sometimes crash before marking one as sent
   let crashed = false;
-  for (const row of outbox) { if (row.sent) continue; bus.push(row.id); if (random(100) < 10) { crashed = true; break; } row.sent = true; }
+  for (const row of outbox) { if (row.sent) continue; bus.push(row.id); if (random(100) < RELAY_CRASH_PERCENT) { crashed = true; break; } row.sent = true; }
   if (!crashed) break;
 }
 

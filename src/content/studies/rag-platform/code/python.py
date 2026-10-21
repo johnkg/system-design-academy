@@ -5,6 +5,8 @@ import re
 import sys
 
 DIM = 16
+RRF_K, RRF_SCALE = 60, 1000000  # the usual fusion constant; scores kept as whole numbers
+TOP_K, WIDE_K = 3, 5
 
 
 def hash_of(s):
@@ -85,7 +87,7 @@ class Index:
         fused = {}  # reciprocal rank fusion: a chunk near the top of either list scores well
         for ranked in (by_score(keyword), by_score(vector)):
             for r, cid in enumerate(ranked):
-                fused[cid] = fused.get(cid, 0) + 1000000 // (60 + r + 1)
+                fused[cid] = fused.get(cid, 0) + RRF_SCALE // (RRF_K + r + 1)
         return [cid for cid, _ in sorted(fused.items(), key=lambda e: (-e[1], e[0]))[:k]]
 
 
@@ -104,12 +106,12 @@ def show(ids):
 
 
 query = 'salary band approval in the portal'
-as_engineer = index.search(['all', 'eng'], query, 3)
-as_hr = index.search(['all', 'hr'], query, 3)
+as_engineer = index.search(['all', 'eng'], query, TOP_K)
+as_hr = index.search(['all', 'hr'], query, TOP_K)
 print(f"engineer asks: {show(as_engineer)}")
 print(f"hr asks: {show(as_hr)}")
 
-unfiltered = [i for i in index.search(['all', 'eng'], query, 3, False) if not any(g in ['all', 'eng'] for g in index.chunks[i]['acl'])]
+unfiltered = [i for i in index.search(['all', 'eng'], query, TOP_K, False) if not any(g in ['all', 'eng'] for g in index.chunks[i]['acl'])]
 print(f"without the filter, the engineer's top 3 would hold {len(unfiltered)} unreadable chunk(s): {show(unfiltered)}")
 
 calls_before = embed_calls
@@ -121,10 +123,10 @@ source.pop()  # the travel policy is deleted at the source
 index.sync_all(source)
 sync_calls = embed_calls - calls_before
 print(f"after edit, ACL change and delete: {sync_calls} embedding calls, {len(index.chunks)} chunks")
-print(f"engineer asks again: {show(index.search(['all', 'eng'], query, 3))}")
+print(f"engineer asks again: {show(index.search(['all', 'eng'], query, TOP_K))}")
 
 leaked = any(i.startswith('tr1') for i in index.chunks)
-hr_seen = any(i.startswith('hr2') for i in index.search(['all', 'eng'], 'salary band', 5))
+hr_seen = any(i.startswith('hr2') for i in index.search(['all', 'eng'], 'salary band', WIDE_K))
 secret = any(i.startswith('hr2') for i in as_engineer)
 print(f"deleted doc still indexed: {str(leaked).lower()}; hr doc hidden before the ACL change: {str(not secret).lower()}; visible after: {str(hr_seen).lower()}")
 if leaked or secret or not hr_seen or sync_calls != 2 or len(unfiltered) == 0:

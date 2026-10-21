@@ -3,6 +3,9 @@
 import sys
 from dataclasses import dataclass
 
+MAX_ATTEMPTS = 3  # calls to the provider before the payment is marked unknown
+REQUESTS = 3      # the same request arrives three times
+
 
 class PaymentTimeoutError(Exception):
     pass
@@ -49,7 +52,7 @@ class PaymentService:
             return existing  # a repeat of a finished request: same answer, no new charge
         payment = existing or Payment(f"pay_{len(self.payments) + 1}", "processing", amount_cents)
         self.payments[key] = payment  # saved BEFORE calling the provider, so a crash leaves a trace
-        for _ in range(3):
+        for _ in range(MAX_ATTEMPTS):
             try:
                 charge = self.provider.charge(key, amount_cents)  # the same key on every attempt
                 payment.state = "succeeded"
@@ -70,7 +73,7 @@ provider = Provider()
 service = PaymentService(provider)
 
 # The shopper's browser sends the same request three times (a timeout, then two double-clicks) with one key.
-results = [service.pay("order-81-attempt-1", 2599) for _ in range(3)]
+results = [service.pay("order-81-attempt-1", 2599) for _ in range(REQUESTS)]
 
 debits = sum(e["debit"] for e in service.ledger)
 credits = sum(e["credit"] for e in service.ledger)

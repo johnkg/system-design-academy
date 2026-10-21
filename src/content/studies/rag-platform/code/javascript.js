@@ -3,6 +3,8 @@
 // merged with reciprocal rank fusion, and re-synced so that changes and deletes reach the index.
 
 const DIM = 16;
+const RRF_K = 60, RRF_SCALE = 1000000; // the usual fusion constant; scores kept as whole numbers
+const TOP_K = 3, WIDE_K = 5;
 const hash = (s) => { let h = 2166136261; for (const c of s) { h ^= c.charCodeAt(0); h = Math.imul(h, 16777619) >>> 0; } return h >>> 0; };
 const tokens = (text) => text.toLowerCase().split(/[^a-z]+/).filter((w) => w.length > 2);
 
@@ -46,7 +48,7 @@ class Index {
     const vector = allowed.map((c) => ({ c, s: dot(qv, c.vec) }));
     const byScore = (list) => list.filter((e) => e.s > 0).sort((a, b) => b.s - a.s || (a.c.id < b.c.id ? -1 : 1)).map((e) => e.c.id);
     const fused = new Map(); // reciprocal rank fusion: a chunk near the top of either list scores well
-    for (const ranked of [byScore(keyword), byScore(vector)]) ranked.forEach((id, r) => fused.set(id, (fused.get(id) ?? 0) + Math.floor(1000000 / (60 + r + 1))));
+    for (const ranked of [byScore(keyword), byScore(vector)]) ranked.forEach((id, r) => fused.set(id, (fused.get(id) ?? 0) + Math.floor(RRF_SCALE / (RRF_K + r + 1))));
     return [...fused].sort((a, b) => b[1] - a[1] || (a[0] < b[0] ? -1 : 1)).slice(0, k).map(([id]) => id);
   }
 }
@@ -62,11 +64,11 @@ index.syncAll(source);
 const show = (ids) => ids.map((id) => `${id} (${index.chunks.get(id).title})`).join(', ');
 
 const query = 'salary band approval in the portal';
-const asEngineer = index.search(['all', 'eng'], query, 3), asHr = index.search(['all', 'hr'], query, 3);
+const asEngineer = index.search(['all', 'eng'], query, TOP_K), asHr = index.search(['all', 'hr'], query, TOP_K);
 console.log(`engineer asks: ${show(asEngineer)}`);
 console.log(`hr asks: ${show(asHr)}`);
 
-const unfiltered = index.search(['all', 'eng'], query, 3, false).filter((id) => !index.chunks.get(id).acl.some((g) => ['all', 'eng'].includes(g)));
+const unfiltered = index.search(['all', 'eng'], query, TOP_K, false).filter((id) => !index.chunks.get(id).acl.some((g) => ['all', 'eng'].includes(g)));
 console.log(`without the filter, the engineer's top 3 would hold ${unfiltered.length} unreadable chunk(s): ${show(unfiltered)}`);
 
 const callsBefore = embedCalls;
@@ -78,10 +80,10 @@ source.pop(); // the travel policy is deleted at the source
 index.syncAll(source);
 const syncCalls = embedCalls - callsBefore;
 console.log(`after edit, ACL change and delete: ${syncCalls} embedding calls, ${index.chunks.size} chunks`);
-console.log(`engineer asks again: ${show(index.search(['all', 'eng'], query, 3))}`);
+console.log(`engineer asks again: ${show(index.search(['all', 'eng'], query, TOP_K))}`);
 
 const leaked = [...index.chunks.keys()].some((id) => id.startsWith('tr1'));
-const hrSeen = index.search(['all', 'eng'], 'salary band', 5).some((id) => id.startsWith('hr2'));
+const hrSeen = index.search(['all', 'eng'], 'salary band', WIDE_K).some((id) => id.startsWith('hr2'));
 const secret = asEngineer.some((id) => id.startsWith('hr2'));
 console.log(`deleted doc still indexed: ${leaked}; hr doc hidden before the ACL change: ${!secret}; visible after: ${hrSeen}`);
 if (leaked || secret || !hrSeen || syncCalls !== 2 || unfiltered.length === 0) process.exit(1);

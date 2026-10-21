@@ -11,14 +11,16 @@ public record Result(int Matched, long GapSum, long WaitSum, int MaxWait, int Le
 
 public static class Matchmaker
 {
-    static long seed = 7;
+    const int Seed = 7, MinRating = 400, DieSides = 600; // a rating is 400 plus three draws of 0..599
+    static long seed = Seed;
+    // Linear congruential generator (Numerical Recipes constants), high 16 bits.
     static int Random(int n) { seed = (seed * 1664525 + 1013904223) % 4294967296; return (int)((seed / 65536) % n); }
 
     // Ratings come from the sum of three dice, so most players are near the middle and a few are far out.
     public static int[] MakeRatings(int count)
     {
         var r = new int[count];
-        for (int i = 0; i < count; i++) { int a = Random(600), b = Random(600), c = Random(600); r[i] = 400 + a + b + c; }
+        for (int i = 0; i < count; i++) { int a = Random(DieSides), b = Random(DieSides), c = Random(DieSides); r[i] = MinRating + a + b + c; }
         return r;
     }
 
@@ -59,9 +61,10 @@ public static class Matchmaker
 
     public static int Main()
     {
-        var ratings = MakeRatings(600);
+        const int Players = 600, DrainSeconds = 120; // one player joins per second, then the queue drains
+        var ratings = MakeRatings(Players);
         var policies = new[] { new Policy("fixed", 25, 0, 25), new Policy("widening", 25, 10, 400) };
-        var results = policies.Select(p => Simulate(p, ratings, 600, 120)).ToArray();
+        var results = policies.Select(p => Simulate(p, ratings, Players, DrainSeconds)).ToArray();
         for (int i = 0; i < 2; i++)
         {
             var r = results[i];
@@ -70,7 +73,7 @@ public static class Matchmaker
         Console.WriteLine($"widening window by wait: {string.Join(" ", new[] { 0, 5, 20, 40 }.Select(w => $"{w}s:{WindowOf(policies[1], w)}"))}");
         var fixedR = results[0]; var widening = results[1];
         Console.WriteLine($"widening finds {widening.Matched - fixedR.Matched} more matches and leaves {fixedR.Left - widening.Left} fewer players waiting");
-        if (2 * widening.Matched + widening.Left != 600 || 2 * fixedR.Matched + fixedR.Left != 600) return 1;
+        if (2 * widening.Matched + widening.Left != Players || 2 * fixedR.Matched + fixedR.Left != Players) return 1;
         if (widening.Matched <= fixedR.Matched || fixedR.MaxWait < widening.MaxWait) return 1;
         return 0;
     }

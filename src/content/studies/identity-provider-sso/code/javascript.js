@@ -5,6 +5,8 @@
 const fnv = (s) => { let h = 2166136261; for (let i = 0; i < s.length; i++) { h ^= s.charCodeAt(i); h = Math.imul(h, 16777619) >>> 0; } return h; };
 const hex = (n) => n.toString(16).padStart(8, '0');
 const TTL = 600; // token lifetime in seconds
+const ACR_PASSWORD = 1, ACR_MFA = 2; // authentication strength levels
+const NO_MAX_AGE = 1000000, ADMIN_MAX_AGE = 300; // seconds since the last login
 
 class Idp {
   constructor(tenant) {
@@ -20,10 +22,10 @@ class Idp {
   jwks(now) { return new Map(this.keys.filter((k) => k.retired === null || now < k.retired + TTL).map((k) => [k.kid, k.secret])); }
   login(sub, now, mfa) {
     const sid = `${this.tenant}-s${this.next++}`;
-    this.sessions.set(sid, { sub, acr: mfa ? 2 : 1, authTime: now, rps: [] });
+    this.sessions.set(sid, { sub, acr: mfa ? ACR_MFA : ACR_PASSWORD, authTime: now, rps: [] });
     return sid;
   }
-  stepUp(sid, now) { const s = this.sessions.get(sid); s.acr = 2; s.authTime = now; }
+  stepUp(sid, now) { const s = this.sessions.get(sid); s.acr = ACR_MFA; s.authTime = now; }
   issue(sid, aud, now) {
     const s = this.sessions.get(sid); if (!s) return null;
     if (!s.rps.includes(aud)) s.rps.push(aud); // remember which apps to notify at logout
@@ -37,7 +39,7 @@ class Idp {
 class Rp { // a relying party: an application that trusts one IdP
   constructor(aud, idp) { this.aud = aud; this.idp = idp; this.revoked = new Set(); }
   revoke(sid) { this.revoked.add(sid); } // the back-channel logout endpoint
-  check(token, now, minAcr = 1, maxAge = 1000000) {
+  check(token, now, minAcr = ACR_PASSWORD, maxAge = NO_MAX_AGE) {
     const f = token.split('|');
     const secret = this.idp.jwks(now).get(f[0]); // a real RP caches the key set and refetches on an unknown kid
     if (secret === undefined) return 'unknown_kid';
@@ -58,11 +60,11 @@ const mail = new Rp('mail', acme), wiki = new Rp('wiki', acme), rps = { mail, wi
 const sid = acme.login('alice', 0, false);
 
 expect('mail at 100', mail.check(acme.issue(sid, 'mail', 100), 100), 'ok');
-expect('admin page at 150 (needs mfa)', wiki.check(acme.issue(sid, 'wiki', 150), 150, 2, 300), 'step_up_required');
+expect('admin page at 150 (needs mfa)', wiki.check(acme.issue(sid, 'wiki', 150), 150, ACR_MFA, ADMIN_MAX_AGE), 'step_up_required');
 acme.stepUp(sid, 160);
 const admin = acme.issue(sid, 'wiki', 160);
-expect('admin page at 170 after mfa', wiki.check(admin, 170, 2, 300), 'ok');
-expect('admin page at 500 (mfa too old)', wiki.check(admin, 500, 2, 300), 'step_up_required');
+expect('admin page at 170 after mfa', wiki.check(admin, 170, ACR_MFA, ADMIN_MAX_AGE), 'ok');
+expect('admin page at 500 (mfa too old)', wiki.check(admin, 500, ACR_MFA, ADMIN_MAX_AGE), 'step_up_required');
 
 const old = acme.issue(sid, 'mail', 900);
 acme.rotate(1000);

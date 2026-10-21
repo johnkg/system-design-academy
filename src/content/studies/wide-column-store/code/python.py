@@ -2,6 +2,8 @@
 # replication factor 3, quorum reads and writes, hinted handoff, read repair and tombstones.
 from collections import Counter
 RF, NAMES = 3, ["n0", "n1", "n2", "n3", "n4"]
+QUORUM = 2  # a majority of the RF replicas
+VNODES, SPREAD_KEYS = 16, 1000
 
 def fnv1a(s):  # 32-bit FNV-1a, integer maths only
     h = 2166136261
@@ -22,11 +24,11 @@ class Ring:
 
 def spread(vnodes):  # how many of 1000 keys each node is the first replica for
     ring = Ring(vnodes)
-    return list(Counter(ring.replicas(f"k{i}")[0] for i in range(1000)).values())
+    return list(Counter(ring.replicas(f"k{i}")[0] for i in range(SPREAD_KEYS)).values())
 
 class Cluster:
     def __init__(self):
-        self.ring, self.up, self.hints = Ring(16), set(NAMES), []
+        self.ring, self.up, self.hints = Ring(VNODES), set(NAMES), []
         self.data = {n: {} for n in NAMES}
     def apply(self, node, key, cell):  # last write wins
         cur = self.data[node].get(key)
@@ -79,30 +81,30 @@ for w in range(1, RF + 1):
 c, key = Cluster(), "user:42"
 down = c.ring.replicas(key)[2]
 print(f"{key} lives on {', '.join(c.ring.replicas(key))}")
-c.write(key, "v1", 1, 2)
+c.write(key, "v1", 1, QUORUM)
 c.up.discard(down)
-ok = c.write(key, "v2", 2, 2)
-print(f"{down} down: write ok={str(ok).lower()}, hints={len(c.hints)}, read={c.read(key, 2)[0]}")
+ok = c.write(key, "v2", 2, QUORUM)
+print(f"{down} down: write ok={str(ok).lower()}, hints={len(c.hints)}, read={c.read(key, QUORUM)[0]}")
 c.up.add(down)
 print(f"{down} back: replayed {c.replay(down)} hint, it holds {c.data[down][key][1]}")
 c.up.discard(down)
-c.write(key, "v3", 3, 2)
+c.write(key, "v3", 3, QUORUM)
 c.hints = []  # the hint expires before the node returns
 c.up.add(down)
-value, repairs = c.read(key, 2)
+value, repairs = c.read(key, QUORUM)
 print(f"hint lost: read={value}, repairs={repairs}, {down} now holds {c.data[down][key][1]}")
 assert value == "v3" and repairs == 1
 
 def delete_while_down(k, purge):  # the third replica misses the delete
     third = c.ring.replicas(k)[2]
-    c.write(k, "v3", 3, 3)
+    c.write(k, "v3", 3, RF)
     c.up.discard(third)
-    c.write(k, None, 4, 2)
+    c.write(k, None, 4, QUORUM)
     c.hints = []
     if purge:
         c.purge(5)
     c.up.add(third)
-    value, repairs = c.read(k, 3)
+    value, repairs = c.read(k, RF)
     return f"{k} purge={str(purge).lower()}: read={'deleted' if value is None else value}, repairs={repairs}"
 
 kept, zombie = delete_while_down("user:7", False), delete_while_down("user:8", True)

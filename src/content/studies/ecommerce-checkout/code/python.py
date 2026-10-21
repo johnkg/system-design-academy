@@ -4,10 +4,17 @@
 import sys
 
 STOCK, TTL, BUYERS, PER_TICK = 30, 3, 80, 10
-seed = 11
+SEED, TICKS = 11, 12
+AFTER_ALL_HOLDS = 99  # a time when every hold has expired
+# Buyer behaviour, in percent: who never pays, gets declined, has shipping fail, or double-clicks.
+NO_PAY_PERCENT, DECLINE_PERCENT, SHIP_FAIL_PERCENT, DOUBLE_CLICK_PERCENT = 30, 15, 10, 20
+PAY_DELAYS = 5  # a buyer pays 0..4 ticks after reserving
+RELAY_CRASH_PERCENT = 10
+seed = SEED
 
 
 def random(n):
+    """Linear congruential generator (Numerical Recipes constants), high 16 bits."""
     global seed
     seed = (seed * 1664525 + 1013904223) % 4294967296
     return (seed // 65536) % n
@@ -48,11 +55,11 @@ class Inventory:
 buyers = []
 for i in range(BUYERS):
     b = {"key": f"k{i}", "tick": i // PER_TICK}
-    b["pays"] = random(100) >= 30
-    b["declined"] = random(100) < 15
-    b["delay"] = random(5)
-    b["ship_fails"] = random(100) < 10
-    b["double"] = random(100) < 20
+    b["pays"] = random(100) >= NO_PAY_PERCENT
+    b["declined"] = random(100) < DECLINE_PERCENT
+    b["delay"] = random(PAY_DELAYS)
+    b["ship_fails"] = random(100) < SHIP_FAIL_PERCENT
+    b["double"] = random(100) < DOUBLE_CLICK_PERCENT
     buyers.append(b)
 
 inv = Inventory(STOCK)
@@ -96,7 +103,7 @@ def pay(order, b, now):  # the saga: reserve (done) -> charge -> ship, and undo 
 
 
 waiting = []
-for t in range(12):
+for t in range(TICKS):
     for id in inv.expire(t):
         set_status(by_id[id], "EXPIRED")
     for b in [x for x in buyers if x["tick"] == t]:
@@ -109,7 +116,7 @@ for t in range(12):
             waiting.append({"order": order, "b": b, "due": t + b["delay"]})
     for w in [w for w in waiting if w["due"] == t]:
         pay(w["order"], w["b"], t)
-for id in inv.expire(99):  # the buyers who never paid
+for id in inv.expire(AFTER_ALL_HOLDS):  # the buyers who never paid
     set_status(by_id[id], "EXPIRED")
 
 bus = []
@@ -119,7 +126,7 @@ while True:  # the relay: publish unsent rows, and sometimes crash before markin
         if row["sent"]:
             continue
         bus.append(row["id"])
-        if random(100) < 10:
+        if random(100) < RELAY_CRASH_PERCENT:
             crashed = True
             break
         row["sent"] = True

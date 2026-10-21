@@ -8,14 +8,18 @@ int[] relevance = { 1, 0, 1, 3, 2, 0, 3, 1 };          // judged grade of each p
 int[] examine = { 100, 60, 40, 30, 20, 15, 10, 8 };     // percent of shoppers who even look at each position
 int[] clickIfSeen = { 2, 10, 30, 60 };                  // percent who click a product they looked at, by its grade
 
-uint seed = 7;
+int positions = relevance.Length;
+const uint Seed = 7;
+const double MinNdcg = 0.95; // the debiased order must come this close to the ideal one
+uint seed = Seed;
+// Linear congruential generator (Numerical Recipes constants), high 16 bits.
 int Random(int n) { seed = unchecked(seed * 1664525u + 1013904223u); return (int)((seed >> 16) % (uint)n); }
 
 // Log 40,000 searches. Every search shows the products in the old order, so product i is always at position i.
 const int searches = 40000;
-var clicks = new int[8];
+var clicks = new int[positions];
 for (int s = 0; s < searches; s++)
-    for (int pos = 0; pos < 8; pos++)
+    for (int pos = 0; pos < positions; pos++)
     {
         bool looked = Random(100) < examine[pos];
         if (looked && Random(100) < clickIfSeen[relevance[pos]]) clicks[pos]++;
@@ -45,4 +49,4 @@ Console.WriteLine($"debiased    {Join(ipsOrder)}  NDCG {F3(Ndcg(ipsOrder))}");
 Console.WriteLine($"ideal       {Join(bestOrder)}  NDCG {F3(Ndcg(bestOrder))}");
 
 // The raw click rate puts a middling product on top just because it sat high; the debiased score finds both grade-3 products.
-if (Ndcg(ipsOrder) <= Ndcg(naiveOrder) || ipsOrder[0] == 0 || Ndcg(ipsOrder) < 0.95) Environment.Exit(1);
+if (Ndcg(ipsOrder) <= Ndcg(naiveOrder) || ipsOrder[0] == 0 || Ndcg(ipsOrder) < MinNdcg) Environment.Exit(1);

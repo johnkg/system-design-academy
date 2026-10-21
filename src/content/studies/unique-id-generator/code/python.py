@@ -5,6 +5,9 @@ import sys
 EPOCH = 1735689600000  # 1 January 2025, so the 41 time bits last about 69 years from there
 MACHINE_BITS, SEQUENCE_BITS = 10, 12
 MAX_SEQUENCE = (1 << SEQUENCE_BITS) - 1  # 4095
+MAX_MACHINE = (1 << MACHINE_BITS) - 1    # 1023
+START_OFFSET, CLOCK_BACK_MS = 1000, 5    # the demo clock starts 1 s after the epoch
+BURST = 4097                             # one more ID than fits in a millisecond
 
 
 class IdGenerator:
@@ -34,11 +37,11 @@ class IdGenerator:
 
 
 def decode(id):
-    return {"ms": id >> (MACHINE_BITS + SEQUENCE_BITS), "machine": (id >> SEQUENCE_BITS) & 1023, "sequence": id & MAX_SEQUENCE}
+    return {"ms": id >> (MACHINE_BITS + SEQUENCE_BITS), "machine": (id >> SEQUENCE_BITS) & MAX_MACHINE, "sequence": id & MAX_SEQUENCE}
 
 
 # A clock we control, so the run is the same every time.
-time = EPOCH + 1000
+time = EPOCH + START_OFFSET
 
 
 def clock():
@@ -59,13 +62,13 @@ for id in ids:
 
 seen = set(ids)
 time += 1
-for _ in range(4097):
+for _ in range(BURST):
     seen.add(a.next())  # more than 4096 in one millisecond
-spill = decode(a.next())["ms"] - 1001  # how many milliseconds after the busy one the generator is now
+spill = decode(a.next())["ms"] - (START_OFFSET + 1)  # how many milliseconds after the busy one the generator is now
 print(f"{len(seen)} distinct IDs from two machines; the 4,097th ID of one millisecond was issued {spill} ms later, after waiting")
 
 refused = False
-time -= 5  # the clock is set back by 5 ms
+time -= CLOCK_BACK_MS  # the clock is set back by 5 ms
 try:
     a.next()
 except RuntimeError as e:
@@ -73,5 +76,5 @@ except RuntimeError as e:
     print(f"clock set back: {e}")
 
 increasing = ids[0] < ids[1] and ids[2] < ids[3]
-if not increasing or len(seen) != 4 + 4097 or spill != 1 or not refused:
+if not increasing or len(seen) != len(ids) + BURST or spill != 1 or not refused:
     sys.exit(1)

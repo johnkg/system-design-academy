@@ -2,19 +2,22 @@
 // checkpoints, and recovery by restoring state and replaying the log. Integers only, so it is deterministic.
 const WINDOW = 10, DELAY = 4, EVERY = 50; // window length, watermark lag behind the newest event time, checkpoint interval (events)
 
-let seed = 7;
+const KEY_SLOTS = 10; // a state id is window start * 10 + key, so keys must stay below 10
+const SEED = 7, EVENTS = 2000, KEYS = 5, EVENTS_PER_TICK = 4, MAX_LATENESS = 8, MAX_VALUE = 9;
+let seed = SEED;
+// Linear congruential generator (Numerical Recipes constants), high 16 bits.
 const rnd = (n) => { seed = (seed * 1664525 + 1013904223) % 4294967296; return Math.floor(seed / 65536) % n; };
-const events = Array.from({ length: 2000 }, (_, i) => ({ key: rnd(5), time: Math.max(0, (i >> 2) - rnd(8)), value: 1 + rnd(9) })); // arrive out of order
+const events = Array.from({ length: EVENTS }, (_, i) => ({ key: rnd(KEYS), time: Math.max(0, Math.floor(i / EVENTS_PER_TICK) - rnd(MAX_LATENESS)), value: 1 + rnd(MAX_VALUE) })); // arrive out of order
 
 class Job {
   constructor() { this.offset = 0; this.maxTime = -1; this.windows = new Map(); this.out = []; this.late = 0; this.lateSum = 0; }
   fire(limit) { // emit every window that ends at or before the watermark, oldest first
-    const ready = [...this.windows.keys()].filter((id) => Math.floor(id / 10) + WINDOW <= limit).sort((a, b) => a - b);
+    const ready = [...this.windows.keys()].filter((id) => Math.floor(id / KEY_SLOTS) + WINDOW <= limit).sort((a, b) => a - b);
     for (const id of ready) { this.out.push([id, this.windows.get(id)]); this.windows.delete(id); }
   }
   step() {
     const e = this.events[this.offset++];
-    const start = e.time - (e.time % WINDOW), id = start * 10 + e.key; // the state is keyed by (key, window)
+    const start = e.time - (e.time % WINDOW), id = start * KEY_SLOTS + e.key; // the state is keyed by (key, window)
     this.maxTime = Math.max(this.maxTime, e.time);
     const watermark = this.maxTime - DELAY;
     if (start + WINDOW <= watermark) { this.late++; this.lateSum += e.value; } // its window has already fired
@@ -52,6 +55,6 @@ const same = JSON.stringify(exact.job.out) === JSON.stringify(ref.out);
 console.log(`4 crashes, transactional sink: replayed ${exact.replayed} events, identical output: ${same}`);
 const naive = run(crashes, false).job;
 console.log(`4 crashes, plain sink: ${naive.out.length} rows, ${naive.out.length - ref.out.length} duplicates`);
-console.log(`first rows: ${ref.out.slice(0, 3).map(([id, v]) => `key ${id % 10} @${Math.floor(id / 10)} = ${v}`).join('; ')}`);
+console.log(`first rows: ${ref.out.slice(0, 3).map(([id, v]) => `key ${id % KEY_SLOTS} @${Math.floor(id / KEY_SLOTS)} = ${v}`).join('; ')}`);
 
 if (!same || sum(ref) !== total || sum(exact.job) !== total || naive.out.length <= ref.out.length) process.exit(1);

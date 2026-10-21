@@ -70,6 +70,7 @@ web = {
 
 GAP = 2  # seconds between requests to one site
 WORKERS = 2  # fetches that can run at the same moment
+MAX_SECONDS = 60  # stop the crawl after this long
 frontier = Frontier(GAP)
 frontier.add("http://a.com/")
 
@@ -77,7 +78,7 @@ fetched_at = {}
 last_time = {}
 too_soon = 0
 t = 0
-while t < 60 and frontier.pending > 0:
+while t < MAX_SECONDS and frontier.pending > 0:
     for _ in range(WORKERS):
         url = frontier.next(t)
         if not url:

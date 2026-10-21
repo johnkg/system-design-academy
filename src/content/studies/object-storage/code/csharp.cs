@@ -8,13 +8,18 @@ using System.Linq;
 const int K = 4, M = 2, N = K + M;                   // any K of the N shards rebuild the object
 const int RACKS = N, DISKS = 8, OBJECTS = 200, ROUNDS = 20;
 const double P_DISK = 0.02, P_RACK = 0.03;
+const int OBJECT_BYTES = 64, SHARD_BYTES = OBJECT_BYTES / K;
+const uint PLACE_SEED = 7, FAIL_SEED = 99;
+const double P_LOSS = 0.01, PER_BILLION = 1e9; // durability maths: each disk lost with probability 1%
+// GF(256): 256 elements, a multiplicative group of order 255, generated modulo x^8 + x^4 + x^3 + x^2 + 1.
+const int GF_SIZE = 256, GF_ORDER = GF_SIZE - 1, GF_POLY = 0x11d;
 
 // Arithmetic in GF(256): addition is XOR, multiplication goes through log and antilog tables.
-var EXP = new int[512]; var LOG = new int[256];
-for (int i = 0, x = 1; i < 255; i++) { EXP[i] = x; LOG[x] = i; x <<= 1; if ((x & 256) != 0) x ^= 0x11d; }
-for (int i = 255; i < 512; i++) EXP[i] = EXP[i - 255];
+var EXP = new int[2 * GF_SIZE]; var LOG = new int[GF_SIZE];
+for (int i = 0, x = 1; i < GF_ORDER; i++) { EXP[i] = x; LOG[x] = i; x <<= 1; if ((x & GF_SIZE) != 0) x ^= GF_POLY; }
+for (int i = GF_ORDER; i < 2 * GF_SIZE; i++) EXP[i] = EXP[i - GF_ORDER];
 int Mul(int a, int b) => a != 0 && b != 0 ? EXP[LOG[a] + LOG[b]] : 0;
-int Inv(int a) => EXP[255 - LOG[a]];
+int Inv(int a) => EXP[GF_ORDER - LOG[a]];
 
 // Row s of the coding matrix: shards 0..K-1 are the data itself, the rest are Cauchy rows, so any K rows can be inverted.
 int[] Row(int s) => Enumerable.Range(0, K).Select(j => s < K ? (s == j ? 1 : 0) : Inv(s ^ j)).ToArray();
@@ -50,11 +55,11 @@ bool Same(byte[]? a, byte[] b) => a != null && a.SequenceEqual(b);
 Func<double> Mulberry32(uint a) => () => { a += 0x6D2B79F5; uint t = (a ^ (a >> 15)) * (1 | a); t = (t + (t ^ (t >> 7)) * (61 | t)) ^ t; return (t ^ (t >> 14)) / 4294967296.0; };
 
 (int lost, int rebuilt, int read, int wrote) Simulate(bool spread) {   // spread: one shard per rack; otherwise all shards in one rack
-  var place = Mulberry32(7); var fail = Mulberry32(99);  // separate streams, so both layouts face the same failures
+  var place = Mulberry32(PLACE_SEED); var fail = Mulberry32(FAIL_SEED);  // separate streams, so both layouts face the same failures
   int Ri(int n) => (int)Math.Floor(place() * n);
   int Pick(int rack, HashSet<int> used) { int d; do d = rack * DISKS + Ri(DISKS); while (used.Contains(d)); return d; }
   var objects = Enumerable.Range(0, OBJECTS).Select(_ => {
-    var data = Enumerable.Range(0, 64).Select(__ => (byte)Ri(256)).ToArray(); int home = Ri(RACKS); var used = new HashSet<int>(); var loc = new List<int>();
+    var data = Enumerable.Range(0, OBJECT_BYTES).Select(__ => (byte)Ri(GF_SIZE)).ToArray(); int home = Ri(RACKS); var used = new HashSet<int>(); var loc = new List<int>();
     for (int s = 0; s < N; s++) { int d = Pick(spread ? s : home, used); used.Add(d); loc.Add(d); }
     return (data, shards: Encode(data).Select(x => (byte[]?)x).ToArray(), loc, lost: false);
   }).ToList();
@@ -72,8 +77,8 @@ Func<double> Mulberry32(uint a) => () => { a += 0x6D2B79F5; uint t = (a ^ (a >> 
       var data = Decode(o.shards);
       if (data == null) { objects[i] = (o.data, o.shards, o.loc, true); lost++; continue; }
       var fresh = Encode(data); var used = new HashSet<int>(o.loc);
-      foreach (int s in missing) { int d = Pick(o.loc[s] / DISKS, used); used.Add(d); o.loc[s] = d; o.shards[s] = fresh[s]; wrote += 16; rebuilt++; }
-      read += K * 16;                                // one decode reads K shards of 16 bytes, however many shards are rebuilt
+      foreach (int s in missing) { int d = Pick(o.loc[s] / DISKS, used); used.Add(d); o.loc[s] = d; o.shards[s] = fresh[s]; wrote += SHARD_BYTES; rebuilt++; }
+      read += K * SHARD_BYTES;                                // one decode reads K shards of 16 bytes, however many shards are rebuilt
     }
   }
   foreach (var o in objects) if (!o.lost && !Same(Decode(o.shards), o.data)) throw new Exception("corrupt object");
@@ -90,10 +95,10 @@ double Loss(int n, int tol, double p) {
   }
   return total;
 }
-long PerBillion(double x) => (long)Math.Floor(x * 1e9 + 0.5);
+long PerBillion(double x) => (long)Math.Floor(x * PER_BILLION + 0.5);
 
 // 1. Every pattern of up to M missing shards decodes; M+1 missing shards never do.
-var sample = Enumerable.Range(0, 64).Select(i => (byte)((i * 37 + 11) & 255)).ToArray(); var whole = Encode(sample);
+var sample = Enumerable.Range(0, OBJECT_BYTES).Select(i => (byte)((i * 37 + 11) & 255)).ToArray(); var whole = Encode(sample);
 int ok = 0, fine = 0, dead2 = 0, tooMany = 0;
 for (int mask = 0; mask < 1 << N; mask++) {
   int gone = Convert.ToString(mask, 2).Count(ch => ch == '1');
@@ -112,5 +117,5 @@ foreach (bool spread in new[] { true, false }) {
 
 // 3. The same durability maths for three layouts when each disk is lost with probability 1%.
 foreach (var (name, n, tol) in new[] { ("3 copies", 3, 2), ("4+2", 6, 2), ("10+4", 14, 4) })
-  Console.WriteLine($"{name.PadRight(8)} loses {PerBillion(Loss(n, tol, 0.01))} objects per billion");
+  Console.WriteLine($"{name.PadRight(8)} loses {PerBillion(Loss(n, tol, P_LOSS))} objects per billion");
 if (ok != fine || dead2 != tooMany || Simulate(true).lost >= Simulate(false).lost) Environment.Exit(1);

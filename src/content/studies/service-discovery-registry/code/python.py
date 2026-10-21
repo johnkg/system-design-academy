@@ -3,6 +3,8 @@ self-preservation stops the sweep when too many renewals vanish at once, and a c
 import sys
 
 TTL, EVERY, N, THRESHOLD = 30, 10, 20, 85  # seconds, seconds, instances, percent
+# The scenario: from FAULT_AT, instances 0..CUT-1 lose the registry until HEAL_AT, and CUT..DEAD_END-1 die for good.
+FAULT_AT, HEAL_AT, END, CHECK_AT, CUT, DEAD_END = 40, 100, 140, 90, 8, 10
 
 
 class Registry:
@@ -54,18 +56,18 @@ class ClientCache:
 
 def run(self_preservation):
     reg, cache, out = Registry(self_preservation), ClientCache(), {}
-    for t in range(141):
+    for t in range(END + 1):
         for instance_id in range(N):
-            crashed = 8 <= instance_id < 10 and t >= 40   # two instances really die at t=40
-            cut = instance_id < 8 and 40 <= t < 100       # eight healthy ones lose the registry for 60 s
+            crashed = CUT <= instance_id < DEAD_END and t >= FAULT_AT  # two instances really die at t=40
+            cut = instance_id < CUT and FAULT_AT <= t < HEAL_AT        # eight healthy ones lose the registry for 60 s
             if t % EVERY == instance_id % EVERY and not crashed and not cut:
                 reg.heartbeat(instance_id, t)
         reg.sweep(t)
         cache.catch_up(reg.log)
-        if t in (90, 140):
+        if t in (CHECK_AT, END):
             shown = reg.listed()
-            missing = len([i for i in range(8) if i not in shown])
-            dead = len([i for i in shown if i in (8, 9)])
+            missing = len([i for i in range(CUT) if i not in shown])
+            dead = len([i for i in shown if CUT <= i < DEAD_END])
             out[t] = f"listed={len(shown)} healthy-missing={missing} dead-listed={dead}"
     if sorted(cache.items) != reg.listed():
         sys.exit(1)
@@ -77,11 +79,11 @@ for sp in (False, True):
     out, reg = run(sp)
     results[sp] = out
     label = "on " if sp else "off"
-    print(f"self-preservation {label}: t=90 {out[90]} | t=140 {out[140]} | events={len(reg.log)} skipped-sweeps={reg.skipped}")
-if not results[False][90].startswith("listed=10 healthy-missing=8"):
+    print(f"self-preservation {label}: t=90 {out[CHECK_AT]} | t=140 {out[END]} | events={len(reg.log)} skipped-sweeps={reg.skipped}")
+if not results[False][CHECK_AT].startswith("listed=10 healthy-missing=8"):
     sys.exit(1)  # without it, a partition empties the list
-if "healthy-missing=0" not in results[True][90]:
+if "healthy-missing=0" not in results[True][CHECK_AT]:
     sys.exit(1)  # with it, nobody healthy is dropped
-if "dead-listed=0" not in results[True][140]:
+if "dead-listed=0" not in results[True][END]:
     sys.exit(1)  # and the dead are removed once the network heals
 print("invariants hold")

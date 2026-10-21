@@ -4,20 +4,23 @@ import sys
 
 WINDOW, DELAY, EVERY = 10, 4, 50  # window length, watermark lag behind the newest event time, checkpoint interval (events)
 
-seed = 7
+KEY_SLOTS = 10  # a state id is window start * 10 + key, so keys must stay below 10
+SEED, EVENTS, KEYS, EVENTS_PER_TICK, MAX_LATENESS, MAX_VALUE = 7, 2000, 5, 4, 8, 9
+seed = SEED
 
 
 def rnd(n):
+    """Linear congruential generator (Numerical Recipes constants), high 16 bits."""
     global seed
     seed = (seed * 1664525 + 1013904223) % 4294967296
     return (seed // 65536) % n
 
 
 events = []
-for i in range(2000):  # arrive out of order
-    key = rnd(5)
-    time = max(0, (i >> 2) - rnd(8))
-    value = 1 + rnd(9)
+for i in range(EVENTS):  # arrive out of order
+    key = rnd(KEYS)
+    time = max(0, i // EVENTS_PER_TICK - rnd(MAX_LATENESS))
+    value = 1 + rnd(MAX_VALUE)
     events.append((key, time, value))
 
 
@@ -31,7 +34,7 @@ class Job:
         self.late_sum = 0
 
     def fire(self, limit):  # emit every window that ends at or before the watermark, oldest first
-        ready = sorted(i for i in self.windows if i // 10 + WINDOW <= limit)
+        ready = sorted(i for i in self.windows if i // KEY_SLOTS + WINDOW <= limit)
         for i in ready:
             self.out.append((i, self.windows.pop(i)))
 
@@ -39,7 +42,7 @@ class Job:
         key, time, value = events[self.offset]
         self.offset += 1
         start = time - (time % WINDOW)
-        wid = start * 10 + key  # the state is keyed by (key, window)
+        wid = start * KEY_SLOTS + key  # the state is keyed by (key, window)
         self.max_time = max(self.max_time, time)
         watermark = self.max_time - DELAY
         if start + WINDOW <= watermark:  # its window has already fired
@@ -96,7 +99,7 @@ same = exact.out == ref.out
 print(f"4 crashes, transactional sink: replayed {replayed} events, identical output: {'true' if same else 'false'}")
 naive, _ = run(crashes, False)
 print(f"4 crashes, plain sink: {len(naive.out)} rows, {len(naive.out) - len(ref.out)} duplicates")
-print("first rows: " + "; ".join(f"key {i % 10} @{i // 10} = {v}" for i, v in ref.out[:3]))
+print("first rows: " + "; ".join(f"key {i % KEY_SLOTS} @{i // KEY_SLOTS} = {v}" for i, v in ref.out[:3]))
 
 if not same or total_of(ref) != total or total_of(exact) != total or len(naive.out) <= len(ref.out):
     sys.exit(1)

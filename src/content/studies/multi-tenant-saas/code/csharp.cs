@@ -12,9 +12,13 @@ public static class App
     static readonly string[] Names = { "acme", "globex", "initech", "umbrella", "hooli", "stark", "wayne", "wonka" };
     static readonly Dictionary<string, int> Dir = new(); // the tenant directory: tenant -> shard
     static List<Row>[] shards = { new(), new(), new(), new() };
-    static ulong seed = 7;
+    const int BigTenantRows = 40, SmallMinRows = 4, SmallRowSpread = 5; // small tenants have 4..8 rows
+    const int MinAmount = 10, AmountSpread = 990;
+    const ulong Seed = 7;
+    static ulong seed = Seed;
 
     static uint Hash(string s) { uint h = 2166136261; foreach (char c in s) h = unchecked((h ^ c) * 16777619u); return h; }
+    // Linear congruential generator (Numerical Recipes constants), high 16 bits.
     static int Rnd(int n) { seed = (seed * 1664525UL + 1013904223UL) % 4294967296UL; return (int)((seed / 65536) % (ulong)n); }
 
     // The right query always filters by tenant. The buggy one forgets, and returns the whole shard.
@@ -59,8 +63,8 @@ public static class App
         int nextId = 1;
         foreach (var t in Names)
         {
-            int count = t == "acme" ? 40 : 4 + Rnd(5);
-            for (int i = 0; i < count; i++) { shards[Dir[t]].Add(new Row(nextId++, t, 10 + Rnd(990))); }
+            int count = t == "acme" ? BigTenantRows : SmallMinRows + Rnd(SmallRowSpread);
+            for (int i = 0; i < count; i++) { shards[Dir[t]].Add(new Row(nextId++, t, MinAmount + Rnd(AmountSpread))); }
         }
         Console.WriteLine("directory: " + string.Join(" ", Names.Select(t => $"{t}->{Dir[t]}")));
         Console.WriteLine("rows per shard: " + string.Join(" ", shards.Select(s => s.Count)));

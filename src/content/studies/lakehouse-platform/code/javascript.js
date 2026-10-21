@@ -35,7 +35,11 @@ class Table {
   }
 }
 
-let seed = 7;
+const SEED = 7, ROUNDS = 12, WRITERS = 3, MIN_ROWS = 10, ROW_SPREAD = 40;
+const SMALL_FILE_ROWS = 30; // compaction merges files smaller than this
+const APPEND_ROWS = 25, DELETED_ROWS = 5, KEEP_SNAPSHOTS = 3, OLD_VERSION = 3;
+let seed = SEED;
+// Linear congruential generator (Numerical Recipes constants), top 24 bits.
 const rnd = (n) => { seed = (Math.imul(seed, 1664525) + 1013904223) >>> 0; return (seed >>> 8) % n; };
 
 const t = new Table();
@@ -43,32 +47,32 @@ const history = [0]; // history[v] = rows at version v, written down at commit t
 let expected = 0, rebases = 0;
 const done = (tx) => { const r = t.commit(tx); if (!r.ok) throw new Error('unexpected conflict'); rebases += r.rebases; history.push(t.total(t.head)); };
 
-for (let round = 0; round < 12; round++) { // three writers start from the same snapshot every round
-  const txs = [0, 1, 2].map(() => { const tx = t.begin(); tx.rows = 10 + rnd(40); tx.add.push(t.newFile(tx.rows)); return tx; });
+for (let round = 0; round < ROUNDS; round++) { // three writers start from the same snapshot every round
+  const txs = Array.from({ length: WRITERS }, () => { const tx = t.begin(); tx.rows = MIN_ROWS + rnd(ROW_SPREAD); tx.add.push(t.newFile(tx.rows)); return tx; });
   for (const tx of txs) { done(tx); expected += tx.rows; }
 }
 console.log(`appends: version ${t.head}, ${t.snaps[t.head].length} files, ${t.total(t.head)} rows, ${rebases} rebases`);
 
 const plan = () => { // merge every small file into one
-  const tx = t.begin(); const small = t.snaps[tx.base].filter(([, r]) => r < 30);
+  const tx = t.begin(); const small = t.snaps[tx.base].filter(([, r]) => r < SMALL_FILE_ROWS);
   tx.remove = small.map(([n]) => n); tx.add.push(t.newFile(small.reduce((s, [, r]) => s + r, 0)));
   return tx;
 };
 let compaction = plan();
-const append = t.begin(); append.add.push(t.newFile(25));
-const del = t.begin(); const victim = compaction.remove[0]; del.remove = [victim]; del.add.push(t.newFile(t.store.get(victim) - 5));
-done(append); expected += 25;
-done(del); expected -= 5;
+const append = t.begin(); append.add.push(t.newFile(APPEND_ROWS));
+const del = t.begin(); const victim = compaction.remove[0]; del.remove = [victim]; del.add.push(t.newFile(t.store.get(victim) - DELETED_ROWS));
+done(append); expected += APPEND_ROWS;
+done(del); expected -= DELETED_ROWS;
 let conflicts = 0;
 while (!t.commit(compaction).ok) { conflicts++; compaction = plan(); } // replan from the new head
 history.push(t.total(t.head));
 console.log(`compaction: ${conflicts} conflict, version ${t.head}, ${t.snaps[t.head].length} files, ${t.total(t.head)} rows`);
 
 const before = t.store.size;
-t.vacuum(3);
+t.vacuum(KEEP_SNAPSHOTS);
 console.log(`vacuum: ${before} stored files -> ${t.store.size}`);
 let expired = false;
-try { t.total(3); } catch { expired = true; }
+try { t.total(OLD_VERSION); } catch { expired = true; }
 const travel = [t.head - 2, t.head - 1, t.head].every((v) => t.total(v) === history[v]);
 console.log(`time travel matches history: ${travel}; version 3 expired: ${expired}`);
 if (t.total(t.head) !== expected || !travel || !expired || conflicts !== 1) process.exit(1);

@@ -3,10 +3,14 @@
 import json
 import sys
 
-seed = 7
+SEED, EVENTS, USERS, MAX_GAP, MAX_AMOUNT = 7, 300, 6, 5, 100
+SWAP_EVERY = 3  # every 3rd pair of online writes arrives swapped
+LABELS, LABEL_MIN_TS, LABEL_SPREAD = 40, 50, 700
+seed = SEED
 
 
 def random(n):
+    """Linear congruential generator (Numerical Recipes constants), high 16 bits."""
     global seed
     seed = (seed * 1664525 + 1013904223) % 4294967296
     return (seed // 65536) % n
@@ -15,9 +19,9 @@ def random(n):
 # Raw purchase events: the source of truth. Time only moves forward.
 events = []
 t = 0
-for _ in range(300):
-    t += 1 + random(5)
-    events.append({"user": random(6), "ts": t, "amount": 1 + random(100)})
+for _ in range(EVENTS):
+    t += 1 + random(MAX_GAP)
+    events.append({"user": random(USERS), "ts": t, "amount": 1 + random(MAX_AMOUNT)})
 
 
 # The single feature definition: per user, total spend and purchase count so far.
@@ -38,7 +42,7 @@ offline = compute_rows(events)  # append-only history of every feature value, wi
 # Online store: only the newest value per user. Delivery is out of order here, so a write with an older time is ignored.
 online = {}
 delivery = list(offline)
-for i in range(0, len(delivery) - 1, 3):
+for i in range(0, len(delivery) - 1, SWAP_EVERY):
     delivery[i], delivery[i + 1] = delivery[i + 1], delivery[i]
 for r in delivery:
     cur = online.get(r["user"])
@@ -70,7 +74,7 @@ def truth(user, ts):
     return {"sum": sum(e["amount"] for e in mine), "count": len(mine)}
 
 
-labels = [{"user": random(6), "ts": 50 + random(700)} for _ in range(40)]
+labels = [{"user": random(USERS), "ts": LABEL_MIN_TS + random(LABEL_SPREAD)} for _ in range(LABELS)]
 naive_wrong = pit_wrong = 0
 for l in labels:
     tr, p, n = truth(l["user"], l["ts"]), as_of(l["user"], l["ts"]), latest(l["user"])

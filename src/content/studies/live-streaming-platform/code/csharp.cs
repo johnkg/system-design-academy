@@ -7,8 +7,14 @@ using System.Linq;
 var ladder = new (string Name, int Kbps)[] { ("1080p", 6000), ("720p", 3000), ("480p", 1200), ("240p", 400) };
 int[] share = { 20, 40, 30, 10 }; // percent of viewers who settle on each rendition
 const int SegMs = 2000, Segs = 30, Edges = 8, ViewerCount = 2000;
+const int MsPerSecond = 1000, PerViewers = 1000; // request rates are quoted per 1000 viewers
+const int IngestMs = 300, TranscodeMs = 500, DeliveryMs = 400;
+// Failover demo: the stream dies at 25.3 s; a cold standby needs 2 s to notice and 3 s to start, a warm one 1 s and none.
+const int FailAt = 25300, ColdDetectMs = 2000, ColdStartMs = 3000, WarmDetectMs = 1000;
 
-uint seed = 7;
+const uint Seed = 7;
+uint seed = Seed;
+// Linear congruential generator (Numerical Recipes constants), high 16 bits.
 int Rnd(int n) { seed = unchecked(seed * 1664525u + 1013904223u); return (int)((seed >> 16) % (uint)n); }
 
 var viewers = new List<(int Rendition, int Edge)>();
@@ -32,13 +38,13 @@ for (int i = 0; i < ViewerCount; i++)
             if (!edgeSeen.Add($"{v.Edge}:{v.Rendition}:{seg}")) continue;
             if (useShield && !shieldSeen.Add($"{v.Rendition}:{seg}")) continue;
             origin++;
-            kbit += ladder[v.Rendition].Kbps * (SegMs / 1000);
+            kbit += ladder[v.Rendition].Kbps * (SegMs / MsPerSecond);
         }
     return (origin, kbit);
 }
 
 // Delay from camera to screen: ingest, transcode, wait for a whole unit (segment or part), the player's hold-back, delivery.
-int GlassToGlass(int unitMs, int held) => 300 + 500 + unitMs + held * unitMs + 400;
+int GlassToGlass(int unitMs, int held) => IngestMs + TranscodeMs + unitMs + held * unitMs + DeliveryMs;
 
 // Milliseconds with no segments: the standby resumes on the next segment boundary after it has started.
 int Failover(int failAt, int detectMs, int startMs)
@@ -56,8 +62,8 @@ var shielded = Deliver(true);
 Console.WriteLine($"requests to origin over {Segs} segments: {plain.Origin} without shield, {shielded.Origin} with shield");
 Console.WriteLine($"origin egress: {plain.Kbit} kbit without shield, {shielded.Kbit} with shield");
 foreach (var (name, unit, held) in new[] { ("6 s segments, hold 3", 6000, 3), ("2 s segments, hold 3", 2000, 3), ("2 s segments, hold 2", 2000, 2), ("0.5 s parts, hold 3", 500, 3) })
-    Console.WriteLine($"{name}: {GlassToGlass(unit, held)} ms, {1000000 / unit} requests/s per 1000 viewers");
-int cold = Failover(25300, 2000, 3000), warm = Failover(25300, 1000, 0);
+    Console.WriteLine($"{name}: {GlassToGlass(unit, held)} ms, {PerViewers * MsPerSecond / unit} requests/s per 1000 viewers");
+int cold = Failover(FailAt, ColdDetectMs, ColdStartMs), warm = Failover(FailAt, WarmDetectMs, 0);
 Console.WriteLine($"failover gap: cold standby {cold} ms, warm standby {warm} ms, dual active 0 ms");
 Console.WriteLine($"viewer holding 1 segment: cold {Stalls(cold, 1)}, warm {Stalls(warm, 1)}; holding 3: cold {Stalls(cold, 3)}, warm {Stalls(warm, 3)}");
 

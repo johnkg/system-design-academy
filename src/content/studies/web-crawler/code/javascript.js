@@ -53,13 +53,14 @@ const web = {
 
 const GAP = 2; // seconds between requests to one site
 const WORKERS = 2; // fetches that can run at the same moment
+const MAX_SECONDS = 60; // stop the crawl after this long
 const frontier = new Frontier(GAP);
 frontier.add('http://a.com/');
 
 const fetchedAt = new Map();
 const lastTime = new Map();
 let tooSoon = 0;
-for (let t = 0; t < 60 && (frontier.pending > 0); t++) {
+for (let t = 0; t < MAX_SECONDS && (frontier.pending > 0); t++) {
   for (let w = 0; w < WORKERS; w++) {
     const url = frontier.next(t);
     if (!url) break;

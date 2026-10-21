@@ -58,7 +58,11 @@ public class Table
 
 public static class Program
 {
-    static uint seed = 7;
+    const int Seed = 7, Rounds = 12, Writers = 3, MinRows = 10, RowSpread = 40;
+    const int SmallFileRows = 30; // compaction merges files smaller than this
+    const int AppendRows = 25, DeletedRows = 5, KeepSnapshots = 3, OldVersion = 3;
+    static uint seed = Seed;
+    // Linear congruential generator (Numerical Recipes constants), top 24 bits.
     static int Rnd(int n) { seed = unchecked(seed * 1664525u + 1013904223u); return (int)((seed >> 8) % (uint)n); }
 
     static Table t = new();
@@ -74,36 +78,36 @@ public static class Program
 
     static Tx Plan() // merge every small file into one
     {
-        var tx = t.Begin(); var small = t.Snaps[tx.Base].Where(f => f.Rows < 30).ToList();
+        var tx = t.Begin(); var small = t.Snaps[tx.Base].Where(f => f.Rows < SmallFileRows).ToList();
         tx.Remove = small.Select(f => f.Name).ToList(); tx.Add.Add(t.NewFile(small.Sum(f => f.Rows)));
         return tx;
     }
 
     public static int Main()
     {
-        for (int round = 0; round < 12; round++) // three writers start from the same snapshot every round
+        for (int round = 0; round < Rounds; round++) // three writers start from the same snapshot every round
         {
             var txs = new List<Tx>();
-            for (int w = 0; w < 3; w++) { var tx = t.Begin(); tx.Rows = 10 + Rnd(40); tx.Add.Add(t.NewFile(tx.Rows)); txs.Add(tx); }
+            for (int w = 0; w < Writers; w++) { var tx = t.Begin(); tx.Rows = MinRows + Rnd(RowSpread); tx.Add.Add(t.NewFile(tx.Rows)); txs.Add(tx); }
             foreach (var tx in txs) { Done(tx); expected += tx.Rows; }
         }
         Console.WriteLine($"appends: version {t.Head}, {t.Snaps[t.Head].Count} files, {t.Total(t.Head)} rows, {rebases} rebases");
 
         var compaction = Plan();
-        var append = t.Begin(); append.Add.Add(t.NewFile(25));
-        var del = t.Begin(); var victim = compaction.Remove[0]; del.Remove.Add(victim); del.Add.Add(t.NewFile(t.Store[victim] - 5));
-        Done(append); expected += 25;
-        Done(del); expected -= 5;
+        var append = t.Begin(); append.Add.Add(t.NewFile(AppendRows));
+        var del = t.Begin(); var victim = compaction.Remove[0]; del.Remove.Add(victim); del.Add.Add(t.NewFile(t.Store[victim] - DeletedRows));
+        Done(append); expected += AppendRows;
+        Done(del); expected -= DeletedRows;
         int conflicts = 0;
         while (!t.Commit(compaction).Ok) { conflicts++; compaction = Plan(); } // replan from the new head
         history.Add(t.Total(t.Head));
         Console.WriteLine($"compaction: {conflicts} conflict, version {t.Head}, {t.Snaps[t.Head].Count} files, {t.Total(t.Head)} rows");
 
         int before = t.Store.Count;
-        t.Vacuum(3);
+        t.Vacuum(KeepSnapshots);
         Console.WriteLine($"vacuum: {before} stored files -> {t.Store.Count}");
         bool expired = false;
-        try { t.Total(3); } catch (InvalidOperationException) { expired = true; }
+        try { t.Total(OldVersion); } catch (InvalidOperationException) { expired = true; }
         bool travel = new[] { t.Head - 2, t.Head - 1, t.Head }.All(v => t.Total(v) == history[v]);
         Console.WriteLine($"time travel matches history: {travel.ToString().ToLower()}; version 3 expired: {expired.ToString().ToLower()}");
         return t.Total(t.Head) != expected || !travel || !expired || conflicts != 1 ? 1 : 0;

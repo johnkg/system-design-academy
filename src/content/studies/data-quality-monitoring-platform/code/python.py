@@ -20,7 +20,8 @@ WEEKEND_FIRST_DAY, WEEKEND_PERCENT = 5, 40  # days 5 and 6 are the weekend
 NOISE_MIN_PER_MILLE, NOISE_STEPS, PER_MILLE = 950, 101, 1000  # a factor of 0.950..1.050
 # Incidents in the last week: an outage on day 2, 13:00-16:00, and a double load on day 4 at 03:00.
 OUTAGE_DAY, OUTAGE_FIRST_HOUR, OUTAGE_LAST_HOUR, OUTAGE_PERCENT = 2, 13, 16, 35
-DOUBLE_LOAD_DAY, DOUBLE_LOAD_HOUR, DOUBLE_LOAD_FACTOR = 4, 3, 4
+# The incident: on this day and hour of the last week, a re-run job leaves four times the usual rows.
+RERUN_DAY, RERUN_HOUR, RERUN_FACTOR = 4, 3, 4
 NAIVE_SIGMAS, SEASONAL_SIGMAS = 3, 4
 MAD_TO_SIGMA_X100, MIN_SIGMA_PERCENT = 148, 3  # sigma = 1.48 * MAD, at least 3% of the median
 FIXED_FLOOR = 200
@@ -40,8 +41,8 @@ for t in range(HOURS_PER_WEEK * WEEKS):
     if week == WEEKS - 1 and day == OUTAGE_DAY and OUTAGE_FIRST_HOUR <= hour <= OUTAGE_LAST_HOUR:
         v = v * OUTAGE_PERCENT // 100  # a source stops sending
         bad = True
-    if week == WEEKS - 1 and day == DOUBLE_LOAD_DAY and hour == DOUBLE_LOAD_HOUR:
-        v *= DOUBLE_LOAD_FACTOR  # a job loads the data twice
+    if week == WEEKS - 1 and day == RERUN_DAY and hour == RERUN_HOUR:
+        v *= RERUN_FACTOR  # a job is re-run by mistake and loads the same rows again
         bad = True
     series.append(v)
     incident.append(bad)

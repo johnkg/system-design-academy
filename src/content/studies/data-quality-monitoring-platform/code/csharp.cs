@@ -8,7 +8,8 @@ const int WeekendFirstDay = 5, WeekendPercent = 40; // days 5 and 6 are the week
 const int NoiseMinPerMille = 950, NoiseSteps = 101, PerMille = 1000; // a factor of 0.950..1.050
 // Incidents in the last week: an outage on day 2, 13:00-16:00, and a double load on day 4 at 03:00.
 const int OutageDay = 2, OutageFirstHour = 13, OutageLastHour = 16, OutagePercent = 35;
-const int DoubleLoadDay = 4, DoubleLoadHour = 3, DoubleLoadFactor = 4;
+// The incident: on this day and hour of the last week, a re-run job leaves four times the usual rows.
+const int RerunDay = 4, RerunHour = 3, RerunFactor = 4;
 const int NaiveSigmas = 3, SeasonalSigmas = 4;
 // Sigma = 1.48 * MAD, at least 3% of the median.
 const int MadToSigmaX100 = 148, MinSigmaPercent = 3;
@@ -35,7 +36,7 @@ for (int t = 0; t < series.Length; t++)
         // A source stops sending.
         v = v * OutagePercent / 100; bad = true;
     }
-    if (week == Weeks - 1 && day == DoubleLoadDay && hour == DoubleLoadHour) { v *= DoubleLoadFactor; bad = true; } // a job loads the data twice
+    if (week == Weeks - 1 && day == RerunDay && hour == RerunHour) { v *= RerunFactor; bad = true; } // a job is re-run by mistake and loads the same rows again
     series[t] = v; incident[t] = bad;
 }
 

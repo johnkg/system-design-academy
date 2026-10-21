@@ -1,6 +1,8 @@
 // A service registry in JavaScript: heartbeats renew leases, a sweep evicts expired ones,
 // self-preservation stops the sweep when too many renewals vanish at once, and a client cache follows a versioned event log.
 const TTL = 30, EVERY = 10, N = 20, THRESHOLD = 85; // seconds, seconds, instances, percent
+// The scenario: from FAULT_AT, instances 0..CUT-1 lose the registry until HEAL_AT, and CUT..DEAD_END-1 die for good.
+const FAULT_AT = 40, HEAL_AT = 100, END = 140, CHECK_AT = 90, CUT = 8, DEAD_END = 10;
 
 class Registry {
   constructor(selfPreservation) {
@@ -35,16 +37,16 @@ class ClientCache { // applies the log in order, and asks for a full copy if it 
 
 function run(selfPreservation) {
   const reg = new Registry(selfPreservation), cache = new ClientCache(), out = {};
-  for (let t = 0; t <= 140; t++) {
+  for (let t = 0; t <= END; t++) {
     for (let id = 0; id < N; id++) {
-      const crashed = id >= 8 && id < 10 && t >= 40;          // two instances really die at t=40
-      const cut = id < 8 && t >= 40 && t < 100;               // eight healthy ones lose the registry for 60 s
+      const crashed = id >= CUT && id < DEAD_END && t >= FAULT_AT; // two instances really die at t=40
+      const cut = id < CUT && t >= FAULT_AT && t < HEAL_AT;       // eight healthy ones lose the registry for 60 s
       if (t % EVERY === id % EVERY && !crashed && !cut) reg.heartbeat(id, t);
     }
     reg.sweep(t); cache.catchUp(reg.log);
-    if (t === 90 || t === 140) {
+    if (t === CHECK_AT || t === END) {
       const l = reg.list();
-      out[t] = `listed=${l.length} healthy-missing=${[0, 1, 2, 3, 4, 5, 6, 7].filter((i) => !l.includes(i)).length} dead-listed=${l.filter((i) => i === 8 || i === 9).length}`;
+      out[t] = `listed=${l.length} healthy-missing=${Array.from({ length: CUT }, (_, i) => i).filter((i) => !l.includes(i)).length} dead-listed=${l.filter((i) => i >= CUT && i < DEAD_END).length}`;
     }
   }
   if (JSON.stringify([...cache.set].sort((a, b) => a - b)) !== JSON.stringify(reg.list())) process.exit(1);
@@ -54,9 +56,9 @@ function run(selfPreservation) {
 const results = {};
 for (const sp of [false, true]) {
   const { out, reg } = run(sp); results[sp] = out;
-  console.log(`self-preservation ${sp ? 'on ' : 'off'}: t=90 ${out[90]} | t=140 ${out[140]} | events=${reg.log.length} skipped-sweeps=${reg.skipped}`);
+  console.log(`self-preservation ${sp ? 'on ' : 'off'}: t=90 ${out[CHECK_AT]} | t=140 ${out[END]} | events=${reg.log.length} skipped-sweeps=${reg.skipped}`);
 }
-if (!results[false][90].startsWith('listed=10 healthy-missing=8')) process.exit(1);     // without it, a partition empties the list
-if (!results[true][90].includes('healthy-missing=0')) process.exit(1);                    // with it, nobody healthy is dropped
-if (!results[true][140].includes('dead-listed=0')) process.exit(1);                       // and the dead are removed once the network heals
+if (!results[false][CHECK_AT].startsWith('listed=10 healthy-missing=8')) process.exit(1);     // without it, a partition empties the list
+if (!results[true][CHECK_AT].includes('healthy-missing=0')) process.exit(1);                    // with it, nobody healthy is dropped
+if (!results[true][END].includes('dead-listed=0')) process.exit(1);                       // and the dead are removed once the network heals
 console.log('invariants hold');

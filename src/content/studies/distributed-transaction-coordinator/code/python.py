@@ -83,7 +83,8 @@ class Coordinator:
                 self.log.append(f"end {tx}")
 
 
-shards = {"A": Shard("A", 100), "B": Shard("B", 100), "C": Shard("C", 100)}
+OPENING_BALANCE = 100
+shards = {"A": Shard("A", OPENING_BALANCE), "B": Shard("B", OPENING_BALANCE), "C": Shard("C", OPENING_BALANCE)}
 coordinator = Coordinator(shards)
 
 
@@ -117,5 +118,5 @@ for tx, deltas, crash_at in plan:
 print(f"log: {', '.join(coordinator.log)}")
 clean = all(s.lock is None for s in shards.values())
 print(f"money total {total()}, all locks released: {'true' if clean else 'false'}")
-if total() != 300 or not clean or any(r.startswith("abort") for r in coordinator.log):
+if total() != OPENING_BALANCE * len(shards) or not clean or any(r.startswith("abort") for r in coordinator.log):
     sys.exit(1)

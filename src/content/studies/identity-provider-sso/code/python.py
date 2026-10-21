@@ -4,6 +4,8 @@
 import sys
 
 TTL = 600  # token lifetime in seconds
+ACR_PASSWORD, ACR_MFA = 1, 2  # authentication strength levels
+NO_MAX_AGE, ADMIN_MAX_AGE = 1000000, 300  # seconds since the last login
 
 def fnv(s):
     h = 2166136261
@@ -29,10 +31,10 @@ class Idp:
     def login(self, sub, now, mfa):
         sid = f'{self.tenant}-s{self.next}'
         self.next += 1
-        self.sessions[sid] = {'sub': sub, 'acr': 2 if mfa else 1, 'auth_time': now, 'rps': []}
+        self.sessions[sid] = {'sub': sub, 'acr': ACR_MFA if mfa else ACR_PASSWORD, 'auth_time': now, 'rps': []}
         return sid
     def step_up(self, sid, now):
-        self.sessions[sid].update(acr=2, auth_time=now)
+        self.sessions[sid].update(acr=ACR_MFA, auth_time=now)
     def issue(self, sid, aud, now):
         s = self.sessions.get(sid)
         if s is None:
@@ -52,7 +54,7 @@ class Rp:  # a relying party: an application that trusts one IdP
     def __init__(self, aud, idp):
         self.aud, self.idp, self.revoked = aud, idp, set()
     def revoke(self, sid): self.revoked.add(sid)  # the back-channel logout endpoint
-    def check(self, token, now, min_acr=1, max_age=1000000):
+    def check(self, token, now, min_acr=ACR_PASSWORD, max_age=NO_MAX_AGE):
         f = token.split('|')
         secret = self.idp.jwks(now).get(f[0])  # a real RP caches the key set and refetches on an unknown kid
         if secret is None:
@@ -81,11 +83,11 @@ rps = {'mail': mail, 'wiki': wiki}
 sid = acme.login('alice', 0, False)
 
 expect('mail at 100', mail.check(acme.issue(sid, 'mail', 100), 100), 'ok')
-expect('admin page at 150 (needs mfa)', wiki.check(acme.issue(sid, 'wiki', 150), 150, 2, 300), 'step_up_required')
+expect('admin page at 150 (needs mfa)', wiki.check(acme.issue(sid, 'wiki', 150), 150, ACR_MFA, ADMIN_MAX_AGE), 'step_up_required')
 acme.step_up(sid, 160)
 admin = acme.issue(sid, 'wiki', 160)
-expect('admin page at 170 after mfa', wiki.check(admin, 170, 2, 300), 'ok')
-expect('admin page at 500 (mfa too old)', wiki.check(admin, 500, 2, 300), 'step_up_required')
+expect('admin page at 170 after mfa', wiki.check(admin, 170, ACR_MFA, ADMIN_MAX_AGE), 'ok')
+expect('admin page at 500 (mfa too old)', wiki.check(admin, 500, ACR_MFA, ADMIN_MAX_AGE), 'step_up_required')
 
 old = acme.issue(sid, 'mail', 900)
 acme.rotate(1000)

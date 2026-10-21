@@ -12,6 +12,7 @@ public class Chunk { public string Id = "", Title = ""; public string[] Acl = Ar
 public class Index
 {
     const int Dim = 16;
+    const int RrfK = 60, RrfScale = 1000000; // the usual fusion constant; scores kept as whole numbers
     public static int EmbedCalls = 0; // a real embedding call costs money, so we count them
     public readonly Dictionary<string, Chunk> Chunks = new();   // chunk id -> chunk
     readonly Dictionary<string, (uint Hash, List<string> Ids)> docs = new(); // doc id -> hash and chunk ids
@@ -68,7 +69,7 @@ public class Index
 
         var fused = new Dictionary<string, int>(); // reciprocal rank fusion: a chunk near the top of either list scores well
         foreach (var ranked in new[] { ByScore(keyword), ByScore(vector) })
-            for (int r = 0; r < ranked.Count; r++) fused[ranked[r]] = fused.GetValueOrDefault(ranked[r]) + 1000000 / (60 + r + 1);
+            for (int r = 0; r < ranked.Count; r++) fused[ranked[r]] = fused.GetValueOrDefault(ranked[r]) + RrfScale / (RrfK + r + 1);
         return fused.OrderByDescending(e => e.Value).ThenBy(e => e.Key, StringComparer.Ordinal).Take(k).Select(e => e.Key).ToList();
     }
 }
@@ -88,13 +89,14 @@ public static class Program
         string Show(IEnumerable<string> ids) => string.Join(", ", ids.Select(id => $"{id} ({index.Chunks[id].Title})"));
 
         string query = "salary band approval in the portal";
+        const int TopK = 3, WideK = 5;
         var eng = new[] { "all", "eng" };
-        var asEngineer = index.Search(eng, query, 3);
-        var asHr = index.Search(new[] { "all", "hr" }, query, 3);
+        var asEngineer = index.Search(eng, query, TopK);
+        var asHr = index.Search(new[] { "all", "hr" }, query, TopK);
         Console.WriteLine($"engineer asks: {Show(asEngineer)}");
         Console.WriteLine($"hr asks: {Show(asHr)}");
 
-        var unfiltered = index.Search(eng, query, 3, false).Where(id => !index.Chunks[id].Acl.Any(g => eng.Contains(g))).ToList();
+        var unfiltered = index.Search(eng, query, TopK, false).Where(id => !index.Chunks[id].Acl.Any(g => eng.Contains(g))).ToList();
         Console.WriteLine($"without the filter, the engineer's top 3 would hold {unfiltered.Count} unreadable chunk(s): {Show(unfiltered)}");
 
         int callsBefore = Index.EmbedCalls;
@@ -106,10 +108,10 @@ public static class Program
         index.SyncAll(source);
         int syncCalls = Index.EmbedCalls - callsBefore;
         Console.WriteLine($"after edit, ACL change and delete: {syncCalls} embedding calls, {index.Chunks.Count} chunks");
-        Console.WriteLine($"engineer asks again: {Show(index.Search(eng, query, 3))}");
+        Console.WriteLine($"engineer asks again: {Show(index.Search(eng, query, TopK))}");
 
         bool leaked = index.Chunks.Keys.Any(id => id.StartsWith("tr1"));
-        bool hrSeen = index.Search(eng, "salary band", 5).Any(id => id.StartsWith("hr2"));
+        bool hrSeen = index.Search(eng, "salary band", WideK).Any(id => id.StartsWith("hr2"));
         bool secret = asEngineer.Any(id => id.StartsWith("hr2"));
         Console.WriteLine($"deleted doc still indexed: {leaked.ToString().ToLowerInvariant()}; hr doc hidden before the ACL change: {(!secret).ToString().ToLowerInvariant()}; visible after: {hrSeen.ToString().ToLowerInvariant()}");
         return leaked || secret || !hrSeen || syncCalls != 2 || unfiltered.Count == 0 ? 1 : 0;

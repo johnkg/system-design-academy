@@ -1,6 +1,8 @@
 // A tiny Cassandra-style cluster in JavaScript: a consistent-hash ring with virtual nodes,
 // replication factor 3, quorum reads and writes, hinted handoff, read repair and tombstones.
 const RF = 3, NAMES = ['n0', 'n1', 'n2', 'n3', 'n4'];
+const QUORUM = 2; // a majority of the RF replicas
+const VNODES = 16, SPREAD_KEYS = 1000;
 
 const fnv1a = (s) => { // 32-bit FNV-1a, integer maths only
   let h = 2166136261;
@@ -23,13 +25,13 @@ class Ring {
 
 function spread(vnodes) { // how many of 1000 keys each node is the first replica for
   const ring = new Ring(vnodes), counts = {};
-  for (let i = 0; i < 1000; i++) { const p = ring.replicas(`k${i}`)[0]; counts[p] = (counts[p] || 0) + 1; }
+  for (let i = 0; i < SPREAD_KEYS; i++) { const p = ring.replicas(`k${i}`)[0]; counts[p] = (counts[p] || 0) + 1; }
   return Object.values(counts);
 }
 
 class Cluster {
   constructor() {
-    this.ring = new Ring(16); this.up = new Set(NAMES); this.hints = [];
+    this.ring = new Ring(VNODES); this.up = new Set(NAMES); this.hints = [];
     this.data = new Map(NAMES.map((n) => [n, new Map()]));
   }
   apply(node, key, cell) { // last write wins
@@ -79,24 +81,24 @@ for (let w = 1; w <= RF; w++) for (let r = 1; r <= RF; r++) { // worst case: the
 
 const c = new Cluster(), key = 'user:42', down = c.ring.replicas(key)[2];
 console.log(`${key} lives on ${c.ring.replicas(key).join(', ')}`);
-c.write(key, 'v1', 1, 2); c.up.delete(down);
-const ok = c.write(key, 'v2', 2, 2);
-console.log(`${down} down: write ok=${ok}, hints=${c.hints.length}, read=${c.read(key, 2).value}`);
+c.write(key, 'v1', 1, QUORUM); c.up.delete(down);
+const ok = c.write(key, 'v2', 2, QUORUM);
+console.log(`${down} down: write ok=${ok}, hints=${c.hints.length}, read=${c.read(key, QUORUM).value}`);
 c.up.add(down);
 console.log(`${down} back: replayed ${c.replay(down)} hint, it holds ${c.data.get(down).get(key).value}`);
 
-c.up.delete(down); c.write(key, 'v3', 3, 2); c.hints = []; c.up.add(down); // the hint expires before the node returns
-const rr = c.read(key, 2);
+c.up.delete(down); c.write(key, 'v3', 3, QUORUM); c.hints = []; c.up.add(down); // the hint expires before the node returns
+const rr = c.read(key, QUORUM);
 console.log(`hint lost: read=${rr.value}, repairs=${rr.repairs}, ${down} now holds ${c.data.get(down).get(key).value}`);
 if (rr.value !== 'v3' || rr.repairs !== 1) process.exit(1);
 
 function deleteWhileDown(k, purge) { // the third replica misses the delete
   const rs = c.ring.replicas(k);
-  c.write(k, 'v3', 3, 3); c.up.delete(rs[2]);
-  c.write(k, null, 4, 2); c.hints = [];
+  c.write(k, 'v3', 3, RF); c.up.delete(rs[2]);
+  c.write(k, null, 4, QUORUM); c.hints = [];
   if (purge) c.purge(5);
   c.up.add(rs[2]);
-  const res = c.read(k, 3);
+  const res = c.read(k, RF);
   return `${k} purge=${purge}: read=${res.value === null ? 'deleted' : res.value}, repairs=${res.repairs}`;
 }
 const kept = deleteWhileDown('user:7', false), zombie = deleteWhileDown('user:8', true);

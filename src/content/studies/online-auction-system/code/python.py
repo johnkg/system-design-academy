@@ -43,16 +43,20 @@ def close_once(a, orders):
     return True
 
 
-seed = 77
+SEED, END_TIME, BIDDERS, MAX_RAISE_STEPS = 77, 1000, 6, 8
+# Time between bid rounds: 10..34 plus 12 for every extension so far.
+MIN_GAP, GAP_SPREAD, SLOWDOWN_PER_EXTENSION = 10, 25, 12
+seed = SEED
 
 
 def rnd(n):
+    """Linear congruential generator (Numerical Recipes constants), high 16 bits."""
     global seed
     seed = (seed * 1664525 + 1013904223) % 4294967296
     return (seed // 65536) % n
 
 
-a = new_auction(1000)
+a = new_auction(END_TIME)
 stats = {"ok": 0, "conflict": 0, "too low": 0}
 
 
@@ -63,12 +67,12 @@ def tally(r):
 
 now, last_price = 0, START
 while now < a["ends_at"]:
-    now += 10 + rnd(25) + a["extensions"] * 12              # bidders slow down as the fight goes on
+    now += MIN_GAP + rnd(GAP_SPREAD) + a["extensions"] * SLOWDOWN_PER_EXTENSION              # bidders slow down as the fight goes on
     if now >= a["ends_at"]:
         break
     seen = a["version"]                                     # two bidders read the same version at once
-    for bidder in [rnd(6), rnd(6)]:
-        max_bid = a["price"] + STEP * (1 + rnd(8))
+    for bidder in [rnd(BIDDERS), rnd(BIDDERS)]:
+        max_bid = a["price"] + STEP * (1 + rnd(MAX_RAISE_STEPS))
         r = place_bid(a, bidder, max_bid, now, seen)
         tally(r)
         if r == "conflict":

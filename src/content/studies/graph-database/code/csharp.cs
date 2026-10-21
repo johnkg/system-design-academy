@@ -10,6 +10,7 @@ public record Walk(List<int> Levels, HashSet<int> Seen, int Examined, int Cross)
 public class Graph
 {
     public const int Shards = 4;
+    // Knuth's multiplicative hash (2654435761 is about 2^32 / golden ratio).
     public static int ShardOf(int id) => (int)(((ulong)id * 2654435761UL & 0xFFFFFFFFUL) >> 16) % Shards; // the high bits of the product are well mixed
 
     public readonly List<int>[] Adj;
@@ -48,7 +49,9 @@ public class Graph
 
 public static class Program
 {
-    static long seed = 7;
+    const int Seed = 7, FriendsPerUser = 3, Start = 5, Hops = 3, DegreeCap = 50;
+    static long seed = Seed;
+    // Linear congruential generator (Numerical Recipes constants), high 16 bits.
     static int Random(int n) { seed = (seed * 1664525 + 1013904223) % 4294967296; return (int)(seed / 65536 % n); }
 
     static void Show(string label, Walk r) =>
@@ -59,20 +62,20 @@ public static class Program
         const int N = 400;
         var graph = new Graph(N);
         for (int i = 1; i < N; i++) graph.AddEdge(0, i);   // node 0 is a celebrity that everyone follows
-        for (int i = 1; i < N; i++) for (int j = 0; j < 3; j++) { int b = 1 + Random(N - 1); if (b != i) graph.AddEdge(i, b); }
+        for (int i = 1; i < N; i++) for (int j = 0; j < FriendsPerUser; j++) { int b = 1 + Random(N - 1); if (b != i) graph.AddEdge(i, b); }
 
         int maxDegree = graph.Adj.Max(a => a.Count);
         int median = graph.Adj.Select(a => a.Count).OrderBy(x => x).ElementAt(N >> 1);
         Console.WriteLine($"nodes {N}, edges {graph.Edges.Count}, supernode degree {graph.Degree(0)}, median degree {median}");
 
-        var full = graph.Run(5, 3, int.MaxValue);
-        var capped = graph.Run(5, 3, 50);
+        var full = graph.Run(Start, Hops, int.MaxValue);
+        var capped = graph.Run(Start, Hops, DegreeCap);
         Show("3 hops, expand everything ", full);
         Show("3 hops, skip nodes over 50", capped);
 
         // Check the walk against the slow way: scan the whole edge list once per hop.
-        var reach = new HashSet<int> { 5 };
-        for (int hop = 0; hop < 3; hop++)
+        var reach = new HashSet<int> { Start };
+        for (int hop = 0; hop < Hops; hop++)
         {
             var grown = new HashSet<int>(reach);
             foreach (var (a, b) in graph.Edges) { if (reach.Contains(a)) grown.Add(b); if (reach.Contains(b)) grown.Add(a); }

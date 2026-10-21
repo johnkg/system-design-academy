@@ -11,6 +11,7 @@ public record Found(Driver? Driver, double Distance, int Examined);
 
 public class DriverIndex
 {
+    const int MaxRing = 50; // give up after this many rings
     const double Cell = 2; // cell size, in the same units as the coordinates (think of 2 km)
     readonly Dictionary<(int, int), Dictionary<int, Driver>> cells = new();
     readonly Dictionary<int, (int, int)> where = new(); // driver id -> the cell it is filed under
@@ -32,7 +33,7 @@ public class DriverIndex
 
     // Search ring by ring around the rider's cell. Ring 0 is the rider's own cell, ring 1 the 8 cells around it, and so on.
     // Every cell in ring k is at least (k - 1) * Cell away, so once the best driver found is closer than that, stop.
-    public Found Nearest(Point rider, int maxRing = 50)
+    public Found Nearest(Point rider, int maxRing = MaxRing)
     {
         var (cx, cy) = CellOf(rider.X, rider.Y);
         Driver? best = null;
@@ -65,15 +66,17 @@ public static class Program
     public static int Main()
     {
         // A reproducible set of 2,000 drivers on a 100 x 100 map.
-        long seed = 42;
+        const int Seed = 42, Drivers = 2000, MapSize = 100, Move = 5; // Move is enough to cross a cell boundary
+        long seed = Seed;
+        // Linear congruential generator (Numerical Recipes constants), scaled to [0, 1).
         double NextRandom() { seed = (seed * 1664525 + 1013904223) % 4294967296; return seed / 4294967296.0; }
-        var drivers = Enumerable.Range(0, 2000).Select(i => new Driver(i, NextRandom() * 100, NextRandom() * 100)).ToList();
+        var drivers = Enumerable.Range(0, Drivers).Select(i => new Driver(i, NextRandom() * MapSize, NextRandom() * MapSize)).ToList();
 
         var index = new DriverIndex();
         foreach (var d in drivers) index.Update(d);
 
         // A driver moves across a cell boundary: the next update files them under the new cell.
-        index.Update(new Driver(0, drivers[0].X + 5, drivers[0].Y));
+        index.Update(new Driver(0, drivers[0].X + Move, drivers[0].Y));
 
         int mismatches = 0;
         foreach (var rider in new[] { new Point(50, 50), new Point(1.9, 99.9), new Point(21.99, 21.99) })

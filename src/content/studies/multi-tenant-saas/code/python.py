@@ -14,10 +14,13 @@ names = ['acme', 'globex', 'initech', 'umbrella', 'hooli', 'stark', 'wayne', 'wo
 POOLED, DEDICATED = 3, 3  # shards 0..2 are shared; shard 3 belongs to the big tenant
 directory = {t: DEDICATED if t == 'acme' else fnv(t) % POOLED for t in names}  # tenant -> shard
 
-seed = 7
+SEED, BIG_TENANT_ROWS, SMALL_MIN_ROWS, SMALL_ROW_SPREAD = 7, 40, 4, 5  # small tenants have 4..8 rows
+MIN_AMOUNT, AMOUNT_SPREAD = 10, 990
+seed = SEED
 
 
 def rnd(n):
+    """Linear congruential generator (Numerical Recipes constants), high 16 bits."""
     global seed
     seed = (seed * 1664525 + 1013904223) % 4294967296
     return (seed // 65536) % n
@@ -26,9 +29,9 @@ def rnd(n):
 shards = [[], [], [], []]
 next_id = 1
 for t in names:
-    count = 40 if t == 'acme' else 4 + rnd(5)
+    count = BIG_TENANT_ROWS if t == 'acme' else SMALL_MIN_ROWS + rnd(SMALL_ROW_SPREAD)
     for _ in range(count):
-        shards[directory[t]].append({'id': next_id, 'tenant': t, 'amount': 10 + rnd(990)})
+        shards[directory[t]].append({'id': next_id, 'tenant': t, 'amount': MIN_AMOUNT + rnd(AMOUNT_SPREAD)})
         next_id += 1
 
 

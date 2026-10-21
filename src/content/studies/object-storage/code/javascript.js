@@ -3,13 +3,18 @@
 
 const K = 4, M = 2, N = K + M;                       // any K of the N shards rebuild the object
 const RACKS = N, DISKS = 8, OBJECTS = 200, ROUNDS = 20, P_DISK = 0.02, P_RACK = 0.03;
+const OBJECT_BYTES = 64, SHARD_BYTES = OBJECT_BYTES / K;
+const PLACE_SEED = 7, FAIL_SEED = 99;
+const P_LOSS = 0.01, PER_BILLION = 1e9; // durability maths: each disk lost with probability 1%
+// GF(256): 256 elements, a multiplicative group of order 255, generated modulo x^8 + x^4 + x^3 + x^2 + 1.
+const GF_SIZE = 256, GF_ORDER = GF_SIZE - 1, GF_POLY = 0x11d;
 
 // Arithmetic in GF(256): addition is XOR, multiplication goes through log and antilog tables.
-const EXP = new Array(512), LOG = new Array(256);
-for (let i = 0, x = 1; i < 255; i++) { EXP[i] = x; LOG[x] = i; x <<= 1; if (x & 256) x ^= 0x11d; }
-for (let i = 255; i < 512; i++) EXP[i] = EXP[i - 255];
+const EXP = new Array(2 * GF_SIZE), LOG = new Array(GF_SIZE);
+for (let i = 0, x = 1; i < GF_ORDER; i++) { EXP[i] = x; LOG[x] = i; x <<= 1; if (x & GF_SIZE) x ^= GF_POLY; }
+for (let i = GF_ORDER; i < 2 * GF_SIZE; i++) EXP[i] = EXP[i - GF_ORDER];
 const mul = (a, b) => (a && b ? EXP[LOG[a] + LOG[b]] : 0);
-const inv = (a) => EXP[255 - LOG[a]];
+const inv = (a) => EXP[GF_ORDER - LOG[a]];
 
 // Row s of the coding matrix: shards 0..K-1 are the data itself, the rest are Cauchy rows, so any K rows can be inverted.
 const row = (s) => Array.from({ length: K }, (_, j) => (s < K ? +(s === j) : inv(s ^ j)));
@@ -42,11 +47,11 @@ const same = (a, b) => a.length === b.length && a.every((v, i) => v === b[i]);
 function mulberry32(a) { return () => { a = (a + 0x6D2B79F5) | 0; let t = Math.imul(a ^ (a >>> 15), 1 | a); t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t; return ((t ^ (t >>> 14)) >>> 0) / 4294967296; }; }
 
 function simulate(spread) {                          // spread: one shard per rack; otherwise all shards in one rack
-  const place = mulberry32(7), fail = mulberry32(99);  // separate streams, so both layouts face the same failures
+  const place = mulberry32(PLACE_SEED), fail = mulberry32(FAIL_SEED);  // separate streams, so both layouts face the same failures
   const ri = (n) => Math.floor(place() * n);
   const pick = (rack, used) => { let d; do d = rack * DISKS + ri(DISKS); while (used.has(d)); return d; };
   const objects = Array.from({ length: OBJECTS }, () => {
-    const data = Uint8Array.from({ length: 64 }, () => ri(256)), home = ri(RACKS), used = new Set(), loc = [];
+    const data = Uint8Array.from({ length: OBJECT_BYTES }, () => ri(GF_SIZE)), home = ri(RACKS), used = new Set(), loc = [];
     for (let s = 0; s < N; s++) { const d = pick(spread ? s : home, used); used.add(d); loc.push(d); }
     return { data, shards: encode(data), loc, lost: false };
   });
@@ -63,8 +68,8 @@ function simulate(spread) {                          // spread: one shard per ra
       const data = decode(o.shards);
       if (!data) { o.lost = true; st.lost++; continue; }
       const fresh = encode(data), used = new Set(o.loc);
-      for (const s of missing) { const d = pick(Math.floor(o.loc[s] / DISKS), used); used.add(d); o.loc[s] = d; o.shards[s] = fresh[s]; st.wrote += 16; st.rebuilt++; }
-      st.read += K * 16;                             // one decode reads K shards of 16 bytes, however many shards are rebuilt
+      for (const s of missing) { const d = pick(Math.floor(o.loc[s] / DISKS), used); used.add(d); o.loc[s] = d; o.shards[s] = fresh[s]; st.wrote += SHARD_BYTES; st.rebuilt++; }
+      st.read += K * SHARD_BYTES;                             // one decode reads K shards of 16 bytes, however many shards are rebuilt
     }
   }
   for (const o of objects) if (!o.lost && !same(decode(o.shards), o.data)) throw new Error('corrupt object');
@@ -81,10 +86,10 @@ function loss(n, tol, p) {
   }
   return total;
 }
-const perBillion = (x) => Math.floor(x * 1e9 + 0.5);
+const perBillion = (x) => Math.floor(x * PER_BILLION + 0.5);
 
 // 1. Every pattern of up to M missing shards decodes; M+1 missing shards never do.
-const sample = Uint8Array.from({ length: 64 }, (_, i) => (i * 37 + 11) & 255), whole = encode(sample);
+const sample = Uint8Array.from({ length: OBJECT_BYTES }, (_, i) => (i * 37 + 11) & 255), whole = encode(sample);
 let ok = 0, fine = 0, dead = 0, tooMany = 0;
 for (let mask = 0; mask < 1 << N; mask++) {
   const gone = mask.toString(2).split('1').length - 1;
@@ -103,5 +108,5 @@ for (const spread of [true, false]) {
 
 // 3. The same durability maths for three layouts when each disk is lost with probability 1%.
 const layouts = [['3 copies', 3, 2], ['4+2', 6, 2], ['10+4', 14, 4]];
-layouts.forEach(([name, n, tol]) => console.log(`${name.padEnd(8)} loses ${perBillion(loss(n, tol, 0.01))} objects per billion`));
+layouts.forEach(([name, n, tol]) => console.log(`${name.padEnd(8)} loses ${perBillion(loss(n, tol, P_LOSS))} objects per billion`));
 if (ok !== fine || dead !== tooMany || simulate(true).lost >= simulate(false).lost) process.exit(1);

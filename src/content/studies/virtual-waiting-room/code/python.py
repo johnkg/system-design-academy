@@ -5,10 +5,13 @@ import hmac
 import sys
 
 SECRET = b'room-secret'
+TAG_HEX, PASS_TICKS = 12, 5  # tag length in hex digits; how long an entry pass stays valid
+RATE, EARLY, LOTTERY_SEED, TICKS, ARRIVALS_PER_TICK = 40, 300, 7, 20, 25
+CLIENT, RESTART_AT = 250, 5  # the client we follow, and the tick when the process restarts
 
 
 def mac(text):
-    return hmac.new(SECRET, text.encode(), hashlib.sha256).hexdigest()[:12]
+    return hmac.new(SECRET, text.encode(), hashlib.sha256).hexdigest()[:TAG_HEX]
 
 
 class WaitingRoom:
@@ -31,6 +34,7 @@ class WaitingRoom:
     # Before the sale opens, arrival time means nothing, so the pool is shuffled once (a lottery) and then numbered.
     def open(self, seed):
         s = seed
+        # Fisher-Yates shuffle driven by a linear congruential generator (Numerical Recipes constants).
         for i in range(len(self.early) - 1, 0, -1):
             s = (s * 1664525 + 1013904223) & 0xFFFFFFFF
             j = (s >> 16) % (i + 1)
@@ -62,7 +66,7 @@ class WaitingRoom:
         return self.served - before
 
     def make_pass(self, seq):
-        exp = self.tick + 5
+        exp = self.tick + PASS_TICKS
         return f'{seq}.{exp}.{mac(f"p{seq}.{exp}")}'
 
     def pass_ok(self, pass_):
@@ -74,32 +78,32 @@ def lower(flag):
     return 'true' if flag else 'false'
 
 
-room = WaitingRoom(40)
-for id_ in range(300):
+room = WaitingRoom(RATE)
+for id_ in range(EARLY):
     room.join_early(id_)
 tokens = {}
-lottery = room.open(7)
+lottery = room.open(LOTTERY_SEED)
 for id_, token in lottery:
     tokens[id_] = token
 print(f"opened with {room.next} waiting; first five in the lottery: {', '.join(str(e[0]) for e in lottery[:5])}")
-print(f'client 250: {room.status(tokens[250])}')
+print(f'client 250: {room.status(tokens[CLIENT])}')
 
 peak = 0
 pass_ = None
 crash_checked = False
-for t in range(1, 21):
-    for k in range(25):
-        tokens[300 + (t - 1) * 25 + k] = room.join()
+for t in range(1, TICKS + 1):
+    for k in range(ARRIVALS_PER_TICK):
+        tokens[EARLY + (t - 1) * ARRIVALS_PER_TICK + k] = room.join()
     peak = max(peak, room.advance())
     if t == 1:
         pass_ = room.make_pass(0)
-    if t == 5:
-        before = room.status(tokens[250])
-        room = WaitingRoom(40, room.save())                # the whole process restarts, tokens in people's browsers stay valid
-        crash_checked = before == room.status(tokens[250])
-        print(f'after a restart at tick 5, client 250: {room.status(tokens[250])}')
+    if t == RESTART_AT:
+        before = room.status(tokens[CLIENT])
+        room = WaitingRoom(RATE, room.save())                # the whole process restarts, tokens in people's browsers stay valid
+        crash_checked = before == room.status(tokens[CLIENT])
+        print(f'after a restart at tick 5, client 250: {room.status(tokens[CLIENT])}')
 
-seq, _, tag = tokens[250].partition('.')
+seq, _, tag = tokens[CLIENT].partition('.')
 forged_position = room.status(f'0.{tag}')
 flipped_tag = room.status(f"{seq}.{tag[:-1]}{'1' if tag.endswith('0') else '0'}")
 print(f'peak admitted in one tick: {peak} (limit 40)')
@@ -107,5 +111,5 @@ print(f"forged place 0 accepted: {lower(forged_position != 'invalid')}; altered 
 print(f'old pass accepted at tick {room.tick}: {lower(room.pass_ok(pass_))}; fresh pass accepted: {lower(room.pass_ok(room.make_pass(100)))}')
 everyone = all(room.status(tk) == 'admitted' for tk in tokens.values())
 print(f'all {len(tokens)} admitted in order by tick {room.tick}: {lower(everyone)}')
-if peak > 40 or not crash_checked or forged_position != 'invalid' or flipped_tag != 'invalid' or not everyone or room.pass_ok(pass_):
+if peak > RATE or not crash_checked or forged_position != 'invalid' or flipped_tag != 'invalid' or not everyone or room.pass_ok(pass_):
     sys.exit(1)

@@ -7,6 +7,7 @@ INF = float('inf')
 
 
 def shard_of(node_id):
+    """Knuth's multiplicative hash (2654435761 is about 2^32 / golden ratio)."""
     return (((node_id * 2654435761) & 0xFFFFFFFF) >> 16) % SHARDS  # the high bits of the product are well mixed
 
 
@@ -48,10 +49,12 @@ class Graph:
         return {'levels': levels, 'seen': seen, 'examined': examined, 'cross': cross}
 
 
-seed = 7
+SEED, FRIENDS_PER_USER, START, HOPS, DEGREE_CAP = 7, 3, 5, 3, 50
+seed = SEED
 
 
 def random_below(n):
+    """Linear congruential generator (Numerical Recipes constants), high 16 bits."""
     global seed
     seed = (seed * 1664525 + 1013904223) % 4294967296
     return (seed // 65536) % n
@@ -62,7 +65,7 @@ graph = Graph(N)
 for i in range(1, N):
     graph.add_edge(0, i)  # node 0 is a celebrity that everyone follows
 for i in range(1, N):
-    for _ in range(3):
+    for _ in range(FRIENDS_PER_USER):
         b = 1 + random_below(N - 1)
         if b != i:
             graph.add_edge(i, b)
@@ -76,14 +79,14 @@ def show(label, r):
     print(f"{label}: new nodes per hop [{', '.join(str(x) for x in r['levels'])}], reached {len(r['seen'])}, edges examined {r['examined']}, cross-shard {r['cross']}")
 
 
-full = graph.walk(5, 3, INF)
-capped = graph.walk(5, 3, 50)
+full = graph.walk(START, HOPS, INF)
+capped = graph.walk(START, HOPS, DEGREE_CAP)
 show('3 hops, expand everything ', full)
 show('3 hops, skip nodes over 50', capped)
 
 # Check the walk against the slow way: scan the whole edge list once per hop.
-reach = {5}
-for _ in range(3):
+reach = {START}
+for _ in range(HOPS):
     grown = set(reach)
     for a, b in graph.edges:
         if a in reach:

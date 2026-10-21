@@ -30,19 +30,23 @@ function closeOnce(a, orders) {
   return true;
 }
 
-let seed = 77;
+const SEED = 77, END_TIME = 1000, BIDDERS = 6, MAX_RAISE_STEPS = 8;
+// Time between bid rounds: 10..34 plus 12 for every extension so far.
+const MIN_GAP = 10, GAP_SPREAD = 25, SLOWDOWN_PER_EXTENSION = 12;
+let seed = SEED;
+// Linear congruential generator (Numerical Recipes constants), high 16 bits.
 const rnd = (n) => { seed = (seed * 1664525 + 1013904223) % 4294967296; return Math.floor(seed / 65536) % n; };
 
-const a = newAuction(1000);
+const a = newAuction(END_TIME);
 const stats = { ok: 0, conflict: 0, low: 0 };
 const tally = (r) => { if (r === 'ok') stats.ok++; else if (r === 'conflict') stats.conflict++; else if (r === 'too low') stats.low++; };
 let now = 0, lastPrice = START;
 while (now < a.endsAt) {
-  now += 10 + rnd(25) + a.extensions * 12;                           // bidders slow down as the fight goes on
+  now += MIN_GAP + rnd(GAP_SPREAD) + a.extensions * SLOWDOWN_PER_EXTENSION;                           // bidders slow down as the fight goes on
   if (now >= a.endsAt) break;
   const seen = a.version;                                            // two bidders read the same version at once
-  for (const bidder of [rnd(6), rnd(6)]) {
-    const max = a.price + STEP * (1 + rnd(8));
+  for (const bidder of [rnd(BIDDERS), rnd(BIDDERS)]) {
+    const max = a.price + STEP * (1 + rnd(MAX_RAISE_STEPS));
     let r = placeBid(a, bidder, max, now, seen);
     tally(r);
     if (r === 'conflict') { r = placeBid(a, bidder, max + STEP, now, a.version); tally(r); } // retry with fresh state

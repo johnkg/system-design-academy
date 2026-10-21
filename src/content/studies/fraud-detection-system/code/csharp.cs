@@ -39,15 +39,26 @@ public class Velocity
 public static class Program
 {
     // Rules are exact and explainable; the model adds a graded score from the same features. Amounts are in cents.
-    static int Rules(int count, int amount) => (count >= 3 ? 40 : 0) + (amount >= 15000 ? 20 : 0);
-    static int Model(int count, int total, int amount) => Math.Min(60, 6 * count + total / 1500 + amount / 1000);
-    static int Candidate(int count, int amount) => amount >= 8000 && count >= 1 ? 35 : 0; // new rule, evaluated in shadow
-    static string Decide(int score) => score >= 70 ? "block" : score >= 40 ? "challenge" : "allow";
+    const int VelocityCount = 3, VelocityPoints = 40, BigAmount = 15000, BigPoints = 20;
+    const int ModelCap = 60, PointsPerPayment = 6, TotalPerPoint = 1500, AmountPerPoint = 1000;
+    const int CandidateAmount = 8000, CandidatePoints = 35;
+    const int BlockAt = 70, ChallengeAt = 40, MaxScore = 100;
+    // Cost of a decision in cents: fraud that gets through a challenge, a good payment blocked, the friction of a challenge.
+    const int ChallengedFraudLoss = 300, FalseBlockCost = 2500, ChallengeFriction = 40;
+    static int Rules(int count, int amount) => (count >= VelocityCount ? VelocityPoints : 0) + (amount >= BigAmount ? BigPoints : 0);
+    static int Model(int count, int total, int amount) => Math.Min(ModelCap, PointsPerPayment * count + total / TotalPerPoint + amount / AmountPerPoint);
+    static int Candidate(int count, int amount) => amount >= CandidateAmount && count >= 1 ? CandidatePoints : 0; // new rule, evaluated in shadow
+    static string Decide(int score) => score >= BlockAt ? "block" : score >= ChallengeAt ? "challenge" : "allow";
 
     static int Price(string d, bool fraud, int amount) =>
-        fraud ? (d == "block" ? 0 : d == "challenge" ? 300 : amount) : d == "block" ? 2500 : d == "challenge" ? 40 : 0;
+        fraud ? (d == "block" ? 0 : d == "challenge" ? ChallengedFraudLoss : amount) : d == "block" ? FalseBlockCost : d == "challenge" ? ChallengeFriction : 0;
 
-    static ulong seed = 7;
+    const int Seed = 7, Seconds = 1200, EventsPerSecond = 2, Cards = 200;
+    const int TheftStart = 300, FraudPercent = 18, FraudMin = 6000, FraudSpread = 24000;
+    const int NormalMin = 500, NormalSpread = 5500;
+    const int BigSpenderEvery = 50, BigSpenderExtra = 12000; // one card in 50 also makes large purchases
+    static ulong seed = Seed;
+    // Linear congruential generator (Numerical Recipes constants), high 16 bits.
     static int Random(int n) { seed = (seed * 1664525 + 1013904223) % 4294967296; return (int)((seed / 65536) % (ulong)n); }
 
     public static int Main()
@@ -57,16 +68,16 @@ public static class Program
         int allow = 0, challenge = 0, block = 0, costLive = 0, costShadow = 0, changed = 0, caught = 0, hurt = 0;
         int fraudTotal = 0, fraudBlocked = 0, goodBlocked = 0, goodChallenged = 0;
 
-        for (int t = 0; t < 1200; t++)
+        for (int t = 0; t < Seconds; t++)
         {
-            for (int k = 0; k < 2; k++) // two events per second: a normal purchase, or a thief using a stolen card
+            for (int k = 0; k < EventsPerSecond; k++) // two events per second: a normal purchase, or a thief using a stolen card
             {
-                bool fraud = t >= 300 && Random(100) < 18;
-                int card = fraud ? stolen[Random(stolen.Length)] : Random(200);
-                int amount = fraud ? 6000 + Random(24000) : 500 + Random(5500) + (card % 50 == 9 ? Random(12000) : 0);
+                bool fraud = t >= TheftStart && Random(100) < FraudPercent;
+                int card = fraud ? stolen[Random(stolen.Length)] : Random(Cards);
+                int amount = fraud ? FraudMin + Random(FraudSpread) : NormalMin + Random(NormalSpread) + (card % BigSpenderEvery == 9 ? Random(BigSpenderExtra) : 0);
                 var (count, total) = velocity.Read(card, t);
-                int baseScore = Math.Min(100, Rules(count, amount) + Model(count, total, amount));
-                int withNew = Math.Min(100, baseScore + Candidate(count, amount));
+                int baseScore = Math.Min(MaxScore, Rules(count, amount) + Model(count, total, amount));
+                int withNew = Math.Min(MaxScore, baseScore + Candidate(count, amount));
                 string d = Decide(baseScore), dNew = Decide(withNew); // only d is acted on
                 if (d == "allow") allow++; else if (d == "challenge") challenge++; else block++;
                 if (fraud) { fraudTotal++; if (d == "block") fraudBlocked++; }
@@ -82,6 +93,6 @@ public static class Program
         Console.WriteLine($"shadow rule would change {changed} decisions: {caught} on fraud, {hurt} on good payments");
         Console.WriteLine($"loss in cents with the live rules {costLive}, with the candidate added {costShadow}");
         Console.WriteLine($"promote the candidate rule: {(costShadow < costLive ? "true" : "false")}");
-        return allow + challenge + block != 2400 || fraudBlocked > fraudTotal || caught + hurt != changed ? 1 : 0;
+        return allow + challenge + block != Seconds * EventsPerSecond || fraudBlocked > fraudTotal || caught + hurt != changed ? 1 : 0;
     }
 }

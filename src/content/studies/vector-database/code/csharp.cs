@@ -6,16 +6,21 @@ using System.Linq;
 
 const int Dim = 8, N = 2000, Lists = 16, K = 10, Queries = 50;
 
-uint seed = 7;
+const uint Seed = 7;
+const int Clusters = 24, KmeansRounds = 5, FilterNprobe = 2;
+const int MaxComponent = 255, Noise = 60; // components are bytes; a vector sits within +-60 of its cluster centre
+const int SaleEvery = 10;                 // 10% of vectors carry the filter tag
+uint seed = Seed;
+// Linear congruential generator (Numerical Recipes constants), top 24 bits.
 int Rand(int n) { seed = unchecked(seed * 1664525u + 1013904223u); return (int)((seed >> 8) % (uint)n); }
 
 int Dist(int[] a, int[] b) { int s = 0; for (int i = 0; i < Dim; i++) s += (a[i] - b[i]) * (a[i] - b[i]); return s; } // squared distance, integers only
-int[] Near(int[] c) => c.Select(x => Math.Min(255, Math.Max(0, x + Rand(121) - 60))).ToArray();
+int[] Near(int[] c) => c.Select(x => Math.Min(MaxComponent, Math.Max(0, x + Rand(2 * Noise + 1) - Noise))).ToArray();
 
-var centers = Enumerable.Range(0, 24).Select(_ => Enumerable.Range(0, Dim).Select(__ => Rand(256)).ToArray()).ToArray();
+var centers = Enumerable.Range(0, Clusters).Select(_ => Enumerable.Range(0, Dim).Select(__ => Rand(MaxComponent + 1)).ToArray()).ToArray();
 var vectors = new List<int[]>();
-for (int i = 0; i < N; i++) vectors.Add(Near(centers[Rand(24)]));
-bool OnSale(int id) => id % 10 == 0; // 10% of vectors carry the filter tag
+for (int i = 0; i < N; i++) vectors.Add(Near(centers[Rand(Clusters)]));
+bool OnSale(int id) => id % SaleEvery == 0; // 10% of vectors carry the filter tag
 
 int Closest(int[] v, List<int[]> items)
 {
@@ -26,7 +31,7 @@ int Closest(int[] v, List<int[]> items)
 
 // Training: a few rounds of k-means with integer centroids.
 var cents = Enumerable.Range(0, Lists).Select(i => (int[])vectors[i * (N / Lists)].Clone()).ToList();
-for (int round = 0; round < 5; round++)
+for (int round = 0; round < KmeansRounds; round++)
 {
     var sums = Enumerable.Range(0, Lists).Select(_ => new int[Dim]).ToArray();
     var counts = new int[Lists];
@@ -68,8 +73,8 @@ if (last != 100) return 1;
 long post = 0, during = 0, duringHits = 0;
 foreach (var q in queries)
 {
-    post += Search(q, 2).ids.Count(OnSale);                 // filter after the search: only what is left of the top 10
-    var r = Search(q, 2, OnSale); during += r.ids.Count;    // filter while scanning: the top 10 of the matching vectors
+    post += Search(q, FilterNprobe).ids.Count(OnSale);                 // filter after the search: only what is left of the top 10
+    var r = Search(q, FilterNprobe, OnSale); during += r.ids.Count;    // filter while scanning: the top 10 of the matching vectors
     var truth = Exact(q, OnSale); duringHits += r.ids.Count(i => truth.Contains(i));
 }
 Console.WriteLine($"filter 'sale' (10%), nprobe 2: after the search {Hundredths(post * 100 / Queries)} results on average, during the scan {Hundredths(during * 100 / Queries)}");

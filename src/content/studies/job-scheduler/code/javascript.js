@@ -35,13 +35,15 @@ function handle(job, worker, crashesAfterEffect) {
   if (crashesAfterEffect) throw new Error(`${worker} crashed after doing the work, before acknowledging it`);
 }
 
-const queue = new JobQueue(30, 3); // 30-second lease, at most 3 attempts
+const LEASE_SECONDS = 30, MAX_ATTEMPTS = 3;
+const END_SECONDS = 200, POLL_EVERY = 10; // the workers poll every 10 s for 200 s
+const queue = new JobQueue(LEASE_SECONDS, MAX_ATTEMPTS);
 ['invoice-1', 'invoice-2', 'poison'].forEach((id) => queue.add(id));
 
 // Script of what goes wrong: worker A dies without doing invoice-1, worker B does invoice-2 but dies before the ack.
 const crashPlan = { 'invoice-1': ['dies before starting'], 'invoice-2': ['crash after work'] };
 const log = [];
-for (let now = 0; now <= 200; now += 10) {
+for (let now = 0; now <= END_SECONDS; now += POLL_EVERY) {
   const job = queue.receive(now);
   if (!job) continue;
   const plan = crashPlan[job.id]?.[job.attempts - 1];

@@ -2,6 +2,7 @@
 // every node holds a direct list of its neighbours, so a hop is a list read. Supernodes are not expanded, and a hash splits nodes over shards.
 
 const SHARDS = 4;
+// Knuth's multiplicative hash (2654435761 is about 2^32 / golden ratio).
 const shardOf = (id) => (Math.imul(id, 2654435761) >>> 16) % SHARDS; // the high bits of the product are well mixed
 
 class Graph {
@@ -31,24 +32,26 @@ class Graph {
   }
 }
 
-let seed = 7;
+const SEED = 7, FRIENDS_PER_USER = 3, START = 5, HOPS = 3, DEGREE_CAP = 50;
+let seed = SEED;
+// Linear congruential generator (Numerical Recipes constants), high 16 bits.
 const random = (n) => { seed = (seed * 1664525 + 1013904223) % 4294967296; return Math.floor(seed / 65536) % n; };
 
 const N = 400, graph = new Graph(N);
 for (let i = 1; i < N; i++) graph.addEdge(0, i);        // node 0 is a celebrity that everyone follows
-for (let i = 1; i < N; i++) for (let j = 0; j < 3; j++) { const b = 1 + random(N - 1); if (b !== i) graph.addEdge(i, b); }
+for (let i = 1; i < N; i++) for (let j = 0; j < FRIENDS_PER_USER; j++) { const b = 1 + random(N - 1); if (b !== i) graph.addEdge(i, b); }
 
 const maxDegree = Math.max(...graph.adj.map((a) => a.length));
 console.log(`nodes ${N}, edges ${graph.edges.length}, supernode degree ${graph.degree(0)}, median degree ${graph.adj.map((a) => a.length).sort((a, b) => a - b)[N >> 1]}`);
 
 const show = (label, r) => console.log(`${label}: new nodes per hop [${r.levels.join(', ')}], reached ${r.seen.size}, edges examined ${r.examined}, cross-shard ${r.cross}`);
-const full = graph.walk(5, 3, Infinity), capped = graph.walk(5, 3, 50);
+const full = graph.walk(START, HOPS, Infinity), capped = graph.walk(START, HOPS, DEGREE_CAP);
 show('3 hops, expand everything ', full);
 show('3 hops, skip nodes over 50', capped);
 
 // Check the walk against the slow way: scan the whole edge list once per hop.
-let reach = new Set([5]);
-for (let hop = 0; hop < 3; hop++) {
+let reach = new Set([START]);
+for (let hop = 0; hop < HOPS; hop++) {
   const grown = new Set(reach);
   for (const [a, b] of graph.edges) { if (reach.has(a)) grown.add(b); if (reach.has(b)) grown.add(a); }
   reach = grown;

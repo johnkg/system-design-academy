@@ -49,16 +49,20 @@ class Platform {
   }
 }
 
-let seed = 7;
+const SEED = 7, TICKS = 400, FIRST_PR = 100, PRS = 10;
+// Each tick draws 0..99: below 6 a PR opens, below 40 a preview is visited, below 43 a PR merges, below 45 a stray host is hit.
+const OPEN_BELOW = 6, HIT_BELOW = 40, MERGE_BELOW = 43, STRAY_BELOW = 45;
+let seed = SEED;
+// Linear congruential generator (Numerical Recipes constants), high 16 bits.
 const random = (n) => { seed = (seed * 1664525 + 1013904223) % 4294967296; return Math.floor(seed / 65536) % n; };
 
 const p = new Platform();
-for (let t = 0; t < 400; t++) {
-  const r = random(100), pr = 100 + random(10);
-  if (r < 6) p.open(pr, t);
-  else if (r < 40) p.hit(`pr-${pr}.preview.example.com`, t);
-  else if (r < 43) p.merge(pr, t);
-  else if (r < 45) p.hit('www.example.com', t);
+for (let t = 0; t < TICKS; t++) {
+  const r = random(100), pr = FIRST_PR + random(PRS);
+  if (r < OPEN_BELOW) p.open(pr, t);
+  else if (r < HIT_BELOW) p.hit(`pr-${pr}.preview.example.com`, t);
+  else if (r < MERGE_BELOW) p.merge(pr, t);
+  else if (r < STRAY_BELOW) p.hit('www.example.com', t);
   p.tick(t);
   if (p.running().length > MAX_RUNNING) { console.log('quota broken'); process.exit(1); }
 }
@@ -67,5 +71,5 @@ const s = p.stats;
 console.log(`opened ${s.opened}, merged ${s.merged}, expired ${s.expired}, slept ${s.slept}, evicted ${s.evicted}, cold starts ${s.coldStarts}`);
 console.log(`served ${s.served}, not found ${s.notFound}, peak running ${s.peak}, still open ${p.envs.length}`);
 const names = new Set(p.envs.map((e) => e.ns));
-console.log(`namespaces unique: ${names.size === p.envs.length}; all within time limit: ${p.envs.every((e) => 399 - e.created < TTL)}`);
+console.log(`namespaces unique: ${names.size === p.envs.length}; all within time limit: ${p.envs.every((e) => TICKS - 1 - e.created < TTL)}`);
 if (names.size !== p.envs.length || s.peak > MAX_RUNNING || s.opened !== s.merged + s.expired + p.envs.length) process.exit(1);

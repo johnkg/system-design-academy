@@ -4,10 +4,14 @@ import sys
 
 DIM, N, LISTS, K, QUERIES = 8, 2000, 16, 10, 50
 
-seed = 7
+SEED, CLUSTERS, KMEANS_ROUNDS, FILTER_NPROBE = 7, 24, 5, 2
+MAX_COMPONENT, NOISE = 255, 60  # components are bytes; a vector sits within +-60 of its cluster centre
+SALE_EVERY = 10                 # 10% of vectors carry the filter tag
+seed = SEED
 
 
 def rand(n):
+    """Linear congruential generator (Numerical Recipes constants), top 24 bits."""
     global seed
     seed = (seed * 1664525 + 1013904223) & 0xFFFFFFFF
     return (seed >> 8) % n
@@ -18,12 +22,12 @@ def dist(a, b):  # squared distance, integers only
 
 
 def near(c):
-    return [min(255, max(0, x + rand(121) - 60)) for x in c]
+    return [min(MAX_COMPONENT, max(0, x + rand(2 * NOISE + 1) - NOISE)) for x in c]
 
 
-centers = [[rand(256) for _ in range(DIM)] for _ in range(24)]
-vectors = [near(centers[rand(24)]) for _ in range(N)]
-tags = ["sale" if i % 10 == 0 else "other" for i in range(N)]  # 10% of vectors carry the filter tag
+centers = [[rand(MAX_COMPONENT + 1) for _ in range(DIM)] for _ in range(CLUSTERS)]
+vectors = [near(centers[rand(CLUSTERS)]) for _ in range(N)]
+tags = ["sale" if i % SALE_EVERY == 0 else "other" for i in range(N)]  # 10% of vectors carry the filter tag
 
 
 def closest(v, items):
@@ -36,7 +40,7 @@ def closest(v, items):
 
 # Training: a few rounds of k-means with integer centroids.
 cents = [list(vectors[i * (N // LISTS)]) for i in range(LISTS)]
-for _ in range(5):
+for _ in range(KMEANS_ROUNDS):
     sums = [[0] * DIM for _ in range(LISTS)]
     counts = [0] * LISTS
     for v in vectors:
@@ -95,8 +99,8 @@ if last != 100:
 
 post = during = during_hits = 0
 for q in queries:
-    post += sum(1 for i in search(q, 2)[0] if on_sale(i))  # filter after the search: only what is left of the top 10
-    ids, _ = search(q, 2, on_sale)  # filter while scanning: the top 10 of the matching vectors
+    post += sum(1 for i in search(q, FILTER_NPROBE)[0] if on_sale(i))  # filter after the search: only what is left of the top 10
+    ids, _ = search(q, FILTER_NPROBE, on_sale)  # filter while scanning: the top 10 of the matching vectors
     during += len(ids)
     truth = exact(q, on_sale)
     during_hits += sum(1 for i in ids if i in truth)

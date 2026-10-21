@@ -34,7 +34,14 @@ public class Row { public bool Sent; }
 public static class Program
 {
     const int STOCK = 30, TTL = 3, BUYERS = 80, PER_TICK = 10;
-    static ulong seed = 11;
+    const int Seed = 11, Ticks = 12;
+    const int AfterAllHolds = 99; // a time when every hold has expired
+    // Buyer behaviour, in percent: who never pays, gets declined, has shipping fail, or double-clicks.
+    const int NoPayPercent = 30, DeclinePercent = 15, ShipFailPercent = 10, DoubleClickPercent = 20;
+    const int PayDelays = 5; // a buyer pays 0..4 ticks after reserving
+    const int RelayCrashPercent = 10;
+    static ulong seed = Seed;
+    // Linear congruential generator (Numerical Recipes constants), high 16 bits.
     static int Random(int n) { seed = (seed * 1664525UL + 1013904223UL) % 4294967296UL; return (int)((seed / 65536) % (ulong)n); }
 
     static readonly Inventory inv = new(STOCK);
@@ -66,12 +73,13 @@ public static class Program
         for (int i = 0; i < BUYERS; i++)
         {
             var b = new Buyer { Key = $"k{i}", Tick = i / PER_TICK };
-            b.Pays = Random(100) >= 30; b.Declined = Random(100) < 15; b.Delay = Random(5); b.ShipFails = Random(100) < 10; b.Double = Random(100) < 20;
+            b.Pays = Random(100) >= NoPayPercent; b.Declined = Random(100) < DeclinePercent; b.Delay = Random(PayDelays);
+            b.ShipFails = Random(100) < ShipFailPercent; b.Double = Random(100) < DoubleClickPercent;
             buyers.Add(b);
         }
 
         var waiting = new List<(Order Order, Buyer B, int Due)>();
-        for (int t = 0; t < 12; t++)
+        for (int t = 0; t < Ticks; t++)
         {
             inv.Expire(t).ForEach(id => SetStatus(byId[id], "EXPIRED"));
             foreach (var b in buyers.Where(x => x.Tick == t))
@@ -83,7 +91,7 @@ public static class Program
             }
             foreach (var w in waiting.Where(w => w.Due == t).ToList()) Pay(w.Order, w.B, t);
         }
-        inv.Expire(99).ForEach(id => SetStatus(byId[id], "EXPIRED")); // the buyers who never paid
+        inv.Expire(AfterAllHolds).ForEach(id => SetStatus(byId[id], "EXPIRED")); // the buyers who never paid
 
         // Row ids are 1..outbox.Count in order, so the bus can hold just the ids.
         var bus = new List<int>();
@@ -94,7 +102,7 @@ public static class Program
             {
                 if (outbox[i].Sent) continue;
                 bus.Add(i + 1);
-                if (Random(100) < 10) { crashed = true; break; }
+                if (Random(100) < RelayCrashPercent) { crashed = true; break; }
                 outbox[i].Sent = true;
             }
             if (!crashed) break;

@@ -73,23 +73,27 @@ class Platform:
         self.envs = [e for e in self.envs if now - e["created"] < TTL]
         self.stats["peak"] = max(self.stats["peak"], len(self.running()))
 
-seed = 7
+SEED, TICKS, FIRST_PR, PRS = 7, 400, 100, 10
+# Each tick draws 0..99: below 6 a PR opens, below 40 a preview is visited, below 43 a PR merges, below 45 a stray host is hit.
+OPEN_BELOW, HIT_BELOW, MERGE_BELOW, STRAY_BELOW = 6, 40, 43, 45
+seed = SEED
 
 def random(n):
+    """Linear congruential generator (Numerical Recipes constants), high 16 bits."""
     global seed
     seed = (seed * 1664525 + 1013904223) % 4294967296
     return (seed // 65536) % n
 
 p = Platform()
-for t in range(400):
-    r, pr = random(100), 100 + random(10)
-    if r < 6:
+for t in range(TICKS):
+    r, pr = random(100), FIRST_PR + random(PRS)
+    if r < OPEN_BELOW:
         p.open(pr, t)
-    elif r < 40:
+    elif r < HIT_BELOW:
         p.hit(f"pr-{pr}.preview.example.com", t)
-    elif r < 43:
+    elif r < MERGE_BELOW:
         p.merge(pr, t)
-    elif r < 45:
+    elif r < STRAY_BELOW:
         p.hit("www.example.com", t)
     p.tick(t)
     if len(p.running()) > MAX_RUNNING:
@@ -101,7 +105,7 @@ print(f"opened {s['opened']}, merged {s['merged']}, expired {s['expired']}, slep
 print(f"served {s['served']}, not found {s['not_found']}, peak running {s['peak']}, still open {len(p.envs)}")
 names = {e["ns"] for e in p.envs}
 unique = len(names) == len(p.envs)
-within = all(399 - e["created"] < TTL for e in p.envs)
+within = all(TICKS - 1 - e["created"] < TTL for e in p.envs)
 print(f"namespaces unique: {str(unique).lower()}; all within time limit: {str(within).lower()}")
 if not unique or s["peak"] > MAX_RUNNING or s["opened"] != s["merged"] + s["expired"] + len(p.envs):
     raise SystemExit(1)

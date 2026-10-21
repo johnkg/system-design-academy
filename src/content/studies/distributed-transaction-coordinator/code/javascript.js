@@ -54,7 +54,8 @@ class Coordinator {
   }
 }
 
-const shards = { A: new Shard('A', 100), B: new Shard('B', 100), C: new Shard('C', 100) };
+const OPENING_BALANCE = 100;
+const shards = { A: new Shard('A', OPENING_BALANCE), B: new Shard('B', OPENING_BALANCE), C: new Shard('C', OPENING_BALANCE) };
 const coordinator = new Coordinator(shards);
 const show = () => {
   const held = Object.values(shards).filter((s) => s.lock).map((s) => `${s.name}:${s.lock}`).join(',');
@@ -80,4 +81,4 @@ for (const [tx, deltas, crashAt] of plan) {
 console.log(`log: ${coordinator.log.join(', ')}`);
 const clean = Object.values(shards).every((s) => s.lock === null);
 console.log(`money total ${total()}, all locks released: ${clean}`);
-if (total() !== 300 || !clean || coordinator.log.some((r) => r.startsWith('abort'))) process.exit(1);
+if (total() !== OPENING_BALANCE * Object.keys(shards).length || !clean || coordinator.log.some((r) => r.startsWith('abort'))) process.exit(1);

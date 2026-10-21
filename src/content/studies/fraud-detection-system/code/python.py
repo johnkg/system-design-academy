@@ -36,32 +36,45 @@ class Velocity:
 
 
 # Rules are exact and explainable; the model adds a graded score from the same features. Amounts are in cents.
+VELOCITY_COUNT, VELOCITY_POINTS, BIG_AMOUNT, BIG_POINTS = 3, 40, 15000, 20
+MODEL_CAP, POINTS_PER_PAYMENT, TOTAL_PER_POINT, AMOUNT_PER_POINT = 60, 6, 1500, 1000
+CANDIDATE_AMOUNT, CANDIDATE_POINTS = 8000, 35
+BLOCK_AT, CHALLENGE_AT, MAX_SCORE = 70, 40, 100
+# Cost of a decision in cents: fraud that gets through a challenge, a good payment blocked, the friction of a challenge.
+CHALLENGED_FRAUD_LOSS, FALSE_BLOCK_COST, CHALLENGE_FRICTION = 300, 2500, 40
+
+
 def rules(count, total, amount):
-    return (40 if count >= 3 else 0) + (20 if amount >= 15000 else 0)
+    return (VELOCITY_POINTS if count >= VELOCITY_COUNT else 0) + (BIG_POINTS if amount >= BIG_AMOUNT else 0)
 
 
 def model(count, total, amount):
-    return min(60, 6 * count + total // 1500 + amount // 1000)
+    return min(MODEL_CAP, POINTS_PER_PAYMENT * count + total // TOTAL_PER_POINT + amount // AMOUNT_PER_POINT)
 
 
 def candidate(count, total, amount):  # new rule, evaluated in shadow
-    return 35 if amount >= 8000 and count >= 1 else 0
+    return CANDIDATE_POINTS if amount >= CANDIDATE_AMOUNT and count >= 1 else 0
 
 
 def decide(score):
-    return 'block' if score >= 70 else 'challenge' if score >= 40 else 'allow'
+    return 'block' if score >= BLOCK_AT else 'challenge' if score >= CHALLENGE_AT else 'allow'
 
 
 def price(d, fraud, amount):
     if fraud:
-        return 0 if d == 'block' else 300 if d == 'challenge' else amount
-    return 2500 if d == 'block' else 40 if d == 'challenge' else 0
+        return 0 if d == 'block' else CHALLENGED_FRAUD_LOSS if d == 'challenge' else amount
+    return FALSE_BLOCK_COST if d == 'block' else CHALLENGE_FRICTION if d == 'challenge' else 0
 
 
-seed = 7
+SEED, SECONDS, EVENTS_PER_SECOND, CARDS = 7, 1200, 2, 200
+THEFT_START, FRAUD_PERCENT, FRAUD_MIN, FRAUD_SPREAD = 300, 18, 6000, 24000
+NORMAL_MIN, NORMAL_SPREAD = 500, 5500
+BIG_SPENDER_EVERY, BIG_SPENDER_EXTRA = 50, 12000  # one card in 50 also makes large purchases
+seed = SEED
 
 
 def random(n):
+    """Linear congruential generator (Numerical Recipes constants), high 16 bits."""
     global seed
     seed = (seed * 1664525 + 1013904223) % 4294967296
     return (seed // 65536) % n
@@ -74,14 +87,15 @@ cost_live = cost_shadow = 0
 changed = caught = hurt = 0
 fraud_total = fraud_blocked = good_blocked = good_challenged = 0
 
-for t in range(1200):
-    for _ in range(2):  # two events per second: a normal purchase, or a thief using a stolen card
-        fraud = t >= 300 and random(100) < 18
-        card = stolen[random(len(stolen))] if fraud else random(200)
-        amount = 6000 + random(24000) if fraud else 500 + random(5500) + (random(12000) if card % 50 == 9 else 0)
+for t in range(SECONDS):
+    for _ in range(EVENTS_PER_SECOND):  # two events per second: a normal purchase, or a thief using a stolen card
+        fraud = t >= THEFT_START and random(100) < FRAUD_PERCENT
+        card = stolen[random(len(stolen))] if fraud else random(CARDS)
+        amount = (FRAUD_MIN + random(FRAUD_SPREAD) if fraud
+                  else NORMAL_MIN + random(NORMAL_SPREAD) + (random(BIG_SPENDER_EXTRA) if card % BIG_SPENDER_EVERY == 9 else 0))
         count, total = velocity.read(card, t)
-        base = min(100, rules(count, total, amount) + model(count, total, amount))
-        with_new = min(100, base + candidate(count, total, amount))
+        base = min(MAX_SCORE, rules(count, total, amount) + model(count, total, amount))
+        with_new = min(MAX_SCORE, base + candidate(count, total, amount))
         d, d_new = decide(base), decide(with_new)  # only d is acted on
         live[d] += 1
         fraud_total += fraud
@@ -101,5 +115,5 @@ print(f"shadow rule would change {changed} decisions: {caught} on fraud, {hurt} 
 print(f"loss in cents with the live rules {cost_live}, with the candidate added {cost_shadow}")
 promote = cost_shadow < cost_live
 print(f"promote the candidate rule: {'true' if promote else 'false'}")
-if sum(live.values()) != 2400 or fraud_blocked > fraud_total or caught + hurt != changed:
+if sum(live.values()) != SECONDS * EVENTS_PER_SECOND or fraud_blocked > fraud_total or caught + hurt != changed:
     sys.exit(1)

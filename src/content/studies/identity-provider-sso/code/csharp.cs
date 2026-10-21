@@ -16,6 +16,7 @@ public class Session { public string Sub = ""; public int Acr, AuthTime; public 
 public class Idp
 {
     public const int Ttl = 600; // token lifetime in seconds
+    public const int AcrPassword = 1, AcrMfa = 2; // authentication strength levels
     readonly string tenant;
     readonly Dictionary<string, Session> sessions = new();
     readonly List<Key> keys = new();
@@ -33,10 +34,10 @@ public class Idp
     public string Login(string sub, int now, bool mfa)
     {
         string sid = $"{tenant}-s{next++}";
-        sessions[sid] = new Session { Sub = sub, Acr = mfa ? 2 : 1, AuthTime = now };
+        sessions[sid] = new Session { Sub = sub, Acr = mfa ? AcrMfa : AcrPassword, AuthTime = now };
         return sid;
     }
-    public void StepUp(string sid, int now) { var s = sessions[sid]; s.Acr = 2; s.AuthTime = now; }
+    public void StepUp(string sid, int now) { var s = sessions[sid]; s.Acr = AcrMfa; s.AuthTime = now; }
     public string? Issue(string sid, string aud, int now)
     {
         if (!sessions.TryGetValue(sid, out var s)) return null;
@@ -54,10 +55,11 @@ public class Idp
 }
 public class Rp // a relying party: an application that trusts one IdP
 {
+    const int NoMaxAge = 1000000; // seconds since the last login
     readonly string aud; readonly Idp idp; readonly HashSet<string> revoked = new();
     public Rp(string aud, Idp idp) { this.aud = aud; this.idp = idp; }
     public void Revoke(string sid) => revoked.Add(sid); // the back-channel logout endpoint
-    public string Check(string token, int now, int minAcr = 1, int maxAge = 1000000)
+    public string Check(string token, int now, int minAcr = Idp.AcrPassword, int maxAge = NoMaxAge)
     {
         var f = token.Split('|');
         if (!idp.Jwks(now).TryGetValue(f[0], out var secret)) return "unknown_kid"; // a real RP refetches its key set on an unknown kid
@@ -71,6 +73,7 @@ public class Rp // a relying party: an application that trusts one IdP
 }
 public static class Program
 {
+    const int AdminMaxAge = 300; // seconds since the last login
     static int fails = 0;
     static void Expect(string label, string got, string want) { Console.WriteLine($"{label}: {got}"); fails += got == want ? 0 : 1; }
     public static int Main()
@@ -80,11 +83,11 @@ public static class Program
         var rps = new Dictionary<string, Rp> { ["mail"] = mail, ["wiki"] = wiki };
         string sid = acme.Login("alice", 0, false);
         Expect("mail at 100", mail.Check(acme.Issue(sid, "mail", 100)!, 100), "ok");
-        Expect("admin page at 150 (needs mfa)", wiki.Check(acme.Issue(sid, "wiki", 150)!, 150, 2, 300), "step_up_required");
+        Expect("admin page at 150 (needs mfa)", wiki.Check(acme.Issue(sid, "wiki", 150)!, 150, Idp.AcrMfa, AdminMaxAge), "step_up_required");
         acme.StepUp(sid, 160);
         string admin = acme.Issue(sid, "wiki", 160)!;
-        Expect("admin page at 170 after mfa", wiki.Check(admin, 170, 2, 300), "ok");
-        Expect("admin page at 500 (mfa too old)", wiki.Check(admin, 500, 2, 300), "step_up_required");
+        Expect("admin page at 170 after mfa", wiki.Check(admin, 170, Idp.AcrMfa, AdminMaxAge), "ok");
+        Expect("admin page at 500 (mfa too old)", wiki.Check(admin, 500, Idp.AcrMfa, AdminMaxAge), "step_up_required");
 
         string old = acme.Issue(sid, "mail", 900)!;
         acme.Rotate(1000);

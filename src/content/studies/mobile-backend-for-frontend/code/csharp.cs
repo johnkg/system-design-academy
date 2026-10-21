@@ -20,10 +20,14 @@ static class Bff
         new("inbox", false, 1, 80, 15, 30),
     };
     const int RawExtra = 300; // bytes each service returns that this screen never shows
+    const int ShownBytes = 12; // bytes of each service's reply that the screen does show
+    const int HangPercent = 3, HangMs = 2000;
 
-    static long seed = 7;
+    const int Seed = 7;
+    static long seed = Seed;
+    // Linear congruential generator (Numerical Recipes constants), high 16 bits.
     static int Rnd(int n) { seed = (seed * 1664525 + 1013904223) % 4294967296; return (int)((seed / 65536) % n); }
-    static int Latency(Service s) { int l = s.Base + Rnd(s.Spread); return Rnd(100) < 3 ? 2000 : l; } // 3% of calls hang
+    static int Latency(Service s) { int l = s.Base + Rnd(s.Spread); return Rnd(100) < HangPercent ? HangMs : l; } // 3% of calls hang
 
     // FNV-1a, 32 bits: a cheap stand-in for the hash behind an ETag.
     public static string EtagOf(string text)
@@ -42,7 +46,7 @@ static class Bff
         int raw = 0; bool failedRequired = false;
         foreach (var (s, ms) in calls)
         {
-            if (ms <= s.Timeout) { parts.Add($"{s.Name}={(user * 7 + s.Name.Length) % 100}"); raw += RawExtra + 12; }
+            if (ms <= s.Timeout) { parts.Add($"{s.Name}={(user * 7 + s.Name.Length) % 100}"); raw += RawExtra + ShownBytes; }
             else if (s.Required) failedRequired = true;
             else degraded.Add(s.Name);
         }
@@ -58,12 +62,13 @@ class Program
     static int Main()
     {
         const int N = 200;
+        const int Users = 20, NewVersion = 3, OldVersion = 2, P95BudgetMs = 150;
         var last = new Dictionary<int, string>();
         var times = new List<int>(); var seq = new List<int>();
         int ok = 0, partial = 0, errors = 0, notModified = 0, shaped = 0, wire = 0, raw = 0;
         for (int i = 0; i < N; i++)
         {
-            int user = i % 20, version = i % 2 == 0 ? 3 : 2;
+            int user = i % Users, version = i % 2 == 0 ? NewVersion : OldVersion;
             var r = Bff.Handle(user, version);
             times.Add(r.Parallel); seq.Add(r.Sequential);
             if (r.Status != 200) { errors++; continue; }
@@ -79,7 +84,7 @@ class Program
         Console.WriteLine($"parallel mean {Mean(times)} ms, p95 {p95} ms; one after another would average {Mean(seq)} ms");
         Console.WriteLine($"not modified {notModified}; bytes: {raw} from the services, {shaped} after shaping, {wire} on the wire");
         Console.WriteLine($"ETag of 'a=1': {Bff.EtagOf("a=1")}");
-        bool good = p95 <= 150 && Mean(seq) > Mean(times) && shaped < raw && wire < shaped && ok + errors == N && notModified > 0;
+        bool good = p95 <= P95BudgetMs && Mean(seq) > Mean(times) && shaped < raw && wire < shaped && ok + errors == N && notModified > 0;
         return good ? 0 : 1;
     }
 }

@@ -1,12 +1,16 @@
 // A tiny feature store in JavaScript:
 // one feature definition feeds an offline log and an online store, and training labels are joined "as of" their own time.
 
-let seed = 7;
+const SEED = 7, EVENTS = 300, USERS = 6, MAX_GAP = 5, MAX_AMOUNT = 100;
+const SWAP_EVERY = 3; // every 3rd pair of online writes arrives swapped
+const LABELS = 40, LABEL_MIN_TS = 50, LABEL_SPREAD = 700;
+let seed = SEED;
+// Linear congruential generator (Numerical Recipes constants), high 16 bits.
 const random = (n) => { seed = (seed * 1664525 + 1013904223) % 4294967296; return Math.floor(seed / 65536) % n; };
 
 // Raw purchase events: the source of truth. Time only moves forward.
 const events = [];
-for (let i = 0, t = 0; i < 300; i++) { t += 1 + random(5); events.push({ user: random(6), ts: t, amount: 1 + random(100) }); }
+for (let i = 0, t = 0; i < EVENTS; i++) { t += 1 + random(MAX_GAP); events.push({ user: random(USERS), ts: t, amount: 1 + random(MAX_AMOUNT) }); }
 
 // The single feature definition: per user, total spend and purchase count so far.
 // The offline log and the online store both use it, so they cannot drift apart.
@@ -25,7 +29,7 @@ const offline = computeRows(events); // append-only history of every feature val
 // Online store: only the newest value per user. Delivery is out of order here, so a write with an older time is ignored.
 const online = new Map();
 const delivery = offline.slice();
-for (let i = 0; i + 1 < delivery.length; i += 3) [delivery[i], delivery[i + 1]] = [delivery[i + 1], delivery[i]];
+for (let i = 0; i + 1 < delivery.length; i += SWAP_EVERY) [delivery[i], delivery[i + 1]] = [delivery[i + 1], delivery[i]];
 for (const r of delivery) { const cur = online.get(r.user); if (!cur || r.ts >= cur.ts) online.set(r.user, r); }
 
 // Point-in-time join: the last row of this user whose time is at or before the label time (binary search).
@@ -41,7 +45,7 @@ const latest = (user) => online.get(user);
 // Ground truth, recomputed from the raw events seen up to the label time.
 const truth = (user, ts) => events.filter((e) => e.user === user && e.ts <= ts).reduce((a, e) => ({ sum: a.sum + e.amount, count: a.count + 1 }), { sum: 0, count: 0 });
 
-const labels = Array.from({ length: 40 }, () => ({ user: random(6), ts: 50 + random(700) }));
+const labels = Array.from({ length: LABELS }, () => ({ user: random(USERS), ts: LABEL_MIN_TS + random(LABEL_SPREAD) }));
 let naiveWrong = 0, pitWrong = 0;
 for (const l of labels) {
   const t = truth(l.user, l.ts), p = asOf(l.user, l.ts), n = latest(l.user);

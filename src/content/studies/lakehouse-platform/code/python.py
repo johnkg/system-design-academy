@@ -51,10 +51,14 @@ class Table:
                 del self.store[n]
 
 
-seed = 7
+SEED, ROUNDS, WRITERS, MIN_ROWS, ROW_SPREAD = 7, 12, 3, 10, 40
+SMALL_FILE_ROWS = 30  # compaction merges files smaller than this
+APPEND_ROWS, DELETED_ROWS, KEEP_SNAPSHOTS, OLD_VERSION = 25, 5, 3, 3
+seed = SEED
 
 
 def rnd(n):
+    """Linear congruential generator (Numerical Recipes constants), top 24 bits."""
     global seed
     seed = (seed * 1664525 + 1013904223) & 0xFFFFFFFF
     return (seed >> 8) % n
@@ -75,11 +79,11 @@ def done(tx):
     history.append(t.total(t.head))
 
 
-for _ in range(12):  # three writers start from the same snapshot every round
+for _ in range(ROUNDS):  # three writers start from the same snapshot every round
     txs = []
-    for _ in range(3):
+    for _ in range(WRITERS):
         tx = t.begin()
-        tx['rows'] = 10 + rnd(40)
+        tx['rows'] = MIN_ROWS + rnd(ROW_SPREAD)
         tx['add'].append(t.new_file(tx['rows']))
         txs.append(tx)
     for tx in txs:
@@ -90,7 +94,7 @@ print(f"appends: version {t.head}, {len(t.snaps[t.head])} files, {t.total(t.head
 
 def plan():  # merge every small file into one
     tx = t.begin()
-    small = [f for f in t.snaps[tx['base']] if f[1] < 30]
+    small = [f for f in t.snaps[tx['base']] if f[1] < SMALL_FILE_ROWS]
     tx['remove'] = [n for n, _ in small]
     tx['add'].append(t.new_file(sum(r for _, r in small)))
     return tx
@@ -98,15 +102,15 @@ def plan():  # merge every small file into one
 
 compaction = plan()
 append = t.begin()
-append['add'].append(t.new_file(25))
+append['add'].append(t.new_file(APPEND_ROWS))
 delete = t.begin()
 victim = compaction['remove'][0]
 delete['remove'] = [victim]
-delete['add'].append(t.new_file(t.store[victim] - 5))
+delete['add'].append(t.new_file(t.store[victim] - DELETED_ROWS))
 done(append)
-expected += 25
+expected += APPEND_ROWS
 done(delete)
-expected -= 5
+expected -= DELETED_ROWS
 conflicts = 0
 while not t.commit(compaction)[0]:
     conflicts += 1
@@ -115,11 +119,11 @@ history.append(t.total(t.head))
 print(f"compaction: {conflicts} conflict, version {t.head}, {len(t.snaps[t.head])} files, {t.total(t.head)} rows")
 
 before = len(t.store)
-t.vacuum(3)
+t.vacuum(KEEP_SNAPSHOTS)
 print(f"vacuum: {before} stored files -> {len(t.store)}")
 expired = False
 try:
-    t.total(3)
+    t.total(OLD_VERSION)
 except ValueError:
     expired = True
 travel = all(t.total(v) == history[v] for v in (t.head - 2, t.head - 1, t.head))

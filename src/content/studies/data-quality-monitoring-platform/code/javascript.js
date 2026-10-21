@@ -11,7 +11,8 @@ const WEEKEND_FIRST_DAY = 5, WEEKEND_PERCENT = 40; // days 5 and 6 are the weeke
 const NOISE_MIN_PER_MILLE = 950, NOISE_STEPS = 101, PER_MILLE = 1000; // a factor of 0.950..1.050
 // Incidents in the last week: an outage on day 2, 13:00-16:00, and a double load on day 4 at 03:00.
 const OUTAGE_DAY = 2, OUTAGE_FIRST_HOUR = 13, OUTAGE_LAST_HOUR = 16, OUTAGE_PERCENT = 35;
-const DOUBLE_LOAD_DAY = 4, DOUBLE_LOAD_HOUR = 3, DOUBLE_LOAD_FACTOR = 4;
+// The incident: on this day and hour of the last week, a re-run job leaves four times the usual rows.
+const RERUN_DAY = 4, RERUN_HOUR = 3, RERUN_FACTOR = 4;
 const NAIVE_SIGMAS = 3, SEASONAL_SIGMAS = 4;
 const MAD_TO_SIGMA_X100 = 148, MIN_SIGMA_PERCENT = 3; // sigma = 1.48 * MAD, at least 3% of the median
 const FIXED_FLOOR = 200;
@@ -30,7 +31,7 @@ for (let t = 0; t < HOURS_PER_WEEK * WEEKS; t++) {
     // A source stops sending.
     v = Math.floor((v * OUTAGE_PERCENT) / 100); bad = true;
   }
-  if (week === WEEKS - 1 && day === DOUBLE_LOAD_DAY && hour === DOUBLE_LOAD_HOUR) { v *= DOUBLE_LOAD_FACTOR; bad = true; } // a job loads the data twice
+  if (week === WEEKS - 1 && day === RERUN_DAY && hour === RERUN_HOUR) { v *= RERUN_FACTOR; bad = true; } // a job is re-run by mistake and loads the same rows again
   series.push(v); incident.push(bad);
 }
 

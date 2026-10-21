@@ -65,19 +65,23 @@ public class Platform
 
 public static class Program
 {
-    static long seed = 7;
+    const int Seed = 7, Ticks = 400, FirstPr = 100, Prs = 10;
+    // Each tick draws 0..99: below 6 a PR opens, below 40 a preview is visited, below 43 a PR merges, below 45 a stray host is hit.
+    const int OpenBelow = 6, HitBelow = 40, MergeBelow = 43, StrayBelow = 45;
+    static long seed = Seed;
+    // Linear congruential generator (Numerical Recipes constants), high 16 bits.
     static int Random(int n) { seed = (seed * 1664525 + 1013904223) % 4294967296; return (int)((seed / 65536) % n); }
 
     public static int Main()
     {
         var p = new Platform();
-        for (int t = 0; t < 400; t++)
+        for (int t = 0; t < Ticks; t++)
         {
-            int r = Random(100), pr = 100 + Random(10);
-            if (r < 6) p.Open(pr, t);
-            else if (r < 40) p.Hit($"pr-{pr}.preview.example.com", t);
-            else if (r < 43) p.Merge(pr, t);
-            else if (r < 45) p.Hit("www.example.com", t);
+            int r = Random(100), pr = FirstPr + Random(Prs);
+            if (r < OpenBelow) p.Open(pr, t);
+            else if (r < HitBelow) p.Hit($"pr-{pr}.preview.example.com", t);
+            else if (r < MergeBelow) p.Merge(pr, t);
+            else if (r < StrayBelow) p.Hit("www.example.com", t);
             p.Tick(t);
             if (p.Running().Count > Platform.MaxRunning) { Console.WriteLine("quota broken"); return 1; }
         }
@@ -85,7 +89,7 @@ public static class Program
         Console.WriteLine($"opened {p.Opened}, merged {p.Merged}, expired {p.Expired}, slept {p.Slept}, evicted {p.Evicted}, cold starts {p.ColdStarts}");
         Console.WriteLine($"served {p.Served}, not found {p.NotFound}, peak running {p.Peak}, still open {p.Envs.Count}");
         bool unique = p.Envs.Select(e => e.Ns).Distinct().Count() == p.Envs.Count;
-        bool within = p.Envs.All(e => 399 - e.Created < Platform.Ttl);
+        bool within = p.Envs.All(e => Ticks - 1 - e.Created < Platform.Ttl);
         Console.WriteLine($"namespaces unique: {unique.ToString().ToLower()}; all within time limit: {within.ToString().ToLower()}");
         return !unique || p.Peak > Platform.MaxRunning || p.Opened != p.Merged + p.Expired + p.Envs.Count ? 1 : 0;
     }

@@ -5,22 +5,26 @@ using System.Collections.Generic;
 using System.Linq;
 
 const int Start = Auction.Start, Step = Auction.Step;
-ulong seed = 77;
+const int Seed = 77, EndTime = 1000, Bidders = 6, MaxRaiseSteps = 8;
+// Time between bid rounds: 10..34 plus 12 for every extension so far.
+const int MinGap = 10, GapSpread = 25, SlowdownPerExtension = 12;
+ulong seed = Seed;
+// Linear congruential generator (Numerical Recipes constants), high 16 bits.
 int Rnd(int n) { seed = (seed * 1664525 + 1013904223) % 4294967296; return (int)((seed / 65536) % (ulong)n); }
 
-var a = new Auction { EndsAt = 1000 };
+var a = new Auction { EndsAt = EndTime };
 int ok = 0, conflicts = 0, low = 0;
 void Tally(string r) { if (r == "ok") ok++; else if (r == "conflict") conflicts++; else if (r == "too low") low++; }
 
 int now = 0, lastPrice = Start;
 while (now < a.EndsAt)
 {
-    now += 10 + Rnd(25) + a.Extensions * 12;                 // bidders slow down as the fight goes on
+    now += MinGap + Rnd(GapSpread) + a.Extensions * SlowdownPerExtension;                 // bidders slow down as the fight goes on
     if (now >= a.EndsAt) break;
     int seen = a.Version;                                    // two bidders read the same version at once
-    foreach (int bidder in new[] { Rnd(6), Rnd(6) })
+    foreach (int bidder in new[] { Rnd(Bidders), Rnd(Bidders) })
     {
-        int max = a.Price + Step * (1 + Rnd(8));
+        int max = a.Price + Step * (1 + Rnd(MaxRaiseSteps));
         string r = a.PlaceBid(bidder, max, now, seen);
         Tally(r);
         if (r == "conflict") { r = a.PlaceBid(bidder, max + Step, now, a.Version); Tally(r); } // retry with fresh state

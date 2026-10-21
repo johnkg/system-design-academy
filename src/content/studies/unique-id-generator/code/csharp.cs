@@ -8,6 +8,7 @@ public class IdGenerator
     public const long Epoch = 1735689600000L; // 1 January 2025, so the 41 time bits last about 69 years from there
     const int MachineBits = 10, SequenceBits = 12;
     const long MaxSequence = (1L << SequenceBits) - 1; // 4095
+    const long MaxMachine = (1L << MachineBits) - 1;   // 1023
 
     readonly long machine;
     readonly Func<long> clock;
@@ -33,7 +34,7 @@ public class IdGenerator
         return ((now - Epoch) << (MachineBits + SequenceBits)) | (machine << SequenceBits) | sequence;
     }
 
-    public static (long Ms, long Machine, long Sequence) Decode(long id) => (id >> (MachineBits + SequenceBits), (id >> SequenceBits) & 1023, id & MaxSequence);
+    public static (long Ms, long Machine, long Sequence) Decode(long id) => (id >> (MachineBits + SequenceBits), (id >> SequenceBits) & MaxMachine, id & MaxSequence);
 }
 
 public static class Program
@@ -41,7 +42,9 @@ public static class Program
     public static int Main()
     {
         // A clock we control, so the run is the same every time.
-        long time = IdGenerator.Epoch + 1000;
+        const int StartOffset = 1000, ClockBackMs = 5; // the demo clock starts 1 s after the epoch
+        const int Burst = 4097;                        // one more ID than fits in a millisecond
+        long time = IdGenerator.Epoch + StartOffset;
         Func<long> clock = () => time;
         Action sleep = () => { time += 1; };
 
@@ -56,15 +59,15 @@ public static class Program
 
         var seen = new HashSet<long>(ids);
         time += 1;
-        for (int i = 0; i < 4097; i++) seen.Add(a.Next()); // more than 4096 in one millisecond
-        long spill = IdGenerator.Decode(a.Next()).Ms - 1001; // how many milliseconds after the busy one the generator is now
+        for (int i = 0; i < Burst; i++) seen.Add(a.Next()); // more than 4096 in one millisecond
+        long spill = IdGenerator.Decode(a.Next()).Ms - (StartOffset + 1); // how many milliseconds after the busy one the generator is now
         Console.WriteLine($"{seen.Count} distinct IDs from two machines; the 4,097th ID of one millisecond was issued {spill} ms later, after waiting");
 
         bool refused = false;
-        time -= 5; // the clock is set back by 5 ms
+        time -= ClockBackMs; // the clock is set back by 5 ms
         try { a.Next(); } catch (InvalidOperationException e) { refused = true; Console.WriteLine($"clock set back: {e.Message}"); }
 
         bool increasing = ids[0] < ids[1] && ids[2] < ids[3];
-        return !increasing || seen.Count != 4 + 4097 || spill != 1 || !refused ? 1 : 0;
+        return !increasing || seen.Count != ids.Length + Burst || spill != 1 || !refused ? 1 : 0;
     }
 }

@@ -2,6 +2,8 @@
 // drivers are filed under the grid cell they are in, so a search only looks at nearby cells instead of every driver.
 
 const CELL = 2; // cell size, in the same units as the coordinates (think of 2 km)
+const MAX_RING = 50; // give up after this many rings
+const SEED = 42, DRIVERS = 2000, MAP_SIZE = 100, MOVE = 5; // MOVE is enough to cross a cell boundary
 
 const cellOf = (v) => Math.floor(v / CELL);
 const distance = (a, b) => Math.hypot(a.x - b.x, a.y - b.y);
@@ -26,7 +28,7 @@ class DriverIndex {
 
   // Search ring by ring around the rider's cell. Ring 0 is the rider's own cell, ring 1 the 8 cells around it, and so on.
   // Every cell in ring k is at least (k - 1) * CELL away, so once the best driver found is closer than that, stop.
-  nearest(rider, maxRing = 50) {
+  nearest(rider, maxRing = MAX_RING) {
     const cx = cellOf(rider.x), cy = cellOf(rider.y);
     let best = null, bestDistance = Infinity, examined = 0;
     for (let k = 0; k <= maxRing; k++) {
@@ -49,15 +51,16 @@ class DriverIndex {
 }
 
 // A reproducible set of 2,000 drivers on a 100 x 100 map.
-let seed = 42;
+let seed = SEED;
+// Linear congruential generator (Numerical Recipes constants), scaled to [0, 1).
 const random = () => ((seed = (seed * 1664525 + 1013904223) % 4294967296) / 4294967296);
-const drivers = Array.from({ length: 2000 }, (_, i) => ({ id: i, x: random() * 100, y: random() * 100 }));
+const drivers = Array.from({ length: DRIVERS }, (_, i) => ({ id: i, x: random() * MAP_SIZE, y: random() * MAP_SIZE }));
 
 const index = new DriverIndex();
 drivers.forEach((d) => index.update(d));
 
 // A driver moves across a cell boundary: the next update files them under the new cell.
-index.update({ id: 0, x: drivers[0].x + 5, y: drivers[0].y });
+index.update({ id: 0, x: drivers[0].x + MOVE, y: drivers[0].y });
 
 let mismatches = 0;
 for (const rider of [{ x: 50, y: 50 }, { x: 1.9, y: 99.9 }, { x: 21.99, y: 21.99 }]) {

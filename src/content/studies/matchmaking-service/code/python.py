@@ -3,10 +3,13 @@
 # when their rating gap fits inside both windows. We compare a fixed window with a widening one.
 import sys
 
-seed = 7
+SEED, MIN_RATING, DIE_SIDES = 7, 400, 600  # a rating is 400 plus three draws of 0..599
+PLAYERS, DRAIN_SECONDS = 600, 120  # one player joins per second, then the queue drains
+seed = SEED
 
 
 def random(n):
+    """Linear congruential generator (Numerical Recipes constants), high 16 bits."""
     global seed
     seed = (seed * 1664525 + 1013904223) % 4294967296
     return (seed // 65536) % n
@@ -14,7 +17,7 @@ def random(n):
 
 # Ratings come from the sum of three dice, so most players are near the middle and a few are far out.
 def make_ratings(count):
-    return [400 + random(600) + random(600) + random(600) for _ in range(count)]
+    return [MIN_RATING + random(DIE_SIDES) + random(DIE_SIDES) + random(DIE_SIDES) for _ in range(count)]
 
 
 # The window is the base plus a step for each second waited, up to a cap. A step of 0 gives a fixed window.
@@ -63,12 +66,12 @@ def schedule(policy):
     return ' '.join(f'{w}s:{window_of(policy, w)}' for w in [0, 5, 20, 40])
 
 
-ratings = make_ratings(600)
+ratings = make_ratings(PLAYERS)
 policies = [
     {'name': 'fixed', 'base': 25, 'step': 0, 'cap': 25},
     {'name': 'widening', 'base': 25, 'step': 10, 'cap': 400},
 ]
-results = [(p, simulate(p, ratings, 600, 120)) for p in policies]
+results = [(p, simulate(p, ratings, PLAYERS, DRAIN_SECONDS)) for p in policies]
 for p, r in results:
     avg_gap = r['gap_sum'] // r['matched']
     avg_wait = r['wait_sum'] // (2 * r['matched'])
@@ -76,7 +79,7 @@ for p, r in results:
 print(f'widening window by wait: {schedule(policies[1])}')
 fixed, widening = results[0][1], results[1][1]
 print(f"widening finds {widening['matched'] - fixed['matched']} more matches and leaves {fixed['left'] - widening['left']} fewer players waiting")
-if 2 * widening['matched'] + widening['left'] != 600 or 2 * fixed['matched'] + fixed['left'] != 600:
+if 2 * widening['matched'] + widening['left'] != PLAYERS or 2 * fixed['matched'] + fixed['left'] != PLAYERS:
     sys.exit(1)
 if widening['matched'] <= fixed['matched'] or fixed['max_wait'] < widening['max_wait']:
     sys.exit(1)

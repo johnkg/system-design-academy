@@ -55,14 +55,16 @@ def handle(job, worker, crashes_after_effect):
         raise RuntimeError(f'{worker} crashed after doing the work, before acknowledging it')
 
 
-queue = JobQueue(30, 3)  # 30-second lease, at most 3 attempts
+LEASE_SECONDS, MAX_ATTEMPTS = 30, 3
+END_SECONDS, POLL_EVERY = 200, 10  # the workers poll every 10 s for 200 s
+queue = JobQueue(LEASE_SECONDS, MAX_ATTEMPTS)
 for job_id in ['invoice-1', 'invoice-2', 'poison']:
     queue.add(job_id)
 
 # Script of what goes wrong: worker A dies without doing invoice-1, worker B does invoice-2 but dies before the ack.
 crash_plan = {'invoice-1': ['dies before starting'], 'invoice-2': ['crash after work']}
 log = []
-for now in range(0, 201, 10):
+for now in range(0, END_SECONDS + 1, POLL_EVERY):
     job = queue.receive(now)
     if job is None:
         continue

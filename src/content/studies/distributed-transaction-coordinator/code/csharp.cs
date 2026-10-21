@@ -5,7 +5,8 @@ using System;
 using System.Collections.Generic;
 using System.Linq;
 
-var shards = new Dictionary<string, Shard> { ["A"] = new Shard("A", 100), ["B"] = new Shard("B", 100), ["C"] = new Shard("C", 100) };
+const int OpeningBalance = 100;
+var shards = new Dictionary<string, Shard> { ["A"] = new Shard("A", OpeningBalance), ["B"] = new Shard("B", OpeningBalance), ["C"] = new Shard("C", OpeningBalance) };
 var coordinator = new Coordinator(shards);
 
 void Show()
@@ -36,7 +37,7 @@ foreach (var (tx, deltas, crashAt) in plan)
 Console.WriteLine($"log: {string.Join(", ", coordinator.Log)}");
 bool clean = shards.Values.All(s => s.Lock == null);
 Console.WriteLine($"money total {Total()}, all locks released: {(clean ? "true" : "false")}");
-if (Total() != 300 || !clean || coordinator.Log.Any(r => r.StartsWith("abort"))) Environment.Exit(1);
+if (Total() != OpeningBalance * shards.Count || !clean || coordinator.Log.Any(r => r.StartsWith("abort"))) Environment.Exit(1);
 
 class Shard
 {

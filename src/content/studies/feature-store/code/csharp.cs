@@ -4,12 +4,16 @@ using System;
 using System.Collections.Generic;
 using System.Linq;
 
-ulong seed = 7;
+const int Seed = 7, Events = 300, Users = 6, MaxGap = 5, MaxAmount = 100;
+const int SwapEvery = 3; // every 3rd pair of online writes arrives swapped
+const int Labels = 40, LabelMinTs = 50, LabelSpread = 700;
+ulong seed = Seed;
+// Linear congruential generator (Numerical Recipes constants), high 16 bits.
 int Random(int n) { seed = (seed * 1664525UL + 1013904223UL) % 4294967296UL; return (int)((seed / 65536UL) % (ulong)n); }
 
 // Raw purchase events: the source of truth. Time only moves forward.
 var events = new List<Ev>();
-for (int i = 0, t = 0; i < 300; i++) { t += 1 + Random(5); int u = Random(6); int a = 1 + Random(100); events.Add(new Ev(u, t, a)); }
+for (int i = 0, t = 0; i < Events; i++) { t += 1 + Random(MaxGap); int u = Random(Users); int a = 1 + Random(MaxAmount); events.Add(new Ev(u, t, a)); }
 
 // The single feature definition: per user, total spend and purchase count so far.
 // The offline log and the online store both use it, so they cannot drift apart.
@@ -32,7 +36,7 @@ var offline = ComputeRows(events); // append-only history of every feature value
 // Online store: only the newest value per user. Delivery is out of order here, so a write with an older time is ignored.
 var online = new Dictionary<int, Row>();
 var delivery = offline.ToList();
-for (int i = 0; i + 1 < delivery.Count; i += 3) (delivery[i], delivery[i + 1]) = (delivery[i + 1], delivery[i]);
+for (int i = 0; i + 1 < delivery.Count; i += SwapEvery) (delivery[i], delivery[i + 1]) = (delivery[i + 1], delivery[i]);
 foreach (var r in delivery) { if (!online.TryGetValue(r.User, out var cur) || r.Ts >= cur.Ts) online[r.User] = r; }
 
 // Point-in-time join: the last row of this user whose time is at or before the label time (binary search).
@@ -54,7 +58,7 @@ foreach (var r in delivery) { if (!online.TryGetValue(r.User, out var cur) || r.
 }
 
 var labels = new List<(int User, int Ts)>();
-for (int i = 0; i < 40; i++) { int u = Random(6); int t = 50 + Random(700); labels.Add((u, t)); }
+for (int i = 0; i < Labels; i++) { int u = Random(Users); int t = LabelMinTs + Random(LabelSpread); labels.Add((u, t)); }
 int naiveWrong = 0, pitWrong = 0;
 foreach (var l in labels)
 {

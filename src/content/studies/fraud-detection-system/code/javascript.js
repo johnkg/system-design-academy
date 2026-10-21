@@ -22,12 +22,23 @@ class Velocity {
 }
 
 // Rules are exact and explainable; the model adds a graded score from the same features. Amounts are in cents.
-const rules = (f) => (f.count >= 3 ? 40 : 0) + (f.amount >= 15000 ? 20 : 0);
-const model = (f) => Math.min(60, 6 * f.count + Math.floor(f.total / 1500) + Math.floor(f.amount / 1000));
-const candidate = (f) => (f.amount >= 8000 && f.count >= 1 ? 35 : 0); // new rule, evaluated in shadow
-const decide = (score) => (score >= 70 ? 'block' : score >= 40 ? 'challenge' : 'allow');
+const VELOCITY_COUNT = 3, VELOCITY_POINTS = 40, BIG_AMOUNT = 15000, BIG_POINTS = 20;
+const MODEL_CAP = 60, POINTS_PER_PAYMENT = 6, TOTAL_PER_POINT = 1500, AMOUNT_PER_POINT = 1000;
+const CANDIDATE_AMOUNT = 8000, CANDIDATE_POINTS = 35;
+const BLOCK_AT = 70, CHALLENGE_AT = 40, MAX_SCORE = 100;
+// Cost of a decision in cents: fraud that gets through a challenge, a good payment blocked, the friction of a challenge.
+const CHALLENGED_FRAUD_LOSS = 300, FALSE_BLOCK_COST = 2500, CHALLENGE_FRICTION = 40;
+const rules = (f) => (f.count >= VELOCITY_COUNT ? VELOCITY_POINTS : 0) + (f.amount >= BIG_AMOUNT ? BIG_POINTS : 0);
+const model = (f) => Math.min(MODEL_CAP, POINTS_PER_PAYMENT * f.count + Math.floor(f.total / TOTAL_PER_POINT) + Math.floor(f.amount / AMOUNT_PER_POINT));
+const candidate = (f) => (f.amount >= CANDIDATE_AMOUNT && f.count >= 1 ? CANDIDATE_POINTS : 0); // new rule, evaluated in shadow
+const decide = (score) => (score >= BLOCK_AT ? 'block' : score >= CHALLENGE_AT ? 'challenge' : 'allow');
 
-let seed = 7;
+const SEED = 7, SECONDS = 1200, EVENTS_PER_SECOND = 2, CARDS = 200;
+const THEFT_START = 300, FRAUD_PERCENT = 18, FRAUD_MIN = 6000, FRAUD_SPREAD = 24000;
+const NORMAL_MIN = 500, NORMAL_SPREAD = 5500;
+const BIG_SPENDER_EVERY = 50, BIG_SPENDER_EXTRA = 12000; // one card in 50 also makes large purchases
+let seed = SEED;
+// Linear congruential generator (Numerical Recipes constants), high 16 bits.
 const random = (n) => { seed = (seed * 1664525 + 1013904223) % 4294967296; return Math.floor(seed / 65536) % n; };
 
 const stolen = [3, 41, 77, 120, 158]; // cards that a thief is using from second 300 on
@@ -37,15 +48,15 @@ const cost = { live: 0, shadow: 0 };
 const shadow = { changed: 0, caught: 0, hurt: 0 };
 let fraudTotal = 0, fraudBlocked = 0, goodBlocked = 0, goodChallenged = 0;
 
-const price = (d, fraud, amount) => (fraud ? (d === 'block' ? 0 : d === 'challenge' ? 300 : amount) : d === 'block' ? 2500 : d === 'challenge' ? 40 : 0);
+const price = (d, fraud, amount) => (fraud ? (d === 'block' ? 0 : d === 'challenge' ? CHALLENGED_FRAUD_LOSS : amount) : d === 'block' ? FALSE_BLOCK_COST : d === 'challenge' ? CHALLENGE_FRICTION : 0);
 
-for (let t = 0; t < 1200; t++) {
-  for (let k = 0; k < 2; k++) { // two events per second: a normal purchase, or a thief using a stolen card
-    const fraud = t >= 300 && random(100) < 18;
-    const card = fraud ? stolen[random(stolen.length)] : random(200);
-    const amount = fraud ? 6000 + random(24000) : 500 + random(5500) + (card % 50 === 9 ? random(12000) : 0);
+for (let t = 0; t < SECONDS; t++) {
+  for (let k = 0; k < EVENTS_PER_SECOND; k++) { // two events per second: a normal purchase, or a thief using a stolen card
+    const fraud = t >= THEFT_START && random(100) < FRAUD_PERCENT;
+    const card = fraud ? stolen[random(stolen.length)] : random(CARDS);
+    const amount = fraud ? FRAUD_MIN + random(FRAUD_SPREAD) : NORMAL_MIN + random(NORMAL_SPREAD) + (card % BIG_SPENDER_EVERY === 9 ? random(BIG_SPENDER_EXTRA) : 0);
     const f = { ...velocity.read(card, t), amount };
-    const base = Math.min(100, rules(f) + model(f)), withNew = Math.min(100, base + candidate(f));
+    const base = Math.min(MAX_SCORE, rules(f) + model(f)), withNew = Math.min(MAX_SCORE, base + candidate(f));
     const d = decide(base), dNew = decide(withNew); // only d is acted on
     live[d]++;
     if (fraud) { fraudTotal++; if (d === 'block') fraudBlocked++; } else { if (d === 'block') goodBlocked++; if (d === 'challenge') goodChallenged++; }
@@ -61,4 +72,4 @@ console.log(`shadow rule would change ${shadow.changed} decisions: ${shadow.caug
 console.log(`loss in cents with the live rules ${cost.live}, with the candidate added ${cost.shadow}`);
 const promote = cost.shadow < cost.live;
 console.log(`promote the candidate rule: ${promote}`);
-if (live.allow + live.challenge + live.block !== 2400 || fraudBlocked > fraudTotal || shadow.caught + shadow.hurt !== shadow.changed) process.exit(1);
+if (live.allow + live.challenge + live.block !== SECONDS * EVENTS_PER_SECOND || fraudBlocked > fraudTotal || shadow.caught + shadow.hurt !== shadow.changed) process.exit(1);
