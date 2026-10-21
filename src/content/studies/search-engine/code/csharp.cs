@@ -30,6 +30,15 @@ public static class Engine
     static readonly HashSet<string> Stop = new() { "the", "of", "a" };
     static readonly string[] Bases = { "search", "index", "shard", "rank", "segment", "term", "token", "filter", "match", "load" };
     const int Skip = 8; // a skip pointer every 8 postings
+    const double Bm25K1 = 1.2; // term-frequency saturation
+    const double Bm25B = 0.75; // length normalisation
+    const int MinDocWords = 8; // documents have 8..20 words
+    const int DocWordsSpread = 13;
+    const int StopwordOneIn = 5;
+    const int ZipfDivisor = 100000; // r^3 / ZIPF_DIVISOR maps 0..99 onto the 10 bases, favouring low ones
+    const int Docs = 600;
+    const int Results = 5; // hits per query
+    const int Shown = 3; // top hits printed
 
     static string Stem(string w)
     {
@@ -51,11 +60,11 @@ public static class Engine
     static string MakeDoc()
     {
         var words = new List<string>();
-        for (int i = 8 + Next(13); i > 0; i--)
+        for (int i = MinDocWords + Next(DocWordsSpread); i > 0; i--)
         {
-            if (Next(5) == 0) { words.Add(new[] { "the", "of", "a" }[Next(3)]); continue; }
+            if (Next(StopwordOneIn) == 0) { words.Add(new[] { "the", "of", "a" }[Next(Stop.Count)]); continue; }
             int r = Next(100);
-            string b = Bases[r * r * r / 100000]; // low-numbered words are much more common
+            string b = Bases[r * r * r / ZipfDivisor]; // low-numbered words are much more common
             words.Add(b + new[] { "", b.EndsWith("x") || b.EndsWith("ch") ? "es" : "s", "ed", "ing" }[Next(4)]);
         }
         return string.Join(" ", words);
@@ -95,7 +104,7 @@ public static class Engine
         foreach (var t in terms)
         {
             int tf = Positions(index, t, id).Count; double d = df[t];
-            score += Math.Log(1 + (n - d + 0.5) / (d + 0.5)) * (tf * 2.2) / (tf + 1.2 * (0.25 + 0.75 * index.Length[id] / avg));
+            score += Math.Log(1 + (n - d + 0.5) / (d + 0.5)) * (tf * (Bm25K1 + 1)) / (tf + Bm25K1 * (1 - Bm25B + Bm25B * index.Length[id] / avg));
         }
         return score;
     }
@@ -106,9 +115,9 @@ public static class Engine
 
     public static int Main()
     {
-        var docs = Enumerable.Range(0, 600).Select(_ => MakeDoc()).ToList();
+        var docs = Enumerable.Range(0, Docs).Select(_ => MakeDoc()).ToList();
         var whole = new Index(); var shards = new[] { new Index(), new Index(), new Index() };
-        for (int id = 0; id < docs.Count; id++) { whole.Add(id, docs[id]); shards[id % 3].Add(id, docs[id]); }
+        for (int id = 0; id < docs.Count; id++) { whole.Add(id, docs[id]); shards[id % shards.Length].Add(id, docs[id]); }
         int n = whole.Length.Count; double avg = (double)whole.Length.Values.Sum() / n;
         var df = whole.Terms.ToDictionary(kv => kv.Key, kv => kv.Value.Count);
 
@@ -121,9 +130,9 @@ public static class Engine
         var phraseTerms = query[1..]; var phrase = a.Where(id => HasPhrase(whole, id, phraseTerms)).ToList();
         Console.WriteLine($"phrase \"{string.Join(" ", phraseTerms)}\" matches: {phrase.Count}");
 
-        var single = TopK(whole, n, avg, df, query, 5);
-        var merged = shards.SelectMany(s => TopK(s, n, avg, df, query, 5)).OrderByDescending(h => h.Score).ThenBy(h => h.Id).Take(5).ToList();
-        foreach (var r in single.Take(3)) Console.WriteLine($"doc {r.Id} score {r.Score.ToString("F4", CultureInfo.InvariantCulture)}: {docs[r.Id]}");
+        var single = TopK(whole, n, avg, df, query, Results);
+        var merged = shards.SelectMany(s => TopK(s, n, avg, df, query, Results)).OrderByDescending(h => h.Score).ThenBy(h => h.Id).Take(Results).ToList();
+        foreach (var r in single.Take(Shown)) Console.WriteLine($"doc {r.Id} score {r.Score.ToString("F4", CultureInfo.InvariantCulture)}: {docs[r.Id]}");
         bool same = single.SequenceEqual(merged);
         Console.WriteLine($"3 shards merged equals one index: {(same ? "true" : "false")}");
         return !same || a.Count != b.Count || shortest[0] >= inOrder[0] || phrase.Count == 0 ? 1 : 0;

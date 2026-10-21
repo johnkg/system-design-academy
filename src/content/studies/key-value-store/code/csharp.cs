@@ -15,6 +15,7 @@ public class Node
 public class Ring
 {
     public const int N = 3; // copies of every key
+    public const int TokensPerNode = 16; // virtual nodes on the ring per server
     readonly List<(uint At, string Name)> tokens;
 
     public static uint Hash(string text) // FNV-1a: a small, fast, well-spread hash
@@ -24,7 +25,7 @@ public class Ring
         return h;
     }
 
-    public Ring(IEnumerable<string> names, int tokensPerNode = 16)
+    public Ring(IEnumerable<string> names, int tokensPerNode = TokensPerNode)
     {
         tokens = names.SelectMany(name => Enumerable.Range(0, tokensPerNode).Select(i => (Hash($"{name}#{i}"), name))).OrderBy(t => t.Item1).ToList();
     }

@@ -2,6 +2,9 @@
 // a last-writer-wins register loses concurrent increments and obeys a skewed clock, while a counter CRDT merges to the exact total.
 
 const SKEW = [0, 2, -3]; // each region's wall clock is a little off
+const REGIONS = SKEW.length;
+const STEPS = 600;
+const REPLICATE_ONE_IN = 4; // a replication round on one step in 4
 let seed = 7;
 const rand = (n) => { seed = (Math.imul(seed, 1664525) + 1013904223) >>> 0; return (seed >>> 16) % n; };
 
@@ -30,16 +33,16 @@ class Region {
   total() { return this.counts.reduce((a, b) => a + b, 0); }
 }
 
-const regions = [0, 1, 2].map((id) => new Region(id));
+const regions = Array.from({ length: REGIONS }, (_, id) => new Region(id));
 let truth = 0;
-for (let step = 1; step <= 600; step++) {
-  const r = rand(3);
+for (let step = 1; step <= STEPS; step++) {
+  const r = rand(REGIONS);
   regions[r].like(step);
   truth++;
   if (step === 100) regions[0].rename(step, "alice-old");
   if (step === 101) regions[2].rename(step, "alice-new"); // really later, but region 2's clock runs 3 behind
-  if (rand(4) === 0) { // lazy replication between random pairs
-    const src = rand(3), dst = (src + 1 + rand(2)) % 3;
+  if (rand(REPLICATE_ONE_IN) === 0) { // lazy replication between random pairs
+    const src = rand(REGIONS), dst = (src + 1 + rand(REGIONS - 1)) % REGIONS;
     regions[dst].mergeFrom(regions[src]);
   }
 }

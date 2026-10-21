@@ -3,6 +3,12 @@
 # and backfill lets short jobs use the gaps without delaying the job at the head of the queue.
 
 NODES, PER_NODE, RACK = 8, 8, 4  # 8 nodes of 8 GPUs, 2 racks of 4 nodes (64 GPUs)
+JOBS = 40
+TEAMS = 3
+MIN_DUR = 2  # job durations: 2..10 ticks
+DUR_SPREAD = 9
+SUBMIT_WINDOW = 8  # jobs are submitted in ticks 0..7
+MAX_TICKS = 1000  # safety stop for the simulation
 seed = 7
 
 
@@ -14,8 +20,8 @@ def random(n):
 
 sizes = [1, 2, 4, 8, 8, 16, 16, 32]
 jobs = []
-for i in range(40):
-    jobs.append({'id': i, 'gpus': sizes[random(8)], 'team': random(3), 'dur': 2 + random(9), 'submit': random(8)})
+for i in range(JOBS):
+    jobs.append({'id': i, 'gpus': sizes[random(len(sizes))], 'team': random(TEAMS), 'dur': MIN_DUR + random(DUR_SPREAD), 'submit': random(SUBMIT_WINDOW)})
 jobs.sort(key=lambda j: j['submit'] * 100 + j['id'])
 
 
@@ -37,11 +43,11 @@ def place(free, gpus):
 
 def run(backfill):
     free = [PER_NODE] * NODES
-    usage = [0, 0, 0]
+    usage = [0] * TEAMS
     pending = [dict(j) for j in jobs]
     running = []
     done = wait_sum = busy = t = 0
-    while done < len(jobs) and t < 1000:
+    while done < len(jobs) and t < MAX_TICKS:
         for j in [r for r in running if r['end'] == t]:
             for n, c in j['slots']:
                 free[n] += c

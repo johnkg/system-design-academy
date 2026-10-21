@@ -152,6 +152,18 @@ def select(matchers):
     return result
 
 
+SERIES = 8  # hosts h0..h7
+POINTS = 120  # points per series
+BASE_VALUE = 50.0  # host h starts at 50 + h
+VALUE_STEP = 0.25  # a changing scrape moves the value by one step
+SCRAPE_S = 10  # seconds between scrapes
+JITTER_ONE_IN = 8  # one scrape in 8 lands a second late
+WEB_HOSTS = 5  # h0..h4 are web, the rest db
+QUERY_FROM = 300  # the range query covers T0+300 .. T0+599
+QUERY_TO = 600
+MAX_BITS_PER_POINT = 40  # compression must do better than this
+
+
 seed = 7
 
 
@@ -162,16 +174,16 @@ def random(n):
 
 
 T0, raw = 1700000000, []
-for h in range(8):
-    v, points = 50.0 + h, []
-    for i in range(120):
+for h in range(SERIES):
+    v, points = BASE_VALUE + h, []
+    for i in range(POINTS):
         if random(2) == 0:
-            v += (random(3) - 1) * 0.25  # half the scrapes see no change
-        points.append([T0 + i * 10 + (1 if random(8) == 0 else 0), v])
+            v += (random(3) - 1) * VALUE_STEP  # half the scrapes see no change
+        points.append([T0 + i * SCRAPE_S + (1 if random(JITTER_ONE_IN) == 0 else 0), v])
     raw.append(points)
-    add_series({"__name__": "cpu", "host": f"h{h}", "region": "eu" if h % 2 == 0 else "us", "tier": "web" if h < 5 else "db"}, points)
+    add_series({"__name__": "cpu", "host": f"h{h}", "region": "eu" if h % 2 == 0 else "us", "tier": "web" if h < WEB_HOSTS else "db"}, points)
 
-total, count = sum(len(b[1]) for b in blocks), len(raw) * 120
+total, count = sum(len(b[1]) for b in blocks), len(raw) * POINTS
 print(f"{len(series)} series, {count} points, raw {count * 16} bytes")
 print(f"compressed {sum((len(b[1]) + 7) // 8 for b in blocks)} bytes, {total / count:.2f} bits per point")
 ok = all(json.dumps(decompress(b[1], b[0])) == json.dumps(raw[i]) for i, b in enumerate(blocks))
@@ -182,9 +194,9 @@ print(f"region=eu has [{','.join(map(str, postings['region=eu']))}]; cpu, eu and
 total_sum, hits = 0.0, 0
 for sid in ids:
     for t, v in decompress(blocks[sid][1], blocks[sid][0]):
-        if T0 + 300 <= t < T0 + 600:
+        if T0 + QUERY_FROM <= t < T0 + QUERY_TO:
             total_sum += v
             hits += 1
 print(f"points in the range: {hits}, sum {total_sum:.2f}")
-if not ok or ids != [0, 2, 4] or total / count > 40:
+if not ok or ids != [0, 2, 4] or total / count > MAX_BITS_PER_POINT:
     sys.exit(1)

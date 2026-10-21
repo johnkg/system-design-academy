@@ -97,11 +97,16 @@ public static class Program
         Console.WriteLine($"final: {order.State} v{order.Version}, log: {string.Join(" > ", order.Log)}");
         if (order.Version != order.Log.Count || order.State != "delivered") return 1;
 
+        const int Trials = 200; // dispatch windows simulated
+        const int Batch = 6; // orders and couriers per window
+        const int Grid = 20; // positions on a 20 x 20 grid
+        const int ReadyMin = 4; // food is ready 4..15 minutes after the order
+        const int ReadySpread = 12;
         int[] a = new int[4], b = new int[4]; int strictlyBetter = 0;
-        for (int trial = 0; trial < 200; trial++) // 200 windows of 6 orders and 6 couriers
+        for (int trial = 0; trial < Trials; trial++) // 200 windows of 6 orders and 6 couriers
         {
-            var orders = Enumerable.Range(0, 6).Select(_ => { var p = new Pos(Dispatch.Rnd(20), Dispatch.Rnd(20)); return new Job(p, 4 + Dispatch.Rnd(12)); }).ToList();
-            var couriers = Enumerable.Range(0, 6).Select(_ => new Pos(Dispatch.Rnd(20), Dispatch.Rnd(20))).ToList();
+            var orders = Enumerable.Range(0, Batch).Select(_ => { var p = new Pos(Dispatch.Rnd(Grid), Dispatch.Rnd(Grid)); return new Job(p, ReadyMin + Dispatch.Rnd(ReadySpread)); }).ToList();
+            var couriers = Enumerable.Range(0, Batch).Select(_ => new Pos(Dispatch.Rnd(Grid), Dispatch.Rnd(Grid))).ToList();
             var x = Dispatch.Sum(orders, couriers, Dispatch.NearestFirst(orders, couriers));
             var y = Dispatch.Sum(orders, couriers, Dispatch.BestAssignment(orders, couriers));
             if (y.Cost > x.Cost) return 1; // the best assignment can never be worse

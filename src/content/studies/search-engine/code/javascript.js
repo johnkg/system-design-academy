@@ -4,6 +4,15 @@
 const STOP = new Set(['the', 'of', 'a']);
 const BASES = ['search', 'index', 'shard', 'rank', 'segment', 'term', 'token', 'filter', 'match', 'load'];
 const SKIP = 8; // a skip pointer every 8 postings
+const BM25_K1 = 1.2; // term-frequency saturation
+const BM25_B = 0.75; // length normalisation
+const MIN_DOC_WORDS = 8; // documents have 8..20 words
+const DOC_WORDS_SPREAD = 13;
+const STOPWORD_ONE_IN = 5;
+const ZIPF_DIVISOR = 100000; // r^3 / ZIPF_DIVISOR maps 0..99 onto the 10 bases, favouring low ones
+const DOCS = 600;
+const RESULTS = 5; // hits per query
+const SHOWN = 3; // top hits printed
 
 // Analysis: split, lowercase, drop stop words (their positions are kept as gaps), strip a suffix.
 function stem(w) {
@@ -20,14 +29,14 @@ let state = 42;
 const next = (n) => { state = (Math.imul(state, 1664525) + 1013904223) >>> 0; return (state >>> 16) % n; };
 function makeDoc() {
   const words = [];
-  for (let i = 8 + next(13); i > 0; i--) {
-    if (next(5) === 0) { words.push(['the', 'of', 'a'][next(3)]); continue; }
-    const r = next(100), base = BASES[Math.floor((r * r * r) / 100000)]; // low-numbered words are much more common
+  for (let i = MIN_DOC_WORDS + next(DOC_WORDS_SPREAD); i > 0; i--) {
+    if (next(STOPWORD_ONE_IN) === 0) { words.push(['the', 'of', 'a'][next(STOP.size)]); continue; }
+    const r = next(100), base = BASES[Math.floor((r * r * r) / ZIPF_DIVISOR)]; // low-numbered words are much more common
     words.push(base + ['', /(x|ch)$/.test(base) ? 'es' : 's', 'ed', 'ing'][next(4)]);
   }
   return words.join(' ');
 }
-const docs = Array.from({ length: 600 }, makeDoc);
+const docs = Array.from({ length: DOCS }, makeDoc);
 
 class Index {
   constructor() { this.terms = new Map(); this.length = new Map(); }
@@ -69,7 +78,7 @@ function bm25(index, g, terms, id) {
   let score = 0;
   for (const t of terms) {
     const post = index.terms.get(t).find((p) => p.id === id), df = g.df.get(t), tf = post.pos.length;
-    score += Math.log(1 + (g.n - df + 0.5) / (df + 0.5)) * (tf * 2.2) / (tf + 1.2 * (0.25 + 0.75 * index.length.get(id) / g.avg));
+    score += Math.log(1 + (g.n - df + 0.5) / (df + 0.5)) * (tf * (BM25_K1 + 1)) / (tf + BM25_K1 * (1 - BM25_B + BM25_B * index.length.get(id) / g.avg));
   }
   return score;
 }
@@ -79,7 +88,7 @@ function topK(index, g, terms, k) {
 }
 
 const whole = new Index(); docs.forEach((d, id) => whole.add(id, d));
-const shards = [new Index(), new Index(), new Index()]; docs.forEach((d, id) => shards[id % 3].add(id, d));
+const shards = [new Index(), new Index(), new Index()]; docs.forEach((d, id) => shards[id % shards.length].add(id, d));
 const g = { ...stats(whole), df: new Map([...whole.terms].map(([t, l]) => [t, l.length])) };
 
 const query = analyse('searching the matched tokens').map((t) => t.term);
@@ -91,9 +100,9 @@ console.log(`AND matches: ${a.length}; postings read in query order: ${inOrder.n
 const phrase = a.filter((id) => hasPhrase(whole, id, query.slice(1)));
 console.log(`phrase "${query.slice(1).join(' ')}" matches: ${phrase.length}`);
 
-const single = topK(whole, g, query, 5);
-const merged = shards.flatMap((s) => topK(s, g, query, 5)).sort((x, y) => y.score - x.score || x.id - y.id).slice(0, 5);
-for (const r of single.slice(0, 3)) console.log(`doc ${r.id} score ${r.score.toFixed(4)}: ${docs[r.id]}`);
+const single = topK(whole, g, query, RESULTS);
+const merged = shards.flatMap((s) => topK(s, g, query, RESULTS)).sort((x, y) => y.score - x.score || x.id - y.id).slice(0, RESULTS);
+for (const r of single.slice(0, SHOWN)) console.log(`doc ${r.id} score ${r.score.toFixed(4)}: ${docs[r.id]}`);
 const same = JSON.stringify(single) === JSON.stringify(merged);
 console.log(`3 shards merged equals one index: ${same}`);
 if (!same || a.length !== b.length || shortest.n >= inOrder.n || phrase.length === 0) process.exit(1);

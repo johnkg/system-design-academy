@@ -27,7 +27,7 @@ def choose_quality(estimated_mbps, buffer_seconds):
 network = [8.0, 8.0, 6.0, 3.0, 1.2, 0.8, 2.0, 4.0, 7.0, 9.0]
 
 buffer = SEGMENT_SECONDS  # the first segment is already buffered when playback starts
-estimate = 8.0  # measured speed of the previous segment
+estimate = network[0]  # measured speed of the previous segment (start from the first)
 stalled_seconds = 0
 
 for i, speed in enumerate(network):

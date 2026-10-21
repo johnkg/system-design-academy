@@ -8,6 +8,7 @@ using System.Linq;
 public class Presence
 {
     public const int Ttl = 30; // seconds a session survives without a heartbeat (three heartbeat intervals)
+    const int DeviceSlots = 8; // session key = user * DEVICE_SLOTS + device
     readonly List<int>[] friendsOf;                 // user -> the users who must hear about this user
     readonly Dictionary<int, int> expiry = new();   // session key -> time at which it expires
     readonly Dictionary<int, int> live = new();     // user -> number of live sessions
@@ -24,7 +25,7 @@ public class Presence
 
     public void Heartbeat(int user, int device, int now)
     {
-        int key = user * 8 + device;
+        int key = user * DeviceSlots + device;
         bool isNew = !expiry.ContainsKey(key);
         expiry[key] = now + Ttl; // renewing is one cheap write
         if (!isNew) return;
@@ -34,14 +35,14 @@ public class Presence
 
     public void Disconnect(int user, int device) // a clean goodbye, or an expiry
     {
-        if (!expiry.Remove(user * 8 + device)) return;
+        if (!expiry.Remove(user * DeviceSlots + device)) return;
         live[user]--;
         if (live[user] == 0) Change(user, false); // the last session takes the user offline
     }
 
     public void Sweep(int now) // in a real store the TTL does this for us
     {
-        foreach (var (key, at) in expiry.ToList()) if (at <= now) Disconnect(key / 8, key % 8);
+        foreach (var (key, at) in expiry.ToList()) if (at <= now) Disconnect(key / DeviceSlots, key % DeviceSlots);
     }
 
     public bool IsOnline(int user) => live.GetValueOrDefault(user) > 0;
@@ -51,6 +52,14 @@ public record Device(int U, int D, int Phase, int Dead, bool Graceful);
 
 public static class Program
 {
+    const int HeartbeatS = 10; // each device beats every 10 s, at its own phase
+    const int Friends = 6;
+    const int MaxDevices = 3;
+    const int DieOneIn = 3; // one device in 3 dies at 30..249 s
+    const int DieFrom = 30;
+    const int DieSpread = 220;
+    const int Ticks = 300;
+    const int LossOneIn = 5;
     static long seed = 77;
     static int Random(int n) { seed = (seed * 1664525 + 1013904223) % 4294967296; return (int)((seed / 65536) % n); }
 
@@ -62,26 +71,26 @@ public static class Program
         for (int u = 0; u < users; u++)
         {
             var list = new List<int>();
-            while (list.Count < 6) { int f = Random(users); if (f != u && !list.Contains(f)) list.Add(f); }
+            while (list.Count < Friends) { int f = Random(users); if (f != u && !list.Contains(f)) list.Add(f); }
             friendsOf[u] = list;
-            int count = 1 + Random(3);
+            int count = 1 + Random(MaxDevices);
             for (int d = 0; d < count; d++)
             {
-                int phase = Random(10); bool dies = Random(3) == 0;
-                int dead = dies ? 30 + Random(220) : -1;
+                int phase = Random(HeartbeatS); bool dies = Random(DieOneIn) == 0;
+                int dead = dies ? DieFrom + Random(DieSpread) : -1;
                 devices.Add(new Device(u, d, phase, dead, Random(2) == 1));
             }
         }
 
         var presence = new Presence(friendsOf);
         int heartbeats = 0;
-        for (int t = 0; t < 300; t++)
+        for (int t = 0; t < Ticks; t++)
         {
             foreach (var x in devices)
             {
                 if (x.Dead >= 0 && t == x.Dead && x.Graceful) presence.Disconnect(x.U, x.D); // others just go silent
                 bool alive = x.Dead < 0 || t < x.Dead;
-                if (alive && (t + x.Phase) % 10 == 0 && Random(5) != 0) // one heartbeat in five is lost
+                if (alive && (t + x.Phase) % HeartbeatS == 0 && Random(LossOneIn) != 0) // one heartbeat in five is lost
                 {
                     presence.Heartbeat(x.U, x.D, t); heartbeats++;
                 }

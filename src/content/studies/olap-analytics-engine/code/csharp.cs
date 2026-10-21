@@ -10,13 +10,20 @@ int Rnd(int n) { seed = unchecked(seed * 1664525u + 1013904223u); return (int)((
 
 string[] countries = { "US", "DE", "FR", "JP", "BR", "IN" }, devices = { "ios", "web", "android" };
 const int Window = 60, Bucket = 10; // a segment covers 60 minutes, rollup granularity is 10 minutes
+const int Events = 6000;
+const int Minutes = 240; // events fall in the first 4 hours
+const int MaxMs = 500; // latency 1..500 ms
+const int KeyStep = 100; // rollup key = bucket * KEY_STEP^2 + country * KEY_STEP + device
+const int KeyBucket = KeyStep * KeyStep;
+const int QueryFrom = 60; // the demo query covers minutes 60..179
+const int QueryTo = 180;
 var events = new List<(int T, int C, int D, int Ms)>();
-for (int i = 0; i < 6000; i++)
+for (int i = 0; i < Events; i++)
 {
-    int t = Rnd(240);
-    int c = Math.Min(Rnd(6), Rnd(6)); // countries are skewed
-    int d = Rnd(3);
-    int ms = 1 + Rnd(500);
+    int t = Rnd(Minutes);
+    int c = Math.Min(Rnd(countries.Length), Rnd(countries.Length)); // countries are skewed
+    int d = Rnd(devices.Length);
+    int ms = 1 + Rnd(MaxMs);
     events.Add((t, c, d, ms));
 }
 
@@ -34,16 +41,16 @@ Segment BuildSegment(int start, IEnumerable<(int T, int C, int D, int Ms)> evs)
     var acc = new Dictionary<int, long[]>(); // rollup: one row per (bucket, country, device) with a count and a sum
     foreach (var e in evs)
     {
-        int key = e.T / Bucket * 10000 + e.C * 100 + e.D;
+        int key = e.T / Bucket * KeyBucket + e.C * KeyStep + e.D;
         if (!acc.ContainsKey(key)) acc[key] = new long[2];
         acc[key][0] += 1; acc[key][1] += e.Ms;
     }
-    var rows = acc.Keys.OrderBy(k => k).Select(k => new Row(k / 10000 * Bucket, countries[k / 100 % 100], devices[k % 100], acc[k][0], acc[k][1])).ToList();
+    var rows = acc.Keys.OrderBy(k => k).Select(k => new Row(k / KeyBucket * Bucket, countries[k / KeyStep % KeyStep], devices[k % KeyStep], acc[k][0], acc[k][1])).ToList();
     return new Segment(start, start + Window, rows, Encode(rows.Select(r => r.Country).ToList()), Encode(rows.Select(r => r.Device).ToList()));
 }
 
 var segments = new List<Segment>();
-for (int s = 0; s < 240; s += Window) segments.Add(BuildSegment(s, events.Where(e => e.T >= s && e.T < s + Window)));
+for (int s = 0; s < Minutes; s += Window) segments.Add(BuildSegment(s, events.Where(e => e.T >= s && e.T < s + Window)));
 Console.WriteLine($"raw events: {events.Count}, rolled-up rows: {segments.Sum(s => s.Rows.Count)} in {segments.Count} segments ({string.Join(", ", segments.Select(s => s.Rows.Count))})");
 Console.WriteLine($"segment 1 country dictionary: {string.Join(",", segments[1].Country.Dict)}");
 
@@ -77,9 +84,9 @@ int[] OrBitmaps((List<string> Dict, int[][] Bitmaps) col, string[] names) // OR 
 var merged = new Dictionary<int, long[]>(); int scanned = 0, matchedRows = 0;
 foreach (var seg in segments)
 {
-    if (seg.End <= 60 || seg.Start >= 180) continue; // pruned by time range
+    if (seg.End <= QueryFrom || seg.Start >= QueryTo) continue; // pruned by time range
     scanned++;
-    var (part, m) = ScanSegment(seg, 60, 180, new[] { "DE", "FR" }, "ios");
+    var (part, m) = ScanSegment(seg, QueryFrom, QueryTo, new[] { "DE", "FR" }, "ios");
     matchedRows += m;
     foreach (var (bucket, v) in part)
     {
@@ -94,7 +101,7 @@ Console.WriteLine($"segments scanned: {scanned} of {segments.Count}, rolled rows
 var raw = new Dictionary<int, long[]>();
 foreach (var e in events)
 {
-    if (e.T < 60 || e.T >= 180 || e.D != 0 || (e.C != 1 && e.C != 2)) continue;
+    if (e.T < QueryFrom || e.T >= QueryTo || e.D != 0 || (e.C != 1 && e.C != 2)) continue;
     int b = e.T / Bucket * Bucket;
     if (!raw.ContainsKey(b)) raw[b] = new long[2];
     raw[b][0] += 1; raw[b][1] += e.Ms;

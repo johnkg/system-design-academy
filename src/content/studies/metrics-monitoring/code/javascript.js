@@ -30,19 +30,34 @@ function evaluate(samples, threshold, forSeconds) {
   return events;
 }
 
+const SAMPLES = 40;
+const SCRAPE_S = 15; // seconds between readings
+const SPIKE_AT = 60;
+const SPIKE_CPU = 97;
+const INCIDENT_FROM = 300;
+const INCIDENT_TO = 420;
+const INCIDENT_CPU = 90;
+const BASE_CPU = 40; // normal load wobbles 40, 43, 46
+const WOBBLE_STEPS = 3;
+const WOBBLE_PCT = 3;
+const MINUTE_S = 60;
+const HOUR_S = 60 * MINUTE_S;
+const THRESHOLD = 80; // alert when CPU is above 80%
+const ALERT_FOR_S = 60; // for at least this long
+
 // Ten minutes of CPU readings, one every 15 seconds: a one-sample spike at 60 s, and a real problem from 300 s to 420 s.
-const samples = Array.from({ length: 40 }, (_, i) => {
-  const t = i * 15;
-  const value = (t === 60) ? 97 : (t >= 300 && t <= 420) ? 90 : 40 + (i % 3) * 3;
+const samples = Array.from({ length: SAMPLES }, (_, i) => {
+  const t = i * SCRAPE_S;
+  const value = (t === SPIKE_AT) ? SPIKE_CPU : (t >= INCIDENT_FROM && t <= INCIDENT_TO) ? INCIDENT_CPU : BASE_CPU + (i % WOBBLE_STEPS) * WOBBLE_PCT;
   return { t, value };
 });
 
-const minutes = rollup(samples, 60, maximum);
+const minutes = rollup(samples, MINUTE_S, maximum);
 console.log(`${samples.length} raw samples became ${minutes.length} one-minute points (max per minute)`);
-console.log(`hourly average CPU: ${rollup(samples, 3600, average)[0].value.toFixed(1)}`);
+console.log(`hourly average CPU: ${rollup(samples, HOUR_S, average)[0].value.toFixed(1)}`);
 
-const noisy = evaluate(samples, 80, 0);
-const calm = evaluate(samples, 80, 60);
+const noisy = evaluate(samples, THRESHOLD, 0);
+const calm = evaluate(samples, THRESHOLD, ALERT_FOR_S);
 console.log(`alert without a duration: ${noisy.join(', ')}`);
 console.log(`alert that must last 60 s: ${calm.join(', ')}`);
 if (noisy.length !== 4 || calm.length !== 2) process.exit(1); // the spike alone must not page anyone, the real problem must

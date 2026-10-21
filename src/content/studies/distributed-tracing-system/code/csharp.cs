@@ -15,27 +15,46 @@ static (string TraceId, string SpanId, bool Sampled)? ParseTraceparent(string he
     return (m.Groups[1].Value, m.Groups[2].Value, (Convert.ToInt32(m.Groups[3].Value, 16) & 1) == 1);
 }
 
-ulong seed = 77;
+const ulong Seed = 77;
+const int Traces = 400;
+const int TraceGapMs = 10; // a trace starts about every 10 ms
+const int IdWords = 4; // 32-bit words in a 128-bit trace id
+const int MinSpans = 3; // spans per trace: 3..7
+const int SpanSpread = 5;
+const int FailedPct = 4; // traces that fail
+const int BadPct = 10; // traces that fail or are slow
+const int FailedMinMs = 30; // root span duration of a failed trace: 30..229 ms
+const int FailedSpreadMs = 200;
+const int SlowMinMs = 800; // of a slow trace: 800..1999 ms
+const int SlowSpreadMs = 1200;
+const int FastMinMs = 20; // of an ordinary trace: 20..99 ms
+const int FastSpreadMs = 80;
+const int AsyncPct = 10; // child spans that run async, ending 1..4 s after the root
+const int AsyncMinMs = 1000;
+const int AsyncSpreadMs = 3000;
+const int ExportMinMs = 5; // export delay before a span reaches the collector: 5..124 ms
+const int ExportSpreadMs = 120;
+ulong seed = Seed;
 ulong NextU32() { seed = (seed * 1664525UL + 1013904223UL) % 4294967296UL; return seed; }
 int Next(int n) => (int)((NextU32() / 65536UL) % (ulong)n);
 
 // 400 traces. About 4% fail and 6% are slow; 10% have an async span that ends long after the root span.
 var traces = new List<Trace>();
 var events = new List<Ev>();
-for (int i = 0; i < 400; i++)
+for (int i = 0; i < Traces; i++)
 {
-    int start = i * 10 + Next(10);
-    string traceId = string.Concat(Enumerable.Range(0, 4).Select(_ => NextU32().ToString("x8")));
-    int kind = Next(100), n = 3 + Next(5);
-    int rootDur = kind < 4 ? 30 + Next(200) : kind < 10 ? 800 + Next(1200) : 20 + Next(80);
-    int errAt = kind < 4 ? 1 + Next(n - 1) : -1;
-    traces.Add(new Trace(traceId, n, kind < 10));
+    int start = i * TraceGapMs + Next(TraceGapMs);
+    string traceId = string.Concat(Enumerable.Range(0, IdWords).Select(_ => NextU32().ToString("x8")));
+    int kind = Next(100), n = MinSpans + Next(SpanSpread);
+    int rootDur = kind < FailedPct ? FailedMinMs + Next(FailedSpreadMs) : kind < BadPct ? SlowMinMs + Next(SlowSpreadMs) : FastMinMs + Next(FastSpreadMs);
+    int errAt = kind < FailedPct ? 1 + Next(n - 1) : -1;
+    traces.Add(new Trace(traceId, n, kind < BadPct));
     for (int k = 0; k < n; k++)
     {
         int off = 0, dur = rootDur;
         if (k > 0) { off = Next(rootDur / 2 + 1); dur = 1 + Next(Math.Max(1, rootDur - off)); }
-        if (k > 0 && Next(100) < 10) off += 1000 + Next(3000); // async span, ends after the root
-        int arrival = start + off + dur + 5 + Next(120);
+        if (k > 0 && Next(100) < AsyncPct) off += AsyncMinMs + Next(AsyncSpreadMs); // async span, ends after the root
+        int arrival = start + off + dur + ExportMinMs + Next(ExportSpreadMs);
         events.Add(new Ev(arrival, traceId, k == 0, dur, k == errAt));
     }
 }
@@ -48,7 +67,8 @@ Console.WriteLine($"traceparent round trip: trace {rootCtx.TraceId[..8]}, sample
 var bad = traces.Where(t => t.Bad).ToList();
 Console.WriteLine($"{traces.Count} traces, {events.Count} spans, {bad.Count} slow or failed");
 var results = new Dictionary<int, (int BadKept, int Incomplete, int Peak)>();
-foreach (int wait in new[] { 100, 1000, 10000 })
+int[] waits = { 100, 1000, 10000 }; // ms a trace stays open before the keep decision
+foreach (int wait in waits)
 {
     var s = new TailSampler(wait);
     foreach (var e in events) s.Add(e);
@@ -58,7 +78,7 @@ foreach (int wait in new[] { 100, 1000, 10000 })
     results[wait] = (badKept, incomplete, s.Peak);
     Console.WriteLine($"wait {wait} ms: kept {s.Kept.Count}, bad kept {badKept}/{bad.Count} ({100 * badKept / bad.Count}%), incomplete {incomplete}, late spans dropped {s.Late}, peak buffered {s.Peak}");
 }
-var (a, b, c) = (results[100], results[1000], results[10000]);
+var (a, b, c) = (results[waits[0]], results[waits[1]], results[waits[2]]);
 bool ok = c.BadKept == bad.Count && c.Incomplete == 0 && a.BadKept < b.BadKept && b.BadKept <= c.BadKept && a.Peak < b.Peak && b.Peak < c.Peak && rootCtx.Sampled;
 Console.WriteLine($"a longer wait keeps more bad traces and more of each trace, and buffers more: {Lower(ok)}");
 if (!ok) Environment.Exit(1);
@@ -72,6 +92,8 @@ class Open { public string Id = ""; public long Deadline; public List<Ev> Spans 
 
 class TailSampler(int wait)
 {
+    const int SlowThresholdMs = 500; // a root span this long marks a slow trace
+    const int BaselinePct = 2; // ordinary traces kept anyway
     readonly List<Open> open = new(); // in order of first arrival, so oldest first
     readonly HashSet<string> decided = new();
     public Dictionary<string, int> Kept = new();
@@ -80,8 +102,8 @@ class TailSampler(int wait)
     void Decide(Open t)
     {
         open.Remove(t);
-        bool slow = t.Spans.Any(s => s.Root && s.Dur >= 500), error = t.Spans.Any(s => s.Err);
-        bool baseline = long.Parse(t.Id[..8], NumberStyles.HexNumber) % 100 < 2; // keep 2% of ordinary traces
+        bool slow = t.Spans.Any(s => s.Root && s.Dur >= SlowThresholdMs), error = t.Spans.Any(s => s.Err);
+        bool baseline = long.Parse(t.Id[..8], NumberStyles.HexNumber) % 100 < BaselinePct; // keep 2% of ordinary traces
         decided.Add(t.Id);
         if (slow || error || baseline) Kept[t.Id] = t.Spans.Count;
     }

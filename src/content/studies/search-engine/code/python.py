@@ -6,6 +6,15 @@ import sys
 STOP = {"the", "of", "a"}
 BASES = ["search", "index", "shard", "rank", "segment", "term", "token", "filter", "match", "load"]
 SKIP = 8  # a skip pointer every 8 postings
+BM25_K1 = 1.2  # term-frequency saturation
+BM25_B = 0.75  # length normalisation
+MIN_DOC_WORDS = 8  # documents have 8..20 words
+DOC_WORDS_SPREAD = 13
+STOPWORD_ONE_IN = 5
+ZIPF_DIVISOR = 100000  # r^3 / ZIPF_DIVISOR maps 0..99 onto the 10 bases, favouring low ones
+DOCS = 600
+RESULTS = 5  # hits per query
+SHOWN = 3  # top hits printed
 
 
 def stem(w):
@@ -38,18 +47,18 @@ def next_int(n):
 
 def make_doc():
     words = []
-    for _ in range(8 + next_int(13)):
-        if next_int(5) == 0:
-            words.append(["the", "of", "a"][next_int(3)])
+    for _ in range(MIN_DOC_WORDS + next_int(DOC_WORDS_SPREAD)):
+        if next_int(STOPWORD_ONE_IN) == 0:
+            words.append(["the", "of", "a"][next_int(len(STOP))])
             continue
         r = next_int(100)
-        base = BASES[(r * r * r) // 100000]  # low-numbered words are much more common
+        base = BASES[(r * r * r) // ZIPF_DIVISOR]  # low-numbered words are much more common
         es = "es" if base.endswith(("x", "ch")) else "s"
         words.append(base + ["", es, "ed", "ing"][next_int(4)])
     return " ".join(words)
 
 
-docs = [make_doc() for _ in range(600)]
+docs = [make_doc() for _ in range(DOCS)]
 
 
 class Index:
@@ -111,7 +120,7 @@ def bm25(index, g, terms, doc_id):
     for t in terms:
         df = g["df"][t]
         tf = len(positions(index, t, doc_id))
-        score += math.log(1 + (g["n"] - df + 0.5) / (df + 0.5)) * (tf * 2.2) / (tf + 1.2 * (0.25 + 0.75 * index.length[doc_id] / g["avg"]))
+        score += math.log(1 + (g["n"] - df + 0.5) / (df + 0.5)) * (tf * (BM25_K1 + 1)) / (tf + BM25_K1 * (1 - BM25_B + BM25_B * index.length[doc_id] / g["avg"]))
     return score
 
 
@@ -125,7 +134,7 @@ for doc_id, d in enumerate(docs):
     whole.add(doc_id, d)
 shards = [Index(), Index(), Index()]
 for doc_id, d in enumerate(docs):
-    shards[doc_id % 3].add(doc_id, d)
+    shards[doc_id % len(shards)].add(doc_id, d)
 g = {"n": len(whole.length), "avg": sum(whole.length.values()) / len(whole.length), "df": {t: len(p) for t, p in whole.terms.items()}}
 
 query = [t for t, _ in analyse("searching the matched tokens")]
@@ -138,9 +147,9 @@ print(f"AND matches: {len(a)}; postings read in query order: {in_order[0]}, shor
 phrase = [i for i in a if has_phrase(whole, i, query[1:])]
 print(f'phrase "{" ".join(query[1:])}" matches: {len(phrase)}')
 
-single = top_k(whole, g, query, 5)
-merged = sorted((r for s in shards for r in top_k(s, g, query, 5)), key=lambda r: (-r[0], r[1]))[:5]
-for score, i in single[:3]:
+single = top_k(whole, g, query, RESULTS)
+merged = sorted((r for s in shards for r in top_k(s, g, query, RESULTS)), key=lambda r: (-r[0], r[1]))[:RESULTS]
+for score, i in single[:SHOWN]:
     print(f"doc {i} score {score:.4f}: {docs[i]}")
 same = single == merged
 print(f"3 shards merged equals one index: {'true' if same else 'false'}")

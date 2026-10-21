@@ -6,12 +6,18 @@ using System.Collections.Generic;
 using System.Linq;
 
 const int NODES = 8, PER_NODE = 8, RACK = 4; // 8 nodes of 8 GPUs, 2 racks of 4 nodes (64 GPUs)
+const int JOBS = 40;
+const int TEAMS = 3;
+const int MIN_DUR = 2; // job durations: 2..10 ticks
+const int DUR_SPREAD = 9;
+const int SUBMIT_WINDOW = 8; // jobs are submitted in ticks 0..7
+const int MAX_TICKS = 1000; // safety stop for the simulation
 long seed = 7;
 int Random(int n) { seed = (seed * 1664525 + 1013904223) % 4294967296; return (int)((seed / 65536) % n); }
 
 int[] sizes = { 1, 2, 4, 8, 8, 16, 16, 32 };
 var jobs = new List<Job>();
-for (int i = 0; i < 40; i++) { int g = sizes[Random(8)], team = Random(3), dur = 2 + Random(9), submit = Random(8); jobs.Add(new Job { Id = i, Gpus = g, Team = team, Dur = dur, Submit = submit }); }
+for (int i = 0; i < JOBS; i++) { int g = sizes[Random(sizes.Length)], team = Random(TEAMS), dur = MIN_DUR + Random(DUR_SPREAD), submit = Random(SUBMIT_WINDOW); jobs.Add(new Job { Id = i, Gpus = g, Team = team, Dur = dur, Submit = submit }); }
 jobs = jobs.OrderBy(j => j.Submit * 100 + j.Id).ToList();
 
 // Returns (node, count) pairs or null. Small jobs: the tightest node that fits. Big jobs: whole free nodes inside one rack.
@@ -36,11 +42,11 @@ List<(int, int)>? Place(int[] free, int gpus)
 (int makespan, int wait, int util, int[] usage) Run(bool backfill)
 {
     var free = Enumerable.Repeat(PER_NODE, NODES).ToArray();
-    var usage = new int[3];
+    var usage = new int[TEAMS];
     var pending = jobs.Select(j => new Job { Id = j.Id, Gpus = j.Gpus, Team = j.Team, Dur = j.Dur, Submit = j.Submit }).ToList();
     var running = new List<Job>();
     int done = 0, waitSum = 0, busy = 0, t = 0;
-    for (; done < jobs.Count && t < 1000; t++)
+    for (; done < jobs.Count && t < MAX_TICKS; t++)
     {
         foreach (var j in running.Where(r => r.End == t).ToList()) { foreach (var (n, c) in j.Slots!) free[n] += c; done++; }
         running = running.Where(r => r.End != t).ToList();

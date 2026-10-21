@@ -2,6 +2,7 @@
 // keys are placed on a hash ring, each key lives on N nodes, a write waits for W of them and a read asks R of them.
 
 const N = 3; // copies of every key
+const TOKENS_PER_NODE = 16; // virtual nodes on the ring per server
 
 function hash(text) { // FNV-1a: a small, fast, well-spread hash
   let h = 2166136261;
@@ -10,7 +11,7 @@ function hash(text) { // FNV-1a: a small, fast, well-spread hash
 }
 
 class Ring {
-  constructor(names, tokensPerNode = 16) {
+  constructor(names, tokensPerNode = TOKENS_PER_NODE) {
     this.tokens = names.flatMap((name) => Array.from({ length: tokensPerNode }, (_, i) => ({ at: hash(`${name}#${i}`), name })));
     this.tokens.sort((a, b) => a.at - b.at);
   }

@@ -121,20 +121,27 @@ def totals(orders, couriers, pick):
     return t
 
 
+TRIALS = 200  # dispatch windows simulated
+BATCH = 6  # orders and couriers per window
+GRID = 20  # positions on a 20 x 20 grid
+READY_MIN = 4  # food is ready 4..15 minutes after the order
+READY_SPREAD = 12
+
+
 def point():
-    x = rnd(20)
-    y = rnd(20)
+    x = rnd(GRID)
+    y = rnd(GRID)
     return {"x": x, "y": y}
 
 
 sums = {"nearest": {"travel": 0, "food": 0, "idle": 0, "cost": 0}, "window": {"travel": 0, "food": 0, "idle": 0, "cost": 0}}
 strictly_better = 0
-for trial in range(200):  # 200 windows of 6 orders and 6 couriers
+for trial in range(TRIALS):  # 200 windows of 6 orders and 6 couriers
     orders = []
-    for _ in range(6):
+    for _ in range(BATCH):
         rest = point()
-        orders.append({"rest": rest, "ready": 4 + rnd(12)})
-    couriers = [point() for _ in range(6)]
+        orders.append({"rest": rest, "ready": READY_MIN + rnd(READY_SPREAD)})
+    couriers = [point() for _ in range(BATCH)]
     a = totals(orders, couriers, nearest_first(orders, couriers))
     b = totals(orders, couriers, best_assignment(orders, couriers))
     if b["cost"] > a["cost"]:

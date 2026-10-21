@@ -12,6 +12,10 @@ public static class Program
     const int Users = 120, Genres = 6, Per = 8, Items = Genres * Per, K = 5, NewItem = Items; // item 48 is new and has no interactions
     static int GenreOf(int item) => item / Per;
 
+    const int SeenPerUser = 12; // items each user has interacted with
+    const int FavouriteIn10 = 8; // 8 in 10 of them are from the user's favourite genre
+    const int Pool = 15; // candidates the diversity re-ranker chooses from
+    const int ExploreEvery = 10; // one user in 10 is shown the new item
     static long seed = 7;
     static int Random(int n) { seed = (seed * 1664525 + 1013904223) % 4294967296; return (int)(seed / 65536 % n); }
 
@@ -39,7 +43,7 @@ public static class Program
     static List<int> Diverse(List<int> items)
     {
         if (items.Count == 0) return ByPopularity(items);
-        var pool = Ranked(items).Take(15).ToList();
+        var pool = Ranked(items).Take(Pool).ToList();
         var picked = new List<int>();
         while (picked.Count < K)
         {
@@ -59,7 +63,7 @@ public static class Program
     static List<int> WithExplore(List<int> items, int u)
     {
         var list = Diverse(items);
-        return u % 10 == 0 ? list.Take(K - 1).Append(NewItem).ToList() : list;
+        return u % ExploreEvery == 0 ? list.Take(K - 1).Append(NewItem).ToList() : list;
     }
 
     static Result Evaluate(string name, Func<List<int>, int, List<int>> recommend)
@@ -84,9 +88,9 @@ public static class Program
         for (int u = 0; u < Users; u++)
         {
             var seen = new List<int>();
-            while (seen.Count < 12)
+            while (seen.Count < SeenPerUser)
             {
-                int g = Random(10) < 8 ? u % Genres : Random(Genres);
+                int g = Random(10) < FavouriteIn10 ? u % Genres : Random(Genres);
                 int item = g * Per + Math.Min(Random(Per), Random(Per));
                 if (!seen.Contains(item)) seen.Add(item);
             }
@@ -108,7 +112,7 @@ public static class Program
         Console.WriteLine($"cold-start user gets the popular items: {string.Join(", ", cold)}");
 
         bool ok = pb.Hits > pa.Hits && pb.Shown > pa.Shown && pc.Genres > pb.Genres && pc.Shown >= pb.Shown
-            && pb.NewShown == 0 && pd.NewShown == 12 && cold.SequenceEqual(popularity.Take(K));
+            && pb.NewShown == 0 && pd.NewShown == Users / ExploreEvery && cold.SequenceEqual(popularity.Take(K));
         Console.WriteLine($"CF beats popularity, diversity widens lists, new item only via exploration: {ok.ToString().ToLowerInvariant()}");
         return ok ? 0 : 1;
     }

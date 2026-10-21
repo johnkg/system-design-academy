@@ -5,6 +5,7 @@ from dataclasses import dataclass, field
 from itertools import combinations
 
 N = 3  # copies of every key
+TOKENS_PER_NODE = 16  # virtual nodes on the ring per server
 
 
 def fnv_hash(text):  # FNV-1a: a small, fast, well-spread hash
@@ -34,7 +35,7 @@ class Node:
 
 
 class Ring:
-    def __init__(self, names, tokens_per_node=16):
+    def __init__(self, names, tokens_per_node=TOKENS_PER_NODE):
         self.tokens = [Token(fnv_hash(f'{name}#{i}'), name) for name in names for i in range(tokens_per_node)]
         self.tokens.sort(key=lambda t: t.at)
 

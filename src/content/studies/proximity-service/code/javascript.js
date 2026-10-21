@@ -3,6 +3,19 @@
 // A radius search reads the query's cell and its 8 neighbours, then measures the true distance of only those candidates.
 
 const BITS = 12, SIZE = 1 << BITS;              // a 4096 by 4096 map; one unit is 10 metres, so the map is about 41 km wide
+const CITY_PLACES = 3000; // a dense city around (1200, 1200), +-300 units
+const CITY_X = 1200;
+const CITY_Y = 1200;
+const CITY_SPREAD = 300;
+const TOWN_PLACES = 400; // a small town around (3000, 2800), +-100 units
+const TOWN_X = 3000;
+const TOWN_Y = 2800;
+const TOWN_SPREAD = 100;
+const RURAL_PLACES = 600; // places anywhere on the map
+const QUERIES = 300; // random searches
+const MIN_RADIUS = 40; // search radius 40..240 units
+const RADIUS_SPREAD = 201;
+
 let seed = 99;
 const random = (n) => { seed = (seed * 1664525 + 1013904223) % 4294967296; return Math.floor(seed / 65536) % n; };
 
@@ -11,9 +24,9 @@ const zkey = (x, y) => { let k = 0; for (let b = BITS - 1; b >= 0; b--) k = k * 
 
 const places = [];
 const add = (x, y) => { x = Math.min(SIZE - 1, Math.max(0, x)); y = Math.min(SIZE - 1, Math.max(0, y)); places.push({ x, y, key: zkey(x, y) }); };
-for (let i = 0; i < 3000; i++) add(1200 + random(300) + random(300) - 300, 1200 + random(300) + random(300) - 300); // a dense city
-for (let i = 0; i < 400; i++) add(3000 + random(100) + random(100) - 100, 2800 + random(100) + random(100) - 100);  // a small town
-for (let i = 0; i < 600; i++) add(random(SIZE), random(SIZE));                                                      // places everywhere else
+for (let i = 0; i < CITY_PLACES; i++) add(CITY_X + random(CITY_SPREAD) + random(CITY_SPREAD) - CITY_SPREAD, CITY_Y + random(CITY_SPREAD) + random(CITY_SPREAD) - CITY_SPREAD); // a dense city
+for (let i = 0; i < TOWN_PLACES; i++) add(TOWN_X + random(TOWN_SPREAD) + random(TOWN_SPREAD) - TOWN_SPREAD, TOWN_Y + random(TOWN_SPREAD) + random(TOWN_SPREAD) - TOWN_SPREAD);  // a small town
+for (let i = 0; i < RURAL_PLACES; i++) add(random(SIZE), random(SIZE));                                                      // places everywhere else
 places.sort((a, b) => a.key - b.key || a.x - b.x || a.y - b.y);
 
 // First index whose key is at least the given key (binary search).
@@ -53,11 +66,11 @@ console.log(`cell and 8 neighbours: ${nine.hits} results, ${nine.examined} exami
 
 // 300 queries all over the map with radii from 40 to 240 units.
 let total = 0, ownTotal = 0, nineTotal = 0, examined = 0, exact = true;
-for (let i = 0; i < 300; i++) {
-  const x = random(SIZE), y = random(SIZE), radius = 40 + random(201);
+for (let i = 0; i < QUERIES; i++) {
+  const x = random(SIZE), y = random(SIZE), radius = MIN_RADIUS + random(RADIUS_SPREAD);
   const t = bruteForce(x, y, radius), a = search(x, y, radius, false), b = search(x, y, radius, true);
   total += t; ownTotal += a.hits; nineTotal += b.hits; examined += b.examined;
   if (b.hits !== t) exact = false;
 }
 console.log(`300 queries: ${total} results, own cell found ${ownTotal}, with neighbours found ${nineTotal}, examined ${examined} instead of ${300 * places.length}`);
-if (!exact || own.hits >= truth || nine.hits !== truth || ownTotal >= total || examined >= 300 * places.length) process.exit(1);
+if (!exact || own.hits >= truth || nine.hits !== truth || ownTotal >= total || examined >= QUERIES * places.length) process.exit(1);

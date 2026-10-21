@@ -2,11 +2,24 @@
 # each team has a token bucket. A request reserves "prompt + max output" before it runs and gets the unused part back when it finishes.
 import sys
 
+MILLI = 1000  # milli-tokens per token
+SEED = 7
+REQUESTS = 300
+GAP_MIN_MS = 40  # requests arrive 40..239 ms apart
+GAP_SPREAD_MS = 200
+PROMPT_MIN = 200  # prompt tokens: 200..1999
+PROMPT_SPREAD = 1800
+MAX_OUT = 1024  # output tokens reserved per request
+OUT_MIN = 50  # output tokens really used: 50..549
+OUT_SPREAD = 500
+SMALL_PROMPT_LIMIT = 800  # shorter prompts go to the small model
+MS_PER_SECOND = 1000
+
 
 class Budget:
     # Levels are kept in milli-tokens so refills are exact integers. rate is tokens per second, now is in milliseconds.
     def __init__(self, capacity, rate):
-        self.cap = capacity * 1000
+        self.cap = capacity * MILLI
         self.rate = rate
         self.level = self.cap
         self.last = 0
@@ -17,20 +30,20 @@ class Budget:
 
     def reserve(self, tokens, now):
         self.refill(now)
-        if self.level < tokens * 1000:
+        if self.level < tokens * MILLI:
             return False
-        self.level -= tokens * 1000
+        self.level -= tokens * MILLI
         return True
 
     def settle(self, reserved, used):
-        self.level = min(self.cap, self.level + (reserved - used) * 1000)
+        self.level = min(self.cap, self.level + (reserved - used) * MILLI)
 
 
 # Price per token in micro-dollars: (input, output). Short prompts go to the small model, the rest to the large one.
 PRICE = {'small': (1, 4), 'large': (3, 15)}
 TEAMS = [('search', 20000, 3000), ('support', 20000, 3000), ('research', 40000, 6000)]  # name, capacity, tokens per second
 
-seed = 7
+seed = SEED
 
 
 def random(n):
@@ -41,28 +54,28 @@ def random(n):
 
 def simulate(refund):
     global seed
-    seed = 7
+    seed = SEED
     budgets = [Budget(cap, rate) for _, cap, rate in TEAMS]
     stats = [{'ok': 0, 'rejected': 0, 'tokens': 0, 'cost': 0} for _ in TEAMS]
     now = 0
-    for _ in range(300):
-        now += 40 + random(200)
-        team = random(3)
-        prompt = 200 + random(1800)
-        max_out = 1024
-        out = 50 + random(500)
+    for _ in range(REQUESTS):
+        now += GAP_MIN_MS + random(GAP_SPREAD_MS)
+        team = random(len(TEAMS))
+        prompt = PROMPT_MIN + random(PROMPT_SPREAD)
+        max_out = MAX_OUT
+        out = OUT_MIN + random(OUT_SPREAD)
         reserved = prompt + max_out
         if not budgets[team].reserve(reserved, now):
             stats[team]['rejected'] += 1
             continue
-        model = 'small' if prompt < 800 else 'large'
+        model = 'small' if prompt < SMALL_PROMPT_LIMIT else 'large'
         used = prompt + out
         if refund:
             budgets[team].settle(reserved, used)  # without it the whole reservation stays spent
         stats[team]['ok'] += 1
         stats[team]['tokens'] += used
         stats[team]['cost'] += prompt * PRICE[model][0] + out * PRICE[model][1]
-    return stats, now / 1000
+    return stats, now / MS_PER_SECOND
 
 
 for refund in (True, False):

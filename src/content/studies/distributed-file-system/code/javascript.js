@@ -1,6 +1,13 @@
 // A tiny GFS-style cluster in JavaScript: a master with a chunk map, rack-aware placement,
 // heartbeats that detect dead servers, prioritised re-replication, and checksum scrubbing.
 const RACKS = 6, PER = 3, N = RACKS * PER, CHUNKS = 40, BLOCKS = 4, COPY_BUDGET = 4, TIMEOUT = 3;
+const REPLICAS = 3; // copies of every chunk
+const MIN_RACKS = 2; // racks every chunk must span
+const TICKS = 30;
+const SERVER_FAILS_AT = 5;
+const RACK_FAILS_AT = 12;
+const SETTLED_AFTER = 16; // count recovery only once the rack failure has been detected
+const CORRUPTIONS = 5; // blocks hit by bit rot
 let seed = 7;
 const rnd = (n) => { seed = (seed * 1664525 + 1013904223) % 4294967296; return Math.floor(seed / 65536) % n; };
 const mix = (x) => { x = Math.imul(x ^ (x >>> 16), 0x45d9f3b) >>> 0; x = Math.imul(x ^ (x >>> 16), 0x45d9f3b) >>> 0; return (x ^ (x >>> 16)) >>> 0; };
@@ -27,7 +34,7 @@ const racksOf = (c) => new Set(liveReplicas(c).map(rack)).size;
 
 function reReplicate(budget) { // fewest surviving copies first, so the most endangered chunks are fixed first
   const queue = [];
-  for (let c = 0; c < CHUNKS; c++) { const k = liveReplicas(c).length; if (k > 0 && k < 3) queue.push([k, c]); }
+  for (let c = 0; c < CHUNKS; c++) { const k = liveReplicas(c).length; if (k > 0 && k < REPLICAS) queue.push([k, c]); }
   queue.sort((x, y) => x[0] - y[0] || x[1] - y[1]);
   let done = 0;
   for (const [, c] of queue.slice(0, budget)) {
@@ -38,27 +45,27 @@ function reReplicate(budget) { // fewest surviving copies first, so the most end
   return done;
 }
 
-const underReplicated = () => { let k = 0; for (let c = 0; c < CHUNKS; c++) if (liveReplicas(c).length < 3) k++; return k; };
+const underReplicated = () => { let k = 0; for (let c = 0; c < CHUNKS; c++) if (liveReplicas(c).length < REPLICAS) k++; return k; };
 for (let c = 0; c < CHUNKS; c++) place(c);
-console.log(`placed ${CHUNKS} chunks, ${CHUNKS * 3} replicas, every chunk on 2+ racks: ${[...Array(CHUNKS).keys()].every((c) => racksOf(c) >= 2)}`);
+console.log(`placed ${CHUNKS} chunks, ${CHUNKS * REPLICAS} replicas, every chunk on 2+ racks: ${[...Array(CHUNKS).keys()].every((c) => racksOf(c) >= MIN_RACKS)}`);
 
-let minCopies = 3, healthyAt = -1;
-for (let tick = 1; tick <= 30; tick++) {
-  if (tick === 5) alive[4] = false;                    // one server dies
-  if (tick === 12) [6, 7, 8].forEach((n) => (alive[n] = false)); // then a whole rack
+let minCopies = REPLICAS, healthyAt = -1;
+for (let tick = 1; tick <= TICKS; tick++) {
+  if (tick === SERVER_FAILS_AT) alive[4] = false;                    // one server dies
+  if (tick === RACK_FAILS_AT) [6, 7, 8].forEach((n) => (alive[n] = false)); // then a whole rack
   for (let n = 0; n < N; n++) if (alive[n]) lastBeat[n] = tick; // heartbeats
   for (let n = 0; n < N; n++) if (!declaredDead[n] && tick - lastBeat[n] > TIMEOUT) { declaredDead[n] = true; console.log(`tick ${tick}: server ${n} declared dead, ${underReplicated()} chunks under-replicated`); }
   for (let c = 0; c < CHUNKS; c++) minCopies = Math.min(minCopies, liveReplicas(c).length);
   const copied = reReplicate(COPY_BUDGET);
   if (copied) console.log(`tick ${tick}: copied ${copied}, ${underReplicated()} still under-replicated`);
-  if (tick > 16 && healthyAt < 0 && underReplicated() === 0) healthyAt = tick;
+  if (tick > SETTLED_AFTER && healthyAt < 0 && underReplicated() === 0) healthyAt = tick;
 }
 console.log(`fewest copies of any chunk: ${minCopies}; fully replicated again at tick ${healthyAt}`);
 
 const sound = (r) => r.data.every((v, b) => mix(v) === r.sums[b]);
 let corrupted = 0, found = 0, repaired = 0;
-for (let i = 0; i < 5; i++) { // bit rot: flip a value in a stored block, leaving the stored checksum alone
-  const c = rnd(CHUNKS), n = liveReplicas(c)[rnd(3)], r = store[n].get(c);
+for (let i = 0; i < CORRUPTIONS; i++) { // bit rot: flip a value in a stored block, leaving the stored checksum alone
+  const c = rnd(CHUNKS), n = liveReplicas(c)[rnd(REPLICAS)], r = store[n].get(c);
   if (!sound(r)) { i--; continue; }                    // pick another replica if this one is already damaged
   r.data[rnd(BLOCKS)] ^= 1; corrupted++;
 }
@@ -74,6 +81,6 @@ console.log(`corrupted ${corrupted}, scrub found ${found}, repaired ${repaired}`
 
 let clean = true;
 for (let c = 0; c < CHUNKS; c++) for (const n of liveReplicas(c)) clean = clean && sound(store[n].get(c)) && store[n].get(c).data.every((v, b) => v === original(c)[b]);
-const ok = clean && underReplicated() === 0 && minCopies >= 1 && found === corrupted && [...Array(CHUNKS).keys()].every((c) => racksOf(c) >= 2 && liveReplicas(c).length === 3);
+const ok = clean && underReplicated() === 0 && minCopies >= 1 && found === corrupted && [...Array(CHUNKS).keys()].every((c) => racksOf(c) >= MIN_RACKS && liveReplicas(c).length === REPLICAS);
 console.log(`all replicas verify, 3 copies on 2+ racks: ${ok}`);
 if (!ok) process.exit(1);

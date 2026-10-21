@@ -18,21 +18,33 @@ var templates = new (string Type, string Msg, (string File, string Fn, int Line)
 };
 int[] weights = { 0, 0, 0, 1, 1, 1, 2, 2, 3, 4 };
 
+const int IdMin = 1000; // messages carry a 4-digit id
+const int IdSpread = 9000;
+const int VendorFns = 3; // vendor frames run0..run2
+const int VendorLine = 300;
+const int LineShift = 7; // app frame lines move this much every release
+const int FingerprintFrames = 3; // top app frames in a fingerprint
+const int Ticks = 300;
+const int ReleaseTicks = 100; // a new release every 100 ticks
+const int StormStart = 100; // the api retry storm: 20 events per tick for 20 ticks
+const int StormTicks = 20;
+const int StormEvents = 20;
+const int TopGroups = 4;
 uint seed = 7;
 int Rnd(int n) { seed = unchecked(seed * 1664525u + 1013904223u); return (int)((seed >> 16) % (uint)n); }
 
 Event MakeEvent(int release) {
-    int idx = weights[Rnd(10)];
+    int idx = weights[Rnd(weights.Length)];
     if (release == 1 && idx == 2) idx = 1; // the checkout bug is fixed in release 1
     var t = templates[idx];
-    int num = Rnd(9000) + 1000, vendor = Rnd(3);
-    var frames = t.Frames.Select(f => new Frame(f.File, f.Fn, f.Line + release * 7, true)).ToList(); // lines move every release
-    if (frames.Count > 0) frames.Add(new Frame("vendor.js", "run" + vendor, 300 + vendor, false));
+    int num = Rnd(IdSpread) + IdMin, vendor = Rnd(VendorFns);
+    var frames = t.Frames.Select(f => new Frame(f.File, f.Fn, f.Line + release * LineShift, true)).ToList(); // lines move every release
+    if (frames.Count > 0) frames.Add(new Frame("vendor.js", "run" + vendor, VendorLine + vendor, false));
     return new Event(t.Type, $"{t.Msg} {num}", frames, release);
 }
 
 uint Fingerprint(Event e) {
-    var app = string.Join(">", e.Frames.Where(f => f.App).Take(3).Select(f => $"{f.File}:{f.Fn}"));
+    var app = string.Join(">", e.Frames.Where(f => f.App).Take(FingerprintFrames).Select(f => $"{f.File}:{f.Fn}"));
     return Fnv1a($"{e.Type}|{(app != "" ? app : Normalize(e.Message))}"); // no line numbers, no vendor frames
 }
 uint NaiveKey(Event e) => Fnv1a($"{e.Type}|{e.Message}|" + string.Join(">", e.Frames.Select(f => $"{f.File}:{f.Fn}:{f.Line}")));
@@ -42,12 +54,12 @@ var groups = new Dictionary<string, Group>();
 var naive = new HashSet<uint>();
 var regressions = new List<string>();
 
-for (int t = 0; t < 300; t++) {
-    int release = t < 100 ? 0 : t < 200 ? 1 : 2;
-    if (t == 100) foreach (var g in groups.Values) if (g.Title.StartsWith("CheckoutError")) g.Status = "resolved";
+for (int t = 0; t < Ticks; t++) {
+    int release = t < ReleaseTicks ? 0 : t < 2 * ReleaseTicks ? 1 : 2;
+    if (t == ReleaseTicks) foreach (var g in groups.Values) if (g.Title.StartsWith("CheckoutError")) g.Status = "resolved";
     foreach (var (name, p) in projects) {
-        p.Tokens = Math.Min(30, p.Tokens + 3);
-        int n = name == "api" && t >= 100 && t < 120 ? 20 : 1; // a retry storm in the api project
+        p.Tokens = Math.Min(Project.BucketCapacity, p.Tokens + Project.BucketRefill);
+        int n = name == "api" && t >= StormStart && t < StormStart + StormTicks ? StormEvents : 1; // a retry storm in the api project
         for (int i = 0; i < n; i++) {
             var e = MakeEvent(release);
             p.Sent++;
@@ -66,7 +78,7 @@ int sent = projects.Values.Sum(p => p.Sent), kept = projects.Values.Sum(p => p.K
 Console.WriteLine($"events sent {sent}, kept {kept}, dropped {sent - kept}");
 foreach (var (name, p) in projects) Console.WriteLine($"{name}: sent {p.Sent}, kept {p.Kept}, dropped {p.Sent - p.Kept}");
 Console.WriteLine($"distinct events by naive key {naive.Count}, groups by fingerprint {groups.Count}");
-foreach (var kv in groups.OrderByDescending(kv => kv.Value.Count).ThenBy(kv => kv.Key, StringComparer.Ordinal).Take(4))
+foreach (var kv in groups.OrderByDescending(kv => kv.Value.Count).ThenBy(kv => kv.Key, StringComparer.Ordinal).Take(TopGroups))
     Console.WriteLine($"{kv.Key} x{kv.Value.Count} [{kv.Value.Status}] {kv.Value.Title}");
 Console.WriteLine($"regressions: {(regressions.Count > 0 ? string.Join("; ", regressions) : "none")}");
 
@@ -74,5 +86,9 @@ if (groups.Values.Sum(g => g.Count) != kept || groups.Count >= naive.Count || re
 
 record Frame(string File, string Fn, int Line, bool App);
 record Event(string Type, string Message, List<Frame> Frames, int Release);
-class Project { public int Tokens = 30, Sent, Kept; } // a token bucket: capacity 30, refill 3 per tick
+class Project // a token bucket: capacity 30, refill 3 per tick
+{
+    public const int BucketCapacity = 30, BucketRefill = 3;
+    public int Tokens = BucketCapacity, Sent, Kept;
+}
 class Group { public string Title = "", Status = "open"; public int Count; }

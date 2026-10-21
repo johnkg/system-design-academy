@@ -3,6 +3,11 @@
 const USERS = 120, GENRES = 6, PER = 8, ITEMS = GENRES * PER, K = 5, NEW_ITEM = ITEMS; // item 48 is new and has no interactions
 const genreOf = (item) => Math.floor(item / PER);
 
+const SEEN_PER_USER = 12; // items each user has interacted with
+const FAVOURITE_IN_10 = 8; // 8 in 10 of them are from the user's favourite genre
+const POOL = 15; // candidates the diversity re-ranker chooses from
+const EXPLORE_EVERY = 10; // one user in 10 is shown the new item
+
 let seed = 7;
 const random = (n) => { seed = (seed * 1664525 + 1013904223) % 4294967296; return Math.floor(seed / 65536) % n; };
 
@@ -10,8 +15,8 @@ const random = (n) => { seed = (seed * 1664525 + 1013904223) % 4294967296; retur
 const history = [], heldOut = [];
 for (let u = 0; u < USERS; u++) {
   const seen = [];
-  while (seen.length < 12) {
-    const g = random(10) < 8 ? u % GENRES : random(GENRES);
+  while (seen.length < SEEN_PER_USER) {
+    const g = random(10) < FAVOURITE_IN_10 ? u % GENRES : random(GENRES);
     const item = g * PER + Math.min(random(PER), random(PER));
     if (!seen.includes(item)) seen.push(item);
   }
@@ -40,7 +45,7 @@ function byCf(items) { return items.length === 0 ? byPopularity(items) : ranked(
 // Greedy re-rank of the best 15: each pick divides the score of items of the same genre by 1 + (how many of that genre are already picked).
 function diverse(items) {
   if (items.length === 0) return byPopularity(items);
-  const pool = ranked(items).slice(0, 15), picked = [];
+  const pool = ranked(items).slice(0, POOL), picked = [];
   while (picked.length < K) {
     let best = null, bestScore = -1;
     for (const x of pool) {
@@ -54,7 +59,7 @@ function diverse(items) {
 }
 
 // Exploration slot: for every 10th user the last slot shows the new item, so that it can start collecting interactions.
-const withExplore = (list, u) => (u % 10 === 0 ? [...list.slice(0, K - 1), NEW_ITEM] : list);
+const withExplore = (list, u) => (u % EXPLORE_EVERY === 0 ? [...list.slice(0, K - 1), NEW_ITEM] : list);
 
 function evaluate(name, recommend) {
   let hits = 0, newShown = 0; const covered = new Set(); let genreSum = 0;
@@ -76,7 +81,7 @@ const d = evaluate('CF + explore slot', (items, u) => withExplore(diverse(items)
 const cold = diverse([]);
 console.log(`cold-start user gets the popular items: ${cold.join(', ')}`);
 
-const ok = b.hits > a.hits && b.shown > a.shown && c.genres > b.genres && c.shown >= b.shown && b.newShown === 0 && d.newShown === 12
+const ok = b.hits > a.hits && b.shown > a.shown && c.genres > b.genres && c.shown >= b.shown && b.newShown === 0 && d.newShown === USERS / EXPLORE_EVERY
   && JSON.stringify(cold) === JSON.stringify(popularity.slice(0, K));
 console.log(`CF beats popularity, diversity widens lists, new item only via exploration: ${ok}`);
 if (!ok) process.exit(1);

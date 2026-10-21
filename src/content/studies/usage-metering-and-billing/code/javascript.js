@@ -13,16 +13,25 @@ function cost(units) {
 }
 const money = (c) => `${Math.floor(c / 100)}.${String(c % 100).padStart(2, '0')}`;
 
+const EVENTS = 2000;
+const CUSTOMERS = 3;
+const MAX_QTY = 5; // units per event: 1..5
+const LATE_IN_10 = 2; // 2 events in 10 arrive up to 599 late, the rest within 19
+const LATE_MAX = 600;
+const ON_TIME_MAX = 20;
+const DUP_ONE_IN = 10; // one event in 10 is delivered twice
+const DUP_DELAY = 50;
+
 let seed = 7;
 const random = (n) => { seed = (seed * 1664525 + 1013904223) % 4294967296; return Math.floor(seed / 65536) % n; };
 
 // Make 2,000 events over two periods. 1 in 5 is delayed a lot, and 1 in 10 is sent twice.
 const stream = [];
-for (let id = 0; id < 2000; id++) {
-  const ev = { id, customer: random(3), ts: random(2 * PERIOD), qty: 1 + random(5) };
-  const delay = random(10) < 2 ? random(600) : random(20);
+for (let id = 0; id < EVENTS; id++) {
+  const ev = { id, customer: random(CUSTOMERS), ts: random(2 * PERIOD), qty: 1 + random(MAX_QTY) };
+  const delay = random(10) < LATE_IN_10 ? random(LATE_MAX) : random(ON_TIME_MAX);
   stream.push({ ...ev, arrival: ev.ts + delay });
-  if (random(10) === 0) stream.push({ ...ev, arrival: ev.ts + delay + random(50) });
+  if (random(DUP_ONE_IN) === 0) stream.push({ ...ev, arrival: ev.ts + delay + random(DUP_DELAY) });
 }
 stream.sort((a, b) => a.arrival - b.arrival || a.id - b.id);
 
@@ -35,7 +44,7 @@ const add = (m, k, q) => m.set(k, (m.get(k) || 0) + q);
 function closeDue(now) { // close every period whose grace time has passed
   for (let p = 0; p < 2; p++) {
     if (!closed.has(p) && (p + 1) * PERIOD + GRACE <= now) {
-      for (let c = 0; c < 3; c++) snapshot.set(key(c, p), live.get(key(c, p)) || 0);
+      for (let c = 0; c < CUSTOMERS; c++) snapshot.set(key(c, p), live.get(key(c, p)) || 0);
       closed.add(p);
     }
   }
@@ -56,7 +65,7 @@ closeDue(Infinity);
 console.log(`events ${stream.length}, unique ${seen.size}, duplicates dropped ${duplicates}`);
 let ok = true;
 for (let p = 0; p < 2; p++) {
-  for (let c = 0; c < 3; c++) {
+  for (let c = 0; c < CUSTOMERS; c++) {
     const k = key(c, p), billed = snapshot.get(k), extra = late.get(k) || 0;
     const adj = cost(billed + extra) - cost(billed);
     console.log(`period ${p} customer ${c}: invoiced ${billed} units = ${money(cost(billed))}, late ${extra} units, adjustment ${money(adj)}`);

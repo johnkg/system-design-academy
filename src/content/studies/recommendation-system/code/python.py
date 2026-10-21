@@ -13,6 +13,11 @@ def genre_of(item):
     return item // PER
 
 
+SEEN_PER_USER = 12  # items each user has interacted with
+FAVOURITE_IN_10 = 8  # 8 in 10 of them are from the user's favourite genre
+POOL = 15  # candidates the diversity re-ranker chooses from
+EXPLORE_EVERY = 10  # one user in 10 is shown the new item
+
 seed = 7
 
 
@@ -26,8 +31,8 @@ def random(n):
 history, held_out = [], []
 for u in range(USERS):
     seen = []
-    while len(seen) < 12:
-        g = u % GENRES if random(10) < 8 else random(GENRES)
+    while len(seen) < SEEN_PER_USER:
+        g = u % GENRES if random(10) < FAVOURITE_IN_10 else random(GENRES)
         item = g * PER + min(random(PER), random(PER))
         if item not in seen:
             seen.append(item)
@@ -68,7 +73,7 @@ def by_cf(items):
 def diverse(items):
     if not items:
         return by_popularity(items)
-    pool, picked = ranked(items)[:15], []
+    pool, picked = ranked(items)[:POOL], []
     while len(picked) < K:
         best, best_score = None, -1
         for c, s in pool:
@@ -84,7 +89,7 @@ def diverse(items):
 # Exploration slot: for every 10th user the last slot shows the new item, so that it can start collecting interactions.
 def with_explore(items, u):
     lst = diverse(items)
-    return lst[:K - 1] + [NEW_ITEM] if u % 10 == 0 else lst
+    return lst[:K - 1] + [NEW_ITEM] if u % EXPLORE_EVERY == 0 else lst
 
 
 def evaluate(name, recommend):
@@ -108,7 +113,7 @@ cold = diverse([])
 print(f"cold-start user gets the popular items: {', '.join(map(str, cold))}")
 
 ok = (b['hits'] > a['hits'] and b['shown'] > a['shown'] and c['genres'] > b['genres'] and c['shown'] >= b['shown']
-      and b['new_shown'] == 0 and d['new_shown'] == 12 and cold == popularity[:K])
+      and b['new_shown'] == 0 and d['new_shown'] == USERS // EXPLORE_EVERY and cold == popularity[:K])
 print(f"CF beats popularity, diversity widens lists, new item only via exploration: {'true' if ok else 'false'}")
 if not ok:
     sys.exit(1)

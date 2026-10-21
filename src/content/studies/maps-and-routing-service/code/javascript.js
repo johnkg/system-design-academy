@@ -2,13 +2,19 @@
 // Each cell takes 2 or 3 minutes to cross, about one cell in eight is blocked, and a jam can make cells slower.
 const W = 24, H = 16, MIN_COST = 2;
 const START = 8 * W + 2, GOAL = 8 * W + 21;
+const WALL_ONE_IN = 8; // one cell in 8 is a wall
+const JAM_X0 = 8; // the jammed area: columns 8..15, rows 4..11
+const JAM_X1 = 16;
+const JAM_Y0 = 4;
+const JAM_Y1 = 12;
+const JAM_FACTOR = 3; // jammed cells cost three times as much
 
 let seed = 7;
 const next = () => { seed = (seed * 1664525 + 1013904223) % 4294967296; return Math.floor(seed / 65536); };
 
 function makeGrid() {
   const cost = []; // cost[cell] = minutes to enter the cell, or 0 for a wall
-  for (let i = 0; i < W * H; i++) cost.push(next() % 8 === 0 ? 0 : MIN_COST + (next() % 2));
+  for (let i = 0; i < W * H; i++) cost.push(next() % WALL_ONE_IN === 0 ? 0 : MIN_COST + (next() % 2));
   cost[START] = MIN_COST; cost[GOAL] = MIN_COST; // start and goal are always open
   return cost;
 }
@@ -80,7 +86,7 @@ const cost = makeGrid();
 const before = compare('free-flowing', cost);
 
 // A jam: every cell in the middle block takes three times as long. The estimate still never overestimates, so A* stays exact.
-const jammed = cost.map((c, i) => (c > 0 && i % W >= 8 && i % W < 16 && Math.floor(i / W) >= 4 && Math.floor(i / W) < 12 ? c * 3 : c));
+const jammed = cost.map((c, i) => (c > 0 && i % W >= JAM_X0 && i % W < JAM_X1 && Math.floor(i / W) >= JAM_Y0 && Math.floor(i / W) < JAM_Y1 ? c * JAM_FACTOR : c));
 const after = compare('with a jam', jammed);
 console.log(`the jam adds ${after.cost - before.cost} minutes to the trip`);
 if (after.cost < before.cost) process.exit(1);

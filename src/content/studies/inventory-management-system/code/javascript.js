@@ -48,28 +48,40 @@ class Inventory {
   }
 }
 
-let seed = 7;
+const SEED = 7;
+const STOCK_A = 60; // opening stock in warehouses 0 and 1
+const STOCK_B = 40;
+const TICKS = 200;
+const RESTOCK_AT = 100; // a delivery to warehouse 1
+const RESTOCK_QTY = 150;
+const MAX_REQUESTS = 3; // 1..3 reservation requests per tick
+const MAX_QTY = 3; // 1..3 units each
+const PAY_PCT = 65; // reservations that are paid
+const MAX_PAY_DELAY = 14; // paid 1..14 ticks after the hold
+const SHRINKAGE = 3; // units lost without a record
+
+let seed = SEED;
 const rnd = (n) => { seed = (seed * 1664525 + 1013904223) % 4294967296; return Math.floor(seed / 65536) % n; };
 
 const inv = new Inventory(2);
-inv.move(0, 60, 'receipt', 'po-1'); inv.move(1, 40, 'receipt', 'po-2');
-const physical = [60, 40];                              // what is really on the shelves
+inv.move(0, STOCK_A, 'receipt', 'po-1'); inv.move(1, STOCK_B, 'receipt', 'po-2');
+const physical = [STOCK_A, STOCK_B];                           // what is really on the shelves
 let next = 0, rejected = 0, accepted = 0, sold = 0, expired = 0, late = 0;
 const pending = [];                                     // { id, payAt }
-for (let now = 0; now < 200; now++) {
+for (let now = 0; now < TICKS; now++) {
   expired += inv.expire(now);
-  if (now === 100) { inv.move(1, 150, 'receipt', 'po-3'); physical[1] += 150; } // a delivery arrives
-  for (let k = 1 + rnd(3); k > 0; k--) {
-    const id = 'r' + next++, qty = 1 + rnd(3);
-    if (inv.reserve(id, qty, now)) { accepted++; if (rnd(100) < 65) pending.push({ id, payAt: now + 1 + rnd(14) }); } else rejected++;
+  if (now === RESTOCK_AT) { inv.move(1, RESTOCK_QTY, 'receipt', 'po-3'); physical[1] += RESTOCK_QTY; } // a delivery arrives
+  for (let k = 1 + rnd(MAX_REQUESTS); k > 0; k--) {
+    const id = 'r' + next++, qty = 1 + rnd(MAX_QTY);
+    if (inv.reserve(id, qty, now)) { accepted++; if (rnd(100) < PAY_PCT) pending.push({ id, payAt: now + 1 + rnd(MAX_PAY_DELAY) }); } else rejected++;
   }
   for (const p of pending.filter((p) => p.payAt === now)) {
     const qty = inv.reservations.get(p.id).qty;
     if (inv.commit(p.id, now)) { sold += qty; physical[inv.reservations.get(p.id).wh] -= qty; } else late++;
   }
 }
-inv.reserve('r0', 1, 200);                              // replay of an old id: no new hold
-physical[1] -= 3;                                       // three units were damaged or stolen, and nobody recorded it
+inv.reserve('r0', 1, TICKS);                              // replay of an old id: no new hold
+physical[1] -= SHRINKAGE;                                      // three units were damaged or stolen, and nobody recorded it
 
 console.log(`requests ${next}: accepted ${accepted}, rejected ${rejected}`);
 console.log(`units sold ${sold}, holds expired ${expired}, payments refused as late ${late}`);

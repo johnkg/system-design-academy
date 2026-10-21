@@ -54,7 +54,16 @@ public record Request(string Key, int From, int To, bool Pays);
 
 public static class Program
 {
-    static long seed = 4242;
+    const int Seed = 4242;
+    const int Requests = 60; // one booking request per tick
+    const int MaxStay = 3; // nights per request: 1..3
+    const int PayPct = 70; // requests that go on to pay
+    const int PayDelay = 2; // ticks between hold and payment
+    const int RetryEvery = 7; // every 7th request is sent twice
+    const int SnapshotGroup = 12; // requests that read the same snapshot in the naive version
+    const int NoShowSteps = 3; // 0%, 10% or 20% no-shows, by night
+    const int Tenths = 10;
+    static long seed = Seed;
     static int Random(int n) { seed = (seed * 1664525 + 1013904223) % 4294967296; return (int)((seed / 65536) % n); }
 
     public static int Main()
@@ -62,19 +71,19 @@ public static class Program
         const int Nights = Inventory.Nights, Capacity = Inventory.Capacity;
         // 60 requests, one per tick. Each wants 1 to 3 nights, pays 2 ticks later unless it abandons, and every 7th request is sent twice.
         var requests = new List<Request>();
-        for (int i = 0; i < 60; i++)
+        for (int i = 0; i < Requests; i++)
         {
-            int len = 1 + Random(3), from = Random(Nights - len + 1);
-            bool pays = Random(100) < 70;
+            int len = 1 + Random(MaxStay), from = Random(Nights - len + 1);
+            bool pays = Random(100) < PayPct;
             requests.Add(new Request($"req-{i}", from, from + len, pays));
         }
 
         // The mistake: everyone reads the free count first, then writes. Here 12 requests read the same snapshot.
         var naive = new int[Nights];
-        for (int i = 0; i < requests.Count; i += 12)
+        for (int i = 0; i < requests.Count; i += SnapshotGroup)
         {
             var snapshot = (int[])naive.Clone();
-            foreach (var r in requests.Skip(i).Take(12))
+            foreach (var r in requests.Skip(i).Take(SnapshotGroup))
             {
                 bool free = true;
                 for (int n = r.From; n < r.To; n++) if (snapshot[n] >= Capacity) free = false;
@@ -86,7 +95,7 @@ public static class Program
         var inv = new Inventory(Capacity + Inventory.Overbook);
         var pending = new List<(string Key, int At)>();
         int rejected = 0, sold = 0, expired = 0;
-        for (int t = 0; t < requests.Count + Inventory.HoldTtl + 2; t++)
+        for (int t = 0; t < requests.Count + Inventory.HoldTtl + PayDelay; t++)
         {
             expired += inv.Expire(t);
             foreach (var p in pending.Where(p => p.At == t).ToList()) if (inv.Confirm(p.Key, t)) sold++;
@@ -94,8 +103,8 @@ public static class Program
             {
                 var r = requests[t];
                 var h = inv.TryHold(r.Key, r.From, r.To, t);
-                if (h.State == "rejected") rejected++; else if (r.Pays) pending.Add((r.Key, t + 2));
-                if (t % 7 == 0) inv.TryHold(r.Key, r.From, r.To, t); // a client retry with the same key
+                if (h.State == "rejected") rejected++; else if (r.Pays) pending.Add((r.Key, t + PayDelay));
+                if (t % RetryEvery == 0) inv.TryHold(r.Key, r.From, r.To, t); // a client retry with the same key
             }
         }
 
@@ -107,7 +116,7 @@ public static class Program
         // Overbooking: guests who cancel or do not show up leave rooms empty, and the allowance sells them twice.
         var sold10 = inv.Rows.Select(row => row.Sold).ToArray();
         // Pretend that 0%, 10% or 20% of the guests booked for a night do not arrive, depending on the night.
-        var shown = sold10.Select((s, i) => (s * (10 - (i % 3)) + 5) / 10).ToArray();
+        var shown = sold10.Select((s, i) => (s * (Tenths - (i % NoShowSteps)) + Tenths / 2) / Tenths).ToArray();
         int walked = shown.Sum(x => Math.Max(0, x - Capacity));
         Console.WriteLine($"sold per night: {string.Join(" ", sold10)}; guests who arrive: {string.Join(" ", shown)}; guests without a room: {walked}");
 

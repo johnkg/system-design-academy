@@ -3,11 +3,17 @@
 // and backfill lets short jobs use the gaps without delaying the job at the head of the queue.
 
 const NODES = 8, PER_NODE = 8, RACK = 4; // 8 nodes of 8 GPUs, 2 racks of 4 nodes (64 GPUs)
+const JOBS = 40;
+const TEAMS = 3;
+const MIN_DUR = 2; // job durations: 2..10 ticks
+const DUR_SPREAD = 9;
+const SUBMIT_WINDOW = 8; // jobs are submitted in ticks 0..7
+const MAX_TICKS = 1000; // safety stop for the simulation
 let seed = 7;
 const random = (n) => { seed = (seed * 1664525 + 1013904223) % 4294967296; return Math.floor(seed / 65536) % n; };
 
 const sizes = [1, 2, 4, 8, 8, 16, 16, 32];
-const jobs = Array.from({ length: 40 }, (_, id) => ({ id, gpus: sizes[random(8)], team: random(3), dur: 2 + random(9), submit: random(8) }));
+const jobs = Array.from({ length: JOBS }, (_, id) => ({ id, gpus: sizes[random(sizes.length)], team: random(TEAMS), dur: MIN_DUR + random(DUR_SPREAD), submit: random(SUBMIT_WINDOW) }));
 jobs.sort((a, b) => a.submit * 100 + a.id - (b.submit * 100 + b.id));
 
 // Returns [[node, count], ...] or null. Small jobs: the tightest node that fits. Big jobs: whole free nodes inside one rack.
@@ -27,7 +33,7 @@ function place(free, gpus) {
 }
 
 function run(backfill) {
-  const free = new Array(NODES).fill(PER_NODE), usage = [0, 0, 0];
+  const free = new Array(NODES).fill(PER_NODE), usage = new Array(TEAMS).fill(0);
   const pending = jobs.map((j) => ({ ...j })), running = [];
   let done = 0, waitSum = 0, busy = 0, t = 0, started = 0;
   const start = (j, slots) => {
@@ -35,7 +41,7 @@ function run(backfill) {
     if (slots.reduce((s, [, c]) => s + c, 0) !== j.gpus || free.some((f) => f < 0)) throw new Error('gang broken');
     j.slots = slots; j.end = t + j.dur; running.push(j); waitSum += t - j.submit; started++;
   };
-  for (; done < jobs.length && t < 1000; t++) {
+  for (; done < jobs.length && t < MAX_TICKS; t++) {
     for (const j of running.filter((r) => r.end === t)) { j.slots.forEach(([n, c]) => { free[n] += c; }); done++; }
     running.splice(0, running.length, ...running.filter((r) => r.end !== t));
     const queue = pending.filter((j) => j.submit <= t && !j.slots).sort((a, b) => usage[a.team] - usage[b.team] || a.submit - b.submit || a.id - b.id);

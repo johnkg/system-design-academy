@@ -77,20 +77,31 @@ function intersect(a, b) {
 }
 const select = (matchers) => matchers.map((m) => postings.get(m) ?? []).sort((a, b) => a.length - b.length).reduce(intersect);
 
+const SERIES = 8; // hosts h0..h7
+const POINTS = 120; // points per series
+const BASE_VALUE = 50; // host h starts at 50 + h
+const VALUE_STEP = 0.25; // a changing scrape moves the value by one step
+const SCRAPE_S = 10; // seconds between scrapes
+const JITTER_ONE_IN = 8; // one scrape in 8 lands a second late
+const WEB_HOSTS = 5; // h0..h4 are web, the rest db
+const QUERY_FROM = 300; // the range query covers T0+300 .. T0+599
+const QUERY_TO = 600;
+const MAX_BITS_PER_POINT = 40; // compression must do better than this
+
 let seed = 7;
 const random = (n) => { seed = (seed * 1664525 + 1013904223) % 4294967296; return Math.floor(seed / 65536) % n; };
 const T0 = 1700000000, raw = [];
-for (let h = 0; h < 8; h++) {
-  let v = 50 + h; const points = [];
-  for (let i = 0; i < 120; i++) {
-    if (random(2) === 0) v += (random(3) - 1) * 0.25; // half the scrapes see no change
-    points.push([T0 + i * 10 + (random(8) === 0 ? 1 : 0), v]);
+for (let h = 0; h < SERIES; h++) {
+  let v = BASE_VALUE + h; const points = [];
+  for (let i = 0; i < POINTS; i++) {
+    if (random(2) === 0) v += (random(3) - 1) * VALUE_STEP; // half the scrapes see no change
+    points.push([T0 + i * SCRAPE_S + (random(JITTER_ONE_IN) === 0 ? 1 : 0), v]);
   }
   raw.push(points);
-  addSeries({ __name__: 'cpu', host: `h${h}`, region: h % 2 === 0 ? 'eu' : 'us', tier: h < 5 ? 'web' : 'db' }, points);
+  addSeries({ __name__: 'cpu', host: `h${h}`, region: h % 2 === 0 ? 'eu' : 'us', tier: h < WEB_HOSTS ? 'web' : 'db' }, points);
 }
 
-const total = blocks.reduce((s, b) => s + b.bits.length, 0), count = raw.length * 120;
+const total = blocks.reduce((s, b) => s + b.bits.length, 0), count = raw.length * POINTS;
 console.log(`${series.length} series, ${count} points, raw ${count * 16} bytes`);
 console.log(`compressed ${blocks.reduce((s, b) => s + Math.ceil(b.bits.length / 8), 0)} bytes, ${(total / count).toFixed(2)} bits per point`);
 const ok = blocks.every((b, i) => JSON.stringify(decompress(b.bits, b.n)) === JSON.stringify(raw[i]));
@@ -99,6 +110,6 @@ console.log(`round trip exact: ${ok}`);
 const ids = select(['__name__=cpu', 'region=eu', 'tier=web']);
 console.log(`region=eu has [${postings.get('region=eu')}]; cpu, eu and web match series [${ids}]`);
 let sum = 0, hits = 0;
-for (const id of ids) for (const [t, v] of decompress(blocks[id].bits, blocks[id].n)) if (t >= T0 + 300 && t < T0 + 600) { sum += v; hits++; }
+for (const id of ids) for (const [t, v] of decompress(blocks[id].bits, blocks[id].n)) if (t >= T0 + QUERY_FROM && t < T0 + QUERY_TO) { sum += v; hits++; }
 console.log(`points in the range: ${hits}, sum ${sum.toFixed(2)}`);
-if (!ok || ids.join() !== '0,2,4' || total / count > 40) process.exit(1);
+if (!ok || ids.join() !== '0,2,4' || total / count > MAX_BITS_PER_POINT) process.exit(1);

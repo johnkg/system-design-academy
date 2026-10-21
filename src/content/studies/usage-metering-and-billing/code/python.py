@@ -21,6 +21,15 @@ def money(c):
     return f"{c // 100}.{c % 100:02d}"
 
 
+EVENTS = 2000
+CUSTOMERS = 3
+MAX_QTY = 5  # units per event: 1..5
+LATE_IN_10 = 2  # 2 events in 10 arrive up to 599 late, the rest within 19
+LATE_MAX = 600
+ON_TIME_MAX = 20
+DUP_ONE_IN = 10  # one event in 10 is delivered twice
+DUP_DELAY = 50
+
 seed = 7
 
 
@@ -32,12 +41,12 @@ def random(n):
 
 # Make 2,000 events over two periods. 1 in 5 is delayed a lot, and 1 in 10 is sent twice.
 stream = []
-for event_id in range(2000):
-    ev = {"id": event_id, "customer": random(3), "ts": random(2 * PERIOD), "qty": 1 + random(5)}
-    delay = random(600) if random(10) < 2 else random(20)
+for event_id in range(EVENTS):
+    ev = {"id": event_id, "customer": random(CUSTOMERS), "ts": random(2 * PERIOD), "qty": 1 + random(MAX_QTY)}
+    delay = random(LATE_MAX) if random(10) < LATE_IN_10 else random(ON_TIME_MAX)
     stream.append({**ev, "arrival": ev["ts"] + delay})
-    if random(10) == 0:
-        stream.append({**ev, "arrival": ev["ts"] + delay + random(50)})
+    if random(DUP_ONE_IN) == 0:
+        stream.append({**ev, "arrival": ev["ts"] + delay + random(DUP_DELAY)})
 stream.sort(key=lambda e: (e["arrival"], e["id"]))
 
 seen, live, snapshot, closed, late, truth = set(), {}, {}, set(), {}, {}
@@ -56,7 +65,7 @@ def add(m, k, q):
 def close_due(now):  # close every period whose grace time has passed
     for p in range(2):
         if p not in closed and (p + 1) * PERIOD + GRACE <= now:
-            for c in range(3):
+            for c in range(CUSTOMERS):
                 snapshot[key(c, p)] = live.get(key(c, p), 0)
             closed.add(p)
 
@@ -81,7 +90,7 @@ close_due(float("inf"))
 print(f"events {len(stream)}, unique {len(seen)}, duplicates dropped {duplicates}")
 ok = True
 for p in range(2):
-    for c in range(3):
+    for c in range(CUSTOMERS):
         k = key(c, p)
         billed, extra = snapshot[k], late.get(k, 0)
         adj = cost(billed + extra) - cost(billed)

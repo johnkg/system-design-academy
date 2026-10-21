@@ -11,6 +11,7 @@ public record Ruleset(int Version, Dictionary<string, Flag> Flags);
 
 public static class Flags
 {
+    const uint Buckets = 10000; // buckets 0..9999, in hundredths of a percent
     // A 32-bit hash (FNV-1a followed by a final mix) of text, so the same user and flag always give the same number.
     public static uint Hash(string text)
     {
@@ -22,7 +23,7 @@ public static class Flags
             return h;
         }
     }
-    public static uint Bucket(string salt, string userId) => Hash($"{salt}:{userId}") % 10000; // 0..9999, in hundredths of a percent
+    public static uint Bucket(string salt, string userId) => Hash($"{salt}:{userId}") % Buckets; // 0..9999, in hundredths of a percent
 
     // The order is: kill switch, then targeting rules, then the percentage rollout. A flag that does not exist is off.
     public static bool Evaluate(Ruleset? ruleset, string key, User user)
@@ -48,37 +49,43 @@ public static class Program
         ["new-checkout"] = new Flag(salt, killed, rolloutBp, new[] { new Rule("plan", "internal", true) }),
     });
 
+    const int Users = 20000;
+    const int InternalEvery = 100; // every 100th user is on the internal plan
+    const int Rollout10Bp = 1000; // rollouts in basis points: 10%, 30%, 90%
+    const int Rollout30Bp = 3000;
+    const int Rollout90Bp = 9000;
+    const int MinAt10 = 1500; // sanity floor for a 10% rollout of 20000 users
     public static int Main()
     {
-        var users = Enumerable.Range(0, 20000).Select(i => new User($"user-{i}", i % 100 == 0 ? "internal" : "free")).ToList();
+        var users = Enumerable.Range(0, Users).Select(i => new User($"user-{i}", i % InternalEvery == 0 ? "internal" : "free")).ToList();
         int Count(Sdk s) => users.Count(u => s.IsOn("new-checkout", u));
 
         var sdk = new Sdk();
         Console.WriteLine($"no ruleset yet, fail closed: {Count(sdk)} users on");
-        sdk.Apply(Make(1, 1000, "nc-7f3a", false));
+        sdk.Apply(Make(1, Rollout10Bp, "nc-7f3a", false));
         var at10 = users.Where(u => sdk.IsOn("new-checkout", u)).ToList();
         Console.WriteLine($"10% rollout: {at10.Count} users on");
-        sdk.Apply(Make(2, 3000, "nc-7f3a", false));
+        sdk.Apply(Make(2, Rollout30Bp, "nc-7f3a", false));
         var at30 = users.Where(u => sdk.IsOn("new-checkout", u)).ToList();
         int kept = at10.Count(u => sdk.IsOn("new-checkout", u));
         Console.WriteLine($"30% rollout: {at30.Count} users on, {kept} of the first {at10.Count} kept it");
 
-        var resalted = new Sdk(); resalted.Apply(Make(3, 3000, "nc-new-salt", false));
+        var resalted = new Sdk(); resalted.Apply(Make(3, Rollout30Bp, "nc-new-salt", false));
         int lost = at10.Count(u => !resalted.IsOn("new-checkout", u));
         Console.WriteLine($"same 30% with a new salt: {lost} of the first {at10.Count} lose it");
 
-        int other = users.Count(u => Flags.Bucket("other-flag", u.Id) < 3000);
-        int both = users.Count(u => Flags.Bucket("other-flag", u.Id) < 3000 && Flags.Bucket("nc-7f3a", u.Id) < 3000);
+        int other = users.Count(u => Flags.Bucket("other-flag", u.Id) < Rollout30Bp);
+        int both = users.Count(u => Flags.Bucket("other-flag", u.Id) < Rollout30Bp && Flags.Bucket("nc-7f3a", u.Id) < Rollout30Bp);
         Console.WriteLine($"two flags at 30% with different salts: {both} of {other} share users");
 
         sdk.Apply(null);                              // the service is down: the last ruleset stays
-        sdk.Apply(Make(1, 9000, "nc-7f3a", false));   // an old version arrives late: ignored
+        sdk.Apply(Make(1, Rollout90Bp, "nc-7f3a", false));   // an old version arrives late: ignored
         Console.WriteLine($"service down, old copy kept: version {sdk.Current!.Version}, {Count(sdk)} users on");
-        sdk.Apply(Make(4, 3000, "nc-7f3a", true));
+        sdk.Apply(Make(4, Rollout30Bp, "nc-7f3a", true));
         Console.WriteLine($"kill switch: {Count(sdk)} users on");
 
         bool monotone = kept == at10.Count && at30.Count > at10.Count;
         bool killed = Count(sdk) == 0;
-        return !monotone || !killed || lost == 0 || at10.Count < 1500 ? 1 : 0;
+        return !monotone || !killed || lost == 0 || at10.Count < MinAt10 ? 1 : 0;
     }
 }

@@ -26,6 +26,15 @@ public class Edge
 public static class Program
 {
     const int Edges = 8, Seconds = 5, Keep = 4, Types = 4;
+    const int FlagOneIn = 11; // every 11th comment is flagged by moderation
+    const int TypeScale = 10; // reaction mix out of 10: heart 5, laugh 3, clap 1, wow 1
+    const int HeartUpto = 5;
+    const int LaughUpto = 8;
+    const int ClapUpto = 9;
+    const int ReactionsMin = 200; // per edge per second: 200..299 reactions, 20..29 comments
+    const int ReactionsSpread = 100;
+    const int CommentsMin = 20;
+    const int CommentsSpread = 10;
     static readonly string[] Names = { "heart", "laugh", "clap", "wow" };
     static uint seed = 7;
 
@@ -39,9 +48,9 @@ public static class Program
         return x ^ (x >> 16);
     }
 
-    public static bool Flagged(int id) => id % 11 == 0; // stands in for the moderation verdict
+    public static bool Flagged(int id) => id % FlagOneIn == 0; // stands in for the moderation verdict
 
-    static int PickType() { int r = Rnd(10); return r < 5 ? 0 : r < 8 ? 1 : r < 9 ? 2 : 3; }
+    static int PickType() { int r = Rnd(TypeScale); return r < HeartUpto ? 0 : r < LaughUpto ? 1 : r < ClapUpto ? 2 : 3; }
 
     static string Ids(IEnumerable<Comment> list) => string.Join(",", list.Select(c => c.Id));
 
@@ -55,7 +64,7 @@ public static class Program
             var everything = new List<Comment>(); // the slow, obvious record of every accepted comment, to check against
             foreach (var edge in edges)
             {
-                int reactions = 200 + Rnd(100), comments = 20 + Rnd(10);
+                int reactions = ReactionsMin + Rnd(ReactionsSpread), comments = CommentsMin + Rnd(CommentsSpread);
                 for (int i = 0; i < reactions; i++) { int t = PickType(); edge.React(t); truthTotal[t]++; }
                 for (int i = 0; i < comments; i++) { int id = ++nextId; edge.Comment(id); if (!Flagged(id)) everything.Add(new Comment(id, Priority(id))); }
                 eventsIn += reactions + comments;

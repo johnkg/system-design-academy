@@ -21,7 +21,8 @@ public static class Program
         Console.WriteLine($"  user received: {string.Join(", ", counts)}");
     }
 
-    static void SendWithRetry(FakeProvider provider, string id, bool useKey, int maxAttempts = 3)
+    const int MaxAttempts = 3; // sends before the worker gives up
+    static void SendWithRetry(FakeProvider provider, string id, bool useKey, int maxAttempts = MaxAttempts)
     {
         for (var attempt = 1; attempt <= maxAttempts; attempt++)
         {

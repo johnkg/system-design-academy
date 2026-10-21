@@ -51,7 +51,19 @@ class Inventory:
         return True
 
 
-seed = 7
+SEED = 7
+STOCK_A = 60  # opening stock in warehouses 0 and 1
+STOCK_B = 40
+TICKS = 200
+RESTOCK_AT = 100  # a delivery to warehouse 1
+RESTOCK_QTY = 150
+MAX_REQUESTS = 3  # 1..3 reservation requests per tick
+MAX_QTY = 3  # 1..3 units each
+PAY_PCT = 65  # reservations that are paid
+MAX_PAY_DELAY = 14  # paid 1..14 ticks after the hold
+SHRINKAGE = 3  # units lost without a record
+
+seed = SEED
 
 
 def rnd(n):
@@ -61,23 +73,23 @@ def rnd(n):
 
 
 inv = Inventory(2)
-inv.move(0, 60, "receipt", "po-1")
-inv.move(1, 40, "receipt", "po-2")
-physical = [60, 40]                           # what is really on the shelves
+inv.move(0, STOCK_A, "receipt", "po-1")
+inv.move(1, STOCK_B, "receipt", "po-2")
+physical = [STOCK_A, STOCK_B]                        # what is really on the shelves
 nxt = rejected = accepted = sold = expired = late = 0
 pending = []                                  # (id, pay_at)
-for now in range(200):
+for now in range(TICKS):
     expired += inv.expire(now)
-    if now == 100:
-        inv.move(1, 150, "receipt", "po-3")
-        physical[1] += 150                    # a delivery arrives
-    for _ in range(1 + rnd(3)):
-        rid, qty = "r" + str(nxt), 1 + rnd(3)
+    if now == RESTOCK_AT:
+        inv.move(1, RESTOCK_QTY, "receipt", "po-3")
+        physical[1] += RESTOCK_QTY                   # a delivery arrives
+    for _ in range(1 + rnd(MAX_REQUESTS)):
+        rid, qty = "r" + str(nxt), 1 + rnd(MAX_QTY)
         nxt += 1
         if inv.reserve(rid, qty, now):
             accepted += 1
-            if rnd(100) < 65:
-                pending.append((rid, now + 1 + rnd(14)))
+            if rnd(100) < PAY_PCT:
+                pending.append((rid, now + 1 + rnd(MAX_PAY_DELAY)))
         else:
             rejected += 1
     for rid, pay_at in [p for p in pending if p[1] == now]:
@@ -87,8 +99,8 @@ for now in range(200):
             physical[r["wh"]] -= r["qty"]
         else:
             late += 1
-inv.reserve("r0", 1, 200)                     # replay of an old id: no new hold
-physical[1] -= 3                              # three units were damaged or stolen, and nobody recorded it
+inv.reserve("r0", 1, TICKS)                     # replay of an old id: no new hold
+physical[1] -= SHRINKAGE                             # three units were damaged or stolen, and nobody recorded it
 
 print(f"requests {nxt}: accepted {accepted}, rejected {rejected}")
 print(f"units sold {sold}, holds expired {expired}, payments refused as late {late}")

@@ -30,6 +30,14 @@ int Score(string url, string agent, int countFromClient) {
 }
 
 // A seeded generator, so every run sees the same traffic.
+const int Requests = 1000;
+const int AttackFrom = 80; // r is 0..99: r >= 80 is an attack (20%)
+const int StrongUpto = 92; // attacks: obvious payload below 92, evasive above
+const int NormalUpto = 70; // users: plain URL below 70, tricky but harmless above
+const int Attackers = 3; // attacker client ids 1..3
+const int UserIdFrom = 10; // user client ids 10..59
+const int Users = 50;
+const int DefaultThreshold = 5; // anomaly score that blocks
 uint seed = 77;
 int Rnd(int n) { seed = unchecked(seed * 1664525u + 1013904223u); return (int)((seed >> 16) % (uint)n); }
 string Pick(string[] items) => items[Rnd(items.Length)];
@@ -42,19 +50,19 @@ const string Browser = "Mozilla/5.0", Bot = "python-requests/2.31";
 
 var traffic = new List<(bool Attack, int Points)>();
 var seen = new Dictionary<int, int>(); // requests per client in the current window
-for (int i = 0; i < 1000; i++) {
+for (int i = 0; i < Requests; i++) {
     if (i % Window == 0) seen.Clear();
     int r = Rnd(100);
-    bool attack = r >= 80;
+    bool attack = r >= AttackFrom;
     string url, agent; int client;
     if (attack) {
-        url = Pick(r < 92 ? strong : evasive);
+        url = Pick(r < StrongUpto ? strong : evasive);
         agent = Rnd(2) != 0 ? Bot : Browser;
-        client = 1 + Rnd(3);
+        client = 1 + Rnd(Attackers);
     } else {
-        url = Pick(r < 70 ? normal : tricky);
+        url = Pick(r < NormalUpto ? normal : tricky);
         agent = Browser;
-        client = 10 + Rnd(50);
+        client = UserIdFrom + Rnd(Users);
     }
     seen[client] = seen.GetValueOrDefault(client) + 1;
     traffic.Add((attack, Score(url, agent, seen[client])));
@@ -76,10 +84,10 @@ foreach (int threshold in new[] { 2, 4, 5, 8 }) {
     var o = Run(threshold, false);
     Console.WriteLine($"threshold {threshold}: blocked attacks {o.BlockedAttacks}, blocked real users {o.BlockedUsers}, attacks let through {o.Missed}");
 }
-var watch = Run(5, true);
+var watch = Run(DefaultThreshold, true);
 Console.WriteLine($"detection only at 5: would block {watch.WouldBlock}, blocked {watch.BlockedAttacks + watch.BlockedUsers}");
 
-var strict = Run(2, false); var mid = Run(5, false); var loose = Run(8, false);
+var strict = Run(2, false); var mid = Run(DefaultThreshold, false); var loose = Run(8, false);
 bool ok = strict.BlockedUsers > mid.BlockedUsers && loose.Missed > mid.Missed && watch.BlockedAttacks + watch.BlockedUsers == 0 && mid.WouldBlock == watch.WouldBlock;
 Console.WriteLine($"stricter threshold blocks more real users, looser lets more attacks through: {(ok ? "true" : "false")}");
 if (!ok) Environment.Exit(1);

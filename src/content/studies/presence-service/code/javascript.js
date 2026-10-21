@@ -3,6 +3,15 @@
 // and friends are told only when the user's status changes, not on every heartbeat.
 
 const TTL = 30; // seconds a session survives without a heartbeat (three heartbeat intervals)
+const DEVICE_SLOTS = 8; // session key = user * DEVICE_SLOTS + device
+const HEARTBEAT_S = 10; // each device beats every 10 s, at its own phase
+const FRIENDS = 6;
+const MAX_DEVICES = 3;
+const DIE_ONE_IN = 3; // one device in 3 dies at 30..249 s
+const DIE_FROM = 30;
+const DIE_SPREAD = 220;
+const TICKS = 300;
+const LOSS_ONE_IN = 5;
 
 class Presence {
   constructor(friendsOf) {
@@ -19,7 +28,7 @@ class Presence {
   }
 
   heartbeat(user, device, now) {
-    const key = user * 8 + device;
+    const key = user * DEVICE_SLOTS + device;
     const isNew = !this.expiry.has(key);
     this.expiry.set(key, now + TTL); // renewing is one cheap write
     if (!isNew) return;
@@ -29,14 +38,14 @@ class Presence {
   }
 
   disconnect(user, device) { // a clean goodbye, or an expiry
-    if (!this.expiry.delete(user * 8 + device)) return;
+    if (!this.expiry.delete(user * DEVICE_SLOTS + device)) return;
     const n = this.live.get(user) - 1;
     this.live.set(user, n);
     if (n === 0) this.change(user, false); // the last session takes the user offline
   }
 
   sweep(now) { // in a real store the TTL does this for us
-    for (const [key, at] of [...this.expiry]) if (at <= now) this.disconnect(Math.floor(key / 8), key % 8);
+    for (const [key, at] of [...this.expiry]) if (at <= now) this.disconnect(Math.floor(key / DEVICE_SLOTS), key % DEVICE_SLOTS);
   }
 
   isOnline(user) { return (this.live.get(user) ?? 0) > 0; }
@@ -49,22 +58,22 @@ const USERS = 100;
 const friendsOf = [], devices = [];
 for (let u = 0; u < USERS; u++) {
   const list = [];
-  while (list.length < 6) { const f = random(USERS); if (f !== u && !list.includes(f)) list.push(f); }
+  while (list.length < FRIENDS) { const f = random(USERS); if (f !== u && !list.includes(f)) list.push(f); }
   friendsOf.push(list);
-  const count = 1 + random(3);
+  const count = 1 + random(MAX_DEVICES);
   for (let d = 0; d < count; d++) {
-    const phase = random(10), dies = random(3) === 0;
-    devices.push({ u, d, phase, dead: dies ? 30 + random(220) : -1, graceful: random(2) === 1 });
+    const phase = random(HEARTBEAT_S), dies = random(DIE_ONE_IN) === 0;
+    devices.push({ u, d, phase, dead: dies ? DIE_FROM + random(DIE_SPREAD) : -1, graceful: random(2) === 1 });
   }
 }
 
 const presence = new Presence(friendsOf);
 let heartbeats = 0;
-for (let t = 0; t < 300; t++) {
+for (let t = 0; t < TICKS; t++) {
   for (const x of devices) {
     if (x.dead >= 0 && t === x.dead && x.graceful) presence.disconnect(x.u, x.d); // others just go silent
     const alive = x.dead < 0 || t < x.dead;
-    if (alive && (t + x.phase) % 10 === 0 && random(5) !== 0) { // one heartbeat in five is lost
+    if (alive && (t + x.phase) % HEARTBEAT_S === 0 && random(LOSS_ONE_IN) !== 0) { // one heartbeat in five is lost
       presence.heartbeat(x.u, x.d, t); heartbeats++;
     }
   }

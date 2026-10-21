@@ -25,7 +25,10 @@ class FakeProvider:
         return "accepted"
 
 
-def send_with_retry(provider, id, use_key, max_attempts=3):
+MAX_ATTEMPTS = 3  # sends before the worker gives up
+
+
+def send_with_retry(provider, id, use_key, max_attempts=MAX_ATTEMPTS):
     for attempt in range(1, max_attempts + 1):
         try:
             answer = provider.send(id, id if use_key else None)

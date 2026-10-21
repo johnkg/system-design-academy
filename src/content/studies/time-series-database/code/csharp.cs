@@ -106,6 +106,16 @@ public static class Program
     static List<int> Select(string[] matchers) =>
         matchers.Select(m => postings.GetValueOrDefault(m) ?? new List<int>()).OrderBy(l => l.Count).Aggregate(Intersect);
 
+    const int Series = 8; // hosts h0..h7
+    const int Points = 120; // points per series
+    const int BaseValue = 50; // host h starts at 50 + h
+    const double ValueStep = 0.25; // a changing scrape moves the value by one step
+    const int ScrapeS = 10; // seconds between scrapes
+    const int JitterOneIn = 8; // one scrape in 8 lands a second late
+    const int WebHosts = 5; // h0..h4 are web, the rest db
+    const int QueryFrom = 300; // the range query covers T0+300 .. T0+599
+    const int QueryTo = 600;
+    const int MaxBitsPerPoint = 40; // compression must do better than this
     static uint seed = 7;
     static int Random(int n) { seed = unchecked(seed * 1664525 + 1013904223); return (int)((seed / 65536) % n); }
     static string F2(double x) => x.ToString("F2", CultureInfo.InvariantCulture);
@@ -113,19 +123,19 @@ public static class Program
     public static int Main()
     {
         const long T0 = 1700000000; var raw = new List<List<Point>>();
-        for (int h = 0; h < 8; h++)
+        for (int h = 0; h < Series; h++)
         {
-            double v = 50 + h; var points = new List<Point>();
-            for (int i = 0; i < 120; i++)
+            double v = BaseValue + h; var points = new List<Point>();
+            for (int i = 0; i < Points; i++)
             {
-                if (Random(2) == 0) v += (Random(3) - 1) * 0.25; // half the scrapes see no change
-                points.Add(new Point(T0 + i * 10 + (Random(8) == 0 ? 1 : 0), v));
+                if (Random(2) == 0) v += (Random(3) - 1) * ValueStep; // half the scrapes see no change
+                points.Add(new Point(T0 + i * ScrapeS + (Random(JitterOneIn) == 0 ? 1 : 0), v));
             }
             raw.Add(points);
-            AddSeries(new() { ["__name__"] = "cpu", ["host"] = $"h{h}", ["region"] = h % 2 == 0 ? "eu" : "us", ["tier"] = h < 5 ? "web" : "db" }, points);
+            AddSeries(new() { ["__name__"] = "cpu", ["host"] = $"h{h}", ["region"] = h % 2 == 0 ? "eu" : "us", ["tier"] = h < WebHosts ? "web" : "db" }, points);
         }
 
-        long total = blocks.Sum(b => (long)b.Bits.Count), count = raw.Count * 120;
+        long total = blocks.Sum(b => (long)b.Bits.Count), count = raw.Count * Points;
         Console.WriteLine($"{series.Count} series, {count} points, raw {count * 16} bytes");
         Console.WriteLine($"compressed {blocks.Sum(b => (b.Bits.Count + 7) / 8)} bytes, {F2((double)total / count)} bits per point");
         bool ok = blocks.Select((b, i) => Gorilla.Decompress(b.Bits, b.N).SequenceEqual(raw[i])).All(x => x);
@@ -136,8 +146,8 @@ public static class Program
         double sum = 0; int hits = 0;
         foreach (int id in ids)
             foreach (var p in Gorilla.Decompress(blocks[id].Bits, blocks[id].N))
-                if (p.T >= T0 + 300 && p.T < T0 + 600) { sum += p.V; hits++; }
+                if (p.T >= T0 + QueryFrom && p.T < T0 + QueryTo) { sum += p.V; hits++; }
         Console.WriteLine($"points in the range: {hits}, sum {F2(sum)}");
-        return ok && string.Join(",", ids) == "0,2,4" && (double)total / count <= 40 ? 0 : 1;
+        return ok && string.Join(",", ids) == "0,2,4" && (double)total / count <= MaxBitsPerPoint ? 0 : 1;
     }
 }

@@ -60,11 +60,17 @@ function bestAssignment(orders, couriers) { // try every way of pairing, which i
 }
 const totals = (orders, couriers, pick) => pick.reduce((t, j, i) => { const d = detail(couriers[j], orders[i]); return { travel: t.travel + d.travel, food: t.food + d.food, idle: t.idle + d.idle, cost: t.cost + cost(couriers[j], orders[i]) }; }, { travel: 0, food: 0, idle: 0, cost: 0 });
 
+const TRIALS = 200; // dispatch windows simulated
+const BATCH = 6; // orders and couriers per window
+const GRID = 20; // positions on a 20 x 20 grid
+const READY_MIN = 4; // food is ready 4..15 minutes after the order
+const READY_SPREAD = 12;
+
 const sum = { nearest: { travel: 0, food: 0, idle: 0, cost: 0 }, window: { travel: 0, food: 0, idle: 0, cost: 0 } };
 let strictlyBetter = 0;
-for (let trial = 0; trial < 200; trial++) { // 200 windows of 6 orders and 6 couriers
-  const orders = Array.from({ length: 6 }, () => ({ rest: { x: rnd(20), y: rnd(20) }, ready: 4 + rnd(12) }));
-  const couriers = Array.from({ length: 6 }, () => ({ x: rnd(20), y: rnd(20) }));
+for (let trial = 0; trial < TRIALS; trial++) { // 200 windows of 6 orders and 6 couriers
+  const orders = Array.from({ length: BATCH }, () => ({ rest: { x: rnd(GRID), y: rnd(GRID) }, ready: READY_MIN + rnd(READY_SPREAD) }));
+  const couriers = Array.from({ length: BATCH }, () => ({ x: rnd(GRID), y: rnd(GRID) }));
   const a = totals(orders, couriers, nearestFirst(orders, couriers)), b = totals(orders, couriers, bestAssignment(orders, couriers));
   if (b.cost > a.cost) process.exit(1); // the best assignment can never be worse
   if (b.cost < a.cost) strictlyBetter++;

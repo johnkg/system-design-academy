@@ -3,6 +3,14 @@
 import sys
 
 
+BUCKETS = 10000  # buckets 0..9999, in hundredths of a percent
+USERS = 20000
+INTERNAL_EVERY = 100  # every 100th user is on the internal plan
+ROLLOUT_10_BP = 1000  # rollouts in basis points: 10%, 30%, 90%
+ROLLOUT_30_BP = 3000
+ROLLOUT_90_BP = 9000
+MIN_AT_10 = 1500  # sanity floor for a 10% rollout of 20000 users
+
 # A 32-bit hash (FNV-1a followed by a final mix) of text, so the same user and flag always give the same number.
 def hash_text(text):
     h = 2166136261
@@ -17,7 +25,7 @@ def hash_text(text):
 
 
 def bucket(salt, user_id):
-    return hash_text(f"{salt}:{user_id}") % 10000  # 0..9999, in hundredths of a percent
+    return hash_text(f"{salt}:{user_id}") % BUCKETS  # 0..9999, in hundredths of a percent
 
 
 # The order is: kill switch, then targeting rules, then the percentage rollout. A flag that does not exist is off.
@@ -50,7 +58,7 @@ def make_ruleset(version, rollout_bp, salt, killed):
         'rules': [{'attr': 'plan', 'equals': 'internal', 'value': True}]}}}
 
 
-users = [{'id': f"user-{i}", 'plan': 'internal' if i % 100 == 0 else 'free'} for i in range(20000)]
+users = [{'id': f"user-{i}", 'plan': 'internal' if i % INTERNAL_EVERY == 0 else 'free'} for i in range(USERS)]
 
 
 def count(sdk, key):
@@ -59,30 +67,30 @@ def count(sdk, key):
 
 sdk = Sdk()
 print(f"no ruleset yet, fail closed: {count(sdk, 'new-checkout')} users on")
-sdk.apply(make_ruleset(1, 1000, 'nc-7f3a', False))
+sdk.apply(make_ruleset(1, ROLLOUT_10_BP, 'nc-7f3a', False))
 at10 = [u for u in users if sdk.is_on('new-checkout', u)]
 print(f"10% rollout: {len(at10)} users on")
-sdk.apply(make_ruleset(2, 3000, 'nc-7f3a', False))
+sdk.apply(make_ruleset(2, ROLLOUT_30_BP, 'nc-7f3a', False))
 at30 = [u for u in users if sdk.is_on('new-checkout', u)]
 kept = sum(1 for u in at10 if sdk.is_on('new-checkout', u))
 print(f"30% rollout: {len(at30)} users on, {kept} of the first {len(at10)} kept it")
 
 resalted = Sdk()
-resalted.apply(make_ruleset(3, 3000, 'nc-new-salt', False))
+resalted.apply(make_ruleset(3, ROLLOUT_30_BP, 'nc-new-salt', False))
 lost = sum(1 for u in at10 if not resalted.is_on('new-checkout', u))
 print(f"same 30% with a new salt: {lost} of the first {len(at10)} lose it")
 
-other = sum(1 for u in users if bucket('other-flag', u['id']) < 3000)
-both = sum(1 for u in users if bucket('other-flag', u['id']) < 3000 and bucket('nc-7f3a', u['id']) < 3000)
+other = sum(1 for u in users if bucket('other-flag', u['id']) < ROLLOUT_30_BP)
+both = sum(1 for u in users if bucket('other-flag', u['id']) < ROLLOUT_30_BP and bucket('nc-7f3a', u['id']) < ROLLOUT_30_BP)
 print(f"two flags at 30% with different salts: {both} of {other} share users")
 
 sdk.apply(None)                                    # the service is down: the last ruleset stays
-sdk.apply(make_ruleset(1, 9000, 'nc-7f3a', False))  # an old version arrives late: ignored
+sdk.apply(make_ruleset(1, ROLLOUT_90_BP, 'nc-7f3a', False))  # an old version arrives late: ignored
 print(f"service down, old copy kept: version {sdk.ruleset['version']}, {count(sdk, 'new-checkout')} users on")
-sdk.apply(make_ruleset(4, 3000, 'nc-7f3a', True))
+sdk.apply(make_ruleset(4, ROLLOUT_30_BP, 'nc-7f3a', True))
 print(f"kill switch: {count(sdk, 'new-checkout')} users on")
 
 monotone = kept == len(at10) and len(at30) > len(at10)
 killed = count(sdk, 'new-checkout') == 0
-if not monotone or not killed or lost == 0 or len(at10) < 1500:
+if not monotone or not killed or lost == 0 or len(at10) < MIN_AT_10:
     sys.exit(1)

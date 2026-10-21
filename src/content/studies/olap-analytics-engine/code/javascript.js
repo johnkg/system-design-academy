@@ -7,9 +7,16 @@ const rnd = (n) => { seed = (Math.imul(seed, 1664525) + 1013904223) >>> 0; retur
 
 const COUNTRIES = ['US', 'DE', 'FR', 'JP', 'BR', 'IN'], DEVICES = ['ios', 'web', 'android'];
 const WINDOW = 60, BUCKET = 10; // a segment covers 60 minutes, rollup granularity is 10 minutes
+const EVENTS = 6000;
+const MINUTES = 240; // events fall in the first 4 hours
+const MAX_MS = 500; // latency 1..500 ms
+const KEY_STEP = 100; // rollup key = bucket * KEY_STEP^2 + country * KEY_STEP + device
+const KEY_BUCKET = KEY_STEP * KEY_STEP;
+const QUERY_FROM = 60; // the demo query covers minutes 60..179
+const QUERY_TO = 180;
 const events = [];
-for (let i = 0; i < 6000; i++) {
-  const t = rnd(240), c = Math.min(rnd(6), rnd(6)), d = rnd(3), ms = 1 + rnd(500); // countries are skewed
+for (let i = 0; i < EVENTS; i++) {
+  const t = rnd(MINUTES), c = Math.min(rnd(COUNTRIES.length), rnd(COUNTRIES.length)), d = rnd(DEVICES.length), ms = 1 + rnd(MAX_MS); // countries are skewed
   events.push({ t, c, d, ms });
 }
 
@@ -24,17 +31,17 @@ function encode(values) {
 function buildSegment(start, evs) {
   const acc = new Map(); // rollup: one row per (bucket, country, device) with a count and a sum
   for (const e of evs) {
-    const key = Math.floor(e.t / BUCKET) * 10000 + e.c * 100 + e.d;
+    const key = Math.floor(e.t / BUCKET) * KEY_BUCKET + e.c * KEY_STEP + e.d;
     const a = acc.get(key) || [0, 0];
     a[0] += 1; a[1] += e.ms; acc.set(key, a);
   }
   const keys = [...acc.keys()].sort((a, b) => a - b);
-  const rows = keys.map((k) => ({ bucket: Math.floor(k / 10000) * BUCKET, country: COUNTRIES[Math.floor(k / 100) % 100], device: DEVICES[k % 100], count: acc.get(k)[0], sum: acc.get(k)[1] }));
+  const rows = keys.map((k) => ({ bucket: Math.floor(k / KEY_BUCKET) * BUCKET, country: COUNTRIES[Math.floor(k / KEY_STEP) % KEY_STEP], device: DEVICES[k % KEY_STEP], count: acc.get(k)[0], sum: acc.get(k)[1] }));
   return { start, end: start + WINDOW, rows, country: encode(rows.map((r) => r.country)), device: encode(rows.map((r) => r.device)) };
 }
 
 const segments = [];
-for (let s = 0; s < 240; s += WINDOW) segments.push(buildSegment(s, events.filter((e) => e.t >= s && e.t < s + WINDOW)));
+for (let s = 0; s < MINUTES; s += WINDOW) segments.push(buildSegment(s, events.filter((e) => e.t >= s && e.t < s + WINDOW)));
 console.log(`raw events: ${events.length}, rolled-up rows: ${segments.reduce((n, s) => n + s.rows.length, 0)} in ${segments.length} segments (${segments.map((s) => s.rows.length).join(', ')})`);
 console.log(`segment 1 country dictionary: ${segments[1].country.dict.join(',')}`);
 
@@ -68,14 +75,14 @@ function query(from, to, countries, device) { // scatter to segments that overla
   return { merged, scanned, matched };
 }
 
-const res = query(60, 180, ['DE', 'FR'], 'ios');
+const res = query(QUERY_FROM, QUERY_TO, ['DE', 'FR'], 'ios');
 for (const b of [...res.merged.keys()].sort((a, c) => a - c)) console.log(`minute ${b}: ${res.merged.get(b)[0]} events, avg ${Math.floor(res.merged.get(b)[1] / res.merged.get(b)[0])} ms`);
 console.log(`segments scanned: ${res.scanned} of ${segments.length}, rolled rows matched: ${res.matched}`);
 
 // The rolled-up answer must equal a brute-force pass over the raw events.
 const raw = new Map();
 for (const e of events) {
-  if (e.t < 60 || e.t >= 180 || e.d !== 0 || (e.c !== 1 && e.c !== 2)) continue;
+  if (e.t < QUERY_FROM || e.t >= QUERY_TO || e.d !== 0 || (e.c !== 1 && e.c !== 2)) continue;
   const b = Math.floor(e.t / BUCKET) * BUCKET, a = raw.get(b) || [0, 0];
   a[0] += 1; a[1] += e.ms; raw.set(b, a);
 }

@@ -6,6 +6,19 @@ from bisect import bisect_left
 
 BITS = 12
 SIZE = 1 << BITS              # a 4096 by 4096 map; one unit is 10 metres, so the map is about 41 km wide
+CITY_PLACES = 3000  # a dense city around (1200, 1200), +-300 units
+CITY_X = 1200
+CITY_Y = 1200
+CITY_SPREAD = 300
+TOWN_PLACES = 400  # a small town around (3000, 2800), +-100 units
+TOWN_X = 3000
+TOWN_Y = 2800
+TOWN_SPREAD = 100
+RURAL_PLACES = 600  # places anywhere on the map
+QUERIES = 300  # random searches
+MIN_RADIUS = 40  # search radius 40..240 units
+RADIUS_SPREAD = 201
+
 seed = 99
 
 
@@ -32,11 +45,11 @@ def add(x, y):
     places.append({"x": x, "y": y, "key": zkey(x, y)})
 
 
-for _ in range(3000):
-    add(1200 + random(300) + random(300) - 300, 1200 + random(300) + random(300) - 300)  # a dense city
-for _ in range(400):
-    add(3000 + random(100) + random(100) - 100, 2800 + random(100) + random(100) - 100)  # a small town
-for _ in range(600):
+for _ in range(CITY_PLACES):
+    add(CITY_X + random(CITY_SPREAD) + random(CITY_SPREAD) - CITY_SPREAD, CITY_Y + random(CITY_SPREAD) + random(CITY_SPREAD) - CITY_SPREAD)  # a dense city
+for _ in range(TOWN_PLACES):
+    add(TOWN_X + random(TOWN_SPREAD) + random(TOWN_SPREAD) - TOWN_SPREAD, TOWN_Y + random(TOWN_SPREAD) + random(TOWN_SPREAD) - TOWN_SPREAD)  # a small town
+for _ in range(RURAL_PLACES):
     add(random(SIZE), random(SIZE))                                                      # places everywhere else
 places.sort(key=lambda p: (p["key"], p["x"], p["y"]))
 keys = [p["key"] for p in places]
@@ -88,8 +101,8 @@ print(f"cell and 8 neighbours: {nine['hits']} results, {nine['examined']} examin
 # 300 queries all over the map with radii from 40 to 240 units.
 total = own_total = nine_total = examined = 0
 exact = True
-for _ in range(300):
-    x, y, radius = random(SIZE), random(SIZE), 40 + random(201)
+for _ in range(QUERIES):
+    x, y, radius = random(SIZE), random(SIZE), MIN_RADIUS + random(RADIUS_SPREAD)
     t, a, b = brute_force(x, y, radius), search(x, y, radius, False), search(x, y, radius, True)
     total += t
     own_total += a["hits"]
@@ -98,5 +111,5 @@ for _ in range(300):
     if b["hits"] != t:
         exact = False
 print(f"300 queries: {total} results, own cell found {own_total}, with neighbours found {nine_total}, examined {examined} instead of {300 * len(places)}")
-if not exact or own["hits"] >= truth or nine["hits"] != truth or own_total >= total or examined >= 300 * len(places):
+if not exact or own["hits"] >= truth or nine["hits"] != truth or own_total >= total or examined >= QUERIES * len(places):
     sys.exit(1)

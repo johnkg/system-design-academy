@@ -17,17 +17,25 @@ long Cost(long units)
 }
 string Money(long c) => $"{c / 100}.{c % 100:00}";
 
+const int Events = 2000;
+const int Customers = 3;
+const int MaxQty = 5; // units per event: 1..5
+const int LateIn10 = 2; // 2 events in 10 arrive up to 599 late, the rest within 19
+const int LateMax = 600;
+const int OnTimeMax = 20;
+const int DupOneIn = 10; // one event in 10 is delivered twice
+const int DupDelay = 50;
 long seed = 7;
 long Random(long n) { seed = (seed * 1664525 + 1013904223) % 4294967296; return seed / 65536 % n; }
 
 // Make 2,000 events over two periods. 1 in 5 is delayed a lot, and 1 in 10 is sent twice.
 var stream = new List<Ev>();
-for (int id = 0; id < 2000; id++)
+for (int id = 0; id < Events; id++)
 {
-    long customer = Random(3), ts = Random(2 * Period), qty = 1 + Random(5);
-    long delay = Random(10) < 2 ? Random(600) : Random(20);
+    long customer = Random(Customers), ts = Random(2 * Period), qty = 1 + Random(MaxQty);
+    long delay = Random(10) < LateIn10 ? Random(LateMax) : Random(OnTimeMax);
     stream.Add(new Ev(id, customer, ts, qty, ts + delay));
-    if (Random(10) == 0) stream.Add(new Ev(id, customer, ts, qty, ts + delay + Random(50)));
+    if (Random(DupOneIn) == 0) stream.Add(new Ev(id, customer, ts, qty, ts + delay + Random(DupDelay)));
 }
 stream = stream.OrderBy(e => e.Arrival).ThenBy(e => e.Id).ToList();
 
@@ -45,7 +53,7 @@ void CloseDue(long now) // close every period whose grace time has passed
     for (long p = 0; p < 2; p++)
         if (!closed.Contains(p) && (p + 1) * Period + Grace <= now)
         {
-            for (long c = 0; c < 3; c++) snapshot[Key(c, p)] = Get(live, Key(c, p));
+            for (long c = 0; c < Customers; c++) snapshot[Key(c, p)] = Get(live, Key(c, p));
             closed.Add(p);
         }
 }
@@ -65,7 +73,7 @@ CloseDue(long.MaxValue);
 Console.WriteLine($"events {stream.Count}, unique {seen.Count}, duplicates dropped {duplicates}");
 bool ok = true;
 for (long p = 0; p < 2; p++)
-    for (long c = 0; c < 3; c++)
+    for (long c = 0; c < Customers; c++)
     {
         string k = Key(c, p); long billed = snapshot[k], extra = Get(late, k);
         long adj = Cost(billed + extra) - Cost(billed);

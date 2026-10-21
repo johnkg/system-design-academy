@@ -12,7 +12,7 @@ public static class Program
         double[] network = { 8.0, 8.0, 6.0, 3.0, 1.2, 0.8, 2.0, 4.0, 7.0, 9.0 };
 
         double buffer = Player.SegmentSeconds; // the first segment is already buffered when playback starts
-        double estimate = 8.0; // measured speed of the previous segment
+        double estimate = network[0]; // measured speed of the previous segment (start from the first)
         double stalledSeconds = 0;
 
         for (int i = 0; i < network.Length; i++)

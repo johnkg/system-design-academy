@@ -20,7 +20,8 @@ class FakeProvider {
   }
 }
 
-function sendWithRetry(provider, id, useKey, maxAttempts = 3) {
+const MAX_ATTEMPTS = 3; // sends before the worker gives up
+function sendWithRetry(provider, id, useKey, maxAttempts = MAX_ATTEMPTS) {
   for (let attempt = 1; attempt <= maxAttempts; attempt++) {
     try {
       const answer = provider.send(id, useKey ? id : undefined);

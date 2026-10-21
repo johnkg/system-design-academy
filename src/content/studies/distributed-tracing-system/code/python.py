@@ -16,7 +16,29 @@ def parse_traceparent(header):
     return {"trace_id": m.group(1), "span_id": m.group(2), "sampled": (int(m.group(3), 16) & 1) == 1}
 
 
-seed = 77
+SEED = 77
+TRACES = 400
+TRACE_GAP_MS = 10  # a trace starts about every 10 ms
+ID_WORDS = 4  # 32-bit words in a 128-bit trace id
+MIN_SPANS = 3  # spans per trace: 3..7
+SPAN_SPREAD = 5
+FAILED_PCT = 4  # traces that fail
+BAD_PCT = 10  # traces that fail or are slow
+FAILED_MIN_MS = 30  # root span duration of a failed trace: 30..229 ms
+FAILED_SPREAD_MS = 200
+SLOW_MIN_MS = 800  # of a slow trace: 800..1999 ms
+SLOW_SPREAD_MS = 1200
+FAST_MIN_MS = 20  # of an ordinary trace: 20..99 ms
+FAST_SPREAD_MS = 80
+ASYNC_PCT = 10  # child spans that run async, ending 1..4 s after the root
+ASYNC_MIN_MS = 1000
+ASYNC_SPREAD_MS = 3000
+EXPORT_MIN_MS = 5  # export delay before a span reaches the collector: 5..124 ms
+EXPORT_SPREAD_MS = 120
+SLOW_THRESHOLD_MS = 500  # a root span this long marks a slow trace
+BASELINE_PCT = 2  # ordinary traces kept anyway
+
+seed = SEED
 
 
 def next_u32():
@@ -32,21 +54,21 @@ def nxt(n):
 # 400 traces. About 4% fail and 6% are slow; 10% have an async span that ends long after the root span.
 def make_traces():
     traces, events = [], []
-    for i in range(400):
-        start = i * 10 + nxt(10)
-        trace_id = "".join(f"{next_u32():08x}" for _ in range(4))
-        kind, n = nxt(100), 3 + nxt(5)
-        root_dur = 30 + nxt(200) if kind < 4 else 800 + nxt(1200) if kind < 10 else 20 + nxt(80)
-        err_at = 1 + nxt(n - 1) if kind < 4 else -1
-        traces.append({"trace_id": trace_id, "n": n, "bad": kind < 10})
+    for i in range(TRACES):
+        start = i * TRACE_GAP_MS + nxt(TRACE_GAP_MS)
+        trace_id = "".join(f"{next_u32():08x}" for _ in range(ID_WORDS))
+        kind, n = nxt(100), MIN_SPANS + nxt(SPAN_SPREAD)
+        root_dur = FAILED_MIN_MS + nxt(FAILED_SPREAD_MS) if kind < FAILED_PCT else SLOW_MIN_MS + nxt(SLOW_SPREAD_MS) if kind < BAD_PCT else FAST_MIN_MS + nxt(FAST_SPREAD_MS)
+        err_at = 1 + nxt(n - 1) if kind < FAILED_PCT else -1
+        traces.append({"trace_id": trace_id, "n": n, "bad": kind < BAD_PCT})
         for k in range(n):
             off, dur = 0, root_dur
             if k > 0:
                 off = nxt(root_dur // 2 + 1)
                 dur = 1 + nxt(max(1, root_dur - off))
-            if k > 0 and nxt(100) < 10:
-                off += 1000 + nxt(3000)  # async span, ends after the root
-            arrival = start + off + dur + 5 + nxt(120)
+            if k > 0 and nxt(100) < ASYNC_PCT:
+                off += ASYNC_MIN_MS + nxt(ASYNC_SPREAD_MS)  # async span, ends after the root
+            arrival = start + off + dur + EXPORT_MIN_MS + nxt(EXPORT_SPREAD_MS)
             events.append({"arrival": arrival, "trace_id": trace_id, "root": k == 0, "dur": dur, "err": k == err_at})
     events.sort(key=lambda e: e["arrival"])  # stable, like the other versions
     return traces, events
@@ -58,9 +80,9 @@ class TailSampler:
 
     def decide(self, t):
         del self.open[t["id"]]
-        slow = any(s["root"] and s["dur"] >= 500 for s in t["spans"])
+        slow = any(s["root"] and s["dur"] >= SLOW_THRESHOLD_MS for s in t["spans"])
         error = any(s["err"] for s in t["spans"])
-        baseline = int(t["id"][:8], 16) % 100 < 2  # keep 2% of ordinary traces
+        baseline = int(t["id"][:8], 16) % 100 < BASELINE_PCT  # keep 2% of ordinary traces
         self.decided.add(t["id"])
         if slow or error or baseline:
             self.kept[t["id"]] = len(t["spans"])
@@ -92,7 +114,8 @@ traces, events = make_traces()
 bad = [t for t in traces if t["bad"]]
 print(f"{len(traces)} traces, {len(events)} spans, {len(bad)} slow or failed")
 results = {}
-for wait in (100, 1000, 10000):
+WAITS = (100, 1000, 10000)  # ms a trace stays open before the keep decision
+for wait in WAITS:
     s = TailSampler(wait)
     for e in events:
         s.add(e)
@@ -101,7 +124,7 @@ for wait in (100, 1000, 10000):
     incomplete = sum(1 for t in traces if t["trace_id"] in s.kept and s.kept[t["trace_id"]] < t["n"])
     results[wait] = {"bad_kept": bad_kept, "incomplete": incomplete, "peak": s.peak}
     print(f"wait {wait} ms: kept {len(s.kept)}, bad kept {bad_kept}/{len(bad)} ({(100 * bad_kept) // len(bad)}%), incomplete {incomplete}, late spans dropped {s.late}, peak buffered {s.peak}")
-a, b, c = results[100], results[1000], results[10000]
+a, b, c = (results[w] for w in WAITS)
 ok = (c["bad_kept"] == len(bad) and c["incomplete"] == 0 and a["bad_kept"] < b["bad_kept"] <= c["bad_kept"]
       and a["peak"] < b["peak"] < c["peak"] and root["sampled"])
 print(f"a longer wait keeps more bad traces and more of each trace, and buffers more: {str(ok).lower()}")

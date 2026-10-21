@@ -14,12 +14,19 @@ def rnd(n):
 COUNTRIES = ['US', 'DE', 'FR', 'JP', 'BR', 'IN']
 DEVICES = ['ios', 'web', 'android']
 WINDOW, BUCKET = 60, 10  # a segment covers 60 minutes, rollup granularity is 10 minutes
+EVENTS = 6000
+MINUTES = 240  # events fall in the first 4 hours
+MAX_MS = 500  # latency 1..500 ms
+KEY_STEP = 100  # rollup key = bucket * KEY_STEP^2 + country * KEY_STEP + device
+KEY_BUCKET = KEY_STEP * KEY_STEP
+QUERY_FROM = 60  # the demo query covers minutes 60..179
+QUERY_TO = 180
 events = []
-for _ in range(6000):
-    t = rnd(240)
-    c = min(rnd(6), rnd(6))  # countries are skewed
-    d = rnd(3)
-    ms = 1 + rnd(500)
+for _ in range(EVENTS):
+    t = rnd(MINUTES)
+    c = min(rnd(len(COUNTRIES)), rnd(len(COUNTRIES)))  # countries are skewed
+    d = rnd(len(DEVICES))
+    ms = 1 + rnd(MAX_MS)
     events.append((t, c, d, ms))
 
 
@@ -35,16 +42,16 @@ def encode(values):
 def build_segment(start, evs):
     acc = {}  # rollup: one row per (bucket, country, device) with a count and a sum
     for t, c, d, ms in evs:
-        key = (t // BUCKET) * 10000 + c * 100 + d
+        key = (t // BUCKET) * KEY_BUCKET + c * KEY_STEP + d
         a = acc.setdefault(key, [0, 0])
         a[0] += 1
         a[1] += ms
-    rows = [(k // 10000 * BUCKET, COUNTRIES[k // 100 % 100], DEVICES[k % 100], acc[k][0], acc[k][1]) for k in sorted(acc)]
+    rows = [(k // KEY_BUCKET * BUCKET, COUNTRIES[k // KEY_STEP % KEY_STEP], DEVICES[k % KEY_STEP], acc[k][0], acc[k][1]) for k in sorted(acc)]
     return {'start': start, 'end': start + WINDOW, 'rows': rows,
             'country': encode([r[1] for r in rows]), 'device': encode([r[2] for r in rows])}
 
 
-segments = [build_segment(s, [e for e in events if s <= e[0] < s + WINDOW]) for s in range(0, 240, WINDOW)]
+segments = [build_segment(s, [e for e in events if s <= e[0] < s + WINDOW]) for s in range(0, MINUTES, WINDOW)]
 print(f"raw events: {len(events)}, rolled-up rows: {sum(len(s['rows']) for s in segments)} in {len(segments)} segments ({', '.join(str(len(s['rows'])) for s in segments)})")
 print(f"segment 1 country dictionary: {','.join(segments[1]['country'][0])}")
 
@@ -91,7 +98,7 @@ def query(lo, hi, countries, device):
     return merged, scanned, matched
 
 
-merged, scanned, matched = query(60, 180, ['DE', 'FR'], 'ios')
+merged, scanned, matched = query(QUERY_FROM, QUERY_TO, ['DE', 'FR'], 'ios')
 for b in sorted(merged):
     print(f"minute {b}: {merged[b][0]} events, avg {merged[b][1] // merged[b][0]} ms")
 print(f"segments scanned: {scanned} of {len(segments)}, rolled rows matched: {matched}")
@@ -99,7 +106,7 @@ print(f"segments scanned: {scanned} of {len(segments)}, rolled rows matched: {ma
 # The rolled-up answer must equal a brute-force pass over the raw events.
 raw = {}
 for t, c, d, ms in events:
-    if t < 60 or t >= 180 or d != 0 or c not in (1, 2):
+    if t < QUERY_FROM or t >= QUERY_TO or d != 0 or c not in (1, 2):
         continue
     a = raw.setdefault(t // BUCKET * BUCKET, [0, 0])
     a[0] += 1

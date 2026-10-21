@@ -2,6 +2,15 @@
 // edge nodes count reactions and keep only their best few comments each second, and a root merges the small summaries.
 
 const EDGES = 8, SECONDS = 5, KEEP = 4, TYPES = 4;
+const FLAG_ONE_IN = 11; // every 11th comment is flagged by moderation
+const TYPE_SCALE = 10; // reaction mix out of 10: heart 5, laugh 3, clap 1, wow 1
+const HEART_UPTO = 5;
+const LAUGH_UPTO = 8;
+const CLAP_UPTO = 9;
+const REACTIONS_MIN = 200; // per edge per second: 200..299 reactions, 20..29 comments
+const REACTIONS_SPREAD = 100;
+const COMMENTS_MIN = 20;
+const COMMENTS_SPREAD = 10;
 const NAMES = ['heart', 'laugh', 'clap', 'wow'];
 
 let seed = 7;
@@ -13,7 +22,7 @@ const priority = (id) => {
   x = Math.imul(x ^ (x >>> 13), 3266489917) >>> 0;
   return (x ^ (x >>> 16)) >>> 0;
 };
-const flagged = (id) => id % 11 === 0; // stands in for the moderation verdict
+const flagged = (id) => id % FLAG_ONE_IN === 0; // stands in for the moderation verdict
 const byPriority = (a, b) => b.pri - a.pri || a.id - b.id;
 
 class Edge {
@@ -28,7 +37,7 @@ class Edge {
   flush() { const out = { counts: this.counts, best: this.best, dropped: this.dropped }; Object.assign(this, new Edge()); return out; }
 }
 
-const pickType = () => { const r = rnd(10); return r < 5 ? 0 : r < 8 ? 1 : r < 9 ? 2 : 3; };
+const pickType = () => { const r = rnd(TYPE_SCALE); return r < HEART_UPTO ? 0 : r < LAUGH_UPTO ? 1 : r < CLAP_UPTO ? 2 : 3; };
 
 const total = new Array(TYPES).fill(0), truthTotal = new Array(TYPES).fill(0);
 let nextId = 0, eventsIn = 0, messagesOut = 0, accepted = 0, shownCount = 0, ok = true;
@@ -36,7 +45,7 @@ for (let s = 0; s < SECONDS; s++) {
   const edges = Array.from({ length: EDGES }, () => new Edge());
   const everything = []; // the slow, obvious record of every accepted comment, to check against
   for (const edge of edges) {
-    const reactions = 200 + rnd(100), comments = 20 + rnd(10);
+    const reactions = REACTIONS_MIN + rnd(REACTIONS_SPREAD), comments = COMMENTS_MIN + rnd(COMMENTS_SPREAD);
     for (let i = 0; i < reactions; i++) { const t = pickType(); edge.react(t); truthTotal[t]++; }
     for (let i = 0; i < comments; i++) { const id = ++nextId; edge.comment(id); if (!flagged(id)) everything.push({ id, pri: priority(id) }); }
     eventsIn += reactions + comments;

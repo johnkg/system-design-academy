@@ -8,6 +8,9 @@ public record Lww<T>(T Value, int Ts, int Region);
 public static class Rules
 {
     public static readonly int[] Skew = { 0, 2, -3 }; // each region's wall clock is a little off
+    public static readonly int Regions = Skew.Length;
+    public const int Steps = 600;
+    public const int ReplicateOneIn = 4; // a replication round on one step in 4
     static uint seed = 7;
     public static int Rand(int n) { seed = unchecked(seed * 1664525 + 1013904223); return (int)((seed >> 16) % (uint)n); }
 
@@ -44,18 +47,18 @@ public static class Program
 {
     public static int Main()
     {
-        var regions = Enumerable.Range(0, 3).Select(i => new Region(i)).ToArray();
+        var regions = Enumerable.Range(0, Rules.Regions).Select(i => new Region(i)).ToArray();
         int truth = 0;
-        for (int step = 1; step <= 600; step++)
+        for (int step = 1; step <= Rules.Steps; step++)
         {
-            int r = Rules.Rand(3);
+            int r = Rules.Rand(Rules.Regions);
             regions[r].Like(step);
             truth++;
             if (step == 100) regions[0].Rename(step, "alice-old");
             if (step == 101) regions[2].Rename(step, "alice-new"); // really later, but region 2's clock runs 3 behind
-            if (Rules.Rand(4) == 0) // lazy replication between random pairs
+            if (Rules.Rand(Rules.ReplicateOneIn) == 0) // lazy replication between random pairs
             {
-                int src = Rules.Rand(3), dst = (src + 1 + Rules.Rand(2)) % 3;
+                int src = Rules.Rand(Rules.Regions), dst = (src + 1 + Rules.Rand(Rules.Regions - 1)) % Rules.Regions;
                 regions[dst].MergeFrom(regions[src]);
             }
         }

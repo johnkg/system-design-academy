@@ -6,6 +6,12 @@ using System.Linq;
 
 const int W = 24, H = 16, MinCost = 2, Inf = 1_000_000_000;
 const int Start = 8 * W + 2, Goal = 8 * W + 21;
+const int WallOneIn = 8; // one cell in 8 is a wall
+const int JamX0 = 8; // the jammed area: columns 8..15, rows 4..11
+const int JamX1 = 16;
+const int JamY0 = 4;
+const int JamY1 = 12;
+const int JamFactor = 3; // jammed cells cost three times as much
 
 long seed = 7;
 int NextRandom() { seed = (seed * 1664525 + 1013904223) % 4294967296; return (int)(seed / 65536); }
@@ -15,7 +21,7 @@ int[] MakeGrid()
     var cost = new int[W * H]; // cost[cell] = minutes to enter the cell, or 0 for a wall
     for (int i = 0; i < W * H; i++)
     {
-        bool wall = NextRandom() % 8 == 0;
+        bool wall = NextRandom() % WallOneIn == 0;
         cost[i] = wall ? 0 : MinCost + NextRandom() % 2;
     }
     cost[Start] = MinCost; cost[Goal] = MinCost; // start and goal are always open
@@ -76,7 +82,7 @@ var grid = MakeGrid();
 int before = Compare("free-flowing", grid);
 
 // A jam: every cell in the middle block takes three times as long. The estimate still never overestimates, so A* stays exact.
-var jammed = grid.Select((c, i) => c > 0 && i % W >= 8 && i % W < 16 && i / W >= 4 && i / W < 12 ? c * 3 : c).ToArray();
+var jammed = grid.Select((c, i) => c > 0 && i % W >= JamX0 && i % W < JamX1 && i / W >= JamY0 && i / W < JamY1 ? c * JamFactor : c).ToArray();
 int after = Compare("with a jam", jammed);
 Console.WriteLine($"the jam adds {after - before} minutes to the trip");
 if (after < before) Environment.Exit(1);

@@ -5,33 +5,51 @@ using System;
 using System.Collections.Generic;
 using System.Linq;
 
-const long End = 600 * 1000; // ten minutes of traffic, in milliseconds
-long seed = 7;
+const long MsPerS = 1000;
+const int Seconds = 600; // ten minutes of traffic
+const int Seed = 7;
+const int SteadyRate = 40; // requests per second
+const int BurstPeriod = 90; // bursty: 150 rps for 8 s every 90 s, 15 rps otherwise
+const int BurstLen = 8;
+const int BurstRate = 150;
+const int QuietRate = 15;
+const int SpikeLen = 6; // spiky: 250 rps for 6 s at each spike start, silence otherwise
+const int SpikeRate = 250;
+const int MinRunMs = 50; // a request runs 50..149 ms
+const int RunSpreadMs = 100;
+const int MsPerMicro = 60; // price: one millionth of a dollar per 60 billed ms, per 240 provisioned ms and per 5 requests
+const int ProvisionedMsPerMicro = 240;
+const int RequestsPerMicro = 5;
+const int CostRatio = 3; // provisioned concurrency must cost at least this many times more
+const long End = Seconds * MsPerS; // in milliseconds
+int[] spikeStarts = { 30, 270, 510 };
+const long KeptFirst = 1_000_000_000_000L; // ranks provisioned instances above any busy-until time
+long seed = Seed;
 long Random(long n) { seed = (seed * 1664525 + 1013904223) % 4294967296; return (seed / 65536) % n; }
 
 // Requests per second for each pattern. Every request has a start time and a run time of 50 to 149 ms.
 List<Req> Traffic(string pattern)
 {
-    seed = 7;
+    seed = Seed;
     var requests = new List<Req>();
-    for (int s = 0; s < 600; s++)
+    for (int s = 0; s < Seconds; s++)
     {
-        int rate = 40; // steady
-        if (pattern == "bursty") rate = s % 90 < 8 ? 150 : 15;
-        if (pattern == "spiky") rate = new[] { 30, 270, 510 }.Any(a => s >= a && s < a + 6) ? 250 : 0;
-        for (int i = 0; i < rate; i++) requests.Add(new Req(s * 1000L + Random(1000), 50 + Random(100), requests.Count));
+        int rate = SteadyRate; // steady
+        if (pattern == "bursty") rate = s % BurstPeriod < BurstLen ? BurstRate : QuietRate;
+        if (pattern == "spiky") rate = spikeStarts.Any(a => s >= a && s < a + SpikeLen) ? SpikeRate : 0;
+        for (int i = 0; i < rate; i++) requests.Add(new Req(s * MsPerS + Random(MsPerS), MinRunMs + Random(RunSpreadMs), requests.Count));
     }
     return requests.OrderBy(r => r.T).ThenBy(r => r.N).ToList();
 }
 
 Result Run(List<Req> requests, long idleSeconds, int provisioned, long initMs, int cap)
 {
-    long idle = idleSeconds * 1000;
+    long idle = idleSeconds * MsPerS;
     var pool = Enumerable.Range(0, provisioned).Select(_ => new Inst { Kept = true }).ToList();
     int cold = 0, throttled = 0, peak = provisioned;
     long billedMs = 0, idleMs = 0;
     var latencies = new List<long>();
-    long Rank(Inst x) => (x.Kept ? 1_000_000_000_000L : 0) + x.BusyUntil;
+    long Rank(Inst x) => (x.Kept ? KeptFirst : 0) + x.BusyUntil;
     foreach (var r in requests)
     {
         // Reap on-demand instances that have been idle for longer than the timeout.
@@ -59,8 +77,8 @@ Result Run(List<Req> requests, long idleSeconds, int provisioned, long initMs, i
     foreach (var x in pool) if (!x.Kept) idleMs += Math.Max(0, Math.Min(idle, End - x.BusyUntil));
     latencies.Sort();
     long Pct(int p) => latencies[(int)((latencies.Count * (long)p + 99) / 100 - 1)]; // nearest rank
-    long costMicro = billedMs / 60 + provisioned * End / 240 + latencies.Count / 5; // millionths of a dollar
-    return new Result(cold, throttled, latencies.Count, peak, Pct(50), Pct(95), Pct(99), billedMs, idleMs / 1000, costMicro);
+    long costMicro = billedMs / MsPerMicro + provisioned * End / ProvisionedMsPerMicro + latencies.Count / RequestsPerMicro; // millionths of a dollar
+    return new Result(cold, throttled, latencies.Count, peak, Pct(50), Pct(95), Pct(99), billedMs, idleMs / MsPerS, costMicro);
 }
 
 void Show(string label, (long Idle, int Prov, long Init, int Cap) c, Result r) =>
@@ -96,7 +114,7 @@ bool ok = b.Throttled > 0 && b.Cold > 0
     && results["longer idle timeout"].Cold < b.Cold // survives the 234 s of silence
     && results["higher cap"].Throttled < b.Throttled
     && results["faster init"].P99 < b.P99
-    && results["provisioned 30"].CostMicro > 3 * b.CostMicro; // paying all day for a 6-second spike
+    && results["provisioned 30"].CostMicro > CostRatio * b.CostMicro; // paying all day for a 6-second spike
 Console.WriteLine($"each change helps what it should, and provisioned concurrency costs more: {(ok ? "true" : "false")}");
 if (!ok) Environment.Exit(1);
 

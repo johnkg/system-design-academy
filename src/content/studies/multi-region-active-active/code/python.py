@@ -3,6 +3,9 @@
 import sys
 
 SKEW = [0, 2, -3]  # each region's wall clock is a little off
+REGIONS = len(SKEW)
+STEPS = 600
+REPLICATE_ONE_IN = 4  # a replication round on one step in 4
 seed = 7
 
 
@@ -47,19 +50,19 @@ class Region:
         return sum(self.counts)
 
 
-regions = [Region(i) for i in range(3)]
+regions = [Region(i) for i in range(REGIONS)]
 truth = 0
-for step in range(1, 601):
-    r = rand(3)
+for step in range(1, STEPS + 1):
+    r = rand(REGIONS)
     regions[r].like(step)
     truth += 1
     if step == 100:
         regions[0].rename(step, 'alice-old')
     if step == 101:
         regions[2].rename(step, 'alice-new')  # really later, but region 2's clock runs 3 behind
-    if rand(4) == 0:  # lazy replication between random pairs
-        src = rand(3)
-        dst = (src + 1 + rand(2)) % 3
+    if rand(REPLICATE_ONE_IN) == 0:  # lazy replication between random pairs
+        src = rand(REGIONS)
+        dst = (src + 1 + rand(REGIONS - 1)) % REGIONS
         regions[dst].merge_from(regions[src])
 
 print(f"likes really given: {truth}")

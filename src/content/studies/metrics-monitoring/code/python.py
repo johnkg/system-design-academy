@@ -39,23 +39,38 @@ def evaluate(samples, threshold, for_seconds):
     return events
 
 
+SAMPLES = 40
+SCRAPE_S = 15  # seconds between readings
+SPIKE_AT = 60
+SPIKE_CPU = 97
+INCIDENT_FROM = 300
+INCIDENT_TO = 420
+INCIDENT_CPU = 90
+BASE_CPU = 40  # normal load wobbles 40, 43, 46
+WOBBLE_STEPS = 3
+WOBBLE_PCT = 3
+MINUTE_S = 60
+HOUR_S = 60 * MINUTE_S
+THRESHOLD = 80  # alert when CPU is above 80%
+ALERT_FOR_S = 60  # for at least this long
+
 # Ten minutes of CPU readings, one every 15 seconds: a one-sample spike at 60 s, and a real problem from 300 s to 420 s.
 def cpu_value(i, t):
-    if t == 60:
-        return 97
-    if 300 <= t <= 420:
-        return 90
-    return 40 + (i % 3) * 3
+    if t == SPIKE_AT:
+        return SPIKE_CPU
+    if INCIDENT_FROM <= t <= INCIDENT_TO:
+        return INCIDENT_CPU
+    return BASE_CPU + (i % WOBBLE_STEPS) * WOBBLE_PCT
 
 
-samples = [(i * 15, cpu_value(i, i * 15)) for i in range(40)]  # (t, value)
+samples = [(i * SCRAPE_S, cpu_value(i, i * SCRAPE_S)) for i in range(SAMPLES)]  # (t, value)
 
-minutes = rollup(samples, 60, maximum)
+minutes = rollup(samples, MINUTE_S, maximum)
 print(f'{len(samples)} raw samples became {len(minutes)} one-minute points (max per minute)')
-print(f'hourly average CPU: {rollup(samples, 3600, average)[0][1]:.1f}')
+print(f'hourly average CPU: {rollup(samples, HOUR_S, average)[0][1]:.1f}')
 
-noisy = evaluate(samples, 80, 0)
-calm = evaluate(samples, 80, 60)
+noisy = evaluate(samples, THRESHOLD, 0)
+calm = evaluate(samples, THRESHOLD, ALERT_FOR_S)
 print(f"alert without a duration: {', '.join(noisy)}")
 print(f"alert that must last 60 s: {', '.join(calm)}")
 if len(noisy) != 4 or len(calm) != 2:

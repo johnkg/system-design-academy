@@ -27,6 +27,15 @@ function score(req, countFromClient) {
 }
 
 // A seeded generator, so every run sees the same traffic.
+const REQUESTS = 1000;
+const ATTACK_FROM = 80; // r is 0..99: r >= 80 is an attack (20%)
+const STRONG_UPTO = 92; // attacks: obvious payload below 92, evasive above
+const NORMAL_UPTO = 70; // users: plain URL below 70, tricky but harmless above
+const ATTACKERS = 3; // attacker client ids 1..3
+const USER_ID_FROM = 10; // user client ids 10..59
+const USERS = 50;
+const DEFAULT_THRESHOLD = 5; // anomaly score that blocks
+
 let seed = 77;
 const rnd = (n) => { seed = (Math.imul(seed, 1664525) + 1013904223) >>> 0; return (seed >>> 16) % n; };
 const pick = (list) => list[rnd(list.length)];
@@ -39,13 +48,13 @@ const BROWSER = 'Mozilla/5.0', BOT = 'python-requests/2.31';
 
 const traffic = [];
 const seen = new Map(); // requests per client in the current window
-for (let i = 0; i < 1000; i++) {
+for (let i = 0; i < REQUESTS; i++) {
   if (i % WINDOW === 0) seen.clear();
   const r = rnd(100);
-  const attack = r >= 80;
+  const attack = r >= ATTACK_FROM;
   const req = attack
-    ? { url: pick(r < 92 ? STRONG : EVASIVE), agent: rnd(2) ? BOT : BROWSER, client: 1 + rnd(3), attack }
-    : { url: pick(r < 70 ? NORMAL : TRICKY), agent: BROWSER, client: 10 + rnd(50), attack };
+    ? { url: pick(r < STRONG_UPTO ? STRONG : EVASIVE), agent: rnd(2) ? BOT : BROWSER, client: 1 + rnd(ATTACKERS), attack }
+    : { url: pick(r < NORMAL_UPTO ? NORMAL : TRICKY), agent: BROWSER, client: USER_ID_FROM + rnd(USERS), attack };
   seen.set(req.client, (seen.get(req.client) ?? 0) + 1);
   traffic.push({ ...req, points: score(req, seen.get(req.client)) });
 }
@@ -66,10 +75,10 @@ for (const threshold of [2, 4, 5, 8]) {
   const o = run(threshold, false);
   console.log(`threshold ${threshold}: blocked attacks ${o.blockedAttacks}, blocked real users ${o.blockedUsers}, attacks let through ${o.missed}`);
 }
-const watch = run(5, true);
+const watch = run(DEFAULT_THRESHOLD, true);
 console.log(`detection only at 5: would block ${watch.wouldBlock}, blocked ${watch.blockedAttacks + watch.blockedUsers}`);
 
-const strict = run(2, false), normal = run(5, false), loose = run(8, false);
+const strict = run(2, false), normal = run(DEFAULT_THRESHOLD, false), loose = run(8, false);
 const ok = strict.blockedUsers > normal.blockedUsers && loose.missed > normal.missed && watch.blockedAttacks + watch.blockedUsers === 0 && normal.wouldBlock === watch.wouldBlock;
 console.log(`stricter threshold blocks more real users, looser lets more attacks through: ${ok}`);
 if (!ok) process.exit(1);

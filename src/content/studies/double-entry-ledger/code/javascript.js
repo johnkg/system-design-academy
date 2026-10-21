@@ -45,7 +45,19 @@ class Ledger {
   }
 }
 
-let seed = 2024;
+const SEED = 2024;
+const WALLETS = 4;
+const OPENING_BALANCE = 1000000; // each wallet is funded from the bank
+const PAYMENTS = 2000;
+const MIN_AMOUNT = 100; // payment amounts are 100..2099
+const AMOUNT_SPREAD = 2000;
+const FEE_PCT = 3;
+const FEE_SHARDS = 8; // the hot fees account is split over fees#0 .. fees#7
+const RETRY_EVERY = 13; // every 13th payment is retried by the client
+const BAD_EVERY = 17; // every 17th has a buggy unbalanced twin
+const REFUND_EVERY = 29; // every 29th triggers a refund, sent twice
+
+let seed = SEED;
 const random = (n) => { seed = (seed * 1664525 + 1013904223) % 4294967296; return Math.floor(seed / 65536) % n; };
 
 const ledger = new Ledger();
@@ -55,22 +67,22 @@ const tally = (fn) => {
   catch (err) { if (err.message === 'unbalanced') { count.unbalanced++; return null; } throw err; }
 };
 
-for (let w = 1; w <= 4; w++) tally(() => ledger.post(`init-${w}`, [['bank', 1000000], [`wallet-${w}`, -1000000]]));
+for (let w = 1; w <= WALLETS; w++) tally(() => ledger.post(`init-${w}`, [['bank', OPENING_BALANCE], [`wallet-${w}`, -OPENING_BALANCE]]));
 let last = 0;
-for (let i = 0; i < 2000; i++) {
-  const wallet = `wallet-${1 + random(4)}`, amount = 100 + random(2000), fee = Math.floor(amount * 3 / 100);
-  const lines = [[wallet, amount], ['merchant', -(amount - fee)], [`fees#${i % 8}`, -fee]];
+for (let i = 0; i < PAYMENTS; i++) {
+  const wallet = `wallet-${1 + random(WALLETS)}`, amount = MIN_AMOUNT + random(AMOUNT_SPREAD), fee = Math.floor(amount * FEE_PCT / 100);
+  const lines = [[wallet, amount], ['merchant', -(amount - fee)], [`fees#${i % FEE_SHARDS}`, -fee]];
   const r = tally(() => ledger.post(`pay-${i}`, lines));
   if (r && !r.duplicate) last = r.entry.seq;
-  if (i % 13 === 0) tally(() => ledger.post(`pay-${i}`, lines));                                  // the client retries
-  if (i % 17 === 0) tally(() => ledger.post(`bad-${i}`, [[wallet, amount], ['merchant', -amount + 1]])); // a bug: lines do not balance
-  if (i % 29 === 0) { tally(() => ledger.reverse(last)); tally(() => ledger.reverse(last)); count.reversals++; } // refund, sent twice
+  if (i % RETRY_EVERY === 0) tally(() => ledger.post(`pay-${i}`, lines));                                  // the client retries
+  if (i % BAD_EVERY === 0) tally(() => ledger.post(`bad-${i}`, [[wallet, amount], ['merchant', -amount + 1]])); // a bug: lines do not balance
+  if (i % REFUND_EVERY === 0) { tally(() => ledger.reverse(last)); tally(() => ledger.reverse(last)); count.reversals++; } // refund, sent twice
 }
 
 const replayed = ledger.replay();
 let trial = 0;
 for (const amount of ledger.balances.values()) trial += amount;
-const fees = Array.from({ length: 8 }, (_, k) => ledger.balances.get(`fees#${k}`) ?? 0);
+const fees = Array.from({ length: FEE_SHARDS }, (_, k) => ledger.balances.get(`fees#${k}`) ?? 0);
 console.log(`accepted ${count.accepted}, duplicates ignored ${count.duplicates}, rejected unbalanced ${count.unbalanced}, refunds ${count.reversals}`);
 for (const a of ['bank', 'wallet-1', 'wallet-2', 'wallet-3', 'wallet-4', 'merchant']) console.log(`${a}: ${ledger.balances.get(a)}`);
 console.log(`fees: ${ledger.sumOf('fees#')} over 8 shards, each between ${-Math.max(...fees)} and ${-Math.min(...fees)} in credits`);

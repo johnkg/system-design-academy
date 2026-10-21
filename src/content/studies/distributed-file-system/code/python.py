@@ -1,6 +1,13 @@
 # A tiny GFS-style cluster in Python: a master with a chunk map, rack-aware placement,
 # heartbeats that detect dead servers, prioritised re-replication, and checksum scrubbing.
 RACKS, PER, CHUNKS, BLOCKS, COPY_BUDGET, TIMEOUT = 6, 3, 40, 4, 4, 3
+REPLICAS = 3  # copies of every chunk
+MIN_RACKS = 2  # racks every chunk must span
+TICKS = 30
+SERVER_FAILS_AT = 5
+RACK_FAILS_AT = 12
+SETTLED_AFTER = 16  # count recovery only once the rack failure has been detected
+CORRUPTIONS = 5  # blocks hit by bit rot
 N = RACKS * PER
 seed = 7
 
@@ -48,10 +55,10 @@ racks_of = lambda c: len({rack(n) for n in live_replicas(c)})
 
 sound = lambda r: all(mix(v) == r["sums"][b] for b, v in enumerate(r["data"]))
 
-under_replicated = lambda: sum(1 for c in range(CHUNKS) if len(live_replicas(c)) < 3)
+under_replicated = lambda: sum(1 for c in range(CHUNKS) if len(live_replicas(c)) < REPLICAS)
 
 def re_replicate(budget):  # fewest surviving copies first, so the most endangered chunks are fixed first
-    queue = sorted((len(live_replicas(c)), c) for c in range(CHUNKS) if 0 < len(live_replicas(c)) < 3)
+    queue = sorted((len(live_replicas(c)), c) for c in range(CHUNKS) if 0 < len(live_replicas(c)) < REPLICAS)
     for _, c in queue[:budget]:
         src = next(n for n in live_replicas(c) if alive[n])
         held = replicas[c]
@@ -61,11 +68,11 @@ def re_replicate(budget):  # fewest surviving copies first, so the most endanger
 
 for c in range(CHUNKS):
     place(c)
-print(f"placed {CHUNKS} chunks, {CHUNKS * 3} replicas, every chunk on 2+ racks: {str(all(racks_of(c) >= 2 for c in range(CHUNKS))).lower()}")
+print(f"placed {CHUNKS} chunks, {CHUNKS * REPLICAS} replicas, every chunk on 2+ racks: {str(all(racks_of(c) >= MIN_RACKS for c in range(CHUNKS))).lower()}")
 
-min_copies, healthy_at = 3, -1
-for tick in range(1, 31):
-    for n in ([4] if tick == 5 else [6, 7, 8] if tick == 12 else []):
+min_copies, healthy_at = REPLICAS, -1
+for tick in range(1, TICKS + 1):
+    for n in ([4] if tick == SERVER_FAILS_AT else [6, 7, 8] if tick == RACK_FAILS_AT else []):
         alive[n] = False  # one server dies, then a whole rack
     for n in range(N):
         if alive[n]:
@@ -76,14 +83,14 @@ for tick in range(1, 31):
     min_copies = min([min_copies] + [len(live_replicas(c)) for c in range(CHUNKS)])
     if copied := re_replicate(COPY_BUDGET):
         print(f"tick {tick}: copied {copied}, {under_replicated()} still under-replicated")
-    if tick > 16 and healthy_at < 0 and under_replicated() == 0:
+    if tick > SETTLED_AFTER and healthy_at < 0 and under_replicated() == 0:
         healthy_at = tick
 print(f"fewest copies of any chunk: {min_copies}; fully replicated again at tick {healthy_at}")
 
 corrupted = found = repaired = 0
-while corrupted < 5:  # bit rot: flip a value in a stored block, leaving the stored checksum alone
+while corrupted < CORRUPTIONS:  # bit rot: flip a value in a stored block, leaving the stored checksum alone
     c = rnd(CHUNKS)
-    n = live_replicas(c)[rnd(3)]
+    n = live_replicas(c)[rnd(REPLICAS)]
     r = store[n][c]
     if sound(r):  # skip a replica that is already damaged
         r["data"][rnd(BLOCKS)] ^= 1
@@ -103,6 +110,6 @@ print(f"corrupted {corrupted}, scrub found {found}, repaired {repaired}")
 
 clean = all(sound(store[n][c]) and store[n][c]["data"] == original(c) for c in range(CHUNKS) for n in live_replicas(c))
 ok = clean and under_replicated() == 0 and min_copies >= 1 and found == corrupted and all(
-    racks_of(c) >= 2 and len(live_replicas(c)) == 3 for c in range(CHUNKS))
+    racks_of(c) >= MIN_RACKS and len(live_replicas(c)) == REPLICAS for c in range(CHUNKS))
 print(f"all replicas verify, 3 copies on 2+ racks: {str(ok).lower()}")
 raise SystemExit(0 if ok else 1)

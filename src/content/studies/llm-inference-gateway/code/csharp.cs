@@ -7,18 +7,19 @@ using System.Linq;
 public class Budget
 {
     // Levels are kept in milli-tokens so refills are exact integers. rate is tokens per second, now is in milliseconds.
+    const int Milli = 1000; // milli-tokens per token
     readonly long cap, rate;
     long level, last;
-    public Budget(long capacity, long rate) { cap = capacity * 1000; this.rate = rate; level = cap; last = 0; }
+    public Budget(long capacity, long rate) { cap = capacity * Milli; this.rate = rate; level = cap; last = 0; }
     void Refill(long now) { level = Math.Min(cap, level + (now - last) * rate); last = now; }
     public bool Reserve(long tokens, long now)
     {
         Refill(now);
-        if (level < tokens * 1000) return false;
-        level -= tokens * 1000;
+        if (level < tokens * Milli) return false;
+        level -= tokens * Milli;
         return true;
     }
-    public void Settle(long reserved, long used) { level = Math.Min(cap, level + (reserved - used) * 1000); }
+    public void Settle(long reserved, long used) { level = Math.Min(cap, level + (reserved - used) * Milli); }
 }
 
 public class Stats { public int Ok, Rejected; public long Tokens, Cost; }
@@ -29,28 +30,39 @@ public static class Program
     static readonly long[] Small = { 1, 4 }, Large = { 3, 15 };
     static readonly (string Name, long Cap, long Rate)[] Teams = { ("search", 20000, 3000), ("support", 20000, 3000), ("research", 40000, 6000) };
 
-    static ulong seed = 7;
+    const ulong Seed = 7;
+    const int Requests = 300;
+    const int GapMinMs = 40; // requests arrive 40..239 ms apart
+    const int GapSpreadMs = 200;
+    const int PromptMin = 200; // prompt tokens: 200..1999
+    const int PromptSpread = 1800;
+    const int MaxOut = 1024; // output tokens reserved per request
+    const int OutMin = 50; // output tokens really used: 50..549
+    const int OutSpread = 500;
+    const int SmallPromptLimit = 800; // shorter prompts go to the small model
+    const int MsPerSecond = 1000;
+    static ulong seed = Seed;
     static int Random(int n) { seed = (seed * 1664525UL + 1013904223UL) % 4294967296UL; return (int)((seed / 65536) % (ulong)n); }
 
     static (Stats[] Stats, double Seconds) Simulate(bool refund)
     {
-        seed = 7;
+        seed = Seed;
         var budgets = Teams.Select(t => new Budget(t.Cap, t.Rate)).ToArray();
         var stats = Teams.Select(_ => new Stats()).ToArray();
         long now = 0;
-        for (int i = 0; i < 300; i++)
+        for (int i = 0; i < Requests; i++)
         {
-            now += 40 + Random(200);
-            int team = Random(3), prompt = 200 + Random(1800), maxOut = 1024, outTokens = 50 + Random(500);
+            now += GapMinMs + Random(GapSpreadMs);
+            int team = Random(Teams.Length), prompt = PromptMin + Random(PromptSpread), maxOut = MaxOut, outTokens = OutMin + Random(OutSpread);
             int reserved = prompt + maxOut;
             if (!budgets[team].Reserve(reserved, now)) { stats[team].Rejected++; continue; }
-            var price = prompt < 800 ? Small : Large;
+            var price = prompt < SmallPromptLimit ? Small : Large;
             int used = prompt + outTokens;
             if (refund) budgets[team].Settle(reserved, used); // without it the whole reservation stays spent
             stats[team].Ok++; stats[team].Tokens += used;
             stats[team].Cost += prompt * price[0] + outTokens * price[1];
         }
-        return (stats, now / 1000.0);
+        return (stats, now / (double)MsPerSecond);
     }
 
     public static int Main()

@@ -53,7 +53,17 @@ class Inventory:
         return freed
 
 
-seed = 4242
+SEED = 4242
+REQUESTS = 60  # one booking request per tick
+MAX_STAY = 3  # nights per request: 1..3
+PAY_PCT = 70  # requests that go on to pay
+PAY_DELAY = 2  # ticks between hold and payment
+RETRY_EVERY = 7  # every 7th request is sent twice
+SNAPSHOT_GROUP = 12  # requests that read the same snapshot in the naive version
+NO_SHOW_STEPS = 3  # 0%, 10% or 20% no-shows, by night
+TENTHS = 10
+
+seed = SEED
 
 
 def random(n):
@@ -64,16 +74,16 @@ def random(n):
 
 # 60 requests, one per tick. Each wants 1 to 3 nights, pays 2 ticks later unless it abandons, and every 7th request is sent twice.
 requests = []
-for i in range(60):
-    length = 1 + random(3)
+for i in range(REQUESTS):
+    length = 1 + random(MAX_STAY)
     start = random(NIGHTS - length + 1)
-    requests.append({"key": f"req-{i}", "from": start, "to": start + length, "pays": random(100) < 70})
+    requests.append({"key": f"req-{i}", "from": start, "to": start + length, "pays": random(100) < PAY_PCT})
 
 # The mistake: everyone reads the free count first, then writes. Here 12 requests read the same snapshot.
 naive = [0] * NIGHTS
-for i in range(0, len(requests), 12):
+for i in range(0, len(requests), SNAPSHOT_GROUP):
     snapshot = naive[:]
-    for r in requests[i:i + 12]:
+    for r in requests[i:i + SNAPSHOT_GROUP]:
         free = True
         for n in range(r["from"], r["to"]):
             if snapshot[n] >= CAPACITY:
@@ -86,7 +96,7 @@ naive_over = sum(max(0, x - CAPACITY) for x in naive)
 inv = Inventory(CAPACITY + OVERBOOK)
 pending = []
 rejected = sold = expired = 0
-for t in range(len(requests) + HOLD_TTL + 2):
+for t in range(len(requests) + HOLD_TTL + PAY_DELAY):
     expired += inv.expire(t)
     for p in [p for p in pending if p["at"] == t]:
         if inv.confirm(p["key"], t):
@@ -97,8 +107,8 @@ for t in range(len(requests) + HOLD_TTL + 2):
         if h["state"] == "rejected":
             rejected += 1
         elif r["pays"]:
-            pending.append({"key": r["key"], "at": t + 2})
-        if t % 7 == 0:
+            pending.append({"key": r["key"], "at": t + PAY_DELAY})
+        if t % RETRY_EVERY == 0:
             inv.hold(r["key"], r["from"], r["to"], t)  # a client retry with the same key
 
 usage = [row["sold"] + row["held"] for row in inv.rows]
@@ -109,7 +119,7 @@ print(f"rooms used per night: {' '.join(str(u) for u in usage)} (limit {CAPACITY
 # Overbooking: guests who cancel or do not show up leave rooms empty, and the allowance sells them twice.
 sold10 = [row["sold"] for row in inv.rows]
 # Pretend that 0%, 10% or 20% of the guests booked for a night do not arrive, depending on the night.
-shown = [(s * (10 - (i % 3)) + 5) // 10 for i, s in enumerate(sold10)]
+shown = [(s * (TENTHS - (i % NO_SHOW_STEPS)) + TENTHS // 2) // TENTHS for i, s in enumerate(sold10)]
 walked = sum(max(0, x - CAPACITY) for x in shown)
 print(f"sold per night: {' '.join(str(s) for s in sold10)}; guests who arrive: {' '.join(str(s) for s in shown)}; guests without a room: {walked}")
 

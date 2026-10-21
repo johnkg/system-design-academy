@@ -33,6 +33,15 @@ def score(req, count_from_client):
 
 
 # A seeded generator, so every run sees the same traffic.
+REQUESTS = 1000
+ATTACK_FROM = 80  # r is 0..99: r >= 80 is an attack (20%)
+STRONG_UPTO = 92  # attacks: obvious payload below 92, evasive above
+NORMAL_UPTO = 70  # users: plain URL below 70, tricky but harmless above
+ATTACKERS = 3  # attacker client ids 1..3
+USER_ID_FROM = 10  # user client ids 10..59
+USERS = 50
+DEFAULT_THRESHOLD = 5  # anomaly score that blocks
+
 seed = 77
 
 
@@ -54,19 +63,19 @@ BROWSER, BOT = "Mozilla/5.0", "python-requests/2.31"
 
 traffic = []
 seen = {}  # requests per client in the current window
-for i in range(1000):
+for i in range(REQUESTS):
     if i % WINDOW == 0:
         seen.clear()
     r = rnd(100)
-    attack = r >= 80
+    attack = r >= ATTACK_FROM
     if attack:
-        url = pick(STRONG if r < 92 else EVASIVE)
+        url = pick(STRONG if r < STRONG_UPTO else EVASIVE)
         agent = BOT if rnd(2) else BROWSER
-        client = 1 + rnd(3)
+        client = 1 + rnd(ATTACKERS)
     else:
-        url = pick(NORMAL if r < 70 else TRICKY)
+        url = pick(NORMAL if r < NORMAL_UPTO else TRICKY)
         agent = BROWSER
-        client = 10 + rnd(50)
+        client = USER_ID_FROM + rnd(USERS)
     seen[client] = seen.get(client, 0) + 1
     req = {"url": url, "agent": agent, "client": client, "attack": attack}
     req["points"] = score(req, seen[client])
@@ -91,10 +100,10 @@ print(f"traffic: {len(traffic)} requests, {sum(1 for t in traffic if t['attack']
 for threshold in [2, 4, 5, 8]:
     o = run(threshold, False)
     print(f"threshold {threshold}: blocked attacks {o['blocked_attacks']}, blocked real users {o['blocked_users']}, attacks let through {o['missed']}")
-watch = run(5, True)
+watch = run(DEFAULT_THRESHOLD, True)
 print(f"detection only at 5: would block {watch['would_block']}, blocked {watch['blocked_attacks'] + watch['blocked_users']}")
 
-strict, normal, loose = run(2, False), run(5, False), run(8, False)
+strict, normal, loose = run(2, False), run(DEFAULT_THRESHOLD, False), run(8, False)
 ok = (strict["blocked_users"] > normal["blocked_users"] and loose["missed"] > normal["missed"]
       and watch["blocked_attacks"] + watch["blocked_users"] == 0 and normal["would_block"] == watch["would_block"])
 print(f"stricter threshold blocks more real users, looser lets more attacks through: {str(ok).lower()}")

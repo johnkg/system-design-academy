@@ -5,6 +5,12 @@ import sys
 
 W, H, MIN_COST = 24, 16, 2
 START, GOAL = 8 * W + 2, 8 * W + 21
+WALL_ONE_IN = 8  # one cell in 8 is a wall
+JAM_X0 = 8  # the jammed area: columns 8..15, rows 4..11
+JAM_X1 = 16
+JAM_Y0 = 4
+JAM_Y1 = 12
+JAM_FACTOR = 3  # jammed cells cost three times as much
 INF = 10**9
 
 seed = 7
@@ -19,7 +25,7 @@ def next_random():
 def make_grid():
     cost = []  # cost[cell] = minutes to enter the cell, or 0 for a wall
     for _ in range(W * H):
-        wall = next_random() % 8 == 0
+        wall = next_random() % WALL_ONE_IN == 0
         cost.append(0 if wall else MIN_COST + next_random() % 2)
     cost[START] = MIN_COST
     cost[GOAL] = MIN_COST  # start and goal are always open
@@ -90,7 +96,7 @@ cost = make_grid()
 before = compare("free-flowing", cost)
 
 # A jam: every cell in the middle block takes three times as long. The estimate still never overestimates, so A* stays exact.
-jammed = [c * 3 if c > 0 and 8 <= i % W < 16 and 4 <= i // W < 12 else c for i, c in enumerate(cost)]
+jammed = [c * JAM_FACTOR if c > 0 and JAM_X0 <= i % W < JAM_X1 and JAM_Y0 <= i // W < JAM_Y1 else c for i, c in enumerate(cost)]
 after = compare("with a jam", jammed)
 print(f"the jam adds {after - before} minutes to the trip")
 if after < before:

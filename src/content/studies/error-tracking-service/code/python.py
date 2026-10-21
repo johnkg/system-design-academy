@@ -22,6 +22,21 @@ TEMPLATES = [
 ]
 WEIGHTS = [0, 0, 0, 1, 1, 1, 2, 2, 3, 4]
 
+ID_MIN = 1000  # messages carry a 4-digit id
+ID_SPREAD = 9000
+VENDOR_FNS = 3  # vendor frames run0..run2
+VENDOR_LINE = 300
+LINE_SHIFT = 7  # app frame lines move this much every release
+FINGERPRINT_FRAMES = 3  # top app frames in a fingerprint
+TICKS = 300
+RELEASE_TICKS = 100  # a new release every 100 ticks
+STORM_START = 100  # the api retry storm: 20 events per tick for 20 ticks
+STORM_TICKS = 20
+STORM_EVENTS = 20
+TOP_GROUPS = 4
+BUCKET_CAPACITY = 30  # per-project token bucket
+BUCKET_REFILL = 3  # tokens added per tick
+
 seed = 7
 
 def rnd(n):
@@ -30,19 +45,19 @@ def rnd(n):
     return (seed >> 16) % n
 
 def make_event(release):
-    idx = WEIGHTS[rnd(10)]
+    idx = WEIGHTS[rnd(len(WEIGHTS))]
     if release == 1 and idx == 2:
         idx = 1  # the checkout bug is fixed in release 1
     etype, msg, tmpl = TEMPLATES[idx]
-    num = rnd(9000) + 1000
-    vendor = rnd(3)
-    frames = [(f, fn, line + release * 7, True) for f, fn, line in tmpl]  # lines move every release
+    num = rnd(ID_SPREAD) + ID_MIN
+    vendor = rnd(VENDOR_FNS)
+    frames = [(f, fn, line + release * LINE_SHIFT, True) for f, fn, line in tmpl]  # lines move every release
     if frames:
-        frames.append(("vendor.js", "run%d" % vendor, 300 + vendor, False))
+        frames.append(("vendor.js", "run%d" % vendor, VENDOR_LINE + vendor, False))
     return {"type": etype, "message": "%s %d" % (msg, num), "frames": frames, "release": release}
 
 def fingerprint(e):
-    app = ">".join("%s:%s" % (f[0], f[1]) for f in [f for f in e["frames"] if f[3]][:3])
+    app = ">".join("%s:%s" % (f[0], f[1]) for f in [f for f in e["frames"] if f[3]][:FINGERPRINT_FRAMES])
     return fnv1a("%s|%s" % (e["type"], app or normalize(e["message"])))  # no line numbers, no vendor frames
 
 def naive_key(e):
@@ -61,18 +76,18 @@ class Bucket:
         self.tokens -= 1
         return True
 
-projects = {"web": {"bucket": Bucket(30, 3), "sent": 0, "kept": 0}, "api": {"bucket": Bucket(30, 3), "sent": 0, "kept": 0}}
+projects = {"web": {"bucket": Bucket(BUCKET_CAPACITY, BUCKET_REFILL), "sent": 0, "kept": 0}, "api": {"bucket": Bucket(BUCKET_CAPACITY, BUCKET_REFILL), "sent": 0, "kept": 0}}
 groups, naive, regressions = {}, set(), []
 
-for t in range(300):
-    release = 0 if t < 100 else 1 if t < 200 else 2
-    if t == 100:
+for t in range(TICKS):
+    release = 0 if t < RELEASE_TICKS else 1 if t < 2 * RELEASE_TICKS else 2
+    if t == RELEASE_TICKS:
         for g in groups.values():
             if g["title"].startswith("CheckoutError"):
                 g["status"] = "resolved"
     for name, p in projects.items():
         p["bucket"].tick()
-        n = 20 if name == "api" and 100 <= t < 120 else 1  # a retry storm in the api project
+        n = STORM_EVENTS if name == "api" and STORM_START <= t < STORM_START + STORM_TICKS else 1  # a retry storm in the api project
         for _ in range(n):
             e = make_event(release)
             p["sent"] += 1
@@ -96,7 +111,7 @@ print("events sent %d, kept %d, dropped %d" % (sent, kept, sent - kept))
 for name, p in projects.items():
     print("%s: sent %d, kept %d, dropped %d" % (name, p["sent"], p["kept"], p["sent"] - p["kept"]))
 print("distinct events by naive key %d, groups by fingerprint %d" % (len(naive), len(groups)))
-for key, g in sorted(groups.items(), key=lambda kv: (-kv[1]["count"], kv[0]))[:4]:
+for key, g in sorted(groups.items(), key=lambda kv: (-kv[1]["count"], kv[0]))[:TOP_GROUPS]:
     print("%s x%d [%s] %s" % (key, g["count"], g["status"], g["title"]))
 print("regressions: %s" % ("; ".join(regressions) if regressions else "none"))
 

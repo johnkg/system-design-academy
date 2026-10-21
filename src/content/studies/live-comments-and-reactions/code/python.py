@@ -3,6 +3,15 @@
 import sys
 
 EDGES, SECONDS, KEEP, TYPES = 8, 5, 4, 4
+FLAG_ONE_IN = 11  # every 11th comment is flagged by moderation
+TYPE_SCALE = 10  # reaction mix out of 10: heart 5, laugh 3, clap 1, wow 1
+HEART_UPTO = 5
+LAUGH_UPTO = 8
+CLAP_UPTO = 9
+REACTIONS_MIN = 200  # per edge per second: 200..299 reactions, 20..29 comments
+REACTIONS_SPREAD = 100
+COMMENTS_MIN = 20
+COMMENTS_SPREAD = 10
 NAMES = ['heart', 'laugh', 'clap', 'wow']
 
 seed = 7
@@ -22,7 +31,7 @@ def priority(id_):
 
 
 def flagged(id_):
-    return id_ % 11 == 0  # stands in for the moderation verdict
+    return id_ % FLAG_ONE_IN == 0  # stands in for the moderation verdict
 
 
 def by_priority(c):
@@ -48,8 +57,8 @@ class Edge:
 
 
 def pick_type():
-    r = rnd(10)
-    return 0 if r < 5 else 1 if r < 8 else 2 if r < 9 else 3
+    r = rnd(TYPE_SCALE)
+    return 0 if r < HEART_UPTO else 1 if r < LAUGH_UPTO else 2 if r < CLAP_UPTO else 3
 
 
 total, truth_total = [0] * TYPES, [0] * TYPES
@@ -59,7 +68,7 @@ for s in range(SECONDS):
     edges = [Edge() for _ in range(EDGES)]
     everything = []  # the slow, obvious record of every accepted comment, to check against
     for edge in edges:
-        reactions, comments = 200 + rnd(100), 20 + rnd(10)
+        reactions, comments = REACTIONS_MIN + rnd(REACTIONS_SPREAD), COMMENTS_MIN + rnd(COMMENTS_SPREAD)
         for _ in range(reactions):
             t = pick_type()
             edge.react(t)

@@ -5,7 +5,18 @@ using System;
 using System.Collections.Generic;
 using System.Linq;
 
-ulong seed = 2024;
+const ulong Seed = 2024;
+const int Wallets = 4;
+const long OpeningBalance = 1000000; // each wallet is funded from the bank
+const int Payments = 2000;
+const int MinAmount = 100; // payment amounts are 100..2099
+const int AmountSpread = 2000;
+const int FeePct = 3;
+const int FeeShards = 8; // the hot fees account is split over fees#0 .. fees#7
+const int RetryEvery = 13; // every 13th payment is retried by the client
+const int BadEvery = 17; // every 17th has a buggy unbalanced twin
+const int RefundEvery = 29; // every 29th triggers a refund, sent twice
+ulong seed = Seed;
 int Random(int n) { seed = (seed * 1664525UL + 1013904223UL) % 4294967296UL; return (int)((seed / 65536UL) % (ulong)n); }
 
 var ledger = new Ledger();
@@ -16,24 +27,24 @@ Entry? Tally(Func<(Entry, bool)> fn)
     catch (InvalidOperationException err) when (err.Message == "unbalanced") { unbalanced++; return null; }
 }
 
-for (int w = 1; w <= 4; w++) { int n = w; Tally(() => ledger.Post($"init-{n}", new[] { ("bank", 1000000L), ($"wallet-{n}", -1000000L) })); }
+for (int w = 1; w <= Wallets; w++) { int n = w; Tally(() => ledger.Post($"init-{n}", new[] { ("bank", OpeningBalance), ($"wallet-{n}", -OpeningBalance) })); }
 int last = 0;
-for (int i = 0; i < 2000; i++)
+for (int i = 0; i < Payments; i++)
 {
-    string wallet = $"wallet-{1 + Random(4)}";
-    long amount = 100 + Random(2000), fee = amount * 3 / 100;
+    string wallet = $"wallet-{1 + Random(Wallets)}";
+    long amount = MinAmount + Random(AmountSpread), fee = amount * FeePct / 100;
     int k = i;
-    var lines = new[] { (wallet, amount), ("merchant", -(amount - fee)), ($"fees#{k % 8}", -fee) };
+    var lines = new[] { (wallet, amount), ("merchant", -(amount - fee)), ($"fees#{k % FeeShards}", -fee) };
     var posted = Tally(() => ledger.Post($"pay-{k}", lines));
     if (posted != null) last = posted.Seq;
-    if (i % 13 == 0) Tally(() => ledger.Post($"pay-{k}", lines));                                                       // the client retries
-    if (i % 17 == 0) Tally(() => ledger.Post($"bad-{k}", new[] { (wallet, amount), ("merchant", -amount + 1) }));      // a bug: lines do not balance
-    if (i % 29 == 0) { int target = last; Tally(() => ledger.Reverse(target)); Tally(() => ledger.Reverse(target)); reversals++; } // refund, sent twice
+    if (i % RetryEvery == 0) Tally(() => ledger.Post($"pay-{k}", lines));                                                       // the client retries
+    if (i % BadEvery == 0) Tally(() => ledger.Post($"bad-{k}", new[] { (wallet, amount), ("merchant", -amount + 1) }));      // a bug: lines do not balance
+    if (i % RefundEvery == 0) { int target = last; Tally(() => ledger.Reverse(target)); Tally(() => ledger.Reverse(target)); reversals++; } // refund, sent twice
 }
 
 var replayed = ledger.Replay();
 long trial = ledger.Balances.Values.Sum();
-var fees = Enumerable.Range(0, 8).Select(j => ledger.Balances.GetValueOrDefault($"fees#{j}")).ToList();
+var fees = Enumerable.Range(0, FeeShards).Select(j => ledger.Balances.GetValueOrDefault($"fees#{j}")).ToList();
 Console.WriteLine($"accepted {accepted}, duplicates ignored {duplicates}, rejected unbalanced {unbalanced}, refunds {reversals}");
 foreach (var a in new[] { "bank", "wallet-1", "wallet-2", "wallet-3", "wallet-4", "merchant" }) Console.WriteLine($"{a}: {ledger.Balances[a]}");
 Console.WriteLine($"fees: {ledger.SumOf("fees#")} over 8 shards, each between {-fees.Max()} and {-fees.Min()} in credits");
