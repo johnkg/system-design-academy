@@ -16,23 +16,27 @@ for a, b in PEER_LINKS:
     nbrs[a].append((b, "peer"))
     nbrs[b].append((a, "peer"))
 LOCAL_PREF = {"customer": 200, "peer": 100, "provider": 50}
+OWN_ROUTE_PREF = 1000  # an origin always prefers its own route
+IPV4_BITS, OCTET_VALUES = 32, 256
+# The ROA: 192.0.2.0/23 may only be originated by AS 64500, at most 23 bits long.
+ROA_ORIGIN_ASN, ROA_MAX_LENGTH = 64500, 23
 
 
 def ip_to_int(s):
     v = 0
     for o in s.split("."):
-        v = v * 256 + int(o)
+        v = v * OCTET_VALUES + int(o)
     return v
 
 
 def covers(prefix, ip):
     net, length = prefix.split("/")
-    d = 2 ** (32 - int(length))
+    d = 2 ** (IPV4_BITS - int(length))
     return ip_to_int(net) // d == ip_to_int(ip) // d
 
 
 def roa_ok(asn, length):
-    return asn == 64500 and length <= 23  # ROA: 192.0.2.0/23, origin 64500, maxLength 23
+    return asn == ROA_ORIGIN_ASN and length <= ROA_MAX_LENGTH  # ROA: 192.0.2.0/23, origin 64500, maxLength 23
 
 
 def better(a, b):
@@ -46,7 +50,7 @@ def better(a, b):
 
 def propagate(origins, length, rov_nodes):
     """Propagate one prefix to a fixed point. Customer routes go to everyone, peer/provider routes only to customers."""
-    best = {o: {"origin": o, "path": [], "pref": 1000, "via": None, "own": True} for o in origins}
+    best = {o: {"origin": o, "path": [], "pref": OWN_ROUTE_PREF, "via": None, "own": True} for o in origins}
     changed = True
     while changed:
         changed = False

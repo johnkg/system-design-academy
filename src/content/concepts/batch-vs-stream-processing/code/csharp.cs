@@ -4,18 +4,24 @@ using System;
 using System.Collections.Generic;
 using System.Linq;
 
-const int WIN = 600, NWIN = 8, REPORT = 6, SPAN = 4800;
+const int WIN = 600, NWIN = 8, REPORT = 6, SPAN = 4800; // window (s), windows, windows reported, event-time span (s)
+const int LATE_MIN = 20; // a late event arrives at least this many seconds after it happened
+const int ON_TIME_JITTER = 4; // an on-time event arrives 0..3 s after it happened
+const int SECONDS_PER_MINUTE = 60;
+const int EVENT_COUNT = 800, LATE_PCT = 10, LATE_MAX = 300; const uint SEED = 7;
+const int SHORT_WAIT = 30; // seconds the first stream waits past a window's end
 
 List<Ev> Generate(int n, int latePct, int lateMax, uint seed)
 {
     uint s = seed;
+    // 32-bit LCG (Numerical Recipes constants)
     uint Next() { unchecked { s = s * 1664525u + 1013904223u; } return s >> 8; }
     var events = new List<Ev>();
     for (int i = 0; i < n; i++)
     {
         int t = (int)(Next() % SPAN); // when it happened (event time, seconds)
         int r = (int)(Next() % 100);
-        int delay = r < latePct ? 20 + (int)(Next() % (uint)(lateMax - 19)) : (int)(Next() % 4);
+        int delay = r < latePct ? LATE_MIN + (int)(Next() % (uint)(lateMax - LATE_MIN + 1)) : (int)(Next() % ON_TIME_JITTER);
         events.Add(new Ev(i, t, t + delay)); // A = when it reaches us (processing time)
     }
     return events;
@@ -52,7 +58,7 @@ Res RunStream(List<Ev> events, int wait)
 // Batch: every `minutes` re-read the whole log. A window is exact at the first run that has seen all of its events.
 Res RunBatch(List<Ev> events, int minutes)
 {
-    int step = minutes * 60; var truth = TrueCounts(events);
+    int step = minutes * SECONDS_PER_MINUTE; var truth = TrueCounts(events);
     int CountAt(int w, int run) => events.Count(e => e.A <= run && e.T / WIN == w);
     var rows = new List<Row>(); int lastRun = 0;
     for (int w = 0; w < REPORT; w++)
@@ -79,13 +85,13 @@ int Report(string label, Res res)
     return missing;
 }
 
-var events = Generate(800, 10, 300, 7);
-var stream30 = RunStream(events, 30);
+var events = Generate(EVENT_COUNT, LATE_PCT, LATE_MAX, SEED);
+var stream30 = RunStream(events, SHORT_WAIT);
 Console.WriteLine("window  true  first  answered_at");
 foreach (var r in stream30.Rows) Console.WriteLine($"{r.W}       {r.Truth}   {r.First}    +{r.FirstAt - (r.W + 1) * WIN}s");
 
 int missStream30 = Report("stream wait 30s ", stream30);
-int missStream300 = Report("stream wait 300s", RunStream(events, 300));
+int missStream300 = Report("stream wait 300s", RunStream(events, LATE_MAX));
 var batch15 = RunBatch(events, 15);
 var batch60 = RunBatch(events, 60);
 Report("batch every 15m", batch15);

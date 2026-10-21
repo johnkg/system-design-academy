@@ -3,10 +3,15 @@ import sys
 
 DAYS, ROWS_PER_DAY, RG_ROWS, PAYLOAD = 10, 300, 100, 40
 COUNTRIES = ["US", "DE", "BRA", "IND", "JPN"]
-seed = 42
+SEED, USER_IDS, MAX_AMOUNT = 42, 100000, 1000  # amounts are 0..MAX_AMOUNT-1
+BITS_PER_BYTE, HEADER_BYTES = 8, 8
+FOOTER_SCHEMA_BYTES, CHUNK_META_BYTES, COLUMN_COUNT = 100, 48, 4  # footer: schema, then offset+stats per chunk
+USER_BYTES, AMOUNT_BYTES = 4, 2  # fixed-width fields in the row format
+seed = SEED
 
 
 def nxt():
+    """Linear congruential generator (Numerical Recipes constants)."""
     global seed
     seed = (seed * 1664525 + 1013904223) % 4294967296
     return seed
@@ -14,14 +19,14 @@ def nxt():
 
 def make_rows(clustered):
     global seed
-    seed = 42
+    seed = SEED
     by_day = []
     for d in range(DAYS):
         rows = []
         for i in range(ROWS_PER_DAY):
-            user = nxt() % 100000
-            country = COUNTRIES[nxt() % 5]
-            amount = nxt() % 1000
+            user = nxt() % USER_IDS
+            country = COUNTRIES[nxt() % len(COUNTRIES)]
+            amount = nxt() % MAX_AMOUNT
             rows.append({"day": d, "user": user, "country": country, "amount": amount, "i": i})
         if clustered:
             rows.sort(key=lambda r: (r["amount"], r["i"]))  # sort inside the partition
@@ -38,7 +43,7 @@ def bits_for(rng):
 
 
 def packed(n, bits):
-    return (n * bits + 7) // 8 + 8  # bit-packed values plus an 8-byte header
+    return (n * bits + BITS_PER_BYTE - 1) // BITS_PER_BYTE + HEADER_BYTES  # bit-packed values plus an 8-byte header
 
 
 def encode_chunk(name, values):
@@ -48,7 +53,7 @@ def encode_chunk(name, values):
         dict_bytes = sum(len(v) + 1 for v in dict_)
         return {"bytes": dict_bytes + packed(n, bits_for(len(dict_) - 1))}
     if name == "payload":
-        return {"bytes": PAYLOAD * n + 8}  # opaque blob, stored plain
+        return {"bytes": PAYLOAD * n + HEADER_BYTES}  # opaque blob, stored plain
     mn, mx = min(values), max(values)  # frame of reference: store (value - min) in few bits
     return {"bytes": packed(n, bits_for(mx - mn)), "min": mn, "max": mx}
 
@@ -61,11 +66,11 @@ def write_file(rows):  # one file per partition, split into row groups, one chun
         for c in ["user", "country", "amount", "payload"]:
             chunks[c] = encode_chunk(c, [0] * len(part) if c == "payload" else [r[c] for r in part])
         groups.append({"rows": part, "chunks": chunks})
-    return {"groups": groups, "footer": 100 + 48 * 4 * len(groups)}  # schema plus every chunk's offset and stats
+    return {"groups": groups, "footer": FOOTER_SCHEMA_BYTES + CHUNK_META_BYTES * COLUMN_COUNT * len(groups)}  # schema plus every chunk's offset and stats
 
 
 def row_format_bytes(rows):
-    return sum(4 + 2 + len(r["country"]) + 1 + PAYLOAD for r in rows)
+    return sum(USER_BYTES + AMOUNT_BYTES + len(r["country"]) + 1 + PAYLOAD for r in rows)
 
 
 # SELECT sum(amount) FROM t WHERE day >= from_day AND amount >= min_amount

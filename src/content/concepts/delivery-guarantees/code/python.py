@@ -4,21 +4,27 @@ import sys
 
 N = 12
 MASK = 0xFFFFFFFF
+MIN_AMOUNT, AMOUNT_STEP, AMOUNT_SPREAD = 10, 7, 30  # synthetic amounts: 10..39
+RATE_SCALE = 1000  # fault rates are per 1000 attempts
+CRASH_BEFORE_UPTO, CRASH_MID_UPTO, CRASH_AFTER_UPTO = 30, 55, 80  # percent cut points; the rest lose the ack
+MAX_ATTEMPTS = 50  # redeliveries before a consumer gives up
+SEED, FAULT_RATE = 1, 250  # 250 per 1000 = 25 % of attempts fail
 
 
 def amount_of(i):
-    return 10 + ((i * 7) % 30)
+    return MIN_AMOUNT + ((i * AMOUNT_STEP) % AMOUNT_SPREAD)
 
 
 # Deterministic fault for (message, attempt): the same schedule hits every style. 25 % of attempts fail.
+# Hash (seed, id, attempt) with primes, then mix with 3 rounds of a 32-bit LCG.
 def fault(seed, id_, attempt, rate):
     x = (seed * 7919 + id_ * 104729 + attempt * 1299709 + 12345) & MASK
     for _ in range(3):
         x = (x * 1664525 + 1013904223) & MASK
-    if (x >> 16) % 1000 >= rate:
+    if (x >> 16) % RATE_SCALE >= rate:
         return "ok"
     s = (x >> 8) % 100
-    return "crashBefore" if s < 30 else "crashMid" if s < 55 else "crashAfter" if s < 80 else "lostAck"
+    return "crashBefore" if s < CRASH_BEFORE_UPTO else "crashMid" if s < CRASH_MID_UPTO else "crashAfter" if s < CRASH_AFTER_UPTO else "lostAck"
 
 
 def run(style, seed, rate, card_key):
@@ -38,7 +44,7 @@ def run(style, seed, rate, card_key):
                 continue  # charged, never recorded, lost
             ledger[i] += 1
             continue
-        for attempt in range(50):
+        for attempt in range(MAX_ATTEMPTS):
             f = fault(seed, i, attempt, rate)
             if f == "crashBefore":
                 continue  # redelivered
@@ -73,12 +79,12 @@ def show(name, r):
 STYLES = ["ack-before", "ack-after", "idempotent", "transactional"]
 R = {}
 for s in STYLES:
-    R[s] = run(s, 1, 250, False)
+    R[s] = run(s, SEED, FAULT_RATE, False)
     show(s, R[s])
 print("-- card API honours an idempotency key --")
 K = {}
 for s in STYLES:
-    K[s] = run(s, 1, 250, True)
+    K[s] = run(s, SEED, FAULT_RATE, True)
     show(s, K[s])
 
 

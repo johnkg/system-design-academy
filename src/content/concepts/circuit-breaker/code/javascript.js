@@ -1,11 +1,15 @@
 // A circuit breaker in JavaScript with closed, open and half-open states. The clock is passed in so the demo is deterministic.
 
+const FAILURE_THRESHOLD = 3; // consecutive failures that open the breaker
+const COOLDOWN_MS = 5000;     // how long it stays open before a half-open probe
+const AFTER_COOLDOWN_MS = 6000; // demo time once the cooldown has passed
+
 class CircuitBreaker {
   state = "closed";
   #failures = 0;
   #openedAt = 0;
 
-  constructor(call, { failureThreshold = 3, cooldownMs = 5000, now = () => Date.now() } = {}) {
+  constructor(call, { failureThreshold = FAILURE_THRESHOLD, cooldownMs = COOLDOWN_MS, now = () => Date.now() } = {}) {
     this.call = call;
     this.failureThreshold = failureThreshold;
     this.cooldownMs = cooldownMs;
@@ -41,7 +45,7 @@ const payment = async () => {
   if (!paymentApiIsUp) throw new Error("payment API timed out");
   return "charged";
 };
-const breaker = new CircuitBreaker(payment, { failureThreshold: 3, cooldownMs: 5000, now: () => time });
+const breaker = new CircuitBreaker(payment, { failureThreshold: FAILURE_THRESHOLD, cooldownMs: COOLDOWN_MS, now: () => time });
 
 async function checkout(label) {
   try {
@@ -52,7 +56,7 @@ async function checkout(label) {
 }
 
 for (const label of ["c1", "c2", "c3", "c4", "c5"]) await checkout(label); // c4 and c5 never reach the API
-time = 6000;
+time = AFTER_COOLDOWN_MS;
 paymentApiIsUp = true; // the provider recovered
 await checkout("c6"); // half-open probe succeeds
 await checkout("c7");

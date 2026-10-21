@@ -26,6 +26,9 @@ def fmt(t):
     return f"{t[0]}#{t[1]}@{t[2]}"
 
 
+DEFAULT_MAX_DEPTH = 8  # hops a check may follow before it gives up
+
+
 # Rewrites: viewer = direct + editor + parent->viewer; editor = direct + parent->editor; group member = direct.
 # Every tuple followed costs one hop, and the walk stops at max_depth, so a cycle or a deep tree cannot run away.
 def walk(obj, rel, user, used, max_depth):
@@ -55,7 +58,7 @@ def walk(obj, rel, user, used, max_depth):
     return None
 
 
-def rebac(user, act, doc, max_depth=8):
+def rebac(user, act, doc, max_depth=DEFAULT_MAX_DEPTH):
     return walk("doc:" + doc, "editor" if act == "edit" else "viewer", user, 0, max_depth)
 
 

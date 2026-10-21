@@ -1,15 +1,21 @@
 // Four consumer styles over the same seeded crash schedule. Payment events are charged to a card API
 // and recorded in a ledger. Intended final state: every payment charged once and recorded once.
 const N = 12;
-const amountOf = (id) => 10 + ((id * 7) % 30);
+const MIN_AMOUNT = 10, AMOUNT_STEP = 7, AMOUNT_SPREAD = 30; // synthetic amounts: 10..39
+const RATE_SCALE = 1000; // fault rates are per 1000 attempts
+const CRASH_BEFORE_UPTO = 30, CRASH_MID_UPTO = 55, CRASH_AFTER_UPTO = 80; // percent cut points; the rest lose the ack
+const MAX_ATTEMPTS = 50; // redeliveries before a consumer gives up
+const SEED = 1, FAULT_RATE = 250; // 250 per 1000 = 25 % of attempts fail
+const amountOf = (id) => MIN_AMOUNT + ((id * AMOUNT_STEP) % AMOUNT_SPREAD);
 
 // Deterministic fault for (message, attempt): the same schedule hits every style. 25 % of attempts fail.
+// Hash (seed, id, attempt) with primes, then mix with 3 rounds of a 32-bit LCG.
 function fault(seed, id, attempt, rate) {
   let x = (Math.imul(seed, 7919) + Math.imul(id, 104729) + Math.imul(attempt, 1299709) + 12345) >>> 0;
   for (let i = 0; i < 3; i++) x = (Math.imul(x, 1664525) + 1013904223) >>> 0;
-  if ((x >>> 16) % 1000 >= rate) return 'ok';
+  if ((x >>> 16) % RATE_SCALE >= rate) return 'ok';
   const s = (x >>> 8) % 100;
-  return s < 30 ? 'crashBefore' : s < 55 ? 'crashMid' : s < 80 ? 'crashAfter' : 'lostAck';
+  return s < CRASH_BEFORE_UPTO ? 'crashBefore' : s < CRASH_MID_UPTO ? 'crashMid' : s < CRASH_AFTER_UPTO ? 'crashAfter' : 'lostAck';
 }
 
 function run(style, seed, rate, cardKey) {
@@ -24,7 +30,7 @@ function run(style, seed, rate, cardKey) {
       ledger[id]++;
       continue;
     }
-    for (let attempt = 0; attempt < 50; attempt++) {
+    for (let attempt = 0; attempt < MAX_ATTEMPTS; attempt++) {
       const f = fault(seed, id, attempt, rate);
       if (f === 'crashBefore') continue;                       // redelivered
       if (style === 'idempotent' && seen.has(id)) break;       // unique key hit: skip and ack
@@ -47,10 +53,10 @@ function run(style, seed, rate, cardKey) {
 
 const show = (name, r) => console.log(`${name.padEnd(14)} lost=${r.lost} dupLedger=${r.dupLedger} dupCard=${r.dupCard} ledger=${r.ledgerTotal} card=${r.cardTotal} intended=${r.want}`);
 const R = {};
-for (const style of ['ack-before', 'ack-after', 'idempotent', 'transactional']) { R[style] = run(style, 1, 250, false); show(style, R[style]); }
+for (const style of ['ack-before', 'ack-after', 'idempotent', 'transactional']) { R[style] = run(style, SEED, FAULT_RATE, false); show(style, R[style]); }
 console.log('-- card API honours an idempotency key --');
 const K = {};
-for (const style of ['ack-before', 'ack-after', 'idempotent', 'transactional']) { K[style] = run(style, 1, 250, true); show(style, K[style]); }
+for (const style of ['ack-before', 'ack-after', 'idempotent', 'transactional']) { K[style] = run(style, SEED, FAULT_RATE, true); show(style, K[style]); }
 
 const must = (c, m) => { if (!c) { console.error('FAILED: ' + m); process.exit(1); } };
 must(R['ack-before'].lost > 0, 'ack-before loses messages');

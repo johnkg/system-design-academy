@@ -19,6 +19,7 @@ const index = new Map();
 for (const t of tuples) index.set(t[0] + "#" + t[1], [...(index.get(t[0] + "#" + t[1]) || []), t]);
 const fmt = (t) => `${t[0]}#${t[1]}@${t[2]}`;
 
+const DEFAULT_MAX_DEPTH = 8; // hops a check may follow before it gives up
 // Rewrites: viewer = direct + editor + parent->viewer; editor = direct + parent->editor; group member = direct.
 // Every tuple followed costs one hop, and the walk stops at maxDepth, so a cycle or a deep tree cannot run away.
 function walk(obj, rel, user, used, maxDepth) {
@@ -39,7 +40,7 @@ function walk(obj, rel, user, used, maxDepth) {
   }
   return null;
 }
-const rebac = (user, act, doc, maxDepth = 8) => walk("doc:" + doc, act === "edit" ? "editor" : "viewer", user, 0, maxDepth);
+const rebac = (user, act, doc, maxDepth = DEFAULT_MAX_DEPTH) => walk("doc:" + doc, act === "edit" ? "editor" : "viewer", user, 0, maxDepth);
 
 // ---- RBAC: roles hold (action, pattern); users hold roles ----
 const roles = { "eng-viewer": ["view", "eng/"], "eng-editor": ["edit", "eng/"], "finance-viewer": ["view", "finance/"], "finance-editor": ["edit", "finance/"], "eng-spec-viewer": ["view", "eng/spec"], "notes-owner": ["edit", "alice-notes"] };

@@ -1,9 +1,14 @@
 # A circuit breaker in Python with closed, open and half-open states. The clock is passed in so the demo is deterministic.
 import time as _time
 
+FAILURE_THRESHOLD = 3  # consecutive failures that open the breaker
+COOLDOWN_MS = 5000  # how long it stays open before a half-open probe
+AFTER_COOLDOWN_MS = 6000  # demo time once the cooldown has passed
+MS_PER_SECOND = 1000
+
 
 class CircuitBreaker:
-    def __init__(self, call, failure_threshold=3, cooldown_ms=5000, now=lambda: int(_time.time() * 1000)):
+    def __init__(self, call, failure_threshold=FAILURE_THRESHOLD, cooldown_ms=COOLDOWN_MS, now=lambda: int(_time.time() * MS_PER_SECOND)):
         self.state = "closed"
         self._failures = 0
         self._opened_at = 0
@@ -43,7 +48,7 @@ def payment():
     return "charged"
 
 
-breaker = CircuitBreaker(payment, failure_threshold=3, cooldown_ms=5000, now=lambda: time)
+breaker = CircuitBreaker(payment, failure_threshold=FAILURE_THRESHOLD, cooldown_ms=COOLDOWN_MS, now=lambda: time)
 
 
 def checkout(label):
@@ -55,7 +60,7 @@ def checkout(label):
 
 for label in ["c1", "c2", "c3", "c4", "c5"]:
     checkout(label)  # c4 and c5 never reach the API
-time = 6000
+time = AFTER_COOLDOWN_MS
 payment_api_is_up = True  # the provider recovered
 checkout("c6")  # half-open probe succeeds
 checkout("c7")

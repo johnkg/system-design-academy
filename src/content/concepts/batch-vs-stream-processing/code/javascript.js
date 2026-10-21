@@ -1,16 +1,22 @@
 // Batch vs stream on the same late-arriving events: count orders per 10-minute window of EVENT time.
 // The stream answers fast from a watermark and drops what comes too late; the batch recomputes the log on a schedule.
 
-const WIN = 600, NWIN = 8, REPORT = 6, SPAN = 4800;
+const WIN = 600, NWIN = 8, REPORT = 6, SPAN = 4800; // window (s), windows, windows reported, event-time span (s)
+const LATE_MIN = 20; // a late event arrives at least this many seconds after it happened
+const ON_TIME_JITTER = 4; // an on-time event arrives 0..3 s after it happened
+const SECONDS_PER_MINUTE = 60;
+const EVENT_COUNT = 800, LATE_PCT = 10, LATE_MAX = 300, SEED = 7;
+const SHORT_WAIT = 30; // seconds the first stream waits past a window's end
 
 function generate(n, latePct, lateMax, seed) {
   let s = seed >>> 0;
+  // 32-bit LCG (Numerical Recipes constants)
   const next = () => { s = (Math.imul(s, 1664525) + 1013904223) >>> 0; return s >>> 8; };
   const events = [];
   for (let i = 0; i < n; i++) {
     const t = next() % SPAN; // when it happened (event time, seconds)
     const r = next() % 100;
-    const delay = r < latePct ? 20 + (next() % (lateMax - 19)) : next() % 4;
+    const delay = r < latePct ? LATE_MIN + (next() % (lateMax - LATE_MIN + 1)) : next() % ON_TIME_JITTER;
     events.push({ i, t, a: t + delay }); // a = when it reaches us (processing time)
   }
   return events;
@@ -45,7 +51,7 @@ function runStream(events, wait) {
 
 // Batch: every `minutes` re-read the whole log. A window is exact at the first run that has seen all of its events.
 function runBatch(events, minutes) {
-  const step = minutes * 60, truth = trueCounts(events);
+  const step = minutes * SECONDS_PER_MINUTE, truth = trueCounts(events);
   const countAt = (w, run) => events.filter((e) => e.a <= run && Math.floor(e.t / WIN) === w).length;
   const rows = []; let lastRun = 0;
   for (let w = 0; w < REPORT; w++) {
@@ -69,13 +75,13 @@ function report(label, res) {
   return missing;
 }
 
-const events = generate(800, 10, 300, 7);
-const stream30 = runStream(events, 30);
+const events = generate(EVENT_COUNT, LATE_PCT, LATE_MAX, SEED);
+const stream30 = runStream(events, SHORT_WAIT);
 console.log("window  true  first  answered_at");
 for (const r of stream30.rows) console.log(`${r.w}       ${r.truth}   ${r.first}    +${r.firstAt - (r.w + 1) * WIN}s`);
 
 const missStream30 = report("stream wait 30s ", stream30);
-const missStream300 = report("stream wait 300s", runStream(events, 300));
+const missStream300 = report("stream wait 300s", runStream(events, LATE_MAX));
 const batch15 = runBatch(events, 15);
 const batch60 = runBatch(events, 60);
 report("batch every 15m", batch15);

@@ -8,6 +8,9 @@ using System.Text.Json;
 public static class Program
 {
     const string Secret = "demo-secret-do-not-use-in-production";
+    const long Now = 1000; // the demo clock, in seconds
+    const long ExpiresAt = 2000; // when the demo tokens expire
+    const long AfterExpiry = 2500;
 
     static string B64(string text) => Convert.ToBase64String(Encoding.UTF8.GetBytes(text)).TrimEnd('=').Replace('+', '-').Replace('/', '_');
     static string B64Bytes(byte[] bytes) => Convert.ToBase64String(bytes).TrimEnd('=').Replace('+', '-').Replace('/', '_');
@@ -46,7 +49,7 @@ public static class Program
         return "200 ok";
     }
 
-    static void Call(string label, string token, string action, string? owner = null, long now = 1000)
+    static void Call(string label, string token, string action, string? owner = null, long now = Now)
     {
         try
         {
@@ -58,14 +61,14 @@ public static class Program
 
     public static void Main()
     {
-        var alice = CreateToken("alice", "customer", 2000);
-        var bob = CreateToken("bob", "admin", 2000);
+        var alice = CreateToken("alice", "customer", ExpiresAt);
+        var bob = CreateToken("bob", "admin", ExpiresAt);
 
         Call("alice reads her order   ", alice, "read-order", "alice");
         Call("alice reads bob's order ", alice, "read-order", "bob");
         Call("alice lists all users   ", alice, "list-users");
         Call("bob lists all users     ", bob, "list-users");
-        Call("alice, after expiry     ", alice, "read-order", "alice", 2500);
+        Call("alice, after expiry     ", alice, "read-order", "alice", AfterExpiry);
 
         // Alice edits her own token to say she is an admin, but she cannot re-sign it
         var parts = alice.Split('.');

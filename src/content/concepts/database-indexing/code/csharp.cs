@@ -5,9 +5,11 @@ using System.Linq;
 
 public static class Program
 {
+    const int RowCount = 500_000; // rows in the demo table
+
     public static void Main()
     {
-        var rows = Enumerable.Range(0, 500_000).Select(i => new Row(i, $"user{i}@example.com")).ToList();
+        var rows = Enumerable.Range(0, RowCount).Select(i => new Row(i, $"user{i}@example.com")).ToList();
         const string target = "user499999@example.com";
 
         Console.WriteLine("full scan comparisons: " + FullScan(rows, target));

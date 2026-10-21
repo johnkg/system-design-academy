@@ -3,6 +3,10 @@
 
 NODE_CPU = 4000  # millicores per node
 NODE_MEM = 8192  # MiB per node
+NODES = 4  # nodes in the demo cluster
+REPLICAS = 6  # desired replicas in the failover demo
+MANY_REPLICAS = 14  # more replicas than the cluster can hold with one node down
+EXPECTED_RUNNING = 12  # 3 surviving nodes x 4 pods of 1000 millicores
 
 
 def make_cluster(count):
@@ -73,28 +77,28 @@ def check(c, spec):
 spec = {"cpu": 1000, "mem": 1024}
 
 for policy in ["spread", "pack"]:
-    c = make_cluster(4)
-    pending = reconcile(c, 6, spec, policy)
+    c = make_cluster(NODES)
+    pending = reconcile(c, REPLICAS, spec, policy)
     print(f"{policy}: placed 6 pods -> {counts(c)} (pending {pending})")
     sizes = [len(pods_on(c, j)) for j in range(len(c["nodes"]))]
     victim = next(i for i, s in enumerate(sizes) if s == max(sizes))
     lost = kill_node(c, victim)
     print(f"{policy}: {c['nodes'][victim]['name']} died, {lost} pods lost, {running(c)} of 6 running")
-    pending = reconcile(c, 6, spec, policy)
+    pending = reconcile(c, REPLICAS, spec, policy)
     print(f"{policy}: reconciled -> {counts(c)} (running {running(c)}, pending {pending})")
     check(c, spec)
-    if running(c) != 6 or pending != 0:
+    if running(c) != REPLICAS or pending != 0:
         raise RuntimeError("did not converge")
 
-c = make_cluster(4)
-reconcile(c, 14, spec, "spread")
+c = make_cluster(NODES)
+reconcile(c, MANY_REPLICAS, spec, "spread")
 kill_node(c, 0)
-pending = reconcile(c, 14, spec, "spread")
+pending = reconcile(c, MANY_REPLICAS, spec, "spread")
 print(f"14 replicas, 1 node down -> {counts(c)} (running {running(c)}, pending {pending})")
-if running(c) != 12 or pending != 2:
+if running(c) != EXPECTED_RUNNING or pending != MANY_REPLICAS - EXPECTED_RUNNING:
     raise RuntimeError("expected 12 running and 2 pending")
 c["nodes"][0]["up"] = True  # the node comes back
-pending = reconcile(c, 14, spec, "spread")
+pending = reconcile(c, MANY_REPLICAS, spec, "spread")
 print(f"node back -> {counts(c)} (running {running(c)}, pending {pending})")
 check(c, spec)
 if pending != 0:

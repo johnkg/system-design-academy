@@ -3,6 +3,10 @@
 
 const NODE_CPU = 4000; // millicores per node
 const NODE_MEM = 8192; // MiB per node
+const NODES = 4; // nodes in the demo cluster
+const REPLICAS = 6; // desired replicas in the failover demo
+const MANY_REPLICAS = 14; // more replicas than the cluster can hold with one node down
+const EXPECTED_RUNNING = 12; // 3 surviving nodes x 4 pods of 1000 millicores
 
 function makeCluster(count) {
   const nodes = [];
@@ -61,26 +65,26 @@ function check(c, spec) {
 const spec = { cpu: 1000, mem: 1024 };
 
 for (const policy of ["spread", "pack"]) {
-  const c = makeCluster(4);
-  let pending = reconcile(c, 6, spec, policy);
+  const c = makeCluster(NODES);
+  let pending = reconcile(c, REPLICAS, spec, policy);
   console.log(`${policy}: placed 6 pods -> ${counts(c)} (pending ${pending})`);
   const victim = c.nodes.findIndex((_, i) => podsOn(c, i).length === Math.max(...c.nodes.map((__, j) => podsOn(c, j).length)));
   const lost = killNode(c, victim);
   console.log(`${policy}: ${c.nodes[victim].name} died, ${lost} pods lost, ${running(c)} of 6 running`);
-  pending = reconcile(c, 6, spec, policy);
+  pending = reconcile(c, REPLICAS, spec, policy);
   console.log(`${policy}: reconciled -> ${counts(c)} (running ${running(c)}, pending ${pending})`);
   check(c, spec);
-  if (running(c) !== 6 || pending !== 0) throw new Error("did not converge");
+  if (running(c) !== REPLICAS || pending !== 0) throw new Error("did not converge");
 }
 
-const c = makeCluster(4);
-reconcile(c, 14, spec, "spread");
+const c = makeCluster(NODES);
+reconcile(c, MANY_REPLICAS, spec, "spread");
 killNode(c, 0);
-let pending = reconcile(c, 14, spec, "spread");
+let pending = reconcile(c, MANY_REPLICAS, spec, "spread");
 console.log(`14 replicas, 1 node down -> ${counts(c)} (running ${running(c)}, pending ${pending})`);
-if (running(c) !== 12 || pending !== 2) throw new Error("expected 12 running and 2 pending");
+if (running(c) !== EXPECTED_RUNNING || pending !== MANY_REPLICAS - EXPECTED_RUNNING) throw new Error("expected 12 running and 2 pending");
 c.nodes[0].up = true; // the node comes back
-pending = reconcile(c, 14, spec, "spread");
+pending = reconcile(c, MANY_REPLICAS, spec, "spread");
 console.log(`node back -> ${counts(c)} (running ${running(c)}, pending ${pending})`);
 check(c, spec);
 if (pending !== 0) throw new Error("pending pods should have been scheduled");

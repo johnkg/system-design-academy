@@ -6,6 +6,15 @@ M = 0xFFFFFFFF
 N = 100000        # 2 seconds of traffic at 50,000 requests per second
 SLOW_MS = 800     # tail sampling keeps anything at least this slow
 SEED = 5
+# Traffic mix, in requests per 100,000: 0.2% errors and 1% slow successes.
+PER_100K, ERRORS_PER_100K, SLOW_PER_100K = 100000, 200, 1000
+ERROR_MIN_MS, ERROR_SPREAD_MS, SLOW_SPREAD_MS = 1500, 2500, 2200
+FAST_MIN_MS, FAST_JITTER_MS = 20, 60  # fast latency adds three jitter draws
+HASH_SPACE = 2 ** 32  # 32-bit hash values
+Z_95 = 1.96  # z score for a 95% interval
+MAX_SE_OFF = 4  # a count estimate must land within this many standard errors
+SERVICE_RATE = 10  # each service on the path samples 1 in this many
+BYTES_PER_GB = 1e9
 
 
 def mix(x):  # 32-bit hash finalizer (murmur3)
@@ -29,22 +38,22 @@ def mulberry32(seed):
 def make_stream(n, seed):  # 0.2% errors (slow timeouts), 1% slow successes, the rest fast
     rng, out = mulberry32(seed), []
     for _ in range(n):
-        id_, u = rng(), rng() % 100000
+        id_, u = rng(), rng() % PER_100K
         err = False
-        if u < 200:
+        if u < ERRORS_PER_100K:
             err = True
-            ms = 1500 + rng() % 2500
-        elif u < 1200:
-            ms = SLOW_MS + rng() % 2200
+            ms = ERROR_MIN_MS + rng() % ERROR_SPREAD_MS
+        elif u < ERRORS_PER_100K + SLOW_PER_100K:
+            ms = SLOW_MS + rng() % SLOW_SPREAD_MS
         else:
-            ms = 20 + rng() % 60 + rng() % 60 + rng() % 60
+            ms = FAST_MIN_MS + rng() % FAST_JITTER_MS + rng() % FAST_JITTER_MS + rng() % FAST_JITTER_MS
         out.append((id_, err, ms))
     return out
 
 
 # Head sampling: a pure function of the trace id, so every service decides the same way.
 def head_keep(id_, d, salt=0x9E3779B9):
-    return mix((id_ ^ salt) & M) < 4294967296 // d
+    return mix((id_ ^ salt) & M) < HASH_SPACE // d
 
 
 def interesting(e):
@@ -61,7 +70,7 @@ def weighted_quantile(items, pct):  # items: (ms, weight); smallest ms with >= p
 
 
 def wilson(k, n):  # 95% interval for a proportion
-    z, p = 1.96, k / n
+    z, p = Z_95, k / n
     d = 1 + z * z / n
     c = (p + z * z / (2 * n)) / d
     h = (z * math.sqrt(p * (1 - p) / n + z * z / (4 * n * n))) / d
@@ -85,7 +94,7 @@ def run(d, tail):
     rel_err = (est_total - N) / N * 100
     if tail:
         rate = errs_kept / est_total  # errors are exact, only the denominator is estimated
-        ci = (errs_kept / (est_total + 1.96 * se), errs_kept / (est_total - 1.96 * se))
+        ci = (errs_kept / (est_total + Z_95 * se), errs_kept / (est_total - Z_95 * se))
     else:
         rate = errs_kept / len(kept) if kept else 0
         ci = wilson(errs_kept, len(kept))
@@ -97,7 +106,7 @@ def run(d, tail):
 
 for d in (1, 10, 100, 1000):
     errs, est, se = run(d, False)
-    if abs(est - N) > 4 * se:
+    if abs(est - N) > MAX_SE_OFF * se:
         raise SystemExit(f"head 1/{d} count estimate off")
     if d == 1 and errs != true_errors:
         raise SystemExit("keep-everything must keep every error")
@@ -105,12 +114,12 @@ for d in (10, 100, 1000):
     errs, est, se = run(d, True)
     if errs != true_errors:
         raise SystemExit("tail sampling lost an error")
-    if abs(est - N) > 4 * se:
+    if abs(est - N) > MAX_SE_OFF * se:
         raise SystemExit(f"tail 1/{d} count estimate off")
 
 # Three services on the request path, each deciding at 1/10.
-consistent = sum(1 for e in stream if head_keep(e[0], 10) and head_keep(e[0], 10) and head_keep(e[0], 10))
-independent = sum(1 for e in stream if head_keep(e[0], 10, 1) and head_keep(e[0], 10, 2) and head_keep(e[0], 10, 3))
+consistent = sum(1 for e in stream if head_keep(e[0], SERVICE_RATE) and head_keep(e[0], SERVICE_RATE) and head_keep(e[0], SERVICE_RATE))
+independent = sum(1 for e in stream if head_keep(e[0], SERVICE_RATE, 1) and head_keep(e[0], SERVICE_RATE, 2) and head_keep(e[0], SERVICE_RATE, 3))
 print(f"complete traces across 3 services at 1/10: by trace id {consistent}, independent coins {independent}")
 if consistent <= independent:
     raise SystemExit("consistent sampling must keep more complete traces")
@@ -129,7 +138,7 @@ def series(names):
 
 for names in (["route", "status"], ["route", "status", "region"], ["route", "status", "region", "customer_id"]):
     s = series(names)
-    print(f"labels {'+'.join(names)}: {s} series, {s * SERIES_BYTES / 1e9:.2f} GB")
+    print(f"labels {'+'.join(names)}: {s} series, {s * SERIES_BYTES / BYTES_PER_GB:.2f} GB")
 if series(["route", "status", "region"]) != 600:
     raise SystemExit("cardinality is the product")
 print("ok")

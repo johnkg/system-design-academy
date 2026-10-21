@@ -4,6 +4,10 @@ using System.Threading.Tasks;
 
 public static class Program
 {
+    const int FailureThreshold = 3;  // consecutive failures that open the breaker
+    const long CooldownMs = 5000;    // how long it stays open before a half-open probe
+    const long AfterCooldownMs = 6000; // demo time once the cooldown has passed
+
     public static async Task Main()
     {
         long time = 0; // milliseconds, moved by hand
@@ -15,7 +19,7 @@ public static class Program
             if (!paymentApiIsUp) throw new InvalidOperationException("payment API timed out");
             return Task.FromResult("charged");
         }
-        var breaker = new CircuitBreaker<string>(Payment, failureThreshold: 3, cooldownMs: 5000, now: () => time);
+        var breaker = new CircuitBreaker<string>(Payment, failureThreshold: FailureThreshold, cooldownMs: CooldownMs, now: () => time);
 
         async Task Checkout(string label)
         {
@@ -24,7 +28,7 @@ public static class Program
         }
 
         foreach (var label in new[] { "c1", "c2", "c3", "c4", "c5" }) await Checkout(label); // c4 and c5 never reach the API
-        time = 6000;
+        time = AfterCooldownMs;
         paymentApiIsUp = true; // the provider recovered
         await Checkout("c6"); // half-open probe succeeds
         await Checkout("c7");

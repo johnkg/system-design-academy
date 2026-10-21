@@ -4,31 +4,36 @@ using System;
 using System.Collections.Generic;
 using System.Linq;
 
+const int Nodes = 4; // nodes in the demo cluster
+const int Replicas = 6; // desired replicas in the failover demo
+const int ManyReplicas = 14; // more replicas than the cluster can hold with one node down
+const int ExpectedRunning = 12; // 3 surviving nodes x 4 pods of 1000 millicores
+
 var spec = new Spec(1000, 1024);
 
 foreach (var policy in new[] { "spread", "pack" })
 {
-    var c = new Cluster(4);
-    int pending = c.Reconcile(6, spec, policy);
+    var c = new Cluster(Nodes);
+    int pending = c.Reconcile(Replicas, spec, policy);
     Console.WriteLine($"{policy}: placed 6 pods -> {c.Counts()} (pending {pending})");
-    int max = Enumerable.Range(0, 4).Max(j => c.PodsOn(j));
-    int victim = Enumerable.Range(0, 4).First(i => c.PodsOn(i) == max);
+    int max = Enumerable.Range(0, Nodes).Max(j => c.PodsOn(j));
+    int victim = Enumerable.Range(0, Nodes).First(i => c.PodsOn(i) == max);
     int lost = c.KillNode(victim);
     Console.WriteLine($"{policy}: {c.Nodes[victim].Name} died, {lost} pods lost, {c.Running()} of 6 running");
-    pending = c.Reconcile(6, spec, policy);
+    pending = c.Reconcile(Replicas, spec, policy);
     Console.WriteLine($"{policy}: reconciled -> {c.Counts()} (running {c.Running()}, pending {pending})");
     c.Check(spec);
-    if (c.Running() != 6 || pending != 0) throw new Exception("did not converge");
+    if (c.Running() != Replicas || pending != 0) throw new Exception("did not converge");
 }
 
-var d = new Cluster(4);
-d.Reconcile(14, spec, "spread");
+var d = new Cluster(Nodes);
+d.Reconcile(ManyReplicas, spec, "spread");
 d.KillNode(0);
-int pend = d.Reconcile(14, spec, "spread");
+int pend = d.Reconcile(ManyReplicas, spec, "spread");
 Console.WriteLine($"14 replicas, 1 node down -> {d.Counts()} (running {d.Running()}, pending {pend})");
-if (d.Running() != 12 || pend != 2) throw new Exception("expected 12 running and 2 pending");
+if (d.Running() != ExpectedRunning || pend != ManyReplicas - ExpectedRunning) throw new Exception("expected 12 running and 2 pending");
 d.Nodes[0].Up = true; // the node comes back
-pend = d.Reconcile(14, spec, "spread");
+pend = d.Reconcile(ManyReplicas, spec, "spread");
 Console.WriteLine($"node back -> {d.Counts()} (running {d.Running()}, pending {pend})");
 d.Check(spec);
 if (pend != 0) throw new Exception("pending pods should have been scheduled");

@@ -6,21 +6,29 @@ using System.Linq;
 
 const int DAYS = 10, ROWS_PER_DAY = 300, RG_ROWS = 100, PAYLOAD = 40;
 string[] COUNTRIES = { "US", "DE", "BRA", "IND", "JPN" };
-ulong seed = 42;
+// Amounts are 0..MAX_AMOUNT-1.
+const int SEED = 42, USER_IDS = 100000, MAX_AMOUNT = 1000;
+const int BITS_PER_BYTE = 8, HEADER_BYTES = 8;
+// Footer: the schema, then offset and stats for every chunk.
+const int FOOTER_SCHEMA_BYTES = 100, CHUNK_META_BYTES = 48, COLUMN_COUNT = 4;
+// Fixed-width fields in the row format.
+const int USER_BYTES = 4, AMOUNT_BYTES = 2;
+ulong seed = SEED;
+// Linear congruential generator (Numerical Recipes constants).
 ulong Next() { seed = (seed * 1664525UL + 1013904223UL) % 4294967296UL; return seed; }
 
 List<Row>[] MakeRows(bool clustered)
 {
-    seed = 42;
+    seed = SEED;
     var byDay = new List<Row>[DAYS];
     for (int d = 0; d < DAYS; d++)
     {
         var rows = new List<Row>();
         for (int i = 0; i < ROWS_PER_DAY; i++)
         {
-            int user = (int)(Next() % 100000);
-            string country = COUNTRIES[Next() % 5];
-            int amount = (int)(Next() % 1000);
+            int user = (int)(Next() % USER_IDS);
+            string country = COUNTRIES[Next() % (ulong)COUNTRIES.Length];
+            int amount = (int)(Next() % MAX_AMOUNT);
             rows.Add(new Row(d, user, country, amount, i));
         }
         if (clustered) rows = rows.OrderBy(r => r.Amount).ThenBy(r => r.I).ToList(); // sort inside the partition
@@ -30,7 +38,7 @@ List<Row>[] MakeRows(bool clustered)
 }
 
 int BitsFor(int range) { int b = 0; while (range > 0) { b++; range /= 2; } return b; }
-int Packed(int n, int bits) => (n * bits + 7) / 8 + 8; // bit-packed values plus an 8-byte header
+int Packed(int n, int bits) => (n * bits + BITS_PER_BYTE - 1) / BITS_PER_BYTE + HEADER_BYTES; // bit-packed values plus an 8-byte header
 
 Chunk Encode(string name, List<int> ints, List<string> strs)
 {
@@ -40,7 +48,7 @@ Chunk Encode(string name, List<int> ints, List<string> strs)
         int dictBytes = dict.Sum(v => v.Length + 1);
         return new Chunk(dictBytes + Packed(strs.Count, BitsFor(dict.Count - 1)), 0, 0);
     }
-    if (name == "payload") return new Chunk(PAYLOAD * ints.Count + 8, 0, 0); // opaque blob, stored plain
+    if (name == "payload") return new Chunk(PAYLOAD * ints.Count + HEADER_BYTES, 0, 0); // opaque blob, stored plain
     int mn = ints.Min(), mx = ints.Max(); // frame of reference: store (value - min) in few bits
     return new Chunk(Packed(ints.Count, BitsFor(mx - mn)), mn, mx);
 }
@@ -60,10 +68,10 @@ File WriteFile(List<Row> rows) // one file per partition, split into row groups,
         };
         groups.Add(new Group(part, chunks));
     }
-    return new File(groups, 100 + 48 * 4 * groups.Count); // schema plus every chunk's offset and stats
+    return new File(groups, FOOTER_SCHEMA_BYTES + CHUNK_META_BYTES * COLUMN_COUNT * groups.Count); // schema plus every chunk's offset and stats
 }
 
-int RowFormatBytes(List<Row> rows) => rows.Sum(r => 4 + 2 + r.Country.Length + 1 + PAYLOAD);
+int RowFormatBytes(List<Row> rows) => rows.Sum(r => USER_BYTES + AMOUNT_BYTES + r.Country.Length + 1 + PAYLOAD);
 
 // SELECT sum(amount) FROM t WHERE day >= fromDay AND amount >= minAmount
 Result Query(File[] files, List<Row>[] byDay, string mode, int fromDay, int minAmount, string[] cols)

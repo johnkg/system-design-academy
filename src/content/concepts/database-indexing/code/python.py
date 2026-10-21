@@ -1,6 +1,7 @@
 # Indexing in Python: a full scan versus a sorted index with binary search.
 
-rows = [{"id": i, "email": f"user{i}@example.com"} for i in range(500_000)]
+ROW_COUNT = 500_000  # rows in the demo table
+rows = [{"id": i, "email": f"user{i}@example.com"} for i in range(ROW_COUNT)]
 
 
 def full_scan(email):  # no index: read rows one by one

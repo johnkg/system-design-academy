@@ -3,6 +3,9 @@
 import { createHmac, timingSafeEqual } from "node:crypto";
 
 const SECRET = "demo-secret-do-not-use-in-production";
+const NOW = 1000; // the demo clock, in seconds
+const EXPIRES_AT = 2000; // when the demo tokens expire
+const AFTER_EXPIRY = 2500;
 const b64 = (text) => Buffer.from(text).toString("base64url");
 const sign = (data) => createHmac("sha256", SECRET).update(data).digest("base64url");
 
@@ -30,7 +33,7 @@ function authorize(claims, action, ownerOfResource) {
   return "200 ok";
 }
 
-function call(label, token, action, owner, now = 1000) {
+function call(label, token, action, owner, now = NOW) {
   try {
     const claims = authenticate(token, now);
     console.log(`${label}: ${authorize(claims, action, owner)} (${claims.sub})`);
@@ -39,14 +42,14 @@ function call(label, token, action, owner, now = 1000) {
   }
 }
 
-const alice = createToken("alice", "customer", 2000);
-const bob = createToken("bob", "admin", 2000);
+const alice = createToken("alice", "customer", EXPIRES_AT);
+const bob = createToken("bob", "admin", EXPIRES_AT);
 
 call("alice reads her order   ", alice, "read-order", "alice");
 call("alice reads bob's order ", alice, "read-order", "bob");
 call("alice lists all users   ", alice, "list-users");
 call("bob lists all users     ", bob, "list-users");
-call("alice, after expiry     ", alice, "read-order", "alice", 2500);
+call("alice, after expiry     ", alice, "read-order", "alice", AFTER_EXPIRY);
 
 // Alice edits her own token to say she is an admin, but she cannot re-sign it
 const [h, , s] = alice.split(".");

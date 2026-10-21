@@ -1,16 +1,21 @@
 // A miniature columnar file writer and reader: partitions, row groups, per-chunk min/max stats and column pruning.
 const DAYS = 10, ROWS_PER_DAY = 300, RG_ROWS = 100, PAYLOAD = 40;
 const COUNTRIES = ["US", "DE", "BRA", "IND", "JPN"];
-let seed = 42;
+const SEED = 42, USER_IDS = 100000, MAX_AMOUNT = 1000; // amounts are 0..MAX_AMOUNT-1
+const BITS_PER_BYTE = 8, HEADER_BYTES = 8;
+const FOOTER_SCHEMA_BYTES = 100, CHUNK_META_BYTES = 48, COLUMN_COUNT = 4; // footer: schema, then offset+stats per chunk
+const USER_BYTES = 4, AMOUNT_BYTES = 2; // fixed-width fields in the row format
+let seed = SEED;
+// Linear congruential generator (Numerical Recipes constants).
 const next = () => (seed = (seed * 1664525 + 1013904223) % 4294967296);
 
 function makeRows(clustered) {
-  seed = 42;
+  seed = SEED;
   const byDay = [];
   for (let d = 0; d < DAYS; d++) {
     const rows = [];
     for (let i = 0; i < ROWS_PER_DAY; i++) {
-      const user = next() % 100000, country = COUNTRIES[next() % 5], amount = next() % 1000;
+      const user = next() % USER_IDS, country = COUNTRIES[next() % COUNTRIES.length], amount = next() % MAX_AMOUNT;
       rows.push({ day: d, user, country, amount, i });
     }
     if (clustered) rows.sort((a, b) => a.amount - b.amount || a.i - b.i); // sort inside the partition
@@ -20,7 +25,7 @@ function makeRows(clustered) {
 }
 
 const bitsFor = (range) => { let b = 0; while (range > 0) { b++; range = Math.floor(range / 2); } return b; };
-const packed = (n, bits) => Math.floor((n * bits + 7) / 8) + 8; // bit-packed values plus an 8-byte header
+const packed = (n, bits) => Math.floor((n * bits + BITS_PER_BYTE - 1) / BITS_PER_BYTE) + HEADER_BYTES; // bit-packed values plus an 8-byte header
 
 function encodeChunk(name, values) {
   const n = values.length;
@@ -29,7 +34,7 @@ function encodeChunk(name, values) {
     const dictBytes = dict.reduce((s, v) => s + v.length + 1, 0);
     return { bytes: dictBytes + packed(n, bitsFor(dict.length - 1)) };
   }
-  if (name === "payload") return { bytes: PAYLOAD * n + 8 }; // opaque blob, stored plain
+  if (name === "payload") return { bytes: PAYLOAD * n + HEADER_BYTES }; // opaque blob, stored plain
   const min = Math.min(...values), max = Math.max(...values); // frame of reference: store (value - min) in few bits
   return { bytes: packed(n, bitsFor(max - min)), min, max };
 }
@@ -41,10 +46,10 @@ function writeFile(rows) { // one file per partition, split into row groups, one
     for (const c of ["user", "country", "amount", "payload"]) chunks[c] = encodeChunk(c, c === "payload" ? part.map(() => 0) : part.map((r) => r[c]));
     groups.push({ rows: part, chunks });
   }
-  return { groups, footer: 100 + 48 * 4 * groups.length }; // the footer holds the schema and every chunk's offset and stats
+  return { groups, footer: FOOTER_SCHEMA_BYTES + CHUNK_META_BYTES * COLUMN_COUNT * groups.length }; // the footer holds the schema and every chunk's offset and stats
 }
 
-const rowFormatBytes = (rows) => rows.reduce((s, r) => s + 4 + 2 + r.country.length + 1 + PAYLOAD, 0);
+const rowFormatBytes = (rows) => rows.reduce((s, r) => s + USER_BYTES + AMOUNT_BYTES + r.country.length + 1 + PAYLOAD, 0);
 
 // SELECT sum(amount) FROM t WHERE day >= fromDay AND amount >= minAmount
 function query(files, byDay, mode, fromDay, minAmount, cols) {

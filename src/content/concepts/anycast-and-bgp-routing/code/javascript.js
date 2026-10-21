@@ -9,13 +9,17 @@ const nbrs = Object.fromEntries(NODES.map((n) => [n, []]));
 for (const [p, c] of CUSTOMER_LINKS) { nbrs[p].push([c, "customer"]); nbrs[c].push([p, "provider"]); }
 for (const [a, b] of PEER_LINKS) { nbrs[a].push([b, "peer"]); nbrs[b].push([a, "peer"]); }
 const LOCAL_PREF = { customer: 200, peer: 100, provider: 50 };
+const OWN_ROUTE_PREF = 1000; // an origin always prefers its own route
+const IPV4_BITS = 32, OCTET_VALUES = 256;
+// The ROA: 192.0.2.0/23 may only be originated by AS 64500, at most 23 bits long.
+const ROA_ORIGIN_ASN = 64500, ROA_MAX_LENGTH = 23;
 
-const ipToInt = (s) => s.split(".").reduce((a, o) => a * 256 + Number(o), 0);
+const ipToInt = (s) => s.split(".").reduce((a, o) => a * OCTET_VALUES + Number(o), 0);
 const covers = (prefix, ip) => {
-  const [net, len] = prefix.split("/"); const d = 2 ** (32 - Number(len));
+  const [net, len] = prefix.split("/"); const d = 2 ** (IPV4_BITS - Number(len));
   return Math.floor(ipToInt(net) / d) === Math.floor(ipToInt(ip) / d);
 };
-const roaOk = (asn, len) => asn === 64500 && len <= 23; // ROA: 192.0.2.0/23, origin 64500, maxLength 23
+const roaOk = (asn, len) => asn === ROA_ORIGIN_ASN && len <= ROA_MAX_LENGTH; // ROA: 192.0.2.0/23, origin 64500, maxLength 23
 
 // Higher local-pref, then shorter AS path, then lowest neighbour AS (stand-in for router ID).
 const better = (a, b) => a.pref !== b.pref ? a.pref > b.pref
@@ -24,7 +28,7 @@ const better = (a, b) => a.pref !== b.pref ? a.pref > b.pref
 // Propagate one prefix to a fixed point. Export rule: customer routes go to everyone, peer/provider routes only to customers.
 function propagate(origins, len, rovNodes) {
   const best = {};
-  for (const o of origins) best[o] = { origin: o, path: [], pref: 1000, via: null, own: true };
+  for (const o of origins) best[o] = { origin: o, path: [], pref: OWN_ROUTE_PREF, via: null, own: true };
   for (let changed = true; changed;) {
     changed = false;
     for (const node of NODES) {

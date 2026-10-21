@@ -8,6 +8,16 @@ using System.Linq;
 const int N = 100000;       // 2 seconds of traffic at 50,000 requests per second
 const int SlowMs = 800;     // tail sampling keeps anything at least this slow
 const uint Seed = 5;
+// Traffic mix, in requests per 100,000: 0.2% errors and 1% slow successes.
+const int Per100k = 100000, ErrorsPer100k = 200, SlowPer100k = 1000;
+const int ErrorMinMs = 1500, ErrorSpreadMs = 2500, SlowSpreadMs = 2200;
+// Fast latency adds three jitter draws.
+const int FastMinMs = 20, FastJitterMs = 60;
+const long HashSpace = 1L << 32; // 32-bit hash values
+const double Z95 = 1.96; // z score for a 95% interval
+const int MaxSeOff = 4; // a count estimate must land within this many standard errors
+const int ServiceRate = 10; // each service on the path samples 1 in this many
+const double BytesPerGb = 1e9;
 CultureInfo.DefaultThreadCurrentCulture = CultureInfo.InvariantCulture;
 CultureInfo.CurrentCulture = CultureInfo.InvariantCulture;
 
@@ -20,7 +30,7 @@ uint Mix(uint x) // 32-bit hash finalizer (murmur3)
         return x ^ (x >> 16);
     }
 }
-bool HeadKeep(uint id, int d, uint salt = 0x9e3779b9u) => (long)Mix(id ^ salt) < 4294967296L / d;
+bool HeadKeep(uint id, int d, uint salt = 0x9e3779b9u) => (long)Mix(id ^ salt) < HashSpace / d;
 bool Interesting(Ev e) => e.Err || e.Ms >= SlowMs;
 
 // Mulberry32 over a captured state.
@@ -38,11 +48,11 @@ uint Rng()
 var stream = new List<Ev>(); // 0.2% errors (slow timeouts), 1% slow successes, the rest fast
 for (int i = 0; i < N; i++)
 {
-    uint id = Rng(), u = Rng() % 100000;
+    uint id = Rng(), u = Rng() % Per100k;
     bool err = false; long ms;
-    if (u < 200) { err = true; ms = 1500 + Rng() % 2500; }
-    else if (u < 1200) ms = SlowMs + Rng() % 2200;
-    else { ms = 20 + Rng() % 60; ms += Rng() % 60; ms += Rng() % 60; }
+    if (u < ErrorsPer100k) { err = true; ms = ErrorMinMs + Rng() % ErrorSpreadMs; }
+    else if (u < ErrorsPer100k + SlowPer100k) ms = SlowMs + Rng() % SlowSpreadMs;
+    else { ms = FastMinMs + Rng() % FastJitterMs; ms += Rng() % FastJitterMs; ms += Rng() % FastJitterMs; }
     stream.Add(new Ev(id, err, ms));
 }
 
@@ -55,7 +65,7 @@ long WeightedQuantile(List<(long ms, long w)> items, int pct) // smallest ms wit
 }
 (double, double) Wilson(int k, int n) // 95% interval for a proportion
 {
-    double z = 1.96, p = (double)k / n, d = 1 + z * z / n;
+    double z = Z95, p = (double)k / n, d = 1 + z * z / n;
     double c = (p + z * z / (2 * n)) / d, h = (z * Math.Sqrt(p * (1 - p) / n + z * z / (4.0 * n * n))) / d;
     return (c - h, c + h);
 }
@@ -77,7 +87,7 @@ Console.WriteLine($"stream: {N} requests, {trueErrors} errors, true p99 {Weighte
     if (tail)
     {
         rate = (double)errsKept / estTotal; // errors are exact, only the denominator is estimated
-        lo = errsKept / (estTotal + 1.96 * se); hi = errsKept / (estTotal - 1.96 * se);
+        lo = errsKept / (estTotal + Z95 * se); hi = errsKept / (estTotal - Z95 * se);
     }
     else
     {
@@ -93,19 +103,19 @@ Console.WriteLine($"stream: {N} requests, {trueErrors} errors, true p99 {Weighte
 foreach (int d in new[] { 1, 10, 100, 1000 })
 {
     var r = Run(d, false);
-    if (Math.Abs(r.estTotal - N) > 4 * r.se) throw new Exception($"head 1/{d} count estimate off");
+    if (Math.Abs(r.estTotal - N) > MaxSeOff * r.se) throw new Exception($"head 1/{d} count estimate off");
     if (d == 1 && r.errsKept != trueErrors) throw new Exception("keep-everything must keep every error");
 }
 foreach (int d in new[] { 10, 100, 1000 })
 {
     var r = Run(d, true);
     if (r.errsKept != trueErrors) throw new Exception("tail sampling lost an error");
-    if (Math.Abs(r.estTotal - N) > 4 * r.se) throw new Exception($"tail 1/{d} count estimate off");
+    if (Math.Abs(r.estTotal - N) > MaxSeOff * r.se) throw new Exception($"tail 1/{d} count estimate off");
 }
 
 // Three services on the request path, each deciding at 1/10.
-int consistent = stream.Count(e => HeadKeep(e.Id, 10) && HeadKeep(e.Id, 10) && HeadKeep(e.Id, 10));
-int independent = stream.Count(e => HeadKeep(e.Id, 10, 1) && HeadKeep(e.Id, 10, 2) && HeadKeep(e.Id, 10, 3));
+int consistent = stream.Count(e => HeadKeep(e.Id, ServiceRate) && HeadKeep(e.Id, ServiceRate) && HeadKeep(e.Id, ServiceRate));
+int independent = stream.Count(e => HeadKeep(e.Id, ServiceRate, 1) && HeadKeep(e.Id, ServiceRate, 2) && HeadKeep(e.Id, ServiceRate, 3));
 Console.WriteLine($"complete traces across 3 services at 1/10: by trace id {consistent}, independent coins {independent}");
 if (consistent <= independent) throw new Exception("consistent sampling must keep more complete traces");
 
@@ -116,7 +126,7 @@ long Series(params string[] names) => names.Aggregate(1L, (p, n) => p * labels[n
 foreach (var names in new[] { new[] { "route", "status" }, new[] { "route", "status", "region" }, new[] { "route", "status", "region", "customer_id" } })
 {
     long s = Series(names);
-    Console.WriteLine($"labels {string.Join("+", names)}: {s} series, {(s * SeriesBytes / 1e9):F2} GB");
+    Console.WriteLine($"labels {string.Join("+", names)}: {s} series, {(s * SeriesBytes / BytesPerGb):F2} GB");
 }
 if (Series("route", "status", "region") != 600) throw new Exception("cardinality is the product");
 Console.WriteLine("ok");

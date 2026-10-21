@@ -4,16 +4,22 @@ using System;
 using System.Collections.Generic;
 
 const int N = 12;
-int AmountOf(int i) => 10 + ((i * 7) % 30);
+const int MIN_AMOUNT = 10, AMOUNT_STEP = 7, AMOUNT_SPREAD = 30; // synthetic amounts: 10..39
+const int RATE_SCALE = 1000; // fault rates are per 1000 attempts
+const int CRASH_BEFORE_UPTO = 30, CRASH_MID_UPTO = 55, CRASH_AFTER_UPTO = 80; // percent cut points; the rest lose the ack
+const int MAX_ATTEMPTS = 50; // redeliveries before a consumer gives up
+const int SEED = 1, FAULT_RATE = 250; // 250 per 1000 = 25 % of attempts fail
+int AmountOf(int i) => MIN_AMOUNT + ((i * AMOUNT_STEP) % AMOUNT_SPREAD);
 
 // Deterministic fault for (message, attempt): the same schedule hits every style. 25 % of attempts fail.
+// Hash (seed, id, attempt) with primes, then mix with 3 rounds of a 32-bit LCG.
 string Fault(int seed, int id, int attempt, int rate)
 {
     uint x = unchecked((uint)seed * 7919u + (uint)id * 104729u + (uint)attempt * 1299709u + 12345u);
     for (int i = 0; i < 3; i++) x = unchecked(x * 1664525u + 1013904223u);
-    if ((x >> 16) % 1000 >= (uint)rate) return "ok";
+    if ((x >> 16) % RATE_SCALE >= (uint)rate) return "ok";
     uint s = (x >> 8) % 100;
-    return s < 30 ? "crashBefore" : s < 55 ? "crashMid" : s < 80 ? "crashAfter" : "lostAck";
+    return s < CRASH_BEFORE_UPTO ? "crashBefore" : s < CRASH_MID_UPTO ? "crashMid" : s < CRASH_AFTER_UPTO ? "crashAfter" : "lostAck";
 }
 
 (int lost, int dupLedger, int dupCard, int ledgerTotal, int cardTotal, int want) Run(string style, int seed, int rate, bool cardKey)
@@ -31,7 +37,7 @@ string Fault(int seed, int id, int attempt, int rate)
             ledger[id]++;
             continue;
         }
-        for (int attempt = 0; attempt < 50; attempt++)
+        for (int attempt = 0; attempt < MAX_ATTEMPTS; attempt++)
         {
             var f = Fault(seed, id, attempt, rate);
             if (f == "crashBefore") continue;                     // redelivered
@@ -61,10 +67,10 @@ void Must(bool c, string m) { if (!c) { Console.Error.WriteLine("FAILED: " + m);
 
 string[] styles = { "ack-before", "ack-after", "idempotent", "transactional" };
 var R = new Dictionary<string, (int lost, int dupLedger, int dupCard, int ledgerTotal, int cardTotal, int want)>();
-foreach (var s in styles) { R[s] = Run(s, 1, 250, false); Show(s, R[s]); }
+foreach (var s in styles) { R[s] = Run(s, SEED, FAULT_RATE, false); Show(s, R[s]); }
 Console.WriteLine("-- card API honours an idempotency key --");
 var K = new Dictionary<string, (int lost, int dupLedger, int dupCard, int ledgerTotal, int cardTotal, int want)>();
-foreach (var s in styles) { K[s] = Run(s, 1, 250, true); Show(s, K[s]); }
+foreach (var s in styles) { K[s] = Run(s, SEED, FAULT_RATE, true); Show(s, K[s]); }
 
 Must(R["ack-before"].lost > 0, "ack-before loses messages");
 Must(R["ack-before"].dupLedger == 0, "ack-before never duplicates");

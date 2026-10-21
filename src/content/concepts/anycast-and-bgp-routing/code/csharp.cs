@@ -14,13 +14,18 @@ var nbrs = nodes.ToDictionary(n => n, n => new List<(string Id, string Rel)>());
 foreach (var (p, c) in customerLinks) { nbrs[p].Add((c, "customer")); nbrs[c].Add((p, "provider")); }
 foreach (var (a, b) in peerLinks) { nbrs[a].Add((b, "peer")); nbrs[b].Add((a, "peer")); }
 var localPref = new Dictionary<string, int> { ["customer"] = 200, ["peer"] = 100, ["provider"] = 50 };
+// An origin always prefers its own route.
+const int OwnRoutePref = 1000;
+const int Ipv4Bits = 32, OctetValues = 256;
+// The ROA: 192.0.2.0/23 may only be originated by AS 64500, at most 23 bits long.
+const int RoaOriginAsn = 64500, RoaMaxLength = 23;
 
-long IpToInt(string s) => s.Split('.').Aggregate(0L, (a, o) => a * 256 + long.Parse(o));
+long IpToInt(string s) => s.Split('.').Aggregate(0L, (a, o) => a * OctetValues + long.Parse(o));
 bool Covers(string prefix, string ip) {
-    var parts = prefix.Split('/'); long d = 1L << (32 - int.Parse(parts[1]));
+    var parts = prefix.Split('/'); long d = 1L << (Ipv4Bits - int.Parse(parts[1]));
     return IpToInt(parts[0]) / d == IpToInt(ip) / d;
 }
-bool RoaOk(int originAsn, int len) => originAsn == 64500 && len <= 23; // ROA: 192.0.2.0/23, origin 64500, maxLength 23
+bool RoaOk(int originAsn, int len) => originAsn == RoaOriginAsn && len <= RoaMaxLength; // ROA: 192.0.2.0/23, origin 64500, maxLength 23
 
 // Higher local-pref, then shorter AS path, then lowest neighbour AS (stand-in for router ID).
 bool Better(Route a, Route b) => a.Pref != b.Pref ? a.Pref > b.Pref
@@ -28,7 +33,7 @@ bool Better(Route a, Route b) => a.Pref != b.Pref ? a.Pref > b.Pref
 
 // Propagate one prefix to a fixed point. Customer routes go to everyone, peer/provider routes only to customers.
 Dictionary<string, Route> Propagate(List<string> origins, int len, List<string> rovNodes) {
-    var best = origins.ToDictionary(o => o, o => new Route(o, new List<int>(), 1000, null, true));
+    var best = origins.ToDictionary(o => o, o => new Route(o, new List<int>(), OwnRoutePref, null, true));
     for (bool changed = true; changed;) {
         changed = false;
         foreach (var node in nodes) {

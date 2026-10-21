@@ -24,6 +24,7 @@ public static class Program
     static readonly Dictionary<string, List<(string O, string R, string S)>> Index = new();
     static string Fmt((string O, string R, string S) t) => $"{t.O}#{t.R}@{t.S}";
 
+    const int DefaultMaxDepth = 8; // hops a check may follow before it gives up
     // Rewrites: viewer = direct + editor + parent->viewer; editor = direct + parent->editor; group member = direct.
     // Every tuple followed costs one hop, and the walk stops at maxDepth, so a cycle or a deep tree cannot run away.
     static List<string>? Walk(string obj, string rel, string user, int used, int maxDepth)
@@ -47,7 +48,7 @@ public static class Program
         }
         return null;
     }
-    static List<string>? Rebac(string user, string act, string doc, int maxDepth = 8) => Walk("doc:" + doc, act == "edit" ? "editor" : "viewer", user, 0, maxDepth);
+    static List<string>? Rebac(string user, string act, string doc, int maxDepth = DefaultMaxDepth) => Walk("doc:" + doc, act == "edit" ? "editor" : "viewer", user, 0, maxDepth);
 
     // ---- RBAC: roles hold (action, pattern); users hold roles ----
     static readonly Dictionary<string, (string Act, string Pat)> Roles = new() {

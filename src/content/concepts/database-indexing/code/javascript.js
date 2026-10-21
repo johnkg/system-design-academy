@@ -1,6 +1,7 @@
 // Indexing in JavaScript: a full scan versus a sorted index with binary search.
 
-const rows = Array.from({ length: 500_000 }, (_, i) => ({ id: i, email: `user${i}@example.com` }));
+const ROW_COUNT = 500_000; // rows in the demo table
+const rows = Array.from({ length: ROW_COUNT }, (_, i) => ({ id: i, email: `user${i}@example.com` }));
 
 function fullScan(email) { // no index: read rows one by one
   let comparisons = 0;

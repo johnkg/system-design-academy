@@ -5,6 +5,7 @@ using System.Collections.Generic;
 using System.Linq;
 
 const int Capacity = 100; // requests per second one warm instance can serve
+const int SecondsPerMinute = 60;
 int targetPercent = 60, warmup = 2, cooldown = 2, min = 2, max = 12;
 
 // Requests per second: quiet, a sharp spike, then a quiet night.
@@ -30,7 +31,7 @@ for (int minute = 0; minute < traffic.Length; minute++)
     int total = ready + warming.Count;
 
     int served = Math.Min(load, ready * Capacity);
-    dropped += (load - served) * 60;
+    dropped += (load - served) * SecondsPerMinute;
     if (load > ready * Capacity) overloaded++;
     instanceMinutes += total; // you pay for instances while they warm up
     peak = Math.Max(peak, total);

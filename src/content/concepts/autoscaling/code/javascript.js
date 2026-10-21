@@ -2,6 +2,7 @@
 // One step is one minute. Everything is integers, so the output is identical in every language.
 
 const CAPACITY = 100; // requests per second one warm instance can serve
+const SECONDS_PER_MINUTE = 60;
 const config = { targetPercent: 60, warmup: 2, cooldown: 2, min: 2, max: 12 };
 
 // Requests per second: quiet, a sharp spike, then a quiet night.
@@ -26,7 +27,7 @@ function run(series, cfg) {
     const total = ready + warming.length;
 
     const served = Math.min(load, ready * CAPACITY);
-    droppedRequests += (load - served) * 60;
+    droppedRequests += (load - served) * SECONDS_PER_MINUTE;
     if (load > ready * CAPACITY) overloadedMinutes++;
     instanceMinutes += total; // you pay for instances while they warm up
     peak = Math.max(peak, total);

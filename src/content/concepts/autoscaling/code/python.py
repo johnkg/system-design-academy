@@ -3,6 +3,7 @@
 import sys
 
 CAPACITY = 100  # requests per second one warm instance can serve
+SECONDS_PER_MINUTE = 60
 config = {"target_percent": 60, "warmup": 2, "cooldown": 2, "min": 2, "max": 12}
 
 # Requests per second: quiet, a sharp spike, then a quiet night.
@@ -29,7 +30,7 @@ def run(series, cfg):
         total = ready + len(warming)
 
         served = min(load, ready * CAPACITY)
-        dropped += (load - served) * 60
+        dropped += (load - served) * SECONDS_PER_MINUTE
         if load > ready * CAPACITY:
             overloaded += 1
         instance_minutes += total  # you pay for instances while they warm up
