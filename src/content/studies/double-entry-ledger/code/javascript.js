@@ -85,7 +85,7 @@ for (const amount of ledger.balances.values()) trial += amount;
 const fees = Array.from({ length: FEE_SHARDS }, (_, k) => ledger.balances.get(`fees#${k}`) ?? 0);
 console.log(`accepted ${count.accepted}, duplicates ignored ${count.duplicates}, rejected unbalanced ${count.unbalanced}, refunds ${count.reversals}`);
 for (const a of ['bank', 'wallet-1', 'wallet-2', 'wallet-3', 'wallet-4', 'merchant']) console.log(`${a}: ${ledger.balances.get(a)}`);
-console.log(`fees: ${ledger.sumOf('fees#')} over 8 shards, each between ${-Math.max(...fees)} and ${-Math.min(...fees)} in credits`);
+console.log(`fees: ${ledger.sumOf('fees#')} over ${FEE_SHARDS} shards, each between ${-Math.max(...fees)} and ${-Math.min(...fees)} in credits`);
 const matches = [...replayed].every(([a, v]) => ledger.balances.get(a) === v) && replayed.size === ledger.balances.size;
 console.log(`trial balance: ${trial}; replay matches balances: ${matches}`);
 if (trial !== 0 || !matches || count.unbalanced === 0 || ledger.entries.length !== count.accepted) process.exit(1);

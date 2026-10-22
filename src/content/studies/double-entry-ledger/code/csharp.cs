@@ -47,7 +47,7 @@ long trial = ledger.Balances.Values.Sum();
 var fees = Enumerable.Range(0, FeeShards).Select(j => ledger.Balances.GetValueOrDefault($"fees#{j}")).ToList();
 Console.WriteLine($"accepted {accepted}, duplicates ignored {duplicates}, rejected unbalanced {unbalanced}, refunds {reversals}");
 foreach (var a in new[] { "bank", "wallet-1", "wallet-2", "wallet-3", "wallet-4", "merchant" }) Console.WriteLine($"{a}: {ledger.Balances[a]}");
-Console.WriteLine($"fees: {ledger.SumOf("fees#")} over 8 shards, each between {-fees.Max()} and {-fees.Min()} in credits");
+Console.WriteLine($"fees: {ledger.SumOf("fees#")} over {FeeShards} shards, each between {-fees.Max()} and {-fees.Min()} in credits");
 bool matches = replayed.Count == ledger.Balances.Count && replayed.All(p => ledger.Balances[p.Key] == p.Value);
 Console.WriteLine($"trial balance: {trial}; replay matches balances: {(matches ? "true" : "false")}");
 if (trial != 0 || !matches || unbalanced == 0 || ledger.Entries.Count != accepted) Environment.Exit(1);

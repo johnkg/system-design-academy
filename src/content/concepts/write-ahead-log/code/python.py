@@ -109,5 +109,4 @@ good = scenario(True)
 assert good == [60, 130, 90, 120], good                           # T1+T2+T3 survive, T4 is gone
 bad = scenario(False)
 assert bad == [60, 80, 90, 120], bad                              # T4's debit leaked: no log record to undo it
-assert sum(bad) == 350 and sum(good) == 400
 print("committed data survived; uncommitted data vanished only with the write-ahead rule")

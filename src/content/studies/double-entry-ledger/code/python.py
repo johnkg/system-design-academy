@@ -113,7 +113,7 @@ fees = [ledger.balances.get(f"fees#{k}", 0) for k in range(FEE_SHARDS)]
 print(f"accepted {count['accepted']}, duplicates ignored {count['duplicates']}, rejected unbalanced {count['unbalanced']}, refunds {count['reversals']}")
 for a in ["bank", "wallet-1", "wallet-2", "wallet-3", "wallet-4", "merchant"]:
     print(f"{a}: {ledger.balances[a]}")
-print(f"fees: {ledger.sum_of('fees#')} over 8 shards, each between {-max(fees)} and {-min(fees)} in credits")
+print(f"fees: {ledger.sum_of('fees#')} over {FEE_SHARDS} shards, each between {-max(fees)} and {-min(fees)} in credits")
 matches = replayed == ledger.balances
 print(f"trial balance: {trial}; replay matches balances: {'true' if matches else 'false'}")
 if trial != 0 or not matches or count["unbalanced"] == 0 or len(ledger.entries) != count["accepted"]:
