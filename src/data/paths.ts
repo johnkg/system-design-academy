@@ -2,17 +2,50 @@
  * Curated learning paths. Every step is a slug that must exist: the Paths page throws at build time on a typo.
  * Order matters: earlier items are the ones later items lean on.
  */
-export interface PathStep { kind: 'concept' | 'pattern' | 'study'; slug: string }
-export interface LearningPath { id: string; title: string; audience: string; blurb: string; steps: PathStep[] }
+export interface PathStep { kind: 'concept' | 'pattern' | 'study'; slug: string; group?: string }
+// maxMinutes is a promise made in the title ("Thirty minutes"): the Paths page throws at build time if the estimated reading time goes over it.
+export interface LearningPath { id: string; title: string; audience: string; blurb: string; steps: PathStep[]; maxMinutes?: number }
 
 const c = (slug: string): PathStep => ({ kind: 'concept', slug });
 const s = (slug: string): PathStep => ({ kind: 'study', slug });
+// Labels a step with the day or stage it belongs to.
+const day = (group: string, ...steps: PathStep[]): PathStep[] => steps.map((st) => ({ ...st, group }));
 
 export const paths: LearningPath[] = [
   {
+    id: 'thirty-minutes',
+    title: 'Thirty minutes to get the idea',
+    audience: 'Start here',
+    blurb: 'Three ideas that sit under almost every large system: keep copies close, share the work, and let a slow job wait in line. Read each page, try its simulation and answer its quiz.',
+    maxMinutes: 30,
+    steps: [c('caching'), c('load-balancing'), c('message-queues')],
+  },
+  {
+    id: 'from-web-developer',
+    title: 'From web developer to system design',
+    audience: 'Start here',
+    blurb: 'You already know requests, browsers and databases. This path starts from what you have seen in the browser and follows a request to the servers, caches and data stores behind it.',
+    steps: [c('latency-and-round-trips'), c('dns'), c('http-caching-headers'), c('caching'), c('cdn'), c('load-balancing'), c('authentication-and-authorization'), c('jwt-and-session-tokens'), c('pagination'), c('database-indexing'), s('url-shortener'), s('photo-sharing')],
+  },
+  {
+    id: 'interview-week',
+    title: 'One week to an interview',
+    audience: 'Start here',
+    blurb: 'A plan for seven short sessions. Four days of building blocks, then complete designs; each step shows how long it takes. On the last day, draw a task on the Mock interview page and explain your design aloud.',
+    steps: [
+      ...day('Day 1', c('load-balancing'), c('caching'), c('database-indexing')),
+      ...day('Day 2', c('database-replication'), c('database-sharding'), c('consistent-hashing')),
+      ...day('Day 3', c('message-queues'), c('delivery-guarantees'), c('idempotency')),
+      ...day('Day 4', c('cap-theorem'), c('consistency-models'), c('rate-limiting')),
+      ...day('Day 5', s('url-shortener'), s('rate-limiter-service')),
+      ...day('Day 6', s('news-feed'), s('chat-system')),
+      ...day('Day 7', s('payment-system')),
+    ],
+  },
+  {
     id: 'interview-foundations',
     title: 'Interview foundations',
-    audience: 'Start here',
+    audience: 'Interview preparation',
     blurb: 'The ten ideas that appear in almost every system design interview, then four classic designs that combine them.',
     steps: [c('load-balancing'), c('caching'), c('database-indexing'), c('database-replication'), c('database-sharding'), c('consistent-hashing'), c('message-queues'), c('cap-theorem'), c('rate-limiting'), c('api-styles'), s('url-shortener'), s('rate-limiter-service'), s('news-feed'), s('chat-system')],
   },

@@ -64,7 +64,7 @@
     {
       "title": "Build each feed ahead of time (fan-out on write)",
       "problem": "Building a feed when it is opened is slow, and feeds are opened far more often than posts are written.",
-      "fix": "When someone publishes, store the post once, then workers look up the author's followers and add the post id to each follower's precomputed feed list, held in a fast in-memory store. Opening the feed is then one cheap read of a list.",
+      "fix": "When someone publishes, store the post once, then workers (background programs) look up the author's followers and add the post id to each follower's precomputed feed list, held in a fast in-memory store. Opening the feed is then one cheap read of a list.",
       "tradeoff": "Reads become fast and flat in cost, whatever the user follows. Each post now causes one write per follower, so work moves from read time to write time, and feed lists cost memory for every active user.",
       "concepts": [{ "slug": "caching" }, { "slug": "pub-sub" }]
     },
@@ -72,7 +72,7 @@
       "title": "Do the fan-out in the background through a queue",
       "problem": "Writing to thousands of feed lists inside the publish request makes posting slow and lets a burst of posts overload the feed store.",
       "fix": "The API saves the post, puts a small job on a queue and acknowledges right away. Fan-out workers consume jobs at their own pace, and more workers can be added when the queue grows.",
-      "tradeoff": "Publishing stays fast and spikes are absorbed by the queue. Followers see the post a few seconds later, so the feed is eventually consistent, and workers must handle a job being delivered twice.",
+      "tradeoff": "Publishing stays fast and spikes are absorbed by the queue. Followers see the post a few seconds later, so the feed is eventually consistent (every copy catches up after a short delay), and workers must handle a job being delivered twice.",
       "concepts": [{ "slug": "message-queues" }, { "slug": "backpressure" }, { "slug": "idempotency" }]
     },
     {
@@ -80,7 +80,7 @@
       "problem": "One post from an account with 20 million followers means 20 million list writes, which takes minutes and swamps the workers.",
       "fix": "Skip fan-out for accounts above a follower threshold. Their posts stay in their own list. When a user opens the feed, the API merges the precomputed list with the latest posts of the few popular accounts that user follows, removing duplicates.",
       "tradeoff": "Posting from huge accounts becomes cheap and fast to reach everyone. Reading costs a little more, since each feed open also pulls from a handful of popular accounts, and two code paths must be kept consistent.",
-      "concepts": [{ "slug": "caching" }, { "slug": "rate-limiting" }]
+      "concepts": [{ "slug": "caching" }, { "slug": "backpressure" }]
     },
     {
       "title": "Store ids in the feed and look up post details from a cache",
@@ -99,7 +99,7 @@
     {
       "title": "Shard the posts and feed stores by user",
       "problem": "Billions of posts and hundreds of millions of feed lists no longer fit on one machine.",
-      "fix": "Partition the posts by author id and the feed lists by the owner's user id, and place them on machines with consistent hashing. Each feed read then touches one shard, and each post lookup is a key lookup on a known shard, with replicas for reads and failover.",
+      "fix": "Partition the posts by author id and the feed lists by the owner's user id, and place them on machines with consistent hashing (a placement rule where adding a machine moves few keys). Each feed read then touches one shard, and each post lookup is a key lookup on a known shard, with replicas for reads and failover.",
       "tradeoff": "Storage and throughput scale by adding machines, and a feed open is a handful of single-shard reads. Queries across authors are no longer possible in the database, and one very popular post can still make a shard hot.",
       "concepts": [{ "slug": "database-sharding" }, { "slug": "consistent-hashing" }, { "slug": "database-replication" }]
     }
@@ -190,12 +190,12 @@
       "explanation": "Pull for a handful of huge accounts at read time costs a small merge per open, while pushing 20 million writes per post is wasteful for any worker count. Ten times the workers is a large bill for a few accounts, and cutting followers off or limiting posts changes the product to hide a design problem."
     },
     {
-      "question": "The feed API sends a few hundred candidate ids to a ranking service. During an incident its p99 rises to 900 ms, while the feed's own target is 500 ms. What should the API do?",
+      "question": "The feed API sends a few hundred candidate ids to a ranking service. During an incident its p99 (the time that 99% of requests beat) rises to 900 ms, while the feed's own target is 500 ms. What should the API do?",
       "options": [
         "Raise the ranking timeout to 1.5 seconds, so that the ranker can finish even on its slowest requests",
         "Return an empty feed with a retry banner until the ranking service is healthy again",
         "Serve each user the last ranked feed they saw, held for up to ten minutes, until ranking recovers",
-        "After a short timeout, return the same candidates newest first"
+        "After a short timeout, drop the ranking and return the same candidates newest first, which stays inside the 500 ms target"
       ],
       "answer": 3,
       "explanation": "Ranking is an improvement on a feed that already exists, so it should degrade to chronological order within the latency budget. A longer timeout breaks the 500 ms target, an empty feed is worse than a plain one, and a ten-minute-old ranked page hides every new post."

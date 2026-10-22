@@ -66,26 +66,26 @@
       "problem": "When a reply is lost, the caller cannot tell a charge that failed from a charge that worked, and a retry or a double-click can charge twice.",
       "fix": "The checkout page makes up a unique key for each payment attempt and sends it with the request. The API saves the key and the payment in its own database before it calls the provider, and passes the same key on to the provider. A repeated request with a known key returns the stored result instead of starting a new charge, and the provider does the same on its side.",
       "tradeoff": "Retrying becomes safe, which makes every other failure easier to handle. The key has to be generated once per attempt and not per click, stored for long enough, and checked against the amount, or a reused key with different details could be mistaken for a repeat.",
-      "concepts": [{ "slug": "idempotency" }, { "slug": "retries-and-backoff" }, { "slug": "api-gateway" }]
+      "concepts": [{ "slug": "idempotency" }, { "slug": "retries-and-backoff" }, { "slug": "delivery-guarantees" }]
     },
     {
       "title": "Model a payment as a state machine and wait for the provider's webhook",
       "problem": "A timeout leaves the outcome unknown, and holding a web request open while a bank decides ties up the server.",
-      "fix": "A payment moves through states: created, processing, then succeeded or failed, with an unknown state after a timeout. Only listed moves are allowed. The API answers 'processing' and the final result arrives as a signed webhook from the provider, which the handler checks and applies with a conditional update. If no webhook comes, a job asks the provider for the payment's status by its key.",
+      "fix": "A payment moves through states: created, processing, then succeeded or failed, with an unknown state after a timeout. Only listed moves are allowed. The API answers 'processing' and the final result arrives as a signed webhook from the provider (a message it sends to our server), which the handler checks and applies with a conditional update (it only applies if the payment is still in the expected state). If no webhook comes, a job asks the provider for the payment's status by its key.",
       "tradeoff": "The server never guesses and never blocks for long, and an unknown outcome is settled by the provider's own record. The customer may see a brief 'processing' screen, webhooks can arrive late, twice or out of order, and each one must be safe to apply again.",
-      "concepts": [{ "slug": "webhooks" }, { "slug": "saga" }, { "slug": "circuit-breaker" }]
+      "concepts": [{ "slug": "webhooks" }, { "slug": "saga" }, { "slug": "timeouts-and-deadlines" }]
     },
     {
       "title": "Record money in an append-only double-entry ledger",
       "problem": "A single 'paid' flag or balance column cannot explain how much was charged, refunded or taken as fees, and edits to it erase the history.",
-      "fix": "Every movement of money writes two ledger entries in one database transaction, a debit on one account and a credit on another for the same amount, such as customer payment against shop revenue. Entries are never edited. A refund is a new pair of entries that reverses part of the old pair. Amounts are whole numbers of the smallest currency unit, never floating-point numbers, and every account's balance is the sum of its entries.",
+      "fix": "Every movement of money writes two ledger entries in one database transaction (all-or-nothing), a debit on one account and a credit on another for the same amount, such as customer payment against shop revenue. Entries are never edited. A refund is a new pair of entries that reverses part of the old pair. Amounts are whole numbers of the smallest currency unit, never floating-point numbers, and every account's balance is the sum of its entries.",
       "tradeoff": "The books always balance, and any number can be traced to the events that made it. Balances need summing or a maintained running total, and a transactional SQL database is the natural home because this is one place where strict ACID guarantees are worth their cost.",
       "concepts": [{ "slug": "acid-vs-base" }, { "slug": "sql-vs-nosql" }, { "slug": "event-sourcing" }]
     },
     {
       "title": "Publish payment events through a transactional outbox",
       "problem": "The order system must hear about every payment result, but telling it directly can fail after the money has already moved.",
-      "fix": "In the same transaction that writes the ledger entries, the service also writes an event row to an outbox table. A relay process reads the outbox and publishes each event to a stream, where the order, email and accounting services consume it. Consumers treat an event they have seen before as a no-op.",
+      "fix": "In the same transaction that writes the ledger entries, the service also writes an event row to an outbox table (events waiting to be published). A relay process reads the outbox and publishes each event to a stream, where the order, email and accounting services consume it. Consumers treat an event they have seen before as a no-op.",
       "tradeoff": "An event is published if and only if the payment was recorded, so nothing is lost and nothing is announced that did not happen. Delivery is at least once, so consumers must be idempotent, and the order may be confirmed a moment after the payment.",
       "concepts": [{ "slug": "transactional-outbox" }, { "slug": "message-queues" }, { "slug": "pub-sub" }]
     },
@@ -99,7 +99,7 @@
     {
       "title": "Keep card data out, and score each payment for fraud",
       "problem": "Handling raw card numbers brings heavy security rules and a very attractive target, and criminals test stolen cards in bulk.",
-      "fix": "The checkout page uses a card form served by the provider, so the card number goes straight to the provider over TLS and the shop only receives a token. The API stores that token, never the number. Each payment is scored for fraud before it is sent, with rate limits per customer, card and address, and risky ones are declined or sent for extra verification. Provider credentials live in a secrets manager.",
+      "fix": "The checkout page uses a card form served by the provider, so the card number goes straight to the provider over an encrypted TLS connection and the shop only receives a token. The API stores that token, never the number. Each payment is scored for fraud before it is sent, with rate limits per customer, card and address, and risky ones are declined or sent for extra verification. Provider credentials live in a secrets manager.",
       "tradeoff": "The shop's systems never hold card numbers, which removes most of the compliance work and the worst breach. The shop depends on the provider's form and tokens, and fraud rules always trade lost sales against lost money.",
       "concepts": [{ "slug": "tls-and-https" }, { "slug": "encryption" }, { "slug": "rate-limiting" }, { "slug": "secrets-management" }]
     }
@@ -135,7 +135,7 @@
       "title": "When the customer learns the result",
       "options": [
         { "name": "Wait for the provider inside the request", "pro": "Simple to build, and the customer sees the result straight away", "con": "Ties up servers, and a timeout leaves the customer with no answer" },
-        { "name": "Answer 'processing' and confirm by webhook", "pro": "Handles slow banks and 3-D Secure steps, and survives timeouts cleanly", "con": "More states and a page that updates itself" }
+        { "name": "Answer 'processing' and confirm by webhook", "pro": "Handles slow banks and 3-D Secure steps (an extra check such as a code sent to the phone), and survives timeouts cleanly", "con": "More states and a page that updates itself" }
       ],
       "pick": "Return quickly and confirm by webhook. A short wait inside the request is fine as long as the webhook remains the source of truth."
     },
@@ -143,7 +143,7 @@
       "title": "How to store balances",
       "options": [
         { "name": "A balance column that is updated", "pro": "Trivial to read and to write", "con": "No history, silent errors, and nothing to check it against" },
-        { "name": "Append-only double-entry ledger", "pro": "Always balances, fully traceable, and refunds and fees are just more entries", "con": "Balances are sums, and the design needs more care up front" },
+        { "name": "Append-only double-entry ledger", "pro": "Always balances, fully traceable, and refunds and fees are more entries", "con": "Balances are sums, and the design needs more care up front" },
         { "name": "A full event-sourced payment history", "pro": "Every state change is kept and can be replayed", "con": "More machinery than most shops need" }
       ],
       "pick": "A double-entry ledger from the first day. It is cheap to add early and very hard to bolt on later."
@@ -162,7 +162,7 @@
       "options": [
         { "name": "One database transaction across both", "pro": "Both happen or neither does", "con": "Only works if they share a database, and not at all with an outside provider" },
         { "name": "Two-phase commit between services", "pro": "Atomic across systems in theory", "con": "Providers do not take part, and a stuck coordinator blocks everything" },
-        { "name": "Events with an outbox and compensating steps", "pro": "Works across services and providers, and recovers from crashes", "con": "The two are briefly out of step, and refunds are separate steps" }
+        { "name": "Events with an outbox and compensating steps (such as a refund that undoes an earlier step)", "pro": "Works across services and providers, and recovers from crashes", "con": "The two are briefly out of step, and refunds are separate steps" }
       ],
       "pick": "Events through an outbox with compensating actions such as refunds. It is the only option that works with an outside provider."
     }
@@ -179,12 +179,12 @@
       "question": "A shop's server calls the payment provider to charge a card, and the call times out after 10 seconds with no reply. The server cannot tell whether the card was charged. What should happen next?",
       "options": [
         "Mark the payment as failed and show an error, so the customer presses Pay again and a new attempt starts with a freshly generated key.",
-        "Retry with the idempotency key saved before the first call, so the provider returns the original charge.",
+        "Retry with the idempotency key that was saved before the first call, so the provider returns the original charge, not a new one.",
         "Wait 30 seconds and send the charge again with a newly generated idempotency key, since a timeout usually means the first request never arrived.",
         "Mark the order as paid right away and let the daily settlement report from the provider correct any charge that did not go through."
       ],
       "answer": 1,
-      "explanation": "The key was saved before the first call, so a retry with it is safe: the provider either returns the charge that already happened or creates it once. A new key makes the retry a second charge and can take the money twice. Marking the payment failed has the same flaw as soon as the customer tries again."
+      "explanation": "The key was saved before the first call, so a retry with it is safe: the provider either returns the charge that already happened or creates it once. A new key makes the retry a second charge and can take the money twice. Marking the payment failed has the same flaw as soon as the customer tries again. Marking the order paid is a guess that ships goods for money that may never arrive."
     },
     {
       "question": "Peak load is 50 payments per second, and assume about half of them need a bank verification step that takes up to 60 seconds. The web tier has 200 worker threads, and each checkout request stays open until the provider answers. What is the right change?",

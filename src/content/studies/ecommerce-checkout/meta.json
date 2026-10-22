@@ -277,34 +277,31 @@
         },
         {
           "slug": "caching"
-        },
-        {
-          "slug": "api-gateway"
         }
       ]
     },
     {
       "title": "Reserve stock with a hold that expires",
       "problem": "Checking the stock and decrementing it are two steps, so two shoppers can both read 1 and both buy it. The opposite fix, taking stock when the item is added to the cart and keeping it until the shopper pays, locks units for as long as the cart lives.",
-      "fix": "A dedicated inventory service owns the stock. Pressing Buy asks it for a reservation, which is a single conditional update such as 'set available = available - 1 where sku = 7 and available >= 1', plus a hold row with an order id and an expiry a few minutes away. The database applies the condition and the decrement together, so the stock cannot go below zero however many requests arrive at once. A repeat of the same request for the same order id finds its hold and changes nothing. When payment succeeds the hold is committed, and if the payment fails, or the shopper walks away, the hold is released, either explicitly or by a sweeper that runs when the expiry passes. The payment call happens outside the transaction.",
+      "fix": "A dedicated inventory service owns the stock. Pressing Buy asks it for a reservation, which is a single conditional update such as 'set available = available - 1 where sku = 7 (a sku is one product line) and available >= 1', plus a hold row with an order id and an expiry a few minutes away. The database applies the condition and the decrement together, so the stock cannot go below zero however many requests arrive at once. A repeat of the same request for the same order id finds its hold and changes nothing. When payment succeeds the hold is committed, and if the payment fails, or the shopper walks away, the hold is released, either explicitly or by a sweeper that runs when the expiry passes. The payment call happens outside the transaction.",
       "tradeoff": "Overselling is impossible, and the units of people who leave come back by themselves. The expiry is a dial: a long one locks stock, so the page may say sold out while units are still held by someone who may never pay. A short one cancels slow but honest payers. A late payer has to try to take a new hold, which can fail if the stock is gone.",
       "concepts": [
         {
           "slug": "acid-vs-base"
         },
         {
-          "slug": "database-indexing"
+          "slug": "optimistic-concurrency-and-etags"
         },
         {
-          "slug": "consistency-models"
+          "slug": "leases-and-fencing-tokens"
         }
       ]
     },
     {
       "title": "Place the order once, and run it as a saga",
       "problem": "The order touches three services that each have their own database, so there is no single transaction. A timeout, a crash or a double click can leave a reserved unit without an order, or a charge without a reservation, and a retry can do each step twice.",
-      "fix": "The checkout page gets an idempotency key when it loads, and sends it with Buy. The order service inserts the order under a unique constraint on that key, so the second request finds the first order and returns it. The order then moves through a state machine driven by a saga: reserve the stock, charge the payment (passing the order id as the payment's own idempotency key), and confirm. Each step has a compensation for the case when a later step fails: a declined card releases the hold, and a refund undoes a charge. The saga persists its state after each step, so a crashed process resumes from where it stopped.",
-      "tradeoff": "No distributed transaction and no locks across services, and each step can be retried safely. The system is only eventually consistent between steps: a reserved unit with no order exists for a moment, compensations must themselves be idempotent and retried until they work, and the design needs a clear order of steps, with the hardest to undo (the charge) after the easy ones.",
+      "fix": "The checkout page gets an idempotency key (a unique id that makes a repeat of the request harmless) when it loads, and sends it with Buy. The order service inserts the order under a unique constraint on that key, so the second request finds the first order and returns it. The order then moves through a state machine driven by a saga (a chain of local steps, each with an undo): reserve the stock, charge the payment (passing the order id as the payment's own idempotency key), and confirm. Each step has a compensation for the case when a later step fails: a declined card releases the hold, and a refund undoes a charge. The saga persists its state after each step, so a crashed process resumes from where it stopped.",
+      "tradeoff": "No distributed transaction and no locks across services, and each step can be retried safely. The services agree only after a short delay (eventual consistency): a reserved unit with no order exists for a moment, compensations must themselves be idempotent and retried until they work, and the design needs a clear order of steps, with the hardest to undo (the charge) after the easy ones.",
       "concepts": [
         {
           "slug": "saga"
@@ -347,7 +344,7 @@
           "slug": "backpressure"
         },
         {
-          "slug": "database-sharding"
+          "slug": "load-shedding"
         }
       ]
     },
@@ -440,7 +437,7 @@
       "answer": "The hold expires after a few minutes and the unit returns to the stock. The waiting room admits the next shopper in line at that moment, and the page only calls the sale sold out once no holds remain. A shorter hold at the payment step keeps the delay small.",
       "concepts": [
         {
-          "slug": "backpressure"
+          "slug": "leases-and-fencing-tokens"
         },
         {
           "slug": "rate-limiting"
@@ -590,7 +587,7 @@
       "question": "A shop runs checkout as one database transaction: read the stock, create the order, call the payment provider, decrement the stock, commit. In a sale, two shoppers both read 'stock = 1' and both orders are confirmed, and the payment call keeps row locks open for seconds. What is the best fix?",
       "options": [
         "Lock the stock row for the whole transaction and raise the lock timeout, so the second shopper waits until the first order and its payment call have finished.",
-        "Reserve with one conditional update (decrement only where available is at least 1) that also writes an expiring hold, and call the payment provider after that transaction commits.",
+        "Reserve with one conditional update that only decrements when stock is left and writes an expiring hold, then call the payment provider after it commits.",
         "Decrement the stock as soon as an item enters the cart, with no expiry, so the unit is already taken before the shopper presses Buy and no read is needed at checkout.",
         "Read the stock a second time just before the commit and abort the order if the value has changed, which closes the window between checking and decrementing."
       ],
@@ -617,7 +614,7 @@
         "Confirm the order anyway and back-order the unit, because the shopper has already paid and the sale must not be lost while stock is chased."
       ],
       "answer": 0,
-      "explanation": "A saga persists its state so it can resume, and the idempotency key makes the repeated charge safe. A refund is the compensation when the unit cannot be re-reserved. A database rollback cannot undo money that already moved at the provider, and back-ordering is only valid if the shop can really supply the unit later."
+      "explanation": "A saga persists its state so it can resume, and the idempotency key makes the repeated charge safe. A refund is the compensation when the unit cannot be re-reserved. Waiting for the authorisation to lapse leaves the shopper charged for days with no order. A database rollback cannot undo money that already moved at the provider, and back-ordering is only valid if the shop can really supply the unit later."
     }
   ]
 }

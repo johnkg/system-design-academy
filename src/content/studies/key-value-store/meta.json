@@ -12,7 +12,7 @@
     "Let each application choose between faster and fresher reads"
   ],
   "nonFunctional": [
-    "Single-digit milliseconds for reads and writes at the 99th percentile",
+    "Reads and writes finish in under 50 ms at the 99th percentile",
     "Always writable: a machine or a network link failing must not stop writes",
     "Scale out by adding machines, with little data moving when machines join or leave",
     "Durable: an acknowledged write survives a machine crash",
@@ -75,30 +75,30 @@
     {
       "title": "Detect conflicting versions and repair stale copies",
       "problem": "Two clients can write the same key at the same time through different coordinators, and a copy that missed a write holds old data.",
-      "fix": "Each value carries version information, such as a vector clock or a timestamp. A read that finds different versions picks the newest one, or returns all concurrent versions for the application to merge, and writes the winner back to the replicas that had old data (read repair). Last-write-wins by timestamp is simple but can drop a concurrent update, so it suits values that can safely be overwritten.",
+      "fix": "Each value carries version information, such as a vector clock (a small counter per writer that shows whether one write came after another or both were made independently) or a timestamp. A read that finds different versions picks the newest one, or returns all concurrent versions for the application to merge, and writes the winner back to the replicas that had old data (read repair). Last-write-wins by timestamp is simple but can drop a concurrent update, so it suits values that can safely be overwritten.",
       "tradeoff": "Conflicts are noticed and resolved rather than silently lost, and hot keys heal themselves as they are read. Vector clocks add size to every value and merging is the application's job, while timestamps rely on clocks that are never perfectly in step.",
-      "concepts": [{ "slug": "logical-clocks" }, { "slug": "consistency-models" }, { "slug": "idempotency" }]
+      "concepts": [{ "slug": "logical-clocks" }, { "slug": "consistency-models" }, { "slug": "crdts" }]
     },
     {
       "title": "Survive failures: gossip, hinted handoff and anti-entropy",
       "problem": "Machines fail, links break and nodes disagree about who is alive, and copies on a node that was down stay out of date until something fixes them.",
       "fix": "Nodes exchange membership and health information by gossip, so every node learns of a failure within seconds without a central coordinator. When a replica is down, the coordinator writes to another node with a hint saying who the data was meant for, and that node hands it over when the replica returns (a sloppy quorum with hinted handoff). In the background, replicas compare Merkle trees, hash trees of their key ranges, to find the keys that differ and copy only those.",
       "tradeoff": "Writes keep succeeding through failures and recovery needs no operator. A sloppy quorum weakens the overlap guarantee for a while, and background repair uses network and disk, so it is rate-limited.",
-      "concepts": [{ "slug": "gossip-protocol" }, { "slug": "health-checks" }, { "slug": "retries-and-backoff" }]
+      "concepts": [{ "slug": "gossip-protocol" }, { "slug": "failure-detection" }, { "slug": "merkle-trees-and-anti-entropy" }]
     },
     {
       "title": "Store data on each node with a log and sorted files",
       "problem": "A hash map in memory is lost on a crash, and random writes to a disk are slow.",
-      "fix": "Each node first appends every write to a commit log on disk, which is fast because it is sequential, and then applies it to a sorted in-memory table. When the table is full it is written out as an immutable sorted file, and a background compaction merges files and drops overwritten values. A read looks in the memory table first and then in the files, using a Bloom filter for each file to skip the ones that cannot hold the key. This design is called a log-structured merge tree.",
+      "fix": "Each node first appends every write to a commit log on disk, which is fast because it is sequential, and then applies it to a sorted in-memory table. When the table is full it is written out as an immutable sorted file, and a background compaction merges files and drops overwritten values. A read looks in the memory table first and then in the files, using a Bloom filter for each file (a small summary that says a key is definitely absent or possibly present) to skip the ones that cannot hold the key. This design is called a log-structured merge tree.",
       "tradeoff": "Writes are very fast and always sequential, and nothing acknowledged is lost on a crash. Reads may touch several files, and compaction uses disk and CPU in the background, so it needs tuning for read-heavy or write-heavy loads.",
-      "concepts": [{ "slug": "database-indexing" }, { "slug": "caching" }, { "slug": "sql-vs-nosql" }]
+      "concepts": [{ "slug": "lsm-trees-vs-b-trees" }, { "slug": "write-ahead-log" }, { "slug": "database-indexing" }]
     }
   ],
   "failures": [
     {
       "scenario": "One node in a key's preference list is down",
       "impact": "A write that needs all N copies would fail, and reads from that node would time out.",
-      "answer": "With N = 3, W = 2 and R = 2 the write is acknowledged by the other two copies and the read is answered by them. The coordinator keeps a hint for the missing node, so it catches up when it returns, and anti-entropy finds anything the hint missed.",
+      "answer": "With N = 3, W = 2 and R = 2 the write is acknowledged by the other two copies and the read is answered by them. Another node keeps a hint for the missing one, so it catches up when it returns, and anti-entropy finds anything the hint missed.",
       "concepts": [{ "slug": "quorums" }, { "slug": "gossip-protocol" }, { "slug": "retries-and-backoff" }]
     },
     {
@@ -167,7 +167,7 @@
         "The new machine is simply empty and every old key stays where it was. A background job that copies keys from the fullest machines to it is all that is needed here."
       ],
       "answer": 1,
-      "explanation": "With hash mod N, going from 10 to 11 machines changes the machine for roughly 10 of every 11 keys. A ring with many virtual nodes per machine moves only about one machine's share of the data. Range partitioning also moves data when ranges are split or rebalanced, so it is not free either."
+      "explanation": "With hash mod N, going from 10 to 11 machines changes the machine for roughly 10 of every 11 keys. A ring with many virtual nodes per machine moves only about one machine's share of the data. Weighting by disk size does not help, because the problem is the mod rule, not the load. Fixed ranges by first letter also give uneven load and still move data when ranges are split. And the old keys do not stay put: lookups now go to the wrong machine until they are copied."
     },
     {
       "question": "A store keeps N = 3 copies of each key. An application needs every read to return the latest acknowledged write, and both reads and writes must keep working while one replica is down. Which setting fits?",
@@ -178,7 +178,7 @@
         "W = 2 and R = 2, so any read set overlaps any write set and two replicas can answer"
       ],
       "answer": 3,
-      "explanation": "W + R must be greater than N for reads to overlap writes, and both W and R must be at most 2 to survive one failure. W = 3 stops all writes when one replica is down, and R = 3 stops all reads. W = 1 with R = 1 can return stale data."
+      "explanation": "W + R must be greater than N for reads to overlap writes, and both W and R must be at most 2 to survive one failure. W = 3 stops all writes when one replica is down, and R = 3 stops all reads. W = 1 with R = 1 can return stale data, because the read may miss the one copy that took the write."
     },
     {
       "question": "During a network partition, a shopping-cart service keeps accepting writes on both sides with W = 1. After the heal, one cart key has two versions: [book] from one side and [pen] from the other. Last-write-wins kept only [pen]. What change prevents this loss?",
@@ -189,7 +189,7 @@
         "Depend on read repair, which copies the newest version over the stale replicas so that every copy of the cart ends up exactly the same"
       ],
       "answer": 0,
-      "explanation": "The two writes were concurrent, so neither is 'last', and a timestamp rule must drop one however good the clocks are. Vector clocks detect the concurrency and give both versions to the application, which knows a cart should be a union. Raising W to 3 would refuse writes during the partition, breaking the always-writable goal."
+      "explanation": "The two writes were concurrent, so neither is 'last', and a timestamp rule must drop one however good the clocks are. Vector clocks detect the concurrency and give both versions to the application, which knows a cart should be a union. Raising W to 3 would refuse writes during the partition, breaking the always-writable goal. Tighter clocks still cannot order writes that were truly concurrent. Read repair copies one winner over the others, so with last-write-wins it would spread the loss, not prevent it."
     }
   ]
 }

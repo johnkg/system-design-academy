@@ -60,7 +60,7 @@
     {
       "title": "Keep the board in a sorted set in memory",
       "problem": "Asking a general database to count millions of rows for every rank is far too slow for something that is looked at after every match.",
-      "fix": "Keep the board in a data structure made for ranking, such as a Redis sorted set, which combines a hash table from player to score with a skip list ordered by score. Updating a player, reading the top 100, finding a player's rank and listing the neighbours are each logarithmic in the number of players, so they take microseconds even with tens of millions of entries. The API reads and writes this structure directly.",
+      "fix": "Keep the board in a data structure made for ranking, such as a Redis sorted set, which combines a hash table from player to score with a skip list (a layered sorted list that can be searched quickly) ordered by score. Updating a player, reading the top 100, finding a player's rank and listing the neighbours are each logarithmic in the number of players, so they take microseconds even with tens of millions of entries. The API reads and writes this structure directly.",
       "tradeoff": "Every operation the leaderboard needs becomes fast and cheap, and the work per request is tiny. It lives in memory, so it must be made durable and rebuilt after a crash, and one machine's memory limits its size.",
       "concepts": [{ "slug": "database-indexing" }, { "slug": "caching" }, { "slug": "sql-vs-nosql" }]
     },
@@ -73,7 +73,7 @@
     },
     {
       "title": "Shard the board, and merge the answers",
-      "problem": "A hundred million entries and tens of thousands of updates per second are more than one machine's memory and CPU can handle.",
+      "problem": "A hundred million players on several boards, with tens of thousands of updates per second, nearly fill one machine's memory and CPU. There is no room to grow and no spare machine if it fails.",
       "fix": "Split the players across shards by a hash of the player id, so each shard holds a sorted set of its own players. An update goes to one shard. The top 100 is found by asking every shard for its own top 100 and merging the lists, because any player in the global top 100 must be in the top 100 of their own shard. A player's exact rank is the sum, over all shards, of the number of players with a better score, and each shard answers that count quickly.",
       "tradeoff": "Memory and write load spread over many machines, and the top list stays exact. A top-100 query now touches every shard and a rank query does too, so it must be parallel and its results cached for a second or two. Asking each shard for fewer than 100 would sometimes give a wrong answer.",
       "concepts": [{ "slug": "database-sharding" }, { "slug": "consistent-hashing" }, { "slug": "load-balancing" }]
@@ -83,7 +83,7 @@
       "problem": "Players want daily and weekly leaderboards that start from zero, and resetting a table of 100 million rows in place would be a huge operation.",
       "fix": "Each time window gets its own sorted sets, named by period, such as 'daily:2026-10-10' and 'weekly:2026-W41'. A score update adds to every board that is currently open. Starting a new period is just starting to use a new, empty key, and old boards are set to expire after a few days or are archived. Seasonal resets work the same way.",
       "tradeoff": "Resets cost nothing, and old boards disappear by themselves. Each update writes to a few boards, so write volume is a small multiple, and rewards at the end of a period need a job that snapshots the final top list before it expires.",
-      "concepts": [{ "slug": "caching" }, { "slug": "pub-sub" }, { "slug": "database-sharding" }]
+      "concepts": [{ "slug": "caching" }, { "slug": "windowing-and-watermarks" }, { "slug": "database-sharding" }]
     },
     {
       "title": "Push changes and build friends boards on demand",
@@ -172,7 +172,7 @@
     {
       "question": "A game keeps scores in one SQL table with an index on score. A player's rank is a count of rows with a higher score. With 100 million players, each rank request takes several seconds, and players reload their rank after every match. What is the best fix?",
       "options": [
-        "Keep the board in an in-memory sorted set with logarithmic update, rank and top-k, backed by the database as the durable source of truth",
+        "Keep the board in an in-memory sorted set (fast update, rank and top-k), with the database as the durable source of truth",
         "Add several read replicas of the SQL table, so that the rank counts for different players are spread over many database machines",
         "Cache each player's rank for five minutes, so that most of the reloads are answered from memory and never reach the database",
         "Store a rank column on each row and refresh it with a batch job that sorts all the players again every few minutes or so"
@@ -185,16 +185,16 @@
       "options": [
         "Nothing is wrong, because hashing spreads players evenly and each shard holds exactly 5 of the global top 100 players",
         "Scores on different shards sit on different scales, so every list has to be normalised before the lists can be merged into one",
-        "The top players may not spread evenly, so one shard could hold 30 of the global top 100. Each shard must return its own top 100.",
+        "The top players may cluster on a few shards, so each shard must return its own top 100",
         "It is accurate enough if each shard returns its top 10 instead, which is double the average share that is really needed"
       ],
       "answer": 2,
-      "explanation": "A hash spreads players evenly on average, not the top players. Any member of the global top 100 must be in the top 100 of its own shard, so asking each shard for 100 is always exact. Asking for fewer can give a wrong answer at the top, where the board must be exact."
+      "explanation": "A hash spreads players evenly on average, not the top players. Any member of the global top 100 must be in the top 100 of its own shard, so asking each shard for 100 is always exact. Asking for fewer can give a wrong answer at the top, where the board must be exact. Scores share one scale, so nothing needs normalising. Top 10 per shard is still too few if one shard holds 30 of the leaders."
     },
     {
-      "question": "Scores are cumulative points. A writer takes each message from an at-least-once queue, does ZINCRBY on the sorted set, then acknowledges. After a crash between the update and the acknowledgement, a match's points are added twice. What is the right fix?",
+      "question": "Scores are cumulative points. A writer takes each message from an at-least-once queue, does ZINCRBY (add points to a score) on the sorted set, then acknowledges. After a crash between the update and the acknowledgement, a match's points are added twice. What is the right fix?",
       "options": [
-        "Have the writer read the current score, add the points and write the total with ZADD, since setting a value twice is harmless",
+        "Have the writer read the current score, add the points and write the total with ZADD (set a score), since setting a value twice is harmless",
         "Give every update a unique id such as the match id, record the applied ids together with the update, and skip any repeat",
         "Configure the queue for exactly-once delivery, so that a message can never reach the writer a second time after it has been sent",
         "Raise the acknowledgement timeout so that the queue does not redeliver a message while the writer is still working on it"

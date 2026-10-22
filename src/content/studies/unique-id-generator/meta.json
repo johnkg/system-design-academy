@@ -63,28 +63,28 @@
     {
       "title": "Generate random UUIDs inside each application",
       "problem": "Asking a server for each ID costs a network round trip, and the servers are still a dependency.",
-      "fix": "Each application creates a 128-bit random UUID on its own, with no network call. With 122 random bits the chance of two UUIDs ever being the same is so small that it can be ignored in practice, and nothing needs to be coordinated.",
+      "fix": "Each application creates a 128-bit random UUID (universally unique identifier) on its own, with no network call. With 122 random bits the chance of two UUIDs ever being the same is so small that it can be ignored in practice, and nothing needs to be coordinated.",
       "tradeoff": "It is simple, local and needs nothing. But 128 bits is twice the size of the key you wanted, the IDs are in no order, and random keys scatter inserts all over a database index, which is slow and wastes space because pages are rewritten constantly.",
       "concepts": [{ "slug": "database-indexing" }, { "slug": "sql-vs-nosql" }, { "slug": "caching" }]
     },
     {
       "title": "Build the ID from time, a machine number and a counter",
       "problem": "We want IDs that are local to generate like UUIDs, but small and sorted like counters.",
-      "fix": "Pack three fields into 64 bits: 41 bits of milliseconds since a custom start date, 10 bits that identify the machine, and 12 bits of sequence that counts the IDs made by that machine within one millisecond. Time makes the numbers grow, the machine bits keep two machines apart even in the same millisecond, and the sequence keeps one machine apart from itself. One machine can make 4,096 IDs per millisecond, over four million a second, and the layout lasts about 69 years.",
+      "fix": "Pack three fields into 64 bits (63 used, plus a sign bit that stays 0 so the number is positive): 41 bits of milliseconds since a custom start date, 10 bits that identify the machine, and 12 bits of sequence that counts the IDs made by that machine within one millisecond. Time makes the numbers grow, the machine bits keep two machines apart even in the same millisecond, and the sequence keeps one machine apart from itself. One machine can make 4,096 IDs per millisecond, over four million a second, and the layout lasts about 69 years.",
       "tradeoff": "IDs are unique without any communication, compact, and sorted by time to the millisecond, which keeps database inserts at the end of the index. They depend on a trustworthy clock and on every machine having its own number, and the time and machine can be read from the ID by anyone.",
-      "concepts": [{ "slug": "logical-clocks" }, { "slug": "database-indexing" }, { "slug": "idempotency" }]
+      "concepts": [{ "slug": "logical-clocks" }, { "slug": "database-indexing" }, { "slug": "lsm-trees-vs-b-trees" }]
     },
     {
       "title": "Give every generator a machine number that no one else has",
       "problem": "If two processes ever run with the same machine number, they will create the same IDs in the same millisecond, and the 'unique' guarantee fails silently.",
-      "fix": "A small coordination service, such as ZooKeeper or etcd, hands out machine numbers. When a generator starts it takes a lease on a free number and keeps renewing it. If it dies, its lease expires and the number goes back to the pool after a safe delay, long enough that its last IDs are in the past. The number is never taken from configuration by hand.",
+      "fix": "A small coordination service, such as ZooKeeper or etcd, hands out machine numbers. When a generator starts it takes a lease on a free number (a claim that runs out unless it is renewed) and keeps renewing it. If it dies, its lease expires and the number goes back to the pool after a safe delay, long enough that its last IDs are in the past. The number is never taken from configuration by hand.",
       "tradeoff": "Duplicate machine numbers become impossible, and instances can come and go freely. Starting up needs the registry, which is the only point where a coordination service is needed, and with 1,024 numbers the fleet size has a limit.",
-      "concepts": [{ "slug": "consensus" }, { "slug": "leader-election" }, { "slug": "health-checks" }]
+      "concepts": [{ "slug": "consensus" }, { "slug": "leases-and-fencing-tokens" }, { "slug": "health-checks" }]
     },
     {
       "title": "Stay safe when clocks misbehave",
       "problem": "Time can go backwards after a clock correction or a leap second, and then a machine could reuse a millisecond it already used and create duplicate IDs.",
-      "fix": "Each generator remembers the last millisecond it used. If the clock shows an earlier time, the generator refuses to issue IDs, or waits until the clock passes the last value, instead of going back. Machines keep their clocks in step with NTP using gradual 'slewing' rather than jumps, and a large clock offset raises an alert and removes the machine from service. If more than 4,096 IDs are needed in one millisecond, the generator waits for the next one.",
+      "fix": "Each generator remembers the last millisecond it used. If the clock shows an earlier time, the generator refuses to issue IDs, or waits until the clock passes the last value, instead of going back. Machines keep their clocks in step with NTP (the protocol that syncs clocks over the network) using gradual 'slewing' (running the clock a little fast or slow to catch up) rather than jumps, and a large clock offset raises an alert and removes the machine from service. If more than 4,096 IDs are needed in one millisecond, the generator waits for the next one.",
       "tradeoff": "A bad clock causes a short pause or an error, and never a duplicate. A machine can stall for as long as its clock was set back, so large jumps are treated as an incident and the instance is replaced.",
       "concepts": [{ "slug": "logical-clocks" }, { "slug": "alerting" }, { "slug": "health-checks" }]
     },
@@ -119,7 +119,7 @@
       "scenario": "An instance crashes and another starts with the same machine number straight away",
       "impact": "The new instance's clock may be earlier than the last millisecond the old one used.",
       "answer": "The registry waits out a safety gap before giving a number to a new owner, and a new generator starts by waiting until its clock is later than the previous lease's last known time, so it can never overlap.",
-      "concepts": [{ "slug": "leader-election" }, { "slug": "logical-clocks" }, { "slug": "idempotency" }]
+      "concepts": [{ "slug": "leases-and-fencing-tokens" }, { "slug": "logical-clocks" }, { "slug": "failure-detection" }]
     }
   ],
   "alternatives": [
@@ -178,18 +178,18 @@
         "Keep the UUIDs but store them as text with a hash index, since a hash index does not depend on key order"
       ],
       "answer": 0,
-      "explanation": "Random keys land on random index pages, so pages are constantly read and rewritten. IDs that grow with time append at the right edge of the index. A random 64-bit key is smaller but just as scattered, and hash indexes lose range scans and ordering."
+      "explanation": "Random keys land on random index pages, so pages are constantly read and rewritten. IDs that grow with time append at the right edge of the index. A random 64-bit key is smaller but just as scattered. More shards leave inserts random inside each shard. Hash indexes lose range scans and ordering."
     },
     {
       "question": "A Snowflake-style generator uses 41 bits of time (about 69 years), 10 bits of machine number and 12 bits of sequence. The fleet will grow to 2,000 generator instances, and each may need 1,500 IDs in a single millisecond. The IDs must still last about 69 years. Which split works?",
       "options": [
-        "41 time, 10 machine, 12 sequence, with two instances sharing a machine number and splitting its sequence range",
+        "41 time, 10 machine, 12 sequence, and let the extra instances reuse machine numbers that are already taken",
         "41 time, 12 machine, 10 sequence, because the fleet is the part that grows and bursts are short",
         "40 time, 11 machine, 12 sequence, taking the extra machine bit from the time field",
         "41 time, 11 machine, 11 sequence, giving 2,048 machines and 2,048 IDs per millisecond each"
       ],
       "answer": 3,
-      "explanation": "Machines need 11 bits for 2,000 numbers and the sequence needs 11 bits for 1,500 IDs per millisecond, which fits exactly in the remaining 22. With 10 sequence bits a busy machine would have to wait for the next millisecond. Taking a bit from time halves the lifetime to about 35 years."
+      "explanation": "Machines need 11 bits for 2,000 numbers and the sequence needs 11 bits for 1,500 IDs per millisecond, which fits exactly in the remaining 22. With 10 sequence bits a busy machine would have to wait for the next millisecond. Taking a bit from time halves the lifetime to about 35 years. Keeping 10 machine bits leaves only 1,024 numbers, and two instances with the same number repeat each other's IDs in the same millisecond."
     },
     {
       "question": "A generator last issued an ID in millisecond T. A time-sync correction sets its clock back, so it now reads T minus 3,000 ms, and it is still running. What should it do?",

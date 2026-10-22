@@ -71,37 +71,37 @@
     {
       "title": "Lease each job to a worker, so a crash brings it back",
       "problem": "A worker can die in the middle of a job, and if the queue has already forgotten the job it is lost for good.",
-      "fix": "When a worker receives a job, the queue does not delete it. It hides the job for a lease period and waits for an acknowledgement. The worker acknowledges after it finishes. If the worker dies, no ack arrives, the lease runs out and the job reappears for another worker. Long jobs renew their lease with a heartbeat so that they are not handed out again while still running.",
+      "fix": "When a worker receives a job, the queue does not delete it. It hides the job for a lease period and waits for an acknowledgement. The worker acknowledges after it finishes. If the worker dies, no ack arrives, the lease runs out and the job reappears for another worker. Long jobs renew their lease with a heartbeat (a small signal sent at intervals) so that they are not handed out again while still running.",
       "tradeoff": "A crash can no longer lose a job. The job may be run again after a worker dies at the wrong moment, so a job can run more than once, which the next step handles. The lease must be long enough for a normal run, or a healthy job gets duplicated.",
       "concepts": [{ "slug": "message-queues" }, { "slug": "retries-and-backoff" }, { "slug": "health-checks" }]
     },
     {
       "title": "Make every job safe to run twice",
-      "problem": "With leases the guarantee is 'at least once', so the same job can start twice and an invoice could be sent twice.",
-      "fix": "Every run is identified by the job id and the scheduled time. Before doing the real work a worker records the run in a table with a unique key on that identifier, or passes the identifier as an idempotency key to the system it calls. A second attempt for the same run finds the record and does nothing. For jobs that must update several things together, the effect and the run record are written in one transaction.",
+      "problem": "With leases the guarantee is 'at least once' (never lost, maybe repeated), so the same job can start twice and an invoice could be sent twice.",
+      "fix": "Every run is identified by the job id and the scheduled time. The worker writes a run record with a unique key on that identifier in the same transaction as the work's effect, or passes the identifier as an idempotency key (a token that makes the other system ignore a repeat) to the system it calls. A second attempt for the same run finds the record and does nothing. Writing the record before the work, in a separate step, would lose the job if the worker crashed in between.",
       "tradeoff": "Duplicate deliveries become harmless, which is much cheaper than trying to guarantee exactly-once delivery. Authors of jobs must design them to be repeatable, and the run records need a retention policy.",
-      "concepts": [{ "slug": "idempotency" }, { "slug": "acid-vs-base" }, { "slug": "transactional-outbox" }]
+      "concepts": [{ "slug": "idempotency" }, { "slug": "delivery-guarantees" }, { "slug": "transactional-outbox" }]
     },
     {
       "title": "Run several schedulers without letting them collide",
       "problem": "A single scheduler is a single point of failure, but two schedulers that both scan the table will queue every job twice.",
-      "fix": "Split the jobs into ranges, for example by a hash of the job id. Each range is owned by one scheduler at a time through a lease kept in a coordination service, and the scheduler renews it regularly. If a scheduler dies, its lease expires and another takes the range. Moving a job to the queue is a conditional update that marks it as queued, so a repeat is rejected.",
+      "fix": "Split the jobs into ranges, for example by a hash of the job id. Each range is owned by one scheduler at a time through a lease kept in a coordination service (a small, highly available store for locks and leases, such as ZooKeeper or etcd), and the scheduler renews it regularly. If a scheduler dies, its lease expires and another takes the range. Moving a job to the queue is a conditional update that marks it as queued, so a repeat is rejected.",
       "tradeoff": "Scheduling is spread across machines and survives failures, and no job is queued twice by two machines. A failover costs a few seconds of delay for the affected range, and the coordination service becomes a dependency of the scheduler.",
-      "concepts": [{ "slug": "leader-election" }, { "slug": "consensus" }, { "slug": "consistent-hashing" }]
+      "concepts": [{ "slug": "leases-and-fencing-tokens" }, { "slug": "consensus" }, { "slug": "consistent-hashing" }]
     },
     {
       "title": "Retry with backoff, and set poison jobs aside",
       "problem": "Some jobs fail because of a temporary problem and should be retried, and others fail every time and will block a worker or loop for ever.",
       "fix": "A failed job is retried after a growing delay with some randomness, such as 10 seconds, then 1 minute, then 10 minutes, up to a maximum number of attempts. A job with a timeout is stopped and counted as failed. After the last attempt it is moved to a dead-letter queue, which raises an alert and keeps the job and its error for a person to look at, fix and replay. A circuit breaker pauses a job type whose target is clearly down.",
       "tradeoff": "Temporary failures heal themselves, permanent ones are visible and cannot jam the system. Retries add load during an outage, which the backoff and the breaker contain, and the dead-letter queue needs someone who looks at it.",
-      "concepts": [{ "slug": "retries-and-backoff" }, { "slug": "circuit-breaker" }, { "slug": "alerting" }]
+      "concepts": [{ "slug": "retries-and-backoff" }, { "slug": "circuit-breaker" }, { "slug": "dead-letter-queues-and-poison-messages" }]
     },
     {
       "title": "Keep tenants fair and scale the workers with the queue",
       "problem": "One team that schedules a million jobs at midnight can fill the queue and make everyone else's jobs late.",
-      "fix": "Each tenant and priority gets its own queue, and workers take from them by weighted round-robin so no tenant can take everything. Per-tenant rate limits and concurrency limits protect both the workers and the systems the jobs call. An autoscaler watches how long jobs wait in the queues and adds or removes workers.",
+      "fix": "Each tenant and priority gets its own queue, and workers take from them by weighted round-robin (taking turns between the queues, with more turns for the more important ones) so no tenant can take everything. Per-tenant rate limits and concurrency limits protect both the workers and the systems the jobs call. An autoscaler watches how long jobs wait in the queues and adds or removes workers.",
       "tradeoff": "A burst from one team slows that team's jobs and no one else's, and capacity follows the load. More queues to run, limits that need to be set sensibly, and some scaling lag during very sharp bursts.",
-      "concepts": [{ "slug": "rate-limiting" }, { "slug": "bulkhead" }, { "slug": "horizontal-vs-vertical-scaling" }]
+      "concepts": [{ "slug": "rate-limiting" }, { "slug": "bulkhead" }, { "slug": "autoscaling" }]
     }
   ],
   "failures": [
@@ -178,8 +178,8 @@
     {
       "question": "A single cron server queues each job when its time comes. To remove the single point of failure, a second identical server is started. Now every job is queued twice. Which design allows several schedulers without duplicates?",
       "options": [
-        "Give each scheduler a range of jobs through a lease, and move a job to the queue with a conditional update that marks it queued",
-        "Start the second server 30 seconds later than the first, so that it finds the jobs already marked as done by then",
+        "Give each scheduler a range of jobs by lease, and mark a job queued with a conditional update",
+        "Start the second server 30 seconds after the first, so it finds the jobs already marked as done",
         "Keep a standby server that takes over when it fails to get a ping answer from the first one for 10 seconds",
         "Have each server read the job, check a running flag, and then set the flag before it puts the job on the queue"
       ],
@@ -202,7 +202,7 @@
       "options": [
         "Autoscale to 1,000 workers so that the whole batch finishes in under two minutes, as the team has asked for",
         "Reject the jobs that arrive beyond what the workers can run in a minute, and tell their owners to schedule them again later today",
-        "Add a jitter window, rate limit the partner calls to 200 per second, and let the queue hold the backlog while workers drain it",
+        "Add jitter, rate limit the partner calls to 200 per second, and let the queue hold the backlog",
         "Let all jobs start at midnight and rely on retry with backoff after the partner answers with rate limit errors"
       ],
       "answer": 2,

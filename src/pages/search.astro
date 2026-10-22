@@ -3,33 +3,37 @@ import { getCollection } from 'astro:content';
 import Layout from '../layouts/Layout.astro';
 import { url } from '../lib';
 import { areaLabel } from '../data/areas';
+import { aliasGroups } from '../data/searchAliases';
 
 // One list of everything on the site, filtered in the browser. Quiz questions are searchable too, so a half-remembered
 // idea ("what happens when the cache expires for everyone at once") still finds its concept.
 const concepts = await getCollection('concepts');
 const patterns = await getCollection('patterns');
 const studies = await getCollection('studies');
-interface Hit { href: string; key: string; kind: string; name: string; intent: string; where: string; level: string; text: string }
+// Each page's searchable text is kept in named sections, so a result can say where the words were found.
+interface Hit { href: string; key: string; kind: string; name: string; intent: string; where: string; level: string; sections: [string, string][] }
 const hits: Hit[] = [
   ...concepts.map((c) => ({
     href: url(`concepts/${c.id}/`), key: `concepts/${c.id}`, kind: 'concept', name: c.data.name, intent: c.data.intent, where: areaLabel(c.data.area), level: c.data.difficulty,
-    text: [c.data.scenario, c.data.problem, ...c.data.pitfalls, ...c.data.whenToUse, ...c.data.howItWorks.map((h) => h.title), ...(c.data.quiz ?? []).map((q) => q.question)].join(' '),
+    sections: [['the scenario', c.data.scenario], ['the problem', c.data.problem], ['how it works', c.data.howItWorks.map((h) => h.title).join(' ')], ['common pitfalls', c.data.pitfalls.join(' ')], ['when to use it', c.data.whenToUse.join(' ')], ['a quiz question', (c.data.quiz ?? []).map((q) => q.question).join(' ')]],
   })),
   ...patterns.map((p) => ({
     href: url(`patterns/${p.id}/`), key: `patterns/${p.id}`, kind: 'pattern', name: p.data.name, intent: p.data.intent, where: `${p.data.category} pattern`, level: p.data.difficulty,
-    text: [p.data.scenario, p.data.problem, ...p.data.pitfalls, ...p.data.whenToUse, 'design pattern'].join(' '),
+    sections: [['the scenario', p.data.scenario], ['the problem', p.data.problem], ['common pitfalls', p.data.pitfalls.join(' ')], ['when to use it', p.data.whenToUse.join(' ')], ['', 'design pattern']],
   })),
   ...studies.map((s) => ({
     href: url(`case-studies/${s.id}/`), key: `studies/${s.id}`, kind: 'study', name: s.data.name, intent: s.data.intent, where: 'Case study', level: s.data.difficulty,
-    text: [s.data.prompt, ...s.data.steps.map((x) => x.title)].join(' '),
+    sections: [['the interview prompt', s.data.prompt], ['the design steps', s.data.steps.map((x) => x.title).join(' ')]],
   })),
 ].sort((a, b) => a.name.localeCompare(b.name));
+// Section texts go to the browser once, in one block, instead of being repeated on every list item.
+const sectionData = JSON.stringify(Object.fromEntries(hits.map((h) => [h.key, h.sections]))).replace(/</g, '\\u003c');
 const kinds = [['all', 'Everything'], ['concept', 'Concepts'], ['pattern', 'Patterns'], ['study', 'Case studies']] as const;
 ---
 <Layout title="Search | System Design Academy" description="Search every concept, design pattern and case study on the site at once.">
   <section class="hero">
     <h1>Search</h1>
-    <p class="lede">Looks through every concept, pattern and case study, including the quiz questions.</p>
+    <p class="lede">Looks through every concept, pattern and case study, including the quiz questions. Everyday words work too: try "login", "duplicate messages" or "slow database".</p>
   </section>
 
   <form class="filters" role="search" data-filters onsubmit="return false">
@@ -45,7 +49,7 @@ const kinds = [['all', 'Everything'], ['concept', 'Concepts'], ['pattern', 'Patt
 
   <ul class="results" data-results>
     {hits.map((h) => (
-      <li data-hit data-kind={h.kind} data-name={h.name.toLowerCase()} data-intent={h.intent.toLowerCase()} data-text={`${h.where} ${h.text}`.toLowerCase()} data-card-key={h.key}>
+      <li data-hit data-kind={h.kind} data-name={h.name.toLowerCase()} data-intent={h.intent.toLowerCase()} data-where={h.where.toLowerCase()} data-key={h.key} data-card-key={h.key}>
         <a href={h.href}>
           <span class="top"><strong>{h.name}</strong> <span class="badge">{h.level}</span></span>
           <span class="where">{h.where}</span>
@@ -55,6 +59,8 @@ const kinds = [['all', 'Everything'], ['concept', 'Concepts'], ['pattern', 'Patt
     ))}
   </ul>
   <p class="empty" data-empty hidden>Nothing matches. Try fewer or simpler words.</p>
+  <script type="application/json" id="search-sections" set:html={sectionData}></script>
+  <script type="application/json" id="search-aliases" set:html={JSON.stringify(aliasGroups)}></script>
 </Layout>
 <script>
   const root = document.querySelector<HTMLElement>('[data-filters]')!;
@@ -69,27 +75,78 @@ const kinds = [['all', 'Everything'], ['concept', 'Concepts'], ['pattern', 'Patt
   const state = { q: params.get('q') ?? '', kind: params.get('type') ?? 'all' };
   input.value = state.q;
 
+  const sections: Record<string, [string, string][]> = JSON.parse(document.getElementById('search-sections')!.textContent!);
+  const aliasGroups: string[][] = JSON.parse(document.getElementById('search-aliases')!.textContent!);
+  const lowered = new Map(items.map((el) => [el, (sections[el.dataset.key!] ?? []).map(([label, text]) => ({ label, text, low: text.toLowerCase() }))]));
+
+  // "queues" and "queue" should find each other, and "caching" should find "cache".
+  const MIN_STEM = 4; // words shorter than this are left alone
+  const stem = (w: string) => {
+    if (w.length <= MIN_STEM) return w;
+    if (w.endsWith('ies')) return `${w.slice(0, -3)}y`;
+    if (w.endsWith('ing') && w.length > MIN_STEM + 2) return w.slice(0, -3);
+    if (w.endsWith('ed') && w.length > MIN_STEM + 1) return w.slice(0, -2);
+    return w.endsWith('s') && !w.endsWith('ss') ? w.slice(0, -1) : w;
+  };
+  // A one-word alias works as a trigger: typing it also searches for everything in its group.
+  const groupsOf = new Map<string, string[][]>();
+  for (const g of aliasGroups) for (const m of g) if (!m.includes(' ')) groupsOf.set(stem(m), [...(groupsOf.get(stem(m)) ?? []), g]);
+  interface Alt { text: string; weight: number }
+  const SYNONYM_WEIGHT = 0.6; // a synonym counts for less than the word that was typed
+  const SYNONYM_SECTIONS = 2; // and is looked for only in the first sections (scenario and problem), not deep in the text
+  function alternatives(word: string): Alt[] {
+    const out = new Map<string, number>([[stem(word), 1]]);
+    for (const g of groupsOf.get(stem(word)) ?? []) for (const m of g) if (!out.has(stem(m))) out.set(stem(m), SYNONYM_WEIGHT);
+    return [...out].map(([text, weight]) => ({ text, weight }));
+  }
+
   // Name matches outrank intent matches, which outrank matches anywhere else; every word must match somewhere.
   const SCORE = { namePrefix: 12, name: 8, intent: 4, text: 1 };
-  function score(el: HTMLElement, words: string[]) {
-    let total = 0;
-    for (const w of words) {
-      if (el.dataset.name!.includes(w)) total += el.dataset.name!.startsWith(w) ? SCORE.namePrefix : SCORE.name;
-      else if (el.dataset.intent!.includes(w)) total += SCORE.intent;
-      else if (el.dataset.text!.includes(w)) total += SCORE.text;
-      else return 0;
+  interface Found { score: number; section?: { label: string; low: string; text: string; at: number; len: number } }
+  function score(el: HTMLElement, words: Alt[][]): Found {
+    let total = 0; let found: Found['section'];
+    for (const alts of words) {
+      let best = 0;
+      for (const { text, weight } of alts) {
+        let s = 0;
+        if (el.dataset.name!.includes(text)) s = el.dataset.name!.startsWith(text) ? SCORE.namePrefix : SCORE.name;
+        else if (el.dataset.intent!.includes(text)) s = SCORE.intent;
+        else if (el.dataset.where!.includes(text)) s = SCORE.text;
+        else for (const [n, sec] of lowered.get(el)!.entries()) {
+          if (weight < 1 && n >= SYNONYM_SECTIONS) break;
+          const at = sec.low.indexOf(text);
+          if (at >= 0) { s = SCORE.text; if (!found && sec.label) found = { ...sec, at, len: text.length }; break; }
+        }
+        best = Math.max(best, s * weight);
+      }
+      if (!best) return { score: 0 };
+      total += best;
     }
-    return total;
+    return { score: total, section: found };
+  }
+
+  // Show where the words were found, with the words marked, when the match is not in the title or the one-line summary.
+  const CONTEXT = 48; // characters kept on each side of the match
+  const wordStart = (t: string, i: number) => { const j = t.lastIndexOf(' ', i); return j < 0 ? 0 : j + 1; };
+  function note(el: HTMLElement, f: Found) {
+    el.querySelector('.found')?.remove();
+    if (!f.section) return;
+    const { label, text, at, len } = f.section;
+    const from = at > CONTEXT ? wordStart(text, at - CONTEXT) : 0, to = Math.min(text.length, at + len + CONTEXT);
+    const p = document.createElement('span'); p.className = 'found';
+    p.append(`In ${label}: ${from > 0 ? '…' : ''}${text.slice(from, at)}`);
+    const mark = document.createElement('mark'); mark.textContent = text.slice(at, at + len); p.append(mark, `${text.slice(at + len, to)}${to < text.length ? '…' : ''}`);
+    el.querySelector('a')!.append(p);
   }
 
   function apply() {
-    const words = state.q.toLowerCase().split(/\s+/).filter(Boolean);
-    const scored = alphabetical.map((el) => ({ el, s: words.length ? score(el, words) : 1 }));
-    const visible = scored.filter(({ el, s }) => s > 0 && (state.kind === 'all' || el.dataset.kind === state.kind));
-    if (words.length) visible.sort((a, b) => b.s - a.s);
+    const words = state.q.toLowerCase().split(/\s+/).filter(Boolean).map(alternatives);
+    const scored = alphabetical.map((el) => ({ el, f: words.length ? score(el, words) : { score: 1 } as Found }));
+    const visible = scored.filter(({ el, f }) => f.score > 0 && (state.kind === 'all' || el.dataset.kind === state.kind));
+    if (words.length) visible.sort((a, b) => b.f.score - a.f.score);
     const shown = new Set(visible.map((v) => v.el));
-    alphabetical.forEach((el) => (el.hidden = !shown.has(el)));
-    visible.forEach(({ el }) => list.appendChild(el));
+    alphabetical.forEach((el) => { el.hidden = !shown.has(el); if (el.hidden) el.querySelector('.found')?.remove(); });
+    visible.forEach(({ el, f }) => { list.appendChild(el); note(el, f); });
     root.querySelectorAll<HTMLElement>('[data-kind]').forEach((b) => b.setAttribute('aria-pressed', String(b.dataset.kind === state.kind)));
     count.textContent = words.length || state.kind !== 'all' ? `${visible.length} result${visible.length === 1 ? '' : 's'}` : `${items.length} pages to search`;
     empty.hidden = visible.length > 0;
@@ -127,4 +184,6 @@ const kinds = [['all', 'Everything'], ['concept', 'Concepts'], ['pattern', 'Patt
   .top { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; }
   .where { color: var(--muted); font-size: .8rem; text-transform: capitalize; }
   .intent { color: var(--muted); font-size: .92rem; }
+  .results :global(.found) { color: var(--muted); font-size: .85rem; border-left: 2px solid var(--border); padding-left: 8px; margin-top: 2px; }
+  .results :global(mark) { background: var(--accent-soft); color: var(--text); border-radius: 3px; padding: 0 2px; }
 </style>

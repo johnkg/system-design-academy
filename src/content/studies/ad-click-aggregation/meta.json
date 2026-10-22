@@ -14,7 +14,7 @@
     "Correct a total after the fact when a late click or a fraud review changes it"
   ],
   "nonFunctional": [
-    "Handle an average of about 6,000 clicks per second, and 20,000 or more at the peak",
+    "Handle an average of about 6,000 clicks per second, and about 17,000 at the peak (three times the average)",
     "Dashboard numbers are fresh within about a minute, and the final billed number may take hours",
     "Never lose a click that the advertiser could be billed for",
     "Billed totals must be accurate, so what is shown quickly may be corrected later",
@@ -213,7 +213,7 @@
     {
       "title": "Write every click to a durable log first",
       "problem": "Counting in the request path ties the endpoint to a database that cannot take the write rate, and a click that is not stored when it arrives is gone for good.",
-      "fix": "A stateless collector validates the click, which carries an id and the time it happened, and appends it to a partitioned, replicated log such as Kafka, keyed by the ad id. It answers as soon as the log has acknowledged the write. Counting now happens behind the log, at its own pace, and the log keeps the raw clicks for days so that anything downstream can be rebuilt by reading it again.",
+      "fix": "A stateless collector validates the click, which carries an id and the time it happened, and appends it to a partitioned, replicated log such as Kafka (an ordered list of messages, split into partitions that many readers can consume), keyed by the ad id. It answers as soon as the log has acknowledged the write. Counting now happens behind the log, at its own pace, and the log keeps the raw clicks for days so that anything downstream can be rebuilt by reading it again.",
       "tradeoff": "The endpoint is fast and a slow or failed counter no longer loses clicks, because the log absorbs the burst. There is a new system to run, and the counts now trail the clicks by a short delay.",
       "concepts": [
         {
@@ -234,10 +234,10 @@
       "tradeoff": "Totals are right by the time of the click, and the store takes a tiny, steady load. The processor now holds state that must survive a restart, and a window cannot be called final while clicks for it may still be on their way.",
       "concepts": [
         {
-          "slug": "database-sharding"
+          "slug": "windowing-and-watermarks"
         },
         {
-          "slug": "caching"
+          "slug": "stateful-stream-processing"
         },
         {
           "slug": "logical-clocks"
@@ -251,27 +251,27 @@
       "tradeoff": "The allowed lateness is a dial between speed and completeness: a short one gives fast but slightly low numbers, and a long one gives complete numbers later. Late corrections mean the dashboard must accept that a shown number can still go up.",
       "concepts": [
         {
+          "slug": "windowing-and-watermarks"
+        },
+        {
           "slug": "logical-clocks"
         },
         {
           "slug": "backpressure"
-        },
-        {
-          "slug": "alerting"
         }
       ]
     },
     {
       "title": "Count each click once with an id",
       "problem": "A phone that gets no reply resends the click, a consumer that crashes re-reads part of the log, and both would count the same click again. Billing cannot tolerate that.",
-      "fix": "Every click has an id that the client side cannot change by retrying, such as a signed token issued when the ad was shown, so all retries carry the same id. The aggregator remembers the ids it has counted, in a store with an expiry just longer than the lateness it accepts, and ignores an id it has seen. Counting is at least once from the log, and the id check, together with checkpoints that save the offsets and the counts together, makes the result behave as if it were exactly once.",
+      "fix": "Every click has an id that the client side cannot change by retrying, such as a signed token issued when the ad was shown, so all retries carry the same id. The aggregator remembers the ids it has counted, in a store with an expiry as long as the corrections it accepts (minutes to hours), and ignores an id it has seen. Counting is at least once from the log, and the id check, together with checkpoints that save the offsets (the positions in the log) and the counts together, makes the result behave as if it were exactly once.",
       "tradeoff": "A duplicate, whether it comes from the network or from replay, is counted at most once. The id store has to hold every id for the retention period, which is a lot of memory at this rate, and a duplicate that arrives after the expiry is counted again.",
       "concepts": [
         {
           "slug": "idempotency"
         },
         {
-          "slug": "retries-and-backoff"
+          "slug": "delivery-guarantees"
         },
         {
           "slug": "two-phase-commit"
@@ -291,7 +291,7 @@
           "slug": "database-sharding"
         },
         {
-          "slug": "load-balancing"
+          "slug": "ordering-and-partitioning"
         }
       ]
     },
@@ -308,7 +308,7 @@
           "slug": "event-sourcing"
         },
         {
-          "slug": "cqrs"
+          "slug": "batch-vs-stream-processing"
         }
       ]
     }
@@ -487,7 +487,7 @@
         "Keep the counters in memory inside each collector and flush them to the database once per minute in a batch"
       ],
       "answer": 0,
-      "explanation": "The log absorbs the burst, and the stream job turns thousands of clicks into one small write per window. Sharding by ad id still sends all 7,000 updates per second to one row on one shard. In-memory counters in the collectors lose every click they hold if a collector dies."
+      "explanation": "The log absorbs the burst, and the stream job turns thousands of clicks into one small write per window. Sharding by ad id still sends all 7,000 updates per second to one row on one shard. In-memory counters in the collectors lose every click they hold if a collector dies. Read replicas do not reduce the write load."
     },
     {
       "question": "A team wants to replace the exact click-id set with a Bloom filter to save memory. Ids are kept for 10 minutes at about 6,000 clicks per second, roughly 3.6 million ids. The filter has a 1 percent false-positive rate and no false negatives. What is right for billed counts?",
@@ -498,7 +498,7 @@
         "Remove the id store and rely on idempotent writes of window totals, which also remove repeated click events"
       ],
       "answer": 2,
-      "explanation": "At 6,000 clicks per second a 1 percent false-positive rate would discard about 60 real clicks every second, and that revenue is lost. An exact set of a few million ids is cheap. Idempotent total writes only protect against repeated writes of the same total, not the same click arriving as two events."
+      "explanation": "At 6,000 clicks per second a 1 percent false-positive rate would discard about 60 real clicks every second, and that revenue is lost. An exact set of a few million ids is cheap. Idempotent total writes only protect against repeated writes of the same total, not the same click arriving as two events. No false negatives is true, but it is the false positives that hurt billing. Rebuilding the filter clears it only for later clicks; the real clicks dropped meanwhile stay lost."
     },
     {
       "question": "The stream processor accepts clicks up to 30 seconds late and remembers click ids for 10 minutes. A mobile network outage ends and delivers one hour of clicks in a burst. Billing comes from the nightly batch recount of the raw archive. What is the best handling in the stream?",
@@ -506,10 +506,10 @@
         "Raise the allowed lateness to one hour for every window, so the whole burst lands in the normal path",
         "Discard the burst, since the dashboard is only an estimate and the nightly batch bills from its own data",
         "Apply every click as an increment straight away, because the log guarantees each click appears only once",
-        "Use a late-events path: increments inside the id retention, archive recount for the older clicks"
+        "Route the burst to a late path, counting recent clicks by id and leaving older ones to the archive recount"
       ],
       "answer": 3,
-      "explanation": "A separate late path protects the live numbers, and the id check still works for clicks younger than the retention. Older clicks cannot be deduplicated safely in the stream, so the recount from the archive settles them. Skipping the id check would double count, because the log delivers at least once."
+      "explanation": "A separate late path protects the live numbers, and the id check still works for clicks younger than the retention. Older clicks cannot be deduplicated safely in the stream, so the recount from the archive settles them. Skipping the id check would double count, because the log delivers at least once. Raising lateness to an hour holds every window open for an hour and delays all numbers. Discarding the burst leaves the dashboard wrong until the batch runs."
     }
   ]
 }

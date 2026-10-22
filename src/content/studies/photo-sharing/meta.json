@@ -232,7 +232,7 @@
       "title": "Process images asynchronously into several sizes",
       "problem": "A 3 MB original is far too big to send to a phone that shows a 150 px thumbnail, and resizing it while the user waits makes uploading slow and fragile.",
       "fix": "When the object is created, the store emits an event onto a queue. Image workers take the job, decode the original, check that it is a real image of a sane size, strip location data, turn it upright, and write 4 sizes (150, 320, 640 and 1080 px) in 2 formats, such as WebP and AVIF, back into storage. The metadata row changes from 'pending' to 'ready' when the common sizes exist. The work is idempotent: a job that runs twice produces the same files with the same names, so retries after a crash are safe. Slow outputs, such as AVIF, can finish later.",
-      "tradeoff": "Uploads return at once, and the number of workers can follow the backlog of the queue instead of the peak of requests. The photo appears a few seconds after the upload, not at the same moment, and a poisoned or oversized image needs a limit on memory and time and a dead-letter queue so that it cannot block everything behind it.",
+      "tradeoff": "Uploads return at once, and the number of workers can follow the backlog of the queue instead of the peak of requests. The photo appears a few seconds after the upload, not at the same moment, and a poisoned or oversized image needs a limit on memory and time and a dead-letter queue (a side queue for jobs that keep failing) so that it cannot block everything behind it.",
       "concepts": [
         {
           "slug": "message-queues"
@@ -241,15 +241,15 @@
           "slug": "idempotency"
         },
         {
-          "slug": "retries-and-backoff"
+          "slug": "dead-letter-queues-and-poison-messages"
         }
       ]
     },
     {
       "title": "Serve every size from a CDN, using names that never change",
       "problem": "Viewers are all over the world, and each photo is looked at thousands of times. Serving each image from one region is slow for most people and expensive for the origin.",
-      "fix": "Put a CDN in front of the storage. The URL of every variant contains the size and a hash of the file's content, such as '/640/9f2c1a.webp', and is sent with 'Cache-Control: public, max-age=31536000, immutable'. A name never refers to different bytes, so a cache can keep it for a year and nothing needs to be refreshed. The app builds the URL from the metadata and chooses a size that fits its screen (the 'srcset' idea). A second cache layer near the origin collapses a million simultaneous misses for a new photo into one request.",
-      "tradeoff": "At a 95% hit ratio, only about 5% of the 2 million requests per second at the peak reach storage, and most users get an image from a nearby node. It costs CDN bandwidth, which is the largest line of the bill, and a cache that is shared between all users can only hold public images. Private photos need signed, short-lived URLs.",
+      "fix": "Put a CDN in front of the storage. The URL of every variant contains the size and a hash of the file's content, such as '/640/9f2c1a.webp', and is sent with 'Cache-Control: public, max-age=31536000, immutable'. A name never refers to different bytes, so a cache can keep it for a year and nothing needs to be refreshed. The app builds the URL from the metadata and chooses a size that fits its screen (the 'srcset' idea: the browser picks the smallest size that fits). A second cache layer near the origin (an origin shield) collapses a million simultaneous misses for a new photo into one request.",
+      "tradeoff": "At a 95% hit ratio (the share of requests answered from cache), only about 5% of the 2 million requests per second at the peak reach storage, and most users get an image from a nearby node. It costs CDN bandwidth, which is the largest line of the bill, and a cache that is shared between all users can only hold public images. Private photos need signed, short-lived URLs.",
       "concepts": [
         {
           "slug": "cdn"
@@ -292,7 +292,7 @@
           "slug": "idempotency"
         },
         {
-          "slug": "backpressure"
+          "slug": "crdts"
         }
       ]
     },
@@ -318,7 +318,7 @@
     {
       "scenario": "An image worker crashes halfway through a photo",
       "impact": "The post stays pending, and the user's photo never appears.",
-      "answer": "The queue hands the job to another worker after a visibility timeout. Because output names come from the content and the job is idempotent, the second run overwrites the partial files with identical ones. After a few failures the job goes to a dead-letter queue and an alert fires. The post moves to 'failed' and the app offers a retry.",
+      "answer": "The queue hands the job to another worker after a visibility timeout (the time a taken job stays hidden from other workers). Because output names come from the content and the job is idempotent, the second run overwrites the partial files with identical ones. After a few failures the job goes to a dead-letter queue and an alert fires. The post moves to 'failed' and the app offers a retry.",
       "concepts": [
         {
           "slug": "message-queues"
@@ -372,10 +372,10 @@
           "slug": "bulkhead"
         },
         {
-          "slug": "message-queues"
+          "slug": "dead-letter-queues-and-poison-messages"
         },
         {
-          "slug": "injection-and-xss"
+          "slug": "timeouts-and-deadlines"
         }
       ]
     }
@@ -504,7 +504,7 @@
       "options": [
         "Autoscale the application servers on open connection count, so more servers share the 300 TB and each one holds fewer slow uploads at a time.",
         "Compress each photo on the phone to under 500 KB before upload, which shrinks the daily volume and shortens every connection.",
-        "Have the API create a pending post and return a signed URL for one object key, with a size limit and about 15 minutes of validity, so the phone sends the bytes straight to object storage in chunks.",
+        "Have the API return a signed URL for one object key, with a size limit and a short life, so the phone uploads straight to object storage in chunks.",
         "Put a dedicated upload service with very large network cards in front of storage, so the main API servers stay free for other requests."
       ],
       "answer": 2,
@@ -524,7 +524,7 @@
     {
       "question": "Photo files are served from a CDN with content-hash names and a one-year immutable cache header. A user switches their account to private, and their photos must stop being visible within minutes. What achieves that?",
       "options": [
-        "Mark the post private so the API stops issuing its URLs, delete the objects, send a CDN purge by path, and use short-lived signed URLs for private variants.",
+        "Mark the post private, stop issuing its URLs, purge the CDN by path, and serve private variants only by short-lived signed URLs.",
         "Generate a new file with a new content-hash name and point the metadata at it, since a changed name makes the old cached copy unreachable for every viewer who asks.",
         "Delete the original objects from storage and rely on the CDN nodes to notice the missing file at their next revalidation.",
         "Lower max-age to 5 minutes on every image, so all cached copies expire quickly and no purge request is needed for deletions."

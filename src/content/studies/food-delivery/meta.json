@@ -212,11 +212,14 @@
     {
       "title": "Make the order a state machine with one owner",
       "problem": "When every app can write any status, orders end up in impossible states, and two people acting at the same moment can both think they won.",
-      "fix": "An order service is the only writer. An order is always in one of these states: placed, accepted, preparing, picked up, delivered or cancelled. A table lists the legal moves, such as placed to accepted and preparing to picked up, and each move has an owner. The restaurant moves it to accepted and preparing, the courier moves it to picked up and delivered, and the customer or a timeout can move it to cancelled, but only before pickup. Every request names the state it expects and carries a version number, and the database applies it only if the version still matches, so two competing changes cannot both succeed. Each accepted change is appended to an event log together with the new state, so the history of an order is never lost.",
+      "fix": "An order service is the only writer. An order is always in one of these states: placed, accepted, preparing, picked up, delivered or cancelled. A table lists the legal moves, such as placed to accepted and preparing to picked up, and each move has an owner. The restaurant moves it to accepted and preparing, the courier moves it to picked up and delivered, and the customer or a timeout can move it to cancelled, but only before pickup, and once cooking has started a cancel is a request that the service may refuse. Every request names the state it expects and carries a version number, and the database applies it only if the version still matches, so two competing changes cannot both succeed. Each accepted change is appended to an event log together with the new state, so the history of an order is never lost.",
       "tradeoff": "Illegal and conflicting changes are impossible, and a dispute can be settled by reading the log. The price is that some taps are refused, so the apps must handle a 'too late, the food is already on its way' answer, and all writes to one order go through one place.",
       "concepts": [
         {
           "slug": "idempotency"
+        },
+        {
+          "slug": "optimistic-concurrency-and-etags"
         },
         {
           "slug": "event-sourcing"
@@ -246,7 +249,7 @@
     {
       "title": "Publish state changes as events, and start dispatch from them",
       "problem": "Dispatch, ETA, payments and notifications all need to react to an order change, and the order service must not be slowed by any of them or lose a change when one of them is down.",
-      "fix": "The order service writes the new state and an 'outbox' record in the same database transaction, and a relay then publishes the record to an event bus. The dispatcher, the ETA service, payments and notifications each read the bus at their own pace. The dispatcher starts looking for a courier when it sees an order accepted, and an event carries the order id and version so a consumer that sees it twice does the work only once.",
+      "fix": "The order service writes the new state and an 'outbox' record in the same database transaction, and a relay then publishes the record to an event bus. The dispatcher, the ETA (estimated time of arrival) service, payments and notifications each read the bus at their own pace. The dispatcher starts looking for a courier when it sees an order accepted, and an event carries the order id and version so a consumer that sees it twice does the work only once.",
       "tradeoff": "The services are decoupled, and a slow consumer cannot hold up an order. Everything downstream now runs a moment behind the truth, and consumers must tolerate repeated and out-of-order events by checking the version.",
       "concepts": [
         {
@@ -263,17 +266,14 @@
     {
       "title": "Dispatch in batches and assign globally, not nearest-first",
       "problem": "Sending the nearest free courier the instant each order arrives wastes couriers: they stand at the counter while the food is cooked, one courier takes a far trip that another could do on the way, and no courier ever carries two orders.",
-      "fix": "The dispatcher collects orders for a short window, from a few seconds up to a minute or two, and then decides all of them together. It builds a table of the cost of every courier for every order that is due, where the cost adds the time the food will wait for the courier, the time the courier will wait for the food, and the distance, and it solves the assignment problem for the whole table, with a method such as the Hungarian algorithm. Orders are due when the time left until the food is ready is about the courier's travel time, so the courier arrives as the food does. Orders from nearby restaurants to nearby customers can be paired onto one courier when the detour is small. Couriers who are about to finish a delivery can be assigned too. Dispatchers are partitioned by city zone, so each decision involves hundreds of couriers rather than the whole country.",
+      "fix": "The dispatcher collects orders for a short window, from a few seconds up to a minute or two, and then decides all of them together. It builds a table of the cost of every courier for every order that is due, where the cost adds the time the food will wait for the courier, the time the courier will wait for the food, and the distance, and it solves the assignment problem for the whole table (finding the cheapest pairing of couriers to orders), with a method such as the Hungarian algorithm. Orders are due when the time left until the food is ready is about the courier's travel time, so the courier arrives as the food does. Orders from nearby restaurants to nearby customers can be paired onto one courier when the detour is small. Couriers who are about to finish a delivery can be assigned too. Dispatchers are partitioned by city zone, so each decision involves hundreds of couriers rather than the whole country.",
       "tradeoff": "Couriers wait less, food is fresher and fewer couriers handle more orders, especially when couriers are scarce. A short window delays each decision slightly, pairing makes the first order of a pair wait for the second pickup, and the solver and its cost weights need tuning and monitoring.",
       "concepts": [
         {
-          "slug": "leader-election"
+          "slug": "ordering-and-partitioning"
         },
         {
           "slug": "database-sharding"
-        },
-        {
-          "slug": "backpressure"
         }
       ]
     },
@@ -304,10 +304,10 @@
           "slug": "rate-limiting"
         },
         {
-          "slug": "backpressure"
+          "slug": "load-shedding"
         },
         {
-          "slug": "alerting"
+          "slug": "graceful-degradation"
         }
       ]
     }
@@ -316,7 +316,7 @@
     {
       "scenario": "The restaurant tablet goes offline after an order is placed",
       "impact": "The order sits in placed, the customer has paid, and nobody is cooking.",
-      "answer": "An order must be accepted within a short deadline, such as two minutes, and a timer on the order service moves it to cancelled when the deadline passes, which voids the payment authorisation. The tablet sends a heartbeat, so a kitchen that has gone quiet is paused in the menu before it receives more orders, and a phone call or text is tried before the cancel.",
+      "answer": "An order must be accepted within a short deadline, such as two minutes, and a timer on the order service moves it to cancelled when the deadline passes, which voids the payment authorisation. The tablet sends a heartbeat (a regular \"I am alive\" signal), so a kitchen that has gone quiet is paused in the menu before it receives more orders, and a phone call or text is tried before the cancel.",
       "concepts": [
         {
           "slug": "health-checks"
@@ -507,20 +507,20 @@
     {
       "question": "A restaurant says the food will be ready 14 minutes after it accepts, and the nearest free courier is 6 minutes away from the restaurant. The goal is that neither the courier nor the food waits. When should the courier be sent?",
       "options": [
-        "8 minutes after acceptance, which is the ready time minus the travel time.",
+        "8 minutes after acceptance, so the courier reaches the counter just as the food comes out.",
         "Immediately on acceptance, for the shortest search time.",
         "11 minutes after acceptance, halfway between sending at once and sending at ready time.",
         "14 minutes after acceptance, when the food is ready, so the courier never arrives early."
       ],
       "answer": 0,
-      "explanation": "Sent at 8 minutes, the courier arrives at 14, exactly as the food is ready. Sent immediately, the courier arrives at 6 and stands at the counter for 8 minutes. Sent at 14, the courier arrives at 20 and the food sits cooling for 6 minutes. The estimate must be adjusted by how accurate that kitchen has been."
+      "explanation": "Sent at 8 minutes, the courier arrives at 14, exactly as the food is ready. Sent immediately, the courier arrives at 6 and stands at the counter for 8 minutes. Sent at 11, the courier arrives at 17 and the food sits cooling for 3 minutes. Sent at 14, the courier arrives at 20 and the food sits cooling for 6 minutes. The estimate must be adjusted by how accurate that kitchen has been."
     },
     {
       "question": "At the lunch peak, orders triple, a third of couriers are busy, and several kitchens are falling behind. Which response keeps orders honest and avoids dropping them?",
       "options": [
         "Assign the nearest free courier the instant each order arrives, to keep decision time as low as possible.",
         "Keep the 30-minute promise and cancel automatically any order that the system can already see will be late.",
-        "Quote longer prep times and pause new orders at the busiest kitchens, widen the dispatch window and allow more two-order trips, and raise courier pay in the zone.",
+        "Quote longer prep times and pause new orders at the busiest kitchens, allow more two-order trips, and raise courier pay in the zone.",
         "Close ordering for the whole city once couriers run short and reopen it after the peak has passed."
       ],
       "answer": 2,

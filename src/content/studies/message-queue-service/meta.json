@@ -217,7 +217,7 @@
     {
       "title": "Keep messages in an append-only log, and let readers track their own position",
       "problem": "A queue that deletes each message when it is read can be read only once, and the random bookkeeping of removing individual messages is slow.",
-      "fix": "Store a topic's messages as a log: new records are only ever added at the end, and each gets the next number, its offset. The log is cut into segment files of, say, 1 GB. Only the newest segment is written, so every write is sequential, which disks and the operating system do very fast. A sparse index per segment maps some offsets to file positions, so reading from any offset is one lookup and then a sequential scan. Nothing is deleted when it is read. A consumer simply remembers the offset it has reached, and it can rewind to replay. Reads of recent data come from the operating system's page cache, and the bytes can go from cache to network without being copied through the application.",
+      "fix": "Store a topic's messages as a log: new records are only ever added at the end, and each gets the next number, its offset. The log is cut into segment files of, say, 1 GB. Only the newest segment is written, so every write is sequential, which disks and the operating system do very fast. A sparse index per segment maps some offsets to file positions, so reading from any offset is one lookup and then a sequential scan. Nothing is deleted when it is read. A consumer simply remembers the offset it has reached, and it can rewind to replay. Reads of recent data come from the operating system's page cache (memory it uses to keep recently used files), and the bytes can go from cache to network without being copied through the application.",
       "tradeoff": "Writes and reads are sequential and cheap, many readers cost almost nothing, and replay is free. The broker cannot reorder, skip or remove one message, a consumer must keep its own position, and old data only goes away by deleting whole segments.",
       "concepts": [
         {
@@ -271,7 +271,7 @@
     {
       "title": "Share a topic's work with consumer groups and committed offsets",
       "problem": "Several consumers should split the work of one topic, each application should see every record, and a restarted consumer must find where it left off.",
-      "fix": "Consumers join a named group. A group coordinator, which is a broker, gives each partition to exactly one member of the group, so each record is processed by one member of each group, and different groups read independently. Consumers pull records in batches from the leader, which lets a slow consumer fall behind without affecting anyone else. A group records its progress by committing offsets into an internal compacted topic. When a member joins, leaves or stops sending heartbeats, the group rebalances and the partitions are redistributed. The new owner continues from the last committed offset.",
+      "fix": "Consumers join a named group. A group coordinator, which is a broker, gives each partition to exactly one member of the group, so each record is processed by one member of each group, and different groups read independently. Consumers pull records in batches from the leader, which lets a slow consumer fall behind without affecting anyone else. A group records its progress by committing offsets into an internal compacted topic (one that keeps only the newest record for each key). When a member joins, leaves or stops sending heartbeats (regular alive signals), the group rebalances and the partitions are redistributed. The new owner continues from the last committed offset.",
       "tradeoff": "Work is shared, and every group has its own view of the same data. Where the commit goes decides the failure mode: committing after processing may repeat messages after a crash (at least once), and committing before may skip them (at most once). Rebalances pause consumption, and a consumer that is too slow to poll is removed from the group, which causes yet another rebalance.",
       "concepts": [
         {
@@ -284,7 +284,7 @@
           "slug": "idempotency"
         },
         {
-          "slug": "backpressure"
+          "slug": "delivery-guarantees"
         }
       ]
     },
@@ -295,20 +295,17 @@
       "tradeoff": "Disk use is bounded and predictable, and compaction gives a table-like topic. A consumer that falls behind by more than the retention loses the records it had not read. Deleting by segment means records live somewhat longer than the limit, and reads from cold storage are slower.",
       "concepts": [
         {
+          "slug": "lsm-trees-vs-b-trees"
+        },
+        {
           "slug": "event-sourcing"
-        },
-        {
-          "slug": "caching"
-        },
-        {
-          "slug": "slos-and-error-budgets"
         }
       ]
     },
     {
       "title": "Run a controller quorum, and make producers safe to retry",
       "problem": "Someone has to decide which broker leads which partition and who is in sync, and a producer that retries after a lost acknowledgement writes the record twice.",
-      "fix": "A small group of controller nodes agrees on the cluster's metadata, which is the topics, the partitions, each leader and each in-sync set, using a consensus log. When a broker fails, the controller picks new leaders from the in-sync replicas, and clients refresh their cached metadata. Producers are made idempotent: each has an id and numbers its records per partition, so the leader recognises a retried record by its sequence number and drops it. Transactions on top of this write to several partitions atomically. The cluster is watched by metrics such as under-replicated partitions and consumer lag.",
+      "fix": "A small group of controller nodes agrees on the cluster's metadata, which is the topics, the partitions, each leader and each in-sync set, using a consensus log. When a broker fails, the controller picks new leaders from the in-sync replicas, and clients refresh their cached metadata. Producers are made idempotent: each has an id and numbers its records per partition, so the leader recognises a retried record by its sequence number and drops it. Transactions on top of this write to several partitions atomically. The cluster is watched by metrics such as under-replicated partitions (partitions with fewer in-sync copies than planned) and consumer lag (how far consumers are behind).",
       "tradeoff": "Failover takes seconds, retries cannot create duplicates inside the log, and the cluster is observable. A controller quorum is more to operate, a transaction costs extra coordination, and exactly-once is only true for the data inside the log: an effect on an outside system still needs an idempotent consumer.",
       "concepts": [
         {
@@ -319,6 +316,9 @@
         },
         {
           "slug": "idempotency"
+        },
+        {
+          "slug": "delivery-guarantees"
         },
         {
           "slug": "metrics"
@@ -378,7 +378,7 @@
     {
       "scenario": "One key is far hotter than the others",
       "impact": "All of its records hash to one partition, so one leader and one consumer are overloaded while the rest are idle.",
-      "answer": "Make the key finer if the order only has to hold for something smaller, such as the order and not the whole customer. For the few keys that remain hot, add a salt to the key and merge afterwards, accepting that order within that key is lost. Watching the per-partition rates shows the problem early.",
+      "answer": "Make the key finer if the order only has to hold for something smaller, such as the order and not the whole customer. For the few keys that remain hot, add a salt (a small random suffix) to the key and merge afterwards, accepting that order within that key is lost. Watching the per-partition rates shows the problem early.",
       "concepts": [
         {
           "slug": "database-sharding"
@@ -521,18 +521,18 @@
         "Keep each topic as an append-only log with time-based retention, and give every consumer group its own committed offset per partition"
       ],
       "answer": 3,
-      "explanation": "A log keeps records after they are read, and each group's offset is just a number it stores, so replay and extra readers cost almost nothing. A second queue per application cannot replay events that were already deleted, and a done flag turns every read into random writes on disk."
+      "explanation": "A log keeps records after they are read, and each group's offset is just a number it stores, so replay and extra readers cost almost nothing. A second queue per application cannot replay events that were already deleted, a done flag turns every read into random writes on disk, and holding messages in memory for 3 days needs far more memory than a disk log and loses them when the broker restarts."
     },
     {
-      "question": "A topic has 3 replicas and producers use acks=all, but the minimum in-sync replicas is left at 1. Both followers stall on a disk problem and drop out of the in-sync set for 10 minutes, while the leader keeps acknowledging writes. Then the leader's machine dies. What happens to the records acknowledged in those 10 minutes?",
+      "question": "A topic has 3 replicas and producers use acks=all, but the minimum in-sync replicas is left at 1. Both followers stall on a disk problem and drop out of the in-sync set for 10 minutes, while the leader keeps acknowledging writes. Then the leader's machine is destroyed, disk included. What happens to the records acknowledged in those 10 minutes?",
       "options": [
         "They are lost, because the in-sync set was only the leader, so acks=all was as weak as acks=1; a minimum of 2 would have refused the writes",
         "They are safe, because acks=all means all 3 replicas wrote each record before the producer received its acknowledgement",
         "They are safe, because the controller rebuilds the missing records on the new leader from the producers' idempotent sequence numbers",
-        "They are lost only for keyless records, because keyed records are copied to every follower of the partition before they are acknowledged"
+        "They are safe, because acks=all needs a majority of the 3 replicas, so at least two brokers held every acknowledged record"
       ],
       "answer": 0,
-      "explanation": "acks=all waits for the in-sync replicas, and with only the leader in sync that is a single copy. Setting the minimum in-sync replicas to 2 makes the partition refuse writes instead, trading availability for safety. Idempotent sequence numbers only drop duplicate retries, they cannot recreate data that was never copied."
+      "explanation": "acks=all waits for the in-sync replicas, not for all replicas or a majority of them, and with only the leader in sync that is a single copy. Setting the minimum in-sync replicas to 2 makes the partition refuse writes instead, trading availability for safety. Idempotent sequence numbers only drop duplicate retries, they cannot recreate data that was never copied."
     },
     {
       "question": "A group of 4 consumers shares 12 partitions. Each poll returns up to 500 records, and processing a full batch takes about 6 minutes, but the poll timeout is 5 minutes. Members keep being removed, the group rebalances again and again, and the same batches get processed twice. Which change fixes the cause?",
@@ -543,7 +543,7 @@
         "Add 4 more consumers to the group, so that each member gets fewer partitions and the batches shrink on their own"
       ],
       "answer": 0,
-      "explanation": "The member is removed because it does not poll again in time, so the work per poll must shrink, and since repeats are normal after a rebalance the processing has to be idempotent. Committing before processing would turn repeats into lost records, and adding partitions or members only causes more rebalances."
+      "explanation": "The member is removed because it does not poll again in time, so the work per poll must shrink, and since repeats are normal after a rebalance the processing has to be idempotent. Committing before processing would turn repeats into lost records, and adding partitions or members does not shrink a poll, which still returns up to 500 records, and each new member triggers another rebalance."
     }
   ]
 }

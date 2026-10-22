@@ -66,7 +66,7 @@
       "problem": "Read-then-write lets two buyers both see a free seat and both take it, and without a hold a seat can be lost between choosing it and paying.",
       "fix": "A booking service claims a seat with one conditional update that checks and changes it in the same step: set the holder and an expiry time only if the seat is free or its hold has run out. The database guarantees only one of two simultaneous claims succeeds, and the loser is told at once. A hold lasts a few minutes, and only the holder can confirm it with a payment before it expires.",
       "tradeoff": "A seat can never be given to two people, and fans get a fair window to pay. Holds take seats off the market while fans hesitate or abandon, and a hold's length is a balance between fans who need time and seats that sit empty.",
-      "concepts": [{ "slug": "acid-vs-base" }, { "slug": "consistency-models" }, { "slug": "idempotency" }]
+      "concepts": [{ "slug": "acid-vs-base" }, { "slug": "consistency-models" }, { "slug": "leases-and-fencing-tokens" }]
     },
     {
       "title": "Serve browsing from caches, keep buying exact",
@@ -78,21 +78,21 @@
     {
       "title": "Put a waiting room in front of the booking service",
       "problem": "A million fans arriving at once is far more than the booking service can process, and letting them all in makes it slow for everyone.",
-      "fix": "A virtual waiting room sits in front of the sale. Fans who arrive before the on-sale are given a random place in the queue, not a first-come one, so being early or fast on the network does not matter. After the sale opens the queue lets people through at a fixed rate that the booking service can handle, with each admitted fan holding a signed token for a limited time. Everyone else sees their position and waits.",
+      "fix": "A virtual waiting room sits in front of the sale. Fans who arrive before the on-sale are given a random place in the queue, not a first-come one, so being early or fast on the network does not matter. After the sale opens the queue lets people through at a fixed rate that the booking service can handle, with each admitted fan holding a signed token (a pass the booking service can check without a database lookup) for a limited time. Everyone else sees their position and waits.",
       "tradeoff": "The booking service sees a steady, safe load however big the crowd is, and the experience is fair and orderly. Fans wait, which is annoying but better than errors, and the waiting room itself must be built to carry a huge crowd cheaply, mostly with static pages and signed tokens.",
       "concepts": [{ "slug": "rate-limiting" }, { "slug": "backpressure" }, { "slug": "message-queues" }]
     },
     {
       "title": "Run purchase as a series of steps that can be undone",
       "problem": "Payment is slow and can fail, so the seat must stay held during it, and a payment that succeeds when the hold has already expired must not leave the fan charged without a seat.",
-      "fix": "The purchase is a small workflow: hold the seat, create a payment, confirm the payment with the provider, then turn the hold into a sale. Each step is idempotent and carries the order's id. If payment fails or the hold expires, the workflow releases the seat. If the money arrives after the hold expired and the seat was sold to someone else, it is refunded automatically. A background job releases expired holds and puts those seats back on sale.",
+      "fix": "The purchase is a small workflow: hold the seat, create a payment, confirm the payment with the provider, then turn the hold into a sale. Each step is idempotent (safe to repeat) and carries the order's id, so a retry does not charge or sell twice. If payment fails or the hold expires, the workflow releases the seat. If the money arrives after the hold expired and the seat was sold to someone else, it is refunded automatically. A background job releases expired holds and puts those seats back on sale.",
       "tradeoff": "Seats and money are never left in an inconsistent state, even through crashes, and failed purchases return their seats to the pool. There are more states to design and test, and the refund path must be reliable.",
       "concepts": [{ "slug": "saga" }, { "slug": "idempotency" }, { "slug": "transactional-outbox" }]
     },
     {
       "title": "Give every event its own partition",
       "problem": "One very popular event can overload a shared database and slow down ticket sales for every other event.",
-      "fix": "Partition the data by event, so that all the seats, holds and orders of one event live together and one event's sale runs on its own database or shard. Large on-sales can be given dedicated capacity ahead of time, and a hot event cannot take resources from the rest of the catalogue. All the checks that matter happen inside one partition, so they stay simple transactions.",
+      "fix": "Partition the data by event (each event gets its own slice of the database), so that all the seats, holds and orders of one event live together and one event's sale runs on its own database or shard. Large on-sales can be given dedicated capacity ahead of time, and a hot event cannot take resources from the rest of the catalogue. All the checks that matter happen inside one partition, so they stay simple transactions.",
       "tradeoff": "A flood for one event stays contained and every claim remains a single-partition transaction. A single enormous event is still limited by one partition, so its seats may need to be split by section, and partitions need to be created and sized before a sale.",
       "concepts": [{ "slug": "database-sharding" }, { "slug": "bulkhead" }, { "slug": "load-balancing" }]
     },
@@ -109,7 +109,7 @@
       "scenario": "Two fans click the same seat in the same millisecond",
       "impact": "Both read it as free, and without protection both would be told they have it.",
       "answer": "The claim is a single conditional update in the database, so exactly one succeeds. The other is told at once that the seat was just taken and sees the map update, and both are told the truth.",
-      "concepts": [{ "slug": "acid-vs-base" }, { "slug": "consistency-models" }, { "slug": "idempotency" }]
+      "concepts": [{ "slug": "acid-vs-base" }, { "slug": "consistency-models" }, { "slug": "optimistic-concurrency-and-etags" }]
     },
     {
       "scenario": "A fan pays, but the booking service crashes before it turns the hold into a sale",
@@ -197,7 +197,7 @@
         "At about ten times the database rate, because most admitted fans will abandon or lose the race for a seat"
       ],
       "answer": 1,
-      "explanation": "The limit is the single database that owns the seats, so the admission rate must follow its real capacity, and fall when it slows. More servers do not help, because the claims still contend in one place. Admitting 50,000 together is still a burst, and some of those fans will abandon their holds."
+      "explanation": "The limit is the single database that owns the seats, so the admission rate must follow its real capacity, and fall when it slows. More servers do not help, because the claims still contend in one place. Admitting 50,000 together is still a burst, and closing the doors strands the seats that come back when holds expire. Ten times the database rate only rebuilds the queue in front of the database."
     },
     {
       "question": "A fan's card payment is confirmed at 12:05:10. The 5-minute hold expired at 12:05:00, and another fan claimed the seat at 12:05:03. The purchase workflow now has to decide what to do with the late payment. What is the right outcome?",
@@ -208,7 +208,7 @@
         "Give the seat back to the paying fan and cancel the other fan's claim, since a completed payment outranks a hold"
       ],
       "answer": 0,
-      "explanation": "A charge without a seat breaks the rule that money and seat go together, so the workflow compensates by refunding, and idempotent steps make a retry safe. A longer hold reduces late payments but cannot remove them. Cancelling the second fan's claim takes a seat from someone who is still paying."
+      "explanation": "A charge without a seat breaks the rule that money and seat go together, so the workflow compensates by refunding, and idempotent steps make a retry safe. A longer hold reduces late payments but cannot remove them. Cancelling the second fan's claim takes a seat from someone who is still paying. Keeping the money while the fan waits for a returned seat charges for a seat that was not given."
     }
   ]
 }

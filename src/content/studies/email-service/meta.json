@@ -22,7 +22,7 @@
     "Mailbox reads under 100 ms, and years of mail per user at a low cost per gigabyte"
   ],
   "firstAttempt": {
-    "text": "One mail server, such as Postfix, on one IP address. Applications hand it messages and it opens an SMTP connection to the recipient's server for each one, in the order they arrived. Incoming mail is written to files on the same machine, and search is a scan of those files.",
+    "text": "One mail server, such as Postfix, on one IP address. Applications hand it messages and it opens an SMTP connection (the standard way mail servers talk to each other) to the recipient's server for each one, in the order they arrived. Incoming mail is written to files on the same machine, and search is a scan of those files.",
     "limits": [
       "A big campaign goes out as fast as the server can manage, so a provider that accepts only a few messages a minute answers with errors, then slows or blocks the sender",
       "A slow or failing provider holds up the messages queued behind it for other providers",
@@ -281,7 +281,7 @@
     },
     {
       "title": "Retry temporary failures, and suppress permanent ones",
-      "problem": "A refused message is either a temporary problem (the mailbox is full, the server is busy, greylisting) or a permanent one (the address does not exist). Treating both alike either loses good mail or keeps mailing dead addresses, which providers count against the sender.",
+      "problem": "A refused message is either a temporary problem (the mailbox is full, the server is busy, greylisting, where a server refuses an unknown sender once on purpose) or a permanent one (the address does not exist). Treating both alike either loses good mail or keeps mailing dead addresses, which providers count against the sender.",
       "fix": "SMTP separates them by the reply code: 4xx is temporary and 5xx is permanent. A 4xx puts the message back on its domain queue with a delay that grows after each failure, with some random spread, so a recovered provider is not hit by everything at once. Real systems start at a few minutes and give up after about four or five days, and then send a failure notice to the sender. A 5xx hard bounce is final: the bounce processor adds the address to the suppression list, and the Send API refuses to queue anything for it from then on.",
       "tradeoff": "Good mail survives a provider's bad hour and dead addresses stop costing reputation. Retries make delivery slower and the queues bigger, and a suppression list must be shared by all of a customer's campaigns, kept for a long time and have a way to remove an address once the owner asks.",
       "concepts": [
@@ -292,7 +292,7 @@
           "slug": "idempotency"
         },
         {
-          "slug": "database-indexing"
+          "slug": "dead-letter-queues-and-poison-messages"
         }
       ]
     },
@@ -332,14 +332,14 @@
           "slug": "rate-limiting"
         },
         {
-          "slug": "circuit-breaker"
+          "slug": "dns"
         }
       ]
     },
     {
       "title": "Store mail in a mailbox store, with a separate search index",
       "problem": "A single mail file or directory per user does not scale to years of mail, and a scan of it makes search take minutes. Attachments are large, and identical ones arrive in thousands of mailboxes.",
-      "fix": "Each message body and attachment is written once to an object store, addressed by a hash of its content. A sharded mailbox database keeps the small, hot metadata per user: folder, flags, subject, date and a pointer to the body, sharded by user id so a whole mailbox is on one shard. Listing the inbox is a range read on that shard. A search index, also sharded by user, receives each new message through a queue and keeps an inverted index of its terms, so a search for a word finds a user's messages without reading them. The indexing runs in the background, so a message appears in a few seconds.",
+      "fix": "Each message body and attachment is written once to an object store, addressed by a hash of its content. A sharded mailbox database keeps the small, hot metadata per user: folder, flags, subject, date and a pointer to the body, sharded by user id so a whole mailbox is on one shard. Listing the inbox is a range read on that shard. A search index, also sharded by user, receives each new message through a queue and keeps an inverted index (a map from each word to the messages that contain it) of its terms, so a search for a word finds a user's messages without reading them. The indexing runs in the background, so a message appears in a few seconds.",
       "tradeoff": "Listing and reading are fast, bodies are stored cheaply and shared copies are stored once. There are three stores to keep consistent, and search can lag a few seconds behind delivery. Deleting a message must also remove its postings from the index and its bodies when no one refers to them.",
       "concepts": [
         {
@@ -359,7 +359,7 @@
     {
       "title": "Watch reputation and feed it back into the sending rate",
       "problem": "Reputation is slow to build and quick to lose, and the signals arrive late: complaints, bounce rates, blocklist listings and DMARC reports. A campaign can damage the IPs before anyone looks at a dashboard.",
-      "fix": "A reputation monitor combines the signals per IP pool, per sending domain and per receiving provider: the share of hard bounces, the number of 421 and 451 replies, spam complaints from feedback loops, blocklist status and the aggregated DMARC reports. It reduces the send rate for a pool when a signal passes its threshold, pauses a campaign that crosses an error budget, and alerts a person. Customers with a bounce or complaint rate above the limit are slowed, then suspended.",
+      "fix": "A reputation monitor combines the signals per IP pool, per sending domain and per receiving provider: the share of hard bounces, the number of 421 and 451 replies, spam complaints from feedback loops (reports that providers send when a user marks mail as spam), blocklist status and the aggregated DMARC reports. It reduces the send rate for a pool when a signal passes its threshold, pauses a campaign that crosses its error limit, and alerts a person. Customers with a bounce or complaint rate above the limit are slowed, then suspended.",
       "tradeoff": "A bad list is caught within minutes, which limits the damage to a pool to a small part of one campaign. The thresholds will sometimes slow a good campaign, they need tuning per provider, and an abusive customer can still do some harm before they are caught.",
       "concepts": [
         {
@@ -506,7 +506,7 @@
       "title": "Where mail bodies live",
       "options": [
         {
-          "name": "Files per user (Maildir)",
+          "name": "Files per user (Maildir, one file per message)",
           "pro": "Simple and robust, and easy to back up",
           "con": "Millions of small files per server, no sharing of attachments and slow search"
         },
@@ -573,14 +573,14 @@
       "options": [
         "Add more outbound servers on new IP addresses, so the campaign drains faster than the provider's limit can react and the receipts go out in parallel.",
         "Retry each 421 at once up to ten times, then move the message to the back of the same shared queue behind other providers' mail.",
-        "Queue per receiving domain, drained at that domain's own rate, slowed when 421 or 451 replies arrive.",
+        "Give each receiving domain its own queue, drained at that domain's own rate and slowed down when it answers 421 or 451.",
         "Apply one global limit equal to the slowest provider's rate, so that every provider sees the same polite pace and none is ever overloaded."
       ],
       "answer": 2,
       "explanation": "Each provider has its own limits, so each domain needs its own queue and rate, and a slow domain then only delays itself. More IPs or faster retries push harder against a provider that already said slow down. One global limit would starve fast providers and still ignore what each one asks for."
     },
     {
-      "question": "A customer who has never sent from a new IP address asks to send 100,000 messages a day starting tomorrow. The warm-up schedule starts at 1,000 messages a day and grows by 50% each day. About how long until this IP can carry 100,000 a day?",
+      "question": "A customer who has never sent from a new IP address asks to send 100,000 messages a day starting tomorrow (day 1). The warm-up schedule starts at 1,000 messages a day and grows by 50% each day. About how long until this IP can carry 100,000 a day?",
       "options": [
         "About two weeks, because 1,000 growing by half each day passes 100,000 on roughly the thirteenth day.",
         "Tomorrow, because mail that is correctly signed with SPF, DKIM and DMARC needs no warm-up and can go out at full volume at once.",
@@ -588,7 +588,7 @@
         "About three months, because each day adds only the starting 1,000 messages."
       ],
       "answer": 0,
-      "explanation": "Growth of 50% a day compounds: 1.5 to the power 12 is about 130, so day 13 reaches roughly 130,000. Signing proves who sent the mail but gives a new IP no history, so a sudden large volume still looks like spam. A sudden need for ten times the volume cannot be met in a day."
+      "explanation": "Growth of 50% a day compounds: 1.5 to the power 12 is about 130, so day 13 reaches roughly 130,000. Signing proves who sent the mail but gives a new IP no history, so a sudden large volume still looks like spam. Doubling every day is faster than the 50% in the schedule, and adding only 1,000 a day is far slower. A sudden need for ten times the volume cannot be met in a day."
     },
     {
       "question": "Ten minutes into a campaign to 2 million addresses on a shared IP pool, 8% of the sends are hard bounces and some providers begin answering 421. The customer's list is two years old. What should the system do first?",
@@ -599,7 +599,7 @@
         "Pause the campaign automatically, suppress the bounced addresses, and ask for a list of recently active addresses only."
       ],
       "answer": 3,
-      "explanation": "A hard bounce is permanent, and a rate near 8% is far above the 2 to 5 percent where a campaign should stop, so the reputation monitor pauses it. Slowing down or moving to a new pool still mails dead addresses, which providers count against the sender. Only 4xx replies are retried, never 5xx."
+      "explanation": "A hard bounce is permanent, and a rate near 8% is far above the 2 to 5 percent where a campaign should stop, so the reputation monitor pauses it. Slowing down or moving to a new pool (which also has no history) still mails dead addresses, which providers count against the sender. Only 4xx replies are retried, never 5xx."
     }
   ]
 }

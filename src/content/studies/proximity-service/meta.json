@@ -24,7 +24,7 @@
     "text": "One table of places with latitude and longitude columns, and an index on each. A search selects the rows with latitude between two values and longitude between two values, computes the distance to each row, sorts and keeps the first 20.",
     "limits": [
       "The database can use only one of the two indexes well, so it reads a strip of the map that is thousands of kilometres long and then filters it",
-      "The box around the circle has about 27% more area than the circle, so a quarter of what it reads is thrown away",
+      "The box around the circle has about 27% more area than the circle, so about a fifth of what it reads is thrown away",
       "A city centre returns thousands of rows that must all be measured and sorted per request, while the countryside returns none and the user has to try a bigger radius",
       "Every search hits one database, and the searches are most of its load",
       "Category and open-now filters and the ranking happen in application code after fetching all the rows"
@@ -70,7 +70,7 @@
     {
       "title": "Let the cells shrink where places are crowded",
       "problem": "One cell size cannot fit both a downtown with 800 places per square kilometre and a desert with none. Small cells make the desert query read dozens of empty cells, and big cells make the downtown query read thousands of places to keep a few hundred.",
-      "fix": "Use a quadtree in memory. Start with the whole map as one square. Whenever a square holds more than about 100 places, split it into four equal squares, and repeat. The squares end up small in cities and huge in empty land, and every square holds a similar number of places. A search starts at the root and descends only into squares that touch the circle, which also reads every neighbour of the spot automatically, so there is no edge case to forget. At the leaves it measures real distances. The same adaptive idea exists inside databases as S2 cells: the circle is covered by a few cells of different sizes, and each cell is a range of a sorted 64-bit id.",
+      "fix": "Use a quadtree in memory. Start with the whole map as one square. Whenever a square holds more than about 50 places, split it into four equal squares, and repeat. The squares end up small in cities and huge in empty land, and every square holds a similar number of places. A search starts at the root and descends only into squares that touch the circle, which also reads every neighbour of the spot automatically, so there is no edge case to forget. At the leaves it measures real distances. The same adaptive idea exists inside databases as S2 cells: the circle is covered by a few cells of different sizes, and each cell is a range of a sorted 64-bit id.",
       "tradeoff": "The work per search follows the number of results rather than the density of the area, and boundaries need no special code. The tree lives in memory and must be built from the database. Places seldom move, so changes can be applied in place or by rebuilding from a snapshot. A tree that is too deep or has too many tiny leaves wastes memory and pointer chasing, so leaves have a minimum size.",
       "concepts": [{ "slug": "database-indexing" }, { "slug": "caching" }, { "slug": "latency-and-round-trips" }]
     },
@@ -91,14 +91,14 @@
     {
       "title": "Filter and rank the candidates inside the search service",
       "problem": "A circle in a city centre holds thousands of places, and the user wants about twenty good ones, such as ramen shops open now with at least four stars.",
-      "fix": "The compact entries carry what the filters need, so the search service drops places that do not match the category, price or opening hours before it fetches anything. The survivors get a score that mixes text relevance, rating, popularity and distance, with ratings smoothed so that one five-star review does not beat a thousand reviews averaging 4.7. The top 20 are returned with a cursor for the next page. Text queries use an inverted index of names and categories, and its matching ids are intersected with the places in the circle.",
+      "fix": "The compact entries carry what the filters need, so the search service drops places that do not match the category, price or opening hours before it fetches anything. The survivors get a score that mixes text relevance, rating, popularity and distance, with ratings smoothed so that one five-star review does not beat a thousand reviews averaging 4.7. The top 20 are returned with a cursor for the next page. Text queries use an inverted index (a map from each word to the places that contain it) of names and categories, and its matching ids are intersected with the places in the circle.",
       "tradeoff": "Thousands of candidates shrink to a short list without any database round trip, and one ranking function is easy to tune. The ranking fields are a second copy of data and must be kept in sync. A cursor stays stable while the user pages, but the ranking can change a little between requests.",
       "concepts": [{ "slug": "pagination" }, { "slug": "database-indexing" }, { "slug": "sql-vs-nosql" }]
     },
     {
       "title": "Apply owners' changes through a queue",
       "problem": "Owners add places, move them, close them and edit hours, and the index must follow without rebuilding 200 million entries each time.",
-      "fix": "A change is written to the places database, and a change event is published through a queue, using a transactional outbox so the two never disagree. Index replicas consume the events and apply them in place: a new place is inserted, a closed place is removed, a moved place is removed and inserted again, and an hours change updates the entry. Because every replica applies the same ordered events, they converge. Every night a full snapshot is built from the database, checked, and swapped in.",
+      "fix": "A change is written to the places database, and a change event is published through a queue, using a transactional outbox (the event is saved in the same transaction as the change) so the two never disagree. Index replicas consume the events and apply them in place: a new place is inserted, a closed place is removed, a moved place is removed and inserted again, and an hours change updates the entry. Because every replica applies the same ordered events, they converge. Every night a full snapshot is built from the database, checked, and swapped in.",
       "tradeoff": "A change shows up in search in about a minute, and a failed replica catches up from the queue. The index is eventually consistent, so a closed place may be listed for a few minutes, longer if its result is cached. There is a second path, the nightly rebuild, to build and test.",
       "concepts": [{ "slug": "message-queues" }, { "slug": "transactional-outbox" }, { "slug": "event-sourcing" }]
     }
@@ -131,8 +131,8 @@
     {
       "scenario": "Someone searches in a remote area where nothing is within the radius",
       "impact": "An empty page looks like a broken service, and a user who widens the radius by hand repeats the request many times.",
-      "answer": "If fewer than a minimum number of places are found, the service doubles the radius up to a cap and says so in the response. A k-nearest search does this directly by walking the tree nearest-first. Both are cheap because the tree has big leaves in empty land.",
-      "concepts": [{ "slug": "latency-and-round-trips" }, { "slug": "slos-and-error-budgets" }]
+      "answer": "If fewer than a minimum number of places are found, the service doubles the radius up to a cap and says so in the response. A k-nearest search (find the k closest places) does this directly by walking the tree nearest-first. Both are cheap because the tree has big leaves in empty land.",
+      "concepts": [{ "slug": "graceful-degradation" }, { "slug": "slos-and-error-budgets" }]
     }
   ],
   "alternatives": [
@@ -141,7 +141,7 @@
       "options": [
         { "name": "Geohash prefix in an ordinary index", "pro": "Works in any database, and the prefix is a simple range lookup", "con": "Fixed cell sizes, 9 cells to read, and cells that shrink towards the poles" },
         { "name": "Quadtree in memory", "pro": "Adapts to density, no boundary special case, and a k-nearest search is natural", "con": "Lives in memory and has to be built and kept in step with the database" },
-        { "name": "S2 or H3 cells", "pro": "Cells of mixed sizes cover a circle with a few ranges, and S2 follows a Hilbert curve for good locality", "con": "A library to learn and a coverage step to tune" },
+        { "name": "S2 or H3 cells", "pro": "Cells of mixed sizes cover a circle with a few ranges, and S2 follows a Hilbert curve, which gives nearby places nearby ids", "con": "A library to learn and a coverage step to tune" },
         { "name": "R-tree in the database (PostGIS)", "pro": "Mature, exact, and also handles polygons and lines", "con": "Harder to spread over many machines, and heavier to update" }
       ],
       "pick": "An in-memory quadtree behind the search service, or S2 cells if the index has to live in a database."
@@ -208,7 +208,7 @@
       "options": [
         "Geohash cells of 5 characters, about 5 km wide, reading the 9 cells around the user and sorting all their candidates by distance.",
         "A fixed 5 km radius, taking the first 20 rows the index returns, since the radius bounds the work in every area of the map.",
-        "An in-memory quadtree that splits any square holding over 100 places and is searched nearest-first, so cells shrink in cities.",
+        "An in-memory quadtree that splits any square holding over 50 places and is searched nearest-first, so cells shrink in cities.",
         "Geohash cells of 7 characters, about 150 m wide, reading the 9 cells around the user and returning the 20 nearest places found there."
       ],
       "answer": 2,

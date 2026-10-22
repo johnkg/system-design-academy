@@ -62,37 +62,37 @@
     {
       "title": "Separate the metadata from the data",
       "problem": "A file system mixes two very different jobs: finding an object by its key, which is small, hot and needs strong consistency, and storing its bytes, which is huge, cold and only needs to be cheap and durable.",
-      "fix": "Split them. A metadata service maps (bucket, key) to an object record: size, checksum, version, and the list of data nodes and shard ids that hold the bytes. Data nodes store opaque, immutable blobs named by id and know nothing about keys. A put writes the bytes to data nodes first, and only then commits the metadata record, which is the moment the object becomes visible. Because the record is committed after the bytes are safe, a crash in the middle leaves unreachable blobs that a cleanup job removes, and never a key that points at nothing.",
+      "fix": "Split them. A metadata service maps (bucket, key) to an object record: size, checksum (a fingerprint of the bytes), version, and the list of data nodes and shard ids that hold the bytes. Data nodes store opaque, immutable blobs named by id and know nothing about keys. A put writes the bytes to data nodes first, and only then commits the metadata record, which is the moment the object becomes visible. Because the record is committed after the bytes are safe, a crash in the middle leaves unreachable blobs that a cleanup job removes, and never a key that points at nothing.",
       "tradeoff": "Each side can scale and be tuned on its own: metadata on fast storage with consensus, data on big cheap disks. Every operation now takes a hop to the metadata service, so that service becomes the busiest and most critical part, and it must be partitioned and replicated carefully.",
       "concepts": [{ "slug": "database-sharding" }, { "slug": "consensus" }, { "slug": "sql-vs-nosql" }]
     },
     {
       "title": "Keep three copies, on different failure domains",
       "problem": "A disk fails in a few percent of cases each year, and a fleet of a million disks loses some every hour. A fire, a power feed or a top-of-rack switch takes out many disks at once.",
-      "fix": "Write every object to three data nodes. The placement logic does not choose at random: it knows the topology of disks, servers, racks and zones, and puts each copy in a different rack, ideally in a different zone with separate power and network. A write is acknowledged when enough copies are on disk. Losing a whole rack then costs each object one copy, not all of them. The same rule is used for the metadata service, whose replicas sit in different zones.",
+      "fix": "Write every object to three data nodes. The placement logic does not choose at random: it knows the topology of disks, servers, racks (a cabinet of servers sharing a switch and power) and zones (separate buildings or data halls), and puts each copy in a different rack, ideally in a different zone with separate power and network. A write is acknowledged when enough copies are on disk. Losing a whole rack then costs each object one copy, not all of them. The same rule is used for the metadata service, whose replicas sit in different zones.",
       "tradeoff": "Independent failure domains turn correlated failures, which are the real killers, into single losses that are easy to repair. Three copies cost three times the storage, writes cross racks and zones so they are slower, and the placement must keep track of capacity so that no rack fills up first.",
       "concepts": [{ "slug": "database-replication" }, { "slug": "quorums" }, { "slug": "consistent-hashing" }]
     },
     {
       "title": "Detect corruption and repair after a disk loss",
       "problem": "Replicas are only useful if lost ones are replaced before more are lost. With three copies, two more failures in the same window destroy the object. Disks also rot silently: a bit flips and nobody notices until the data is read.",
-      "fix": "Every blob is stored with a checksum. Reads verify it, and a background scrubber reads all data on a slow cycle, so corruption is found long before anyone asks for the object. Data nodes send heartbeats, and when a disk or server is declared dead, repair workers use the metadata to list every object that had a piece on it and re-create the missing piece on a healthy disk in the right failure domain, reading from the survivors. Repair is spread over thousands of disks at once, so a 16 TB disk is rebuilt in hours and not days, and it is rate-limited so that it does not starve customer traffic.",
+      "fix": "Every blob is stored with a checksum. Reads verify it, and a background scrubber reads all data on a slow cycle, so corruption is found long before anyone asks for the object. Data nodes send heartbeats (regular alive signals), and when a disk or server is declared dead, repair workers use the metadata to list every object that had a piece on it and re-create the missing piece on a healthy disk in the right failure domain, reading from the survivors. Repair is spread over thousands of disks at once, so a 16 TB disk is rebuilt in hours and not days, and it is rate-limited so that it does not starve customer traffic.",
       "tradeoff": "The window in which an object is under-replicated shrinks from weeks to hours, and that window is what durability maths depends on. Repair traffic is large and constant background load, and a bad rule (for example one that treats a short network blip as a dead rack) can trigger a repair storm.",
-      "concepts": [{ "slug": "health-checks" }, { "slug": "backpressure" }, { "slug": "gossip-protocol" }]
+      "concepts": [{ "slug": "health-checks" }, { "slug": "backpressure" }, { "slug": "failure-detection" }]
     },
     {
       "title": "Use erasure coding for the bulk of the data",
       "problem": "Three copies of exabytes is a vast bill, and eleven nines of durability needs more than a hand-wavy argument.",
-      "fix": "Cut an object into k data pieces and compute m extra parity pieces, so that any k of the k+m pieces can rebuild it. A 6+3 code uses 1.5 times the space and survives any 3 lost pieces, where three copies use 3 times and survive 2. A 10+4 code uses 1.4 times and survives 4. The pieces go on k+m different racks. Durability is a binomial tail: if each piece is lost with probability p in one repair window, the object is lost when more than m are, which is about C(k+m, m+1) times p to the power m+1. With a yearly disk failure rate of 2% and a 24-hour repair window p is about 0.00005, and 6+3 loses an object with a probability around 10 to the minus 13 per year, well beyond eleven nines, as long as failures are independent and repair is quick. Small objects, and hot data, still use plain copies, because splitting 4 KB into 6 pieces is not worth it.",
+      "fix": "Cut an object into k data pieces and compute m extra parity pieces, so that any k of the k+m pieces can rebuild it. A 6+3 code uses 1.5 times the space and survives any 3 lost pieces, where three copies use 3 times and survive 2. A 10+4 code uses 1.4 times and survives 4. The pieces go on k+m different racks. Durability comes from the chance that more pieces fail than the code can absorb: if each piece is lost with probability p in one repair window, the object is lost when more than m are, which is about C(k+m, m+1) times p to the power m+1. With a yearly disk failure rate of 2% and a 24-hour repair window p is about 0.00005, and 6+3 loses an object with a probability around 10 to the minus 13 per year, well beyond eleven nines, as long as failures are independent and repair is quick. Small objects, and hot data, still use plain copies, because splitting 4 KB into 6 pieces is not worth it.",
       "tradeoff": "Storage drops by half or more. In return a read touches k disks, a write computes parity, and repairing one lost piece means reading k pieces, so repair traffic is k times the size of what is rebuilt. The code does not help if failures are correlated, which is why placing pieces across racks matters as much as the maths.",
-      "concepts": [{ "slug": "quorums" }, { "slug": "latency-and-round-trips" }, { "slug": "caching" }]
+      "concepts": [{ "slug": "quorums" }, { "slug": "hedged-requests-and-tail-latency" }]
     },
     {
       "title": "Upload large objects in parts",
       "problem": "A 500 GB object cannot be sent in one request. A dropped connection at 99% would mean starting over, and one connection cannot use the bandwidth available.",
       "fix": "A client starts a multipart upload and gets an upload id. It uploads numbered parts, each a few MB to a few GB, in parallel and in any order, and each part is stored, erasure coded and checksummed on its own. A failed part is simply sent again, and sending the same part number twice replaces the earlier one, so retries are safe. When all parts are in, the client sends a complete call with the list of part numbers and checksums, and the metadata service writes one object record that refers to the parts, in one atomic commit. Uploads that are never completed are removed after a time limit so they do not cost money forever.",
       "tradeoff": "Large uploads become fast, parallel and resumable, and a range read can go straight to the right part. The server has to track upload state, abandoned parts waste space until cleaned up, and the final object is only visible at the instant of the complete call, which is what clients expect.",
-      "concepts": [{ "slug": "idempotency" }, { "slug": "retries-and-backoff" }, { "slug": "transactional-outbox" }]
+      "concepts": [{ "slug": "idempotency" }, { "slug": "retries-and-backoff" }, { "slug": "async-apis-and-long-running-operations" }]
     },
     {
       "title": "List keys by prefix with a sorted index",
@@ -125,11 +125,11 @@
       "scenario": "A client crashes in the middle of a multipart upload",
       "impact": "Hundreds of gigabytes of parts exist, but there is no object, and they cost storage forever.",
       "answer": "The object does not exist until complete is called. A lifecycle rule removes incomplete uploads after a set number of days, and the client can instead list the parts already stored and resume with only the missing ones.",
-      "concepts": [{ "slug": "idempotency" }, { "slug": "retries-and-backoff" }, { "slug": "message-queues" }]
+      "concepts": [{ "slug": "idempotency" }, { "slug": "retries-and-backoff" }]
     },
     {
       "scenario": "The metadata service loses a partition leader",
-      "impact": "Puts and lists for a range of keys stop, and a split brain could accept conflicting writes.",
+      "impact": "Puts and lists for a range of keys stop, and a split brain (two leaders both accepting writes) could accept conflicting writes.",
       "answer": "Each partition is a consensus group. A new leader is elected within seconds and only a majority can commit, so a deposed leader cannot make a write visible. Reads and writes to other key ranges are not affected.",
       "concepts": [{ "slug": "leader-election" }, { "slug": "consensus" }, { "slug": "cap-theorem" }]
     }
@@ -198,7 +198,7 @@
         "It needs 150 PB raw and survives 3 lost pieces, but rebuilding a 16 TB disk reads about 96 TB"
       ],
       "answer": 3,
-      "explanation": "A 6+3 code stores 1.5 times the data, so 150 PB, and tolerates any 3 lost pieces. Rebuilding one lost piece means reading k = 6 surviving pieces, so repair traffic is about six times the size of what is rebuilt, 96 TB for a 16 TB disk."
+      "explanation": "A 6+3 code stores 1.5 times the data, so 150 PB, and tolerates any 3 lost pieces. Rebuilding one lost piece means reading k = 6 surviving pieces, so repair traffic is about six times the size of what is rebuilt, 96 TB for a 16 TB disk. The other figures break the 1.5x space ratio, the 3-piece tolerance or the 6x repair cost."
     },
     {
       "question": "Objects are stored as 6+3 pieces across 9 racks. A top-of-rack switch fails, and 40 disks of 16 TB (640 TB) become unreachable. Past network blips like this lasted about 5 minutes. What should the repair system do?",
@@ -209,7 +209,7 @@
         "Wait a short grace period, then rebuild at a limited rate, objects with the fewest pieces left first"
       ],
       "answer": 3,
-      "explanation": "Each affected object lost only one piece and can still be read from the others, so there is time. Rebuilding 640 TB reads about six times that, near 3.8 PB, so an instant rebuild of a blip causes a repair storm. A grace period, a rate limit and priority for the most exposed objects balance risk and load."
+      "explanation": "Each affected object lost only one piece and can still be read from the others, so there is time. Rebuilding 640 TB reads about six times that, near 3.8 PB, so an instant rebuild of a blip causes a repair storm. A grace period, a rate limit and priority for the most exposed objects balance risk and load. Waiting for an operator while writes are blocked turns a short blip into an outage."
     }
   ]
 }

@@ -104,6 +104,20 @@ if (share > MAX_LONGEST_SHARE) err('quizzes', `the correct option is the single 
   if (dates.some((d, i) => i > 0 && d >= dates[i - 1])) err('data/changelog.ts', 'entries must be newest first with distinct dates');
 }
 
+// 5. Search aliases: each group needs at least two entries, all lowercase, none repeated, and at least one one-word trigger.
+{
+  const text = readFileSync(join(root, 'data/searchAliases.ts'), 'utf8');
+  const MIN_GROUP = 2;
+  for (const line of text.split('\n').filter((l) => /^\s*\[('.*',?\s*)+\],?$/.test(l))) {
+    const words = [...line.matchAll(/'([^']+)'/g)].map((m) => m[1]);
+    const where = `data/searchAliases.ts [${words[0]}]`;
+    if (words.length < MIN_GROUP) err(where, 'a group needs at least two entries');
+    if (new Set(words).size !== words.length) err(where, 'repeats an entry');
+    if (words.some((x) => x !== x.toLowerCase())) err(where, 'entries must be lowercase');
+    if (!words.some((x) => !x.includes(' '))) err(where, 'needs at least one one-word entry to act as a trigger');
+  }
+}
+
 for (const w of warnings) console.warn(`warn  ${w}`);
 for (const e of errors) console.error(`ERROR ${e}`);
 console.log(`checked ${Object.keys(meta).length} pages and ${dist.total} quiz questions (correct option longest in ${share}%): ${errors.length} error(s), ${warnings.length} warning(s)`);

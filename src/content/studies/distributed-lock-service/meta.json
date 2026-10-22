@@ -62,20 +62,20 @@
       "problem": "A worker that crashes, loses its network or is killed never releases its lock, and everyone else waits for ever.",
       "fix": "A lock is a lease: the grant has a time to live, such as 10 seconds, and the server frees the lock by itself when that time runs out unless the holder extends it. The lock client library does this for the worker. It sets the key and its expiry in one atomic command, writes a random value that proves who owns it, and releases only if the value still matches, so a late release can never delete a lock that now belongs to someone else. The server measures the time on its own clock, as a duration from the grant, and the client treats its lease as a little shorter than the server does.",
       "tradeoff": "A crashed holder blocks the lock for at most one lease. A short lease recovers fast but is easy to outlive by accident, and a long lease is safe against slow work but leaves a crashed holder's lock stuck for longer. A lease alone does not make the lock safe, because a worker cannot know that its lease has run out while it is paused.",
-      "concepts": [{ "slug": "health-checks" }, { "slug": "idempotency" }, { "slug": "logical-clocks" }]
+      "concepts": [{ "slug": "leases-and-fencing-tokens" }, { "slug": "health-checks" }, { "slug": "failure-detection" }]
     },
     {
       "title": "Return a fencing token and make the resource check it",
       "problem": "A worker is paused for 15 seconds by a garbage collection. Its 10-second lease ends, a second worker is granted the lock and writes. Then the first one wakes up, still believes it holds the lock, and overwrites the newer data. No clock check made by the worker can prevent this, because the pause can happen right after the check.",
       "fix": "Every grant carries a fencing token, a number that only goes up: the first holder gets 33, the next one 34. The worker sends its token with every request to the shared resource. The resource remembers the highest token it has seen and rejects any request with a lower one. The stale holder's write arrives with 33 after 34 was seen, and it is refused. The check must be made by the resource, or by something in front of it that sees every write, and a request must carry the token on reads as well as writes, or an old holder can slip in before the new holder is first seen.",
       "tradeoff": "This is the only thing that makes the lock safe against pauses and message delays, because the decision is taken where the data lives. It needs a resource that can compare numbers, such as a conditional update, a version column or a storage API that accepts a token, and it does nothing for resources that cannot (an email, a payment at another company), which need idempotent requests instead.",
-      "concepts": [{ "slug": "logical-clocks" }, { "slug": "idempotency" }, { "slug": "consistency-models" }]
+      "concepts": [{ "slug": "leases-and-fencing-tokens" }, { "slug": "idempotency" }, { "slug": "consistency-models" }]
     },
     {
       "title": "Keep locks in a consensus group, not on one Redis",
       "problem": "One server is a single point of failure. A Redis primary with an asynchronous replica fails over without its newest writes, so after a failover the replica can grant a lock that is still held, and can reuse a fencing token. Both mutual exclusion and the ordering of tokens are then broken.",
       "fix": "Store the locks in a replicated state machine run by a consensus protocol such as Raft or ZooKeeper's Zab, as etcd, Consul and ZooKeeper do, on 3 or 5 servers. A grant, a renewal and a release are entries in the replicated log, and are acknowledged only after a majority has them on disk. A single leader orders all grants, so the token counter is one sequence that never goes back, and if the leader dies, a new one is elected from the servers that have every committed entry.",
-      "tradeoff": "Locks and tokens are linearizable and survive the loss of a minority of servers. Every grant costs a round trip to a majority and a disk flush, so the group handles tens of thousands of writes per second and not millions, and during an election of a second or two, no lock can be granted. Spreading the group over regions makes every grant slow.",
+      "tradeoff": "Locks and tokens are linearizable (every client sees one single order of grants) and survive the loss of a minority of servers. Every grant costs a round trip to a majority and a disk flush, so the group handles about ten thousand writes per second and not millions, and during an election of a second or two, no lock can be granted. Spreading the group over regions makes every grant slow.",
       "concepts": [{ "slug": "consensus" }, { "slug": "leader-election" }, { "slug": "quorums" }, { "slug": "cap-theorem" }]
     },
     {
@@ -83,14 +83,14 @@
       "problem": "Work often takes longer than any sensible lease, and a lease of several minutes would leave a crashed holder's lock stuck for that long.",
       "fix": "Keep the lease short and have the library renew it from a background thread, about three times per lease, so one lost message does not matter. The server resets the timer on each renewal, as an etcd lease keep-alive or a ZooKeeper session does. If renewals stop being acknowledged for longer than the lease, the library tells the worker that the lock is lost, and the worker stops at its next safe point. A pause that freezes the whole process also freezes the heartbeat, so renewal helps with slow work and with crashes, but not with a stall that outlives the lease.",
       "tradeoff": "Lease length no longer needs to match the length of the work, and a crashed holder is detected within one lease. The heartbeats are a steady write load proportional to the number of held locks, and a congested network that delays heartbeats makes healthy holders lose their locks, so the lease has to be several times the typical delay.",
-      "concepts": [{ "slug": "health-checks" }, { "slug": "retries-and-backoff" }, { "slug": "gossip-protocol" }]
+      "concepts": [{ "slug": "health-checks" }, { "slug": "retries-and-backoff" }, { "slug": "failure-detection" }]
     },
     {
       "title": "Queue the waiters so that one wakes at a time",
       "problem": "With 500 workers waiting for one lock, every release makes all 500 retry at once, and 499 of them fail. The group sees a burst of reads and writes for every release, and the winner is whoever happens to be fastest, so some workers wait for ever.",
       "fix": "Each waiter creates an ordered entry under the lock, such as 'invoice-7/0000000042', and takes the lock when its entry has the lowest number. It watches only the entry just before its own, so a release or an expiry wakes exactly one waiter. A waiter that gives up or dies removes its own entry, and the one behind it moves up to watch the next. This is the lock recipe of ZooKeeper, and etcd offers the same with revisions.",
       "tradeoff": "There is no herd of retries and the order is fair, first come first served. The queue entries are more state to store and to clean up when waiters die, so they are leased too, and a lock that is badly contended is a design problem that no lock service will fix.",
-      "concepts": [{ "slug": "message-queues" }, { "slug": "pub-sub" }, { "slug": "backpressure" }]
+      "concepts": [{ "slug": "message-queues" }, { "slug": "pub-sub" }, { "slug": "retries-and-backoff" }]
     },
     {
       "title": "Decide which locks need safety, and watch them",
@@ -123,12 +123,12 @@
       "scenario": "A popular lock is released and 500 workers are waiting",
       "impact": "Without a queue, 500 retries land together, most of them fail, and the lock group sees a spike for every release.",
       "answer": "Waiters are ordered and each watches only its predecessor, so the release wakes one of them. The rest stay asleep. The work per release is one notification and one grant, whatever the number of waiters.",
-      "concepts": [{ "slug": "pub-sub" }, { "slug": "backpressure" }, { "slug": "message-queues" }]
+      "concepts": [{ "slug": "pub-sub" }, { "slug": "retries-and-backoff" }, { "slug": "message-queues" }]
     },
     {
       "scenario": "Clocks on the machines disagree or jump",
       "impact": "If leases were stored as wall-clock deadlines, a clock that jumps forward could expire a lease early, or a clock that steps back could extend it.",
-      "answer": "Leases are durations counted by each side on a monotonic clock, never absolute timestamps compared between machines. The client assumes its lease is shorter than the server's by a margin for clock drift. Tokens, not clocks, decide who may write, so even a wrong lease only produces an extra rejected request.",
+      "answer": "Leases are durations counted by each side on a monotonic clock (one that never jumps), never absolute timestamps compared between machines. The client assumes its lease is shorter than the server's by a margin for clock drift. Tokens, not clocks, decide who may write, so even a wrong lease only produces an extra rejected request.",
       "concepts": [{ "slug": "logical-clocks" }, { "slug": "consensus" }, { "slug": "metrics" }]
     }
   ],
@@ -189,26 +189,26 @@
         "Wait one extra second after finishing before running DEL, so that other holders have time to settle"
       ],
       "answer": 0,
-      "explanation": "Without an owner check, A's late DEL removes B's live lock. Matching on a random value, atomically, makes the release safe. A longer expiry only moves the problem to the next slow job, and an existence check races with another holder taking the key."
+      "explanation": "Without an owner check, A's late DEL removes B's live lock. Matching on a random value, atomically, makes the release safe. A longer expiry only moves the problem to the next slow job, an existence check races with another holder taking the key, and a pause before DEL still leaves the same gap."
     },
     {
-      "question": "A lock group commits every lease renewal as a write. It holds 30,000 locks, each renewed three times per lease, and can commit about 30,000 writes per second. The team shortens the lease from 10 s to 2 s to recover faster. What happens?",
+      "question": "A lock group commits every lease renewal as a write. It holds 20,000 locks, each renewed three times per lease, and can commit about 10,000 writes per second. The team shortens the lease from 10 s to 2 s to recover faster. What happens?",
       "options": [
-        "Renewals rise from about 9,000 to 45,000 per second, past what the group commits, so healthy holders start losing locks",
-        "Renewals stay near 9,000 per second because only the lease length changes, so crashed holders are simply replaced five times faster",
-        "Renewals fall to about 1,800 per second because each lock is held for a shorter time, which leaves more room for new acquisitions",
-        "Renewals rise to 45,000 per second, but followers serve them as reads, so write capacity is unaffected"
+        "Renewals rise from about 6,000 to 30,000 per second, past what the group commits, so healthy holders start losing locks",
+        "Renewals stay near 6,000 per second because only the lease length changes, so crashed holders are simply replaced five times faster",
+        "Renewals fall to about 1,200 per second because each lock is held for a shorter time, which leaves more room for new acquisitions",
+        "Renewals rise to 30,000 per second, but followers serve them as reads, so write capacity is unaffected"
       ],
       "answer": 0,
-      "explanation": "Renewals per second are locks x 3 / lease, so a lease five times shorter means five times more writes, and each one is committed by a majority. The result is overload and false lock loss, not a free speedup."
+      "explanation": "Renewals per second are locks x 3 / lease, so a lease five times shorter means five times more writes, and each one is committed by a majority. The result is overload and false lock loss. Renewals do not stay flat, they do not fall, and followers cannot absorb them, because each renewal changes the lease timer and must go through the leader's log."
     },
     {
       "question": "Workers guard writes to a database with a 10 second lease. One worker freezes for 15 s in a garbage collection, wakes up, and still writes. It checks 'is my lease still valid?' just before each write. What really prevents the damage?",
       "options": [
         "Check the lease again right after the write, and undo the write if the lease turns out to have expired",
-        "Send the rising token with each write and let the database reject any lower token than it has seen",
+        "Send a rising token with every write and let the database reject an older one",
         "Lengthen the lease to 60 seconds, so that a pause of 15 seconds or so can no longer outlive the lease",
-        "Synchronise the machines with NTP, so the worker's clock check is accurate to within a few milliseconds"
+        "Synchronise the machines with NTP (a clock-sync protocol), so the worker's clock check is accurate to within a few milliseconds"
       ],
       "answer": 1,
       "explanation": "The freeze can begin right after the validity check, so no check in the worker can be trusted. Only the resource, which sees the tokens in order, can refuse the stale write. A longer lease only needs a longer pause, and exact clocks do not stop a paused process."
