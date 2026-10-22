@@ -1,7 +1,11 @@
 // An incident core in JavaScript: alerts are grouped into incidents, the on-call chain is paged until someone
 // acknowledges, every step lands in an append-only timeline, and status updates fan out with retries and dedupe.
 
-let seed = 4242;
+const SEED = 4242, ALERTS = 24, ALERT_SPACING = 4; // one alert about every 4 minutes
+const SEVERITIES = 3, PUBLIC_SEV = 2; // sev 1..3; sev 1 and 2 get a status page update
+const MAX_ACK_DELAY = 9; // a paged person answers after 1..9 minutes
+const SEND_FAIL_PCT = 15, ACK_LOST_PCT = 5;
+let seed = SEED;
 const rand = (n) => { seed = (seed * 1664525 + 1013904223) % 4294967296; return Math.floor(seed / 65536) % n; };
 
 const SERVICES = ['checkout', 'search', 'login'];
@@ -15,8 +19,8 @@ const log = (t, text) => timeline.push({ t, idx: timeline.length, text });
 
 // 1. Group alerts into incidents. Severity 1 is the worst, and an incident takes the worst severity of its alerts.
 const incidents = [];
-for (let i = 0; i < 24; i++) {
-  const t = i * 4 + rand(4), service = SERVICES[rand(3)], sev = 1 + rand(3);
+for (let i = 0; i < ALERTS; i++) {
+  const t = i * ALERT_SPACING + rand(ALERT_SPACING), service = SERVICES[rand(SERVICES.length)], sev = 1 + rand(SEVERITIES);
   const open = incidents.find((x) => x.service === service && t - x.last <= GROUP_GAP);
   if (open) { open.last = t; open.alerts++; open.sev = Math.min(open.sev, sev); }
   else incidents.push({ id: incidents.length + 1, service, start: t, last: t, alerts: 1, sev });
@@ -27,7 +31,7 @@ for (const inc of incidents) {
   let now = inc.start, paged = 0;
   log(now, `INC-${inc.id} declared on ${inc.service}, sev ${inc.sev}, from ${inc.alerts} alerts`);
   for (const level of CHAIN) {
-    const delay = 1 + rand(9);
+    const delay = 1 + rand(MAX_ACK_DELAY);
     paged++;
     log(now, `INC-${inc.id} paged ${level}`);
     if (delay <= ACK_WINDOW) { now += delay; inc.commander = level; log(now, `INC-${inc.id} ${level} acknowledged and is commander`); break; }
@@ -41,16 +45,16 @@ for (const inc of incidents) {
 // 3. Status page fan-out for serious incidents. A key per (incident, subscriber) lets the receiver drop repeats.
 const received = new Set();
 let attempts = 0, duplicates = 0, gaveUp = 0, total = 0;
-for (const inc of incidents.filter((x) => x.sev <= 2)) {
+for (const inc of incidents.filter((x) => x.sev <= PUBLIC_SEV)) {
   for (let s = 0; s < SUBSCRIBERS; s++) {
     const key = `${inc.id}:${s}`;
     total++;
     let done = false;
     for (let a = 0; a < ATTEMPTS && !done; a++) {
       attempts++;
-      if (rand(100) < 15) continue;                                            // the send failed: retry
+      if (rand(100) < SEND_FAIL_PCT) continue;                                           // the send failed: retry
       if (received.has(key)) duplicates++; else received.add(key);             // delivered, and a repeat is ignored
-      done = rand(100) >= 5;                                                   // 5%: the acknowledgement was lost, so we resend
+      done = rand(100) >= ACK_LOST_PCT;                                                  // 5%: the acknowledgement was lost, so we resend
     }
     if (!done && !received.has(key)) gaveUp++;
   }
@@ -65,5 +69,5 @@ console.log(`fan-out: ${total} messages, ${attempts} attempts, ${duplicates} dup
 
 const times = ordered.every((e, i) => i === 0 || ordered[i - 1].t <= e.t);
 const alertSum = incidents.reduce((s, x) => s + x.alerts, 0);
-console.log(`checks: ordered ${times}, alerts kept ${alertSum === 24}, delivered + gave up = total ${received.size + gaveUp === total}`);
-if (!times || alertSum !== 24 || received.size + gaveUp !== total) process.exit(1);
+console.log(`checks: ordered ${times}, alerts kept ${alertSum === ALERTS}, delivered + gave up = total ${received.size + gaveUp === total}`);
+if (!times || alertSum !== ALERTS || received.size + gaveUp !== total) process.exit(1);

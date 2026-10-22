@@ -5,8 +5,10 @@
 
 const USER = 2000, GAP = 50, N = 200, SLOW_PERMILLE = 100, ATTEMPT = 400, BACKOFF = 25, RETRIES = 2;
 const PRE = 10, POST = 5, MIN_LEFT = 50, RETRY_MIN = 100;
+const SEED = 12345;
+const SLOW_MIN = 2500, SLOW_SPREAD = 6500, FAST_MIN = 20, FAST_SPREAD = 60; // database attempt latency (ms)
 
-let seed = 12345; // Park-Miller generator, integers only so every language prints the same
+let seed = SEED; // Park-Miller generator, integers only so every language prints the same
 const next = () => (seed = (seed * 48271) % 2147483647);
 
 // timeouts[0] = A waits on B, [1] = B waits on C, [2] = C waits on the database per attempt
@@ -56,7 +58,7 @@ function simulate(policy, t0, attempts) {
 const requests = [];
 for (let i = 0; i < N; i++) {
   const attempts = [];
-  for (let k = 0; k < 3; k++) { const s = next(), a = next(); attempts.push(s % 1000 < SLOW_PERMILLE ? 2500 + (a % 6500) : 20 + (a % 60)); }
+  for (let k = 0; k < RETRIES + 1; k++) { const s = next(), a = next(); attempts.push(s % 1000 < SLOW_PERMILLE ? SLOW_MIN + (a % SLOW_SPREAD) : FAST_MIN + (a % FAST_SPREAD)); }
   requests.push({ t0: i * GAP, attempts });
 }
 

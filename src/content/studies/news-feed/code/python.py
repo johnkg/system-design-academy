@@ -67,7 +67,9 @@ def show(r):
     return ' | '.join(f'{p.id}:{p.author}:{p.text}' for p in r.page) + f'  (next cursor: {next_cursor})'
 
 
-svc = FeedService(3)  # an author with 3 or more followers counts as popular, to keep the demo small
+POPULAR_FOLLOWERS = 3  # an author with 3 or more followers counts as popular, to keep the demo small
+PAGE_SIZE = 2
+svc = FeedService(POPULAR_FOLLOWERS)
 svc.follow("ann", "bob")
 svc.follow("dan", "bob")
 for user in ["ann", "dan", "eve"]:
@@ -77,7 +79,7 @@ print("bob posts 'lunch':       ", f"pushed to {svc.publish('bob', 'lunch')} fee
 print("cat posts 'big news':    ", f"pushed to {svc.publish('cat', 'big news')} feeds")
 print("bob posts 'coffee':      ", f"pushed to {svc.publish('bob', 'coffee')} feeds")
 
-first = svc.feed("ann", 2)
+first = svc.feed("ann", PAGE_SIZE)
 print("ann page 1:              ", show(first))
-print("ann page 2:              ", show(svc.feed("ann", 2, first.next_cursor)))
-print("eve page 1:              ", show(svc.feed("eve", 2)))
+print("ann page 2:              ", show(svc.feed("ann", PAGE_SIZE, first.next_cursor)))
+print("eve page 1:              ", show(svc.feed("eve", PAGE_SIZE)))

@@ -54,21 +54,25 @@ const view = (recs) => [...recs].filter(([, f]) => !gone(f)).sort((a, b) => a[0]
   .map(([id, f]) => `${id}:${['title', 'done', 'note'].map((k) => f[k]?.v ?? '-').join('/')}`).join(' ');
 const checksum = (s) => [...s].reduce((h, ch) => (h * 31 + ch.charCodeAt(0)) % 1000000007, 7);
 
-let seed = 99;
+const SEED = 99, STEPS = 600, ROWS = 12, DELETE_PCT = 4, MAX_VALUE = 100;
+const START_MS = 5000000, STEP_MS = 1000, B_SKEW_MS = -10 * 60 * 1000; // B's clock is 10 minutes slow
+const SYNC_EVERY = 7, RETRY_ONE_IN = 4; // a device syncs every 7 steps; 1 sync in 4 also re-sends its last push
+const C_SYNC_AT = 100, COMPACT_AT = 400, COMPACT_KEEP = 100; // compaction keeps the last 100 changes
+let seed = SEED;
 const rnd = (n) => { seed = (seed * 1664525 + 1013904223) % 4294967296; return Math.floor(seed / 65536) % n; };
 
 const server = new Server(), log = [];
-const [A, B, C] = [new Client('A', 0, server, log), new Client('B', -600000, server, log), new Client('C', 0, server, log)]; // B's clock is 10 minutes slow
+const [A, B, C] = [new Client('A', 0, server, log), new Client('B', B_SKEW_MS, server, log), new Client('C', 0, server, log)]; // B's clock is 10 minutes slow
 let edits = 0, deletes = 0, removed = 0, ghosts = 0, wasReset = false;
-for (let step = 0; step < 600; step++) {
-  const d = rnd(2), c = [A, B][d], id = rnd(12), kind = rnd(100), wall = 5000000 + step * 1000;
+for (let step = 0; step < STEPS; step++) {
+  const d = rnd(2), c = [A, B][d], id = rnd(ROWS), kind = rnd(100), wall = START_MS + step * STEP_MS;
   if (!(c.db.get(id) && gone(c.db.get(id)))) { // a deleted row is not on screen, so it cannot be edited
-    if (kind < 4) { c.write(id, '_gone', 1, wall); deletes++; }
-    else { c.write(id, ['title', 'done', 'note'][rnd(3)], rnd(100), wall); edits++; }
+    if (kind < DELETE_PCT) { c.write(id, '_gone', 1, wall); deletes++; }
+    else { c.write(id, ['title', 'done', 'note'][rnd(3)], rnd(MAX_VALUE), wall); edits++; }
   }
-  if (step % 7 === d) c.sync(rnd(4) === 0);
-  if (step === 100) C.sync(false); // C syncs once and then stays offline
-  if (step === 400) removed = server.compact(server.seq - 100);
+  if (step % SYNC_EVERY === d) c.sync(rnd(RETRY_ONE_IN) === 0);
+  if (step === C_SYNC_AT) C.sync(false); // C syncs once and then stays offline
+  if (step === COMPACT_AT) removed = server.compact(server.seq - COMPACT_KEEP);
 }
 const before = new Set([...C.db].filter(([, f]) => !gone(f)).map(([id]) => id));
 A.sync(false); B.sync(false); wasReset = C.sync(false); A.sync(false); B.sync(false);

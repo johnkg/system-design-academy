@@ -3,6 +3,8 @@
 
 const STEPS = ['reserve', 'charge', 'pack', 'ship', 'notify'];
 const MAX_ATTEMPTS = 3;
+const SEED = 7, ORDERS = 200;
+const FAIL_PCT = 10, LOST_REPLY_PCT = 10, CRASH_PCT = 4; // an attempt fails early, or acts but its reply is lost; a worker dies before recording
 
 class NeedActivity extends Error { constructor(name) { super(name); this.activity = name; } }
 
@@ -19,7 +21,7 @@ function replay(history) {
   return orderWorkflow(ctx);
 }
 
-let seed = 7;
+let seed = SEED;
 const random = (n) => { seed = (seed * 1664525 + 1013904223) % 4294967296; return Math.floor(seed / 65536) % n; };
 
 // Runs one order to the end. The activity is at-least-once: it can run, lose its reply, and be run again.
@@ -32,14 +34,14 @@ function runOrder(orderId, idempotent, effects, stats) {
       let done = false;
       for (let attempt = 1; attempt <= MAX_ATTEMPTS && !done; attempt++) {
         const r = random(100);
-        if (r < 10) continue;                                   // failed before doing anything
+        if (r < FAIL_PCT) continue;                                  // failed before doing anything
         const key = `${orderId}:${e.activity}`;                 // the idempotency key
         if (!(idempotent && effects.has(key))) { effects.set(key, (effects.get(key) || 0) + 1); } // the side effect (a charge, a shipment)
-        if (r < 20) continue;                                   // the effect happened but the reply was lost
+        if (r < FAIL_PCT + LOST_REPLY_PCT) continue;                                  // the effect happened but the reply was lost
         done = true;
       }
       if (!done) { stats.stuck++; return history.length; }       // retries are used up: the workflow waits for a human
-      if (random(100) < 4) { stats.crashes++; continue; }       // the worker died before it wrote the result: the activity will run again
+      if (random(100) < CRASH_PCT) { stats.crashes++; continue; }       // the worker died before it wrote the result: the activity will run again
       history.push({ type: 'ActivityCompleted', result: `${e.activity}-${orderId}` });
       continue;
     }
@@ -49,10 +51,10 @@ function runOrder(orderId, idempotent, effects, stats) {
 }
 
 function runAll(idempotent) {
-  seed = 7;
+  seed = SEED;
   const effects = new Map(), stats = { completed: 0, stuck: 0, crashes: 0 };
   let longest = 0;
-  for (let id = 1; id <= 200; id++) longest = Math.max(longest, runOrder(id, idempotent, effects, stats));
+  for (let id = 1; id <= ORDERS; id++) longest = Math.max(longest, runOrder(id, idempotent, effects, stats));
   let twice = 0, doubleCharges = 0;
   for (const [key, n] of effects) { twice += n - 1; if (key.endsWith(':charge')) doubleCharges += n - 1; }
   const events = 2 + 2 * longest; // started + one scheduled and one completed event per step + finished
@@ -62,7 +64,7 @@ function runAll(idempotent) {
 for (const idempotent of [false, true]) {
   const r = runAll(idempotent);
   console.log(`idempotent=${idempotent}: completed ${r.completed}, stuck ${r.stuck}, crashes ${r.crashes}, steps run twice ${r.twice}, double charges ${r.doubleCharges}, longest history ${r.events} events`);
-  if (r.completed + r.stuck !== 200) process.exit(1);
+  if (r.completed + r.stuck !== ORDERS) process.exit(1);
   if (idempotent && r.twice !== 0) process.exit(1);
   if (!idempotent && r.doubleCharges === 0) process.exit(1);
 }

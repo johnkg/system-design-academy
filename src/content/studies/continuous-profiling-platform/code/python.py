@@ -1,10 +1,15 @@
 # A tiny continuous-profiling backend, in Python:
 # samples of call stacks are interned by an FNV-1a hash, counted, folded into flame-graph paths and diffed across two releases.
 
+MAX_HZ, US_PER_PERMILLE = 100, 1000  # a permille of one core-second is 1000 microseconds
+SEED, BUDGET_PERMILLE, SAMPLES = 7, 10, 20000
+SHARE_BASIS = 10000  # shares are compared in parts per 10,000
+REGRESSION = 1000  # a growth of 10 percentage points counts as a regression
+
 # Rate control: the sampling frequency that keeps profiler overhead within a budget (in permille of one core).
 # One second of one core is 1,000,000 microseconds, so a budget of b permille allows b * 1000 microseconds of sampling work per second.
 def choose_hz(budget_permille, cost_us):
-    return min(100, (budget_permille * 1000) // cost_us)
+    return min(MAX_HZ, (budget_permille * US_PER_PERMILLE) // cost_us)
 
 
 def fnv1a(text):  # 32-bit FNV-1a over ASCII text
@@ -54,7 +59,7 @@ MIX = [(s.split(";"), a, b) for s, a, b in [
     ("main;handle;parse_json", 30, 30), ("main;handle;auth;verify_token", 20, 20), ("main;handle;render;json_encode", 15, 40),
     ("main;handle;db_query;wait", 25, 25), ("main;gc", 10, 10)]]
 
-seed = 7
+seed = SEED
 
 
 def next_int(n):
@@ -75,9 +80,9 @@ def collect(store, column, samples):
     return profile
 
 
-print("; ".join(f"cost {c}us -> {choose_hz(10, c)} Hz" for c in [100, 250, 1000]))
+print("; ".join(f"cost {c}us -> {choose_hz(BUDGET_PERMILLE, c)} Hz" for c in [100, 250, 1000]))
 store = Store()
-before, after = collect(store, 1, 20000), collect(store, 2, 20000)
+before, after = collect(store, 1, SAMPLES), collect(store, 2, SAMPLES)
 print(f"samples {before.total + after.total}, distinct stacks {len(store.stacks)}")
 
 flame = after.flame()
@@ -87,7 +92,7 @@ for p, n in sorted(flame.items(), key=lambda e: (-e[1], e[0]))[:4]:
 
 # Diff: compare shares in parts per 10,000, so two ranges with different sample counts can be compared.
 fa = before.flame()
-diff = [(p, n * 10000 // after.total - fa.get(p, 0) * 10000 // before.total) for p, n in flame.items()]
+diff = [(p, n * SHARE_BASIS // after.total - fa.get(p, 0) * SHARE_BASIS // before.total) for p, n in flame.items()]
 diff.sort(key=lambda e: (-e[1], e[0]))
 print("biggest share increases:")
 for p, d in diff[:3]:
@@ -95,6 +100,6 @@ for p, d in diff[:3]:
 
 root_ok = flame["main"] == after.total and fa["main"] == before.total
 worst = next(d for p, d in diff if p.endswith("json_encode"))
-print(f"root equals samples: {str(root_ok).lower()}; json_encode regression found: {str(worst > 1000).lower()}")
-if not root_ok or worst <= 1000 or choose_hz(10, 250) != 40:
+print(f"root equals samples: {str(root_ok).lower()}; json_encode regression found: {str(worst > REGRESSION).lower()}")
+if not root_ok or worst <= REGRESSION or choose_hz(BUDGET_PERMILLE, 250) != 40:
     raise SystemExit(1)

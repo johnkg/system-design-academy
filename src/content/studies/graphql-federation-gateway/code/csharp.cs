@@ -8,14 +8,17 @@ var fields = new Dictionary<string, bool> { ["users"] = true, ["friends"] = true
 const int MaxDepth = 5, MaxCost = 500, ListGuess = 10;
 
 // The supergraph: whether each field returns a list. Lists are assumed to hold 10 items when costing.
-ulong seed = 7;
+const int Seed = 7, Users = 20, OrderSpread = 4, Products = 8; // each user has 0..3 orders
+const int MinPrice = 10, PriceSpread = 90, PriceStride = 37; // prices 10..99, scattered by a fixed stride
+
+ulong seed = Seed;
 int Random(int n) { seed = (seed * 1664525UL + 1013904223UL) % 4294967296UL; return (int)((seed >> 16) % (ulong)n); }
 
 // Subgraph data, keyed by entity id. Each subgraph only knows its own part.
-var users = Enumerable.Range(0, 20).ToList();
+var users = Enumerable.Range(0, Users).ToList();
 var orders = new List<(int Id, int UserId, int ProductId)>();
-foreach (var u in users) for (int k = Random(4); k > 0; k--) orders.Add((orders.Count, u, Random(8)));
-var prices = Enumerable.Range(0, 8).Select(i => 10 + (i * 37) % 90).ToArray();
+foreach (var u in users) for (int k = Random(OrderSpread); k > 0; k--) orders.Add((orders.Count, u, Random(Products)));
+var prices = Enumerable.Range(0, Products).Select(i => MinPrice + (i * PriceStride) % PriceSpread).ToArray();
 
 (Dictionary<string, int> calls, int total) Execute(bool batch)
 {

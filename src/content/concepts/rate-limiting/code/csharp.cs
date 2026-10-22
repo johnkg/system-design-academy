@@ -5,8 +5,10 @@ public static class Program
 {
     public static void Main()
     {
+        const int Capacity = 3; // burst size in tokens
+        const int RefillPerSecond = 1;
         double time = 0; // seconds, moved by hand
-        var bucket = new TokenBucket(3, 1, () => time);
+        var bucket = new TokenBucket(Capacity, RefillPerSecond, () => time);
 
         void Request(string label) =>
             Console.WriteLine($"t={time}s {label}: {(bucket.TryTake() ? "allowed" : "429 too many requests")}");

@@ -13,7 +13,13 @@ public static class Fleet
     public const int Cap = 8;
     public static readonly int[][] Lat = { new[] { 10, 60, 120 }, new[] { 60, 10, 90 }, new[] { 120, 90, 10 }, new[] { 30, 40, 100 } }; // ms from each region
     public static readonly List<Gateway> Gateways = Lat.Select((l, i) => new Gateway { Id = i, Lat = l }).ToList();
-    static uint seed = 7;
+    public const int Clients = 24, Regions = 3;
+    const int LoadPenaltyMs = 60; // a full gateway counts as 60 ms further away
+    const int KeySalt = 99, AddrBase = 1000; // per-session key derivation; tunnel addresses start at 1000
+    const int DeadAfter = 30; // ticks of silence before a peer is dead
+    const int Ipv4Bits = 32;
+    const uint Seed = 7;
+    static uint seed = Seed;
 
     public static uint Fnv(params uint[] xs) { uint h = 0x811c9dc5; foreach (var x in xs) h = unchecked((h ^ x) * 16777619u); return h; }
     public static int Rnd(int n) { seed = unchecked(seed * 1664525u + 1013904223u); return (int)((seed >> 8) % (uint)n); }
@@ -25,7 +31,7 @@ public static class Fleet
         foreach (var g in Gateways)
         {
             if (g.Draining || g.Sessions.Count >= Cap) continue;
-            int cost = g.Lat[region] + g.Sessions.Count * 60 / Cap;
+            int cost = g.Lat[region] + g.Sessions.Count * LoadPenaltyMs / Cap;
             if (cost < bestCost) { best = g; bestCost = cost; }
         }
         return best;
@@ -34,7 +40,7 @@ public static class Fleet
     public static Session Connect(int sid, int region)
     {
         var g = Pick(region);
-        var s = new Session { Sid = sid, Key = Fnv((uint)sid, 99), Region = region, Addr = 1000 + sid, Gw = g.Id };
+        var s = new Session { Sid = sid, Key = Fnv((uint)sid, KeySalt), Region = region, Addr = AddrBase + sid, Gw = g.Id };
         g.Sessions[sid] = s;
         return s;
     }
@@ -53,7 +59,7 @@ public static class Fleet
     }
 
     // Dead-peer detection: a keepalive every 10 ticks, and a peer is dead after 3 missed keepalives.
-    public static bool IsDead(Session s, int now) => now - s.LastSeen >= 30;
+    public static bool IsDead(Session s, int now) => now - s.LastSeen >= DeadAfter;
 
     // Drain: stop accepting, then resume every session elsewhere with the same key and sequence number.
     public static int Drain(Gateway g)
@@ -69,7 +75,7 @@ public static class Fleet
     }
 
     public static uint Ip(uint a, uint b, uint c, uint d) => (a << 24) | (b << 16) | (c << 8) | d;
-    public static bool InNet(uint addr, uint net, int bits) => (addr >> (32 - bits)) == (net >> (32 - bits));
+    public static bool InNet(uint addr, uint net, int bits) => (addr >> (Ipv4Bits - bits)) == (net >> (Ipv4Bits - bits));
     public static bool ViaTunnel(uint addr) => InNet(addr, Ip(10, 0, 0, 0), 8) || InNet(addr, Ip(192, 168, 0, 0), 16);
 }
 
@@ -80,8 +86,8 @@ public static class Program
 
     public static void Main()
     {
-        var regions = Enumerable.Range(0, 24).Select(_ => Fleet.Rnd(3)).ToList();
-        var nearest = new int[4];
+        var regions = Enumerable.Range(0, Fleet.Clients).Select(_ => Fleet.Rnd(Fleet.Regions)).ToList();
+        var nearest = new int[Fleet.Lat.Length];
         foreach (var r in regions) { var col = Fleet.Lat.Select(l => l[r]).ToList(); nearest[col.IndexOf(col.Min())]++; }
         var sessions = regions.Select((r, i) => Fleet.Connect(i + 1, r)).ToList();
         int Avg() => sessions.Sum(s => Fleet.Gateways[s.Gw].Lat[s.Region]) / sessions.Count;

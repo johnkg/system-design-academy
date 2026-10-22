@@ -7,7 +7,9 @@ const MIN_CANARY = 300;          // fewer requests than this prove nothing, so t
 const Z_LIMIT = 2.33;            // one-sided, about a 1% chance of a false alarm per check
 const TOTAL = REGIONS.reduce((s, r) => s + r.requests, 0);
 
-let seed = 7;
+const SEED = 7;
+const MAX_EXPOSED_SHARE = 50; // a bad release may reach at most 1/50 (2%) of all requests
+let seed = SEED;
 const chance = (per10000) => { seed = (seed * 1664525 + 1013904223) % 4294967296; return Math.floor(seed / 65536) % 10000 < per10000; };
 const errors = (n, rate) => { let e = 0; for (let i = 0; i < n; i++) if (chance(rate)) e++; return e; };
 
@@ -47,4 +49,4 @@ const bad = rollout('v3', 200);
 const share = (bad.exposed * 100) / TOTAL;
 console.log(`v2 finished: ${good.done}, v3 finished: ${bad.done}`);
 console.log(`v3 was seen by ${bad.exposed} of ${TOTAL} requests (${fmt2(Math.floor(share * 100))}%) before the rollback, ${bad.steps} checks`);
-if (!good.done || bad.done || bad.exposed > TOTAL / 50 || bad.steps !== 2) process.exit(1);
+if (!good.done || bad.done || bad.exposed > TOTAL / MAX_EXPOSED_SHARE || bad.steps !== 2) process.exit(1);

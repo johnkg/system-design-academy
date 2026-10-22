@@ -1,6 +1,10 @@
 # Three rate limiting algorithms in Python, tried on a burst that straddles a window boundary.
 # Limit: 10 requests per second. Times are in milliseconds and passed in, so the demo is deterministic.
 
+MS_PER_S, LIMIT, WINDOW_MS = 1000, 10, 1000
+BURST, GAP_MS, LATE_BURST_AT, EARLY_BURST_AT = 10, 10, 2900, 3000  # two bursts around the 3 s boundary
+GATEWAYS = 3
+
 
 class FixedWindow:
     def __init__(self, limit, window_ms):
@@ -43,7 +47,7 @@ class TokenBucket:
         self._last = 0
 
     def allow(self, t):
-        self._tokens = min(self.capacity, self._tokens + ((t - self._last) / 1000) * self.refill_per_second)
+        self._tokens = min(self.capacity, self._tokens + ((t - self._last) / MS_PER_S) * self.refill_per_second)
         self._last = t
         if self._tokens < 1:
             return False
@@ -52,27 +56,27 @@ class TokenBucket:
 
 
 # 10 requests in the last 100 ms of one second, and 10 more in the first 100 ms of the next
-times = [2900 + k * 10 for k in range(10)] + [3000 + k * 10 for k in range(10)]
+times = [LATE_BURST_AT + k * GAP_MS for k in range(BURST)] + [EARLY_BURST_AT + k * GAP_MS for k in range(BURST)]
 
 
 def run(name, allow):
     allowed = [t for t in times if allow(t)]
-    worst = max(len([u for u in allowed if t <= u < t + 1000]) for t in allowed)
+    worst = max(len([u for u in allowed if t <= u < t + MS_PER_S]) for t in allowed)
     print(f"{name}: allowed {len(allowed)} of {len(times)}, most in any 1 s: {worst}")
 
 
-run("fixed window     ", FixedWindow(10, 1000).allow)
-run("sliding log      ", SlidingWindowLog(10, 1000).allow)
-run("token bucket     ", TokenBucket(10, 10).allow)
+run("fixed window     ", FixedWindow(LIMIT, WINDOW_MS).allow)
+run("sliding log      ", SlidingWindowLog(LIMIT, WINDOW_MS).allow)
+run("token bucket     ", TokenBucket(LIMIT, LIMIT).allow)
 
 # Three gateways that each count on their own (the first attempt): requests rotate between them
-gateways = [FixedWindow(10, 1000) for _ in range(3)]
+gateways = [FixedWindow(LIMIT, WINDOW_MS) for _ in range(GATEWAYS)]
 turn = 0
 
 
 def separate_gates(t):
     global turn
-    allowed = gateways[turn % 3].allow(t)
+    allowed = gateways[turn % GATEWAYS].allow(t)
     turn += 1
     return allowed
 

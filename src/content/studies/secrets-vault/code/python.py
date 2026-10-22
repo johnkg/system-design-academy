@@ -2,7 +2,11 @@
 # The cipher is a toy (XOR with a seeded stream) so the example stays short and deterministic. Never use it for real secrets.
 import sys
 
-state = 7  # seeded generator, so every run prints the same thing
+SEED = 7
+KEY_BYTES = 16  # 128-bit master and data keys
+SHARES, THRESHOLD = 5, 3  # any 3 of 5 key holders can unseal
+LEASE_TTL, MAX_TTL = 60, 120  # seconds
+state = SEED  # seeded generator, so every run prints the same thing
 
 
 def next_value():
@@ -96,7 +100,7 @@ class Vault:
         self.master = combine(shares)
 
     def put(self, path, text):  # envelope: a fresh data key encrypts the secret, the master key only wraps it
-        dek, nonce_w, nonce_c = random_bytes(16), next_value(), next_value()
+        dek, nonce_w, nonce_c = random_bytes(KEY_BYTES), next_value(), next_value()
         self.store[path] = {"wrapped": cipher(dek, self.master, nonce_w), "nonce_w": nonce_w,
                             "ct": cipher(to_bytes(text), dek, nonce_c), "nonce_c": nonce_c}
 
@@ -109,7 +113,7 @@ class Vault:
         return to_text(cipher(e["ct"], cipher(e["wrapped"], self.master, e["nonce_w"]), e["nonce_c"]))
 
     def rotate_master(self):  # rewrap each data key under a new master; the stored secrets are not touched
-        fresh = random_bytes(16)
+        fresh = random_bytes(KEY_BYTES)
         for e in self.store.values():
             dek = cipher(e["wrapped"], self.master, e["nonce_w"])
             e["nonce_w"] = next_value()
@@ -139,13 +143,13 @@ def lower(flag):
     return "true" if flag else "false"
 
 
-master0 = random_bytes(16)
-shares = split(master0, 5, 3)
+master0 = random_bytes(KEY_BYTES)
+shares = split(master0, SHARES, THRESHOLD)
 print("share 1 starts with " + ",".join(str(v) for v in shares[0]["ys"][:4]))
 all_equal = True
-for i in range(5):
-    for j in range(i + 1, 5):
-        for k in range(j + 1, 5):
+for i in range(SHARES):
+    for j in range(i + 1, SHARES):
+        for k in range(j + 1, SHARES):
             all_equal = all_equal and hex_of(combine([shares[i], shares[j], shares[k]])) == hex_of(master0)
 two_work = hex_of(combine([shares[0], shares[1]])) == hex_of(master0)
 print(f"any 3 of 5 shares rebuild the master key: {lower(all_equal)}; 2 shares do: {lower(two_work)}")
@@ -164,11 +168,11 @@ after_ok = vault.read("web", "db/web") == "p4ss-web" and before == all_ct(vault)
 print(f"master rotated: {lower(keys_changed)}; 3 data keys rewrapped, stored ciphertext unchanged and readable: {lower(after_ok)}")
 print(f"audit has {len(vault.audit)} lines, last: {vault.audit[-1]}")
 
-a = vault.issue(0, 60, 120)
-b = vault.issue(10, 60, 120)
-vault.renew(a, 50, 60)  # a would reach 110
+a = vault.issue(0, LEASE_TTL, MAX_TTL)
+b = vault.issue(10, LEASE_TTL, MAX_TTL)
+vault.renew(a, 50, LEASE_TTL)  # a would reach 110
 gone75 = vault.sweep(75)
-vault.renew(a, 100, 60)  # capped at start + max_ttl = 120
+vault.renew(a, 100, LEASE_TTL)  # capped at start + max_ttl = 120
 gone130 = vault.sweep(130)
 print(f"leases: revoked {','.join(gone75)} at t=75, {','.join(gone130)} at t=130 (expiry capped at {a['expires']})")
 

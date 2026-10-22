@@ -3,7 +3,12 @@
 # an idempotent sink, and a polling copy for comparison. Values are positive, and 0 means "no row".
 import sys
 
-seed = 7
+SEED, CHANGES, KEYS, MAX_VALUE = 7, 400, 25, 1000
+DELETE_IN_10 = 2  # 2 in 10 writes to an existing row delete it
+POLL_EVERY = 50  # changes between two polls
+BATCH, CRASH_AT_BATCH = 25, 6  # the connector crashes once, after its 6th batch
+
+seed = SEED
 
 
 def random(n):
@@ -39,15 +44,15 @@ def poll():
     cursor = len(log)
 
 
-for i in range(400):  # 400 changes to 25 keys
-    key = random(25)
+for i in range(CHANGES):
+    key = random(KEYS)
     if key not in table:
-        write("insert", key, 1 + random(1000))
-    elif random(10) < 2:
+        write("insert", key, 1 + random(MAX_VALUE))
+    elif random(10) < DELETE_IN_10:
         write("delete", key, 0)
     else:
-        write("update", key, 1 + random(1000))
-    if (i + 1) % 50 == 0:
+        write("update", key, 1 + random(MAX_VALUE))
+    if (i + 1) % POLL_EVERY == 0:
         poll()
 
 
@@ -75,13 +80,13 @@ delta_total = 0  # a careless sink that adds (after - before) for every event it
 delivered = committed = batches = 0
 crashed = False
 while committed < len(log):
-    batch = log[committed:committed + 25]
+    batch = log[committed:committed + BATCH]
     for e in batch:
         sink.apply(e)
         delta_total += e["after"] - e["before"]
         delivered += 1
     batches += 1
-    if batches == 6 and not crashed:  # crash after applying the batch, before committing its offset: restart from the old offset
+    if batches == CRASH_AT_BATCH and not crashed:  # crash after applying the batch, before committing its offset: restart from the old offset
         crashed = True
         continue
     committed += len(batch)

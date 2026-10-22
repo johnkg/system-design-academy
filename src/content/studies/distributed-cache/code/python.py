@@ -5,6 +5,10 @@ import bisect
 import sys
 
 M = 0xFFFFFFFF
+EXPIRES_AT, STAMPEDE_END, LOAD_MS = 100, 200, 40  # the stampede scenario, in ms
+KEY_COUNT, NODES, VNODES = 10000, 4, 100
+CACHE_CAPACITY, DEMO_TTL = 3, 100
+BURST_KEYS, TTL_MS, JITTER_MS, MS_PER_S = 1000, 300000, 30000, 1000  # 5 min TTL, +/- 10% jitter
 
 
 def hash32(s):
@@ -61,30 +65,30 @@ class Cache:
 def stampede(single_flight):
     """A key expires at 100 ms; one request per millisecond arrives until 200 ms, and a database load takes 40 ms."""
     loads, ready, started = 0, float("inf"), False
-    for t in range(100, 200):
+    for t in range(EXPIRES_AT, STAMPEDE_END):
         if t >= ready:
             continue  # refilled: a hit
         if single_flight and started:
             continue  # waits for the load already running
         loads += 1
         started = True
-        ready = min(ready, t + 40)
+        ready = min(ready, t + LOAD_MS)
     return loads
 
 
 def peak(keys, jitter):
     per_second = {}
-    for k in keys[:1000]:
-        ttl = 300000 + ((hash32(k) % 60000) - 30000 if jitter else 0)  # +/- 10%
-        s = ttl // 1000
+    for k in keys[:BURST_KEYS]:
+        ttl = TTL_MS + ((hash32(k) % (2 * JITTER_MS)) - JITTER_MS if jitter else 0)
+        s = ttl // MS_PER_S
         per_second[s] = per_second.get(s, 0) + 1
     return max(per_second.values())
 
 
-keys = [f"user:{i}" for i in range(10000)]
+keys = [f"user:{i}" for i in range(KEY_COUNT)]
 
-ring4, ring5 = Ring(4, 100), Ring(5, 100)
-load = [0, 0, 0, 0]
+ring4, ring5 = Ring(NODES, VNODES), Ring(NODES + 1, VNODES)
+load = [0] * NODES
 before = []
 for k in keys:
     n = ring4.owner(k)
@@ -96,18 +100,18 @@ for k, b in zip(keys, before):
     after = ring5.owner(k)
     if after != b:
         moved += 1
-        if after != 4:
+        if after != NODES:
             to_new = False
-    if hash32(k) % 4 != hash32(k) % 5:
+    if hash32(k) % NODES != hash32(k) % (NODES + 1):
         mod_moved += 1
 print(f"adding a 5th node moves {moved} keys on the ring, all to the new node: {str(to_new).lower()}; hash mod N would move {mod_moved}")
 
-cache = Cache(3)
-cache.set("a", 1, 0, 100)
-cache.set("b", 2, 0, 100)
-cache.set("c", 3, 0, 100)
+cache = Cache(CACHE_CAPACITY)
+cache.set("a", 1, 0, DEMO_TTL)
+cache.set("b", 2, 0, DEMO_TTL)
+cache.set("c", 3, 0, DEMO_TTL)
 cache.get("a", 10)  # a is now the newest, so b is the oldest
-cache.set("d", 4, 20, 100)  # over the limit: b is evicted
+cache.set("d", 4, 20, DEMO_TTL)  # over the limit: b is evicted
 
 
 def shown(v):
@@ -122,7 +126,7 @@ print(f"database loads while refilling: {plain} without protection, {single} wit
 flat, spread = peak(keys, False), peak(keys, True)
 print(f"1000 keys cached together: most expiries in one second is {flat} without jitter, {spread} with it")
 
-ok = (to_new and moved < 3000 and mod_moved > 7000 and min(load) > 2000 and plain == 40 and single == 1
-      and flat == 1000 and spread < 50 and ",".join(cache.evicted) == "b" and cache.get("b", 30) is None)
+ok = (to_new and moved < 3000 and mod_moved > 7000 and min(load) > 2000 and plain == LOAD_MS and single == 1
+      and flat == BURST_KEYS and spread < 50 and ",".join(cache.evicted) == "b" and cache.get("b", 30) is None)
 if not ok:
     sys.exit(1)

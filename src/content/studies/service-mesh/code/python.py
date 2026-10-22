@@ -5,8 +5,12 @@ import sys
 PODS, TICKS, PER_TICK, BAD_POD, BAD_FROM, OUTAGE_FROM, OUTAGE_TO = 5, 300, 2, 3, 50, 200, 220
 HOLD = [2, 5, 2, 2, 2]  # ticks a request stays in flight; pod 1 is slow
 MAX_RETRIES, EJECT_AFTER, EJECT_TICKS = 3, 5, 30
+SEED = 7
+RETRY_BUDGET = 5  # retries may be at most 1/5 (20%) of requests
+RELEASE_SLACK = 10  # ticks past the end for requests still in flight
+MIN_OK_SHARE = 0.9  # retries alone must still deliver 90% of requests
 
-seed = 7
+seed = SEED
 
 
 def random(n):
@@ -17,9 +21,9 @@ def random(n):
 
 def run(eject, budget):
     global seed
-    seed = 7
+    seed = SEED
     active, consecutive, ejected_until, sent = [0] * PODS, [0] * PODS, [0] * PODS, [0] * PODS
-    releases = [[] for _ in range(TICKS + 10)]
+    releases = [[] for _ in range(TICKS + RELEASE_SLACK)]
     r = {"requests": 0, "ok": 0, "attempts": 0, "retries": 0, "ejections": 0, "denied": 0, "bad_before": 0}
 
     # Power of two choices: draw two candidate pods and take the one with fewer requests in flight.
@@ -58,7 +62,7 @@ def run(eject, budget):
                 tried.append(p)
                 if k == MAX_RETRIES:
                     break
-                if budget and (r["retries"] + 1) * 5 > r["requests"]:  # the budget: retries <= 20% of requests
+                if budget and (r["retries"] + 1) * RETRY_BUDGET > r["requests"]:  # the budget: retries <= 20% of requests
                     r["denied"] += 1
                     break
                 r["retries"] += 1
@@ -80,9 +84,9 @@ print(f"amplification: {plain['attempts'] / plain['requests']:.2f} plain, {both[
 
 checks = [
     eject["bad_before"] * 2 < plain["bad_before"],      # ejection stops most traffic to the bad pod
-    budget["retries"] * 5 <= budget["requests"],        # the budget bounds retries to 20% of requests
+    budget["retries"] * RETRY_BUDGET <= budget["requests"],        # the budget bounds retries to 20% of requests
     both["attempts"] < plain["attempts"],               # less wasted work
-    plain["ok"] > plain["requests"] * 0.9 and both["ok"] > 0,  # retries still hide the one bad pod
+    plain["ok"] > plain["requests"] * MIN_OK_SHARE and both["ok"] > 0,  # retries still hide the one bad pod
 ]
 if False in checks:
     print("invariant failed", checks)

@@ -23,7 +23,8 @@ class Radio { // Concrete Implementor
 class Remote { // Abstraction: holds the bridge
   constructor(device) { this.device = device; }
   togglePower() { this.device.isEnabled() ? this.device.disable() : this.device.enable(); }
-  volumeUp() { this.device.setVolume(this.device.getVolume() + 10); }
+  static VOLUME_STEP = 10; // one button press
+  volumeUp() { this.device.setVolume(this.device.getVolume() + Remote.VOLUME_STEP); }
 }
 
 class AdvancedRemote extends Remote { // Refined Abstraction

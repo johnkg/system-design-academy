@@ -1,7 +1,11 @@
 // A tiny secrets vault in JavaScript: Shamir-split master key, envelope encryption, policies with audit, master rotation, and leases.
 // The cipher is a toy (XOR with a seeded stream) so the example stays short and deterministic. Never use it for real secrets.
 
-let state = 7; // seeded generator, so every run prints the same thing
+const SEED = 7;
+const KEY_BYTES = 16; // 128-bit master and data keys
+const SHARES = 5, THRESHOLD = 3; // any 3 of 5 key holders can unseal
+const LEASE_TTL = 60, MAX_TTL = 120; // seconds
+let state = SEED; // seeded generator, so every run prints the same thing
 const next = () => { state = (state * 1664525 + 1013904223) % 4294967296; return state; };
 const rnd = (n) => Math.floor(next() / 65536) % n;
 const randomBytes = (n) => Array.from({ length: n }, () => rnd(256));
@@ -42,7 +46,7 @@ class Vault {
   constructor(policies) { this.master = null; this.store = new Map(); this.audit = []; this.policies = policies; this.leases = []; this.issued = 0; }
   unseal(shares) { this.master = combine(shares); }
   put(path, text) { // envelope: a fresh data key encrypts the secret, the master key only wraps the data key
-    const dek = randomBytes(16), nonceW = next(), nonceC = next();
+    const dek = randomBytes(KEY_BYTES), nonceW = next(), nonceC = next();
     this.store.set(path, { wrapped: cipher(dek, this.master, nonceW), nonceW, ct: cipher(toBytes(text), dek, nonceC), nonceC });
   }
   read(token, path) { // every read is logged, allowed or not
@@ -53,7 +57,7 @@ class Vault {
     return toText(cipher(e.ct, cipher(e.wrapped, this.master, e.nonceW), e.nonceC));
   }
   rotateMaster() { // rewrap each data key under a new master; the stored secrets are not touched
-    const fresh = randomBytes(16);
+    const fresh = randomBytes(KEY_BYTES);
     for (const e of this.store.values()) { const dek = cipher(e.wrapped, this.master, e.nonceW); e.nonceW = next(); e.wrapped = cipher(dek, fresh, e.nonceW); }
     this.master = fresh;
   }
@@ -62,11 +66,11 @@ class Vault {
   sweep(now) { const dead = this.leases.filter((l) => l.expires <= now); this.leases = this.leases.filter((l) => l.expires > now); return dead.map((l) => l.user); }
 }
 
-const master0 = randomBytes(16);
-const shares = split(master0, 5, 3);
+const master0 = randomBytes(KEY_BYTES);
+const shares = split(master0, SHARES, THRESHOLD);
 console.log(`share 1 starts with ${shares[0].ys.slice(0, 4).join(',')}`);
 let allEqual = true;
-for (let i = 0; i < 5; i++) for (let j = i + 1; j < 5; j++) for (let k = j + 1; k < 5; k++) allEqual = allEqual && hex(combine([shares[i], shares[j], shares[k]])) === hex(master0);
+for (let i = 0; i < SHARES; i++) for (let j = i + 1; j < SHARES; j++) for (let k = j + 1; k < SHARES; k++) allEqual = allEqual && hex(combine([shares[i], shares[j], shares[k]])) === hex(master0);
 const twoWork = hex(combine([shares[0], shares[1]])) === hex(master0);
 console.log(`any 3 of 5 shares rebuild the master key: ${allEqual}; 2 shares do: ${twoWork}`);
 
@@ -82,10 +86,10 @@ const afterOk = vault.read('web', 'db/web') === 'p4ss-web' && before === hex([..
 console.log(`master rotated: ${keysChanged}; 3 data keys rewrapped, stored ciphertext unchanged and readable: ${afterOk}`);
 console.log(`audit has ${vault.audit.length} lines, last: ${vault.audit[vault.audit.length - 1]}`);
 
-const a = vault.issue(0, 60, 120), b = vault.issue(10, 60, 120);
-vault.renew(a, 50, 60); // a would reach 110
+const a = vault.issue(0, LEASE_TTL, MAX_TTL), b = vault.issue(10, LEASE_TTL, MAX_TTL);
+vault.renew(a, 50, LEASE_TTL); // a would reach 110
 const gone75 = vault.sweep(75);
-vault.renew(a, 100, 60); // capped at start + maxTtl = 120
+vault.renew(a, 100, LEASE_TTL); // capped at start + maxTtl = 120
 const gone130 = vault.sweep(130);
 console.log(`leases: revoked ${gone75.join(',')} at t=75, ${gone130.join(',')} at t=130 (expiry capped at ${a.expires})`);
 

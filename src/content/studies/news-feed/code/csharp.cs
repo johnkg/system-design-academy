@@ -10,7 +10,9 @@ public static class Program
 
     public static void Main()
     {
-        var svc = new FeedService(3); // an author with 3 or more followers counts as popular, to keep the demo small
+        const int PopularFollowers = 3; // an author with 3 or more followers counts as popular, to keep the demo small
+        const int PageSize = 2;
+        var svc = new FeedService(PopularFollowers);
         svc.Follow("ann", "bob");
         svc.Follow("dan", "bob");
         foreach (var user in new[] { "ann", "dan", "eve" }) svc.Follow(user, "cat"); // cat becomes popular
@@ -19,10 +21,10 @@ public static class Program
         Console.WriteLine($"cat posts 'big news':     pushed to {svc.Publish("cat", "big news")} feeds");
         Console.WriteLine($"bob posts 'coffee':       pushed to {svc.Publish("bob", "coffee")} feeds");
 
-        var first = svc.Feed("ann", 2);
+        var first = svc.Feed("ann", PageSize);
         Console.WriteLine($"ann page 1:               {Show(first)}");
-        Console.WriteLine($"ann page 2:               {Show(svc.Feed("ann", 2, first.NextCursor))}");
-        Console.WriteLine($"eve page 1:               {Show(svc.Feed("eve", 2))}");
+        Console.WriteLine($"ann page 2:               {Show(svc.Feed("ann", PageSize, first.NextCursor))}");
+        Console.WriteLine($"eve page 1:               {Show(svc.Feed("eve", PageSize))}");
     }
 }
 

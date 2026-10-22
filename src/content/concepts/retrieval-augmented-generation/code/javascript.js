@@ -8,14 +8,19 @@ const DOCS = {
   payments: "Payments. We accept cards and bank transfer. Invoices are due in 30 days. A failed payment is retried twice before the order is cancelled.",
 };
 const ANSWER = "laptops are accepted within 30 days of delivery";
+const MIN_STEM_LENGTH = 4; // only words of 4+ letters lose a plural "s"
+const IDF_SCALE = 4096; // fixed-point scale for n / df
+const TOKENS_PER_10_WORDS = 13, CITATION_TOKENS = 6; // about 1.3 tokens per word plus a citation header
+const TF_CAP = 2; // a term counts at most twice per chunk
+const RERANK_POOL = 8, RERANK_WINDOW = 12, RERANK_WEIGHT = 4; // rerank the 8 best by their densest 12-word window
 const STOP = new Set("how can i a an the of to is are in on and or for after you your with by it".split(" "));
 
 const words = (t) => t.toLowerCase().replace(/[^a-z0-9 ]/g, " ").split(" ").filter(Boolean);
-const stem = (w) => (w.length > 3 && w.endsWith("s") ? w.slice(0, -1) : w);
+const stem = (w) => (w.length >= MIN_STEM_LENGTH && w.endsWith("s") ? w.slice(0, -1) : w);
 const bitLength = (x) => { let n = 0; for (; x > 0; x = Math.floor(x / 2)) n++; return n; };
 // integer idf in half-octave steps: rarer terms weigh more, and every language computes the same number
-const idfOf = (n, df) => { const x = Math.floor((4096 * n) / df), b = bitLength(x) - 1; return 2 * b + (b >= 1 ? Math.floor(x / 2 ** (b - 1)) % 2 : 0); };
-const tokensOf = (wordCount) => Math.floor((wordCount * 13 + 9) / 10) + 6; // about 1.3 tokens per word plus a citation header
+const idfOf = (n, df) => { const x = Math.floor((IDF_SCALE * n) / df), b = bitLength(x) - 1; return 2 * b + (b >= 1 ? Math.floor(x / 2 ** (b - 1)) % 2 : 0); };
+const tokensOf = (wordCount) => Math.floor((wordCount * TOKENS_PER_10_WORDS + 9) / 10) + CITATION_TOKENS; // rounded up
 
 function chunk(size, overlap) {
   const out = [];
@@ -41,17 +46,17 @@ function retrieve(query, { size, overlap, k, rerank, budget }) {
   for (const c of chunks) {
     const stems = c.words.map(stem);
     c.score = 0;
-    for (const t of terms) { const tf = stems.filter((x) => x === t).length; c.score += (idf[t] ?? 0) * Math.min(tf, 2); }
+    for (const t of terms) { const tf = stems.filter((x) => x === t).length; c.score += (idf[t] ?? 0) * Math.min(tf, TF_CAP); }
   }
   const order = (a, b) => b.score - a.score || (a.id < b.id ? -1 : 1);
   let ranked = chunks.filter((c) => c.score > 0).sort(order);
   if (rerank) { // second stage on the 8 best candidates: reward a dense 12 word window instead of scattered matches
-    ranked = ranked.slice(0, 8);
+    ranked = ranked.slice(0, RERANK_POOL);
     for (const c of ranked) {
       const stems = c.words.map(stem);
       let best = 0;
-      for (let s = 0; s < stems.length; s++) best = Math.max(best, terms.filter((t) => stems.slice(s, s + 12).includes(t)).reduce((a, t) => a + (idf[t] ?? 0), 0));
-      c.score = best * 4 + Math.floor(c.score / 4);
+      for (let s = 0; s < stems.length; s++) best = Math.max(best, terms.filter((t) => stems.slice(s, s + RERANK_WINDOW).includes(t)).reduce((a, t) => a + (idf[t] ?? 0), 0));
+      c.score = best * RERANK_WEIGHT + Math.floor(c.score / RERANK_WEIGHT);
     }
     ranked.sort(order);
   }

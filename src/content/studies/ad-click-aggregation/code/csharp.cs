@@ -10,7 +10,14 @@ public record Result(int Total, int Late, int Duplicates, int Lost, int AvgDelay
 
 public static class Program
 {
-    static ulong seed = 7;
+    const int Seed = 7, Clicks = 400, SpanS = 300;
+    const int OnTimePct = 85, HeldPct = 12; // the remaining 3% come from phones that were offline
+    const int OnTimeSpread = 3, HeldMin = 2, HeldSpread = 9, OfflineMin = 10, OfflineSpread = 36; // delays 0..2, 2..10, 10..45 s
+    const int RetryOneIn = 8;
+    const int SoonIn5 = 4, SoonMin = 1, SoonSpread = 7, LateCopyMin = 15, LateCopySpread = 41; // copy delay: 4 in 5 after 1..7 s, else 15..55 s
+    const int WindowS = 30, ExactLateness = 60; // ExactLateness exceeds every delay in the stream
+
+    static ulong seed = Seed;
     static int Random(int n) { seed = (seed * 1664525UL + 1013904223UL) % 4294967296UL; return (int)((seed / 65536) % (ulong)n); }
 
     // 400 true clicks over 300 seconds. Most arrive within 2 s, some are held up for up to 45 s (a phone that was offline).
@@ -18,12 +25,12 @@ public static class Program
     static List<Click> MakeStream()
     {
         var events = new List<Click>();
-        for (int id = 0; id < 400; id++)
+        for (int id = 0; id < Clicks; id++)
         {
-            int t = Random(300), u = Random(100);
-            int delay = u < 85 ? Random(3) : u < 97 ? 2 + Random(9) : 10 + Random(36);
+            int t = Random(SpanS), u = Random(100);
+            int delay = u < OnTimePct ? Random(OnTimeSpread) : u < OnTimePct + HeldPct ? HeldMin + Random(HeldSpread) : OfflineMin + Random(OfflineSpread);
             events.Add(new Click(id, t, t + delay, 0));
-            if (Random(8) == 0) events.Add(new Click(id, t, t + delay + (Random(5) < 4 ? 1 + Random(7) : 15 + Random(41)), 1));
+            if (Random(RetryOneIn) == 0) events.Add(new Click(id, t, t + delay + (Random(5) < SoonIn5 ? SoonMin + Random(SoonSpread) : LateCopyMin + Random(LateCopySpread)), 1));
         }
         return events.OrderBy(e => e.Arrival).ThenBy(e => e.Id).ThenBy(e => e.Copy).ToList();
     }
@@ -50,7 +57,7 @@ public static class Program
                 }
             }
         }
-        return new Result(counts.Values.Sum(), late, duplicates, 400 - counted.Count, delaySum / closedCount);
+        return new Result(counts.Values.Sum(), late, duplicates, Clicks - counted.Count, delaySum / closedCount);
     }
 
     public static int Main()
@@ -69,11 +76,11 @@ public static class Program
         foreach (var (dedup, r) in rows)
         {
             if (dedup && r.Duplicates != 0) ok = false;                 // dedup never counts a click twice
-            if (!dedup && r.Total - 400 + r.Lost != r.Duplicates) ok = false; // counted = clicks seen + double counts
+            if (!dedup && r.Total - Clicks + r.Lost != r.Duplicates) ok = false; // counted = clicks seen + double counts
         }
-        var full = Aggregate(events, 30, 60, true);                     // more lateness than any delay, with dedup: exact
-        if (full.Total != 400 || full.Lost != 0 || full.Late != 0) ok = false;
-        var a = Aggregate(events, 30, 0, true); var b = Aggregate(events, 30, 5, true); var c = Aggregate(events, 30, 30, true);
+        var full = Aggregate(events, WindowS, ExactLateness, true);                     // more lateness than any delay, with dedup: exact
+        if (full.Total != Clicks || full.Lost != 0 || full.Late != 0) ok = false;
+        var a = Aggregate(events, WindowS, 0, true); var b = Aggregate(events, WindowS, 5, true); var c = Aggregate(events, WindowS, 30, true);
         if (!(a.Late >= b.Late && b.Late >= c.Late && c.Late >= full.Late)) ok = false; // more lateness never drops more
         Console.WriteLine($"invariants hold: {(ok ? "true" : "false")}");
         return ok ? 0 : 1;

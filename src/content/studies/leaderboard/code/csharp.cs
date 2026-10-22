@@ -60,29 +60,33 @@ public class Leaderboard
 
 public static class Program
 {
-    static long seed = 2024;
+    const long Seed = 2024;
+    const int Shards = 5;
+    const int Updates = 20000, Players = 2000, MaxScore = 1000;
+    const int TopN = 5, CheckedTop = 100, ProbeIndex = 1234, SpotCheckEvery = 97;
+    static long seed = Seed;
     static int Random(int n) { seed = (seed * 1664525 + 1013904223) % 4294967296; return (int)(seed / 65536 % n); }
 
     public static int Main()
     {
-        var board = new Leaderboard(5);
+        var board = new Leaderboard(Shards);
         var truth = new Dictionary<int, int>(); // the same scores kept the slow, obvious way, to check against
-        for (int i = 0; i < 20000; i++) // 20,000 updates to 2,000 players, so most players are updated many times
+        for (int i = 0; i < Updates; i++) // 20,000 updates to 2,000 players, so most players are updated many times
         {
-            int id = Random(2000), score = Random(1000);
+            int id = Random(Players), score = Random(MaxScore);
             board.Update(id, score); truth[id] = score;
         }
 
         var all = truth.Select(kv => new Entry(kv.Key, kv.Value)).ToList();
         all.Sort(Rules.Compare);
-        var top = board.Top(5);
+        var top = board.Top(TopN);
         Console.WriteLine($"top 5: {string.Join(", ", top.Select(e => $"#{e.Id} ({e.Score})"))}");
-        int probe = all[1234].Id;
-        Console.WriteLine($"player #{probe} has score {truth[probe]} and rank {board.Rank(probe)}; the full sort says {1234 + 1}");
+        int probe = all[ProbeIndex].Id;
+        Console.WriteLine($"player #{probe} has score {truth[probe]} and rank {board.Rank(probe)}; the full sort says {ProbeIndex + 1}");
 
-        bool sameTop = board.Top(100).SequenceEqual(all.Take(100));
-        bool sameRank = all.Select((e, i) => (e, i)).All(t => t.i % 97 != 0 || board.Rank(t.e.Id) == t.i + 1); // spot-check every 97th player
+        bool sameTop = board.Top(CheckedTop).SequenceEqual(all.Take(CheckedTop));
+        bool sameRank = all.Select((e, i) => (e, i)).All(t => t.i % SpotCheckEvery != 0 || board.Rank(t.e.Id) == t.i + 1); // spot-check every 97th player
         Console.WriteLine($"top 100 matches the full sort: {sameTop.ToString().ToLowerInvariant()}; ranks match: {sameRank.ToString().ToLowerInvariant()}");
-        return !sameTop || !sameRank || board.Rank(probe) != 1235 ? 1 : 0;
+        return !sameTop || !sameRank || board.Rank(probe) != ProbeIndex + 1 ? 1 : 0;
     }
 }

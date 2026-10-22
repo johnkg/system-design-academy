@@ -10,7 +10,10 @@ public static class Program
     const int Min = 1024, AvgBits = 12, Max = 16384; // chunks average about 4 KB (2^12 bytes), and are never under 1 KB or over 16 KB
     const int Fixed = 4096;
 
-    static long seed = 7; // a small repeatable random generator, so every run sees the same file
+    const long Seed = 7;
+    const int FileBytes = 300000, Inserted = 10;
+    const int MinResentFixed = 90, MaxResentCdc = 10; // percent of the file sent again after the edit
+    static long seed = Seed; // a small repeatable random generator, so every run sees the same file
     static long NextRandom() => seed = (seed * 1664525 + 1013904223) % 4294967296;
     static uint[] gear = Array.Empty<uint>(); // a random number for each possible byte value
     static byte[] RandomBytes(int n) => Enumerable.Range(0, n).Select(_ => (byte)((NextRandom() >> 16) & 255)).ToArray();
@@ -57,8 +60,8 @@ public static class Program
     public static int Main()
     {
         gear = Enumerable.Range(0, 256).Select(_ => (uint)NextRandom()).ToArray();
-        var original = RandomBytes(300000);
-        var edited = RandomBytes(10).Concat(original).ToArray(); // 10 bytes inserted at the very start
+        var original = RandomBytes(FileBytes);
+        var edited = RandomBytes(Inserted).Concat(original).ToArray(); // 10 bytes inserted at the very start
 
         int failures = 0;
         foreach (var (name, chunker, limitHigh) in new (string, Func<byte[], List<byte[]>>, bool)[] { ("fixed 4 KB chunks", ChunkFixed, true), ("content-defined chunks", ChunkByContent, false) })
@@ -68,8 +71,8 @@ public static class Program
             long second = Sync(server, chunker(edited));
             double share = second * 100.0 / edited.Length;
             Console.WriteLine($"{name}: first upload {first} bytes, after inserting 10 bytes at the start {second} bytes ({share:0.0}% of the file)");
-            if (limitHigh && share < 90) failures++; // fixed chunks: every boundary moved, so nearly everything is sent again
-            if (!limitHigh && share > 10) failures++; // content-defined: only the chunk around the edit is sent
+            if (limitHigh && share < MinResentFixed) failures++; // fixed chunks: every boundary moved, so nearly everything is sent again
+            if (!limitHigh && share > MaxResentCdc) failures++; // content-defined: only the chunk around the edit is sent
         }
         return failures > 0 ? 1 : 0;
     }

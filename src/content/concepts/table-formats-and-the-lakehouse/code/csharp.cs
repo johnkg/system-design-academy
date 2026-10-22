@@ -22,8 +22,10 @@ class Catalog
 
 static class Program
 {
+    const int MaxRetries = 4; // a writer gives up after this many lost compare-and-swaps
+
     // Optimistic commit built on snapshot `baseV`; on a lost race, validate and retry.
-    static int Commit(Catalog cat, string who, int baseV, string[] adds, string[] removes, int maxRetries = 4)
+    static int Commit(Catalog cat, string who, int baseV, string[] adds, string[] removes, int maxRetries = MaxRetries)
     {
         int attempts = 0;
         while (true)

@@ -11,7 +11,10 @@ FIELDS = {
     'price': False,
 }
 MAX_DEPTH, MAX_COST, LIST_GUESS = 5, 500, 10
-seed = 7
+SEED, USERS, ORDER_SPREAD, PRODUCTS = 7, 20, 4, 8  # each user has 0..3 orders
+MIN_PRICE, PRICE_SPREAD, PRICE_STRIDE = 10, 90, 37  # prices 10..99, scattered by a fixed stride
+
+seed = SEED
 
 def random(n):
     global seed
@@ -20,12 +23,12 @@ def random(n):
 
 
 # Subgraph data, keyed by entity id. Each subgraph only knows its own part.
-users = list(range(20))
+users = list(range(USERS))
 orders = []
 for u in users:
-    for _ in range(random(4)):
-        orders.append({'id': len(orders), 'user_id': u, 'product_id': random(8)})
-prices = [10 + ((i * 37) % 90) for i in range(8)]
+    for _ in range(random(ORDER_SPREAD)):
+        orders.append({'id': len(orders), 'user_id': u, 'product_id': random(PRODUCTS)})
+prices = [MIN_PRICE + ((i * PRICE_STRIDE) % PRICE_SPREAD) for i in range(PRODUCTS)]
 
 def make_subgraphs(calls):
     def hit(name):

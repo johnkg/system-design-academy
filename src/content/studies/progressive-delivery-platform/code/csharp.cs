@@ -9,7 +9,9 @@ const long MinCanary = 300;   // fewer requests than this prove nothing, so the 
 const double ZLimit = 2.33;   // one-sided, about a 1% chance of a false alarm per check
 long total = regions.Sum(r => r.Requests);
 
-long seed = 7;
+const long Seed = 7;
+const double MaxExposedShare = 50; // a bad release may reach at most 1/50 (2%) of all requests
+long seed = Seed;
 bool Chance(int per10000)
 {
     seed = (seed * 1664525 + 1013904223) % 4294967296;
@@ -57,4 +59,4 @@ var badRelease = Rollout("v3", 200);
 double share = badRelease.Exposed * 100.0 / total;
 Console.WriteLine($"v2 finished: {good.Done.ToString().ToLower()}, v3 finished: {badRelease.Done.ToString().ToLower()}");
 Console.WriteLine($"v3 was seen by {badRelease.Exposed} of {total} requests ({Fmt2((long)Math.Floor(share * 100))}%) before the rollback, {badRelease.Steps} checks");
-if (!good.Done || badRelease.Done || badRelease.Exposed > total / 50.0 || badRelease.Steps != 2) Environment.Exit(1);
+if (!good.Done || badRelease.Done || badRelease.Exposed > total / MaxExposedShare || badRelease.Steps != 2) Environment.Exit(1);

@@ -3,6 +3,12 @@
 // and response rate limiting (RRL) against a spoofed amplification attack.
 
 const fnv = (s) => { let h = 0x811c9dc5; for (const c of s) h = Math.imul(h ^ c.charCodeAt(0), 16777619) >>> 0; return h; }; // 32-bit FNV-1a hash
+const DEFAULT_TTL = 300, CDN_TTL = 60, CLIENTS = 10000;
+const CHECK_INTERVAL = 10, FAIL_THRESHOLD = 3; // health checks every 10 s, 3 failures in a row mark the address down
+const RRL_LIMIT = 5; // full answers per second per (client prefix, name)
+const ATTACK_SECONDS = 3, ATTACK_QPS = 1000, LEGIT_QPS = 2;
+const ANSWER_BYTES = 1400, SLIP_BYTES = 90, QUERY_BYTES = 70; // a signed answer, a truncated reply, a spoofed query
+const MIN_REDUCTION = 20; // RRL must cut the reflected bytes at least 20-fold
 const NEG_TTL = 60;          // how long resolvers may cache "no such name" (the SOA minimum)
 const PRIMARY = '192.0.2.10';
 const ZONE = {
@@ -62,27 +68,27 @@ class Limiter {
 }
 
 function attack(rrl) {
-  const limiter = rrl ? new Limiter(5) : null;
+  const limiter = rrl ? new Limiter(RRL_LIMIT) : null;
   const victim = { answer: 0, slip: 0, drop: 0 }, legit = { answer: 0, slip: 0, drop: 0 };
-  for (let sec = 0; sec < 3; sec++) {
-    for (let i = 0; i < 1000; i++) victim[limiter ? limiter.check('198.51.100.0/24', 'www.example.com', sec) : 'answer']++; // spoofed source = the victim
-    for (let i = 0; i < 2; i++) legit[limiter ? limiter.check('203.0.113.0/24', 'www.example.com', sec) : 'answer']++;
+  for (let sec = 0; sec < ATTACK_SECONDS; sec++) {
+    for (let i = 0; i < ATTACK_QPS; i++) victim[limiter ? limiter.check('198.51.100.0/24', 'www.example.com', sec) : 'answer']++; // spoofed source = the victim
+    for (let i = 0; i < LEGIT_QPS; i++) legit[limiter ? limiter.check('203.0.113.0/24', 'www.example.com', sec) : 'answer']++;
   }
-  const bytes = victim.answer * 1400 + victim.slip * 90; // a signed answer is 1400 bytes, a truncated reply 90
-  return { victim, legit, bytes, amplification: (bytes / (3000 * 70)).toFixed(2) }; // the attacker sent 3000 queries of 70 bytes
+  const bytes = victim.answer * ANSWER_BYTES + victim.slip * SLIP_BYTES;
+  return { victim, legit, bytes, amplification: (bytes / (ATTACK_SECONDS * ATTACK_QPS * QUERY_BYTES)).toFixed(2) }; // bytes out per byte the attacker sent
 }
 
 const none = new Set();
 for (const name of ['www.example.com', 'mail.example.com', 'nope.example.com']) {
-  const a = resolve(name, 'r1', none, 300);
+  const a = resolve(name, 'r1', none, DEFAULT_TTL);
   console.log(`${name} -> ${a.rcode} ${a.ips.join(',')} ttl ${a.ttl}`);
 }
-console.log(`www with the primary down -> ${resolve('www.example.com', 'r1', new Set([PRIMARY]), 300).ips.join(',')}`);
-console.log(`everything down fails open -> ${resolve('www.example.com', 'r1', new Set(ZONE['www.example.com'].ips), 300).ips.join(',')}`);
+console.log(`www with the primary down -> ${resolve('www.example.com', 'r1', new Set([PRIMARY]), DEFAULT_TTL).ips.join(',')}`);
+console.log(`everything down fails open -> ${resolve('www.example.com', 'r1', new Set(ZONE['www.example.com'].ips), DEFAULT_TTL).ips.join(',')}`);
 
 const count = (down) => { // how 10,000 different clients are spread over the three addresses
   const c = {};
-  for (let i = 0; i < 10000; i++) { const ip = resolve('cdn.example.com', `c${i}`, down, 60).ips[0]; c[ip] = (c[ip] || 0) + 1; }
+  for (let i = 0; i < CLIENTS; i++) { const ip = resolve('cdn.example.com', `c${i}`, down, CDN_TTL).ips[0]; c[ip] = (c[ip] || 0) + 1; }
   return c;
 };
 const show = (c) => Object.keys(c).sort().map((ip) => `${ip}=${c[ip]}`).join(' ');
@@ -92,7 +98,7 @@ console.log(`weighted, first one down: ${show(split2)}`);
 
 const results = {};
 for (const ttl of [30, 60, 300, 3600]) {
-  const r = failover(ttl, 10, 3); results[ttl] = r;
+  const r = failover(ttl, CHECK_INTERVAL, FAIL_THRESHOLD); results[ttl] = r;
   console.log(`ttl ${ttl}: marked down at ${r.markedAt}, users on the dead address for ${r.bad} s, ${r.fetches} queries to the name server`);
 }
 const off = attack(false), on = attack(true);
@@ -102,5 +108,5 @@ for (const [label, r] of [['off', off], ['on', on]]) {
 
 const ok = results[30].markedAt === 120 && results[30].bad === 50 && results[60].bad === 80 && results[300].bad === 200 && results[3600].bad === 3500
   && Math.abs(split['203.0.113.1'] - 7000) < 400 && Math.abs(split['203.0.113.2'] - 2000) < 300 && Math.abs(split['203.0.113.3'] - 1000) < 250 && split2['203.0.113.1'] === undefined
-  && off.victim.answer === 3000 && on.victim.answer === 15 && on.victim.slip + on.victim.drop === 2985 && on.legit.answer === 6 && on.bytes * 20 < off.bytes;
+  && off.victim.answer === 3000 && on.victim.answer === 15 && on.victim.slip + on.victim.drop === 2985 && on.legit.answer === 6 && on.bytes * MIN_REDUCTION < off.bytes;
 if (!ok) process.exit(1);

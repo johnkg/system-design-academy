@@ -1,14 +1,19 @@
 // A tiny distributed SQL core, in JavaScript: keys split into ranges, versions stamped by a hybrid logical clock,
 // and a transaction that commits across ranges with write intents and a transaction record (two-phase commit).
 
+const LOGICAL_SLOTS = 100; // a timestamp is wall * 100 + logical counter
+const MAX_KEYS_PER_RANGE = 3;
+const CLOCK_SKEW = 8, MAX_OFFSET = 10; // gateway b runs 8 behind; reads allow 10 of uncertainty
+const LATEST = 999999; // a read timestamp after every write
+
 class Hlc { // wall time plus a counter, so timestamps never go backwards and follow causality
   constructor(offset) { this.offset = offset; this.wall = 0; this.logical = 0; } // offset: how far this machine's clock is off
   now(real) {
     const w = real + this.offset;
     if (w > this.wall) { this.wall = w; this.logical = 0; } else this.logical++;
-    return this.wall * 100 + this.logical;
+    return this.wall * LOGICAL_SLOTS + this.logical;
   }
-  observe(ts) { const w = Math.floor(ts / 100); if (w > this.wall) { this.wall = w; this.logical = ts % 100; } } // a message carries a timestamp
+  observe(ts) { const w = Math.floor(ts / LOGICAL_SLOTS); if (w > this.wall) { this.wall = w; this.logical = ts % LOGICAL_SLOTS; } } // a message carries a timestamp
 }
 
 class Range {
@@ -34,7 +39,7 @@ class Db {
       const c = this.ranges[this.rangeIndex(key)].cell(key), rec = c.intent && this.records.get(c.intent.txn);
       if (rec && rec.status === 'PENDING') return { blocked: true };
       const all = c.versions.concat(rec ? [[rec.ts, c.intent.value]] : []); // a committed intent counts as a version
-      const seen = all.filter(([t]) => t <= ts), later = all.filter(([t]) => t > ts && t <= ts + maxOffset * 100);
+      const seen = all.filter(([t]) => t <= ts), later = all.filter(([t]) => t > ts && t <= ts + maxOffset * LOGICAL_SLOTS);
       if (later.length === 0) return { value: seen.length ? seen[seen.length - 1][1] : null, restarts };
       ts = later[later.length - 1][0]; maxOffset = 0; // restart at the newest uncertain version
     }
@@ -56,13 +61,13 @@ class Txn {
   }
 }
 
-const db = new Db(3), a = new Hlc(0), b = new Hlc(-8);
+const db = new Db(MAX_KEYS_PER_RANGE), a = new Hlc(0), b = new Hlc(-CLOCK_SKEW);
 [['alice', 100], ['bob', 50], ['carol', 70], ['maria', 100], ['nina', 20], ['zed', 100]].forEach(([k, v], i) => {
   const t = new Txn(db, a, 1 + i); t.write(k, v); t.commit(); t.resolve(); db.split();
 });
 console.log(`ranges after splits: ${db.ranges.map((r) => `[${r.lo}..${r.hi})`).join(' ')}`);
-const total = () => ['alice', 'bob', 'carol', 'maria', 'nina', 'zed'].reduce((s, k) => s + db.read(k, 999999, 0).value, 0);
-const before = total(), setupTs = 6 * 100;
+const total = () => ['alice', 'bob', 'carol', 'maria', 'nina', 'zed'].reduce((s, k) => s + db.read(k, LATEST, 0).value, 0);
+const before = total(), setupTs = 6 * LOGICAL_SLOTS; // after the six setup transactions
 
 const t1 = new Txn(db, a, 20); // move 30 from alice to zed: two keys in two ranges
 t1.write('alice', 70); t1.write('zed', 130);
@@ -77,7 +82,7 @@ t1.resolve();
 console.log(`snapshot at ts ${setupTs} still sees alice = ${db.read('alice', setupTs, 0).value}, zed = ${db.read('zed', setupTs, 0).value}`);
 
 const ts = b.now(22); // this gateway's clock runs 8 behind, so its read timestamp is below T1's commit timestamp
-const trusting = db.read('zed', ts, 0), careful = db.read('zed', ts, 10);
+const trusting = db.read('zed', ts, 0), careful = db.read('zed', ts, MAX_OFFSET);
 console.log(`behind clock, read at ${ts}: trusting clocks sees ${trusting.value}; with a 10 uncertainty window sees ${careful.value} after ${careful.restarts} restart`);
 b.observe(t1.ts);
 console.log(`after a message from T1's gateway, the next timestamp here is ${b.now(23)}`);

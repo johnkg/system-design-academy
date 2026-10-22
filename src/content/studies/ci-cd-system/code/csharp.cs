@@ -27,7 +27,10 @@ static string Hash(string text) { // FNV-1a, 32 bits
 static string CacheKey(string os, string lockfile) => $"deps-{os}-{Hash(lockfile)}";
 
 // 3. Test sharding: put the slowest test first on the least loaded shard (greedy), using the timings of earlier runs.
-uint seed = 99;
+const uint Seed = 99;
+const int TestCount = 12, MinTestS = 10, TestSpreadS = 170, Shards = 4;
+const int JobMinutes = 3, Runners = 2, TeamAJobs = 8;
+uint seed = Seed;
 int Rand(int n) { seed = unchecked(seed * 1664525u + 1013904223u); return (int)((seed >> 16) % (uint)n); }
 static int[] Shard(List<(string Name, int Secs)> tests, int k) {
     var loads = new int[k];
@@ -46,7 +49,7 @@ static Dictionary<string, int> Schedule(List<(string Team, string Id)> jobs, int
         int pick = 0;
         if (fair) for (int i = 1; i < pending.Count; i++) if (Running(pending[i].Team) < Running(pending[pick].Team)) pick = i;
         var job = pending[pick]; pending.RemoveAt(pick);
-        spans.Add((job.Team, t, t + 3)); start[job.Id] = t; free[r] = t + 3;
+        spans.Add((job.Team, t, t + JobMinutes)); start[job.Id] = t; free[r] = t + JobMinutes;
     }
     return start;
 }
@@ -59,18 +62,18 @@ bool same = CacheKey("linux", lockText) == CacheKey("linux", "left-pad 1.3.0\nre
 bool changed = CacheKey("linux", lockText) == CacheKey("linux", lockText.Replace("18.2.0", "18.3.1"));
 Console.WriteLine($"cache key {CacheKey("linux", lockText)}; same lockfile same key: {same.ToString().ToLower()}; one version changed, same key: {changed.ToString().ToLower()}");
 
-var tests = Enumerable.Range(0, 12).Select(i => ($"t{i + 1:00}", 10 + Rand(170))).ToList();
+var tests = Enumerable.Range(0, TestCount).Select(i => ($"t{i + 1:00}", MinTestS + Rand(TestSpreadS))).ToList();
 int total = tests.Sum(t => t.Item2), longest = tests.Max(t => t.Item2);
-var loads = Shard(tests, 4);
-var roundRobin = new int[4]; for (int i = 0; i < tests.Count; i++) roundRobin[i % 4] += tests[i].Item2;
+var loads = Shard(tests, Shards);
+var roundRobin = new int[Shards]; for (int i = 0; i < tests.Count; i++) roundRobin[i % Shards] += tests[i].Item2;
 Console.WriteLine($"one shard takes {total} s; 4 shards by timing: {string.Join(", ", loads)} s; 4 shards by name: {string.Join(", ", roundRobin)} s");
 
-var jobs = Enumerable.Range(1, 8).Select(i => ("A", $"A{i}")).Concat(new[] { ("B", "B1"), ("B", "B2") }).ToList();
+var jobs = Enumerable.Range(1, TeamAJobs).Select(i => ("A", $"A{i}")).Concat(new[] { ("B", "B1"), ("B", "B2") }).ToList();
 static int WaitB(Dictionary<string, int> s) => Math.Max(s["B1"], s["B2"]);
-var fifo = Schedule(jobs, 2, false); var fairShare = Schedule(jobs, 2, true);
+var fifo = Schedule(jobs, Runners, false); var fairShare = Schedule(jobs, Runners, true);
 Console.WriteLine($"team B waits at most {WaitB(fifo)} min first come first served, and {WaitB(fairShare)} min with fair share");
 
 bool ok = lay.Count == 3 && same && !changed
-    && loads.Max() * 4 <= total + longest * 3 && loads.Sum() == total
+    && loads.Max() * Shards <= total + longest * (Shards - 1) && loads.Sum() == total
     && WaitB(fairShare) < WaitB(fifo);
 return ok ? 0 : 1;

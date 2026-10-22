@@ -11,7 +11,9 @@ public class Key { public Dictionary<string, string[]> Policy = new(); public Li
 
 public static class Toy
 {
-    static uint seed = 7;
+    const uint Seed = 7;
+    public const int DeletionWaitDays = 7; // a key scheduled for deletion can still be cancelled for a week
+    static uint seed = Seed;
     public static uint Rng() => seed = unchecked(seed * 1664525u + 1013904223u);
     public static int[] Bytes(string s) => s.Select(c => (int)c).ToArray();
     public static string Text(int[] b) => new string(b.Select(c => (char)c).ToArray());
@@ -98,11 +100,11 @@ public static class Program
         bool same = moved.Zip(docs).All(p => p.First.Ct.SequenceEqual(p.Second.Ct));
         Console.WriteLine($"rewrapped, blob versions: {Versions(moved)}, data ciphertext untouched: {Low(same)}");
         Console.WriteLine($"batch decrypt: {Attempt(() => Get(kms, "batch", "orders", moved[0]))}; mallory encrypt: {Attempt(() => kms.GenerateDataKey("mallory", "orders"))}");
-        kms.SetState("secops", "orders", "pending", 7);
+        kms.SetState("secops", "orders", "pending", Toy.DeletionWaitDays);
         Console.WriteLine($"during the wait: {Attempt(() => Get(kms, "app", "orders", moved[1]))}");
         kms.SetState("secops", "orders", "enabled");
         Console.WriteLine($"after cancel: {Attempt(() => Get(kms, "app", "orders", moved[1]))}");
-        kms.Advance(3); kms.SetState("secops", "orders", "pending", 7); kms.Advance(6);
+        kms.Advance(3); kms.SetState("secops", "orders", "pending", Toy.DeletionWaitDays); kms.Advance(Toy.DeletionWaitDays - 1);
         Console.WriteLine($"day {kms.Day}, still waiting: {Attempt(() => Get(kms, "app", "orders", moved[2]))}");
         kms.Advance(1);
         Console.WriteLine($"day {kms.Day}, deleted: {Attempt(() => Get(kms, "app", "orders", moved[2]))}");

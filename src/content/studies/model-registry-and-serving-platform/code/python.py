@@ -3,6 +3,10 @@
 import math
 import sys
 
+MAX_P95_MS, MAX_ACC_DROP = 120, 5  # the eval gate; accuracy is in per mille
+REQUESTS, CANARY_PCT, WIDER_PCT = 10000, 10, 25
+BOOT_S, QUEUE_PER_REPLICA = 6, 8  # fixed start-up time; queued requests one replica absorbs
+MODEL_MB, NETWORK_MBPS, LOCAL_MBPS = 14000, 1000, 5000
 
 # 32-bit FNV-1a hash, used here as the checksum of the weights and as the traffic-split hash.
 def fnv(s):
@@ -37,9 +41,9 @@ class Registry:
         prod = self.production()
         if checksum(v['weights']) != v['sum']:
             return f'v{n} refused: checksum mismatch'
-        if evals['p95'] > 120:
+        if evals['p95'] > MAX_P95_MS:
             return f"v{n} blocked: p95 {evals['p95']} ms is over 120 ms"
-        if prod and evals['acc'] < prod['evals']['acc'] - 5:
+        if prod and evals['acc'] < prod['evals']['acc'] - MAX_ACC_DROP:
             return f"v{n} blocked: accuracy {evals['acc']} is below production"
         v['evals'] = evals
         v['stage'] = 'staging'
@@ -85,11 +89,11 @@ def to_canary(i, pct):
 
 at10 = at25 = 0
 sticky = nested = True
-for i in range(10000):
-    a, b = to_canary(i, 10), to_canary(i, 25)
+for i in range(REQUESTS):
+    a, b = to_canary(i, CANARY_PCT), to_canary(i, WIDER_PCT)
     at10 += a
     at25 += b
-    if a != to_canary(i, 10):
+    if a != to_canary(i, CANARY_PCT):
         sticky = False
     if a and not b:
         nested = False
@@ -98,14 +102,14 @@ print(f"canary share: {at10} of 10000 at 10%, {at25} at 25%; sticky {str(sticky)
 
 # Scale from zero: a cold replica pays 6 s of start-up plus the weight download. Replicas follow the queue at 8 requests each.
 def cold_start(size_mb, mb_per_sec):
-    return 6 + math.ceil(size_mb / mb_per_sec)
+    return BOOT_S + math.ceil(size_mb / mb_per_sec)
 
 
 def replicas(queue):
-    return math.ceil(queue / 8)
+    return math.ceil(queue / QUEUE_PER_REPLICA)
 
 
-print(f"cold start for 14000 MB: {cold_start(14000, 1000)} s from the network, {cold_start(14000, 5000)} s from a local cache; replicas for queue 0, 5, 50: {', '.join(str(replicas(q)) for q in (0, 5, 50))}")
+print(f"cold start for 14000 MB: {cold_start(MODEL_MB, NETWORK_MBPS)} s from the network, {cold_start(MODEL_MB, LOCAL_MBPS)} s from a local cache; replicas for queue 0, 5, 50: {', '.join(str(replicas(q)) for q in (0, 5, 50))}")
 
 print(reg.rollback())
 if reg.production()['n'] != 1 or at10 < 800 or at10 > 1200 or not sticky or not nested or checksum('weights-beta!') == v2['sum']:

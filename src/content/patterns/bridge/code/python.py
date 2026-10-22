@@ -43,6 +43,8 @@ class Radio(Device):  # Concrete Implementor
 
 
 class Remote:  # Abstraction: holds the bridge
+    VOLUME_STEP = 10  # one button press
+
     def __init__(self, device):
         self.device = device
 
@@ -53,7 +55,7 @@ class Remote:  # Abstraction: holds the bridge
             self.device.enable()
 
     def volume_up(self):
-        self.device.set_volume(self.device.get_volume() + 10)
+        self.device.set_volume(self.device.get_volume() + self.VOLUME_STEP)
 
 
 class AdvancedRemote(Remote):  # Refined Abstraction

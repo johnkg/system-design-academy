@@ -36,16 +36,19 @@ console.log(`without it: Alice sees "${aliceNaive}", Bob sees "${bobNaive}"`);
 if (aliceSees !== 'XCA' || bobSees !== 'XCA' || aliceNaive === bobNaive) process.exit(1);
 
 // Try it on 5,000 random pairs of simultaneous edits.
-let seed = 99;
+const SEED = 99;
+const ALPHABET_SIZE = 8; // letters a..h
+const MAX_TEXT = 8; // starting documents hold 0..8 letters
+let seed = SEED;
 const random = (n) => { seed = (seed * 1664525 + 1013904223) % 4294967296; return Math.floor(seed / 65536) % n; };
 const makeOp = (text, site) => (text.length > 0 && random(2) === 0)
   ? { type: 'del', pos: random(text.length), site }
-  : { type: 'ins', pos: random(text.length + 1), ch: 'abcdefgh'[random(8)], site };
+  : { type: 'ins', pos: random(text.length + 1), ch: 'abcdefgh'[random(ALPHABET_SIZE)], site };
 
 let converged = 0, diverged = 0;
 const TRIALS = 5000;
 for (let i = 0; i < TRIALS; i++) {
-  const text = Array.from({ length: random(9) }, () => 'ABCDEFGH'[random(8)]).join('');
+  const text = Array.from({ length: random(MAX_TEXT + 1) }, () => 'ABCDEFGH'[random(ALPHABET_SIZE)]).join('');
   const a = makeOp(text, 1), b = makeOp(text, 2);
   const left = apply(apply(text, a), transform(b, a));
   const right = apply(apply(text, b), transform(a, b));

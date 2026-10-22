@@ -1,6 +1,8 @@
 // Error budget and burn rate in JavaScript. The numbers are passed in, so the output is deterministic.
 
 const MINUTES_PER_DAY = 24 * 60;
+const WINDOW_DAYS = 30; // the SLO is measured over a rolling 30-day window
+const PAGE_BURN_RATE = 14; // burning this fast for an hour spends 2% of a 30-day budget: page a human
 
 // How much downtime does an SLO allow over a window?
 function errorBudgetMinutes(slo, windowDays) {
@@ -14,7 +16,7 @@ function burnRate(errorRatio, slo) {
 }
 
 for (const slo of [0.99, 0.999, 0.9999]) {
-  console.log(`SLO ${(slo * 100).toFixed(2)}% over 30 days allows ${errorBudgetMinutes(slo, 30).toFixed(1)} minutes of downtime`);
+  console.log(`SLO ${(slo * 100).toFixed(2)}% over 30 days allows ${errorBudgetMinutes(slo, WINDOW_DAYS).toFixed(1)} minutes of downtime`);
 }
 
 const slo = 0.999;
@@ -23,7 +25,7 @@ const incidents = [
   { name: "provider blip", minutes: 5 },
   { name: "slow day", minutes: 12 },
 ];
-const budget = errorBudgetMinutes(slo, 30);
+const budget = errorBudgetMinutes(slo, WINDOW_DAYS);
 let spent = 0;
 for (const incident of incidents) {
   spent += incident.minutes;
@@ -33,5 +35,5 @@ console.log(spent > budget ? "budget spent: freeze feature releases, fix reliabi
 
 // A 2% error rate for an hour, against a 99.9% SLO
 const rate = burnRate(0.02, slo);
-console.log(`burn rate at 2% errors: ${rate.toFixed(0)}x${rate >= 14 ? " -> page someone now" : ""}`);
+console.log(`burn rate at 2% errors: ${rate.toFixed(0)}x${rate >= PAGE_BURN_RATE ? " -> page someone now" : ""}`);
 console.log(`burn rate at 0.05% errors: ${burnRate(0.0005, slo).toFixed(1)}x (well within budget)`);

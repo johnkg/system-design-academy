@@ -4,13 +4,16 @@ import hashlib
 import hmac
 import sys
 
+TOLERANCE_S = 300  # a signature older than 5 minutes is rejected as a replay
+SEED, EVENTS = 7, 10  # events fanned out to every endpoint
+BACKOFF_BASE, BACKOFF_CAP = 2, 30  # retry delays grow 2, 4, 8, ... ticks, capped at 30
 
 # The signature covers the timestamp and the exact body, so a captured request cannot be replayed later or edited.
 def sign(secret, ts, body):
     return hmac.new(secret.encode(), f"{ts}.{body}".encode(), hashlib.sha256).hexdigest()
 
 
-def verify(secret, header, ts, body, now, tolerance=300):
+def verify(secret, header, ts, body, now, tolerance=TOLERANCE_S):
     if abs(now - ts) > tolerance:  # too old (or from the future)
         return False
     want = sign(secret, ts, body)
@@ -18,7 +21,7 @@ def verify(secret, header, ts, body, now, tolerance=300):
 
 
 LIMIT, MAX_ATTEMPTS, TRIP, COOL, END, EPOCH = 2, 6, 3, 20, 200, 1700000000
-seed = 7
+seed = SEED
 
 
 def rnd(n):
@@ -28,7 +31,7 @@ def rnd(n):
 
 
 def backoff(attempt):  # full jitter: anywhere from 1 to the cap
-    return 1 + rnd(min(30, 2 * 2 ** (attempt - 1)))
+    return 1 + rnd(min(BACKOFF_CAP, BACKOFF_BASE * 2 ** (attempt - 1)))
 
 
 # The customer side. A receiver stores event ids, so a repeated delivery is ignored instead of processed twice.
@@ -67,7 +70,7 @@ def body_of(i):
 
 
 for ep in endpoints:
-    for i in range(1, 11):  # fan-out: one job per endpoint
+    for i in range(1, EVENTS + 1):  # fan-out: one job per endpoint
         ep["queue"].append({"id": i, "attempts": 0, "ready_at": 0})
 
 for t in range(END):
@@ -111,9 +114,9 @@ for ep in endpoints:
           f"duplicates ignored {ep['dupes']}, breaker opened {ep['opened']}, last delivery at {ep['last']}")
 
 h, f, d = endpoints
-fine = (checks[0] and not checks[1] and not checks[2] and h["delivered"] == 10 and h["last"] <= 5 and h["attempts"] == 10
-        and f["delivered"] == 10 and len(f["seen"]) == 10 and f["dupes"] > 0 and d["delivered"] == 0
-        and d["attempts"] < 10 * MAX_ATTEMPTS and d["delivered"] + d["dropped"] + len(d["queue"]) == 10)
-print(f"dead endpoint saw {d['attempts']} attempts, not {10 * MAX_ATTEMPTS}; healthy finished by tick {h['last']}")
+fine = (checks[0] and not checks[1] and not checks[2] and h["delivered"] == EVENTS and h["last"] <= 5 and h["attempts"] == EVENTS
+        and f["delivered"] == EVENTS and len(f["seen"]) == EVENTS and f["dupes"] > 0 and d["delivered"] == 0
+        and d["attempts"] < EVENTS * MAX_ATTEMPTS and d["delivered"] + d["dropped"] + len(d["queue"]) == EVENTS)
+print(f"dead endpoint saw {d['attempts']} attempts, not {EVENTS * MAX_ATTEMPTS}; healthy finished by tick {h['last']}")
 if not fine:
     sys.exit(1)

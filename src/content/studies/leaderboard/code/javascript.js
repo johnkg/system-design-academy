@@ -39,23 +39,26 @@ class Leaderboard {
   }
 }
 
-let seed = 2024;
+const SEED = 2024, SHARDS = 5;
+const UPDATES = 20000, PLAYERS = 2000, MAX_SCORE = 1000;
+const TOP_N = 5, CHECKED_TOP = 100, PROBE_INDEX = 1234, SPOT_CHECK_EVERY = 97;
+let seed = SEED;
 const random = (n) => { seed = (seed * 1664525 + 1013904223) % 4294967296; return Math.floor(seed / 65536) % n; };
 
-const board = new Leaderboard(5);
+const board = new Leaderboard(SHARDS);
 const truth = new Map(); // the same scores kept the slow, obvious way, to check against
-for (let i = 0; i < 20000; i++) { // 20,000 updates to 2,000 players, so most players are updated many times
-  const id = random(2000), score = random(1000);
+for (let i = 0; i < UPDATES; i++) { // 20,000 updates to 2,000 players, so most players are updated many times
+  const id = random(PLAYERS), score = random(MAX_SCORE);
   board.update(id, score); truth.set(id, score);
 }
 
 const all = [...truth].map(([id, score]) => ({ id, score })).sort((a, b) => (better(a, b) ? -1 : 1));
-const top = board.top(5);
+const top = board.top(TOP_N);
 console.log(`top 5: ${top.map((e) => `#${e.id} (${e.score})`).join(', ')}`);
-const probe = all[1234].id;
-console.log(`player #${probe} has score ${truth.get(probe)} and rank ${board.rank(probe)}; the full sort says ${1234 + 1}`);
+const probe = all[PROBE_INDEX].id;
+console.log(`player #${probe} has score ${truth.get(probe)} and rank ${board.rank(probe)}; the full sort says ${PROBE_INDEX + 1}`);
 
-const sameTop = JSON.stringify(board.top(100)) === JSON.stringify(all.slice(0, 100));
-const sameRank = all.every((e, i) => i % 97 !== 0 || board.rank(e.id) === i + 1); // spot-check every 97th player
+const sameTop = JSON.stringify(board.top(CHECKED_TOP)) === JSON.stringify(all.slice(0, CHECKED_TOP));
+const sameRank = all.every((e, i) => i % SPOT_CHECK_EVERY !== 0 || board.rank(e.id) === i + 1); // spot-check every 97th player
 console.log(`top 100 matches the full sort: ${sameTop}; ranks match: ${sameRank}`);
-if (!sameTop || !sameRank || board.rank(probe) !== 1235) process.exit(1);
+if (!sameTop || !sameRank || board.rank(probe) !== PROBE_INDEX + 1) process.exit(1);

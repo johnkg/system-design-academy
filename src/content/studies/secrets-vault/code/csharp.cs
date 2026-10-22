@@ -5,11 +5,14 @@ using System.Collections.Generic;
 using System.Linq;
 using static Crypto;
 
-var master0 = RandomBytes(16);
-var shares = Split(master0, 5, 3);
+const int Shares = 5, Threshold = 3; // any 3 of 5 key holders can unseal
+const int LeaseTtl = 60, MaxTtl = 120; // seconds
+
+var master0 = RandomBytes(KeyBytes);
+var shares = Split(master0, Shares, Threshold);
 Console.WriteLine($"share 1 starts with {string.Join(",", shares[0].Ys.Take(4))}");
 bool allEqual = true;
-for (int i = 0; i < 5; i++) for (int j = i + 1; j < 5; j++) for (int k = j + 1; k < 5; k++)
+for (int i = 0; i < Shares; i++) for (int j = i + 1; j < Shares; j++) for (int k = j + 1; k < Shares; k++)
     allEqual = allEqual && Hex(Combine(new[] { shares[i], shares[j], shares[k] })) == Hex(master0);
 bool twoWork = Hex(Combine(new[] { shares[0], shares[1] })) == Hex(master0);
 Console.WriteLine($"any 3 of 5 shares rebuild the master key: {Lower(allEqual)}; 2 shares do: {Lower(twoWork)}");
@@ -27,10 +30,10 @@ bool afterOk = vault.Read("web", "db/web") == "p4ss-web" && before == AllCt();
 Console.WriteLine($"master rotated: {Lower(keysChanged)}; 3 data keys rewrapped, stored ciphertext unchanged and readable: {Lower(afterOk)}");
 Console.WriteLine($"audit has {vault.Audit.Count} lines, last: {vault.Audit[^1]}");
 
-var a = vault.Issue(0, 60, 120); vault.Issue(10, 60, 120);
-vault.Renew(a, 50, 60); // a would reach 110
+var a = vault.Issue(0, LeaseTtl, MaxTtl); vault.Issue(10, LeaseTtl, MaxTtl);
+vault.Renew(a, 50, LeaseTtl); // a would reach 110
 var gone75 = vault.Sweep(75);
-vault.Renew(a, 100, 60); // capped at start + maxTtl = 120
+vault.Renew(a, 100, LeaseTtl); // capped at start + maxTtl = 120
 var gone130 = vault.Sweep(130);
 Console.WriteLine($"leases: revoked {string.Join(",", gone75)} at t=75, {string.Join(",", gone130)} at t=130 (expiry capped at {a.Expires})");
 
@@ -48,7 +51,7 @@ class Vault
     public Vault(Dictionary<string, string[]> p) { policies = p; }
     public void Put(string path, string text) // envelope: a fresh data key encrypts the secret, the master key only wraps it
     {
-        var dek = RandomBytes(16); long nw = Next(), nc = Next();
+        var dek = RandomBytes(KeyBytes); long nw = Next(), nc = Next();
         Store[path] = new Entry { Wrapped = Cipher(dek, Master!, nw), NonceW = nw, Ct = Cipher(ToBytes(text), dek, nc), NonceC = nc };
     }
     public string? Read(string token, string path) // every read is logged, allowed or not
@@ -61,7 +64,7 @@ class Vault
     }
     public void RotateMaster() // rewrap each data key under a new master; the stored secrets are not touched
     {
-        var fresh = RandomBytes(16);
+        var fresh = RandomBytes(KeyBytes);
         foreach (var e in Store.Values) { var dek = Cipher(e.Wrapped, Master!, e.NonceW); e.NonceW = Next(); e.Wrapped = Cipher(dek, fresh, e.NonceW); }
         Master = fresh;
     }
@@ -72,7 +75,9 @@ class Vault
 static class Crypto
 {
 public const long P = 257; // a prime just above 255, so each byte of the key is one number in the field
-    static long state = 7; // seeded generator, so every run prints the same thing
+    const long Seed = 7;
+    public const int KeyBytes = 16; // 128-bit master and data keys
+    static long state = Seed; // seeded generator, so every run prints the same thing
 public static long Next() { state = (state * 1664525 + 1013904223) % 4294967296; return state; }
 public static long Rnd(long n) => Next() / 65536 % n;
 public static long[] RandomBytes(int n) => Enumerable.Range(0, n).Select(_ => Rnd(256)).ToArray();

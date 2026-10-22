@@ -5,6 +5,12 @@ using System.Collections.Generic;
 using System.Linq;
 using System.Text.RegularExpressions;
 
+const int MinStemLength = 4; // only words of 4+ letters lose a plural "s"
+const long IdfScale = 4096; // fixed-point scale for n / df
+const int TokensPer10Words = 13, CitationTokens = 6; // about 1.3 tokens per word plus a citation header
+const int TfCap = 2; // a term counts at most twice per chunk
+const int RerankPool = 8, RerankWindow = 12, RerankWeight = 4; // rerank the 8 best by their densest 12-word window
+
 var docs = new Dictionary<string, string> {
     ["returns"] = "Returns policy. Customers may return unused accessories such as cables and cases within 14 days of delivery. Opened software cannot be refunded. Refunds go back to the original payment method within 5 business days. Returns of laptops are accepted within 30 days of delivery if the device works and all original packaging is included. Gift purchases can be returned for store credit only.",
     ["shipping"] = "Shipping and delivery. Standard delivery takes 3 to 5 days and express delivery takes 1 to 2 days. A laptop ships in a padded box and needs a signature on delivery. After delivery you can track the parcel for 30 days. Delivery to islands can take 10 days.",
@@ -15,14 +21,14 @@ const string Answer = "laptops are accepted within 30 days of delivery";
 var stop = new HashSet<string>("how can i a an the of to is are in on and or for after you your with by it".Split(' '));
 
 string[] Words(string t) => Regex.Replace(t.ToLowerInvariant(), "[^a-z0-9 ]", " ").Split(' ', StringSplitOptions.RemoveEmptyEntries);
-string Stem(string w) => w.Length > 3 && w.EndsWith('s') ? w[..^1] : w;
+string Stem(string w) => w.Length >= MinStemLength && w.EndsWith('s') ? w[..^1] : w;
 // integer idf in half-octave steps: rarer terms weigh more, and every language computes the same number
 int IdfOf(int n, int df) {
-  long x = 4096L * n / df; int b = 0;
+  long x = IdfScale * n / df; int b = 0;
   for (long y = x; y > 1; y /= 2) b++;
   return 2 * b + (b >= 1 ? (int)(x / (1L << (b - 1)) % 2) : 0);
 }
-int TokensOf(int wordCount) => (wordCount * 13 + 9) / 10 + 6; // about 1.3 tokens per word plus a citation header
+int TokensOf(int wordCount) => (wordCount * TokensPer10Words + 9) / 10 + CitationTokens; // rounded up
 
 List<Chunk> MakeChunks(int size, int overlap) {
   if (overlap >= size) throw new ArgumentException("overlap must be smaller than the chunk size");
@@ -48,16 +54,16 @@ List<Chunk> MakeChunks(int size, int overlap) {
   int Idf(string t) => idf.GetValueOrDefault(t, 0);
   foreach (var c in chunks) {
     var stems = c.Words.Select(Stem).ToArray();
-    c.Score = terms.Sum(t => Idf(t) * Math.Min(stems.Count(x => x == t), 2));
+    c.Score = terms.Sum(t => Idf(t) * Math.Min(stems.Count(x => x == t), TfCap));
   }
   var ranked = chunks.Where(c => c.Score > 0).OrderBy(c => -c.Score).ThenBy(c => c.Id, StringComparer.Ordinal).ToList();
   if (rerank) { // second stage on the 8 best candidates: reward a dense 12 word window instead of scattered matches
-    ranked = ranked.Take(8).ToList();
+    ranked = ranked.Take(RerankPool).ToList();
     foreach (var c in ranked) {
       var stems = c.Words.Select(Stem).ToArray();
       int best = 0;
-      for (int s = 0; s < stems.Length; s++) best = Math.Max(best, terms.Where(t => stems.Skip(s).Take(12).Contains(t)).Sum(Idf));
-      c.Score = best * 4 + c.Score / 4;
+      for (int s = 0; s < stems.Length; s++) best = Math.Max(best, terms.Where(t => stems.Skip(s).Take(RerankWindow).Contains(t)).Sum(Idf));
+      c.Score = best * RerankWeight + c.Score / RerankWeight;
     }
     ranked = ranked.OrderBy(c => -c.Score).ThenBy(c => c.Id, StringComparer.Ordinal).ToList();
   }

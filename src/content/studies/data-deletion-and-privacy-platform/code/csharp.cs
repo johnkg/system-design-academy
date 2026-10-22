@@ -8,6 +8,9 @@ string[] stores = { "users-db", "search-index", "cache", "lake", "warehouse", "p
 var method = new Dictionary<string, string> { ["users-db"] = "delete rows", ["search-index"] = "delete docs", ["cache"] = "evict keys", ["lake"] = "shred key", ["warehouse"] = "delete rows", ["processor-crm"] = "api call" };
 const int Grace = 2; // days between the soft delete and the hard delete
 const int Deadline = 30; // days allowed by law
+const int Users = 6, MaxRows = 3; // each user has 1..3 rows in every store
+const int CrmFailMod = 3; // the CRM processor fails (user % 3) times before it succeeds
+const int RestoreDay = 20; // the day a backup is restored
 
 uint Fnv(string text) {
     uint h = 0x811C9DC5;
@@ -22,10 +25,10 @@ int[] XorStream(uint key, int[] bytes) { // a toy stream cipher, only to show th
 var keyring = new Dictionary<int, uint>(); // user -> key; destroying the entry is the erasure
 var plain = stores.ToDictionary(s => s, s => new Dictionary<int, int>()); // rows per user, for the stores that hold plain text
 var lake = new Dictionary<int, List<int[]>>();
-for (int user = 1; user <= 6; user++) {
+for (int user = 1; user <= Users; user++) {
     keyring[user] = Fnv("key|" + user);
     for (int i = 0; i < stores.Length; i++) {
-        int count = 1 + (user + i) % 3;
+        int count = 1 + (user + i) % MaxRows;
         if (stores[i] != "lake") { plain[stores[i]][user] = count; continue; }
         lake[user] = Enumerable.Range(0, count).Select(n => XorStream(keyring[user], ($"lake:{user}:{n}").Select(c => (int)c).ToArray())).ToList();
     }
@@ -57,7 +60,7 @@ for (int day = 0; day <= Deadline; day++) {
         foreach (var store in stores) {
             if (tasks[r.id][store] == -1) continue;
             tasks[r.id][store]++;
-            if (store == "processor-crm" && tasks[r.id][store] <= r.user % 3) { Console.WriteLine($"day {day}: {r.id} {store} failed, will retry"); continue; }
+            if (store == "processor-crm" && tasks[r.id][store] <= r.user % CrmFailMod) { Console.WriteLine($"day {day}: {r.id} {store} failed, will retry"); continue; }
             Erase(store, r.user);
             tasks[r.id][store] = -1;
             audit.Add((r.id, store, method[store], day, Fnv("salt|" + r.user).ToString("x8")));
@@ -69,7 +72,7 @@ Console.WriteLine($"audit entries: {audit.Count}, first: {audit[0].method} in {a
 Console.WriteLine($"lake rows still in the files: {reqs.Sum(r => lake[r.user].Count)}, readable: {reqs.Sum(r => Readable("lake", r.user))}");
 
 int Present(Dictionary<int, int> rows) => reqs.Count(r => rows.ContainsKey(r.user));
-var replay = reqs.Where(r => done[r.id] >= 0 && done[r.id] <= 20).Select(r => r.user).ToList();
+var replay = reqs.Where(r => done[r.id] >= 0 && done[r.id] <= RestoreDay).Select(r => r.user).ToList();
 var restored = new Dictionary<int, int>(backup);
 Console.WriteLine($"restore on day 20 without the replay list: {Present(restored)} deleted users are back");
 foreach (var u in replay) restored.Remove(u);

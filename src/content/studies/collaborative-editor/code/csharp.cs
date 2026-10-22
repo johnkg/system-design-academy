@@ -8,7 +8,10 @@ public record Op(bool Insert, int Pos, char Ch, int Site);
 
 public static class Program
 {
-    static long seed = 99;
+    const long Seed = 99;
+    const int AlphabetSize = 8; // letters a..h
+    const int MaxText = 8; // starting documents hold 0..8 letters
+    static long seed = Seed;
     static int Random(int n) { seed = (seed * 1664525 + 1013904223) % 4294967296; return (int)(seed / 65536 % n); }
 
     // A null operation means "nothing to do".
@@ -39,7 +42,7 @@ public static class Program
     {
         if (text.Length > 0 && Random(2) == 0) return new Op(false, Random(text.Length), ' ', site);
         int pos = Random(text.Length + 1);
-        return new Op(true, pos, "abcdefgh"[Random(8)], site);
+        return new Op(true, pos, "abcdefgh"[Random(AlphabetSize)], site);
     }
 
     public static int Main()
@@ -62,8 +65,8 @@ public static class Program
         int converged = 0, diverged = 0;
         for (int i = 0; i < Trials; i++)
         {
-            int length = Random(9);
-            string text = new string(Enumerable.Range(0, length).Select(_ => "ABCDEFGH"[Random(8)]).ToArray());
+            int length = Random(MaxText + 1);
+            string text = new string(Enumerable.Range(0, length).Select(_ => "ABCDEFGH"[Random(AlphabetSize)]).ToArray());
             var a = MakeOp(text, 1);
             var b = MakeOp(text, 2);
             string left = Apply(Apply(text, a), Transform(b, a));

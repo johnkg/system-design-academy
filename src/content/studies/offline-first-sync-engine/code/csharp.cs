@@ -5,28 +5,32 @@ using System.Collections.Generic;
 using System.Linq;
 
 string[] fieldNames = { "title", "done", "note" };
-long seed = 99;
+const int SeedValue = 99, Steps = 600, Rows = 12, DeletePct = 4, MaxValue = 100;
+const long StartMs = 5000000, StepMs = 1000, BSkewMs = -10 * 60 * 1000; // B's clock is 10 minutes slow
+const int SyncEvery = 7, RetryOneIn = 4; // a device syncs every 7 steps; 1 sync in 4 also re-sends its last push
+const int CSyncAt = 100, CompactAt = 400, CompactKeep = 100; // compaction keeps the last 100 changes
+long seed = SeedValue;
 int Rnd(int n) { seed = (seed * 1664525 + 1013904223) % 4294967296; return (int)((seed / 65536) % n); }
 
 var server = new Server();
 var log = new List<Write>();
 var a = new Client("A", 0, server, log);
-var b = new Client("B", -600000, server, log); // B's clock is 10 minutes slow
+var b = new Client("B", BSkewMs, server, log); // B's clock is 10 minutes slow
 var c3 = new Client("C", 0, server, log);
 int edits = 0, deletes = 0, removed = 0, ghosts = 0;
-for (int step = 0; step < 600; step++)
+for (int step = 0; step < Steps; step++)
 {
-    int d = Rnd(2), id = Rnd(12), kind = Rnd(100);
-    long wall = 5000000 + step * 1000L;
+    int d = Rnd(2), id = Rnd(Rows), kind = Rnd(100);
+    long wall = StartMs + step * StepMs;
     var c = d == 0 ? a : b;
     if (!(c.Db.ContainsKey(id) && Sync.Gone(c.Db[id]))) // a deleted row is not on screen, so it cannot be edited
     {
-        if (kind < 4) { c.Write(id, "_gone", 1, wall); deletes++; }
-        else { string f = fieldNames[Rnd(3)]; c.Write(id, f, Rnd(100), wall); edits++; }
+        if (kind < DeletePct) { c.Write(id, "_gone", 1, wall); deletes++; }
+        else { string f = fieldNames[Rnd(3)]; c.Write(id, f, Rnd(MaxValue), wall); edits++; }
     }
-    if (step % 7 == d) c.SyncNow(Rnd(4) == 0);
-    if (step == 100) c3.SyncNow(false); // C syncs once and then stays offline
-    if (step == 400) removed = server.Compact(server.Seq - 100);
+    if (step % SyncEvery == d) c.SyncNow(Rnd(RetryOneIn) == 0);
+    if (step == CSyncAt) c3.SyncNow(false); // C syncs once and then stays offline
+    if (step == CompactAt) removed = server.Compact(server.Seq - CompactKeep);
 }
 var before = c3.Db.Where(kv => !Sync.Gone(kv.Value)).Select(kv => kv.Key).ToList();
 a.SyncNow(false); b.SyncNow(false);

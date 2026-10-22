@@ -9,15 +9,19 @@ public static class Program
     static readonly string[] Levels = { "debug", "info", "warn", "error" }; // index = priority
     const int Capacity = 300, Drain = 60, Ticks = 60;                       // lines the buffer holds, lines shipped per tick, length of the run
 
-    static long seed = 7;
+    const int Debug = 0, Info = 1, Warn = 2, Error = 3;
+    const int ErrorPct = 3, WarnPct = 7, InfoPct = 30; // the remaining 60% is debug
+    const int NormalRate = 30, BurstRate = 150, BurstStart = 20, BurstEnd = 30; // lines per tick
+    const long Seed = 7;
+    static long seed = Seed;
     static int Random(int n) { seed = (seed * 1664525 + 1013904223) % 4294967296; return (int)(seed / 65536 % n); }
-    static int LevelOf(int r) => r < 3 ? 3 : r < 10 ? 2 : r < 40 ? 1 : 0; // 3% errors, 7% warnings, 30% info, 60% debug
+    static int LevelOf(int r) => r < ErrorPct ? Error : r < ErrorPct + WarnPct ? Warn : r < ErrorPct + WarnPct + InfoPct ? Info : Debug;
 
     static (int arrived, int[] lost, int[] sent) Run(string policy)
     {
-        seed = 7;
+        seed = Seed;
         var queue = new List<int>();
-        var lost = new int[4]; var sent = new int[4];
+        var lost = new int[Levels.Length]; var sent = new int[Levels.Length];
         int arrived = 0, peak = 0;
 
         void Offer(int level)
@@ -32,7 +36,7 @@ public static class Program
 
         for (int t = 0; t < Ticks; t++)
         {
-            int n = t >= 20 && t < 30 ? 150 : 30; // a burst between ticks 20 and 29
+            int n = t >= BurstStart && t < BurstEnd ? BurstRate : NormalRate;// a burst between ticks 20 and 29
             for (int i = 0; i < n; i++) { Offer(LevelOf(Random(100))); arrived++; }
             peak = Math.Max(peak, queue.Count);
             for (int i = 0; i < Drain && queue.Count > 0; i++) { sent[queue[0]]++; queue.RemoveAt(0); }
@@ -51,7 +55,7 @@ public static class Program
         foreach (var policy in policies)
         {
             var (arrived, lost, sent) = Run(policy);
-            errorsLost[policy] = lost[3];
+            errorsLost[policy] = lost[Error];
             if (lost.Sum() + sent.Sum() != arrived) return 1; // every line is either shipped or counted as lost
         }
         bool ok = errorsLost["keep-errors"] == 0 && errorsLost["drop-newest"] > 0 && errorsLost["drop-oldest"] > 0;

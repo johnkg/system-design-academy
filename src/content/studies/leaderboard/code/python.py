@@ -59,7 +59,10 @@ class Leaderboard:
         return 1 + sum(s.count_better(entry) for s in self.shards)
 
 
-seed = 2024
+SEED, SHARDS = 2024, 5
+UPDATES, PLAYERS, MAX_SCORE = 20000, 2000, 1000
+TOP_N, CHECKED_TOP, PROBE_INDEX, SPOT_CHECK_EVERY = 5, 100, 1234, 97
+seed = SEED
 
 
 def random(n):
@@ -68,21 +71,21 @@ def random(n):
     return (seed // 65536) % n
 
 
-board = Leaderboard(5)
+board = Leaderboard(SHARDS)
 truth = {}  # the same scores kept the slow, obvious way, to check against
-for _ in range(20000):  # 20,000 updates to 2,000 players, so most players are updated many times
-    id, score = random(2000), random(1000)
+for _ in range(UPDATES):  # 20,000 updates to 2,000 players, so most players are updated many times
+    id, score = random(PLAYERS), random(MAX_SCORE)
     board.update(id, score)
     truth[id] = score
 
 all_players = sorted(({'id': id, 'score': score} for id, score in truth.items()), key=cmp_to_key(order))
-top = board.top(5)
+top = board.top(TOP_N)
 print(f"top 5: {', '.join(f'#{e['id']} ({e['score']})' for e in top)}")
-probe = all_players[1234]['id']
-print(f"player #{probe} has score {truth[probe]} and rank {board.rank(probe)}; the full sort says {1234 + 1}")
+probe = all_players[PROBE_INDEX]['id']
+print(f"player #{probe} has score {truth[probe]} and rank {board.rank(probe)}; the full sort says {PROBE_INDEX + 1}")
 
-same_top = board.top(100) == all_players[:100]
-same_rank = all(i % 97 != 0 or board.rank(e['id']) == i + 1 for i, e in enumerate(all_players))  # spot-check every 97th player
+same_top = board.top(CHECKED_TOP) == all_players[:CHECKED_TOP]
+same_rank = all(i % SPOT_CHECK_EVERY != 0 or board.rank(e['id']) == i + 1 for i, e in enumerate(all_players))  # spot-check every 97th player
 print(f"top 100 matches the full sort: {str(same_top).lower()}; ranks match: {str(same_rank).lower()}")
-if not same_top or not same_rank or board.rank(probe) != 1235:
+if not same_top or not same_rank or board.rank(probe) != PROBE_INDEX + 1:
     sys.exit(1)

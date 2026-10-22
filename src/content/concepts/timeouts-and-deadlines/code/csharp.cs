@@ -10,8 +10,10 @@ public static class Program
 {
     const long User = 2000, Gap = 50, SlowPermille = 100, Attempt = 400, Backoff = 25, Pre = 10, Post = 5, MinLeft = 50, RetryMin = 100, Inf = long.MaxValue;
     const int N = 200, Retries = 2;
+    const long Seed = 12345;
+    const long SlowMin = 2500, SlowSpread = 6500, FastMin = 20, FastSpread = 60; // database attempt latency (ms)
 
-    static long seed = 12345; // Park-Miller generator, integers only so every language prints the same
+    static long seed = Seed; // Park-Miller generator, integers only so every language prints the same
     static long Next() => seed = seed * 48271 % 2147483647;
 
     class Span { public int Hop; public long Start, End, Left = Inf; public bool Ok; }
@@ -74,8 +76,8 @@ public static class Program
         var requests = new List<(long t0, long[] attempts)>();
         for (int i = 0; i < N; i++)
         {
-            var attempts = new long[3];
-            for (int k = 0; k < 3; k++) { long s = Next(), a = Next(); attempts[k] = s % 1000 < SlowPermille ? 2500 + a % 6500 : 20 + a % 60; }
+            var attempts = new long[Retries + 1];
+            for (int k = 0; k < Retries + 1; k++) { long s = Next(), a = Next(); attempts[k] = s % 1000 < SlowPermille ? SlowMin + a % SlowSpread : FastMin + a % FastSpread; }
             requests.Add((i * Gap, attempts));
         }
 

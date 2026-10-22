@@ -5,6 +5,12 @@ using System;
 using System.Collections.Generic;
 using System.Linq;
 
+const int DefaultTtl = 300, CdnTtl = 60, Clients = 10000;
+const int CheckInterval = 10, FailThreshold = 3; // health checks every 10 s, 3 failures in a row mark the address down
+const int RrlLimit = 5; // full answers per second per (client prefix, name)
+const int AttackSeconds = 3, AttackQps = 1000, LegitQps = 2;
+const int AnswerBytes = 1400, SlipBytes = 90, QueryBytes = 70; // a signed answer, a truncated reply, a spoofed query
+const int MinReduction = 20; // RRL must cut the reflected bytes at least 20-fold
 const int NegTtl = 60; // how long resolvers may cache "no such name" (the SOA minimum)
 const string Primary = "192.0.2.10";
 var zone = new Dictionary<string, Rec> {
@@ -60,31 +66,31 @@ uint Fnv(string s) { uint h = 0x811c9dc5; foreach (char c in s) h = unchecked((h
         string key = $"{prefix}|{name}|{sec}";
         int n = seen.GetValueOrDefault(key) + 1;
         seen[key] = n;
-        if (n <= 5) return "answer";
-        return (n - 5) % 2 == 0 ? "slip" : "drop";
+        if (n <= RrlLimit) return "answer";
+        return (n - RrlLimit) % 2 == 0 ? "slip" : "drop";
     }
     var victim = new Dictionary<string, int> { ["answer"] = 0, ["slip"] = 0, ["drop"] = 0 };
     var legit = new Dictionary<string, int> { ["answer"] = 0, ["slip"] = 0, ["drop"] = 0 };
-    for (int sec = 0; sec < 3; sec++) {
-        for (int i = 0; i < 1000; i++) victim[Check("198.51.100.0/24", "www.example.com", sec)]++; // spoofed source = the victim
-        for (int i = 0; i < 2; i++) legit[Check("203.0.113.0/24", "www.example.com", sec)]++;
+    for (int sec = 0; sec < AttackSeconds; sec++) {
+        for (int i = 0; i < AttackQps; i++) victim[Check("198.51.100.0/24", "www.example.com", sec)]++; // spoofed source = the victim
+        for (int i = 0; i < LegitQps; i++) legit[Check("203.0.113.0/24", "www.example.com", sec)]++;
     }
-    int bytes = victim["answer"] * 1400 + victim["slip"] * 90; // a signed answer is 1400 bytes, a truncated reply 90
-    return (victim, legit, bytes, (bytes / (3000.0 * 70)).ToString("F2", System.Globalization.CultureInfo.InvariantCulture)); // 3000 queries of 70 bytes
+    int bytes = victim["answer"] * AnswerBytes + victim["slip"] * SlipBytes;
+    return (victim, legit, bytes, (bytes / (double)(AttackSeconds * AttackQps * QueryBytes)).ToString("F2", System.Globalization.CultureInfo.InvariantCulture)); // bytes out per byte the attacker sent
 }
 
 var none = new HashSet<string>();
 foreach (var name in new[] { "www.example.com", "mail.example.com", "nope.example.com" }) {
-    var a = Resolve(name, "r1", none, 300);
+    var a = Resolve(name, "r1", none, DefaultTtl);
     Console.WriteLine($"{name} -> {a.Rcode} {string.Join(",", a.Ips)} ttl {a.Ttl}");
 }
-Console.WriteLine($"www with the primary down -> {string.Join(",", Resolve("www.example.com", "r1", new HashSet<string> { Primary }, 300).Ips)}");
-Console.WriteLine($"everything down fails open -> {string.Join(",", Resolve("www.example.com", "r1", new HashSet<string>(zone["www.example.com"].Ips), 300).Ips)}");
+Console.WriteLine($"www with the primary down -> {string.Join(",", Resolve("www.example.com", "r1", new HashSet<string> { Primary }, DefaultTtl).Ips)}");
+Console.WriteLine($"everything down fails open -> {string.Join(",", Resolve("www.example.com", "r1", new HashSet<string>(zone["www.example.com"].Ips), DefaultTtl).Ips)}");
 
 // how 10,000 different clients are spread over the three addresses
 SortedDictionary<string, int> Count(HashSet<string> down) {
     var c = new SortedDictionary<string, int>(StringComparer.Ordinal);
-    for (int i = 0; i < 10000; i++) { var ip = Resolve("cdn.example.com", $"c{i}", down, 60).Ips[0]; c[ip] = c.GetValueOrDefault(ip) + 1; }
+    for (int i = 0; i < Clients; i++) { var ip = Resolve("cdn.example.com", $"c{i}", down, CdnTtl).Ips[0]; c[ip] = c.GetValueOrDefault(ip) + 1; }
     return c;
 }
 string Show(SortedDictionary<string, int> c) => string.Join(" ", c.Select(kv => $"{kv.Key}={kv.Value}"));
@@ -94,7 +100,7 @@ Console.WriteLine($"weighted, first one down: {Show(split2)}");
 
 var results = new Dictionary<int, (int MarkedAt, int Bad, int Fetches)>();
 foreach (int ttl in new[] { 30, 60, 300, 3600 }) {
-    var r = Failover(ttl, 10, 3); results[ttl] = r;
+    var r = Failover(ttl, CheckInterval, FailThreshold); results[ttl] = r;
     Console.WriteLine($"ttl {ttl}: marked down at {r.MarkedAt}, users on the dead address for {r.Bad} s, {r.Fetches} queries to the name server");
 }
 var off = Attack(false); var on = Attack(true);
@@ -103,7 +109,7 @@ foreach (var (label, r) in new[] { ("off", off), ("on", on) })
 
 bool ok = results[30].MarkedAt == 120 && results[30].Bad == 50 && results[60].Bad == 80 && results[300].Bad == 200 && results[3600].Bad == 3500
     && Math.Abs(split["203.0.113.1"] - 7000) < 400 && Math.Abs(split["203.0.113.2"] - 2000) < 300 && Math.Abs(split["203.0.113.3"] - 1000) < 250 && !split2.ContainsKey("203.0.113.1")
-    && off.Victim["answer"] == 3000 && on.Victim["answer"] == 15 && on.Victim["slip"] + on.Victim["drop"] == 2985 && on.Legit["answer"] == 6 && on.Bytes * 20 < off.Bytes;
+    && off.Victim["answer"] == 3000 && on.Victim["answer"] == 15 && on.Victim["slip"] + on.Victim["drop"] == 2985 && on.Legit["answer"] == 6 && on.Bytes * MinReduction < off.Bytes;
 if (!ok) Environment.Exit(1);
 
 record Rec(string Kind, string[] Ips, int[] Weights);

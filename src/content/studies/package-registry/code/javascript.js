@@ -2,6 +2,7 @@
 // immutable publishes stored by content hash, semver range resolution over a dependency graph, and an integrity check on install.
 import { createHash } from 'node:crypto';
 
+const INTEGRITY_HEX = 16; // hex digits of the SHA-256 kept in the integrity string, enough for a demo
 const sha = (text) => createHash('sha256').update(text).digest('hex');
 const parse = (v) => v.split('.').map(Number);
 const cmp = (a, b) => { for (let i = 0; i < 3; i++) if (a[i] !== b[i]) return a[i] < b[i] ? -1 : 1; return 0; };
@@ -38,7 +39,7 @@ class Registry {
 
   publish(name, version, deps) {
     const body = `${name}@${version}|${deps.map(([n, r]) => `${n}:${r}`).join(',')}`; // stands in for the tarball bytes
-    const integrity = 'sha256-' + sha(body).slice(0, 16);
+    const integrity = 'sha256-' + sha(body).slice(0, INTEGRITY_HEX);
     if (!this.index.has(name)) this.index.set(name, new Map());
     const old = this.index.get(name).get(version);
     if (old) { // a version is immutable: the same bytes are a no-op, different bytes are refused
@@ -81,7 +82,7 @@ class Registry {
     const bad = [];
     for (const [name, version] of chosen) {
       const integrity = this.index.get(name).get(version).integrity;
-      if ('sha256-' + sha(this.blobs.get(integrity)).slice(0, 16) !== integrity) bad.push(`${name}@${version}`);
+      if ('sha256-' + sha(this.blobs.get(integrity)).slice(0, INTEGRITY_HEX) !== integrity) bad.push(`${name}@${version}`);
     }
     return bad;
   }

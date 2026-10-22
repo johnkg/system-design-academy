@@ -5,11 +5,13 @@
 const LAYERS = [150, 500, 1500]; // kbit/s of the low, medium and high layer
 const N = 6;
 
-let seed = 7;
+const SEED = 7;
+const LINK_STEP = 1000, UP_STEPS = 6, DOWN_STEPS = 9; // links are whole Mbit/s: upload 1..6, download 1..9
+let seed = SEED;
 const random = (n) => { seed = (seed * 1664525 + 1013904223) % 4294967296; return Math.floor(seed / 65536) % n; };
 
 const people = Array.from({ length: N }, (_, id) => {
-  const up = 1000 + random(6) * 1000, down = 1000 + random(9) * 1000; // kbit/s, drawn in this order
+  const up = LINK_STEP + random(UP_STEPS) * LINK_STEP, down = LINK_STEP + random(DOWN_STEPS) * LINK_STEP; // kbit/s, drawn in this order
   return { id, up, down };
 });
 

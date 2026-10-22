@@ -3,7 +3,14 @@
 # events for a closed window are dropped as late, and a set of click ids removes duplicates.
 import sys
 
-seed = 7
+SEED, CLICKS, SPAN_S = 7, 400, 300
+ON_TIME_PCT, HELD_PCT = 85, 12  # the remaining 3% come from phones that were offline
+ON_TIME_SPREAD, HELD_MIN, HELD_SPREAD, OFFLINE_MIN, OFFLINE_SPREAD = 3, 2, 9, 10, 36  # delays 0..2, 2..10, 10..45 s
+RETRY_ONE_IN = 8
+SOON_IN_5, SOON_MIN, SOON_SPREAD, LATE_COPY_MIN, LATE_COPY_SPREAD = 4, 1, 7, 15, 41  # copy delay: 4 in 5 after 1..7 s, else 15..55 s
+WINDOW_S, EXACT_LATENESS = 30, 60  # EXACT_LATENESS exceeds every delay in the stream
+
+seed = SEED
 
 
 def random(n):
@@ -16,13 +23,14 @@ def random(n):
 # About 1 click in 8 is sent twice (a retry), and the copy arrives a few seconds, sometimes up to a minute, later.
 def make_stream():
     events = []
-    for id in range(400):
-        t = random(300)
+    for id in range(CLICKS):
+        t = random(SPAN_S)
         u = random(100)
-        delay = random(3) if u < 85 else 2 + random(9) if u < 97 else 10 + random(36)
+        delay = random(ON_TIME_SPREAD) if u < ON_TIME_PCT else HELD_MIN + random(HELD_SPREAD) if u < ON_TIME_PCT + HELD_PCT else OFFLINE_MIN + random(OFFLINE_SPREAD)
         events.append({"id": id, "t": t, "arrival": t + delay, "copy": 0})
-        if random(8) == 0:
-            events.append({"id": id, "t": t, "arrival": t + delay + (1 + random(7) if random(5) < 4 else 15 + random(41)), "copy": 1})
+        if random(RETRY_ONE_IN) == 0:
+            copy_delay = SOON_MIN + random(SOON_SPREAD) if random(5) < SOON_IN_5 else LATE_COPY_MIN + random(LATE_COPY_SPREAD)
+            events.append({"id": id, "t": t, "arrival": t + delay + copy_delay, "copy": 1})
     return sorted(events, key=lambda e: (e["arrival"], e["id"], e["copy"]))
 
 
@@ -48,7 +56,7 @@ def aggregate(events, window_size, lateness, dedup):
                 delay_sum += e["arrival"] - (closed_up_to + 1) * window_size
                 closed_count += 1
     total = sum(counts.values())
-    return {"total": total, "late": late, "duplicates": duplicates, "lost": 400 - len(counted), "avg_delay": delay_sum // closed_count}
+    return {"total": total, "late": late, "duplicates": duplicates, "lost": CLICKS - len(counted), "avg_delay": delay_sum // closed_count}
 
 
 events = make_stream()
@@ -64,12 +72,12 @@ ok = True
 for r in rows:
     if r["dedup"] and r["duplicates"] != 0:
         ok = False                                              # dedup never counts a click twice
-    if not r["dedup"] and r["total"] - 400 + r["lost"] != r["duplicates"]:
+    if not r["dedup"] and r["total"] - CLICKS + r["lost"] != r["duplicates"]:
         ok = False                                              # counted = clicks seen + double counts
-full = aggregate(events, 30, 60, True)                          # more lateness than any delay, with dedup: exact
-if full["total"] != 400 or full["lost"] != 0 or full["late"] != 0:
+full = aggregate(events, WINDOW_S, EXACT_LATENESS, True)                          # more lateness than any delay, with dedup: exact
+if full["total"] != CLICKS or full["lost"] != 0 or full["late"] != 0:
     ok = False
-a, b, c = aggregate(events, 30, 0, True), aggregate(events, 30, 5, True), aggregate(events, 30, 30, True)
+a, b, c = aggregate(events, WINDOW_S, 0, True), aggregate(events, WINDOW_S, 5, True), aggregate(events, WINDOW_S, 30, True)
 if not (a["late"] >= b["late"] >= c["late"] >= full["late"]):
     ok = False                                                  # more lateness never drops more
 print(f"invariants hold: {str(ok).lower()}")

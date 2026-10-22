@@ -5,13 +5,16 @@ const ROWS = 6000, DAYS = 30, PART_DAYS = 5, ROW_BYTES = 14; // a row store keep
 const COUNTRIES = ['BR', 'DE', 'IN', 'JP', 'US'];
 const COLUMNS = ['day', 'country', 'qty', 'amount'];
 
-let seed = 7;
+const SEED = 7, MAX_QTY = 5, MAX_AMOUNT = 500;
+const RUN_BYTES = 3; // one run-length entry: 1 byte code + 2 bytes count
+
+let seed = SEED;
 const next = (n) => { seed = (seed * 1664525 + 1013904223) % 4294967296; return Math.floor(seed / 65536) % n; };
 const bytesFor = (max) => (max < 256 ? 1 : max < 65536 ? 2 : 4); // the narrowest whole number of bytes that holds the biggest value
 
 const rows = [];
 for (let i = 0; i < ROWS; i++) {
-  const country = next(5), qty = 1 + next(5), amount = 1 + next(500);
+  const country = next(COUNTRIES.length), qty = 1 + next(MAX_QTY), amount = 1 + next(MAX_AMOUNT);
   rows.push({ day: Math.floor((i * DAYS) / ROWS), country, qty, amount }); // rows arrive in date order, as events do
 }
 
@@ -25,7 +28,7 @@ for (let p = 0; p < DAYS / PART_DAYS; p++) {
   items.forEach((r, i) => { if (i === 0 || r.country !== items[i - 1].country) runs++; });
   const size = {
     day: bytesFor(maxDay - minDay) * n,                       // delta from the partition's first day
-    country: runs * 3,                                        // run-length: 1 byte code + 2 bytes count per run
+    country: runs * RUN_BYTES,                                       // run-length: 1 byte code + 2 bytes count per run
     qty: bytesFor(Math.max(...items.map((r) => r.qty))) * n,  // bit-packed to the width the values need
     amount: bytesFor(Math.max(...items.map((r) => r.amount))) * n,
   };

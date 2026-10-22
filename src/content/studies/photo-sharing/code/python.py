@@ -4,6 +4,10 @@
 import sys
 
 SHARDS, BATCH = 8, 500
+KEY_SPACE = 100000  # a like key packs post and user: post * 100000 + user, with user ids below 100000
+SEED, TAPS, USERS, PICK_RANGE = 4242, 30000, 20000, 1000
+VIRAL_IN_10 = 8  # 80% of the taps go to the viral post 0
+MAX_WRITE_SHARE = 10  # batching must cut counter writes at least tenfold
 
 
 class LikeStore:
@@ -16,7 +20,7 @@ class LikeStore:
         self.row_writes = {}    # "post:shard" -> updates that row received
 
     def like(self, post, user, pick):
-        key = post * 100000 + user
+        key = post * KEY_SPACE + user
         if key in self.liked:
             return False  # the unique constraint says: already liked
         self.liked.add(key)
@@ -40,7 +44,7 @@ class LikeStore:
         return sum(self.shards.get(post, []))
 
 
-seed = 4242
+seed = SEED
 
 
 def random(n):
@@ -59,11 +63,11 @@ def sum_shown():
 
 taps = []  # every tap, including repeats
 accepted = behind_max = 0
-for _ in range(30000):
-    post = 0 if random(10) < 8 else 1 + random(2)  # 80% of the taps go to the viral post 0
-    user = random(20000)
+for _ in range(TAPS):
+    post = 0 if random(10) < VIRAL_IN_10 else 1 + random(len(posts) - 1)  # 80% of the taps go to the viral post 0
+    user = random(USERS)
     taps.append((post, user))
-    if store.like(post, user, random(1000)):
+    if store.like(post, user, random(PICK_RANGE)):
         accepted += 1
     behind_max = max(behind_max, accepted - sum_shown())  # likes in the buffer, not yet in the counters
 last_behind = accepted - sum_shown()
@@ -77,6 +81,6 @@ print(f"the count trailed by at most {behind_max} likes, and by {last_behind} ju
 hot = [n for k, n in store.row_writes.items() if k.startswith("0:")]
 print(f"counter writes: {store.counter_writes} instead of {accepted}; the hottest row got {max(hot)}, a single row would have got {truth[0]}")
 
-ok = shown == truth and accepted == sum(truth) and store.counter_writes < accepted / 10
+ok = shown == truth and accepted == sum(truth) and store.counter_writes < accepted / MAX_WRITE_SHARE
 if not ok:
     sys.exit(1)

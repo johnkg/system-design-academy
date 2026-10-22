@@ -6,15 +6,19 @@ using System.Collections.Generic;
 using System.Linq;
 
 const int Nodes = 5, Majority = 3;
+const int Trials = 8, SeedBase = 1000;
+const int MinCrash = 40, CrashSpread = 20; // the primary dies after 40..59 writes
+const int SlowNode = 4, SlowSteps = 2, Steps = 3; // per tick a secondary copies 0..2 entries, the slow one 0..1
+const int ElectionTimeout = 150; // election timeouts are random in 0..149 ms
 uint seed = 0;
 int Next(int n) { seed = unchecked(seed * 1664525u + 1013904223u); return (int)((seed >> 8) % (uint)n); }
 
 // A log is just its length here: every secondary holds a prefix of the primary's log.
 (int crashAt, int commit, int winner, int keep, int denied, int rolledBack, int lostW1, int lostMajority) Trial(int n)
 {
-    seed = (uint)(1000 + n);
+    seed = (uint)(SeedBase + n);
     var len = new int[Nodes];                              // node 0 is the primary
-    int crashAt = 40 + Next(20);
+    int crashAt = MinCrash + Next(CrashSpread);
     var isMajorityWrite = new List<bool> { false };        // write k (1-based) uses w:majority when true
     for (int tick = 1; tick <= crashAt; tick++)
     {
@@ -22,7 +26,7 @@ int Next(int n) { seed = unchecked(seed * 1664525u + 1013904223u); return (int)(
         isMajorityWrite.Add(Next(2) == 1);
         for (int i = 1; i < Nodes; i++)                    // node 4 sits on a slow link
         {
-            int step = Next(i == 4 ? 2 : 3);
+            int step = Next(i == SlowNode ? SlowSteps : Steps);
             len[i] = Math.Min(len[0], len[i] + step);
         }
     }
@@ -30,7 +34,7 @@ int Next(int n) { seed = unchecked(seed * 1664525u + 1013904223u); return (int)(
     int primaryLen = len[0];
 
     // Election among the four survivors, in the order their random timeouts fire.
-    var order = new[] { 1, 2, 3, 4 }.Select(id => (id, timeout: Next(150))).OrderBy(c => c.timeout).ThenBy(c => c.id).ToList();
+    var order = new[] { 1, 2, 3, 4 }.Select(id => (id, timeout: Next(ElectionTimeout))).OrderBy(c => c.timeout).ThenBy(c => c.id).ToList();
     int winner = -1, denied = 0;
     foreach (var c in order)
     {
@@ -54,7 +58,7 @@ string Partition(int reachable) =>
     $"partition: {reachable} of {Nodes} nodes reachable, can elect a primary: {(reachable >= Majority ? "true" : "false")}";
 
 int tRolled = 0, tW1 = 0, tMajority = 0, tDenied = 0;
-for (int n = 1; n <= 8; n++)
+for (int n = 1; n <= Trials; n++)
 {
     var r = Trial(n);
     Console.WriteLine($"trial {n}: crash after {r.crashAt} writes, committed {r.commit}, node {r.winner} wins with {r.keep}, stale candidates denied {r.denied}, rolled back {r.rolledBack}, lost w:1 acks {r.lostW1}, lost majority acks {r.lostMajority}");

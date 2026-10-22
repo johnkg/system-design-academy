@@ -4,9 +4,15 @@ using System;
 using System.Collections.Generic;
 using System.Linq;
 
+const int MaxHz = 100, UsPerPermille = 1000; // a permille of one core-second is 1000 microseconds
+const int BudgetPermille = 10, Samples = 20000;
+const uint Seed = 7;
+const int ShareBasis = 10000; // shares are compared in parts per 10,000
+const int Regression = 1000; // a growth of 10 percentage points counts as a regression
+
 // Rate control: the sampling frequency that keeps profiler overhead within a budget (in permille of one core).
 // One second of one core is 1,000,000 microseconds, so a budget of b permille allows b * 1000 microseconds of sampling work per second.
-static int ChooseHz(int budgetPermille, int costUs) => Math.Min(100, budgetPermille * 1000 / costUs);
+static int ChooseHz(int budgetPermille, int costUs) => Math.Min(MaxHz, budgetPermille * UsPerPermille / costUs);
 
 static uint Fnv1a(string text) // 32-bit FNV-1a over ASCII text
 {
@@ -19,7 +25,7 @@ var mix = new (string[] Frames, int Before, int After)[] {
     ("main;handle;parse_json".Split(';'), 30, 30), ("main;handle;auth;verify_token".Split(';'), 20, 20),
     ("main;handle;render;json_encode".Split(';'), 15, 40), ("main;handle;db_query;wait".Split(';'), 25, 25), ("main;gc".Split(';'), 10, 10) };
 
-uint seed = 7;
+uint seed = Seed;
 int Next(int n) { seed = unchecked(seed * 1664525u + 1013904223u); return (int)((seed >> 16) % (uint)n); }
 
 var stacks = new Dictionary<uint, string[]>(); // stack id -> frames (kept once, however many samples use it)
@@ -57,9 +63,9 @@ Dictionary<string, int> Flame(Dictionary<uint, int> counts)
     return paths;
 }
 
-Console.WriteLine(string.Join("; ", new[] { 100, 250, 1000 }.Select(c => $"cost {c}us -> {ChooseHz(10, c)} Hz")));
-var before = Collect(false, 20000);
-var afterProfile = Collect(true, 20000);
+Console.WriteLine(string.Join("; ", new[] { 100, 250, 1000 }.Select(c => $"cost {c}us -> {ChooseHz(BudgetPermille, c)} Hz")));
+var before = Collect(false, Samples);
+var afterProfile = Collect(true, Samples);
 Console.WriteLine($"samples {before.Total + afterProfile.Total}, distinct stacks {stacks.Count}");
 
 var flame = Flame(afterProfile.Counts);
@@ -68,12 +74,12 @@ foreach (var e in flame.OrderByDescending(e => e.Value).ThenBy(e => e.Key, Strin
 
 // Diff: compare shares in parts per 10,000, so two ranges with different sample counts can be compared.
 var fa = Flame(before.Counts);
-var diff = flame.Select(e => (Path: e.Key, Delta: e.Value * 10000 / afterProfile.Total - fa.GetValueOrDefault(e.Key) * 10000 / before.Total))
+var diff = flame.Select(e => (Path: e.Key, Delta: e.Value * ShareBasis / afterProfile.Total - fa.GetValueOrDefault(e.Key) * ShareBasis / before.Total))
     .OrderByDescending(e => e.Delta).ThenBy(e => e.Path, StringComparer.Ordinal).ToList();
 Console.WriteLine("biggest share increases:");
 foreach (var e in diff.Take(3)) Console.WriteLine($"  +{e.Delta} {e.Path}");
 
 bool rootOk = flame["main"] == afterProfile.Total && fa["main"] == before.Total;
 int worst = diff.First(e => e.Path.EndsWith("json_encode")).Delta;
-Console.WriteLine($"root equals samples: {rootOk.ToString().ToLower()}; json_encode regression found: {(worst > 1000).ToString().ToLower()}");
-if (!rootOk || worst <= 1000 || ChooseHz(10, 250) != 40) Environment.Exit(1);
+Console.WriteLine($"root equals samples: {rootOk.ToString().ToLower()}; json_encode regression found: {(worst > Regression).ToString().ToLower()}");
+if (!rootOk || worst <= Regression || ChooseHz(BudgetPermille, 250) != 40) Environment.Exit(1);

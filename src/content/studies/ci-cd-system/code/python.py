@@ -32,7 +32,9 @@ def cache_key(os_name, lockfile):
 
 
 # 3. Test sharding: put the slowest test first on the least loaded shard (greedy), using the timings of earlier runs.
-seed = 99
+SEED, TEST_COUNT, MIN_TEST_S, TEST_SPREAD_S, SHARDS = 99, 12, 10, 170, 4
+JOB_MINUTES, RUNNERS, TEAM_A_JOBS = 3, 2, 8
+seed = SEED
 
 
 def rand(n):
@@ -67,9 +69,9 @@ def schedule(jobs, runners, fair):
                 if running(pending[i]['team']) < running(pending[pick]['team']):
                     pick = i
         job = pending.pop(pick)
-        spans.append({'team': job['team'], 'start': t, 'end': t + 3})
+        spans.append({'team': job['team'], 'start': t, 'end': t + JOB_MINUTES})
         start[job['id']] = t
-        free[r] = t + 3
+        free[r] = t + JOB_MINUTES
     return start
 
 
@@ -81,28 +83,28 @@ same = cache_key('linux', lock) == cache_key('linux', 'left-pad 1.3.0\nreact 18.
 changed = cache_key('linux', lock) == cache_key('linux', lock.replace('18.2.0', '18.3.1'))
 print(f"cache key {cache_key('linux', lock)}; same lockfile same key: {str(same).lower()}; one version changed, same key: {str(changed).lower()}")
 
-tests = [{'name': f't{i + 1:02d}', 'secs': 10 + rand(170)} for i in range(12)]
+tests = [{'name': f't{i + 1:02d}', 'secs': MIN_TEST_S + rand(TEST_SPREAD_S)} for i in range(TEST_COUNT)]
 total = sum(t['secs'] for t in tests)
 longest = max(t['secs'] for t in tests)
-loads = shard(tests, 4)
-round_robin = [0] * 4
+loads = shard(tests, SHARDS)
+round_robin = [0] * SHARDS
 for i, t in enumerate(tests):
-    round_robin[i % 4] += t['secs']
+    round_robin[i % SHARDS] += t['secs']
 print(f"one shard takes {total} s; 4 shards by timing: {', '.join(map(str, loads))} s; 4 shards by name: {', '.join(map(str, round_robin))} s")
 
-jobs = [{'team': 'A', 'id': f'A{i + 1}'} for i in range(8)] + [{'team': 'B', 'id': 'B1'}, {'team': 'B', 'id': 'B2'}]
+jobs = [{'team': 'A', 'id': f'A{i + 1}'} for i in range(TEAM_A_JOBS)] + [{'team': 'B', 'id': 'B1'}, {'team': 'B', 'id': 'B2'}]
 
 
 def wait_b(s):
     return max(s['B1'], s['B2'])
 
 
-fifo = schedule(jobs, 2, False)
-fair = schedule(jobs, 2, True)
+fifo = schedule(jobs, RUNNERS, False)
+fair = schedule(jobs, RUNNERS, True)
 print(f'team B waits at most {wait_b(fifo)} min first come first served, and {wait_b(fair)} min with fair share')
 
 ok = (len(lay) == 3 and same and not changed
-      and max(loads) * 4 <= total + longest * 3 and sum(loads) == total
+      and max(loads) * SHARDS <= total + longest * (SHARDS - 1) and sum(loads) == total
       and wait_b(fair) < wait_b(fifo))
 if not ok:
     sys.exit(1)

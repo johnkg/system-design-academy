@@ -6,9 +6,11 @@ import sys
 
 USER, GAP, N, SLOW_PERMILLE, ATTEMPT, BACKOFF, RETRIES = 2000, 50, 200, 100, 400, 25, 2
 PRE, POST, MIN_LEFT, RETRY_MIN = 10, 5, 50, 100
+SEED = 12345
+SLOW_MIN, SLOW_SPREAD, FAST_MIN, FAST_SPREAD = 2500, 6500, 20, 60  # database attempt latency (ms)
 INF = float("inf")
 
-seed = 12345  # Park-Miller generator, integers only so every language prints the same
+seed = SEED  # Park-Miller generator, integers only so every language prints the same
 def next_rand():
     global seed
     seed = (seed * 48271) % 2147483647
@@ -78,9 +80,9 @@ def simulate(timeouts, deadline, t0, attempts):
 requests = []
 for i in range(N):
     attempts = []
-    for _ in range(3):
+    for _ in range(RETRIES + 1):
         s, a = next_rand(), next_rand()
-        attempts.append(2500 + a % 6500 if s % 1000 < SLOW_PERMILLE else 20 + a % 60)
+        attempts.append(SLOW_MIN + a % SLOW_SPREAD if s % 1000 < SLOW_PERMILLE else FAST_MIN + a % FAST_SPREAD)
     requests.append((i * GAP, attempts))
 
 summary = {}

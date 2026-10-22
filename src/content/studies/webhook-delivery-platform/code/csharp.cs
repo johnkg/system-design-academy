@@ -3,11 +3,16 @@
 using System.Security.Cryptography;
 using System.Text;
 
+const long ToleranceS = 300; // a signature older than 5 minutes is rejected as a replay
+const int Events = 10; // events fanned out to every endpoint
+const int BackoffBase = 2, BackoffCap = 30; // retry delays grow 2, 4, 8, ... ticks, capped at 30
+const uint Seed = 7;
+
 // The signature covers the timestamp and the exact body, so a captured request cannot be replayed later or edited.
 static string Sign(string secret, long ts, string body) =>
     Convert.ToHexString(HMACSHA256.HashData(Encoding.UTF8.GetBytes(secret), Encoding.UTF8.GetBytes($"{ts}.{body}"))).ToLowerInvariant();
 
-static bool Verify(string secret, string header, long ts, string body, long now, long tolerance = 300)
+static bool Verify(string secret, string header, long ts, string body, long now, long tolerance = ToleranceS)
 {
     if (Math.Abs(now - ts) > tolerance) return false;                        // too old (or from the future)
     string want = Sign(secret, ts, body);
@@ -16,9 +21,9 @@ static bool Verify(string secret, string header, long ts, string body, long now,
 
 const int Limit = 2, MaxAttempts = 6, Trip = 3, Cool = 20, End = 200;
 const long Epoch = 1700000000;
-uint seed = 7;
+uint seed = Seed;
 int Rnd(int n) { seed = unchecked(seed * 1664525u + 1013904223u); return (int)((seed >> 16) % (uint)n); }
-int Backoff(int attempt) => 1 + Rnd(Math.Min(30, 2 * (1 << (attempt - 1))));   // full jitter: anywhere from 1 to the cap
+int Backoff(int attempt) => 1 + Rnd(Math.Min(BackoffCap, BackoffBase * (1 << (attempt - 1))));   // full jitter: anywhere from 1 to the cap
 
 // The customer side. A receiver stores event ids, so a repeated delivery is ignored instead of processed twice.
 string[] rotation = { "whsec_new", "whsec_old" };   // while a secret is rotated the sender signs with both
@@ -40,7 +45,7 @@ string Receive(Endpoint ep, int id, int attempt, long ts, string body, string he
     return how;
 }
 
-foreach (var ep in endpoints) for (int id = 1; id <= 10; id++) ep.Queue.Add(new Job { Id = id });   // fan-out: one job per endpoint
+foreach (var ep in endpoints) for (int id = 1; id <= Events; id++) ep.Queue.Add(new Job { Id = id });   // fan-out: one job per endpoint
 
 for (int t = 0; t < End; t++)
 {
@@ -73,9 +78,9 @@ foreach (var ep in endpoints)
     Console.WriteLine($"{ep.Name}: delivered {ep.Delivered}, attempts {ep.Attempts}, dropped {ep.Dropped}, waiting {ep.Queue.Count}, duplicates ignored {ep.Dupes}, breaker opened {ep.Opened}, last delivery at {ep.Last}");
 
 var (h, f, d) = (endpoints[0], endpoints[1], endpoints[2]);
-bool fine = checks[0] && !checks[1] && !checks[2] && h.Delivered == 10 && h.Last <= 5 && h.Attempts == 10 && f.Delivered == 10 && f.Seen.Count == 10 && f.Dupes > 0 &&
-    d.Delivered == 0 && d.Attempts < 10 * MaxAttempts && d.Delivered + d.Dropped + d.Queue.Count == 10;
-Console.WriteLine($"dead endpoint saw {d.Attempts} attempts, not {10 * MaxAttempts}; healthy finished by tick {h.Last}");
+bool fine = checks[0] && !checks[1] && !checks[2] && h.Delivered == Events && h.Last <= 5 && h.Attempts == Events && f.Delivered == Events && f.Seen.Count == Events && f.Dupes > 0 &&
+    d.Delivered == 0 && d.Attempts < Events * MaxAttempts && d.Delivered + d.Dropped + d.Queue.Count == Events;
+Console.WriteLine($"dead endpoint saw {d.Attempts} attempts, not {Events * MaxAttempts}; healthy finished by tick {h.Last}");
 if (!fine) Environment.Exit(1);
 
 class Job { public int Id, Attempts, ReadyAt; }

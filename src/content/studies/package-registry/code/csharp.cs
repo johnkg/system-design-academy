@@ -55,13 +55,14 @@ public static class Semver
 
 public class Registry
 {
+    const int IntegrityHex = 16; // hex digits of the SHA-256 kept in the integrity string, enough for a demo
     public readonly Dictionary<string, Dictionary<string, Meta>> Index = new(); // name -> version -> metadata
     public readonly Dictionary<string, string> Blobs = new();                   // hash -> tarball
 
     public bool Publish(string name, string version, List<(string, string)> deps)
     {
         string body = $"{name}@{version}|{string.Join(",", deps.Select(d => $"{d.Item1}:{d.Item2}"))}"; // stands in for the tarball bytes
-        string integrity = "sha256-" + Semver.Sha(body)[..16];
+        string integrity = "sha256-" + Semver.Sha(body)[..IntegrityHex];
         if (!Index.ContainsKey(name)) Index[name] = new();
         if (Index[name].TryGetValue(version, out var old)) // a version is immutable: the same bytes are a no-op, different bytes are refused
         {
@@ -110,7 +111,7 @@ public class Registry
         foreach (var (name, version) in chosen)
         {
             string integrity = Index[name][version].Integrity;
-            if ("sha256-" + Semver.Sha(Blobs[integrity])[..16] != integrity) bad.Add($"{name}@{version}");
+            if ("sha256-" + Semver.Sha(Blobs[integrity])[..IntegrityHex] != integrity) bad.Add($"{name}@{version}");
         }
         return bad;
     }

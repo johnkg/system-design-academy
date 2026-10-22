@@ -5,7 +5,11 @@ import sys
 PAGES, DAYS, FULL_EVERY, KEEP, ATTACK_DAY = 32, 24, 7, 14, 18
 LOCK = KEEP + FULL_EVERY
 
-seed = 7
+SEED = 7
+PAGE_CHECK = 97  # every valid page value is a multiple of 97, so garbled pages are detectable
+VALUE_RANGE, WRITES_PER_DAY, GARBLED_PER_DAY = 1000, 6, 8
+
+seed = SEED
 
 
 def random(n):
@@ -59,7 +63,7 @@ def restore(vault, day):
     return state
 
 
-prod = [(i + 1) * 97 for i in range(PAGES)]  # every valid page value is a multiple of 97
+prod = [(i + 1) * PAGE_CHECK for i in range(PAGES)]
 dirty = [True] * PAGES
 
 
@@ -72,11 +76,11 @@ vault = Vault()
 fulls = written = 0
 
 for day in range(DAYS):
-    for _ in range(6):
-        touch(random(PAGES), random(1000) * 97)
+    for _ in range(WRITES_PER_DAY):
+        touch(random(PAGES), random(VALUE_RANGE) * PAGE_CHECK)
     if day >= ATTACK_DAY:
-        for _ in range(8):
-            touch(random(PAGES), random(1000) * 97 + 1 + random(96))  # garbled
+        for _ in range(GARBLED_PER_DAY):
+            touch(random(PAGES), random(VALUE_RANGE) * PAGE_CHECK + 1 + random(PAGE_CHECK - 1))  # garbled
     full = day % FULL_EVERY == 0
     pages = [[i, v] for i, v in enumerate(prod) if full or dirty[i]]
     vault.put({'day': day, 'full': full, 'pages': pages, 'hash': fingerprint(prod)})
@@ -98,7 +102,7 @@ day = DAYS - 1
 while day >= 0 and clean < 0:
     state = restore(vault, day)
     hash_ok = fingerprint(state) == vault.items[day]['backup']['hash']
-    data_ok = all(v % 97 == 0 for v in state)
+    data_ok = all(v % PAGE_CHECK == 0 for v in state)
     print(f"restore test day {day}: hash {'ok' if hash_ok else 'BAD'}, data check {'passed' if data_ok else 'FAILED'}")
     if hash_ok and data_ok:
         clean = day

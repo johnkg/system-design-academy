@@ -25,8 +25,10 @@ class TokenBucket {
   }
 }
 
+const CAPACITY = 3; // burst size in tokens
+const REFILL_PER_SECOND = 1;
 let time = 0; // seconds, moved by hand
-const bucket = new TokenBucket(3, 1, () => time);
+const bucket = new TokenBucket(CAPACITY, REFILL_PER_SECOND, () => time);
 
 function request(label) {
   console.log(`t=${time}s ${label}: ${bucket.tryTake() ? "allowed" : "429 too many requests"}`);

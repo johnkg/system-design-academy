@@ -14,7 +14,12 @@ public record Entry(int T, int Idx, string Text);
 
 public static class Program
 {
-    static long seed = 4242;
+    const long Seed = 4242;
+    const int Alerts = 24, AlertSpacing = 4; // one alert about every 4 minutes
+    const int Severities = 3, PublicSev = 2; // sev 1..3; sev 1 and 2 get a status page update
+    const int MaxAckDelay = 9; // a paged person answers after 1..9 minutes
+    const int SendFailPct = 15, AckLostPct = 5;
+    static long seed = Seed;
     static int Rand(int n) { seed = (seed * 1664525 + 1013904223) % 4294967296L; return (int)((seed / 65536) % n); }
 
     static readonly string[] Services = { "checkout", "search", "login" };
@@ -30,9 +35,9 @@ public static class Program
     {
         // 1. Group alerts into incidents. Severity 1 is the worst, and an incident takes the worst severity of its alerts.
         var incidents = new List<Incident>();
-        for (int i = 0; i < 24; i++)
+        for (int i = 0; i < Alerts; i++)
         {
-            int t = i * 4 + Rand(4); string service = Services[Rand(3)]; int sev = 1 + Rand(3);
+            int t = i * AlertSpacing + Rand(AlertSpacing); string service = Services[Rand(Services.Length)]; int sev = 1 + Rand(Severities);
             var open = incidents.FirstOrDefault(x => x.Service == service && t - x.Last <= GroupGap);
             if (open != null) { open.Last = t; open.Alerts++; open.Sev = Math.Min(open.Sev, sev); }
             else incidents.Add(new Incident { Id = incidents.Count + 1, Service = service, Start = t, Last = t, Alerts = 1, Sev = sev });
@@ -45,7 +50,7 @@ public static class Program
             Log(now, $"INC-{inc.Id} declared on {inc.Service}, sev {inc.Sev}, from {inc.Alerts} alerts");
             foreach (var level in Chain)
             {
-                int delay = 1 + Rand(9);
+                int delay = 1 + Rand(MaxAckDelay);
                 paged++;
                 Log(now, $"INC-{inc.Id} paged {level}");
                 if (delay <= AckWindow) { now += delay; inc.Commander = level; Log(now, $"INC-{inc.Id} {level} acknowledged and is commander"); break; }
@@ -59,7 +64,7 @@ public static class Program
         // 3. Status page fan-out for serious incidents. A key per (incident, subscriber) lets the receiver drop repeats.
         var received = new HashSet<string>();
         int attempts = 0, duplicates = 0, gaveUp = 0, total = 0;
-        foreach (var inc in incidents.Where(x => x.Sev <= 2))
+        foreach (var inc in incidents.Where(x => x.Sev <= PublicSev))
         {
             for (int s = 0; s < Subscribers; s++)
             {
@@ -69,9 +74,9 @@ public static class Program
                 for (int a = 0; a < Attempts && !done; a++)
                 {
                     attempts++;
-                    if (Rand(100) < 15) continue;                                  // the send failed: retry
+                    if (Rand(100) < SendFailPct) continue;                                 // the send failed: retry
                     if (received.Contains(key)) duplicates++; else received.Add(key); // delivered, and a repeat is ignored
-                    done = Rand(100) >= 5;                                         // 5%: the acknowledgement was lost, so we resend
+                    done = Rand(100) >= AckLostPct;                                        // 5%: the acknowledgement was lost, so we resend
                 }
                 if (!done && !received.Contains(key)) gaveUp++;
             }
@@ -86,7 +91,7 @@ public static class Program
         Console.WriteLine($"fan-out: {total} messages, {attempts} attempts, {duplicates} duplicates dropped, {gaveUp} gave up, {received.Count} delivered");
 
         bool times = ordered.Select((e, i) => i == 0 || ordered[i - 1].T <= e.T).All(b => b);
-        bool kept = incidents.Sum(x => x.Alerts) == 24;
+        bool kept = incidents.Sum(x => x.Alerts) == Alerts;
         bool accounted = received.Count + gaveUp == total;
         Console.WriteLine($"checks: ordered {times.ToString().ToLower()}, alerts kept {kept.ToString().ToLower()}, delivered + gave up = total {accounted.ToString().ToLower()}");
         return times && kept && accounted ? 0 : 1;

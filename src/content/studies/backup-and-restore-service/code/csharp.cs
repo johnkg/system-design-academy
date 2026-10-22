@@ -6,7 +6,11 @@ using System.Linq;
 
 const int Pages = 32, Days = 24, FullEvery = 7, Keep = 14, Lock = Keep + FullEvery, AttackDay = 18;
 
-uint seed = 7;
+const uint Seed = 7;
+const int PageCheck = 97; // every valid page value is a multiple of 97, so garbled pages are detectable
+const int ValueRange = 1000, WritesPerDay = 6, GarbledPerDay = 8;
+
+uint seed = Seed;
 int Random(int n) { seed = unchecked(seed * 1664525u + 1013904223u); return (int)((seed >> 16) % (uint)n); }
 
 // A 32-bit FNV style hash of the whole database, recorded with each backup so a restore can be compared with the original.
@@ -32,14 +36,14 @@ int[]? Restore(int day) {
     return state;
 }
 
-var prod = Enumerable.Range(0, Pages).Select(i => (i + 1) * 97).ToArray(); // every valid page value is a multiple of 97
+var prod = Enumerable.Range(0, Pages).Select(i => (i + 1) * PageCheck).ToArray();
 var dirty = Enumerable.Repeat(true, Pages).ToArray();
 void Touch(int i, int v) { prod[i] = v; dirty[i] = true; }
 int fulls = 0, written = 0;
 
 for (int day = 0; day < Days; day++) {
-    for (int k = 0; k < 6; k++) { int i = Random(Pages); Touch(i, Random(1000) * 97); }
-    if (day >= AttackDay) for (int k = 0; k < 8; k++) { int i = Random(Pages); int a = Random(1000) * 97 + 1; Touch(i, a + Random(96)); } // garbled
+    for (int k = 0; k < WritesPerDay; k++) { int i = Random(Pages); Touch(i, Random(ValueRange) * PageCheck); }
+    if (day >= AttackDay) for (int k = 0; k < GarbledPerDay; k++) { int i = Random(Pages); int a = Random(ValueRange) * PageCheck + 1; Touch(i, a + Random(PageCheck - 1)); } // garbled
     bool full = day % FullEvery == 0;
     var pages = prod.Select((v, i) => (i, v)).Where(p => full || dirty[p.i]).ToList();
     vault.Put(new Backup(day, full, pages, Hash(prod)), Lock);
@@ -59,7 +63,7 @@ int clean = -1;
 for (int day = Days - 1; day >= 0 && clean < 0; day--) {
     var state = Restore(day)!;
     bool hashOk = Hash(state) == vault.Items[day].Backup.Hash;
-    bool dataOk = state.All(v => v % 97 == 0);
+    bool dataOk = state.All(v => v % PageCheck == 0);
     Console.WriteLine($"restore test day {day}: hash {(hashOk ? "ok" : "BAD")}, data check {(dataOk ? "passed" : "FAILED")}");
     if (hashOk && dataOk) clean = day;
 }

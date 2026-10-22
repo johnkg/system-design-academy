@@ -2,6 +2,8 @@
 # Events arrive in processing order; each carries the event time (seconds) when the click happened.
 
 WINDOW = 10
+END_OF_STREAM = 10**9  # a watermark later than any event time
+TRACED_DELAY, SAFE_DELAY = 5, 20  # the run printed step by step, and one above the worst disorder
 EVENTS = [1, 3, 12, 8, 5, 14, 22, 11, 25, 9, 31, 18, 35, 27, 41, 33]  # event times, in arrival order
 
 
@@ -32,7 +34,7 @@ def run(delay, verbose):
         watermark = max_time - delay  # the watermark never moves backwards because max_time does not
         fire_ready(f"t={t}")
     # End of input: the watermark jumps to infinity and flushes everything left.
-    watermark = 10**9
+    watermark = END_OF_STREAM
     fire_ready("end")
     return fired, late
 
@@ -42,13 +44,13 @@ for t in EVENTS:
     s = t // WINDOW * WINDOW
     truth[s] = truth.get(s, 0) + 1
 
-for delay in (0, 5, 20):
+for delay in (0, TRACED_DELAY, SAFE_DELAY):
     print(f"watermark delay {delay}s")
-    fired, late = run(delay, verbose=(delay == 5))
+    fired, late = run(delay, verbose=(delay == TRACED_DELAY))
     error = sum(abs(truth[s] - fired.get(s, 0)) for s in truth)
     counted = sum(fired.values())
     print(f"  windows={len(fired)} counted={counted} late={len(late)} error={error}")
     assert counted + len(late) == len(EVENTS), "every event is counted or late"
     assert error == len(late), "the only error is the dropped late events"
-    if delay == 20:
+    if delay == SAFE_DELAY:
         assert not late, "a delay above the worst disorder (16s) drops nothing"

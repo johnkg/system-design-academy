@@ -16,15 +16,19 @@ public static class Mesh
     public const int Pods = 5, Ticks = 300, PerTick = 2, BadPod = 3, BadFrom = 50, OutageFrom = 200, OutageTo = 220;
     public const int MaxRetries = 3, EjectAfter = 5, EjectTicks = 30;
     static readonly int[] Hold = { 2, 5, 2, 2, 2 }; // ticks a request stays in flight; pod 1 is slow
-    static uint seed = 7;
+    const uint Seed = 7;
+    const int RetryBudget = 5; // retries may be at most 1/5 (20%) of requests
+    const int ReleaseSlack = 10; // ticks past the end for requests still in flight
+    const double MinOkShare = 0.9; // retries alone must still deliver 90% of requests
+    static uint seed = Seed;
 
     static int Random(int n) { seed = unchecked(seed * 1664525u + 1013904223u); return (int)((seed >> 16) % (uint)n); }
 
     public static Result Run(bool eject, bool budget)
     {
-        seed = 7;
+        seed = Seed;
         var active = new int[Pods]; var consecutive = new int[Pods]; var ejectedUntil = new int[Pods];
-        var releases = Enumerable.Range(0, Ticks + 10).Select(_ => new List<int>()).ToArray();
+        var releases = Enumerable.Range(0, Ticks + ReleaseSlack).Select(_ => new List<int>()).ToArray();
         var r = new Result();
 
         // Power of two choices: draw two candidate pods and take the one with fewer requests in flight.
@@ -54,7 +58,7 @@ public static class Mesh
                     if (eject && consecutive[p] >= EjectAfter) { ejectedUntil[p] = t + EjectTicks; consecutive[p] = 0; r.Ejections++; }
                     tried.Add(p);
                     if (k == MaxRetries) break;
-                    if (budget && (r.Retries + 1) * 5 > r.Requests) { r.Denied++; break; } // the budget: retries <= 20% of requests
+                    if (budget && (r.Retries + 1) * RetryBudget > r.Requests) { r.Denied++; break; } // the budget: retries <= 20% of requests
                     r.Retries++;
                 }
             }
@@ -78,9 +82,9 @@ public static class Mesh
 
         bool[] checks = {
             eject2.BadBefore * 2 < plain.BadBefore,        // ejection stops most traffic to the bad pod
-            budget2.Retries * 5 <= budget2.Requests,       // the budget bounds retries to 20% of requests
+            budget2.Retries * RetryBudget <= budget2.Requests,       // the budget bounds retries to 20% of requests
             both.Attempts < plain.Attempts,                // less wasted work
-            plain.Ok > plain.Requests * 0.9 && both.Ok > 0, // retries still hide the one bad pod
+            plain.Ok > plain.Requests * MinOkShare && both.Ok > 0, // retries still hide the one bad pod
         };
         if (checks.Contains(false)) { Console.WriteLine("invariant failed"); Environment.Exit(1); }
     }

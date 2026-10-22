@@ -11,7 +11,9 @@ public static class Program
 {
     static readonly int[] Layers = { 150, 500, 1500 }; // kbit/s of the low, medium and high layer
     const int N = 6;
-    static long seed = 7;
+    const long Seed = 7;
+    const int LinkStep = 1000, UpSteps = 6, DownSteps = 9; // links are whole Mbit/s: upload 1..6, download 1..9
+    static long seed = Seed;
     static int Random(int n) { seed = (seed * 1664525 + 1013904223) % 4294967296; return (int)((seed / 65536) % n); }
 
     // A sender uploads layers from the lowest upwards for as long as they fit in its uplink.
@@ -28,7 +30,7 @@ public static class Program
         var people = new List<Person>();
         for (int id = 0; id < N; id++)
         {
-            int up = 1000 + Random(6) * 1000, down = 1000 + Random(9) * 1000; // kbit/s, drawn in this order
+            int up = LinkStep + Random(UpSteps) * LinkStep, down = LinkStep + Random(DownSteps) * LinkStep; // kbit/s, drawn in this order
             people.Add(new Person(id, up, down));
         }
         var sent = people.Select(Published).ToList();

@@ -4,13 +4,16 @@
 const LEVELS = ['debug', 'info', 'warn', 'error']; // index = priority
 const CAPACITY = 300, DRAIN = 60, TICKS = 60;      // lines the buffer holds, lines shipped per tick, length of the run
 
-let seed = 7;
+const DEBUG = 0, INFO = 1, WARN = 2, ERROR = 3;
+const ERROR_PCT = 3, WARN_PCT = 7, INFO_PCT = 30; // the remaining 60% is debug
+const SEED = 7, NORMAL_RATE = 30, BURST_RATE = 150, BURST_START = 20, BURST_END = 30; // lines per tick
+let seed = SEED;
 const random = (n) => { seed = (seed * 1664525 + 1013904223) % 4294967296; return Math.floor(seed / 65536) % n; };
-const levelOf = (r) => (r < 3 ? 3 : r < 10 ? 2 : r < 40 ? 1 : 0); // 3% errors, 7% warnings, 30% info, 60% debug
+const levelOf = (r) => (r < ERROR_PCT ? ERROR : r < ERROR_PCT + WARN_PCT ? WARN : r < ERROR_PCT + WARN_PCT + INFO_PCT ? INFO : DEBUG);
 
 function run(policy) {
-  seed = 7;
-  const queue = [], lost = [0, 0, 0, 0], sent = [0, 0, 0, 0];
+  seed = SEED;
+  const queue = [], lost = LEVELS.map(() => 0), sent = LEVELS.map(() => 0);
   let arrived = 0, peak = 0;
 
   const offer = (level) => {
@@ -23,7 +26,7 @@ function run(policy) {
   };
 
   for (let t = 0; t < TICKS; t++) {
-    const n = t >= 20 && t < 30 ? 150 : 30;  // a burst between ticks 20 and 29
+    const n = t >= BURST_START && t < BURST_END ? BURST_RATE : NORMAL_RATE; // a burst between ticks 20 and 29
     for (let i = 0; i < n; i++) { offer(levelOf(random(100))); arrived++; }
     peak = Math.max(peak, queue.length);
     for (let i = 0; i < DRAIN && queue.length > 0; i++) sent[queue.shift()]++;
@@ -42,6 +45,6 @@ for (const policy of ['drop-newest', 'drop-oldest', 'keep-errors']) {
   results[policy] = r;
   if (r.lost.reduce((a, b) => a + b, 0) + r.sent.reduce((a, b) => a + b, 0) !== r.arrived) process.exit(1); // every line is either shipped or counted as lost
 }
-const ok = results['keep-errors'].lost[3] === 0 && results['drop-newest'].lost[3] > 0 && results['drop-oldest'].lost[3] > 0;
-console.log(`errors lost: ${['drop-newest', 'drop-oldest', 'keep-errors'].map((p) => results[p].lost[3]).join(' / ')}; keep-errors loses none: ${ok}`);
+const ok = results['keep-errors'].lost[ERROR] === 0 && results['drop-newest'].lost[ERROR] > 0 && results['drop-oldest'].lost[ERROR] > 0;
+console.log(`errors lost: ${['drop-newest', 'drop-oldest', 'keep-errors'].map((p) => results[p].lost[ERROR]).join(' / ')}; keep-errors loses none: ${ok}`);
 if (!ok) process.exit(1);

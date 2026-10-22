@@ -20,8 +20,10 @@ class TokenBucket:
         return False
 
 
+CAPACITY = 3  # burst size in tokens
+REFILL_PER_SECOND = 1
 time = 0  # seconds, moved by hand
-bucket = TokenBucket(3, 1, lambda: time)
+bucket = TokenBucket(CAPACITY, REFILL_PER_SECOND, lambda: time)
 
 
 def request(label):

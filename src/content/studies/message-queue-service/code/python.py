@@ -2,6 +2,10 @@
 # keys pick a partition, each partition is an append-only log with a leader and followers, and a leader crash shows what each acks setting loses.
 import sys
 
+PARTITIONS, USERS, EVENTS_PER_USER = 4, 12, 5
+REPLICAS, MESSAGES, CRASH_AT, NOTICED_AT = 3, 20, 14, 16  # a fire-and-forget producer only notices the dead leader at message 16
+FETCH_EVERY, LOST_ACK_ID = 4, 9  # followers copy every 4th message; the ack of message 9 is lost
+BATCH, CRASH_AFTER = 5, 3  # the consumer crashes after processing 3 of a batch of 5
 
 def fnv(s):  # FNV-1a, a stable hash
     h = 2166136261
@@ -15,11 +19,11 @@ def partition_for(key, count):
 
 
 # ---- 1. Keys decide the partition, so one key's events stay in order ----
-parts = [[] for _ in range(4)]
-for n in range(5):
-    for u in range(12):
+parts = [[] for _ in range(PARTITIONS)]
+for n in range(EVENTS_PER_USER):
+    for u in range(USERS):
         key = f'user-{u}'
-        parts[partition_for(key, 4)].append({'key': key, 'n': n})
+        parts[partition_for(key, PARTITIONS)].append({'key': key, 'n': n})
 
 
 def is_in_order(log):
@@ -65,21 +69,21 @@ class Partition:
 
 
 def run(acks, idempotent):
-    p = Partition(3)
+    p = Partition(REPLICAS)
     acked = []
-    for id in range(20):
-        if id == 14:
+    for id in range(MESSAGES):
+        if id == CRASH_AT:
             p.crash()  # the leader dies while the producer is writing
         if p.leader < 0:
-            if acks == 0 and id < 16:  # fire and forget: nobody tells the producer, and the message goes nowhere
+            if acks == 0 and id < NOTICED_AT:  # fire and forget: nobody tells the producer, and the message goes nowhere
                 acked.append(id)
                 continue
             p.elect()  # acks 1 or all: an error, a metadata refresh, and a retry on the new leader
             p.fetch()
         p.append(id, idempotent)
-        if acks == 'all' or id % 4 == 3:
+        if acks == 'all' or id % FETCH_EVERY == FETCH_EVERY - 1:
             p.fetch()  # acks=all waits for the followers, otherwise they copy in batches
-        if id == 9 and acks != 0:
+        if id == LOST_ACK_ID and acks != 0:
             p.append(id, idempotent)  # the ack was lost on the network, so the producer retries
         acked.append(id)
     kept = p.logs[p.leader]
@@ -102,10 +106,10 @@ show('acks=all + idem ', r_idem)
 def consume(log, commit_first):
     committed = 0
     processed = []
-    batch = log[committed:committed + 5]
+    batch = log[committed:committed + BATCH]
     if commit_first:
         committed += len(batch)  # commit, then process
-    processed.extend(batch[:3])  # crash after 3 messages
+    processed.extend(batch[:CRASH_AFTER])  # crash after 3 messages
     rest = log[committed:]  # the restarted consumer resumes at the committed offset
     processed.extend(rest)
     missing = len([id for id in log if id not in processed])
@@ -116,7 +120,7 @@ before, after = consume(r_idem['log'], True), consume(r_idem['log'], False)
 print(f"commit before processing: {before['missing']} missing, {before['repeated']} repeated")
 print(f"commit after processing:  {after['missing']} missing, {after['repeated']} repeated")
 
-ok = (in_order and len(r_all['lost']) == 0 and r_idem['dups'] == 0 and len(r_idem['log']) == 20
+ok = (in_order and len(r_all['lost']) == 0 and r_idem['dups'] == 0 and len(r_idem['log']) == MESSAGES
       and len(r1['lost']) > 0 and len(r0['lost']) > len(r1['lost']) and r_all['dups'] == 1
       and before['missing'] == 2 and after['missing'] == 0 and after['repeated'] == 3)
 if not ok:

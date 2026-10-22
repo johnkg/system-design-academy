@@ -60,7 +60,9 @@ class FeedService {
 
 const show = (r) => r.page.map((p) => `${p.id}:${p.author}:${p.text}`).join(" | ") + `  (next cursor: ${r.nextCursor})`;
 
-const svc = new FeedService(3); // an author with 3 or more followers counts as popular, to keep the demo small
+const POPULAR_FOLLOWERS = 3; // an author with 3 or more followers counts as popular, to keep the demo small
+const PAGE_SIZE = 2;
+const svc = new FeedService(POPULAR_FOLLOWERS);
 svc.follow("ann", "bob");
 svc.follow("dan", "bob");
 for (const user of ["ann", "dan", "eve"]) svc.follow(user, "cat"); // cat becomes popular
@@ -69,7 +71,7 @@ console.log("bob posts 'lunch':       ", `pushed to ${svc.publish("bob", "lunch"
 console.log("cat posts 'big news':    ", `pushed to ${svc.publish("cat", "big news")} feeds`);
 console.log("bob posts 'coffee':      ", `pushed to ${svc.publish("bob", "coffee")} feeds`);
 
-const first = svc.feed("ann", 2);
+const first = svc.feed("ann", PAGE_SIZE);
 console.log("ann page 1:              ", show(first));
-console.log("ann page 2:              ", show(svc.feed("ann", 2, first.nextCursor)));
-console.log("eve page 1:              ", show(svc.feed("eve", 2)));
+console.log("ann page 2:              ", show(svc.feed("ann", PAGE_SIZE, first.nextCursor)));
+console.log("eve page 1:              ", show(svc.feed("eve", PAGE_SIZE)));

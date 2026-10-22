@@ -7,7 +7,10 @@ COUNTRIES = ['BR', 'DE', 'IN', 'JP', 'US']
 COLUMNS = ['day', 'country', 'qty', 'amount']
 RAW_WIDTH = {'day': 4, 'country': 2, 'qty': 4, 'amount': 4}
 
-seed = 7
+SEED, MAX_QTY, MAX_AMOUNT = 7, 5, 500
+RUN_BYTES = 3  # one run-length entry: 1 byte code + 2 bytes count
+
+seed = SEED
 
 
 def next_int(n):
@@ -23,9 +26,9 @@ def bytes_for(biggest):
 
 rows = []
 for i in range(ROWS):
-    country = next_int(5)
-    qty = 1 + next_int(5)
-    amount = 1 + next_int(500)
+    country = next_int(len(COUNTRIES))
+    qty = 1 + next_int(MAX_QTY)
+    amount = 1 + next_int(MAX_AMOUNT)
     rows.append({'day': i * DAYS // ROWS, 'country': country, 'qty': qty, 'amount': amount})  # rows arrive in date order
 
 # Cut into partitions by day. Inside a partition sort by country (the sort key), so equal countries sit in long runs.
@@ -38,7 +41,7 @@ for p in range(DAYS // PART_DAYS):
     runs = sum(1 for i, r in enumerate(items) if i == 0 or r['country'] != items[i - 1]['country'])
     size = {
         'day': bytes_for(max_day - min_day) * n,                      # delta from the partition's first day
-        'country': runs * 3,                                          # run-length: 1 byte code + 2 bytes count per run
+        'country': runs * RUN_BYTES,                                         # run-length: 1 byte code + 2 bytes count per run
         'qty': bytes_for(max(r['qty'] for r in items)) * n,           # bit-packed to the width the values need
         'amount': bytes_for(max(r['amount'] for r in items)) * n,
     }

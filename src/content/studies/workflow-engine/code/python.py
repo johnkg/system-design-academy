@@ -4,6 +4,8 @@ import sys
 
 STEPS = ['reserve', 'charge', 'pack', 'ship', 'notify']
 MAX_ATTEMPTS = 3
+SEED, ORDERS = 7, 200
+FAIL_PCT, LOST_REPLY_PCT, CRASH_PCT = 10, 10, 4  # an attempt fails early, or acts but its reply is lost; a worker dies before recording
 
 
 class NeedActivity(Exception):
@@ -36,7 +38,7 @@ def replay(history):
     return order_workflow(Ctx(history))
 
 
-seed = 7
+seed = SEED
 
 
 def random(n):
@@ -57,18 +59,18 @@ def run_order(order_id, idempotent, effects, stats):
             while attempt <= MAX_ATTEMPTS and not done:
                 attempt += 1
                 r = random(100)
-                if r < 10:
+                if r < FAIL_PCT:
                     continue  # failed before doing anything
                 key = f'{order_id}:{e.activity}'  # the idempotency key
                 if not (idempotent and key in effects):
                     effects[key] = effects.get(key, 0) + 1  # the side effect (a charge, a shipment)
-                if r < 20:
+                if r < FAIL_PCT + LOST_REPLY_PCT:
                     continue  # the effect happened but the reply was lost
                 done = True
             if not done:
                 stats['stuck'] += 1  # retries are used up: the workflow waits for a human
                 return len(history)
-            if random(100) < 4:
+            if random(100) < CRASH_PCT:
                 stats['crashes'] += 1  # the worker died before it wrote the result: the activity will run again
                 continue
             history.append({'type': 'ActivityCompleted', 'result': f'{e.activity}-{order_id}'})
@@ -79,11 +81,11 @@ def run_order(order_id, idempotent, effects, stats):
 
 def run_all(idempotent):
     global seed
-    seed = 7
+    seed = SEED
     effects = {}
     stats = {'completed': 0, 'stuck': 0, 'crashes': 0}
     longest = 0
-    for order_id in range(1, 201):
+    for order_id in range(1, ORDERS + 1):
         longest = max(longest, run_order(order_id, idempotent, effects, stats))
     twice = sum(n - 1 for n in effects.values())
     double_charges = sum(n - 1 for key, n in effects.items() if key.endswith(':charge'))
@@ -96,7 +98,7 @@ def main():
         r = run_all(idempotent)
         flag = 'true' if idempotent else 'false'
         print(f"idempotent={flag}: completed {r['completed']}, stuck {r['stuck']}, crashes {r['crashes']}, steps run twice {r['twice']}, double charges {r['double_charges']}, longest history {r['events']} events")
-        if r['completed'] + r['stuck'] != 200:
+        if r['completed'] + r['stuck'] != ORDERS:
             sys.exit(1)
         if idempotent and r['twice'] != 0:
             sys.exit(1)

@@ -1,6 +1,8 @@
 // A tiny table format: immutable data files, snapshots listing them, and one atomic
 // pointer swap (compare-and-swap) in the catalog. Concurrent writers use optimistic retries.
 
+const MAX_RETRIES = 4; // a writer gives up after this many lost compare-and-swaps
+
 class Catalog {
   constructor() {
     this.head = 0;
@@ -19,7 +21,7 @@ class Catalog {
 }
 
 // Optimistic commit built on snapshot `base`; on a lost race, validate and retry.
-function commit(cat, who, base, adds, removes, maxRetries = 4) {
+function commit(cat, who, base, adds, removes, maxRetries = MAX_RETRIES) {
   let attempts = 0;
   for (;;) {
     attempts++;

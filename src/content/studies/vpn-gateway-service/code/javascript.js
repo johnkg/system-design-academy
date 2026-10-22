@@ -1,7 +1,12 @@
 // A small VPN gateway fleet, in JavaScript: pick a gateway by latency plus load, keep a session alive across address changes,
 // detect a dead peer, drain a gateway without dropping its users, and split traffic by route.
 const fnv = (...xs) => { let h = 0x811c9dc5; for (const x of xs) h = Math.imul((h ^ x) >>> 0, 16777619) >>> 0; return h; };
-let seed = 7;
+const SEED = 7, CLIENTS = 24, REGIONS = 3;
+const LOAD_PENALTY_MS = 60; // a full gateway counts as 60 ms further away
+const KEY_SALT = 99, ADDR_BASE = 1000; // per-session key derivation; tunnel addresses start at 1000
+const DEAD_AFTER = 30; // ticks of silence before a peer is dead
+const IPV4_BITS = 32;
+let seed = SEED;
 const rnd = (n) => { seed = (Math.imul(seed, 1664525) + 1013904223) >>> 0; return (seed >>> 8) % n; };
 
 const LAT = [[10, 60, 120], [60, 10, 90], [120, 90, 10], [30, 40, 100]]; // ms from each region to each gateway
@@ -13,7 +18,7 @@ function pick(region, useLoad) {
   let best = null, bestCost = 1e9;
   for (const g of gateways) {
     if (g.draining || g.sessions.size >= CAP) continue;
-    const cost = g.lat[region] + (useLoad ? Math.floor(g.sessions.size * 60 / CAP) : 0);
+    const cost = g.lat[region] + (useLoad ? Math.floor(g.sessions.size * LOAD_PENALTY_MS / CAP) : 0);
     if (cost < bestCost) { best = g; bestCost = cost; }
   }
   return best;
@@ -21,7 +26,7 @@ function pick(region, useLoad) {
 
 function connect(sid, region) {
   const g = pick(region, true);
-  const s = { sid, key: fnv(sid, 99), region, addr: 1000 + sid, lastSeq: 0, lastSeen: 0, gw: g.id };
+  const s = { sid, key: fnv(sid, KEY_SALT), region, addr: ADDR_BASE + sid, lastSeq: 0, lastSeen: 0, gw: g.id };
   g.sessions.set(sid, s);
   return s;
 }
@@ -40,7 +45,7 @@ function receive(g, pkt, now) {
 const packet = (s, seq, addr) => ({ sid: s.sid, seq, addr, tag: tagOf(s.key, s.sid, seq) });
 
 // Dead-peer detection: a keepalive every 10 ticks, and a peer is dead after 3 missed keepalives.
-const deadPeers = (g, now) => [...g.sessions.values()].filter((s) => now - s.lastSeen >= 30).map((s) => s.sid);
+const deadPeers = (g, now) => [...g.sessions.values()].filter((s) => now - s.lastSeen >= DEAD_AFTER).map((s) => s.sid);
 
 // Drain: stop accepting, then resume every session elsewhere with the same key and sequence number.
 function drain(g) {
@@ -54,11 +59,11 @@ function drain(g) {
 }
 
 const ip = (a, b, c, d) => ((a << 24) | (b << 16) | (c << 8) | d) >>> 0;
-const inNet = (addr, net, bits) => (addr >>> (32 - bits)) === (net >>> (32 - bits));
+const inNet = (addr, net, bits) => (addr >>> (IPV4_BITS - bits)) === (net >>> (IPV4_BITS - bits));
 const viaTunnel = (addr) => inNet(addr, ip(10, 0, 0, 0), 8) || inNet(addr, ip(192, 168, 0, 0), 16);
 
-const clients = Array.from({ length: 24 }, (_, i) => ({ sid: i + 1, region: rnd(3) }));
-const nearest = [0, 0, 0, 0];
+const clients = Array.from({ length: CLIENTS }, (_, i) => ({ sid: i + 1, region: rnd(REGIONS) }));
+const nearest = LAT.map(() => 0);
 for (const c of clients) nearest[LAT.map((l) => l[c.region]).indexOf(Math.min(...LAT.map((l) => l[c.region])))]++;
 const sessions = clients.map((c) => connect(c.sid, c.region));
 const loads = () => gateways.map((g) => g.sessions.size).join(',');
@@ -76,7 +81,7 @@ console.log('silent since tick 10, dead at 39:', deadPeers(g1, 39).includes(s1.s
 const busiest = gateways.reduce((a, b) => (b.sessions.size > a.sessions.size ? b : a));
 const before = busiest.sessions.size;
 console.log('drain gateway', busiest.id, 'moved', drain(busiest), 'of', before, '| loads:', loads());
-console.assert(busiest.sessions.size === 0 && gateways.reduce((t, g) => t + g.sessions.size, 0) === 24);
+console.assert(busiest.sessions.size === 0 && gateways.reduce((t, g) => t + g.sessions.size, 0) === CLIENTS);
 const sample = sessions.find((s) => s.sid === s1.sid);
 console.log('session kept its sequence:', receive(gateways[sample.gw], packet(sample, 3, 7100), 20));
 console.log('split tunnel:', [ip(10, 4, 1, 9), ip(192, 168, 7, 1), ip(142, 250, 1, 1)].map((a) => (viaTunnel(a) ? 'tunnel' : 'direct')).join(','));

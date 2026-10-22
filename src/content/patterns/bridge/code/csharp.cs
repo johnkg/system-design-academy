@@ -44,7 +44,8 @@ public class Remote(IDevice device) // Abstraction: holds the bridge
 {
     protected IDevice Device { get; } = device;
     public void TogglePower() => Device.IsEnabled = !Device.IsEnabled;
-    public void VolumeUp() => Device.Volume += 10;
+    const int VolumeStep = 10; // one button press
+    public void VolumeUp() => Device.Volume += VolumeStep;
 }
 
 public class AdvancedRemote(IDevice device) : Remote(device) // Refined Abstraction

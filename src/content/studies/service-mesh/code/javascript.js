@@ -5,13 +5,17 @@ const PODS = 5, TICKS = 300, PER_TICK = 2, BAD_POD = 3, BAD_FROM = 50, OUTAGE_FR
 const HOLD = [2, 5, 2, 2, 2]; // ticks a request stays in flight; pod 1 is slow
 const MAX_RETRIES = 3, EJECT_AFTER = 5, EJECT_TICKS = 30;
 
-let seed = 7;
+const SEED = 7;
+const RETRY_BUDGET = 5; // retries may be at most 1/5 (20%) of requests
+const RELEASE_SLACK = 10; // ticks past the end for requests still in flight
+const MIN_OK_SHARE = 0.9; // retries alone must still deliver 90% of requests
+let seed = SEED;
 const random = (n) => { seed = (Math.imul(seed, 1664525) + 1013904223) >>> 0; return (seed >>> 16) % n; };
 
 function run(eject, budget) {
-  seed = 7;
+  seed = SEED;
   const active = new Array(PODS).fill(0), consecutive = new Array(PODS).fill(0), ejectedUntil = new Array(PODS).fill(0);
-  const sent = new Array(PODS).fill(0), releases = Array.from({ length: TICKS + 10 }, () => []);
+  const sent = new Array(PODS).fill(0), releases = Array.from({ length: TICKS + RELEASE_SLACK }, () => []);
   const r = { requests: 0, ok: 0, attempts: 0, retries: 0, ejections: 0, denied: 0, badBefore: 0 };
 
   // Power of two choices: draw two candidate pods and take the one with fewer requests in flight.
@@ -37,7 +41,7 @@ function run(eject, budget) {
         if (eject && consecutive[p] >= EJECT_AFTER) { ejectedUntil[p] = t + EJECT_TICKS; consecutive[p] = 0; r.ejections++; }
         tried.push(p);
         if (k === MAX_RETRIES) break;
-        if (budget && (r.retries + 1) * 5 > r.requests) { r.denied++; break; } // the budget: retries <= 20% of requests
+        if (budget && (r.retries + 1) * RETRY_BUDGET > r.requests) { r.denied++; break; } // the budget: retries <= 20% of requests
         r.retries++;
       }
     }
@@ -59,8 +63,8 @@ console.log(`amplification: ${(plain.attempts / plain.requests).toFixed(2)} plai
 
 const checks = [
   eject.badBefore * 2 < plain.badBefore,           // ejection stops most traffic to the bad pod
-  budget.retries * 5 <= budget.requests,                // the budget bounds retries to 20% of requests
+  budget.retries * RETRY_BUDGET <= budget.requests,                // the budget bounds retries to 20% of requests
   both.attempts < plain.attempts,                       // less wasted work
-  plain.ok > plain.requests * 0.9 && both.ok > 0,       // retries still hide the one bad pod
+  plain.ok > plain.requests * MIN_OK_SHARE && both.ok > 0,       // retries still hide the one bad pod
 ];
 if (checks.includes(false)) { console.log('invariant failed', checks); process.exit(1); }

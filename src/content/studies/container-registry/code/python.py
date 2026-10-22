@@ -64,7 +64,11 @@ class Registry:
         return sum(len(b['data']) for b in self.blobs.values())
 
 
-seed = 7
+SEED, IMAGES, BASE_LAYERS, RUNTIME_LAYERS, RETIRED = 7, 30, 6, 4, 10
+BASE_SIZE, BASE_SIZE_STEP, RUNTIME_SIZE, APP_MIN_SIZE, APP_SIZE_SPREAD = 600, 100, 300, 100, 100  # bytes
+BIG_SIZE, CHUNK = 650, 200  # the resumable upload sends 200-byte chunks
+MIN_DEDUPED = 20  # shared layers must save at least this many uploads
+seed = SEED
 
 
 def rnd(n):
@@ -77,9 +81,9 @@ def layer(name, size):
 
 reg = Registry()
 logical = 0
-for i in range(30):  # 30 images share 6 base layers and 4 runtime layers, and each has its own app layer
-    base, mid = rnd(6), rnd(4)
-    texts = [layer('base%d' % base, 600 + 100 * base), layer('rt%d' % mid, 300), layer('app%d' % i, 100 + rnd(100))]
+for i in range(IMAGES):  # 30 images share 6 base layers and 4 runtime layers, and each has its own app layer
+    base, mid = rnd(BASE_LAYERS), rnd(RUNTIME_LAYERS)
+    texts = [layer('base%d' % base, BASE_SIZE + BASE_SIZE_STEP * base), layer('rt%d' % mid, RUNTIME_SIZE), layer('app%d' % i, APP_MIN_SIZE + rnd(APP_SIZE_SPREAD))]
     for t in texts:  # push: upload only what is missing, then publish the manifest
         logical += len(t)
         if not reg.head(digest(t)):
@@ -87,15 +91,15 @@ for i in range(30):  # 30 images share 6 base layers and 4 runtime layers, and e
     reg.put_manifest('app%d:v1' % i, [digest(t) for t in texts])
 print('30 images, logical %d bytes, stored %d bytes in %d blobs, %d uploads skipped' % (logical, reg.size(), len(reg.blobs), reg.deduped))
 
-big = layer('big', 650)
+big = layer('big', BIG_SIZE)
 uid = reg.start_upload()
-reg.patch(uid, 0, big[:200])
-reg.patch(uid, 200, big[200:400])
-print('stale retry at offset 200: %d; server says resume at %d' % (reg.patch(uid, 200, big[200:400]), reg.offset(uid)))
-reg.patch(uid, reg.offset(uid), big[400:])
+reg.patch(uid, 0, big[:CHUNK])
+reg.patch(uid, CHUNK, big[CHUNK:2 * CHUNK])
+print('stale retry at offset 200: %d; server says resume at %d' % (reg.patch(uid, CHUNK, big[CHUNK:2 * CHUNK]), reg.offset(uid)))
+reg.patch(uid, reg.offset(uid), big[2 * CHUNK:])
 print('resumed upload verified: %s' % str(reg.finish(uid, digest(big))).lower())
 
-for i in range(10):  # retire ten images
+for i in range(RETIRED):  # retire ten images
     del reg.tags['app%d:v1' % i]
 swept, freed = reg.gc(0)
 print('gc after untagging 10 images: swept %d blobs, freed %d bytes, %d blobs left' % (swept, freed, len(reg.blobs)))
@@ -110,5 +114,5 @@ for grace in (0, 5):
     r.gc(grace)  # a collection runs in between
     ok = not r.put_manifest('late:v1', [digest(t)]).startswith('rejected')
     print('grace %d: manifest commit -> %s' % (grace, 'ok' if ok else 'rejected, layer was swept'))
-if reg.deduped < 20 or reg.size() >= logical or swept == 0:
+if reg.deduped < MIN_DEDUPED or reg.size() >= logical or swept == 0:
     sys.exit(1)

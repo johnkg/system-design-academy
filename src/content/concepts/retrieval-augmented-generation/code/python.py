@@ -10,6 +10,11 @@ DOCS = {
     "payments": "Payments. We accept cards and bank transfer. Invoices are due in 30 days. A failed payment is retried twice before the order is cancelled.",
 }
 ANSWER = "laptops are accepted within 30 days of delivery"
+MIN_STEM_LENGTH = 4  # only words of 4+ letters lose a plural "s"
+IDF_SCALE = 4096  # fixed-point scale for n / df
+TOKENS_PER_10_WORDS, CITATION_TOKENS = 13, 6  # about 1.3 tokens per word plus a citation header
+TF_CAP = 2  # a term counts at most twice per chunk
+RERANK_POOL, RERANK_WINDOW, RERANK_WEIGHT = 8, 12, 4  # rerank the 8 best by their densest 12-word window
 STOP = set("how can i a an the of to is are in on and or for after you your with by it".split(" "))
 
 
@@ -18,18 +23,18 @@ def words(t):
 
 
 def stem(w):
-    return w[:-1] if len(w) > 3 and w.endswith("s") else w
+    return w[:-1] if len(w) >= MIN_STEM_LENGTH and w.endswith("s") else w
 
 
 # integer idf in half-octave steps: rarer terms weigh more, and every language computes the same number
 def idf_of(n, df):
-    x = (4096 * n) // df
+    x = (IDF_SCALE * n) // df
     b = x.bit_length() - 1
     return 2 * b + ((x // 2 ** (b - 1)) % 2 if b >= 1 else 0)
 
 
 def tokens_of(word_count):
-    return (word_count * 13 + 9) // 10 + 6  # about 1.3 tokens per word plus a citation header
+    return (word_count * TOKENS_PER_10_WORDS + 9) // 10 + CITATION_TOKENS  # rounded up
 
 
 def chunk(size, overlap):
@@ -58,17 +63,17 @@ def retrieve(query, size, overlap, k, rerank, budget):
             idf[t] = idf_of(len(chunks), df)
     for c in chunks:
         stems = [stem(x) for x in c["words"]]
-        c["score"] = sum(idf.get(t, 0) * min(stems.count(t), 2) for t in terms)
+        c["score"] = sum(idf.get(t, 0) * min(stems.count(t), TF_CAP) for t in terms)
     order = lambda c: (-c["score"], c["id"])
     ranked = sorted((c for c in chunks if c["score"] > 0), key=order)
     if rerank:  # second stage on the 8 best candidates: reward a dense 12 word window instead of scattered matches
-        ranked = ranked[:8]
+        ranked = ranked[:RERANK_POOL]
         for c in ranked:
             stems = [stem(x) for x in c["words"]]
             best = 0
             for s in range(len(stems)):
-                best = max(best, sum(idf.get(t, 0) for t in terms if t in stems[s:s + 12]))
-            c["score"] = best * 4 + c["score"] // 4
+                best = max(best, sum(idf.get(t, 0) for t in terms if t in stems[s:s + RERANK_WINDOW]))
+            c["score"] = best * RERANK_WEIGHT + c["score"] // RERANK_WEIGHT
         ranked.sort(key=order)
     context, used = [], 0
     for c in ranked[:k]:  # greedy packing: stop adding chunks that do not fit

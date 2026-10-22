@@ -4,6 +4,8 @@ using System;
 public static class Program
 {
     const int MinutesPerDay = 24 * 60;
+    const int WindowDays = 30; // the SLO is measured over a rolling 30-day window
+    const int PageBurnRate = 14; // burning this fast for an hour spends 2% of a 30-day budget: page a human
 
     // How much downtime does an SLO allow over a window?
     static double ErrorBudgetMinutes(double slo, int windowDays) => (1 - slo) * windowDays * MinutesPerDay;
@@ -15,11 +17,11 @@ public static class Program
     public static void Main()
     {
         foreach (var target in new[] { 0.99, 0.999, 0.9999 })
-            Console.WriteLine($"SLO {target * 100:F2}% over 30 days allows {ErrorBudgetMinutes(target, 30):F1} minutes of downtime");
+            Console.WriteLine($"SLO {target * 100:F2}% over 30 days allows {ErrorBudgetMinutes(target, WindowDays):F1} minutes of downtime");
 
         var slo = 0.999;
         var incidents = new[] { ("bad deploy", 20), ("provider blip", 5), ("slow day", 12) };
-        var budget = ErrorBudgetMinutes(slo, 30);
+        var budget = ErrorBudgetMinutes(slo, WindowDays);
         double spent = 0;
         foreach (var (name, minutes) in incidents)
         {
@@ -30,7 +32,7 @@ public static class Program
 
         // A 2% error rate for an hour, against a 99.9% SLO
         var rate = BurnRate(0.02, slo);
-        Console.WriteLine($"burn rate at 2% errors: {rate:F0}x{(rate >= 14 ? " -> page someone now" : "")}");
+        Console.WriteLine($"burn rate at 2% errors: {rate:F0}x{(rate >= PageBurnRate ? " -> page someone now" : "")}");
         Console.WriteLine($"burn rate at 0.05% errors: {BurnRate(0.0005, slo):F1}x (well within budget)");
     }
 }

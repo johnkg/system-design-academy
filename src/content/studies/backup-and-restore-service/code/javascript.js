@@ -3,7 +3,11 @@
 
 const PAGES = 32, DAYS = 24, FULL_EVERY = 7, KEEP = 14, LOCK = KEEP + FULL_EVERY, ATTACK_DAY = 18;
 
-let seed = 7;
+const SEED = 7;
+const PAGE_CHECK = 97; // every valid page value is a multiple of 97, so garbled pages are detectable
+const VALUE_RANGE = 1000, WRITES_PER_DAY = 6, GARBLED_PER_DAY = 8;
+
+let seed = SEED;
 const random = (n) => { seed = (Math.imul(seed, 1664525) + 1013904223) >>> 0; return (seed >>> 16) % n; };
 
 // A 32-bit FNV style hash of the whole database, recorded with each backup so a restore can be compared with the original.
@@ -38,15 +42,15 @@ function restore(vault, day) {
   return state;
 }
 
-const prod = Array.from({ length: PAGES }, (_, i) => (i + 1) * 97); // every valid page value is a multiple of 97
+const prod = Array.from({ length: PAGES }, (_, i) => (i + 1) * PAGE_CHECK);
 const dirty = new Array(PAGES).fill(true);
 const touch = (i, v) => { prod[i] = v; dirty[i] = true; };
 const vault = new Vault();
 let fulls = 0, written = 0;
 
 for (let day = 0; day < DAYS; day++) {
-  for (let k = 0; k < 6; k++) touch(random(PAGES), random(1000) * 97);
-  if (day >= ATTACK_DAY) for (let k = 0; k < 8; k++) touch(random(PAGES), random(1000) * 97 + 1 + random(96)); // garbled
+  for (let k = 0; k < WRITES_PER_DAY; k++) touch(random(PAGES), random(VALUE_RANGE) * PAGE_CHECK);
+  if (day >= ATTACK_DAY) for (let k = 0; k < GARBLED_PER_DAY; k++) touch(random(PAGES), random(VALUE_RANGE) * PAGE_CHECK + 1 + random(PAGE_CHECK - 1)); // garbled
   const full = day % FULL_EVERY === 0;
   const pages = prod.map((v, i) => [i, v]).filter(([i]) => full || dirty[i]);
   vault.put({ day, full, pages, hash: hash(prod) });
@@ -66,7 +70,7 @@ let clean = -1;
 for (let day = DAYS - 1; day >= 0 && clean < 0; day--) {
   const state = restore(vault, day);
   const hashOk = hash(state) === vault.items.get(day).backup.hash;
-  const dataOk = state.every((v) => v % 97 === 0);
+  const dataOk = state.every((v) => v % PAGE_CHECK === 0);
   console.log(`restore test day ${day}: hash ${hashOk ? 'ok' : 'BAD'}, data check ${dataOk ? 'passed' : 'FAILED'}`);
   if (hashOk && dataOk) clean = day;
 }

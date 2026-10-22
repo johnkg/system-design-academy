@@ -4,6 +4,10 @@ using System;
 using System.Collections.Generic;
 using System.Linq;
 
+const int Requests = 10000, CanaryPct = 10, WiderPct = 25;
+const int BootS = 6, QueuePerReplica = 8; // fixed start-up time; queued requests one replica absorbs
+const int ModelMb = 14000, NetworkMbps = 1000, LocalMbps = 5000;
+
 var reg = new Registry();
 var v1 = reg.Publish("weights-alpha", "ana"); var v2 = reg.Publish("weights-beta", "ana"); var v3 = reg.Publish("weights-gamma", "ana");
 Console.WriteLine($"published v1={v1.Sum} v2={v2.Sum} v3={v3.Sum}; same bytes again gives v{reg.Publish("weights-beta", "ana").N}");
@@ -15,20 +19,20 @@ Console.WriteLine($"tampered copy of v2 passes the checksum: {(Registry.Checksum
 // A request id always lands on the same side, and raising the canary share only moves requests onto the canary.
 bool ToCanary(int id, int pct) => Registry.Fnv($"req-{id}") % 100 < pct;
 int at10 = 0, at25 = 0; bool sticky = true, nested = true;
-for (int i = 0; i < 10000; i++)
+for (int i = 0; i < Requests; i++)
 {
-    bool a = ToCanary(i, 10), b = ToCanary(i, 25);
+    bool a = ToCanary(i, CanaryPct), b = ToCanary(i, WiderPct);
     if (a) at10++;
     if (b) at25++;
-    if (a != ToCanary(i, 10)) sticky = false;
+    if (a != ToCanary(i, CanaryPct)) sticky = false;
     if (a && !b) nested = false;
 }
 Console.WriteLine($"canary share: {at10} of 10000 at 10%, {at25} at 25%; sticky {sticky.ToString().ToLower()}; nested {nested.ToString().ToLower()}");
 
 // Scale from zero: a cold replica pays 6 s of start-up plus the weight download. Replicas follow the queue at 8 requests each.
-int ColdStart(int sizeMb, int mbPerSec) => 6 + (int)Math.Ceiling((double)sizeMb / mbPerSec);
-int Replicas(int queue) => (int)Math.Ceiling(queue / 8.0);
-Console.WriteLine($"cold start for 14000 MB: {ColdStart(14000, 1000)} s from the network, {ColdStart(14000, 5000)} s from a local cache; replicas for queue 0, 5, 50: {string.Join(", ", new[] { 0, 5, 50 }.Select(Replicas))}");
+int ColdStart(int sizeMb, int mbPerSec) => BootS + (int)Math.Ceiling((double)sizeMb / mbPerSec);
+int Replicas(int queue) => (int)Math.Ceiling(queue / (double)QueuePerReplica);
+Console.WriteLine($"cold start for 14000 MB: {ColdStart(ModelMb, NetworkMbps)} s from the network, {ColdStart(ModelMb, LocalMbps)} s from a local cache; replicas for queue 0, 5, 50: {string.Join(", ", new[] { 0, 5, 50 }.Select(Replicas))}");
 
 Console.WriteLine(reg.Rollback());
 if (reg.Production()!.N != 1 || at10 < 800 || at10 > 1200 || !sticky || !nested || Registry.Checksum("weights-beta!") == v2.Sum) Environment.Exit(1);
@@ -58,12 +62,13 @@ class Registry
     }
 
     // The eval gate: accuracy (per mille) must not drop more than 5 below production, and p95 latency must stay at or below 120 ms.
+    const int MaxP95Ms = 120, MaxAccDrop = 5;
     public string Stage(int n, int acc, int p95)
     {
         var v = versions[n - 1]; var prod = Production();
         if (Checksum(v.Weights) != v.Sum) return $"v{n} refused: checksum mismatch";
-        if (p95 > 120) return $"v{n} blocked: p95 {p95} ms is over 120 ms";
-        if (prod != null && acc < prod.Acc - 5) return $"v{n} blocked: accuracy {acc} is below production";
+        if (p95 > MaxP95Ms) return $"v{n} blocked: p95 {p95} ms is over 120 ms";
+        if (prod != null && acc < prod.Acc - MaxAccDrop) return $"v{n} blocked: accuracy {acc} is below production";
         v.Acc = acc; v.P95 = p95; v.Stage = "staging";
         return $"v{n} is in staging";
     }

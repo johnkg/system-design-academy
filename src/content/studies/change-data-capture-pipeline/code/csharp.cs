@@ -5,7 +5,12 @@ using System;
 using System.Collections.Generic;
 using System.Linq;
 
-long seed = 7;
+const int Seed = 7, Changes = 400, Keys = 25, MaxValue = 1000;
+const int DeleteIn10 = 2; // 2 in 10 writes to an existing row delete it
+const int PollEvery = 50; // changes between two polls
+const int Batch = 25, CrashAtBatch = 6; // the connector crashes once, after its 6th batch
+
+long seed = Seed;
 int Random(int n) { seed = (seed * 1664525 + 1013904223) % 4294967296; return (int)(seed / 65536 % n); }
 
 var table = new Dictionary<int, (int Value, int UpdatedAt)>(); // key -> row
@@ -28,13 +33,13 @@ void Poll()
     cursor = log.Count;
 }
 
-for (int i = 0; i < 400; i++) // 400 changes to 25 keys
+for (int i = 0; i < Changes; i++)
 {
-    int key = Random(25);
-    if (!table.ContainsKey(key)) Write("insert", key, 1 + Random(1000));
-    else if (Random(10) < 2) Write("delete", key, 0);
-    else Write("update", key, 1 + Random(1000));
-    if ((i + 1) % 50 == 0) Poll();
+    int key = Random(Keys);
+    if (!table.ContainsKey(key)) Write("insert", key, 1 + Random(MaxValue));
+    else if (Random(10) < DeleteIn10) Write("delete", key, 0);
+    else Write("update", key, 1 + Random(MaxValue));
+    if ((i + 1) % PollEvery == 0) Poll();
 }
 
 // The sink keeps the log position of the last change it applied per key, and ignores anything not newer.
@@ -53,10 +58,10 @@ int delivered = 0, committed = 0, batches = 0;
 bool crashed = false;
 while (committed < log.Count)
 {
-    var batch = log.Skip(committed).Take(25).ToList();
+    var batch = log.Skip(committed).Take(Batch).ToList();
     foreach (var e in batch) { Apply(e); deltaTotal += e.After - e.Before; delivered++; }
     batches++;
-    if (batches == 6 && !crashed) { crashed = true; continue; } // crash after applying the batch, before committing its offset: restart from the old offset
+    if (batches == CrashAtBatch && !crashed) { crashed = true; continue; } // crash after applying the batch, before committing its offset: restart from the old offset
     committed += batch.Count;
 }
 

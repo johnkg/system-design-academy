@@ -6,7 +6,9 @@ import sys
 MIN, AVG_BITS, MAX = 1024, 12, 16384  # chunks average about 4 KB (2^12 bytes), and are never under 1 KB or over 16 KB
 FIXED = 4096
 
-seed = 7  # a small repeatable random generator, so every run sees the same file
+SEED, FILE_BYTES, INSERTED = 7, 300000, 10
+MIN_RESENT_FIXED, MAX_RESENT_CDC = 90, 10  # percent of the file sent again after the edit
+seed = SEED  # a small repeatable random generator, so every run sees the same file
 
 
 def next_random():
@@ -59,8 +61,8 @@ def sync(server, chunks):
     return sent
 
 
-original = random_bytes(300000)
-edited = random_bytes(10) + original  # 10 bytes inserted at the very start
+original = random_bytes(FILE_BYTES)
+edited = random_bytes(INSERTED) + original  # 10 bytes inserted at the very start
 
 failures = 0
 for name, chunker, limit in [("fixed 4 KB chunks", chunk_fixed, "high"), ("content-defined chunks", chunk_by_content, "low")]:
@@ -69,9 +71,9 @@ for name, chunker, limit in [("fixed 4 KB chunks", chunk_fixed, "high"), ("conte
     second = sync(server, chunker(edited))
     share = (second / len(edited)) * 100
     print(f"{name}: first upload {first} bytes, after inserting 10 bytes at the start {second} bytes ({share:.1f}% of the file)")
-    if limit == "high" and share < 90:
+    if limit == "high" and share < MIN_RESENT_FIXED:
         failures += 1  # fixed chunks: every boundary moved, so nearly everything is sent again
-    if limit == "low" and share > 10:
+    if limit == "low" and share > MAX_RESENT_CDC:
         failures += 1  # content-defined: only the chunk around the edit is sent
 if failures:
     sys.exit(1)

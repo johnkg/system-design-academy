@@ -8,15 +8,16 @@ using System.Linq;
 
 class Hlc // wall time plus a counter, so timestamps never go backwards and follow causality
 {
+    public const long LogicalSlots = 100; // a timestamp is Wall * 100 + Logical
     public long Offset, Wall, Logical; // Offset: how far this machine's clock is off
     public Hlc(long offset) { Offset = offset; }
     public long Now(long real)
     {
         long w = real + Offset;
         if (w > Wall) { Wall = w; Logical = 0; } else Logical++;
-        return Wall * 100 + Logical;
+        return Wall * LogicalSlots + Logical;
     }
-    public void Observe(long ts) { if (ts / 100 > Wall) { Wall = ts / 100; Logical = ts % 100; } } // a message carries a timestamp
+    public void Observe(long ts) { if (ts / LogicalSlots > Wall) { Wall = ts / LogicalSlots; Logical = ts % LogicalSlots; } } // a message carries a timestamp
 }
 
 class Cell { public List<(long Ts, long Value)> Versions = new(); public (int Txn, long Value)? Intent; }
@@ -64,7 +65,7 @@ class Db
             var all = c.Versions.ToList();
             if (rec != null) all.Add((rec.Ts, c.Intent.Value.Value)); // a committed intent counts as a version
             var seen = all.Where(v => v.Ts <= ts).ToList();
-            var later = all.Where(v => v.Ts > ts && v.Ts <= ts + maxOffset * 100).ToList();
+            var later = all.Where(v => v.Ts > ts && v.Ts <= ts + maxOffset * Hlc.LogicalSlots).ToList();
             if (later.Count == 0) return (false, seen.Count > 0 ? seen[^1].Value : null, restarts);
             ts = later[^1].Ts; maxOffset = 0; // restart at the newest uncertain version
         }
@@ -92,15 +93,18 @@ class Txn
 
 class Program
 {
+    const int MaxKeysPerRange = 3;
+    const long ClockSkew = 8, MaxOffset = 10; // gateway b runs 8 behind; reads allow 10 of uncertainty
+    const long Latest = 999999; // a read timestamp after every write
     static string Js(bool b) => b ? "true" : "false";
     static int Main()
     {
-        var db = new Db(3); var a = new Hlc(0); var b = new Hlc(-8);
+        var db = new Db(MaxKeysPerRange); var a = new Hlc(0); var b = new Hlc(-ClockSkew);
         var seed = new (string, long)[] { ("alice", 100), ("bob", 50), ("carol", 70), ("maria", 100), ("nina", 20), ("zed", 100) };
         for (int i = 0; i < seed.Length; i++) { var t = new Txn(db, a, 1 + i); t.Write(seed[i].Item1, seed[i].Item2); t.Commit(); t.Resolve(); db.Split(); }
         Console.WriteLine("ranges after splits: " + string.Join(" ", db.Ranges.Select(r => $"[{r.Lo}..{r.Hi})")));
-        long Total() => seed.Sum(s => db.Read(s.Item1, 999999, 0).Value.Value);
-        long before = Total(), setupTs = 6 * 100;
+        long Total() => seed.Sum(s => db.Read(s.Item1, Latest, 0).Value.Value);
+        long before = Total(), setupTs = 6 * Hlc.LogicalSlots; // after the six setup transactions
 
         var t1 = new Txn(db, a, 20); // move 30 from alice to zed: two keys in two ranges
         t1.Write("alice", 70); t1.Write("zed", 130);
@@ -115,7 +119,7 @@ class Program
         Console.WriteLine($"snapshot at ts {setupTs} still sees alice = {db.Read("alice", setupTs, 0).Value}, zed = {db.Read("zed", setupTs, 0).Value}");
 
         long ts = b.Now(22); // this gateway's clock runs 8 behind, so its read timestamp is below T1's commit timestamp
-        var trusting = db.Read("zed", ts, 0); var careful = db.Read("zed", ts, 10);
+        var trusting = db.Read("zed", ts, 0); var careful = db.Read("zed", ts, MaxOffset);
         Console.WriteLine($"behind clock, read at {ts}: trusting clocks sees {trusting.Value}; with a 10 uncertainty window sees {careful.Value} after {careful.Restarts} restart");
         b.Observe(t1.Ts);
         Console.WriteLine($"after a message from T1's gateway, the next timestamp here is {b.Now(23)}");

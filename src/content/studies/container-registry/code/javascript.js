@@ -45,7 +45,11 @@ class Registry {
   size() { let n = 0; for (const b of this.blobs.values()) n += b.data.length; return n; }
 }
 
-let seed = 7;
+const SEED = 7, IMAGES = 30, BASE_LAYERS = 6, RUNTIME_LAYERS = 4, RETIRED = 10;
+const BASE_SIZE = 600, BASE_SIZE_STEP = 100, RUNTIME_SIZE = 300, APP_MIN_SIZE = 100, APP_SIZE_SPREAD = 100; // bytes
+const BIG_SIZE = 650, CHUNK = 200; // the resumable upload sends 200-byte chunks
+const MIN_DEDUPED = 20; // shared layers must save at least this many uploads
+let seed = SEED;
 const rnd = (n) => { seed = (seed * 1664525 + 1013904223) % 4294967296; return Math.floor(seed / 65536) % n; };
 const layer = (name, size) => name + ':' + 'x'.repeat(size - name.length - 1);
 
@@ -55,20 +59,20 @@ const push = (ref, texts) => { // upload only what is missing, then publish the 
   const ds = texts.map((t) => { logical += t.length; const d = digest(t); if (!reg.head(d)) reg.put(t); return d; });
   return reg.putManifest(ref, ds);
 };
-for (let i = 0; i < 30; i++) { // 30 images share 6 base layers and 4 runtime layers, and each has its own app layer
-  const base = rnd(6), mid = rnd(4);
-  push(`app${i}:v1`, [layer('base' + base, 600 + 100 * base), layer('rt' + mid, 300), layer('app' + i, 100 + rnd(100))]);
+for (let i = 0; i < IMAGES; i++) { // 30 images share 6 base layers and 4 runtime layers, and each has its own app layer
+  const base = rnd(BASE_LAYERS), mid = rnd(RUNTIME_LAYERS);
+  push(`app${i}:v1`, [layer('base' + base, BASE_SIZE + BASE_SIZE_STEP * base), layer('rt' + mid, RUNTIME_SIZE), layer('app' + i, APP_MIN_SIZE + rnd(APP_SIZE_SPREAD))]);
 }
 const blobCount = reg.blobs.size;
 console.log(`30 images, logical ${logical} bytes, stored ${reg.size()} bytes in ${blobCount} blobs, ${reg.deduped} uploads skipped`);
 
-const big = layer('big', 650), want = digest(big), id = reg.startUpload();
-reg.patch(id, 0, big.slice(0, 200)); reg.patch(id, 200, big.slice(200, 400));
-console.log(`stale retry at offset 200: ${reg.patch(id, 200, big.slice(200, 400))}; server says resume at ${reg.offset(id)}`);
-reg.patch(id, reg.offset(id), big.slice(400));
+const big = layer('big', BIG_SIZE), want = digest(big), id = reg.startUpload();
+reg.patch(id, 0, big.slice(0, CHUNK)); reg.patch(id, CHUNK, big.slice(CHUNK, 2 * CHUNK));
+console.log(`stale retry at offset 200: ${reg.patch(id, CHUNK, big.slice(CHUNK, 2 * CHUNK))}; server says resume at ${reg.offset(id)}`);
+reg.patch(id, reg.offset(id), big.slice(2 * CHUNK));
 console.log(`resumed upload verified: ${reg.finish(id, want)}`);
 
-for (let i = 0; i < 10; i++) reg.tags.delete(`app${i}:v1`); // retire ten images
+for (let i = 0; i < RETIRED; i++) reg.tags.delete(`app${i}:v1`); // retire ten images
 const live = reg.gc(0);
 console.log(`gc after untagging 10 images: swept ${live.swept} blobs, freed ${live.bytes} bytes, ${reg.blobs.size} blobs left`);
 for (const m of reg.tags.values()) for (const d of reg.blobs.get(m).data.split('\n')) if (!reg.blobs.has(d)) { console.log('BROKEN IMAGE'); process.exit(1); }
@@ -80,4 +84,4 @@ for (const [r, grace] of [[racy, 0], [r2, 5]]) {
   r.gc(grace);                     // a collection runs in between
   console.log(`grace ${grace}: manifest commit -> ${r.putManifest('late:v1', [d]).startsWith('rejected') ? 'rejected, layer was swept' : 'ok'}`);
 }
-if (reg.deduped < 20 || reg.size() >= logical || live.swept === 0) process.exit(1);
+if (reg.deduped < MIN_DEDUPED || reg.size() >= logical || live.swept === 0) process.exit(1);

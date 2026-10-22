@@ -2,6 +2,11 @@
 # and a transaction that commits across ranges with write intents and a transaction record (two-phase commit).
 import sys
 
+LOGICAL_SLOTS = 100  # a timestamp is wall * 100 + logical counter
+MAX_KEYS_PER_RANGE = 3
+CLOCK_SKEW, MAX_OFFSET = 8, 10  # gateway b runs 8 behind; reads allow 10 of uncertainty
+LATEST = 999999  # a read timestamp after every write
+
 
 class Hlc:  # wall time plus a counter, so timestamps never go backwards and follow causality
     def __init__(self, offset):
@@ -13,11 +18,11 @@ class Hlc:  # wall time plus a counter, so timestamps never go backwards and fol
             self.wall, self.logical = w, 0
         else:
             self.logical += 1
-        return self.wall * 100 + self.logical
+        return self.wall * LOGICAL_SLOTS + self.logical
 
     def observe(self, ts):  # a message carries a timestamp
-        if ts // 100 > self.wall:
-            self.wall, self.logical = ts // 100, ts % 100
+        if ts // LOGICAL_SLOTS > self.wall:
+            self.wall, self.logical = ts // LOGICAL_SLOTS, ts % LOGICAL_SLOTS
 
 
 class Range:
@@ -61,7 +66,7 @@ class Db:
                 return {"blocked": True}
             allv = c["versions"] + ([[rec["ts"], c["intent"]["value"]]] if rec else [])  # a committed intent counts as a version
             seen = [v for v in allv if v[0] <= ts]
-            later = [v for v in allv if ts < v[0] <= ts + max_offset * 100]
+            later = [v for v in allv if ts < v[0] <= ts + max_offset * LOGICAL_SLOTS]
             if not later:
                 return {"value": seen[-1][1] if seen else None, "restarts": restarts}
             ts, max_offset, restarts = later[-1][0], 0, restarts + 1  # restart at the newest uncertain version
@@ -97,7 +102,7 @@ def js(b):
     return "true" if b else "false"
 
 
-db, a, b = Db(3), Hlc(0), Hlc(-8)
+db, a, b = Db(MAX_KEYS_PER_RANGE), Hlc(0), Hlc(-CLOCK_SKEW)
 for i, (k, v) in enumerate([("alice", 100), ("bob", 50), ("carol", 70), ("maria", 100), ("nina", 20), ("zed", 100)]):
     t = Txn(db, a, 1 + i)
     t.write(k, v)
@@ -108,10 +113,10 @@ print("ranges after splits: " + " ".join(f"[{r.lo}..{r.hi})" for r in db.ranges)
 
 
 def total():
-    return sum(db.read(k, 999999, 0)["value"] for k in ["alice", "bob", "carol", "maria", "nina", "zed"])
+    return sum(db.read(k, LATEST, 0)["value"] for k in ["alice", "bob", "carol", "maria", "nina", "zed"])
 
 
-before, setup_ts = total(), 6 * 100
+before, setup_ts = total(), 6 * LOGICAL_SLOTS  # after the six setup transactions
 
 t1 = Txn(db, a, 20)  # move 30 from alice to zed: two keys in two ranges
 t1.write("alice", 70)
@@ -127,7 +132,7 @@ t1.resolve()
 print(f"snapshot at ts {setup_ts} still sees alice = {db.read('alice', setup_ts, 0)['value']}, zed = {db.read('zed', setup_ts, 0)['value']}")
 
 ts = b.now(22)  # this gateway's clock runs 8 behind, so its read timestamp is below T1's commit timestamp
-trusting, careful = db.read("zed", ts, 0), db.read("zed", ts, 10)
+trusting, careful = db.read("zed", ts, 0), db.read("zed", ts, MAX_OFFSET)
 print(f"behind clock, read at {ts}: trusting clocks sees {trusting['value']}; with a 10 uncertainty window sees {careful['value']} after {careful['restarts']} restart")
 b.observe(t1.ts)
 print(f"after a message from T1's gateway, the next timestamp here is {b.now(23)}")

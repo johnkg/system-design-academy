@@ -40,7 +40,10 @@ class TimingWheel {
   }
 }
 
-let seed = 2024;
+const SEED = 2024, HORIZON = 200000; // ticks simulated
+const FIRST_BATCH = 3000, LATE_BATCH = 200, LATE_AT = 1000, LATE_HORIZON = 150000;
+const CANCEL_EVERY = 10, CANCEL_ID_END = 3; // ids ending in 3 are cancelled: 10%
+let seed = SEED;
 const random = (n) => { seed = (seed * 1664525 + 1013904223) % 4294967296; return Math.floor(seed / 256) % n; };
 
 const wheel = new TimingWheel();
@@ -48,15 +51,15 @@ const timers = [];
 const placed = [0, 0, 0];
 const schedule = (id, due) => { const t = { id, due }; timers.push(t); placed[wheel.add(t)]++; };
 
-for (let id = 0; id < 3000; id++) schedule(id, 1 + random(200000));
-for (const t of timers) if (t.id % 10 === 3) wheel.cancel(t.id); // 10% are cancelled before they are due
+for (let id = 0; id < FIRST_BATCH; id++) schedule(id, 1 + random(HORIZON));
+for (const t of timers) if (t.id % CANCEL_EVERY === CANCEL_ID_END) wheel.cancel(t.id); // 10% are cancelled before they are due
 
 const fired = [];
 let onTime = true;
-while (wheel.now < 200000) {
-  if (wheel.now === 1000) { // new timers keep arriving while the wheel turns
-    for (let id = 3000; id < 3200; id++) schedule(id, wheel.now + 1 + random(150000));
-    for (const t of timers) if (t.id >= 3000 && t.id % 10 === 3) wheel.cancel(t.id);
+while (wheel.now < HORIZON) {
+  if (wheel.now === LATE_AT) { // new timers keep arriving while the wheel turns
+    for (let id = FIRST_BATCH; id < FIRST_BATCH + LATE_BATCH; id++) schedule(id, wheel.now + 1 + random(LATE_HORIZON));
+    for (const t of timers) if (t.id >= FIRST_BATCH && t.id % CANCEL_EVERY === CANCEL_ID_END) wheel.cancel(t.id);
   }
   for (const t of wheel.tick()) { fired.push(t); if (t.due !== wheel.now) onTime = false; }
 }

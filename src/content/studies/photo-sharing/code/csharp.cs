@@ -8,6 +8,7 @@ using System.Linq;
 public class LikeStore
 {
     const int Shards = 8, Batch = 500;
+    const long KeySpace = 100000; // a like key packs post and user: post * 100000 + user, with user ids below 100000
     readonly HashSet<long> liked = new();                                // the unique (post, user) rows: a repeat is rejected here
     readonly Dictionary<int, int[]> shards = new();                      // post -> counter shards, each one a separate row in the database
     readonly Dictionary<(int Post, int Shard), int> pending = new();     // likes waiting in the buffer
@@ -17,7 +18,7 @@ public class LikeStore
 
     public bool Like(int post, int user, int pick)
     {
-        long key = post * 100000L + user;
+        long key = post * KeySpace + user;
         if (!liked.Add(key)) return false;                               // the unique constraint says: already liked
         var slot = (post, pick % Shards);                                // any shard will do, so choose by a random number
         pending[slot] = pending.GetValueOrDefault(slot) + 1;
@@ -42,7 +43,11 @@ public class LikeStore
 
 public static class Program
 {
-    static ulong seed = 4242;
+    const int Taps = 30000, Users = 20000, PickRange = 1000;
+    const int ViralIn10 = 8; // 80% of the taps go to the viral post 0
+    const int MaxWriteShare = 10; // batching must cut counter writes at least tenfold
+    const ulong Seed = 4242;
+    static ulong seed = Seed;
     static int Random(int n) { seed = (seed * 1664525UL + 1013904223UL) % 4294967296UL; return (int)((seed / 65536) % (ulong)n); }
 
     public static int Main()
@@ -52,12 +57,12 @@ public static class Program
         int SumShown() => posts.Sum(p => store.Shown(p));
         var taps = new List<(int Post, int User)>();                     // every tap, including repeats
         int accepted = 0, behindMax = 0;
-        for (int i = 0; i < 30000; i++)
+        for (int i = 0; i < Taps; i++)
         {
-            int post = Random(10) < 8 ? 0 : 1 + Random(2);               // 80% of the taps go to the viral post 0
-            int user = Random(20000);
+            int post = Random(10) < ViralIn10 ? 0 : 1 + Random(posts.Length - 1);              // 80% of the taps go to the viral post 0
+            int user = Random(Users);
             taps.Add((post, user));
-            if (store.Like(post, user, Random(1000))) accepted++;
+            if (store.Like(post, user, Random(PickRange))) accepted++;
             behindMax = Math.Max(behindMax, accepted - SumShown());      // likes in the buffer, not yet in the counters
         }
         int lastBehind = accepted - SumShown();
@@ -71,7 +76,7 @@ public static class Program
         int hottest = store.RowWrites.Where(kv => kv.Key.Post == 0).Max(kv => kv.Value);
         Console.WriteLine($"counter writes: {store.CounterWrites} instead of {accepted}; the hottest row got {hottest}, a single row would have got {truth[0]}");
 
-        bool ok = shown.SequenceEqual(truth) && accepted == truth.Sum() && store.CounterWrites < accepted / 10;
+        bool ok = shown.SequenceEqual(truth) && accepted == truth.Sum() && store.CounterWrites < accepted / MaxWriteShare;
         return ok ? 0 : 1;
     }
 }

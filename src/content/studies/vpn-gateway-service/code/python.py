@@ -8,7 +8,12 @@ def fnv(*xs):
         h = ((h ^ x) & MASK) * 16777619 & MASK
     return h
 
-seed = 7
+SEED, CLIENTS, REGIONS = 7, 24, 3
+LOAD_PENALTY_MS = 60  # a full gateway counts as 60 ms further away
+KEY_SALT, ADDR_BASE = 99, 1000  # per-session key derivation; tunnel addresses start at 1000
+DEAD_AFTER = 30  # ticks of silence before a peer is dead
+IPV4_BITS = 32
+seed = SEED
 
 def rnd(n):
     global seed
@@ -25,14 +30,14 @@ def pick(region):
     for g in gateways:
         if g['draining'] or len(g['sessions']) >= CAP:
             continue
-        cost = g['lat'][region] + len(g['sessions']) * 60 // CAP
+        cost = g['lat'][region] + len(g['sessions']) * LOAD_PENALTY_MS // CAP
         if cost < best_cost:
             best, best_cost = g, cost
     return best
 
 def connect(sid, region):
     g = pick(region)
-    s = {'sid': sid, 'key': fnv(sid, 99), 'region': region, 'addr': 1000 + sid, 'last_seq': 0, 'last_seen': 0, 'gw': g['id']}
+    s = {'sid': sid, 'key': fnv(sid, KEY_SALT), 'region': region, 'addr': ADDR_BASE + sid, 'last_seq': 0, 'last_seen': 0, 'gw': g['id']}
     g['sessions'][sid] = s
     return s
 
@@ -54,7 +59,7 @@ def receive(g, pkt, now):
 
 # Dead-peer detection: a keepalive every 10 ticks, and a peer is dead after 3 missed keepalives.
 def dead_peers(g, now):
-    return [s['sid'] for s in g['sessions'].values() if now - s['last_seen'] >= 30]
+    return [s['sid'] for s in g['sessions'].values() if now - s['last_seen'] >= DEAD_AFTER]
 
 # Drain: stop accepting, then resume every session elsewhere with the same key and sequence number.
 def drain(g):
@@ -72,13 +77,13 @@ def ip(a, b, c, d):
     return ((a << 24) | (b << 16) | (c << 8) | d) & MASK
 
 def in_net(addr, net, bits):
-    return (addr >> (32 - bits)) == (net >> (32 - bits))
+    return (addr >> (IPV4_BITS - bits)) == (net >> (IPV4_BITS - bits))
 
 def via_tunnel(addr):
     return in_net(addr, ip(10, 0, 0, 0), 8) or in_net(addr, ip(192, 168, 0, 0), 16)
 
-regions = [rnd(3) for _ in range(24)]
-nearest = [0, 0, 0, 0]
+regions = [rnd(REGIONS) for _ in range(CLIENTS)]
+nearest = [0] * len(LAT)
 for r in regions:
     col = [l[r] for l in LAT]
     nearest[col.index(min(col))] += 1
@@ -108,6 +113,6 @@ for g in gateways:
         busiest = g
 before = len(busiest['sessions'])
 print('drain gateway', busiest['id'], 'moved', drain(busiest), 'of', before, '| loads:', loads())
-assert len(busiest['sessions']) == 0 and sum(len(g['sessions']) for g in gateways) == 24
+assert len(busiest['sessions']) == 0 and sum(len(g['sessions']) for g in gateways) == CLIENTS
 print('session kept its sequence:', receive(gateways[s1['gw']], packet(s1, 3, 7100), 20))
 print('split tunnel:', ','.join('tunnel' if via_tunnel(a) else 'direct' for a in [ip(10, 4, 1, 9), ip(192, 168, 7, 1), ip(142, 250, 1, 1)]))

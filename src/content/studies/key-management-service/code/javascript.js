@@ -1,7 +1,9 @@
 // Envelope encryption with a key management service, in JavaScript.
 // WARNING: the cipher below (FNV-1a hashing and an LCG keystream XOR) is a TOY to show the structure. It is NOT real cryptography.
 // Shape: root key (the "HSM") wraps key versions, a key version wraps data keys, a data key encrypts the data.
-let seed = 7;
+const SEED = 7;
+const DELETION_WAIT_DAYS = 7; // a key scheduled for deletion can still be cancelled for a week
+let seed = SEED;
 const rng = () => (seed = (Math.imul(seed, 1664525) + 1013904223) >>> 0);
 const bytes = (s) => [...s].map((c) => c.charCodeAt(0));
 const text = (b) => String.fromCharCode(...b);
@@ -55,11 +57,11 @@ const before = docs.map((d) => d.ct.join());
 const moved = docs.map((d) => ({ ...d, blob: kms.rewrap('batch', 'orders', d.blob) }));
 console.log(`rewrapped, blob versions: ${versions(moved)}, data ciphertext untouched: ${moved.every((d, i) => d.ct.join() === before[i])}`);
 console.log(`batch decrypt: ${attempt(() => get(kms, 'batch', 'orders', moved[0]))}; mallory encrypt: ${attempt(() => kms.generateDataKey('mallory', 'orders'))}`);
-kms.scheduleDeletion('secops', 'orders', 7);
+kms.scheduleDeletion('secops', 'orders', DELETION_WAIT_DAYS);
 console.log(`during the wait: ${attempt(() => get(kms, 'app', 'orders', moved[1]))}`);
 kms.cancelDeletion('secops', 'orders');
 console.log(`after cancel: ${attempt(() => get(kms, 'app', 'orders', moved[1]))}`);
-kms.advance(3); kms.scheduleDeletion('secops', 'orders', 7); kms.advance(6);
+kms.advance(3); kms.scheduleDeletion('secops', 'orders', DELETION_WAIT_DAYS); kms.advance(DELETION_WAIT_DAYS - 1);
 console.log(`day ${kms.day}, still waiting: ${attempt(() => get(kms, 'app', 'orders', moved[2]))}`);
 kms.advance(1);
 console.log(`day ${kms.day}, deleted: ${attempt(() => get(kms, 'app', 'orders', moved[2]))}`);

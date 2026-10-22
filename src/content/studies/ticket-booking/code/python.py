@@ -3,6 +3,7 @@
 import sys
 
 HOLD_SECONDS = 600
+WAIT_SECONDS = 700  # longer than a hold, so unpaid holds expire
 
 
 # The seat table. In a real database, claim() is one statement:
@@ -49,7 +50,7 @@ results = [
     ("ben claims A1 at the same moment", seats.claim("A1", "ben", t)),
     ("ben claims A2", seats.claim("A2", "ben", t)),
 ]
-t += 700  # ben never pays, and ten minutes pass
+t += WAIT_SECONDS  # ben never pays, and more than ten minutes pass
 results.append(("ben tries to pay for A2 after his hold ran out", seats.confirm("A2", "ben", t)))
 results.append(("cat claims A2, now free again", seats.claim("A2", "cat", t)))
 results.append(("ann pays for A1 after 700 seconds", seats.confirm("A1", "ann", t)))

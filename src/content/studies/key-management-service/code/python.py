@@ -4,7 +4,9 @@
 import sys
 
 M = 0xFFFFFFFF
-seed = 7
+SEED = 7
+DELETION_WAIT_DAYS = 7  # a key scheduled for deletion can still be cancelled for a week
+seed = SEED
 def rng():
     global seed
     seed = (seed * 1664525 + 1013904223) & M
@@ -108,13 +110,13 @@ moved = [{**d, "blob": kms.rewrap("batch", "orders", d["blob"])} for d in docs]
 same = all(m["ct"] == d["ct"] for m, d in zip(moved, docs))
 print(f"rewrapped, blob versions: {versions(moved)}, data ciphertext untouched: {low(same)}")
 print(f"batch decrypt: {attempt(lambda: get(kms, 'batch', 'orders', moved[0]))}; mallory encrypt: {attempt(lambda: kms.generate_data_key('mallory', 'orders'))}")
-kms.set_state("secops", "orders", "pending", 7)
+kms.set_state("secops", "orders", "pending", DELETION_WAIT_DAYS)
 print(f"during the wait: {attempt(lambda: get(kms, 'app', 'orders', moved[1]))}")
 kms.set_state("secops", "orders", "enabled")
 print(f"after cancel: {attempt(lambda: get(kms, 'app', 'orders', moved[1]))}")
 kms.advance(3)
-kms.set_state("secops", "orders", "pending", 7)
-kms.advance(6)
+kms.set_state("secops", "orders", "pending", DELETION_WAIT_DAYS)
+kms.advance(DELETION_WAIT_DAYS - 1)
 print(f"day {kms.day}, still waiting: {attempt(lambda: get(kms, 'app', 'orders', moved[2]))}")
 kms.advance(1)
 print(f"day {kms.day}, deleted: {attempt(lambda: get(kms, 'app', 'orders', moved[2]))}")

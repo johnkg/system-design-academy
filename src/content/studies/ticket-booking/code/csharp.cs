@@ -58,7 +58,8 @@ public static class Program
             ("ben claims A1 at the same moment", seats.Claim("A1", "ben", t)),
             ("ben claims A2", seats.Claim("A2", "ben", t)),
         };
-        t += 700; // ben never pays, and ten minutes pass
+        const int WaitSeconds = 700; // longer than a hold, so unpaid holds expire
+        t += WaitSeconds; // ben never pays, and more than ten minutes pass
         results.Add(("ben tries to pay for A2 after his hold ran out", seats.Confirm("A2", "ben", t)));
         results.Add(("cat claims A2, now free again", seats.Claim("A2", "cat", t)));
         results.Add(("ann pays for A1 after 700 seconds", seats.Confirm("A1", "ann", t)));

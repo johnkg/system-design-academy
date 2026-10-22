@@ -9,14 +9,17 @@ string[] countries = { "BR", "DE", "IN", "JP", "US" };
 string[] columns = { "day", "country", "qty", "amount" };
 var rawWidth = new Dictionary<string, int> { ["day"] = 4, ["country"] = 2, ["qty"] = 4, ["amount"] = 4 };
 
-long seed = 7;
+const int Seed = 7, MaxQty = 5, MaxAmount = 500;
+const int RunBytes = 3; // one run-length entry: 1 byte code + 2 bytes count
+
+long seed = Seed;
 int Next(int n) { seed = (seed * 1664525 + 1013904223) % 4294967296L; return (int)(seed / 65536 % n); }
 int BytesFor(int max) => max < 256 ? 1 : max < 65536 ? 2 : 4; // the narrowest whole number of bytes that holds the biggest value
 
 var rows = new List<Row>();
 for (int i = 0; i < Rows; i++)
 {
-    int country = Next(5), qty = 1 + Next(5), amount = 1 + Next(500);
+    int country = Next(countries.Length), qty = 1 + Next(MaxQty), amount = 1 + Next(MaxAmount);
     rows.Add(new Row(i * Days / Rows, country, qty, amount)); // rows arrive in date order
 }
 
@@ -31,7 +34,7 @@ for (int p = 0; p < Days / PartDays; p++)
     var size = new Dictionary<string, int>
     {
         ["day"] = BytesFor(maxDay - minDay) * n,                  // delta from the partition's first day
-        ["country"] = runs * 3,                                   // run-length: 1 byte code + 2 bytes count per run
+        ["country"] = runs * RunBytes,                                  // run-length: 1 byte code + 2 bytes count per run
         ["qty"] = BytesFor(items.Max(r => r.Qty)) * n,            // bit-packed to the width the values need
         ["amount"] = BytesFor(items.Max(r => r.Amount)) * n,
     };

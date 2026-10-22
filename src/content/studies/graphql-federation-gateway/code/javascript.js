@@ -11,14 +11,17 @@ const FIELDS = {
 };
 const MAX_DEPTH = 5, MAX_COST = 500, LIST_GUESS = 10;
 
-let seed = 7;
+const SEED = 7, USERS = 20, ORDER_SPREAD = 4, PRODUCTS = 8; // each user has 0..3 orders
+const MIN_PRICE = 10, PRICE_SPREAD = 90, PRICE_STRIDE = 37; // prices 10..99, scattered by a fixed stride
+
+let seed = SEED;
 const random = (n) => { seed = (seed * 1664525 + 1013904223) % 4294967296; return (seed >>> 16) % n; };
 
 // Subgraph data, keyed by entity id. Each subgraph only knows its own part.
-const users = Array.from({ length: 20 }, (_, id) => ({ id }));
+const users = Array.from({ length: USERS }, (_, id) => ({ id }));
 const orders = [];
-for (const u of users) for (let k = random(4); k > 0; k--) orders.push({ id: orders.length, userId: u.id, productId: random(8) });
-const prices = Array.from({ length: 8 }, (_, id) => 10 + ((id * 37) % 90));
+for (const u of users) for (let k = random(ORDER_SPREAD); k > 0; k--) orders.push({ id: orders.length, userId: u.id, productId: random(PRODUCTS) });
+const prices = Array.from({ length: PRODUCTS }, (_, id) => MIN_PRICE + ((id * PRICE_STRIDE) % PRICE_SPREAD));
 
 function makeSubgraphs(calls) {
   const hit = (name) => { calls[name] = (calls[name] || 0) + 1; };

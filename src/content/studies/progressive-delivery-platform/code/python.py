@@ -9,7 +9,9 @@ MIN_CANARY = 300      # fewer requests than this prove nothing, so the bake time
 Z_LIMIT = 2.33        # one-sided, about a 1% chance of a false alarm per check
 TOTAL = sum(requests for _, requests in REGIONS)
 
-seed = 7
+SEED = 7
+MAX_EXPOSED_SHARE = 50  # a bad release may reach at most 1/50 (2%) of all requests
+seed = SEED
 
 
 def chance(per_10000):
@@ -64,5 +66,5 @@ bad_done, bad_exposed, bad_steps = rollout("v3", 200)
 share = bad_exposed * 100 / TOTAL
 print(f"v2 finished: {str(good_done).lower()}, v3 finished: {str(bad_done).lower()}")
 print(f"v3 was seen by {bad_exposed} of {TOTAL} requests ({fmt2(math.floor(share * 100))}%) before the rollback, {bad_steps} checks")
-if not good_done or bad_done or bad_exposed > TOTAL / 50 or bad_steps != 2:
+if not good_done or bad_done or bad_exposed > TOTAL / MAX_EXPOSED_SHARE or bad_steps != 2:
     sys.exit(1)

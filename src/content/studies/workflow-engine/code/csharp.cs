@@ -6,7 +6,9 @@ using System.Linq;
 
 string[] steps = { "reserve", "charge", "pack", "ship", "notify" };
 const int MaxAttempts = 3;
-long seed = 7;
+const int SeedValue = 7, Orders = 200;
+const int FailPct = 10, LostReplyPct = 10, CrashPct = 4; // an attempt fails early, or acts but its reply is lost; a worker dies before recording
+long seed = SeedValue;
 int Random(int n) { seed = (seed * 1664525 + 1013904223) % 4294967296; return (int)((seed / 65536) % n); }
 
 // The workflow must be deterministic: same history in, same decisions out. It may only touch the world through ctx.
@@ -32,14 +34,14 @@ int RunOrder(int orderId, bool idempotent, Dictionary<string, int> effects, int[
             for (int attempt = 1; attempt <= MaxAttempts && !done; attempt++)
             {
                 int r = Random(100);
-                if (r < 10) continue;                                  // failed before doing anything
+                if (r < FailPct) continue;                                 // failed before doing anything
                 var key = $"{orderId}:{e.Activity}";                   // the idempotency key
                 if (!(idempotent && effects.ContainsKey(key))) effects[key] = effects.GetValueOrDefault(key) + 1; // the side effect (a charge, a shipment)
-                if (r < 20) continue;                                  // the effect happened but the reply was lost
+                if (r < FailPct + LostReplyPct) continue;                                 // the effect happened but the reply was lost
                 done = true;
             }
             if (!done) { stats[1]++; return history.Count; }           // retries are used up: the workflow waits for a human
-            if (Random(100) < 4) { stats[2]++; continue; }             // the worker died before it wrote the result: the activity will run again
+            if (Random(100) < CrashPct) { stats[2]++; continue; }             // the worker died before it wrote the result: the activity will run again
             history.Add($"{e.Activity}-{orderId}");
             continue;
         }
@@ -50,11 +52,11 @@ int RunOrder(int orderId, bool idempotent, Dictionary<string, int> effects, int[
 
 (int[] stats, int twice, int doubleCharges, int events) RunAll(bool idempotent)
 {
-    seed = 7;
+    seed = SeedValue;
     var effects = new Dictionary<string, int>();
     var stats = new int[3];
     int longest = 0;
-    for (int id = 1; id <= 200; id++) longest = Math.Max(longest, RunOrder(id, idempotent, effects, stats));
+    for (int id = 1; id <= Orders; id++) longest = Math.Max(longest, RunOrder(id, idempotent, effects, stats));
     int twice = effects.Values.Sum(n => n - 1);
     int doubleCharges = effects.Where(kv => kv.Key.EndsWith(":charge")).Sum(kv => kv.Value - 1);
     return (stats, twice, doubleCharges, 2 + 2 * longest); // started + one scheduled and one completed event per step + finished
@@ -64,7 +66,7 @@ foreach (var idempotent in new[] { false, true })
 {
     var r = RunAll(idempotent);
     Console.WriteLine($"idempotent={(idempotent ? "true" : "false")}: completed {r.stats[0]}, stuck {r.stats[1]}, crashes {r.stats[2]}, steps run twice {r.twice}, double charges {r.doubleCharges}, longest history {r.events} events");
-    if (r.stats[0] + r.stats[1] != 200) Environment.Exit(1);
+    if (r.stats[0] + r.stats[1] != Orders) Environment.Exit(1);
     if (idempotent && r.twice != 0) Environment.Exit(1);
     if (!idempotent && r.doubleCharges == 0) Environment.Exit(1);
 }

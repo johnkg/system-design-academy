@@ -7,6 +7,9 @@ STORES = ['users-db', 'search-index', 'cache', 'lake', 'warehouse', 'processor-c
 METHOD = {'users-db': 'delete rows', 'search-index': 'delete docs', 'cache': 'evict keys', 'lake': 'shred key', 'warehouse': 'delete rows', 'processor-crm': 'api call'}
 GRACE = 2  # days between the soft delete and the hard delete
 DEADLINE = 30  # days allowed by law
+USERS, MAX_ROWS = 6, 3  # each user has 1..3 rows in every store
+CRM_FAIL_MOD = 3  # the CRM processor fails (user % 3) times before it succeeds
+RESTORE_DAY = 20  # the day a backup is restored
 
 
 def fnv(text):
@@ -27,11 +30,11 @@ def xor_stream(key, data_bytes):  # a toy stream cipher, only to show the idea o
 
 keyring = {}  # user -> key; destroying the entry is the erasure
 data = {s: {} for s in STORES}
-for user in range(1, 7):
+for user in range(1, USERS + 1):
     keyring[user] = fnv('key|' + str(user))
     for i, store in enumerate(STORES):
         rows = []
-        for n in range(1 + (user + i) % 3):
+        for n in range(1 + (user + i) % MAX_ROWS):
             text = f'{store}:{user}:{n}'
             rows.append(xor_stream(keyring[user], [ord(c) for c in text]) if store == 'lake' else text)
         data[store][user] = rows
@@ -78,7 +81,7 @@ for day in range(DEADLINE + 1):
             if r['tasks'][store] == -1:
                 continue
             r['tasks'][store] += 1
-            if store == 'processor-crm' and r['tasks'][store] <= r['user'] % 3:
+            if store == 'processor-crm' and r['tasks'][store] <= r['user'] % CRM_FAIL_MOD:
                 print(f'day {day}: {r["id"]} {store} failed, will retry')
                 continue
             erase(store, r['user'])
@@ -96,7 +99,7 @@ def present(rows):
     return sum(1 for r in requests if r['user'] in rows)
 
 
-replay = [r['user'] for r in requests if r['done'] is not None and r['done'] <= 20]
+replay = [r['user'] for r in requests if r['done'] is not None and r['done'] <= RESTORE_DAY]
 restored = copy.deepcopy(backup)
 print(f'restore on day 20 without the replay list: {present(restored)} deleted users are back')
 for u in replay:

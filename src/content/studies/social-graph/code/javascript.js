@@ -62,31 +62,34 @@ function bidirectional(a, b) {
   return { dist: -1, scanned };
 }
 
-let seed = 7; // a small deterministic generator, so every run builds the same graph
+const SEED = 7, CELEBRITIES = 3, CELEB_IN_10 = 3, FRIENDS_EACH = 6, NEIGHBOR_SPAN = 25; // users 0..2 are celebrities that 3 in 10 friendships point to
+const USER_A = 250, USER_B = 262; // the pair the demo looks at
+const PAIRS = 200, STRIDE_A = 37, STRIDE_B = 91, OFFSET_B = 5; // spread the sampled pairs over the users
+let seed = SEED; // a small deterministic generator, so every run builds the same graph
 const rnd = (n) => { seed = (Math.imul(seed, 1664525) + 1013904223) >>> 0; return Math.floor(seed / 65536) % n; };
-for (let u = 3; u < USERS; u++) // users 0, 1 and 2 are celebrities that 3 in 10 friendships point to
-  for (let i = 0; i < 6; i++) connect(u, rnd(10) < 3 ? rnd(3) : (u + 1 + rnd(25)) % USERS);
+for (let u = CELEBRITIES; u < USERS; u++)
+  for (let i = 0; i < FRIENDS_EACH; i++) connect(u, rnd(10) < CELEB_IN_10 ? rnd(CELEBRITIES) : (u + 1 + rnd(NEIGHBOR_SPAN)) % USERS);
 
 const degrees = adj.map((l) => l.length), maxDegree = Math.max(...degrees);
-console.log(`${USERS} users, ${edges} friendships, ${crossShard} of them across shards, biggest list ${maxDegree}, typical list ${degrees[250]}`);
+console.log(`${USERS} users, ${edges} friendships, ${crossShard} of them across shards, biggest list ${maxDegree}, typical list ${degrees[USERS / 2]}`);
 
-const m = mutual(250, 262);
-console.log(`mutual friends of 250 and 262: [${m.common.join(', ')}] after ${m.steps} steps (lists of ${adj[250].length} and ${adj[262].length})`);
+const m = mutual(USER_A, USER_B);
+console.log(`mutual friends of 250 and 262: [${m.common.join(', ')}] after ${m.steps} steps (lists of ${adj[USER_A].length} and ${adj[USER_B].length})`);
 
-const noCap = suggest(250, Infinity), capped = suggest(250, HUB_CAP);
+const noCap = suggest(USER_A, Infinity), capped = suggest(USER_A, HUB_CAP);
 const show = (r) => r.ranked.slice(0, 3).map(([id, c]) => `${id}x${c}`).join(' ');
 console.log(`suggestions for 250 without a cap: ${show(noCap)}, edges read ${noCap.touched}, shards ${noCap.shards}`);
 console.log(`suggestions for 250 with cap ${HUB_CAP}: ${show(capped)}, edges read ${capped.touched}, shards ${capped.shards}`);
 
 let pairs = 0, sumPlain = 0, sumBoth = 0;
-for (let i = 0; i < 200; i++) {
-  const a = (i * 37) % USERS, b = (i * 91 + 5) % USERS, p = bfs(a, b), q = bidirectional(a, b);
+for (let i = 0; i < PAIRS; i++) {
+  const a = (i * STRIDE_A) % USERS, b = (i * STRIDE_B + OFFSET_B) % USERS, p = bfs(a, b), q = bidirectional(a, b);
   if (p.dist !== q.dist || p.dist < 0) { console.log(`mismatch for ${a} and ${b}`); process.exit(1); }
   pairs++; sumPlain += p.scanned; sumBoth += q.scanned;
 }
 console.log(`${pairs} distance queries agree; edges scanned: plain ${sumPlain}, bidirectional ${sumBoth}`);
 
 const symmetric = adj.every((l, a) => l.every((b) => isFriend(b, a))) && adj.every((l) => l.every((v, i) => i === 0 || l[i - 1] < v));
-const mutualOk = m.common.every((c) => isFriend(250, c) && isFriend(262, c)) && m.common.length === adj[250].filter((c) => isFriend(262, c)).length;
+const mutualOk = m.common.every((c) => isFriend(USER_A, c) && isFriend(USER_B, c)) && m.common.length === adj[USER_A].filter((c) => isFriend(USER_B, c)).length;
 console.log(`lists symmetric and sorted: ${symmetric}; mutual friends match the slow check: ${mutualOk}`);
 if (!symmetric || !mutualOk || sumBoth >= sumPlain || capped.touched >= noCap.touched) process.exit(1);

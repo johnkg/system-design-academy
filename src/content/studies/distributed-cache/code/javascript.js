@@ -2,6 +2,11 @@
 // 1) a consistent-hash ring with virtual nodes, 2) an LRU cache with a memory limit and TTLs,
 // 3) single flight against a stampede, 4) TTL jitter against a mass expiry.
 
+const EXPIRES_AT = 100, STAMPEDE_END = 200, LOAD_MS = 40; // the stampede scenario, in ms
+const KEY_COUNT = 10000, NODES = 4, VNODES = 100;
+const CACHE_CAPACITY = 3, DEMO_TTL = 100;
+const BURST_KEYS = 1000, TTL_MS = 300000, JITTER_MS = 30000, MS_PER_S = 1000; // 5 min TTL, +/- 10% jitter
+
 // A 32-bit hash: FNV-1a, then a final mix so that similar strings land far apart.
 const hash = (s) => {
   let h = 0x811c9dc5;
@@ -45,32 +50,32 @@ class Cache {
 // A key expires at time 100 ms; one request per millisecond arrives until 200 ms, and a database load takes 40 ms.
 function stampede(singleFlight) {
   let loads = 0, ready = Infinity, started = false;
-  for (let t = 100; t < 200; t++) {
+  for (let t = EXPIRES_AT; t < STAMPEDE_END; t++) {
     if (t >= ready) continue;                 // refilled: a hit
     if (singleFlight && started) continue;    // waits for the load already running
-    loads++; started = true; ready = Math.min(ready, t + 40);
+    loads++; started = true; ready = Math.min(ready, t + LOAD_MS);
   }
   return loads;
 }
 
-const keys = Array.from({ length: 10000 }, (_, i) => `user:${i}`);
+const keys = Array.from({ length: KEY_COUNT }, (_, i) => `user:${i}`);
 
-const ring4 = new Ring(4, 100), ring5 = new Ring(5, 100);
-const load = [0, 0, 0, 0];
+const ring4 = new Ring(NODES, VNODES), ring5 = new Ring(NODES + 1, VNODES);
+const load = Array(NODES).fill(0);
 const before = keys.map((k) => { const n = ring4.owner(k); load[n]++; return n; });
 console.log(`keys per node on 4 nodes x 100 vnodes: ${load.join(', ')}`);
 let moved = 0, toNew = true, modMoved = 0;
 keys.forEach((k, i) => {
   const after = ring5.owner(k);
-  if (after !== before[i]) { moved++; if (after !== 4) toNew = false; }
-  if (hash(k) % 4 !== hash(k) % 5) modMoved++;
+  if (after !== before[i]) { moved++; if (after !== NODES) toNew = false; }
+  if (hash(k) % NODES !== hash(k) % (NODES + 1)) modMoved++;
 });
 console.log(`adding a 5th node moves ${moved} keys on the ring, all to the new node: ${toNew}; hash mod N would move ${modMoved}`);
 
-const cache = new Cache(3);
-cache.set('a', 1, 0, 100); cache.set('b', 2, 0, 100); cache.set('c', 3, 0, 100);
+const cache = new Cache(CACHE_CAPACITY);
+cache.set('a', 1, 0, DEMO_TTL); cache.set('b', 2, 0, DEMO_TTL); cache.set('c', 3, 0, DEMO_TTL);
 cache.get('a', 10);                  // a is now the newest, so b is the oldest
-cache.set('d', 4, 20, 100);          // over the limit: b is evicted
+cache.set('d', 4, 20, DEMO_TTL);         // over the limit: b is evicted
 console.log(`evicted: ${cache.evicted.join(',')}; a=${cache.get('a', 30) ?? 'miss'}, b=${cache.get('b', 30) ?? 'miss'}; a after its TTL=${cache.get('a', 150) ?? 'miss'}`);
 
 const plain = stampede(false), single = stampede(true);
@@ -78,9 +83,9 @@ console.log(`database loads while refilling: ${plain} without protection, ${sing
 
 const peak = (jitter) => {
   const perSecond = new Map();
-  for (const k of keys.slice(0, 1000)) {
-    const ttl = 300000 + (jitter ? (hash(k) % 60000) - 30000 : 0); // +/- 10%
-    const s = Math.floor(ttl / 1000);
+  for (const k of keys.slice(0, BURST_KEYS)) {
+    const ttl = TTL_MS + (jitter ? (hash(k) % (2 * JITTER_MS)) - JITTER_MS : 0);
+    const s = Math.floor(ttl / MS_PER_S);
     perSecond.set(s, (perSecond.get(s) || 0) + 1);
   }
   return Math.max(...perSecond.values());
@@ -88,6 +93,6 @@ const peak = (jitter) => {
 const [flat, spread] = [peak(false), peak(true)];
 console.log(`1000 keys cached together: most expiries in one second is ${flat} without jitter, ${spread} with it`);
 
-const ok = toNew && moved < 3000 && modMoved > 7000 && Math.min(...load) > 2000 && plain === 40 && single === 1 && flat === 1000 && spread < 50
+const ok = toNew && moved < 3000 && modMoved > 7000 && Math.min(...load) > 2000 && plain === LOAD_MS && single === 1 && flat === BURST_KEYS && spread < 50
   && cache.evicted.join() === 'b' && cache.get('b', 30) === undefined;
 if (!ok) process.exit(1);

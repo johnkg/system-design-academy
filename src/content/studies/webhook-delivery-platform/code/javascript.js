@@ -2,18 +2,22 @@
 // concurrency limit, exponential backoff with jitter, and a circuit breaker, so a dead endpoint cannot hurt the others.
 import crypto from 'node:crypto';
 
+const TOLERANCE_S = 300; // a signature older than 5 minutes is rejected as a replay
+const SEED = 7, EVENTS = 10; // events fanned out to every endpoint
+const BACKOFF_BASE = 2, BACKOFF_CAP = 30; // retry delays grow 2, 4, 8, ... ticks, capped at 30
+
 // The signature covers the timestamp and the exact body, so a captured request cannot be replayed later or edited.
 const sign = (secret, ts, body) => crypto.createHmac('sha256', secret).update(`${ts}.${body}`).digest('hex');
 const sameHex = (a, b) => a.length === b.length && crypto.timingSafeEqual(Buffer.from(a), Buffer.from(b));
-function verify(secret, header, ts, body, now, tolerance = 300) {
+function verify(secret, header, ts, body, now, tolerance = TOLERANCE_S) {
   if (Math.abs(now - ts) > tolerance) return false;                       // too old (or from the future)
   return header.split(',').some((sig) => sameHex(sig, sign(secret, ts, body))); // any listed signature may match
 }
 
 const LIMIT = 2, MAX_ATTEMPTS = 6, TRIP = 3, COOL = 20, END = 200, EPOCH = 1700000000;
-let seed = 7;
+let seed = SEED;
 const rnd = (n) => { seed = (seed * 1664525 + 1013904223) % 4294967296; return Math.floor(seed / 65536) % n; };
-const backoff = (attempt) => 1 + rnd(Math.min(30, 2 * 2 ** (attempt - 1))); // full jitter: anywhere from 1 to the cap
+const backoff = (attempt) => 1 + rnd(Math.min(BACKOFF_CAP, BACKOFF_BASE * 2 ** (attempt - 1))); // full jitter: anywhere from 1 to the cap
 
 // The customer side. A receiver stores event ids, so a repeated delivery is ignored instead of processed twice.
 const ROTATION = ['whsec_new', 'whsec_old']; // while a secret is rotated the sender signs with both
@@ -31,7 +35,7 @@ function receive(ep, id, attempt, ts, body, header) {
 }
 
 const bodyOf = (id) => `{"id":"evt_${id}","type":"invoice.paid","n":${id}}`;
-for (const ep of endpoints) for (let id = 1; id <= 10; id++) ep.queue.push({ id, attempts: 0, readyAt: 0 }); // fan-out: one job per endpoint
+for (const ep of endpoints) for (let id = 1; id <= EVENTS; id++) ep.queue.push({ id, attempts: 0, readyAt: 0 }); // fan-out: one job per endpoint
 
 for (let t = 0; t < END; t++) {
   for (const ep of endpoints) {                          // each endpoint has its own queue and its own limit
@@ -60,7 +64,7 @@ console.log(`valid: ${checks[0]}, edited body: ${checks[1]}, stale timestamp: ${
 for (const ep of endpoints) console.log(`${ep.name}: delivered ${ep.delivered}, attempts ${ep.attempts}, dropped ${ep.dropped}, waiting ${ep.queue.length}, duplicates ignored ${ep.dupes}, breaker opened ${ep.opened}, last delivery at ${ep.last}`);
 
 const [h, f, d] = endpoints;
-const fine = checks[0] && !checks[1] && !checks[2] && h.delivered === 10 && h.last <= 5 && h.attempts === 10 && f.delivered === 10 && f.seen.size === 10 && f.dupes > 0 &&
-  d.delivered === 0 && d.attempts < 10 * MAX_ATTEMPTS && d.delivered + d.dropped + d.queue.length === 10;
-console.log(`dead endpoint saw ${d.attempts} attempts, not ${10 * MAX_ATTEMPTS}; healthy finished by tick ${h.last}`);
+const fine = checks[0] && !checks[1] && !checks[2] && h.delivered === EVENTS && h.last <= 5 && h.attempts === EVENTS && f.delivered === EVENTS && f.seen.size === EVENTS && f.dupes > 0 &&
+  d.delivered === 0 && d.attempts < EVENTS * MAX_ATTEMPTS && d.delivered + d.dropped + d.queue.length === EVENTS;
+console.log(`dead endpoint saw ${d.attempts} attempts, not ${EVENTS * MAX_ATTEMPTS}; healthy finished by tick ${h.last}`);
 if (!fine) process.exit(1);

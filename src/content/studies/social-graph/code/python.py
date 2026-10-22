@@ -93,7 +93,10 @@ def bidirectional(a, b):  # search from both ends and meet in the middle
     return -1, scanned
 
 
-seed = 7  # a small deterministic generator, so every run builds the same graph
+SEED, CELEBRITIES, CELEB_IN_10, FRIENDS_EACH, NEIGHBOR_SPAN = 7, 3, 3, 6, 25  # users 0..2 are celebrities that 3 in 10 friendships point to
+USER_A, USER_B = 250, 262  # the pair the demo looks at
+PAIRS, STRIDE_A, STRIDE_B, OFFSET_B = 200, 37, 91, 5  # spread the sampled pairs over the users
+seed = SEED  # a small deterministic generator, so every run builds the same graph
 
 
 def rnd(n):
@@ -102,17 +105,17 @@ def rnd(n):
     return (seed >> 16) % n
 
 
-for u in range(3, USERS):  # users 0, 1 and 2 are celebrities that 3 in 10 friendships point to
-    for _ in range(6):
-        connect(u, rnd(3) if rnd(10) < 3 else (u + 1 + rnd(25)) % USERS)
+for u in range(CELEBRITIES, USERS):
+    for _ in range(FRIENDS_EACH):
+        connect(u, rnd(CELEBRITIES) if rnd(10) < CELEB_IN_10 else (u + 1 + rnd(NEIGHBOR_SPAN)) % USERS)
 
 degrees = [len(row) for row in adj]
-print(f"{USERS} users, {stats['edges']} friendships, {stats['cross']} of them across shards, biggest list {max(degrees)}, typical list {degrees[250]}")
+print(f"{USERS} users, {stats['edges']} friendships, {stats['cross']} of them across shards, biggest list {max(degrees)}, typical list {degrees[USERS // 2]}")
 
-common, steps = mutual(250, 262)
-print(f"mutual friends of 250 and 262: [{', '.join(map(str, common))}] after {steps} steps (lists of {len(adj[250])} and {len(adj[262])})")
+common, steps = mutual(USER_A, USER_B)
+print(f"mutual friends of 250 and 262: [{', '.join(map(str, common))}] after {steps} steps (lists of {len(adj[USER_A])} and {len(adj[USER_B])})")
 
-no_cap, capped = suggest(250, INF), suggest(250, HUB_CAP)
+no_cap, capped = suggest(USER_A, INF), suggest(USER_A, HUB_CAP)
 
 
 def show(r):
@@ -123,8 +126,8 @@ print(f"suggestions for 250 without a cap: {show(no_cap)}, edges read {no_cap[1]
 print(f"suggestions for 250 with cap {HUB_CAP}: {show(capped)}, edges read {capped[1]}, shards {capped[2]}")
 
 pairs = sum_plain = sum_both = 0
-for i in range(200):
-    a, b = (i * 37) % USERS, (i * 91 + 5) % USERS
+for i in range(PAIRS):
+    a, b = (i * STRIDE_A) % USERS, (i * STRIDE_B + OFFSET_B) % USERS
     (pd, ps), (qd, qs) = bfs(a, b), bidirectional(a, b)
     if pd != qd or pd < 0:
         print(f"mismatch for {a} and {b}")
@@ -135,7 +138,7 @@ for i in range(200):
 print(f"{pairs} distance queries agree; edges scanned: plain {sum_plain}, bidirectional {sum_both}")
 
 symmetric = all(is_friend(b, a) for a, row in enumerate(adj) for b in row) and all(row == sorted(set(row)) for row in adj)
-mutual_ok = all(is_friend(250, c) and is_friend(262, c) for c in common) and len(common) == len([c for c in adj[250] if is_friend(262, c)])
+mutual_ok = all(is_friend(USER_A, c) and is_friend(USER_B, c) for c in common) and len(common) == len([c for c in adj[USER_A] if is_friend(USER_B, c)])
 print(f"lists symmetric and sorted: {str(symmetric).lower()}; mutual friends match the slow check: {str(mutual_ok).lower()}")
 if not symmetric or not mutual_ok or sum_both >= sum_plain or capped[1] >= no_cap[1]:
     sys.exit(1)

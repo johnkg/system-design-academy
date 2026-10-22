@@ -3,6 +3,10 @@
 // and writes to the counter are batched, so the database sees a few big additions instead of thousands of small ones.
 
 const SHARDS = 8, BATCH = 500;
+const KEY_SPACE = 100000; // a like key packs post and user: post * 100000 + user, with user ids below 100000
+const SEED = 4242, TAPS = 30000, USERS = 20000, PICK_RANGE = 1000;
+const VIRAL_IN_10 = 8; // 80% of the taps go to the viral post 0
+const MAX_WRITE_SHARE = 10; // batching must cut counter writes at least tenfold
 
 class LikeStore {
   constructor() {
@@ -15,7 +19,7 @@ class LikeStore {
   }
 
   like(post, user, pick) {
-    const key = post * 100000 + user;
+    const key = post * KEY_SPACE + user;
     if (this.liked.has(key)) return false;           // the unique constraint says: already liked
     this.liked.add(key);
     const slot = `${post}:${pick % SHARDS}`;         // any shard will do, so choose by a random number
@@ -38,7 +42,7 @@ class LikeStore {
   shown(post) { return (this.shards.get(post) ?? []).reduce((a, b) => a + b, 0); } // the count a reader sees: the sum of the shards
 }
 
-let seed = 4242;
+let seed = SEED;
 const random = (n) => { seed = (seed * 1664525 + 1013904223) % 4294967296; return Math.floor(seed / 65536) % n; };
 
 const store = new LikeStore();
@@ -46,11 +50,11 @@ const posts = [0, 1, 2];
 const sumShown = () => posts.reduce((s, p) => s + store.shown(p), 0);
 const taps = [];                                    // every tap, including repeats
 let accepted = 0, behindMax = 0;
-for (let i = 0; i < 30000; i++) {
-  const post = random(10) < 8 ? 0 : 1 + random(2);  // 80% of the taps go to the viral post 0
-  const user = random(20000);
+for (let i = 0; i < TAPS; i++) {
+  const post = random(10) < VIRAL_IN_10 ? 0 : 1 + random(posts.length - 1);  // 80% of the taps go to the viral post 0
+  const user = random(USERS);
   taps.push([post, user]);
-  if (store.like(post, user, random(1000))) accepted++;
+  if (store.like(post, user, random(PICK_RANGE))) accepted++;
   behindMax = Math.max(behindMax, accepted - sumShown()); // likes in the buffer, not yet in the counters
 }
 const lastBehind = accepted - sumShown();
@@ -64,5 +68,5 @@ console.log(`the count trailed by at most ${behindMax} likes, and by ${lastBehin
 const hot = [...store.rowWrites].filter(([k]) => k.startsWith('0:')).map(([, n]) => n);
 console.log(`counter writes: ${store.counterWrites} instead of ${accepted}; the hottest row got ${Math.max(...hot)}, a single row would have got ${truth[0]}`);
 
-const ok = shown.every((c, i) => c === truth[i]) && accepted === truth.reduce((a, b) => a + b, 0) && store.counterWrites < accepted / 10;
+const ok = shown.every((c, i) => c === truth[i]) && accepted === truth.reduce((a, b) => a + b, 0) && store.counterWrites < accepted / MAX_WRITE_SHARE;
 if (!ok) process.exit(1);

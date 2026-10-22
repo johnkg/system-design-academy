@@ -2,7 +2,12 @@
 // a table that appends every change to a log, a connector that reads the log with committed offsets and crashes once,
 // an idempotent sink, and a polling copy for comparison. Values are positive, and 0 means "no row".
 
-let seed = 7;
+const SEED = 7, CHANGES = 400, KEYS = 25, MAX_VALUE = 1000;
+const DELETE_IN_10 = 2; // 2 in 10 writes to an existing row delete it
+const POLL_EVERY = 50; // changes between two polls
+const BATCH = 25, CRASH_AT_BATCH = 6; // the connector crashes once, after its 6th batch
+
+let seed = SEED;
 const random = (n) => { seed = (seed * 1664525 + 1013904223) % 4294967296; return Math.floor(seed / 65536) % n; };
 
 const table = new Map(); // key -> { value, updatedAt }
@@ -22,12 +27,12 @@ function poll() {
   cursor = log.length;
 }
 
-for (let i = 0; i < 400; i++) { // 400 changes to 25 keys
-  const key = random(25);
-  if (!table.has(key)) write('insert', key, 1 + random(1000));
-  else if (random(10) < 2) write('delete', key, 0);
-  else write('update', key, 1 + random(1000));
-  if ((i + 1) % 50 === 0) poll();
+for (let i = 0; i < CHANGES; i++) {
+  const key = random(KEYS);
+  if (!table.has(key)) write('insert', key, 1 + random(MAX_VALUE));
+  else if (random(10) < DELETE_IN_10) write('delete', key, 0);
+  else write('update', key, 1 + random(MAX_VALUE));
+  if ((i + 1) % POLL_EVERY === 0) poll();
 }
 
 // The sink keeps the log position of the last change it applied per key, and ignores anything not newer.
@@ -43,10 +48,10 @@ const sink = new Sink();
 let deltaTotal = 0; // a careless sink that adds (after - before) for every event it receives
 let delivered = 0, committed = 0, batches = 0, crashed = false;
 while (committed < log.length) {
-  const batch = log.slice(committed, committed + 25);
+  const batch = log.slice(committed, committed + BATCH);
   for (const e of batch) { sink.apply(e); deltaTotal += e.after - e.before; delivered++; }
   batches++;
-  if (batches === 6 && !crashed) { crashed = true; continue; } // crash after applying the batch, before committing its offset: restart from the old offset
+  if (batches === CRASH_AT_BATCH && !crashed) { crashed = true; continue; } // crash after applying the batch, before committing its offset: restart from the old offset
   committed += batch.length;
 }
 

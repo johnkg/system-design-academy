@@ -3,6 +3,7 @@
 import hashlib
 import sys
 
+INTEGRITY_HEX = 16  # hex digits of the SHA-256 kept in the integrity string, enough for a demo
 
 def sha(text):
     return hashlib.sha256(text.encode('utf-8')).hexdigest()
@@ -55,7 +56,7 @@ class Registry:
 
     def publish(self, name, version, deps):
         body = f"{name}@{version}|{','.join(f'{n}:{r}' for n, r in deps)}"  # stands in for the tarball bytes
-        integrity = 'sha256-' + sha(body)[:16]
+        integrity = 'sha256-' + sha(body)[:INTEGRITY_HEX]
         versions = self.index.setdefault(name, {})
         old = versions.get(version)
         if old:  # a version is immutable: the same bytes are a no-op, different bytes are refused
@@ -99,7 +100,7 @@ class Registry:
         bad = []
         for name, version in chosen.items():
             integrity = self.index[name][version]['integrity']
-            if 'sha256-' + sha(self.blobs[integrity])[:16] != integrity:
+            if 'sha256-' + sha(self.blobs[integrity])[:INTEGRITY_HEX] != integrity:
                 bad.append(f'{name}@{version}')
         return bad
 

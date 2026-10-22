@@ -5,7 +5,9 @@ import { createHash } from 'node:crypto';
 const MIN = 1024, AVG_BITS = 12, MAX = 16384; // chunks average about 4 KB (2^12 bytes), and are never under 1 KB or over 16 KB
 const FIXED = 4096;
 
-let seed = 7; // a small repeatable random generator, so every run sees the same file
+const SEED = 7, FILE_BYTES = 300000, INSERTED = 10;
+const MIN_RESENT_FIXED = 90, MAX_RESENT_CDC = 10; // percent of the file sent again after the edit
+let seed = SEED; // a small repeatable random generator, so every run sees the same file
 const nextRandom = () => (seed = (seed * 1664525 + 1013904223) % 4294967296);
 const GEAR = Array.from({ length: 256 }, () => nextRandom()); // a random number for each possible byte value
 const randomBytes = (n) => Uint8Array.from({ length: n }, () => (nextRandom() >>> 16) & 255);
@@ -42,9 +44,9 @@ function sync(server, chunks) {
   return sent;
 }
 
-const original = randomBytes(300000);
-const edited = new Uint8Array(original.length + 10);
-edited.set(randomBytes(10), 0); edited.set(original, 10); // 10 bytes inserted at the very start
+const original = randomBytes(FILE_BYTES);
+const edited = new Uint8Array(original.length + INSERTED);
+edited.set(randomBytes(INSERTED), 0); edited.set(original, INSERTED); // 10 bytes inserted at the very start
 
 let failures = 0;
 for (const [name, chunker, limit] of [['fixed 4 KB chunks', chunkFixed, 'high'], ['content-defined chunks', chunkByContent, 'low']]) {
@@ -53,7 +55,7 @@ for (const [name, chunker, limit] of [['fixed 4 KB chunks', chunkFixed, 'high'],
   const second = sync(server, chunker(edited));
   const share = (second / edited.length) * 100;
   console.log(`${name}: first upload ${first} bytes, after inserting 10 bytes at the start ${second} bytes (${share.toFixed(1)}% of the file)`);
-  if (limit === 'high' && share < 90) failures++; // fixed chunks: every boundary moved, so nearly everything is sent again
-  if (limit === 'low' && share > 10) failures++; // content-defined: only the chunk around the edit is sent
+  if (limit === 'high' && share < MIN_RESENT_FIXED) failures++; // fixed chunks: every boundary moved, so nearly everything is sent again
+  if (limit === 'low' && share > MAX_RESENT_CDC) failures++; // content-defined: only the chunk around the edit is sent
 }
 if (failures) process.exit(1);

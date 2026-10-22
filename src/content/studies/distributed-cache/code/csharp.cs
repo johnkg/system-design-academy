@@ -5,15 +5,20 @@ using System;
 using System.Collections.Generic;
 using System.Linq;
 
+const int ExpiresAt = 100, StampedeEnd = 200, LoadMs = 40; // the stampede scenario, in ms
+const int KeyCount = 10000, Nodes = 4, Vnodes = 100;
+const int CacheCapacity = 3, DemoTtl = 100;
+const int BurstKeys = 1000, TtlMs = 300000, JitterMs = 30000, MsPerS = 1000; // 5 min TTL, +/- 10% jitter
+
 // A key expires at 100 ms; one request per millisecond arrives until 200 ms, and a database load takes 40 ms.
 static int Stampede(bool singleFlight)
 {
     int loads = 0, ready = int.MaxValue; bool started = false;
-    for (int t = 100; t < 200; t++)
+    for (int t = ExpiresAt; t < StampedeEnd; t++)
     {
         if (t >= ready) continue;                 // refilled: a hit
         if (singleFlight && started) continue;    // waits for the load already running
-        loads++; started = true; ready = Math.Min(ready, t + 40);
+        loads++; started = true; ready = Math.Min(ready, t + LoadMs);
     }
     return loads;
 }
@@ -21,10 +26,10 @@ static int Stampede(bool singleFlight)
 static int Peak(List<string> keys, bool jitter)
 {
     var perSecond = new Dictionary<long, int>();
-    foreach (var k in keys.Take(1000))
+    foreach (var k in keys.Take(BurstKeys))
     {
-        long ttl = 300000 + (jitter ? (long)(Ring.Hash(k) % 60000) - 30000 : 0); // +/- 10%
-        long s = ttl / 1000;
+        long ttl = TtlMs + (jitter ? (long)(Ring.Hash(k) % (2 * JitterMs)) - JitterMs : 0);
+        long s = ttl / MsPerS;
         perSecond[s] = perSecond.GetValueOrDefault(s) + 1;
     }
     return perSecond.Values.Max();
@@ -32,10 +37,10 @@ static int Peak(List<string> keys, bool jitter)
 
 static string Shown(int? v) => v.HasValue ? v.Value.ToString() : "miss";
 
-var keys = Enumerable.Range(0, 10000).Select(i => $"user:{i}").ToList();
+var keys = Enumerable.Range(0, KeyCount).Select(i => $"user:{i}").ToList();
 
-var ring4 = new Ring(4, 100); var ring5 = new Ring(5, 100);
-var load = new int[4];
+var ring4 = new Ring(Nodes, Vnodes); var ring5 = new Ring(Nodes + 1, Vnodes);
+var load = new int[Nodes];
 var before = new List<int>();
 foreach (var k in keys) { int n = ring4.Owner(k); load[n]++; before.Add(n); }
 Console.WriteLine($"keys per node on 4 nodes x 100 vnodes: {string.Join(", ", load)}");
@@ -43,15 +48,15 @@ int moved = 0, modMoved = 0; bool toNew = true;
 for (int i = 0; i < keys.Count; i++)
 {
     int after = ring5.Owner(keys[i]);
-    if (after != before[i]) { moved++; if (after != 4) toNew = false; }
-    if (Ring.Hash(keys[i]) % 4 != Ring.Hash(keys[i]) % 5) modMoved++;
+    if (after != before[i]) { moved++; if (after != Nodes) toNew = false; }
+    if (Ring.Hash(keys[i]) % Nodes != Ring.Hash(keys[i]) % (Nodes + 1)) modMoved++;
 }
 Console.WriteLine($"adding a 5th node moves {moved} keys on the ring, all to the new node: {toNew.ToString().ToLower()}; hash mod N would move {modMoved}");
 
-var cache = new Cache(3);
-cache.Set("a", 1, 0, 100); cache.Set("b", 2, 0, 100); cache.Set("c", 3, 0, 100);
+var cache = new Cache(CacheCapacity);
+cache.Set("a", 1, 0, DemoTtl); cache.Set("b", 2, 0, DemoTtl); cache.Set("c", 3, 0, DemoTtl);
 cache.Get("a", 10);                  // a is now the newest, so b is the oldest
-cache.Set("d", 4, 20, 100);          // over the limit: b is evicted
+cache.Set("d", 4, 20, DemoTtl);         // over the limit: b is evicted
 Console.WriteLine($"evicted: {string.Join(",", cache.Evicted)}; a={Shown(cache.Get("a", 30))}, b={Shown(cache.Get("b", 30))}; a after its TTL={Shown(cache.Get("a", 150))}");
 
 int plain = Stampede(false), single = Stampede(true);
@@ -60,7 +65,7 @@ Console.WriteLine($"database loads while refilling: {plain} without protection, 
 int flat = Peak(keys, false), spread = Peak(keys, true);
 Console.WriteLine($"1000 keys cached together: most expiries in one second is {flat} without jitter, {spread} with it");
 
-bool ok = toNew && moved < 3000 && modMoved > 7000 && load.Min() > 2000 && plain == 40 && single == 1 && flat == 1000 && spread < 50
+bool ok = toNew && moved < 3000 && modMoved > 7000 && load.Min() > 2000 && plain == LoadMs && single == 1 && flat == BurstKeys && spread < 50
     && string.Join(",", cache.Evicted) == "b" && cache.Get("b", 30) == null;
 if (!ok) Environment.Exit(1);
 

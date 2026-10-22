@@ -1,6 +1,7 @@
 # A tiny table format: immutable data files, snapshots listing them, and one atomic
 # pointer swap (compare-and-swap) in the catalog. Concurrent writers use optimistic retries.
 
+MAX_RETRIES = 4  # a writer gives up after this many lost compare-and-swaps
 
 class Catalog:
     def __init__(self):
@@ -19,7 +20,7 @@ class Catalog:
         return sum(self.rows[f] for f in self.snapshots[version])
 
 
-def commit(cat, who, base, adds, removes, max_retries=4):
+def commit(cat, who, base, adds, removes, max_retries=MAX_RETRIES):
     """Optimistic commit built on snapshot `base`; on a lost race, validate and retry."""
     attempts = 0
     while True:

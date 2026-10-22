@@ -5,6 +5,8 @@ using System.Collections.Generic;
 using System.Linq;
 
 const int Window = 10;
+const int EndOfStream = 1000000000; // a watermark later than any event time
+const int TracedDelay = 5, SafeDelay = 20; // the run printed step by step, and one above the worst disorder
 int[] events = { 1, 3, 12, 8, 5, 14, 22, 11, 25, 9, 31, 18, 35, 27, 41, 33 }; // event times, in arrival order
 
 // Returns the fired windows (start -> count emitted when the watermark passed its end) and the late events.
@@ -44,7 +46,7 @@ int[] events = { 1, 3, 12, 8, 5, 14, 22, 11, 25, 9, 31, 18, 35, 27, 41, 33 }; //
         FireReady($"t={t}");
     }
     // End of input: the watermark jumps to infinity and flushes everything left.
-    watermark = 1000000000;
+    watermark = EndOfStream;
     FireReady("end");
     return (fired, late);
 }
@@ -56,14 +58,14 @@ foreach (var t in events)
     truth[s] = truth.GetValueOrDefault(s) + 1;
 }
 
-foreach (var delay in new[] { 0, 5, 20 })
+foreach (var delay in new[] { 0, TracedDelay, SafeDelay })
 {
     Console.WriteLine($"watermark delay {delay}s");
-    var (fired, late) = Run(delay, delay == 5);
+    var (fired, late) = Run(delay, delay == TracedDelay);
     int error = truth.Sum(kv => Math.Abs(kv.Value - fired.GetValueOrDefault(kv.Key)));
     int counted = fired.Values.Sum();
     Console.WriteLine($"  windows={fired.Count} counted={counted} late={late.Count} error={error}");
     if (counted + late.Count != events.Length) throw new Exception("every event is counted or late");
     if (error != late.Count) throw new Exception("the only error is the dropped late events");
-    if (delay == 20 && late.Count != 0) throw new Exception("a delay above the worst disorder (16s) drops nothing");
+    if (delay == SafeDelay && late.Count != 0) throw new Exception("a delay above the worst disorder (16s) drops nothing");
 }

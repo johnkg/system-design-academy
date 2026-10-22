@@ -1,6 +1,11 @@
 // A model registry in JavaScript: immutable checksummed versions, gated promotion with approval,
 // rollback, a sticky canary traffic split, and the scale-from-zero arithmetic.
 
+const MAX_P95_MS = 120, MAX_ACC_DROP = 5; // the eval gate; accuracy is in per mille
+const REQUESTS = 10000, CANARY_PCT = 10, WIDER_PCT = 25;
+const BOOT_S = 6, QUEUE_PER_REPLICA = 8; // fixed start-up time; queued requests one replica absorbs
+const MODEL_MB = 14000, NETWORK_MBPS = 1000, LOCAL_MBPS = 5000;
+
 // 32-bit FNV-1a hash, used here as the checksum of the weights and as the traffic-split hash.
 const fnv = (s) => { let h = 0x811c9dc5; for (let i = 0; i < s.length; i++) { h ^= s.charCodeAt(i); h = Math.imul(h, 16777619) >>> 0; } return h >>> 0; };
 const checksum = (weights) => fnv(weights).toString(16).padStart(8, '0');
@@ -22,8 +27,8 @@ class Registry {
   stage(n, evals) {
     const v = this.versions[n - 1], prod = this.production();
     if (checksum(v.weights) !== v.sum) return `v${n} refused: checksum mismatch`;
-    if (evals.p95 > 120) return `v${n} blocked: p95 ${evals.p95} ms is over 120 ms`;
-    if (prod && evals.acc < prod.evals.acc - 5) return `v${n} blocked: accuracy ${evals.acc} is below production`;
+    if (evals.p95 > MAX_P95_MS) return `v${n} blocked: p95 ${evals.p95} ms is over 120 ms`;
+    if (prod && evals.acc < prod.evals.acc - MAX_ACC_DROP) return `v${n} blocked: accuracy ${evals.acc} is below production`;
     v.evals = evals; v.stage = 'staging';
     return `v${n} is in staging`;
   }
@@ -60,18 +65,18 @@ console.log(`tampered copy of v2 passes the checksum: ${checksum('weights-beta!'
 // A request id always lands on the same side, and raising the canary share only moves requests onto the canary.
 const toCanary = (id, pct) => fnv(`req-${id}`) % 100 < pct;
 let at10 = 0, at25 = 0, sticky = true, nested = true;
-for (let i = 0; i < 10000; i++) {
-  const a = toCanary(i, 10), b = toCanary(i, 25);
+for (let i = 0; i < REQUESTS; i++) {
+  const a = toCanary(i, CANARY_PCT), b = toCanary(i, WIDER_PCT);
   if (a) at10++; if (b) at25++;
-  if (a !== toCanary(i, 10)) sticky = false;
+  if (a !== toCanary(i, CANARY_PCT)) sticky = false;
   if (a && !b) nested = false;
 }
 console.log(`canary share: ${at10} of 10000 at 10%, ${at25} at 25%; sticky ${sticky}; nested ${nested}`);
 
 // Scale from zero: a cold replica pays 6 s of start-up plus the weight download. Replicas follow the queue at 8 requests each.
-const coldStart = (sizeMb, mbPerSec) => 6 + Math.ceil(sizeMb / mbPerSec);
-const replicas = (queue) => Math.ceil(queue / 8);
-console.log(`cold start for 14000 MB: ${coldStart(14000, 1000)} s from the network, ${coldStart(14000, 5000)} s from a local cache; replicas for queue 0, 5, 50: ${[0, 5, 50].map(replicas).join(', ')}`);
+const coldStart = (sizeMb, mbPerSec) => BOOT_S + Math.ceil(sizeMb / mbPerSec);
+const replicas = (queue) => Math.ceil(queue / QUEUE_PER_REPLICA);
+console.log(`cold start for 14000 MB: ${coldStart(MODEL_MB, NETWORK_MBPS)} s from the network, ${coldStart(MODEL_MB, LOCAL_MBPS)} s from a local cache; replicas for queue 0, 5, 50: ${[0, 5, 50].map(replicas).join(', ')}`);
 
 console.log(reg.rollback());
 if (reg.production().n !== 1 || at10 < 800 || at10 > 1200 || !sticky || !nested || checksum('weights-beta!') === v2.sum) process.exit(1);

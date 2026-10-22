@@ -2,6 +2,7 @@
 // a seat is claimed with one atomic step that checks and changes it together, and an unpaid hold expires by itself.
 
 const HOLD_SECONDS = 600;
+const WAIT_SECONDS = 700; // longer than a hold, so unpaid holds expire
 
 // The seat table. In a real database, claim() is one statement:
 //   UPDATE seats SET holder = ?, expires = ? WHERE id = ? AND (holder IS NULL OR expires <= now)
@@ -42,7 +43,7 @@ const results = [
   ['ben claims A1 at the same moment', seats.claim('A1', 'ben', t)],
   ['ben claims A2', seats.claim('A2', 'ben', t)],
 ];
-t += 700; // ben never pays, and ten minutes pass
+t += WAIT_SECONDS; // ben never pays, and more than ten minutes pass
 results.push(['ben tries to pay for A2 after his hold ran out', seats.confirm('A2', 'ben', t)]);
 results.push(['cat claims A2, now free again', seats.claim('A2', 'cat', t)]);
 results.push(['ann pays for A1 after 700 seconds', seats.confirm('A1', 'ann', t)]);

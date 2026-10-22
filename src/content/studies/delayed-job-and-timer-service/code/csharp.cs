@@ -47,7 +47,11 @@ public class TimingWheel
 
 public static class Program
 {
-    static long seed = 2024;
+    const long Seed = 2024;
+    const int Horizon = 200000; // ticks simulated
+    const int FirstBatch = 3000, LateBatch = 200, LateAt = 1000, LateHorizon = 150000;
+    const int CancelEvery = 10, CancelIdEnd = 3; // ids ending in 3 are cancelled: 10%
+    static long seed = Seed;
     static int Random(int n) { seed = (seed * 1664525 + 1013904223) % 4294967296; return (int)((seed / 256) % n); }
 
     public static int Main()
@@ -57,17 +61,17 @@ public static class Program
         var placed = new int[3];
         void Schedule(int id, int due) { var t = new Timer(id, due); timers.Add(t); placed[wheel.Add(t)]++; }
 
-        for (int id = 0; id < 3000; id++) Schedule(id, 1 + Random(200000));
-        foreach (var t in timers) if (t.Id % 10 == 3) wheel.Cancel(t.Id); // 10% are cancelled before they are due
+        for (int id = 0; id < FirstBatch; id++) Schedule(id, 1 + Random(Horizon));
+        foreach (var t in timers) if (t.Id % CancelEvery == CancelIdEnd) wheel.Cancel(t.Id); // 10% are cancelled before they are due
 
         var fired = new List<Timer>();
         bool onTime = true;
-        while (wheel.Now < 200000)
+        while (wheel.Now < Horizon)
         {
-            if (wheel.Now == 1000) // new timers keep arriving while the wheel turns
+            if (wheel.Now == LateAt) // new timers keep arriving while the wheel turns
             {
-                for (int id = 3000; id < 3200; id++) Schedule(id, wheel.Now + 1 + Random(150000));
-                foreach (var t in timers) if (t.Id >= 3000 && t.Id % 10 == 3) wheel.Cancel(t.Id);
+                for (int id = FirstBatch; id < FirstBatch + LateBatch; id++) Schedule(id, wheel.Now + 1 + Random(LateHorizon));
+                foreach (var t in timers) if (t.Id >= FirstBatch && t.Id % CancelEvery == CancelIdEnd) wheel.Cancel(t.Id);
             }
             foreach (var t in wheel.Tick()) { fired.Add(t); if (t.Due != wheel.Now) onTime = false; }
         }

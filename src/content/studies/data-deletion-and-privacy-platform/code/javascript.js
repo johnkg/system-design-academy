@@ -4,6 +4,9 @@ const STORES = ['users-db', 'search-index', 'cache', 'lake', 'warehouse', 'proce
 const METHOD = { 'users-db': 'delete rows', 'search-index': 'delete docs', cache: 'evict keys', lake: 'shred key', warehouse: 'delete rows', 'processor-crm': 'api call' };
 const GRACE = 2; // days between the soft delete and the hard delete
 const DEADLINE = 30; // days allowed by law
+const USERS = 6, MAX_ROWS = 3; // each user has 1..3 rows in every store
+const CRM_FAIL_MOD = 3; // the CRM processor fails (user % 3) times before it succeeds
+const RESTORE_DAY = 20; // the day a backup is restored
 
 function fnv(text) {
   let h = 0x811c9dc5;
@@ -16,10 +19,10 @@ function xorStream(key, bytes) { // a toy stream cipher, only to show the idea o
 }
 const keyring = {}; // user -> key; destroying the entry is the erasure
 const data = Object.fromEntries(STORES.map((s) => [s, {}]));
-for (let user = 1; user <= 6; user++) {
+for (let user = 1; user <= USERS; user++) {
   keyring[user] = fnv('key|' + user);
   STORES.forEach((store, i) => {
-    data[store][user] = Array.from({ length: 1 + ((user + i) % 3) }, (_, n) => {
+    data[store][user] = Array.from({ length: 1 + ((user + i) % MAX_ROWS) }, (_, n) => {
       const text = `${store}:${user}:${n}`;
       return store === 'lake' ? xorStream(keyring[user], [...text].map((c) => c.charCodeAt(0))) : text;
     });
@@ -54,7 +57,7 @@ for (let day = 0; day <= DEADLINE; day++) {
     for (const store of STORES) {
       if (r.tasks[store] === -1) continue;
       r.tasks[store]++;
-      if (store === 'processor-crm' && r.tasks[store] <= r.user % 3) { console.log(`day ${day}: ${r.id} ${store} failed, will retry`); continue; }
+      if (store === 'processor-crm' && r.tasks[store] <= r.user % CRM_FAIL_MOD) { console.log(`day ${day}: ${r.id} ${store} failed, will retry`); continue; }
       erase(store, r.user);
       r.tasks[store] = -1;
       audit.push({ id: r.id, store, method: METHOD[store], day, who: fnv('salt|' + r.user).toString(16).padStart(8, '0') });
@@ -67,7 +70,7 @@ const lakeKept = requests.reduce((n, r) => n + data.lake[r.user].length, 0);
 console.log(`lake rows still in the files: ${lakeKept}, readable: ${requests.reduce((n, r) => n + readable('lake', r.user), 0)}`);
 
 const present = (rows) => requests.filter((r) => rows[r.user]).length;
-const replay = requests.filter((r) => r.done !== null && r.done <= 20).map((r) => r.user);
+const replay = requests.filter((r) => r.done !== null && r.done <= RESTORE_DAY).map((r) => r.user);
 const restored = JSON.parse(JSON.stringify(backup));
 console.log(`restore on day 20 without the replay list: ${present(restored)} deleted users are back`);
 replay.forEach((u) => delete restored[u]);

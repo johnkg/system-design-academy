@@ -4,8 +4,11 @@ import sys
 
 LEVELS = ['debug', 'info', 'warn', 'error']  # index = priority
 CAPACITY, DRAIN, TICKS = 300, 60, 60  # lines the buffer holds, lines shipped per tick, length of the run
+DEBUG, INFO, WARN, ERROR = 0, 1, 2, 3
+ERROR_PCT, WARN_PCT, INFO_PCT = 3, 7, 30  # the remaining 60% is debug
+SEED, NORMAL_RATE, BURST_RATE, BURST_START, BURST_END = 7, 30, 150, 20, 30  # lines per tick
 
-seed = 7
+seed = SEED
 
 
 def random(n):
@@ -15,13 +18,13 @@ def random(n):
 
 
 def level_of(r):
-    return 3 if r < 3 else 2 if r < 10 else 1 if r < 40 else 0  # 3% errors, 7% warnings, 30% info, 60% debug
+    return ERROR if r < ERROR_PCT else WARN if r < ERROR_PCT + WARN_PCT else INFO if r < ERROR_PCT + WARN_PCT + INFO_PCT else DEBUG
 
 
 def run(policy):
     global seed
-    seed = 7
-    queue, lost, sent = [], [0, 0, 0, 0], [0, 0, 0, 0]
+    seed = SEED
+    queue, lost, sent = [], [0] * len(LEVELS), [0] * len(LEVELS)
     arrived = 0
     peak = 0
 
@@ -43,7 +46,7 @@ def run(policy):
                 lost[level] += 1
 
     for t in range(TICKS):
-        n = 150 if 20 <= t < 30 else 30  # a burst between ticks 20 and 29
+        n = BURST_RATE if BURST_START <= t < BURST_END else NORMAL_RATE # a burst between ticks 20 and 29
         for _ in range(n):
             offer(level_of(random(100)))
             arrived += 1
@@ -65,7 +68,7 @@ for policy in policies:
     results[policy] = lost
     if sum(lost) + sum(sent) != arrived:  # every line is either shipped or counted as lost
         sys.exit(1)
-ok = results['keep-errors'][3] == 0 and results['drop-newest'][3] > 0 and results['drop-oldest'][3] > 0
-print(f"errors lost: {' / '.join(str(results[p][3]) for p in policies)}; keep-errors loses none: {str(ok).lower()}")
+ok = results['keep-errors'][ERROR] == 0 and results['drop-newest'][ERROR] > 0 and results['drop-oldest'][ERROR] > 0
+print(f"errors lost: {' / '.join(str(results[p][ERROR]) for p in policies)}; keep-errors loses none: {str(ok).lower()}")
 if not ok:
     sys.exit(1)

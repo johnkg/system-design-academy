@@ -46,7 +46,10 @@ if alice_sees != "XCA" or bob_sees != "XCA" or alice_naive == bob_naive:
     sys.exit(1)
 
 # Try it on 5,000 random pairs of simultaneous edits.
-seed = 99
+SEED = 99
+ALPHABET_SIZE = 8  # letters a..h
+MAX_TEXT = 8  # starting documents hold 0..8 letters
+seed = SEED
 
 
 def random(n):
@@ -58,13 +61,13 @@ def random(n):
 def make_op(text, site):
     if len(text) > 0 and random(2) == 0:
         return {"type": "del", "pos": random(len(text)), "site": site}
-    return {"type": "ins", "pos": random(len(text) + 1), "ch": "abcdefgh"[random(8)], "site": site}
+    return {"type": "ins", "pos": random(len(text) + 1), "ch": "abcdefgh"[random(ALPHABET_SIZE)], "site": site}
 
 
 converged = diverged = 0
 TRIALS = 5000
 for _ in range(TRIALS):
-    text = "".join("ABCDEFGH"[random(8)] for _ in range(random(9)))
+    text = "".join("ABCDEFGH"[random(ALPHABET_SIZE)] for _ in range(random(MAX_TEXT + 1)))
     a = make_op(text, 1)
     b = make_op(text, 2)
     left = apply(apply(text, a), transform(b, a))

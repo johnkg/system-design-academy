@@ -79,33 +79,37 @@ void Connect(int a, int b) // a friendship is stored twice, once in each person'
     return (-1, scanned);
 }
 
-uint seed = 7; // a small deterministic generator, so every run builds the same graph
+const int Celebrities = 3, CelebIn10 = 3, FriendsEach = 6, NeighborSpan = 25; // users 0..2 are celebrities that 3 in 10 friendships point to
+const int UserA = 250, UserB = 262; // the pair the demo looks at
+const int Pairs = 200, StrideA = 37, StrideB = 91, OffsetB = 5; // spread the sampled pairs over the users
+const uint Seed = 7;
+uint seed = Seed; // a small deterministic generator, so every run builds the same graph
 int Rnd(int n) { seed = unchecked(seed * 1664525u + 1013904223u); return (int)((seed >> 16) % (uint)n); }
 
-for (int u = 3; u < Users; u++) // users 0, 1 and 2 are celebrities that 3 in 10 friendships point to
-    for (int i = 0; i < 6; i++) Connect(u, Rnd(10) < 3 ? Rnd(3) : (u + 1 + Rnd(25)) % Users);
+for (int u = Celebrities; u < Users; u++)
+    for (int i = 0; i < FriendsEach; i++) Connect(u, Rnd(10) < CelebIn10 ? Rnd(Celebrities) : (u + 1 + Rnd(NeighborSpan)) % Users);
 
 var degrees = adj.Select(l => l.Count).ToArray();
-Console.WriteLine($"{Users} users, {edges} friendships, {crossShard} of them across shards, biggest list {degrees.Max()}, typical list {degrees[250]}");
+Console.WriteLine($"{Users} users, {edges} friendships, {crossShard} of them across shards, biggest list {degrees.Max()}, typical list {degrees[Users / 2]}");
 
-var m = Mutual(250, 262);
-Console.WriteLine($"mutual friends of 250 and 262: [{string.Join(", ", m.Common)}] after {m.Steps} steps (lists of {adj[250].Count} and {adj[262].Count})");
+var m = Mutual(UserA, UserB);
+Console.WriteLine($"mutual friends of 250 and 262: [{string.Join(", ", m.Common)}] after {m.Steps} steps (lists of {adj[UserA].Count} and {adj[UserB].Count})");
 
-var noCap = Suggest(250, int.MaxValue); var capped = Suggest(250, HubCap);
+var noCap = Suggest(UserA, int.MaxValue); var capped = Suggest(UserA, HubCap);
 string Show(List<KeyValuePair<int, int>> r) => string.Join(" ", r.Take(3).Select(p => $"{p.Key}x{p.Value}"));
 Console.WriteLine($"suggestions for 250 without a cap: {Show(noCap.Ranked)}, edges read {noCap.Touched}, shards {noCap.ShardCount}");
 Console.WriteLine($"suggestions for 250 with cap {HubCap}: {Show(capped.Ranked)}, edges read {capped.Touched}, shards {capped.ShardCount}");
 
 int pairs = 0, sumPlain = 0, sumBoth = 0;
-for (int i = 0; i < 200; i++)
+for (int i = 0; i < Pairs; i++)
 {
-    int a = i * 37 % Users, b = (i * 91 + 5) % Users; var p = Bfs(a, b); var q = Bidirectional(a, b);
+    int a = i * StrideA % Users, b = (i * StrideB + OffsetB) % Users; var p = Bfs(a, b); var q = Bidirectional(a, b);
     if (p.Dist != q.Dist || p.Dist < 0) { Console.WriteLine($"mismatch for {a} and {b}"); return 1; }
     pairs++; sumPlain += p.Scanned; sumBoth += q.Scanned;
 }
 Console.WriteLine($"{pairs} distance queries agree; edges scanned: plain {sumPlain}, bidirectional {sumBoth}");
 
 bool symmetric = Enumerable.Range(0, Users).All(a => adj[a].All(b => IsFriend(b, a)) && adj[a].Zip(adj[a].Skip(1), (x, y) => x < y).All(t => t));
-bool mutualOk = m.Common.All(c => IsFriend(250, c) && IsFriend(262, c)) && m.Common.Count == adj[250].Count(c => IsFriend(262, c));
+bool mutualOk = m.Common.All(c => IsFriend(UserA, c) && IsFriend(UserB, c)) && m.Common.Count == adj[UserA].Count(c => IsFriend(UserB, c));
 Console.WriteLine($"lists symmetric and sorted: {symmetric.ToString().ToLower()}; mutual friends match the slow check: {mutualOk.ToString().ToLower()}");
 return symmetric && mutualOk && sumBoth < sumPlain && capped.Touched < noCap.Touched ? 0 : 1;

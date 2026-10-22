@@ -95,7 +95,11 @@ def checksum(s):
     return h
 
 
-seed = 99
+SEED, STEPS, ROWS, DELETE_PCT, MAX_VALUE = 99, 600, 12, 4, 100
+START_MS, STEP_MS, B_SKEW_MS = 5000000, 1000, -10 * 60 * 1000  # B's clock is 10 minutes slow
+SYNC_EVERY, RETRY_ONE_IN = 7, 4  # a device syncs every 7 steps; 1 sync in 4 also re-sends its last push
+C_SYNC_AT, COMPACT_AT, COMPACT_KEEP = 100, 400, 100  # compaction keeps the last 100 changes
+seed = SEED
 
 
 def rnd(n):
@@ -105,25 +109,25 @@ def rnd(n):
 
 
 server, log = Server(), []
-A, B, C = Client('A', 0, server, log), Client('B', -600000, server, log), Client('C', 0, server, log)  # B's clock is 10 minutes slow
+A, B, C = Client('A', 0, server, log), Client('B', B_SKEW_MS, server, log), Client('C', 0, server, log)  # B's clock is 10 minutes slow
 edits = deletes = removed = ghosts = 0
-for step in range(600):
+for step in range(STEPS):
     d = rnd(2)
     c = [A, B][d]
-    i, kind, wall = rnd(12), rnd(100), 5000000 + step * 1000
+    i, kind, wall = rnd(ROWS), rnd(100), START_MS + step * STEP_MS
     if not (i in c.db and gone(c.db[i])):  # a deleted row is not on screen, so it cannot be edited
-        if kind < 4:
+        if kind < DELETE_PCT:
             c.write(i, '_gone', 1, wall)
             deletes += 1
         else:
-            c.write(i, FIELDS[rnd(3)], rnd(100), wall)
+            c.write(i, FIELDS[rnd(3)], rnd(MAX_VALUE), wall)
             edits += 1
-    if step % 7 == d:
-        c.sync(rnd(4) == 0)
-    if step == 100:
+    if step % SYNC_EVERY == d:
+        c.sync(rnd(RETRY_ONE_IN) == 0)
+    if step == C_SYNC_AT:
         C.sync(False)  # C syncs once and then stays offline
-    if step == 400:
-        removed = server.compact(server.seq - 100)
+    if step == COMPACT_AT:
+        removed = server.compact(server.seq - COMPACT_KEEP)
 before = [i for i, f in C.db.items() if not gone(f)]
 A.sync(False)
 B.sync(False)

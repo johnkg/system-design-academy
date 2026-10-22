@@ -10,6 +10,12 @@ def fnv(s):  # 32-bit FNV-1a hash
     return h
 
 
+DEFAULT_TTL, CDN_TTL, CLIENTS = 300, 60, 10000
+CHECK_INTERVAL, FAIL_THRESHOLD = 10, 3  # health checks every 10 s, 3 failures in a row mark the address down
+RRL_LIMIT = 5  # full answers per second per (client prefix, name)
+ATTACK_SECONDS, ATTACK_QPS, LEGIT_QPS = 3, 1000, 2
+ANSWER_BYTES, SLIP_BYTES, QUERY_BYTES = 1400, 90, 70  # a signed answer, a truncated reply, a spoofed query
+MIN_REDUCTION = 20  # RRL must cut the reflected bytes at least 20-fold
 NEG_TTL = 60  # how long resolvers may cache "no such name" (the SOA minimum)
 PRIMARY = '192.0.2.10'
 ZONE = {
@@ -80,30 +86,31 @@ class Limiter:
 
 
 def attack(rrl):
-    limiter = Limiter(5) if rrl else None
+    limiter = Limiter(RRL_LIMIT) if rrl else None
     victim = {'answer': 0, 'slip': 0, 'drop': 0}
     legit = {'answer': 0, 'slip': 0, 'drop': 0}
-    for sec in range(3):
-        for _ in range(1000):  # spoofed source = the victim
+    for sec in range(ATTACK_SECONDS):
+        for _ in range(ATTACK_QPS):  # spoofed source = the victim
             victim[limiter.check('198.51.100.0/24', 'www.example.com', sec) if limiter else 'answer'] += 1
-        for _ in range(2):
+        for _ in range(LEGIT_QPS):
             legit[limiter.check('203.0.113.0/24', 'www.example.com', sec) if limiter else 'answer'] += 1
-    size = victim['answer'] * 1400 + victim['slip'] * 90  # a signed answer is 1400 bytes, a truncated reply 90
-    return {'victim': victim, 'legit': legit, 'bytes': size, 'amplification': f'{size / (3000 * 70):.2f}'}  # 3000 queries of 70 bytes
+    size = victim['answer'] * ANSWER_BYTES + victim['slip'] * SLIP_BYTES
+    amplification = size / (ATTACK_SECONDS * ATTACK_QPS * QUERY_BYTES)  # bytes out per byte the attacker sent
+    return {'victim': victim, 'legit': legit, 'bytes': size, 'amplification': f'{amplification:.2f}'}
 
 
 none = set()
 for name in ['www.example.com', 'mail.example.com', 'nope.example.com']:
-    rcode, ips, ttl = resolve(name, 'r1', none, 300)
+    rcode, ips, ttl = resolve(name, 'r1', none, DEFAULT_TTL)
     print(f"{name} -> {rcode} {','.join(ips)} ttl {ttl}")
-print(f"www with the primary down -> {','.join(resolve('www.example.com', 'r1', {PRIMARY}, 300)[1])}")
-print(f"everything down fails open -> {','.join(resolve('www.example.com', 'r1', set(ZONE['www.example.com'][1]), 300)[1])}")
+print(f"www with the primary down -> {','.join(resolve('www.example.com', 'r1', {PRIMARY}, DEFAULT_TTL)[1])}")
+print(f"everything down fails open -> {','.join(resolve('www.example.com', 'r1', set(ZONE['www.example.com'][1]), DEFAULT_TTL)[1])}")
 
 
 def count(down):  # how 10,000 different clients are spread over the three addresses
     c = {}
-    for i in range(10000):
-        ip = resolve('cdn.example.com', f'c{i}', down, 60)[1][0]
+    for i in range(CLIENTS):
+        ip = resolve('cdn.example.com', f'c{i}', down, CDN_TTL)[1][0]
         c[ip] = c.get(ip, 0) + 1
     return c
 
@@ -118,7 +125,7 @@ print(f'weighted, first one down: {show(split2)}')
 
 results = {}
 for ttl in [30, 60, 300, 3600]:
-    r = failover(ttl, 10, 3)
+    r = failover(ttl, CHECK_INTERVAL, FAIL_THRESHOLD)
     results[ttl] = r
     print(f"ttl {ttl}: marked down at {r['marked_at']}, users on the dead address for {r['bad']} s, {r['fetches']} queries to the name server")
 off, on = attack(False), attack(True)
@@ -128,6 +135,6 @@ for label, r in [('off', off), ('on', on)]:
 
 ok = (results[30]['marked_at'] == 120 and results[30]['bad'] == 50 and results[60]['bad'] == 80 and results[300]['bad'] == 200 and results[3600]['bad'] == 3500
       and abs(split['203.0.113.1'] - 7000) < 400 and abs(split['203.0.113.2'] - 2000) < 300 and abs(split['203.0.113.3'] - 1000) < 250 and '203.0.113.1' not in split2
-      and off['victim']['answer'] == 3000 and on['victim']['answer'] == 15 and on['victim']['slip'] + on['victim']['drop'] == 2985 and on['legit']['answer'] == 6 and on['bytes'] * 20 < off['bytes'])
+      and off['victim']['answer'] == 3000 and on['victim']['answer'] == 15 and on['victim']['slip'] + on['victim']['drop'] == 2985 and on['legit']['answer'] == 6 and on['bytes'] * MIN_REDUCTION < off['bytes'])
 if not ok:
     raise SystemExit(1)

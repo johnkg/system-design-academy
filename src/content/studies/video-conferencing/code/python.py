@@ -6,7 +6,9 @@ import sys
 LAYERS = [150, 500, 1500]  # kbit/s of the low, medium and high layer
 N = 6
 
-seed = 7
+SEED = 7
+LINK_STEP, UP_STEPS, DOWN_STEPS = 1000, 6, 9  # links are whole Mbit/s: upload 1..6, download 1..9
+seed = SEED
 
 
 def random(n):
@@ -17,8 +19,8 @@ def random(n):
 
 people = []
 for pid in range(N):
-    up = 1000 + random(6) * 1000  # kbit/s, drawn in this order
-    down = 1000 + random(9) * 1000
+    up = LINK_STEP + random(UP_STEPS) * LINK_STEP # kbit/s, drawn in this order
+    down = LINK_STEP + random(DOWN_STEPS) * LINK_STEP
     people.append({'id': pid, 'up': up, 'down': down})
 
 

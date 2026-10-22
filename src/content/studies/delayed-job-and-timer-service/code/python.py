@@ -44,7 +44,10 @@ class TimingWheel:
         return sorted((t for t in due if t['id'] not in self.cancelled), key=lambda t: t['id'])
 
 
-seed = 2024
+SEED, HORIZON = 2024, 200000  # ticks simulated
+FIRST_BATCH, LATE_BATCH, LATE_AT, LATE_HORIZON = 3000, 200, 1000, 150000
+CANCEL_EVERY, CANCEL_ID_END = 10, 3  # ids ending in 3 are cancelled: 10%
+seed = SEED
 
 
 def random_below(n):
@@ -64,20 +67,20 @@ def schedule(timer_id, due):
     placed[wheel.add(t)] += 1
 
 
-for i in range(3000):
-    schedule(i, 1 + random_below(200000))
+for i in range(FIRST_BATCH):
+    schedule(i, 1 + random_below(HORIZON))
 for t in timers:
-    if t['id'] % 10 == 3:
+    if t['id'] % CANCEL_EVERY == CANCEL_ID_END:
         wheel.cancel(t['id'])  # 10% are cancelled before they are due
 
 fired = []
 on_time = True
-while wheel.now < 200000:
-    if wheel.now == 1000:  # new timers keep arriving while the wheel turns
-        for i in range(3000, 3200):
-            schedule(i, wheel.now + 1 + random_below(150000))
+while wheel.now < HORIZON:
+    if wheel.now == LATE_AT:  # new timers keep arriving while the wheel turns
+        for i in range(FIRST_BATCH, FIRST_BATCH + LATE_BATCH):
+            schedule(i, wheel.now + 1 + random_below(LATE_HORIZON))
         for t in timers:
-            if t['id'] >= 3000 and t['id'] % 10 == 3:
+            if t['id'] >= FIRST_BATCH and t['id'] % CANCEL_EVERY == CANCEL_ID_END:
                 wheel.cancel(t['id'])
     for t in wheel.tick():
         fired.append(t)
