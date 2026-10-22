@@ -8,7 +8,7 @@
   "howItWorks": [
     { "title": "Store each column contiguously, in row groups", "text": "A columnar file such as Parquet or ORC splits rows into row groups (commonly 128 MB to 1 GB of data, or roughly 100,000 to a few million rows) and, inside a group, writes one column chunk per column. A query that needs 3 of 40 columns reads only those chunks. Values of one type sit next to each other, so they compress far better than mixed rows." },
     { "title": "Encode and compress each chunk by its data", "text": "Low-cardinality columns use dictionary encoding (each distinct string stored once, rows hold small integer codes), repeated runs use run-length encoding, and integers use bit-packing or delta encoding, then a general codec like Snappy or Zstd is applied on top. Typical analytical tables shrink 3x to 10x against CSV, but a column of random strings or already-compressed blobs barely shrinks." },
-    { "title": "Keep statistics in the footer", "text": "The file ends with a footer holding the schema and, for every column chunk, its offset, row count and min/max (plus null count, and optionally a Bloom filter). A reader fetches the footer first, with one ranged read of the file tail, then decides which chunks to fetch. A row group whose amount max is 640 cannot contain amount >= 900, so none of its bytes are read. This only works when values are clustered: if every group spans 0 to 999, nothing can be skipped." },
+    { "title": "Keep statistics in the footer", "text": "The file ends with a footer holding the schema and, for every column chunk, its offset, row count and min/max (plus null count, and optionally a Bloom filter, a small structure that can rule out a value). A reader fetches the footer first, with one ranged read of the file tail, then decides which chunks to fetch. A row group whose amount max is 640 cannot contain amount >= 900, so none of its bytes are read. This only works when values are clustered: if every group spans 0 to 999, nothing can be skipped." },
     { "title": "Partition the directory layout by a low-cardinality key", "text": "Files are written under paths such as events/day=2026-10-04/part-0007.parquet. A filter on day lets the planner drop whole directories using only the path, without opening a file. Hive-style partitions are the convention, and table formats such as Iceberg and Delta track partitions in metadata instead of by listing directories." },
     { "title": "Pick partition keys, sort order and file size together", "text": "Partition on what queries nearly always filter by (usually event date) and keep it to hundreds or thousands of partitions, not millions. Inside a partition, sort or cluster by the next most selective column so min/max statistics prune, and compact files toward 128 MB to 1 GB each: thousands of tiny files cost more in listing, opening and footer reads than in bytes." }
   ],
@@ -39,7 +39,7 @@
     "The small-files problem: streaming or over-parallel writers emit thousands of files of a few MB each, so listing, opening and reading footers dominates query time; compact them",
     "Over-partitioning (by user_id or by hour on a tiny table) creates millions of partitions, slow listings and a bloated catalog",
     "Data skew: one hot partition (a null key, a default country, one huge customer) holds most of the data and makes a single task the straggler",
-    "Statistics that cannot prune because the data is not clustered: filtering on a column whose every row group spans the full range still reads everything unless you sort or Z-order on write",
+    "Statistics that cannot prune because the data is not clustered: filtering on a column whose every row group spans the full range still reads everything unless you sort or Z-order (sort on several columns at once) on write",
     "Filtering by a function of the partition column (for example WHERE date_trunc('week', ts) = ...) or comparing it with a mismatched type can defeat pruning; filter on the partition column itself",
     "Changing the partition scheme or schema later requires rewriting the data, so check schema-evolution rules before adding or renaming columns"
   ],
@@ -76,7 +76,7 @@
       "options": [
         "Partition by user_id, because it is the more selective filter and so skips more of the data.",
         "Partition by user_id and then by hour, so each directory is small and every query is fast.",
-        "Partition by day and sort or cluster the files by user_id inside each day, so statistics prune the user lookups.",
+        "Partition by day and sort the files by user_id inside each day, so statistics can prune.",
         "Partition by hour only, because more partitions always mean more data skipped by queries."
       ],
       "answer": 2,
@@ -86,12 +86,12 @@
       "question": "A table is partitioned by day, and a query asks for the last 7 days where amount >= 900. It reads every row group in those 7 days despite the min/max statistics in each footer. What is the likely cause and fix?",
       "options": [
         "Each row group spans about 0 to 999, so nothing can be skipped. Cluster by amount on write.",
-        "The footer statistics are ignored for numeric columns, so add a Bloom filter on amount to enable skipping.",
+        "The footer statistics are ignored for numeric columns, so add a Bloom filter on amount.",
         "The partitions are too large, so add a partition by amount range to prune the row groups.",
         "The row groups are too big, so make them 10 times larger to give the statistics more data."
       ],
       "answer": 0,
-      "explanation": "Min/max pruning only works when values are clustered, and here every group spans the full range. Ordering the data on write makes the ranges narrow so groups can be skipped."
+      "explanation": "Min/max pruning only works when values are clustered, and here every group spans the full range. Ordering the data on write makes the ranges narrow so groups can be skipped. Min/max statistics do work for numbers, and bigger row groups would span even more values."
     }
   ]
 }

@@ -7,11 +7,11 @@
   "problem": "Aggregating or joining by key needs every record for a key in one place, but the data is spread over hundreds of machines. Moving it naively floods the network, and a few popular keys can leave one machine doing most of the work while the rest sit idle.",
   "howItWorks": [
     { "title": "Map: run user code next to the data", "text": "The input is cut into splits (often one per 128 MB to 256 MB storage block). A mapper task reads one split, applies your function and emits (key, value) records. Map tasks are independent, so thousands can run in parallel and a failed one is simply re-run." },
-    { "title": "Combine and spill: shrink data before it leaves", "text": "Mapper output is buffered in memory, partitioned by hash(key) mod number-of-reducers, sorted and spilled to local disk (not to a replicated filesystem). An optional combiner pre-aggregates inside the mapper, which is valid only when the operation is associative and commutative, like sum, count or max, and can shrink shuffle volume by 10x to 1000x on repetitive keys." },
+    { "title": "Combine and spill: shrink data before it leaves", "text": "Mapper output is buffered in memory, partitioned by hash(key) mod number-of-reducers, sorted and spilled to local disk (not to a replicated filesystem). An optional combiner pre-aggregates inside the mapper, which is valid only when the operation is associative and commutative (order and grouping do not change the result), like sum, count or max, and can shrink shuffle volume by 10x to 1000x on repetitive keys." },
     { "title": "Shuffle: an all-to-all network copy", "text": "Each reducer pulls its partition from every mapper, so M mappers and R reducers mean up to M x R transfers. This is usually the slowest and most failure-prone stage: it needs disk and network on every node, and lost map output means re-running those mappers." },
     { "title": "Merge: sort so equal keys are adjacent", "text": "A reducer merge-sorts the sorted runs it fetched, so all values for one key are contiguous and it can stream through them with little memory. Spark and Hive can instead use hash aggregation, but every approach needs all records of a key on one task." },
     { "title": "Reduce: one call per key, then write", "text": "The reduce function sees (key, all values) and emits results to the output files, one per reducer. The job finishes only when the slowest reducer does, so the work per reducer matters more than the average." },
-    { "title": "Handle skew and pick the partition count", "text": "Hash partitioning balances keys, not records. A hot key goes to one reducer whatever the reducer count. Fixes include combiners, salting the hot key and merging in a second stage, a broadcast join for a small table, or letting the engine split skewed partitions at run time (Spark adaptive query execution). A common target is 100 MB to 1 GB per partition: thousands of tiny partitions drown in scheduling overhead, a few huge ones spill and cannot parallelise." }
+    { "title": "Handle skew and pick the partition count", "text": "Hash partitioning balances keys, not records. A hot key goes to one reducer whatever the reducer count. Fixes include combiners, salting the hot key (adding a suffix so it splits across reducers) and merging in a second stage, a broadcast join (sending a small table to every node), or letting the engine split skewed partitions at run time (Spark adaptive query execution). A common target is 100 MB to 1 GB per partition: thousands of tiny partitions drown in scheduling overhead, a few huge ones spill and cannot parallelise." }
   ],
   "pros": [
     "Simple model: you write two functions, the framework handles distribution, retries and sorting",
@@ -21,7 +21,7 @@
   ],
   "cons": [
     "The shuffle is expensive: it writes to disk, crosses the network and sorts, so it often dominates job time",
-    "Hot keys make one reducer a straggler, and adding reducers does not fix it",
+    "Hot keys make one reducer a straggler (a slow task the whole job waits for), and adding reducers does not fix it",
     "Latency is minutes to hours: it is a batch model, not for interactive or per-event answers",
     "Chains of jobs write intermediate data to disk between stages, which is slow for iterative algorithms"
   ],
@@ -41,7 +41,7 @@
     "Leaving the default shuffle partition count (200 in Spark SQL) regardless of data size, producing tiny or enormous tasks",
     "Joining two large datasets on a key with many nulls: all null keys hash to the same reducer",
     "Reading the average task time instead of the maximum: one straggler hides behind a healthy mean",
-    "Assuming reducers are idempotent when they write to an external system, so a retried task double-counts"
+    "Assuming reducers are idempotent (safe to run twice) when they write to an external system, so a retried task double-counts"
   ],
   "related": [
     { "kind": "concept", "slug": "batch-vs-stream-processing" },
@@ -61,8 +61,8 @@
     {
       "question": "A job sums clicks per user from 1 TB of logs. Each mapper sees the same users thousands of times, and the shuffle moves about 400 GB, which dominates the runtime. What is the cheapest change that cuts the shuffle without changing the result?",
       "options": [
-        "Add a combiner that sums clicks per user inside each mapper",
-        "Double the number of reducers",
+        "Add a combiner that sums clicks inside each mapper",
+        "Double the number of reducers to spread the load",
         "Sort the input by user before the map step",
         "Run each reducer on the same machine as its mappers"
       ],
@@ -73,7 +73,7 @@
       "question": "An inner join between a 3 TB events table and a 2 TB users table on user_id runs with 200 reducers. 40% of events have a null user_id. One reducer runs for 40 minutes while the rest finish in one. Adding 800 reducers changes nothing. What is the best fix?",
       "options": [
         "Broadcast the users table to every node so no shuffle is needed",
-        "Filter out null keys first, as they can never match in an inner join",
+        "Filter out the null keys first, since they cannot match",
         "Switch to a range partitioner on user_id so keys spread evenly",
         "Add a combiner to the join so each mapper sends fewer null rows"
       ],
@@ -89,7 +89,7 @@
         "Emit partial sum and count pairs, then divide in the reducer"
       ],
       "answer": 3,
-      "explanation": "An average of averages is wrong when groups have different sizes, because the operation is not associative. Partial sums and counts can be combined safely, and the division happens once at the end."
+      "explanation": "An average of averages is wrong when groups have different sizes, because the operation is not associative. Partial sums and counts can be combined safely, and the division happens once at the end. Using one mapper loses parallelism, idempotent reducers address retries and not averages, and sorting does not change the maths."
     }
   ]
 }

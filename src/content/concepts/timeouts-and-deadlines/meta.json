@@ -7,7 +7,7 @@
   "problem": "A call with no timeout can wait forever: the thread, connection and memory behind it are never released, and a single slow dependency drains the pool until the whole service stops, even for requests that never touch it. Adding timeouts is not enough on its own. If each hop picks its own number, the inner timeout is often longer than the outer one, so the work continues after the caller gave up. Retries then multiply the waiting. Each hop needs to know how much of the user's patience is left.",
   "howItWorks": [
     { "title": "Every blocking call gets a timeout, split by phase", "text": "A connect timeout bounds the TCP and TLS handshake (typically 100 ms to 1 s: it either works fast or the host is gone). A read timeout bounds the wait for bytes on an established connection, and is only a per-read limit, so a server that trickles one byte every few seconds never trips it. A total (request) timeout bounds the whole call including redirects and body streaming. Many clients default to infinite for read or total: check, because the default is the bug." },
-    { "title": "Choose the value from a percentile and from your own budget", "text": "Measure the dependency's latency distribution and set the timeout just above a high percentile, such as p99 or p99.9 of its healthy latency, not the average: the average says nothing about the tail you are cutting. Then cap it by what the caller can afford. If the user waits 2 s and you have three sequential calls, no single call can take 2 s. A timeout at p99 means about 1% of healthy calls are cut off, which is the price of freeing resources fast, and it is why a retry usually follows." },
+    { "title": "Choose the value from a percentile and from your own budget", "text": "Measure the dependency's latency distribution and set the timeout slightly above a high percentile, such as p99 or p99.9 of its healthy latency (p99 is the time that 99% of calls beat), not the average: the average says nothing about the tail you are cutting. Then cap it by what the caller can afford. If the user waits 2 s and you have three sequential calls, no single call can take 2 s. A timeout at p99 means about 1% of healthy calls are cut off, which is the price of freeing resources fast, and it is why a retry usually follows." },
     { "title": "Nest timeouts so the inside gives up first", "text": "The outer timeout must exceed the inner work it contains: the caller's timeout is at least the callee's timeout times its attempts, plus local work. With A to B at 1.8 s, B to C at 1.2 s and C to the database at 0.4 s per attempt, the innermost fires first and each layer can still return an answer. Invert them and the caller leaves while the callee carries on, which is wasted work and held resources." },
     { "title": "Propagate a deadline, not a duration", "text": "A fixed per-hop number cannot know how much time earlier hops already spent. Instead the edge computes an absolute deadline (arrival time plus patience) or a remaining budget, and passes it on: gRPC sends the remaining time in the grpc-timeout header and each server sets its own deadline from it, Go carries a deadline in context.Context, and HTTP services use a header such as X-Request-Deadline. Prefer remaining time on the wire (clocks between machines disagree) and convert to a local monotonic deadline on arrival. Every hop then uses min(its own limit, remaining) and can fail fast, or skip optional work, when little is left." },
     { "title": "Cancel downstream work when the caller leaves", "text": "A timeout only frees the caller. The callee keeps running unless it is told: gRPC cancels the server call and its context, Go's context cancellation propagates through database/sql, and HTTP/2 sends RST_STREAM. The callee must check for cancellation or the deadline between steps, and the database must be able to abort a query (statement timeout, pg_cancel_backend) or the work continues to completion." },
@@ -22,7 +22,7 @@
   ],
   "cons": [
     "A timeout below the true latency tail turns slow successes into failures and adds load through retries",
-    "A timed-out call is ambiguous: the callee may still have performed the write, so retries need idempotency",
+    "A timed-out call is ambiguous: the callee may still have performed the write, so retries need idempotency (the call must be safe to repeat)",
     "Deadline propagation needs every service and client library on the path to cooperate; one hop that drops the header breaks the chain",
     "Cancellation is cooperative: code and databases that ignore it keep working",
     "Values drift as the dependency changes, so they need review against current percentiles"
@@ -77,7 +77,7 @@
         "The load balancer quietly reroutes hung requests to another instance"
       ],
       "answer": 1,
-      "explanation": "Each hung call keeps its thread forever, so the pool drains and even requests that never touch payments cannot get a thread. Hung TCP connections can stay open for a long time with no application timeout."
+      "explanation": "Each hung call keeps its thread forever, so the pool drains and even requests that never touch payments cannot get a thread. Hung TCP connections can stay open for a long time with no application timeout, and a load balancer does not reroute a request that is already sent."
     },
     {
       "question": "A request goes through A, B and C to a database, and the user gives up after 2 seconds. Each hop has a 5 second timeout. What is the best fix?",
@@ -85,7 +85,7 @@
         "Set a 2 second timeout on every hop",
         "Set 10 seconds on every hop to avoid false failures",
         "Add a retry on every hop so that slow calls are tried again",
-        "Pass the remaining budget down, each hop using the smaller value"
+        "Pass the remaining budget down and use the smaller value"
       ],
       "answer": 3,
       "explanation": "A fixed 2 seconds everywhere still lets the inner hops start late and finish after the caller has left. Passing the remaining budget lets every hop fail fast and cancel work when nobody is waiting. Longer timeouts and more retries make the orphaned work worse."
@@ -94,12 +94,12 @@
       "question": "A dependency has p50 of 20 ms, an average of 35 ms, p99 of 300 ms and p99.9 of 900 ms. The caller has 1 second left and wants one retry of this idempotent call with about 50 ms backoff. Which per-attempt timeout fits best?",
       "options": [
         "400 ms per attempt",
-        "50 ms per attempt, just above the average",
-        "900 ms per attempt, just above p99.9",
+        "50 ms per attempt, a little above the average",
+        "900 ms per attempt, a little above p99.9",
         "1 second per attempt, the whole budget"
       ],
       "answer": 0,
-      "explanation": "400 ms sits just above p99, so about 1% of healthy calls are cut, and two attempts plus backoff finish at 850 ms inside the budget. 50 ms cuts off many healthy calls, and 900 ms or 1 second leave no time for the retry."
+      "explanation": "400 ms sits slightly above p99, so about 1% of healthy calls are cut, and two attempts plus backoff finish at 850 ms inside the budget. 50 ms cuts off many healthy calls, and 900 ms or 1 second leave no time for the retry."
     }
   ]
 }

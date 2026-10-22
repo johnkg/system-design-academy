@@ -3,12 +3,12 @@
   "area": "dataengineering",
   "difficulty": "advanced",
   "intent": "Let a stream processor remember things across events (counts, windows, join sides) and survive crashes by snapshotting state and input position together.",
-  "scenario": "A job keeps a running count of orders per customer across 3 parallel operator instances. At input offset 300 a checkpoint completes; at offset 330 one worker crashes. The job must come back with every customer's count exactly right, and the downstream system must not see 30 orders announced twice.",
+  "scenario": "A job keeps a running count of orders per customer across 3 parallel operator instances. At input offset 300 (the position in the input log) a checkpoint (a saved copy of all state and the input position) completes; at offset 330 one worker crashes. The job must come back with every customer's count exactly right, and the downstream system must not see 30 orders announced twice.",
   "problem": "A counter, a window or a join buffer lives in the memory of one operator instance. When that process dies, the memory is gone, and the broker only knows how far the consumer had read, not what the state looked like at that point. Restart from the latest offset and you lose counts; restart from an older offset with the old state and you count events twice; restart from zero and recovery takes as long as the whole history. The state, the input position and the output sent to the outside world have to be recovered as one consistent unit, without stopping the stream to take a picture of it.",
   "howItWorks": [
     {
       "title": "Keyed state, one owner per key",
-      "text": "The stream is partitioned by a key (customer id). Each key is hashed to a key group (Flink defaults to a max parallelism of 128 groups; Kafka Streams uses the input partition), and each group is owned by exactly one operator instance. That instance keeps the state for its keys in a local store: a heap hash map for small state, or an embedded LSM store such as RocksDB for state larger than memory. Because no two instances ever touch the same key, updates need no locks or network round trips, and per-key order is preserved."
+      "text": "The stream is partitioned by a key (customer id). Each key is hashed to a key group (Flink uses at least 128 groups by default; Kafka Streams uses the input partition), and each group is owned by exactly one operator instance. That instance keeps the state for its keys in a local store: a heap hash map for small state, or an embedded LSM store such as RocksDB for state larger than memory. Because no two instances ever touch the same key, updates need no locks or network round trips, and per-key order is preserved."
     },
     {
       "title": "Barriers cut a consistent snapshot while data keeps flowing",
@@ -24,11 +24,11 @@
     },
     {
       "title": "Output to the outside is a separate problem",
-      "text": "Replay re-emits the outputs of the replayed events. A plain sink therefore sees them twice (at-least-once). Two fixes: make writes idempotent (a keyed upsert of count=44 for customer ada can be applied any number of times), or use a two-phase-commit sink that writes into an open transaction and commits it only when the checkpoint completes (Flink's TwoPhaseCommitSinkFunction and the Kafka transactional producer). A crash aborts the open transaction, so the replay writes those records once. The price is output latency: results become visible only at checkpoint boundaries."
+      "text": "Replay re-emits the outputs of the replayed events. A plain sink therefore sees them twice (at-least-once: nothing is lost, but repeats are possible). Two fixes: make writes idempotent (a keyed upsert, which inserts or overwrites, of count=44 for customer ada can be applied any number of times), or use a two-phase-commit sink that writes into an open transaction and commits it only when the checkpoint completes (Flink's TwoPhaseCommitSinkFunction and the Kafka transactional producer). A crash aborts the open transaction, so the replay writes those records once. The price is output latency: results become visible only at checkpoint boundaries."
     },
     {
       "title": "Rescale and clean up",
-      "text": "Because state is split into key groups, changing parallelism means reassigning whole groups to instances and loading the matching slices of a checkpoint or savepoint, not rehashing every key. State that only grows (one entry per customer ever seen, per session, per join side) needs a TTL or timers that clear it, or the checkpoint size and recovery time grow forever."
+      "text": "Because state is split into key groups, changing parallelism means reassigning whole groups to instances and loading the matching slices of a checkpoint or savepoint, not rehashing every key. State that only grows (one entry per customer ever seen, per session, per join side) needs a TTL (time to live) or timers that clear it, or the checkpoint size and recovery time grow forever."
     }
   ],
   "pros": [
@@ -54,7 +54,7 @@
     "Pipelines that must be correct after failures without a manual reconciliation step"
   ],
   "whenNotToUse": [
-    "Stateless transforms (filter, map, enrich from a small broadcast table), which need no checkpointing at all and just restart from the committed offset",
+    "Stateless transforms (filter, map, enrich from a small broadcast table), which need no checkpointing at all and restart from the committed offset",
     "Daily or hourly freshness is enough: a batch job with a re-runnable input is simpler to operate and reason about",
     "The state is a few counters that one database upsert per event can hold, and the event rate is modest",
     "A sink that cannot be made idempotent or transactional while duplicates are unacceptable: the guarantee stops at the job boundary no matter how good the engine is"
@@ -100,7 +100,7 @@
         "Resume at offset 5070 with empty counts and let them rebuild"
       ],
       "answer": 2,
-      "explanation": "State and offsets were saved as one unit, so restoring both and replaying 5000 to 5070 counts each event once. Keeping old state with the newer offset loses 70 events, and restarting from zero is correct but recovery takes as long as the whole history."
+      "explanation": "State and offsets were saved as one unit, so restoring both and replaying 5000 to 5070 counts each event once. Keeping old state with the newer offset loses 70 events, and restarting from zero is correct but recovery takes as long as the whole history. Resuming at 5070 with empty counts loses every count from before the crash."
     },
     {
       "question": "A job with exactly-once checkpoints calls an HTTP billing API from inside an operator for each order. After a crash and recovery, some customers are billed twice. What is the best fix?",
@@ -111,7 +111,7 @@
         "Switch to unaligned checkpoints so that nothing is ever replayed"
       ],
       "answer": 0,
-      "explanation": "Exactly-once covers the job's state, not calls to the outside. Replay repeats the calls made since the last checkpoint, so the receiver must deduplicate or the sink must be transactional. A shorter interval only reduces how many duplicates appear."
+      "explanation": "Exactly-once covers the job's state, not calls to the outside. Replay repeats the calls made since the last checkpoint, so the receiver must deduplicate or the sink must be transactional. A shorter interval only reduces how many duplicates appear, and more parallelism or unaligned checkpoints change speed, not whether replay happens."
     },
     {
       "question": "A job keeps one state entry per session id and never removes it. There are about 2 million active sessions at any time, but the checkpoint has grown from 2 GB to 400 GB over six months, and a restore now takes 40 minutes. What is the best fix?",
@@ -122,7 +122,7 @@
         "Expire finished sessions with a TTL or timers"
       ],
       "answer": 3,
-      "explanation": "State that only grows makes checkpoints and restores grow forever, and only about 2 million entries are actually needed. RocksDB or more instances just hold a larger pile, and a shorter interval does not shrink what must be downloaded on restore."
+      "explanation": "State that only grows makes checkpoints and restores grow forever, and only about 2 million entries are actually needed. RocksDB or more instances only hold a larger pile, and a shorter interval does not shrink what must be downloaded on restore."
     }
   ]
 }

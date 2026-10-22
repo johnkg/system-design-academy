@@ -6,9 +6,9 @@
   "scenario": "A post's like counter and tag set are replicated in three regions. A network partition separates them; each region keeps taking likes, unlikes, tag adds and tag removes. When the partition heals the replicas merge in whatever order messages arrive, with duplicates, and must all end up identical without losing anyone's update.",
   "problem": "Replicas that accept writes independently will diverge, and the usual fixes cost availability or data: a single leader or a quorum refuses writes during a partition, while 'last write wins' silently discards concurrent writes and trusts clocks that skew. Plain sets have no good merge at all: if one replica removed an element while another added it, which wins? Without a principled merge rule, offline-first apps, multi-region counters and collaborative editors lose data or need a coordinator.",
   "howItWorks": [
-    { "title": "Design the state as a join-semilattice", "text": "A state-based CRDT (CvRDT) has states that form a partial order and a merge that returns the least upper bound of two states. That merge must be commutative, associative and idempotent: merge(a,b) = merge(b,a), merge(a,merge(b,c)) = merge(merge(a,b),c), merge(a,a) = a. Updates must also move the state upward in the order. Those four properties are the whole proof that replicas converge, whatever the delivery order, and with duplicates." },
+    { "title": "Design the state as a join-semilattice", "text": "A state-based CRDT (CvRDT) has states that form a partial order and a merge that returns the least upper bound of two states. That merge must be commutative (the order of two states does not matter), associative (grouping does not matter) and idempotent (merging the same state again changes nothing): merge(a,b) = merge(b,a), merge(a,merge(b,c)) = merge(merge(a,b),c), merge(a,a) = a. Updates must also move the state upward in the order. Those four properties are the whole proof that replicas converge, whatever the delivery order, and with duplicates." },
     { "title": "Counters: one slot per replica", "text": "A G-Counter is a vector with one integer per replica. A replica only increments its own slot; merge is the element-wise max; the value is the sum. A PN-Counter is two G-Counters, P for increments and N for decrements, value = sum(P) - sum(N). The state is O(replicas) however many updates happen, and a replica never overwrites another's slot, so no increment can be lost." },
-    { "title": "Sets: unique tags make remove safe", "text": "A G-Set only grows (merge = union). A 2P-Set adds a tombstone set, but a removed element can never be re-added. An OR-Set (observed-remove) tags every add with a unique id, such as (replica id, counter). Remove deletes only the tags it has observed, by recording them as tombstones. A concurrent add carries a tag the remover never saw, so it survives: add wins, and add-after-remove works. Merge is the union of the add set and the union of the tombstones." },
+    { "title": "Sets: unique tags make remove safe", "text": "A G-Set only grows (merge = union). A 2P-Set adds a tombstone set, but a removed element can never be re-added. An OR-Set (observed-remove) tags every add with a unique id, such as (replica id, counter). Remove deletes only the tags it has observed, by recording them as tombstones (markers that say removed). A concurrent add carries a tag the remover never saw, so it survives: add wins, and add-after-remove works. Merge is the union of the add set and the union of the tombstones." },
     { "title": "Registers: say what happens to concurrent writes", "text": "A last-writer-wins register keeps (value, timestamp) and merges by the larger timestamp, with the replica id as a tie-break. It converges, but it discards one of two concurrent writes and its winner depends on wall clocks, so a replica with a clock 5 seconds fast can overwrite newer data. A multi-value register (Riak siblings, Dynamo's shopping cart) keeps all concurrent values, tagged with version vectors, and hands the conflict to the application." },
     { "title": "Operation-based variant and delivery", "text": "An operation-based CRDT (CmRDT) ships operations instead of state. It is cheaper on the wire, but it needs reliable broadcast with causal delivery (each operation delivered exactly once, after everything it depends on), or concurrent operations must commute. State-based CRDTs only need an eventually-connected gossip, which is why anti-entropy with Merkle trees and delta-state CRDTs, which ship only the recent changes, are the practical middle ground." },
     { "title": "Sequences, metadata and garbage", "text": "Collaborative text uses sequence CRDTs (RGA, Logoot, Yjs, Automerge) that give every character a unique, ordered identifier so concurrent inserts interleave deterministically. The price is metadata: tombstones and identifiers can outweigh the visible text, and they can only be discarded once every replica is known to have seen the delete (causal stability), which needs membership knowledge and some coordination." }
@@ -66,8 +66,8 @@
       "question": "A post's like counter is replicated in three regions. During a partition, region A takes 5 likes, region B takes 3 and region C takes 4, all starting from zero. Messages arrive in any order and sometimes twice. Which design guarantees every replica ends at 12?",
       "options": [
         "A single integer on each replica, and merge takes the highest value seen from any replica.",
-        "A single integer on each replica, and every received value is added to the local one on arrival, so totals stay up to date.",
-        "One slot per region, each region bumps only its own slot, merge takes max per slot, value is the sum.",
+        "A single integer on each replica, and every received value is added to the local one on arrival.",
+        "One slot per region, each bumps only its own slot, merge takes max per slot, value is the sum.",
         "One integer per replica, and merge keeps the value with the latest timestamp."
       ],
       "answer": 2,
@@ -77,7 +77,7 @@
       "question": "A post's tag set uses an observed-remove set replicated in two regions. Region A removes the tag 'spicy' it had seen. At the same time region B adds 'spicy' again. After the partition heals and they merge, what is the result?",
       "options": [
         "The tag is absent, because a remove always beats a concurrent add in every merge order.",
-        "The tag is absent, because the replica with the later timestamp wins, so clocks decide the outcome.",
+        "The tag is absent, because the later timestamp wins, so clocks decide the outcome.",
         "Either result is possible, depending on which region's message reaches the merging node first.",
         "The tag is present, because the remove covers only adds that A saw."
       ],
@@ -88,9 +88,9 @@
       "question": "A wallet balance is a PN-Counter replicated in three regions, starting at 100. During a partition each region approves a withdrawal of 80 after checking its local balance. What does the balance show after the merge, and why?",
       "options": [
         "-140, because each replica checked only its own view, so a floor needs coordination.",
-        "-140, because the merge double counts duplicate deliveries, so switching to a G-Counter would fix it.",
+        "-140, because merge double counts duplicate deliveries, so a G-Counter would fix it.",
         "20, because the counter keeps only the latest withdrawal and discards the others.",
-        "-140, but adding vector clocks to the counter would reject the extra withdrawals once replicas compare versions on merge."
+        "-140, but adding vector clocks would reject the extra withdrawals on merge."
       ],
       "answer": 0,
       "explanation": "The counter merges correctly: all three decrements are real, and 100 minus 240 is -140. CRDTs cannot enforce a global invariant such as balance at least zero, which needs a quorum, consensus or a budget reserved per region. Vector clocks only order events, they do not block them."

@@ -4,14 +4,14 @@
   "difficulty": "intermediate",
   "intent": "Run a graph of data tasks in the right order, on a schedule, with retries, state tracking and safe re-runs.",
   "scenario": "A nightly pipeline for each date runs extract, clean, aggregate and publish. On March 3 the aggregate task dies halfway through writing its output, after 5 of 10 rows. Downstream tasks must not run on half a table, the failure must be visible, and re-running must not double-count.",
-  "problem": "Data jobs depend on each other: clean needs extract, publish needs aggregate. A cron job per step has no idea whether its input exists, cannot retry only the part that broke, cannot backfill last month, and leaves no record of what ran. When one step fails silently, the next one runs on missing or partial data and the damage is found by a dashboard consumer days later.",
+  "problem": "Data jobs depend on each other: clean needs extract, publish needs aggregate. A cron job per step has no idea whether its input exists, cannot retry only the part that broke, cannot backfill (re-process past dates) last month, and leaves no record of what ran. When one step fails silently, the next one runs on missing or partial data and the damage is found by a dashboard consumer days later.",
   "howItWorks": [
-    { "title": "Describe the pipeline as a DAG", "text": "Tasks are nodes and dependencies are edges, with no cycles. The definition is code (Airflow, Dagster, Prefect, dbt's graph), so it is reviewed and versioned. The graph says what may run in parallel and what must wait, and nothing about when." },
+    { "title": "Describe the pipeline as a DAG", "text": "A DAG (directed acyclic graph) is a set of tasks with one-way dependencies and no loops: tasks are nodes and dependencies are edges. The definition is code (Airflow, Dagster, Prefect, dbt's graph), so it is reviewed and versioned. The graph says what may run in parallel and what must wait, and nothing about when." },
     { "title": "A scheduler creates runs per data interval", "text": "For a daily schedule the scheduler creates one run per logical date, with one task instance per task. The run for March 3 covers the data of March 3 and typically starts shortly after that day ends. The date is passed to the task, so the same code can be run for any day, which is what makes backfills possible." },
     { "title": "Dispatch ready tasks to workers", "text": "A task is ready when all upstream instances succeeded. The scheduler places it on a queue limited by pools or slots (a typical Airflow default is 32 parallel tasks per installation), and a worker executes it. Every state change (queued, running, success, failed, upstream_failed) is written to a metadata database, which is the single source of truth." },
     { "title": "Retry, then fail visibly", "text": "A failed attempt is retried after a delay, usually with exponential backoff (for example 2 minutes, then 4), up to a configured count, often 2 to 3. Retries absorb transient causes such as a throttled API or a lost connection. When retries are exhausted the instance is failed, its downstream instances are marked upstream_failed without running, and an alert fires." },
-    { "title": "Make tasks idempotent so re-runs are safe", "text": "A task that overwrites its own partition for its date (delete and insert in one transaction, or write a new file and swap it in) gives the same table after one run or five. An append-only task leaves the half-written rows of the dead attempt in place and adds a full set on top. Idempotence is what turns retry, clear-and-rerun and backfill into routine operations." },
-    { "title": "Recover and backfill by clearing state", "text": "The operator fixes the cause, then clears the failed task and its downstream instances, and the scheduler runs just those. A backfill creates runs for a past date range, bounded by a catchup or concurrency limit so that 90 old days do not swamp the cluster. Sensors, SLAs and data-quality checks sit on top of the same graph." }
+    { "title": "Make tasks idempotent so re-runs are safe", "text": "Idempotent means running twice gives the same result as running once. A task that overwrites its own partition for its date (delete and insert in one transaction, or write a new file and swap it in) gives the same table after one run or five. An append-only task leaves the half-written rows of the dead attempt in place and adds a full set on top. Idempotence is what turns retry, clear-and-rerun and backfill into routine operations." },
+    { "title": "Recover and backfill by clearing state", "text": "The operator fixes the cause, then clears the failed task and its downstream instances, and the scheduler runs only those. A backfill creates runs for a past date range, bounded by a catchup or concurrency limit so that 90 old days do not swamp the cluster. Sensors (tasks that wait for data to arrive), SLAs (deadlines for finishing) and data-quality checks sit on top of the same graph." }
   ],
   "pros": [
     "Dependencies are explicit, so a task never runs on input that does not exist yet",
@@ -42,7 +42,7 @@
   "pitfalls": [
     "Non-idempotent tasks: an append-only load plus a retry or backfill silently duplicates rows, and sums are inflated with no error",
     "Using the wall clock instead of the logical date, so a re-run for March 3 processes today's data",
-    "Retrying a deterministic failure (bad schema, missing file) three times with backoff just delays the alert; retry transient errors and fail fast on the rest",
+    "Retrying a deterministic failure (bad schema, missing file) three times with backoff only delays the alert; retry transient errors and fail fast on the rest",
     "Unbounded catchup or backfill that starts hundreds of runs at once and overwhelms the source database or the warehouse",
     "Tasks that depend on data from another DAG without a sensor or dataset dependency, so they run before the upstream data lands",
     "Passing large data through task-to-task messaging (XCom in Airflow) instead of storing it and passing a path",
@@ -75,7 +75,7 @@
         "15, because the 5 rows of the dead attempt stay and 10 more are added"
       ],
       "answer": 3,
-      "explanation": "An orchestrator reruns the task but does not undo its side effects. Append-only tasks duplicate data on retry, so tasks should overwrite their own date partition, for example by delete and insert in one transaction."
+      "explanation": "An orchestrator reruns the task but does not undo its side effects. The orchestrator does not know which rows the dead attempt wrote, so it cannot write only the missing ones. Append-only tasks duplicate data on retry, so tasks should overwrite their own date partition, for example by delete and insert in one transaction."
     },
     {
       "question": "A daily DAG task picks its data with WHERE day = date.today(). On March 10 an operator clears the failed March 3 run to re-run it. What data does the task process?",

@@ -3,13 +3,13 @@
   "area": "distributed",
   "difficulty": "advanced",
   "intent": "Let replicas find which key ranges differ by comparing hashes top-down, so repair costs a few hashes and the differing ranges instead of a scan of everything.",
-  "scenario": "Two replicas of a 1,000,000 key store missed a handful of writes while one node was down, and the hinted handoff for them was lost. Five keys differ. Each replica has a Merkle tree over 1,024 key ranges (about 977 keys each). The repair job compares roots, descends only into differing subtrees, finds 5 ranges with 79 hash comparisons, and copies those ranges instead of streaming 100 MB.",
-  "problem": "Replicas drift: a node is down during writes, a hint is dropped, a disk loses a block, a write times out on one replica. Read repair only fixes keys that are read, and hinted handoff is best effort and expires. Eventually you must compare two copies of a huge dataset and fix the differences, but reading and shipping every key (or even a hash per key) costs about as much as the data itself, and the cost does not shrink when only five keys are wrong.",
+  "scenario": "Two replicas of a 1,000,000 key store missed a handful of writes while one node was down, and the hinted handoff for them (a note another node keeps to replay writes to a down peer) was lost. Five keys differ. Each replica has a Merkle tree over 1,024 key ranges (about 977 keys each). The repair job compares roots, descends only into differing subtrees, finds 5 ranges with 79 hash comparisons, and copies those ranges instead of streaming 100 MB.",
+  "problem": "Replicas drift: a node is down during writes, a hint is dropped, a disk loses a block, a write times out on one replica. Read repair (fixing a stale replica when a read happens to notice it) only fixes keys that are read, and hinted handoff is best effort and expires. Eventually you must compare two copies of a huge dataset and fix the differences, but reading and shipping every key (or even a hash per key) costs about as much as the data itself, and the cost does not shrink when only five keys are wrong.",
   "howItWorks": [
     { "title": "Hash key ranges into leaves", "text": "Split the key space (or token range) into fixed ranges, for example 1,024. Each leaf holds the hash, usually SHA-256, of the sorted key and value pairs in its range. Both replicas must use the same boundaries, the same serialisation and the same hash, or equal data will not produce equal hashes." },
     { "title": "Hash upward to one root", "text": "Each parent hashes the concatenation of its children's hashes, up to a single root. Equal roots mean the whole range is identical, up to hash collisions, which are negligible with SHA-256. One 32 byte comparison can therefore prove that a million keys agree." },
-    { "title": "Descend only where hashes differ", "text": "If the roots differ, exchange the children's hashes. Equal children are pruned and never opened; differing ones are descended. With k differing leaves in a binary tree of depth d this takes at most about 2*k*d comparisons, which is O(k log n), not O(n)." },
-    { "title": "Stream only the differing ranges", "text": "At the leaves you have a list of key ranges that differ. Those ranges are exchanged (keys, values, versions or timestamps) and reconciled by the store's normal rules, such as last write wins, vector clocks or a CRDT merge. Everything outside those ranges is untouched." },
+    { "title": "Descend only where hashes differ", "text": "If the roots differ, exchange the children's hashes. Equal children are pruned and never opened; differing ones are descended. With k differing leaves in a binary tree of depth d this takes at most about 2*k*d comparisons, which is O(k log n), not O(n): it grows with the number of differences and only slowly with the data size." },
+    { "title": "Stream only the differing ranges", "text": "At the leaves you have a list of key ranges that differ. Those ranges are exchanged (keys, values, versions or timestamps) and reconciled by the store's normal rules, such as last write wins (the newest timestamp wins), vector clocks or a CRDT merge. Everything outside those ranges is untouched." },
     { "title": "Keep the trees cheap to obtain", "text": "Building a tree means reading the data. Cassandra builds it in a validation compaction pass at repair time; Riak keeps a persistent hash tree on disk and updates it as writes arrive. Either way you pay for the build, so repair is scheduled range by range and throttled so it does not starve foreground traffic." }
   ],
   "pros": [
@@ -40,7 +40,7 @@
   ],
   "pitfalls": [
     "Tree depth that is too small gives huge leaf ranges, so one bad key streams thousands; too large and the tree itself costs memory and hashes",
-    "Hash input that is not canonical (different serialisation, ordering, timestamps or tombstone handling) makes equal data look different and repairs everything every time",
+    "Hash input that is not canonical (different serialisation, ordering, timestamps or tombstone (the marker for a delete) handling) makes equal data look different and repairs everything every time",
     "Building the tree from live data: concurrent writes mean the two trees describe different moments, so recent writes show up as false differences. Compare snapshots or accept re-checking recent ranges",
     "Running full repair on every node at once on a busy cluster, saturating disks and network; repair one range at a time with a throttle",
     "Not repairing within the tombstone grace period (gc_grace_seconds in Cassandra, 10 days by default), so a deleted key is purged on one replica and resurrected from another",
@@ -82,7 +82,7 @@
         "The tree is built from live writes, so every range shows as changed"
       ],
       "answer": 2,
-      "explanation": "If equal data gives different hashes, the leaf input is not canonical: field order, serialisation, timestamps or tombstone handling differ between replicas. A coarse tree would only make repairs larger, not make identical data look different."
+      "explanation": "If equal data gives different hashes, the leaf input is not canonical: field order, serialisation, timestamps or tombstone handling differ between replicas. A coarse tree would only make repairs larger, not make identical data look different. Live writes would show up as a few changed ranges, not as every range changed."
     },
     {
       "question": "A cluster runs a full repair every 14 days. Its tombstone grace period is 10 days. Users deleted from one replica occasionally reappear a few weeks later. What is the most likely reason?",
@@ -93,7 +93,7 @@
         "The trees were built from live data, so recent writes looked like differences"
       ],
       "answer": 1,
-      "explanation": "Once the tombstone is purged on one replica, the copy that missed the delete looks like the newest data and is streamed back. Repair has to finish a full pass within the grace period so every replica sees the tombstone first."
+      "explanation": "Once the tombstone is purged on one replica, the copy that missed the delete looks like the newest data and is streamed back. Repair has to finish a full pass within the grace period so every replica sees the tombstone first. Trees do represent deletes as tombstones, and collisions are negligible with SHA-256."
     }
   ]
 }

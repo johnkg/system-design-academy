@@ -4,14 +4,14 @@
   "difficulty": "intermediate",
   "intent": "Understand why a GraphQL query resolved field by field turns into 1 + N + N*M backend calls, how DataLoader batching collapses them, and how to stop a single query from costing too much.",
   "scenario": "A client asks for 50 posts, each with its author and its 20 comments, and each comment with its author. Resolved naively that is 1 + 50 + 50 + 1,000 = 1,101 database queries for one HTTP request; with DataLoader it is 4.",
-  "problem": "A GraphQL query is a tree, and the server executes it by calling one resolver per field per parent object. A resolver for Post.author does not know that 49 sibling resolvers are about to ask for other users, so each one issues its own SELECT. The cost grows with the shape of the data and the shape of the query, both chosen by the caller, so the same endpoint can take 5 ms or 5 seconds, and a hostile client can pick the expensive shape on purpose.",
+  "problem": "A GraphQL query is a tree, and the server executes it by calling one resolver (the function that fetches one field) per field per parent object. A resolver for Post.author does not know that 49 sibling resolvers are about to ask for other users, so each one issues its own SELECT. The cost grows with the shape of the data and the shape of the query, both chosen by the caller, so the same endpoint can take 5 ms or 5 seconds, and a hostile client can pick the expensive shape on purpose.",
   "howItWorks": [
     { "title": "The executor walks the tree, one resolver per field per object", "text": "For { posts { author { name } } } the executor runs Query.posts once, then Post.author once for every post it returned. Each resolver sees one parent and cannot see its siblings, so the natural implementation is one lookup per call: 1 query for the list plus N for the nested field. Nest a list inside the list and it becomes 1 + N + N*M. ORMs do the same with lazy loading (post.author inside a loop), and REST does it when a client fetches a list and then GET /users/{id} for each item. The pattern is the cost model, not a GraphQL bug." },
     { "title": "DataLoader collects keys during one tick, then fires one batch", "text": "A loader exposes load(key) and returns a promise. It does not query immediately: it queues the key and schedules a dispatch for the end of the current tick of the event loop (process.nextTick or a microtask, after all the resolvers of the same level have run). At dispatch it calls your batch function once with every key, for example SELECT * FROM users WHERE id IN (3, 7, 12, ...), and resolves each promise with its own row. Your batch function must return results in the same order and length as the keys, using null or an error for a missing key." },
     { "title": "Batching and caching are two different mechanisms", "text": "Batching merges different keys requested in the same tick into one query. Caching (memoization) returns the same promise for the same key requested again. DataLoader does both by default, but they save different things: with 1,000 comments written by 40 people the cache turns 1,000 key lookups into at most 40, while batching is what turns those 40 separate queries into 1. The cache lives in a loader created per request, never at module level, otherwise one user's data is served to another and stale rows live forever." },
     { "title": "Levels are still sequential, so latency is depth, not N", "text": "Post.author and Post.comments are resolved in the same tick, so their loaders batch independently and run in parallel. Comment.author needs the comments first, so it waits for the next tick. The query above therefore costs 3 sequential database rounds regardless of N and M. Batching cannot remove depth, which is why a root-level JOIN can still win on round trips when the shape is fixed, at the price of coupling the resolver to the query and returning wide, repetitive rows." },
-    { "title": "Cost model for defence: count what the query can ask for", "text": "The same multiplication that causes N+1 is the denial-of-service lever. Aliases repeat a field 50 times at depth 1, cyclic relations (post { comments { post { comments ... } } }) nest as deep as the caller likes, and first: 100000 asks for a huge page. Defences stack: validate depth, estimate cost from the page sizes and per-field weights before executing (GitHub caps first/last at 100 and a call at 500,000 nodes), accept only persisted or allow-listed queries from first-party clients, put a timeout and a rate limit on the operation, and cap pagination on every connection." },
-    { "title": "Measure per field, because the average hides it", "text": "A slow request does not say which resolver is guilty. Record the latency and call count of each resolver (Apollo tracing, OpenTelemetry spans per field, or sampled traces) and watch two numbers: queries per request and the p99 of the slowest field. A field that runs 1,000 times per request with a 3 ms query is a 3 second request even though every individual query looks fast in the database dashboard." }
+    { "title": "Cost model for defence: count what the query can ask for", "text": "The same multiplication that causes N+1 is the denial-of-service lever. Aliases repeat a field 50 times at depth 1, cyclic relations (post { comments { post { comments ... } } }) nest as deep as the caller likes, and first: 100000 asks for a huge page. Defences stack: validate depth, estimate cost from the page sizes and per-field weights before executing (GitHub caps first/last at 100 and a call at 500,000 nodes), accept only persisted queries (stored on the server and called by id) or allow-listed queries from first-party clients, put a timeout and a rate limit on the operation, and cap pagination on every connection." },
+    { "title": "Measure per field, because the average hides it", "text": "A slow request does not say which resolver is guilty. Record the latency and call count of each resolver (Apollo tracing, OpenTelemetry spans per field, or sampled traces) and watch two numbers: queries per request and the p99 (the time that 99 in 100 calls beat) of the slowest field. A field that runs 1,000 times per request with a 3 ms query is a 3 second request even though every individual query looks fast in the database dashboard." }
   ],
   "pros": [
     "Backend calls drop from 1 + N + N*M to one per level of the tree, independent of list sizes",
@@ -36,7 +36,7 @@
     "Root fields that fetch one object or a handful: a loader adds machinery and saves nothing",
     "When the relation can be fetched in the parent query for every client (a fixed screen): a join or a prefetch is simpler",
     "As a replacement for cost limits: batching makes each query cheaper, not the allowed query smaller",
-    "Dependencies with no batch endpoint and no way to build one: you still make N calls, just concurrently, so bound the concurrency instead"
+    "Dependencies with no batch endpoint and no way to build one: you still make N calls, only concurrently, so bound the concurrency instead"
   ],
   "pitfalls": [
     "A module-level loader: the cache never expires and one request can read another user's authorised data",
@@ -71,11 +71,11 @@
       "options": [
         "Add another index on users, since the 100 lookups are probably slow.",
         "Increase the database connection pool so that the 100 queries can all run at the same time.",
-        "Create a DataLoader per request, so author ids are collected and fetched with one IN query.",
+        "Create a DataLoader per request, so author ids are fetched with one IN query.",
         "Cache users in a module-level map that all of the requests share, to avoid repeat lookups."
       ],
       "answer": 2,
-      "explanation": "The cost is the count of queries, not the speed of each, so batching the keys into one IN query takes the request from 101 to 2. A per-request loader is also safe; a map shared by all requests can leak data between users and goes stale."
+      "explanation": "The cost is the count of queries, not the speed of each, so batching the keys into one IN query takes the request from 101 to 2. A new index cannot help, since each lookup is already fast, and a bigger pool still runs 101 queries. A per-request loader is also safe; a map shared by all requests can leak data between users and goes stale."
     },
     {
       "question": "A DataLoader batch function runs SELECT * FROM users WHERE id IN (keys) and returns the rows as the database gave them. In production some posts show another person's name, especially when a user has been deleted. What is wrong?",
@@ -86,7 +86,7 @@
         "The loader must be created once at startup so that every request sees the same row order every time."
       ],
       "answer": 1,
-      "explanation": "DataLoader matches results to callers by position, so the output array must have the same length and order as the key list. A missing row shifts everything after it unless it is replaced by null. Creating the loader once is a separate bug."
+      "explanation": "DataLoader matches results to callers by position, so the output array must have the same length and order as the key list. The database returns rows in whatever order suits it, not key order, and cache size is not the cause. A missing row shifts everything after it unless it is replaced by null. Creating the loader once is a separate bug."
     },
     {
       "question": "A public GraphQL API enforces a maximum query depth of 5 and uses DataLoader. An attacker sends one request with 100 aliases of posts(first: 100) { comments(first: 100) { author { name } } }, which is within the depth limit. What is the best additional defence?",
@@ -97,7 +97,7 @@
         "Increase the loader batch size, so that each level of the query tree needs fewer database queries to run."
       ],
       "answer": 1,
-      "explanation": "The cost comes from breadth multiplied by page sizes, which a depth limit does not see. Cost analysis and page caps reject the query before the work starts. A timeout acts after the database has done most of it, and batching makes queries cheaper, not smaller."
+      "explanation": "The cost comes from breadth multiplied by page sizes, which a depth limit does not see. Cost analysis and page caps reject the query before the work starts. A timeout acts after the database has done most of it, a lower depth limit still lets through 100 aliases of a shallower query, and batching makes queries cheaper, not smaller."
     }
   ]
 }

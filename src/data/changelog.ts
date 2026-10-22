@@ -9,6 +9,7 @@ export const changelog: Change[] = [
       { text: 'Animated diagrams no longer squeeze boxes together on a phone: boxes keep clear space between them and the diagram grows taller when it needs the room.' },
       { text: 'Search understands everyday words ("login", "duplicate messages", "slow database"), matches word forms like "queues" and "caching", and shows where on the page it found your words.', href: 'search/' },
       { text: 'Three start-here paths with a time for every step: thirty minutes, from web developer to system design, and one week to an interview.', href: 'paths/' },
+      { text: 'All 134 concept and pattern pages were reviewed: wrong or unclear numbers in animations and how-to lists were corrected, quiz answers are harder to guess by length, and unfamiliar terms are explained where they first appear. The Undo button in the event sourcing simulation no longer cancels the same event twice.', href: 'concepts/' },
       { text: 'The thirty oldest case studies were checked again: short explanations for terms a newcomer may not know, quiz answers that are no longer recognisable by length, and a few corrected numbers in the how-to lists.', href: 'case-studies/' },
     ],
   },

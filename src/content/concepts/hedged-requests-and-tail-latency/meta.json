@@ -3,14 +3,14 @@
   "area": "reliability",
   "difficulty": "advanced",
   "intent": "Cut the slowest requests at scale: send a duplicate to a second replica when the first is slow, and take whichever answers first.",
-  "scenario": "A search request queries 50 shards in parallel and waits for all of them. Each shard answers in about 10 ms, but 1% of calls take 200 ms to a second. About 40% of searches now include one slow shard, so the user-visible p99 is the shards' rare worst case, not their typical case.",
-  "problem": "Averages hide the tail, and fan-out multiplies it. If one backend is slow 1% of the time and a user request waits for N of them, the chance that at least one is slow is 1 - 0.99^N: 9.6% for 10, 39.5% for 50, 63.4% for 100. Each cause is ordinary (a GC pause, a compaction, a noisy neighbour, a cold cache, a deep queue, a retry), cannot be fixed everywhere, and a timeout does not help because the request is slow, not failed. The latency users feel is the maximum over many calls, so it is set by the rarest delays.",
+  "scenario": "A search request queries 50 shards in parallel and waits for all of them. Each shard answers in about 10 ms, but 1% of calls take 200 ms to a second. About 40% of searches now include one slow shard, so the user-visible p99 (the time that 99 in 100 requests beat) is the shards' rare worst case, not their typical case.",
+  "problem": "Averages hide the tail (the slowest few percent of requests), and fan-out (one request calling many backends) multiplies it. If one backend is slow 1% of the time and a user request waits for N of them, the chance that at least one is slow is 1 - 0.99^N: 9.6% for 10, 39.5% for 50, 63.4% for 100. Each cause is ordinary (a garbage-collection pause, a compaction, a noisy neighbour, a cold cache, a deep queue, a retry), cannot be fixed everywhere, and a timeout does not help because the request is slow, not failed. The latency users feel is the maximum over many calls, so it is set by the rarest delays.",
   "howItWorks": [
     { "title": "Measure the tail per backend and per user request", "text": "Record p50, p95, p99 and p99.9 of each backend call and of the whole fan-out request. Averages and p50 look healthy while the user request is dominated by the slowest of N calls. The per-backend p99 is the number that gets amplified." },
     { "title": "Send a backup request after a delay", "text": "Send the call to one replica. If it has not answered within a hedge delay, typically the backend's p95, send the same call to a second replica and use whichever answer arrives first, then cancel the loser. Only about 5% of calls ever get a second copy, but those are exactly the calls that were headed for the tail. Dean and Barroso (The Tail at Scale) report a Bigtable read benchmark where hedging after 10 ms cut the 99.9th percentile by about 96% for around 2% more requests." },
     { "title": "Tie requests to cancel cheaply", "text": "A tied request goes to two replicas at once, each carrying the identity of the other. When one starts executing it tells the other to drop the request. The duplicate costs a queue slot but almost no CPU, and it removes the hedge delay for the wait-in-queue part of the tail. It needs a cancel path that is faster than the work and replicas that can see each other." },
-    { "title": "Make the delay adaptive and budget the extra load", "text": "Keep a rolling latency histogram per backend and set the delay to its current p95 (or p90 to p99), so the delay rises when the backend is genuinely slower. Cap hedges at a fraction of traffic (a token bucket refilled at 5% of calls) and drop hedges when the backends are overloaded. A fixed 13 ms delay that was right yesterday becomes a load amplifier when latencies drift." },
-    { "title": "Hedge only what is safe, and shorten the tail at the source", "text": "A hedged request executes twice, so hedge reads or idempotent operations, or make the write idempotent with a key. Then attack the causes: break work into small units, spread hot data over micro-partitions, replicate hot items selectively, send canary requests to one or two servers before the full fan-out, remove GC and background-job stalls, and shed load before queues build." }
+    { "title": "Make the delay adaptive and budget the extra load", "text": "Keep a rolling latency histogram per backend and set the delay to its current p95 (or p90 to p99), so the delay rises when the backend is genuinely slower. Cap hedges at a fraction of traffic (a token bucket: a budget that refills a little on every call and is spent by each hedge, refilled at 5% of calls) and drop hedges when the backends are overloaded. A fixed 13 ms delay that was right yesterday becomes a load amplifier when latencies drift." },
+    { "title": "Hedge only what is safe, and shorten the tail at the source", "text": "A hedged request executes twice, so hedge reads or idempotent operations (safe to run twice), or make the write idempotent with a key. Then attack the causes: break work into small units, spread hot data over micro-partitions, replicate hot items selectively, send canary requests to one or two servers before the full fan-out, remove GC and background-job stalls, and shed load before queues build." }
   ],
   "pros": [
     "Attacks the actual cause of a bad p99 at scale: the maximum over many calls",
@@ -69,11 +69,11 @@
       "options": [
         "Roughly 1% of searches, because each backend is slow so rarely",
         "Roughly 10% of searches, because the rare delays add up linearly",
-        "Roughly 63% of searches, since the chance of no slow call is about 37%",
+        "Roughly 63% of searches, because 37% have no slow call",
         "Roughly 99% of searches, because with this many calls a delay is certain"
       ],
       "answer": 2,
-      "explanation": "The chance that none of 100 calls is slow is 0.99 to the power 100, about 37%, so about 63% of requests hit a slow one. The user sees the slowest of all calls, so rare per-backend delays become common."
+      "explanation": "The chance that none of 100 calls is slow is 0.99 to the power 100, about 37%, so about 63% of requests hit a slow one. The user sees the slowest of all calls, so rare per-backend delays become common. One percent is the rate per call, not per search, and the chances do not add up linearly or reach certainty."
     },
     {
       "question": "A read goes to one of three replicas. The backend latency is p50 8 ms, p95 30 ms, p99 200 ms. You want to cut the tail while adding only about 5% extra load. When should a backup request go to a second replica?",
@@ -84,7 +84,7 @@
         "After about 200 ms, since only outliers need help"
       ],
       "answer": 1,
-      "explanation": "A hedge delay near p95 duplicates only about 5% of calls, the ones heading for the tail. Hedging at p50 would duplicate about half the traffic, and waiting for p99 leaves most of the tail untouched."
+      "explanation": "A hedge delay near p95 duplicates only about 5% of calls, the ones heading for the tail. Hedging at p50 would duplicate about half the traffic, sending to two replicas at once doubles the load, and waiting for p99 leaves most of the tail untouched."
     },
     {
       "question": "A bad deploy makes every replica of a service five times slower. Reads use hedging with a fixed 30 ms delay that was the p95 last week. Latency gets worse, not better. What is the best protection against this?",

@@ -3,12 +3,12 @@
   "area": "databases",
   "difficulty": "intermediate",
   "intent": "Change a table's structure while the application keeps running, by splitting the change into small compatible steps instead of one big blocking ALTER.",
-  "scenario": "A users table with 100 million rows has one full_name column. The product needs first_name and last_name. Traffic is about 2,000 writes per second and must not stop, and read replicas must not fall minutes behind.",
+  "scenario": "A users table with 100 million rows has one full_name column. The product needs first_name and last_name. Traffic is about 2,000 writes per second and must not stop, and read replicas (extra copies that serve reads) must not fall minutes behind.",
   "problem": "A schema change that rewrites or locks a large table blocks writes for as long as it runs: minutes to hours on 100 million rows. Writers queue behind the lock, connection pools fill, and the outage looks like the database died. Even without a table lock, one giant UPDATE holds row locks and one huge transaction, produces a replication event the replicas cannot apply for a long time, and cannot be rolled back cheaply. Meanwhile the application is deployed gradually, so old and new code run against the same table at the same time.",
   "howItWorks": [
     { "title": "Expand: add the new shape without breaking the old one", "text": "ADD COLUMN first_name and last_name as nullable with no default. In PostgreSQL this is a catalog change, in MySQL 8 it can be ALGORITHM=INSTANT. The lock is taken for milliseconds, but it still queues behind any long running transaction and blocks everyone behind it, so set lock_timeout (or retry) and run it at a quiet moment. Old code ignores the new columns and keeps working." },
     { "title": "Dual-write before backfill", "text": "Deploy an app version that writes full_name and first_name/last_name together, in the same statement, while still reading full_name. This must be live everywhere before the backfill starts. Otherwise a row written after the backfill has passed it keeps a stale split, and nothing will ever repair it." },
-    { "title": "Backfill in small, throttled batches", "text": "A job walks the primary key in ranges of a few thousand rows: UPDATE users SET first_name = ..., last_name = ... WHERE id BETWEEN a AND b AND first_name IS NULL. Each batch is a short transaction (hundreds of milliseconds), so row locks are brief and the WAL or binlog is produced in small pieces. Between batches it sleeps while replica lag is above a threshold, so replicas and any lag-sensitive reads are not sacrificed. The WHERE first_name IS NULL guard means the job never overwrites a value the application just wrote." },
+    { "title": "Backfill (fill the new columns for existing rows) in small, throttled batches", "text": "A job walks the primary key in ranges of a few thousand rows: UPDATE users SET first_name = ..., last_name = ... WHERE id BETWEEN a AND b AND first_name IS NULL. Each batch is a short transaction (hundreds of milliseconds), so row locks are brief and the WAL or binlog (the log of changes that replicas replay) is produced in small pieces. Between batches it sleeps while replica lag (how far a replica is behind the primary) is above a threshold, so replicas and any lag-sensitive reads are not sacrificed. The WHERE first_name IS NULL guard means the job never overwrites a value the application wrote moments ago." },
     { "title": "Verify, switch reads, stop writing the old column", "text": "Count rows where the new columns are NULL or differ from the split of full_name, and wait until replicas have caught up. Then flip reads to the new columns behind a flag. Keep dual-writing for a while so you can flip back. When confident, deploy the version that no longer touches full_name." },
     { "title": "Contract: drop the old column", "text": "DROP COLUMN full_name once no deployed code, job, report or replica consumer references it. In PostgreSQL this is metadata only; in MySQL it can rewrite the table, so use INSTANT where available or a shadow-table tool. Each step is its own deploy and can be reverted on its own." },
     { "title": "Shadow-table tools for changes that must rewrite the table", "text": "gh-ost and pt-online-schema-change create an empty copy with the new schema, copy rows in chunks (INSERT IGNORE ... SELECT), and capture ongoing changes (gh-ost reads the binlog, pt-osc uses triggers) to replay on the copy. When the copy has caught up, a short atomic rename swaps the tables. They throttle on replica lag, but they cannot compute a column from other columns. Splitting full_name still needs a backfill, which is why the expand and contract pattern is the usual answer here." }
@@ -71,7 +71,7 @@
         "Replicas cannot apply the backfill, so reads return NULL names for weeks"
       ],
       "answer": 2,
-      "explanation": "Dual-write must be live everywhere before the backfill starts. Otherwise a row changed behind the backfill cursor has a new full_name and an old split, and the IS NULL guard never revisits it. Old code simply ignores extra nullable columns."
+      "explanation": "Dual-write must be live everywhere before the backfill starts. Otherwise a row changed behind the backfill cursor has a new full_name and an old split, and the IS NULL guard never revisits it. Old code simply ignores extra nullable columns, and a backfill does not need to wait for replicas to apply anything."
     },
     {
       "question": "On a 100-million-row PostgreSQL table, a team runs ALTER TABLE users ADD COLUMN first_name text, a metadata-only change, at peak traffic. A 10-minute analytics transaction is already reading the table. What happens?",
@@ -93,7 +93,7 @@
         "Compute the split on a replica and copy the results to the primary"
       ],
       "answer": 1,
-      "explanation": "Reading, computing in the app and writing back unconditionally can overwrite a newer value with stale data. A single statement guarded by IS NULL never touches a row the application already wrote. Bigger batches and one huge transaction only hold locks longer and widen the race."
+      "explanation": "Reading, computing in the app and writing back unconditionally can overwrite a newer value with stale data. A single statement guarded by IS NULL never touches a row the application already wrote. Bigger batches and one huge transaction only hold locks longer and widen the race, and a replica cannot write the results to the primary."
     }
   ]
 }
