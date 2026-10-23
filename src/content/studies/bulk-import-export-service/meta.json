@@ -274,7 +274,7 @@
     {
       "title": "Run the import as a background job with status and webhooks",
       "problem": "Checking and writing two million rows takes minutes, far longer than a request should stay open, and the customer still wants to know how it is going.",
-      "fix": "Completing the upload creates a job record and puts a message on a queue, then answers at once with the job id. Workers take jobs from the queue, read the chunks from storage and update the job table with a state (queued, running, done, failed or cancelled) and a progress count. The customer can poll the job by id, or register a webhook, and a sender posts a signed message when the job ends and retries it with growing delays if the customer's server is down. Writing the state change and the event in one step, with an outbox, means a webhook is never lost or sent for a state that was not saved.",
+      "fix": "Completing the upload creates a job record and puts a message on a queue, then answers at once with the job id. Workers take jobs from the queue, read the chunks from storage and update the job table with a state (queued, running, done, failed or cancelled) and a progress count. The customer can poll the job by id, or register a webhook (a URL of the customer's that we call when the job ends), and a sender posts a signed message when the job ends and retries it with growing delays if the customer's server is down. Writing the state change and the event in one step, with an outbox, means a webhook is never lost or sent for a state that was not saved.",
       "tradeoff": "Requests stay short and the system can absorb a burst by letting jobs wait. Customers must handle an asynchronous result, polling needs a sensible rate limit, and webhooks arrive at least once, so the receiver must tolerate a repeat.",
       "concepts": [
         {
@@ -317,7 +317,7 @@
     {
       "title": "Make every submit and every re-run idempotent",
       "problem": "Clients time out and retry, workers crash after writing half a chunk, and customers upload the same fixed file again, so rows must never be duplicated.",
-      "fix": "The create request carries an idempotency key. The API stores it with the job id, and a second request with the same key returns the same job instead of starting another. Inside the job, each row is written as an upsert by its natural key (or by job id plus line number when there is none), so applying the same row again changes nothing. A job records the last chunk it finished, so a crashed job resumes from the next chunk rather than from the start, and re-running a whole file with the same content writes zero changes.",
+      "fix": "The create request carries an idempotency key. The API stores it with the job id, and a second request with the same key returns the same job instead of starting another. Inside the job, each row is written as an upsert (insert, or update if the key exists) by its natural key, meaning a field that already identifies the row such as a SKU (or by job id plus line number when there is none), so applying the same row again changes nothing. A job records the last chunk it finished, so a crashed job resumes from the next chunk rather than from the start, and re-running a whole file with the same content writes zero changes.",
       "tradeoff": "Retries and re-runs are safe, and a crash costs at most one chunk of repeated work. Keys must be kept long enough to cover real retries, upserts cost a little more than plain inserts, and a re-run does not remove rows that were deleted from the file unless the contract says so.",
       "concepts": [
         {
@@ -337,7 +337,7 @@
     {
       "title": "Share the workers fairly and push back when overloaded",
       "problem": "If jobs are served in the order they arrive, one tenant that queues a 100 times bigger file makes everybody else wait for hours.",
-      "fix": "Each tenant has its own queue of chunks, not just of jobs. A scheduler takes turns between tenants that have work, handing out one chunk at a time, with weights for larger plans and a cap on how many workers one tenant can hold. When a tenant's queue or concurrent jobs exceed a limit, the API refuses new work with a 429 and a Retry-After header, so waiting is pushed back to the client instead of growing in memory. The pool of workers scales on the total number of waiting chunks.",
+      "fix": "Each tenant has its own queue of chunks, not only of jobs. A scheduler takes turns between tenants that have work, handing out one chunk at a time, with weights for larger plans and a cap on how many workers one tenant can hold. When a tenant's queue or concurrent jobs exceed a limit, the API refuses new work with a 429 (too many requests) and a Retry-After header, so waiting is pushed back to the client instead of growing in memory. The pool of workers scales on the total number of waiting chunks.",
       "tradeoff": "Small tenants start in seconds and the big tenant still makes steady progress. A big job takes longer than it would on an empty system, the scheduler is one more thing to tune, and limits need to be explained so a customer understands a 429.",
       "concepts": [
         {
@@ -385,7 +385,7 @@
     {
       "scenario": "A worker crashes in the middle of a chunk",
       "impact": "Some of the chunk's rows are written and the rest are not, and the job seems to be stuck in the running state.",
-      "answer": "The job has a lease that the worker keeps renewing, and when it stops the message becomes visible on the queue again. Another worker restarts from the last finished chunk and applies the same chunk again, which is safe because every row is an upsert by key. Progress counts only whole chunks, so it never goes backwards.",
+      "answer": "The job has a lease (a time-limited claim) that the worker keeps renewing, and when it stops the message becomes visible on the queue again. Another worker restarts from the last finished chunk and applies the same chunk again, which is safe because every row is an upsert by key. Progress counts only whole chunks, so it never goes backwards.",
       "concepts": [
         {
           "slug": "message-queues"
@@ -603,13 +603,13 @@
     {
       "question": "Tenant A queues a 60 GB import, about 7,500 chunks of 8 MB, and tenant B then submits a 6 MB file. The pool has 10 workers, and a chunk takes about 5 seconds. B must start within seconds. Which design meets that?",
       "options": [
-        "One shared FIFO queue and 100 workers, so that A's chunks drain about ten times faster than before",
+        "One shared first-in-first-out queue and 100 workers, so that A's chunks drain about ten times faster than before",
         "Smallest job first, so B's file always jumps ahead of any bigger job that is waiting in the queue",
         "A queue per tenant served in turns by chunk, with a worker cap per tenant and a 429 over the limit",
         "A dedicated pool of 10 workers for every tenant, so that nobody ever has to share capacity at all"
       ],
       "answer": 2,
-      "explanation": "With turns by chunk, B waits for at most one running chunk, about 5 seconds. FIFO makes B wait for A's 7,500 chunks, roughly an hour with 10 workers and still several minutes with 100. Smallest-first can starve large tenants forever, and a pool per tenant leaves most workers idle."
+      "explanation": "With turns by chunk, B waits for at most one running chunk, about 5 seconds. A shared first-in-first-out queue makes B wait for A's 7,500 chunks, roughly an hour with 10 workers and still several minutes with 100. Smallest-first can starve large tenants forever, and a pool per tenant leaves most workers idle."
     },
     {
       "question": "A customer's script builds a new idempotency key on every run. After a timeout, it uploads the same 2 million row file again while the first job is still running. Rows have a natural key. Which design property keeps the data correct?",

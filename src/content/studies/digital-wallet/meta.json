@@ -67,7 +67,7 @@
       "title": "Shard the wallets, and keep same-shard transfers local",
       "problem": "One database cannot take every write for 100 million users, and one machine is one failure domain.",
       "fix": "Put a wallet API in front and split the wallets over many SQL shards by a hash of the account id, with each shard replicated for failover. A wallet lives on exactly one shard. When the sender and the recipient share a shard, the transfer is still one local transaction with the guarded update 'balance = balance - amount where balance >= amount', and the database keeps it atomic and non-negative. The check and the write are one statement, so two concurrent transfers cannot both pass the check and overdraw the wallet.",
-      "tradeoff": "Writes and storage spread across many machines, and same-shard transfers keep full ACID. With S shards and random pairs, a fraction 1 - 1/S of transfers cross shards, so with 16 shards that is 94 percent, and for those no single transaction covers both wallets. Debit-then-credit as two separate commits would lose the money if anything dies in between, so the next steps are about that gap.",
+      "tradeoff": "Writes and storage spread across many machines, and same-shard transfers keep full ACID (all or nothing, consistent, isolated, durable). With S shards and random pairs, a fraction 1 - 1/S of transfers cross shards, so with 16 shards that is 94 percent, and for those no single transaction covers both wallets. Debit-then-credit as two separate commits would lose the money if anything dies in between, so the next steps are about that gap.",
       "concepts": [{ "slug": "database-sharding" }, { "slug": "consistent-hashing" }, { "slug": "acid-vs-base" }, { "slug": "database-replication" }]
     },
     {
@@ -87,14 +87,14 @@
     {
       "title": "Give every account a single writer and an event log",
       "problem": "The saga works, but its correctness lives in many places: guarded SQL, a transfer table, a sweeper and ad hoc compensations. Locks, the balance check and the history are separate things that can disagree.",
-      "fix": "Make each account a partition of an append-only ledger with exactly one active writer, chosen by a lease or by leader election, with a hot standby following its log. The writer handles one request at a time, so 'is the balance enough' is an ordinary if statement in memory with no lock. A transfer becomes one event, 'debited 30 for transfer t-5521', appended to the sender's log together with an outbox entry in the same atomic append. The balance is a fold over the events, with periodic snapshots. A stream carries the entry to the recipient's partition, whose writer appends 'credited 30 for t-5521' once, remembering the transfer id. A refund is simply another event. A request id seen before gets its recorded answer back.",
+      "fix": "Make each account a partition of an append-only ledger with exactly one active writer, chosen by a lease or by leader election, with a hot standby following its log. The writer handles one request at a time, so 'is the balance enough' is an ordinary if statement in memory with no lock. A transfer becomes one event, 'debited 30 for transfer t-5521', appended to the sender's log together with an outbox entry (a note that the credit still has to be sent) in the same atomic append. The balance is found by adding up the events, with periodic snapshots to avoid replaying them all. A stream carries the entry to the recipient's partition, whose writer appends 'credited 30 for t-5521' once, remembering the transfer id. A refund is simply another event. A request id seen before gets its recorded answer back.",
       "tradeoff": "Atomic debit, ordering, idempotency and history all come from one mechanism, and the sender sees confirmation after a single append, about 5 ms. Money is still in flight between the two appends, so the system must show it as such and must not stop retrying the credit. A failed writer pauses its partition for the few seconds of failover, and the log and stream must be replicated well enough that an acknowledged event is never lost.",
       "concepts": [{ "slug": "event-sourcing" }, { "slug": "transactional-outbox" }, { "slug": "leader-election" }, { "slug": "consensus" }, { "slug": "cqrs" }]
     },
     {
       "title": "Absorb hot merchants with batching and sub-ledgers",
       "problem": "A large merchant is one account with one writer, and it receives hundreds of payments per second, or thousands on a sale day.",
-      "fix": "Credits to an account can never fail the balance check and they commute, so they do not need to be handled one at a time. The writer applies credits in batches, appending 30 or more events with one disk write, which lifts the limit of one account from hundreds to about ten thousand per second. For anything beyond that, the merchant gets several sub-ledgers, with senders spread over them by a hash of the sender, and the balance is the sum, read from a cached total. Debits from the merchant, such as a payout, sweep from the sub-ledgers, and each still uses the single writer's check. Bursts are queued by the stream with backpressure instead of being rejected.",
+      "fix": "Credits to an account can never fail the balance check, and their order does not change the final balance, so they do not need to be handled one at a time. The writer applies credits in batches, appending 30 or more events with one disk write, which lifts the limit of one account from hundreds to about ten thousand per second. For anything beyond that, the merchant gets several sub-ledgers, with senders spread over them by a hash of the sender, and the balance is the sum, read from a cached total. Debits from the merchant, such as a payout, sweep from the sub-ledgers, and each still uses the single writer's check. Bursts are queued by the stream with backpressure instead of being rejected.",
       "tradeoff": "A merchant can receive far more than one row lock would allow, and the sender's path is not slowed down. The merchant's displayed balance can lag by a moment, a payout needs a small sweep first, and a hot sender, such as a payroll account paying thousands of people, needs its own fan-out job and rate limit.",
       "concepts": [{ "slug": "backpressure" }, { "slug": "database-sharding" }, { "slug": "bulkhead" }, { "slug": "rate-limiting" }]
     },
@@ -110,7 +110,7 @@
     {
       "scenario": "The two-phase commit coordinator dies after both shards voted yes",
       "impact": "Both shards hold prepared transfers and row locks, they cannot commit or abort on their own, and every payment touching those wallets waits.",
-      "answer": "This is why the step 4 design avoids global locks. If 2PC is used, the coordinator's decision log is replicated through consensus so a new coordinator can finish the transfers, and shards expose in-doubt transactions for operators. With the saga or the ledger, nothing holds a lock across shards, and the durable record means any worker can continue or refund the transfer after a restart.",
+      "answer": "This is why steps 3 and 4 avoid locks held across shards. If 2PC is used, the coordinator's decision log is replicated through consensus so a new coordinator can finish the transfers, and shards expose in-doubt transactions for operators. With the saga or the ledger, nothing holds a lock across shards, and the durable record means any worker can continue or refund the transfer after a restart.",
       "concepts": [{ "slug": "two-phase-commit" }, { "slug": "consensus" }, { "slug": "saga" }]
     },
     {
@@ -187,13 +187,13 @@
     {
       "question": "A wallet service is split over 16 SQL shards by account id. A first version does the transfer as two separate commits: debit the sender on shard 3, then credit the recipient on shard 9. The process sometimes crashes between them. Which design closes the gap?",
       "options": [
-        "Credit the recipient first and debit the sender second, so a crash can only leave a user briefly better off",
+        "Credit the recipient first and debit the sender second, so a crash can only ever leave a user briefly better off, never worse off",
         "Retry the credit in a loop after a crash, keeping the list of pending transfers in the memory of the API process",
         "Run the debit and the credit in parallel with a 2 second timeout, and roll both back if either one is too slow",
         "Save a durable transfer record with an id, debit, then credit by that id, and refund the sender if the credit fails"
       ],
       "answer": 3,
-      "explanation": "The durable record lets any worker resume or refund after a crash, and the id makes each step safe to repeat. Credit-first creates money if the debit then fails, and a retry list in memory is lost with the process."
+      "explanation": "The durable record lets any worker resume or refund after a crash, and the id makes each step safe to repeat. Credit-first creates money if the debit then fails, a retry list in memory is lost with the process, and a parallel debit and credit with a timeout leaves no record to resume or undo from when the process dies."
     },
     {
       "question": "A merchant receives 400 payments per second. Each transfer uses two-phase commit and holds the merchant's row lock for about 13 ms. Assume nothing else changes. What is the real limit, and what is the best fix?",
@@ -204,18 +204,18 @@
         "About 77 per second, so cut the lock time to 5 ms with faster disks, which allows the 400 per second needed"
       ],
       "answer": 0,
-      "explanation": "One lock held 13 ms allows about 1000/13, or 77 transfers per second. Even 5 ms would only reach 200, and replicas do not help writes. Credits always pass the balance check and commute, so batching them removes the one-at-a-time limit."
+      "explanation": "One lock held 13 ms allows about 1000/13, or 77 transfers per second. Even 5 ms would only reach 200, and replicas do not help writes. Credits always pass the balance check and their order does not matter, so batching them removes the one-at-a-time limit."
     },
     {
       "question": "In a ledger design, the sender's debit is appended and acknowledged. Then the recipient's partition goes down for 20 seconds before the credit is applied. What should the system do?",
       "options": [
         "Refund the sender after 5 seconds of silence, so the money is back in a known place until the partition is healthy again",
         "Delete the debit event from the sender's log, so both accounts again agree that the transfer never happened at all",
-        "Retry the credit from a durable outbox, apply it once by transfer id, show it as pending, and alert if it stays stuck",
+        "Retry the credit from a durable outbox, apply it once by transfer id, show it pending, and alert if stuck",
         "Freeze the sender's account and ask an operator to approve the credit manually once the partition is back up"
       ],
       "answer": 2,
-      "explanation": "The debit is already acknowledged, so the credit must eventually happen, and a remembered transfer id makes retries safe. An early refund can double-pay once the credit finally lands, and the log is immutable, so events are never deleted."
+      "explanation": "The debit is already acknowledged, so the credit must eventually happen, and a remembered transfer id makes retries safe. An early refund can double-pay once the credit finally lands, and the log is immutable, so events are never deleted. Freezing the account for a manual approval turns a 20-second outage into an operator task and still needs the same retry to finish the credit."
     }
   ]
 }

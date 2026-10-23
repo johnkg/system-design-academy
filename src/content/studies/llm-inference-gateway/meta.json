@@ -208,7 +208,7 @@
     {
       "title": "Put one gateway in front, with a token budget per team",
       "problem": "Shared provider keys give no accountability and no brake, and a request limit counts the wrong thing: one request can cost 50 tokens or 100,000.",
-      "fix": "Teams call the gateway with their own key. The gateway authenticates it, finds the team, and checks a token bucket for that team before anything runs. Because the real cost of a request is not known until the answer is finished, it reserves the prompt size plus the maximum output the caller allows, then returns the unused part when the answer ends. A monthly spending cap sits beside the per-minute bucket. Provider keys stay in the gateway's secret store and teams never see them.",
+      "fix": "Teams call the gateway with their own key. The gateway authenticates it, finds the team, and checks a token bucket for that team (a budget that refills at a fixed rate) before anything runs. Because the real cost of a request is not known until the answer is finished, it reserves the prompt size plus the maximum output the caller allows, then returns the unused part when the answer ends. A monthly spending cap sits beside the per-minute bucket. Provider keys stay in the gateway's secret store and teams never see them.",
       "tradeoff": "Cost is measured in the unit the models actually charge for, and a runaway loop is stopped within a minute. The reservation is pessimistic, so callers who ask for a huge maximum output are throttled early, and the gateway has to count tokens itself, using the tokenizer of each model, which can differ from the provider's count by a few percent.",
       "concepts": [
         {
@@ -231,7 +231,7 @@
     {
       "title": "Stream the answer and stop work on cancel",
       "problem": "A long answer takes 10 to 60 seconds to generate. Waiting for all of it feels broken, and if the user closes the tab the GPU keeps generating text nobody will read.",
-      "fix": "The model generates one token at a time, so the gateway relays them to the caller as server-sent events over a long-lived HTTP connection. A stream relay tier does only this job, holds the open connections cheaply, and sends a small keep-alive comment every 15 seconds so proxies do not close idle streams. When the caller disconnects, or a deadline passes, the relay notices the closed socket and sends a cancel to the backend, which frees the GPU slot at once. The unused part of the reservation is refunded.",
+      "fix": "The model generates one token at a time, so the gateway relays them to the caller as server-sent events (a one-way stream over a long-lived HTTP connection). A stream relay tier does only this job, holds the open connections cheaply, and sends a small keep-alive comment every 15 seconds so proxies do not close idle streams. When the caller disconnects, or a deadline passes, the relay notices the closed socket and sends a cancel to the backend, which frees the GPU slot at once. The unused part of the reservation is refunded.",
       "tradeoff": "The first words appear after a fraction of a second and cancelled work is not wasted. Thousands of open connections need their own capacity and careful deploys, because restarting a relay cuts every stream it holds, and an error can arrive after the 200 status was already sent, so errors travel inside the stream.",
       "concepts": [
         {
@@ -280,7 +280,7 @@
     {
       "title": "Cache the prefix, and sometimes the whole answer",
       "problem": "Most requests begin with the same long system prompt and documents, and many users ask nearly the same question. Recomputing the same thousands of tokens on a GPU wastes the scarcest resource.",
-      "fix": "Two caches work at different levels. A prefix cache keeps the attention state for the start of a prompt on the GPU that computed it, and the router sends requests with the same prefix to the same replica, using a hash of the first blocks of tokens, so only the new tail needs to be processed. An answer cache, used only for deterministic or low-risk calls, returns a stored response when the exact prompt matches, or when an embedding of the question is very close to an earlier one and the team has opted in. Cache keys include the model, the system prompt and the team's tenant, so answers never cross a boundary.",
+      "fix": "Two caches work at different levels. A prefix cache keeps the attention state (the work already done on the start of a prompt) on the GPU that computed it, and the router sends requests with the same prefix to the same replica, using a hash of the first blocks of tokens, so only the new tail needs to be processed. An answer cache, used only for deterministic or low-risk calls, returns a stored response when the exact prompt matches, or when an embedding of the question is very close to an earlier one and the team has opted in. Cache keys include the model, the system prompt and the team's tenant, so answers never cross a boundary.",
       "tradeoff": "Prefill cost and time to first token fall sharply for long shared prompts, and repeated questions cost nothing. Sending the same prefix to one replica can overload it, a semantic match can return a wrong answer to a question that only looks similar, and cached answers go stale when the model or the documents change.",
       "concepts": [
         {
@@ -302,7 +302,7 @@
     },
     {
       "title": "Queue, prioritise and shed when the GPUs are full",
-      "problem": "A GPU pool has a fixed number of sequences it can generate at once. Above that, a plain queue just grows, every request waits longer than its caller will, and the pool spends its time on answers that no one is waiting for.",
+      "problem": "A GPU pool has a fixed number of sequences it can generate at once. Above that, a plain queue grows, every request waits longer than its caller will, and the pool spends its time on answers that no one is waiting for.",
       "fix": "Requests enter an admission queue per model with a short maximum wait, based on how long callers will really wait. Interactive traffic goes ahead of batch jobs. When the queue is longer than the wait allows, the gateway rejects at once with a retry-after hint or diverts to a provider, instead of accepting work it cannot finish. Waiting requests whose caller has gone are dropped before they start. Under heavy overload newer requests are served first, since the oldest are most likely abandoned. Queue depth and wait time drive the autoscaler that adds GPU replicas.",
       "tradeoff": "Latency stays bounded and the GPUs keep doing useful work at 100 percent load, so the pool delivers its full capacity. Some callers get an immediate rejection that they must handle, batch work can be starved without a quota, and a queue limit that is too tight rejects requests the pool could have served.",
       "concepts": [
@@ -327,7 +327,7 @@
       "title": "Meter every call and watch time to first token",
       "problem": "Finance needs to know which team and feature spent how much, and engineers need to know why a stream felt slow. Neither is possible from request counts and average latency.",
       "fix": "Every call, including cached, cancelled and failed ones, produces one usage event with team, feature tag, model, backend, input tokens (cached and uncached), output tokens and computed cost, sent through a log to the metering pipeline and reconciled against provider invoices. Latency is measured in the phases a user feels: queue wait, time to first token, inter-token gap and total time, shown as percentiles per model and per team. A trace id follows the request from the key check to the backend, and service-level objectives on time to first token and on rejection rate set the alerts.",
-      "tradeoff": "Costs can be charged back, anomalies show up within minutes, and slowness can be placed in the queue, the prefill or the decode. Every call adds an event and a few metric labels, high-cardinality labels such as the user id must stay out of metrics, and prompt text in logs needs redaction and retention rules.",
+      "tradeoff": "Costs can be charged back, anomalies show up within minutes, and slowness can be placed in the queue, the prefill (reading the prompt) or the decode (writing the answer). Every call adds an event and a few metric labels, high-cardinality labels such as the user id must stay out of metrics, and prompt text in logs needs redaction and retention rules.",
       "concepts": [
         {
           "slug": "metrics"
@@ -568,7 +568,7 @@
       "options": [
         "Queue everything in arrival order, because the pool stays busy and each caller's own 30 second timeout clears out whatever is late by then",
         "Queue everything but serve the oldest first, and add a GPU replica for each minute of backlog, since capacity will then catch up soon enough",
-        "Admit only what can start within about 10 seconds (roughly 50 waiting), and reject the rest at once with a retry-after hint or divert it to a provider",
+        "Admit only what can start within about 10 seconds (roughly 50 waiting), and reject the rest at once or divert it to a provider",
         "Queue up to 30 seconds of work (about 150 requests), because that is exactly how long the callers say they are willing to wait for it"
       ],
       "answer": 2,

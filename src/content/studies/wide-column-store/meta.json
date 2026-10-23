@@ -1,7 +1,7 @@
 {
   "name": "Design a Wide-Column Store",
   "difficulty": "advanced",
-  "intent": "Build a database like Cassandra or Bigtable that absorbs a million writes per second across hundreds of machines, keeps serving when machines fail, and lets applications choose between speed and consistency per request.",
+  "intent": "Build a database like Cassandra or Bigtable that absorbs hundreds of thousands of writes per second across hundreds of machines, keeps serving when machines fail, and lets applications choose between speed and consistency per request.",
   "codeTitle": "a replicated ring with quorums, hints, read repair and tombstones",
   "finalIntro": "One sensor reading written at QUORUM while a replica is down, then read back and repaired.",
   "prompt": "Design a distributed wide-column database. Applications store billions of rows, such as sensor readings, messages or activity events. Each row belongs to a partition chosen by a key, and rows inside a partition are sorted by a clustering key so that a time range can be read quickly. The database must absorb about 200,000 writes per second, grow by adding machines, survive the loss of machines and of a data centre, and let each request choose how strongly consistent it needs to be.",
@@ -261,8 +261,8 @@
     },
     {
       "title": "Make writes sequential with an LSM tree",
-      "problem": "Updating B-tree pages in place turns a million small writes per second into a million random disk writes, and the disk becomes the limit.",
-      "fix": "Each node appends every write to a commit log, which is a sequential disk write and the crash safety net, and inserts it into the memtable, a sorted structure in memory. The write is acknowledged then, with no read and no random I/O. When the memtable is full it is flushed as an immutable, sorted SSTable file. A read checks the memtable and then the SSTables, using a Bloom filter per file to skip the files that cannot contain the key. A background compaction merges SSTables, keeps the newest version of each cell and drops what was overwritten, so the number of files stays small.",
+      "problem": "Updating B-tree pages in place turns hundreds of thousands of small writes per second into as many random disk writes, and the disk becomes the limit.",
+      "fix": "Each node appends every write to a commit log, which is a sequential disk write and the crash safety net, and inserts it into the memtable, a sorted structure in memory. The write is acknowledged then, with no read and no random I/O. When the memtable is full it is flushed as an immutable, sorted SSTable file. A read checks the memtable and then the SSTables, using a Bloom filter per file (a small structure that says a key is surely absent) to skip the files that cannot contain the key. A background compaction merges SSTables, keeps the newest version of each cell and drops what was overwritten, so the number of files stays small.",
       "tradeoff": "Writes become as fast as appending to a file, and compaction runs in the background. A read may have to look in several files (read amplification), and compaction rewrites the same bytes several times (write amplification), so it needs spare disk and I/O. Size-tiered, leveled and time-window compaction trade these costs differently.",
       "concepts": [
         {
@@ -282,7 +282,7 @@
     {
       "title": "Spread rows over a ring and replicate them",
       "problem": "One node cannot hold the data or take the writes, and a single copy of a row is lost when its node fails.",
-      "fix": "Hash the partition key to a token on a ring. Each node owns many small token ranges, called virtual nodes, instead of one big range, so load is even and a new node takes a little from every existing node. A row is stored on the node that owns its token and on the next distinct nodes clockwise until there are RF copies, usually three, placed on different racks. Any node can be the coordinator for a request, because every node knows the ring from gossip, and it forwards the request to the replicas. There is no leader and no routing tier.",
+      "fix": "Hash the partition key to a token on a ring. Each node owns many small token ranges, called virtual nodes, instead of one big range, so load is even and a new node takes a little from every existing node. A row is stored on the node that owns its token and on the next distinct nodes clockwise until there are RF copies, usually three, placed on different racks. Any node can be the coordinator for a request, because every node knows the ring from gossip (nodes regularly telling each other what they know), and it forwards the request to the replicas. There is no leader and no routing tier.",
       "tradeoff": "Capacity and write rate grow by adding nodes, and no machine is special. Replication multiplies storage and write traffic by RF, a node that joins or leaves streams data in the background, and the ring state that nodes gossip must stay consistent enough to route requests.",
       "concepts": [
         {
@@ -328,7 +328,7 @@
     {
       "title": "Heal failures with hints, read repair and anti-entropy",
       "problem": "When a replica is down or a message is lost, the copies of a row differ, and nothing guarantees they ever become equal.",
-      "fix": "Three mechanisms work together. Hinted handoff: the coordinator keeps a hint for a replica that did not answer and replays it when the node returns, if the outage is shorter than the hint window of a few hours. Read repair: when a read finds replicas disagreeing, the coordinator compares timestamps, returns the newest, and writes it back to the stale replicas. Anti-entropy repair: nodes compare Merkle trees of their data and stream only the ranges that differ, and it is run on a schedule. A failure detector marks slow or dead nodes so requests avoid them.",
+      "fix": "Three mechanisms work together. Hinted handoff: the coordinator keeps a hint for a replica that did not answer and replays it when the node returns, if the outage is shorter than the hint window of a few hours. Read repair: when a read finds replicas disagreeing, the coordinator compares timestamps, returns the newest, and writes it back to the stale replicas. Anti-entropy repair: nodes compare Merkle trees of their data (hash summaries of key ranges) and stream only the ranges that differ, and it is run on a schedule. A failure detector marks slow or dead nodes so requests avoid them.",
       "tradeoff": "The cluster converges without a leader and without downtime. Hints and read repair are best effort, so scheduled repair is not optional. Repair costs disk and network, and a very long outage is better handled by replacing the node than by catching it up.",
       "concepts": [
         {
@@ -580,7 +580,7 @@
       "options": [
         "Add three read replicas, so that the work of the primary is shared among four machines in total",
         "Add RAM to the buffer pool so that more of the hot B-tree pages stay cached in memory",
-        "Use an LSM-tree engine that appends writes to a commit log and a memory table, then flushes sorted files",
+        "Use an LSM-tree engine that appends writes to a log and a memory table and flushes sorted files",
         "Switch the primary key to a random UUID, so that inserts spread evenly across the index"
       ],
       "answer": 2,
@@ -592,13 +592,13 @@
         "ONE, because the write already reached a majority, so any single replica holds the value",
         "ALL, because only a read of every replica proves that the freshest copy was included",
         "LOCAL_ONE, because it keeps the read inside the data centre and is always the fastest",
-        "QUORUM: 2 read plus 2 written replicas of 3 must overlap"
+        "QUORUM, because 2 replicas read and 2 written out of 3 must share at least one copy"
       ],
       "answer": 3,
-      "explanation": "When R + W is greater than the replication factor (2 + 2 > 3), every read set shares a replica with every write set, and QUORUM still works with one replica down. ONE may hit the one replica that missed the write. ALL fails the moment a replica is down."
+      "explanation": "When R + W is greater than the replication factor (2 + 2 > 3), every read set shares a replica with every write set, and QUORUM still works with one replica down. ONE and LOCAL_ONE may hit the one replica that missed the write. ALL fails the moment a replica is down."
     },
     {
-      "question": "Deletes are tombstones that compaction purges after 10 days. A node was down for 12 days, and the other two replicas purged the tombstones for rows deleted on day 3. The node is back, with its old disk. What should the operator do?",
+      "question": "Deletes are tombstones that compaction purges after 10 days. A node was down for 12 days, and the other two replicas purged the tombstones for rows deleted on day 1. The node is back, with its old disk. What should the operator do?",
       "options": [
         "Wipe the node and bootstrap it as a new member, so that it streams all current data from its two peers",
         "Start it and run a repair, because repair compares the replicas and streams whatever differs in both directions",

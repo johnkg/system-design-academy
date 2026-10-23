@@ -271,8 +271,8 @@
     {
       "title": "Write every step to a log so a run survives a crash",
       "problem": "One process holds the whole conversation in memory and loops: ask the model, run the tool it picked, repeat. A run can take twenty minutes and fifty model calls. If the process dies, a deploy rolls it, or the machine is reclaimed, the run is gone, the money spent on the model is wasted, and the tools it already used may be used again when someone starts over.",
-      "fix": "Make the run a record in a store and the workers stateless. The run API creates a run and puts it on a queue. A worker loads the run, asks the model for the next action, runs it, and appends a step to the step log: the action the model chose, the tool result and the tokens used. Unlike a workflow engine, where the developer wrote the steps in advance, here the next step is decided by a model at run time, so the log is the only record of what the plan turned out to be, and the model is never asked again about a step that is already recorded. After a crash another worker leases the run, replays the log to rebuild the conversation, and carries on from the last recorded step. A lease with a heartbeat decides which worker owns the run, and a fencing token stops a worker that only seemed dead from writing after its replacement.",
-      "tradeoff": "A crash costs at most one step of repeated work, and runs can be paused for days, moved between workers or inspected later. Every step now pays a write to the log, and the log must record the model's chosen action, because asking the model again may give a different answer. The one gap is a tool that ran just before the crash and was not yet recorded, which the next step closes.",
+      "fix": "Make the run a record in a store and the workers stateless. The run API creates a run and puts it on a queue. A worker loads the run, asks the model for the next action, runs it, and appends a step to the step log: the action the model chose, the tool result and the tokens used. Unlike a workflow engine, where the developer wrote the steps in advance, here the next step is decided by a model at run time, so the log is the only record of what the plan turned out to be, and the model is never asked again about a step that is already recorded. After a crash another worker leases the run (takes a time-limited claim on it), replays the log to rebuild the conversation, and carries on from the last recorded step. A lease with a heartbeat decides which worker owns the run, and a fencing token stops a worker that only seemed dead from writing after its replacement.",
+      "tradeoff": "A crash costs at most one step of repeated work, and runs can be paused for days, moved between workers or inspected later. Every step now pays a write to the log, and the log must record the model's chosen action, because asking the model again may give a different answer. The one gap is a tool that ran right before the crash and was not yet recorded, which the next step closes.",
       "concepts": [
         {
           "slug": "write-ahead-log"
@@ -316,8 +316,8 @@
     },
     {
       "title": "Run code and tools in a sandbox with narrow credentials",
-      "problem": "Agents run code they just wrote and call tools with whatever access the platform has. A single prompt that goes wrong can read another customer's files, call an internal service or use a production credential that was lying in an environment variable.",
-      "fix": "Tools that run code or touch the network execute in a sandbox: a microVM or a locked-down container with no host access, a read-only root, a small CPU, memory and time limit, and an egress allow-list. The sandbox gets no standing secrets. A credential broker mints a short-lived token for one tenant, one run and one tool, with only the scopes that tool declared in the registry, and the token expires when the step ends. The sandbox is destroyed or reset between runs so nothing carries over.",
+      "problem": "Agents run code they have written and call tools with whatever access the platform has. A single prompt that goes wrong can read another customer's files, call an internal service or use a production credential that was lying in an environment variable.",
+      "fix": "Tools that run code or touch the network execute in a sandbox: a microVM (a very small virtual machine) or a locked-down container with no host access, a read-only root, a small CPU, memory and time limit, and an egress allow-list (the only addresses it may call). The sandbox gets no standing secrets. A credential broker mints a short-lived token for one tenant, one run and one tool, with only the scopes that tool declared in the registry, and the token expires when the step ends. The sandbox is destroyed or reset between runs so nothing carries over.",
       "tradeoff": "Even a successful attack is limited to what one short-lived token and one empty sandbox can reach. Starting an isolated environment per step adds latency, so warm pools of sandboxes are kept, and a narrow scope sometimes makes a legitimate task fail until someone widens it on purpose.",
       "concepts": [
         {
@@ -392,7 +392,7 @@
     {
       "title": "Fan out to sub-agents and trace every step",
       "problem": "A big task, such as researching ten suppliers, takes ten times as long when one agent does it step by step, and one conversation grows too long for the model. When a run goes wrong later, nobody can tell which prompt, tool call or model version caused it.",
-      "fix": "A parent agent can start child runs, each a separate run with its own log, budget and narrow tools, put on the same run queue so they execute in parallel on different workers. The parent's step waits for the children and a merge step combines their results, either by a fixed rule or by asking the model to reconcile them; a failed child gives a partial result with the failure noted. The children's budgets come out of the parent's, so the total stays capped. Every model call, tool call, approval and child run emits a span carrying the run id and the step number to a trace store, so a whole run, with its prompts, arguments and costs, can be viewed as one tree and replayed against a new prompt or model to test a change.",
+      "fix": "A parent agent can start child runs, each a separate run with its own log, budget and narrow tools, put on the same run queue so they execute in parallel on different workers. The parent's step waits for the children and a merge step combines their results, either by a fixed rule or by asking the model to reconcile them; a failed child gives a partial result with the failure noted. The children's budgets come out of the parent's, so the total stays capped. Every model call, tool call, approval and child run emits a span (a timed record of one call) carrying the run id and the step number to a trace store, so a whole run, with its prompts, arguments and costs, can be viewed as one tree and replayed against a new prompt or model to test a change.",
       "tradeoff": "A task takes as long as its slowest sub-agent and each child works with a small, clean context. Parallelism multiplies spending and the chance of conflicting results, and traces contain prompts and tool outputs, which can hold personal data, so they are access-controlled and kept for a limited time.",
       "concepts": [
         {
@@ -641,7 +641,7 @@
   ],
   "quiz": [
     {
-      "question": "An agent run calls a refund tool at step 6. The worker crashes just after the payment provider accepted the refund, before step 6 was written to the log. Another worker replays the log and sees nothing for step 6. How do you avoid a second refund?",
+      "question": "An agent run calls a refund tool at step 6. The worker crashes right after the payment provider accepted the refund, before step 6 was written to the log. Another worker replays the log and sees nothing for step 6. How do you avoid a second refund?",
       "options": [
         "Write step 6 as done in the log before calling the tool, so that any replay always skips the step",
         "Take a lock on the run id, so that only one worker at a time can ever execute a step of the run",
@@ -649,7 +649,7 @@
         "Send the call with a key built from run id and step number, so the gateway returns the saved result"
       ],
       "answer": 3,
-      "explanation": "An idempotency key makes the repeated call harmless, whether or not the first one finished. Marking the step done before the call risks skipping a refund that never happened, if the crash comes first. A lock does not survive the crash and says nothing about what the tool already did."
+      "explanation": "An idempotency key makes the repeated call harmless, whether or not the first one finished. Marking the step done before the call risks skipping a refund that never happened, if the crash comes first. A lock does not survive the crash and says nothing about what the tool already did. Asking the model again may give a different answer, and it cannot see what the provider did."
     },
     {
       "question": "Each run has a cap of 60 steps and 5 dollars. A stuck agent repeats a failing search and changes one word of the query each time, so the exact-repeat check never fires. One lap costs about 15 cents because the whole conversation is sent again. What bounds the damage of this run?",

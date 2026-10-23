@@ -3,6 +3,14 @@ export interface Change { date: string; title: string; items: { text: string; hr
 
 export const changelog: Change[] = [
   {
+    date: '2026-10-23',
+    title: 'Every case study reviewed',
+    items: [
+      { text: 'The remaining 95 case studies got the same review as the first 30: figures in requirements, steps and how-to lists now match what the simulations show, quiz answers are harder to guess by length and every wrong option is explained, and unfamiliar terms are explained where they first appear.', href: 'case-studies/' },
+      { text: 'One case study quiz (maps and routing) was rewritten because its wrong options were not believable, and several others had a number or a wording that could not be worked out from the page.' },
+    ],
+  },
+  {
     date: '2026-10-22',
     title: 'Diagrams that fit phones, smarter search and start-here paths',
     items: [

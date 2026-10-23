@@ -65,7 +65,7 @@
     {
       "title": "Share one cache and decide what leaves when memory is full",
       "problem": "Per-server maps duplicate the data, start cold, cannot be corrected and cannot be sized on their own.",
-      "fix": "Move the cache to a separate service that all the servers share, used cache-aside: the application asks the cache, and on a miss it reads the database and stores the result with a time to live. The cache has a hard memory limit. When it is reached, it evicts entries by a policy: LRU removes the one least recently used, and LFU removes the one least often used, which protects a popular entry from a one-time scan. Real systems approximate this. Redis samples a few random entries and evicts the worst of them, instead of keeping an exact list for hundreds of millions of keys. Expired entries are removed lazily when they are read, and by a background sweep.",
+      "fix": "Move the cache to a separate service that all the servers share, used cache-aside: the application asks the cache, and on a miss it reads the database and stores the result with a time to live (TTL). The cache has a hard memory limit. When it is reached, it evicts entries by a policy: LRU removes the one least recently used, and LFU removes the one least often used, which protects a popular entry from a one-time scan. Real systems approximate this. Redis samples a few random entries and evicts the worst of them, instead of keeping an exact list for hundreds of millions of keys. Expired entries are removed lazily when they are read, and by a background sweep.",
       "tradeoff": "One copy of each entry, a high hit ratio, and the memory is bounded. A single node is still one machine, with a memory and throughput limit and a single point of failure, and an eviction policy is a guess that a bad access pattern, such as a big scan, can defeat.",
       "concepts": [{ "slug": "caching" }, { "slug": "latency-and-round-trips" }, { "slug": "metrics" }]
     },
@@ -79,7 +79,7 @@
     {
       "title": "Replicate every shard and fail over automatically",
       "problem": "When a node dies, all its keys miss at once, and the database has to serve them cold.",
-      "fix": "Each shard has one or two replicas on other machines, fed by asynchronous replication from the primary. The nodes send each other heartbeats, usually with a gossip protocol. When most of the other primaries have not heard from a node for the timeout (a few seconds), they agree it is down, and a replica is promoted with an epoch number that makes the newest primary win. Clients refresh their view of the ring. Replicas can also serve reads for hot shards. Replication is asynchronous, so the last few milliseconds of writes can be missing after a promotion, which is fine for a cache because the database holds the truth.",
+      "fix": "Each shard has one or two replicas on other machines, fed by asynchronous replication from the primary. The nodes send each other heartbeats, usually with a gossip protocol (each node regularly tells a few random peers what it knows). When most of the other primaries have not heard from a node for the timeout (a few seconds), they agree it is down, and a replica is promoted with an epoch number that makes the newest primary win. Clients refresh their view of the ring. Replicas can also serve reads for hot shards. Replication is asynchronous, so the last few milliseconds of writes can be missing after a promotion, which is fine for a cache because the database holds the truth.",
       "tradeoff": "A node failure becomes a few seconds of errors for one shard instead of a cold start of its keys, but the memory bill doubles or triples. Asynchronous replication can lose the newest entries and, if a partition isolates the old primary, two nodes can briefly both accept writes. Promotion that is too eager will flap when a node only had a long garbage-collection pause.",
       "concepts": [{ "slug": "database-replication" }, { "slug": "gossip-protocol" }, { "slug": "leader-election" }, { "slug": "health-checks" }, { "slug": "cap-theorem" }]
     },
@@ -100,7 +100,7 @@
     {
       "title": "Invalidate on change and warm up gently",
       "problem": "A TTL alone leaves stale data for minutes, and a naive update of the cache can leave it wrong for ever. A restarted or new node has an empty cache.",
-      "fix": "On a write, update the database first and then delete the cache entry, rather than updating it, so a later read reloads the current value. The deletes come from the change stream of the database (the binlog or a transactional outbox), so they are reliable and also cover writes from other services. A TTL stays as a backstop for any invalidation that is lost. A read that raced with a write, and put an old value back after the delete, is limited by that TTL, by a version number stored with the value, or by a lease that a delete cancels. Write-through writes the database and the cache together for data that is read right after it is written. A new or restarted node first loads a snapshot from its replica, or the proxy gives it a small share of the traffic at first and raises it as it fills.",
+      "fix": "On a write, update the database first and then delete the cache entry, rather than updating it, so a later read reloads the current value. The deletes come from the change stream of the database (the binlog, which is the database's own log of changes, or a transactional outbox, which saves the message in the same transaction as the write), so they are reliable and also cover writes from other services. A TTL stays as a backstop for any invalidation that is lost. A read that raced with a write, and put an old value back after the delete, is limited by that TTL, by a version number stored with the value, or by a lease that a delete cancels. Write-through writes the database and the cache together for data that is read right after it is written. A new or restarted node first loads a snapshot from its replica, or the proxy gives it a small share of the traffic at first and raises it as it fills.",
       "tradeoff": "Readers see a change within about a second of it being committed, and a lost message costs at most one TTL of staleness. The invalidation stream is a new component to run and monitor, and deleting instead of updating makes the first read after each write a miss.",
       "concepts": [{ "slug": "transactional-outbox" }, { "slug": "message-queues" }, { "slug": "idempotency" }, { "slug": "pub-sub" }]
     }
@@ -212,7 +212,7 @@
         "Add more database read replicas, so that the roughly 4,000 queries during the reload are spread over more machines"
       ],
       "answer": 2,
-      "explanation": "About 20,000 x 0.2 s, or 4,000, requests arrive during the reload and all miss. Serving the stale value while one refresher runs makes it one query. Jitter helps many keys expiring together, not one hot key, and a longer TTL only delays the same spike."
+      "explanation": "About 20,000 x 0.2 s, or 4,000, requests arrive during the reload and all miss. Serving the stale value while one refresher runs makes it one query. Jitter helps many keys expiring together, not one hot key, and a longer TTL only delays the same spike. More read replicas still run all 4,000 queries, only on more machines."
     },
     {
       "question": "Reader A reads an old row from the database. A writer then updates the row and deletes the cache entry. A now stores its old value in the cache, and it stays wrong until a 6 hour TTL ends. The team wants A's late store rejected without hurting the hit ratio. What fits?",
@@ -220,7 +220,7 @@
         "Update the cache with the new value on every write instead of deleting, so that the entry is always current",
         "Cut the TTL to 5 seconds on all entries, so that any stale value is gone again within seconds of being stored",
         "Make readers take a database read lock for the whole miss path, so that no writer can commit meanwhile",
-        "Use a lease: a miss returns a token, a delete invalidates that token, and a store carrying an invalid token is refused"
+        "Use a lease: a miss returns a token, a delete voids it, and a store carrying a voided token is refused"
       ],
       "answer": 3,
       "explanation": "A lease ties the late store to the state before the delete, so it fails. Updating instead of deleting still lets two writers land in the wrong order. A 5 second TTL ruins the hit ratio, and read locks add contention to the miss path."

@@ -19,7 +19,7 @@
     "Handle about 100,000 lines per second on average, 30 MB per second",
     "A slow or broken log platform must never slow or break the services that write logs",
     "Never lose a line silently: if lines are dropped, count them and say so",
-    "Keep logs for 30 days in fast storage and for a year in total, at a small fraction of the cost of indexing everything"
+    "Keep logs searchable for 30 days and for a year in total, at a small fraction of the cost of indexing everything"
   ],
   "firstAttempt": {
     "text": "Each service inserts every log line into one shared SQL table with columns for time, service, level and message. Engineers search with a query using LIKE on the message and a filter on the time.",
@@ -246,7 +246,7 @@
     {
       "title": "Put a durable queue between collecting and storing",
       "problem": "Logs come in bursts. An incident multiplies the volume by five at the moment the search store is under most pressure, and if the store cannot keep up, lines are lost.",
-      "fix": "The ingest gateway does little more than authenticate the batch and append it to a replicated queue, partitioned by tenant and source, and acknowledge it. Consumers read from the queue at their own pace, so a burst becomes a backlog instead of a failure. The queue is sized to hold some time, such as half an hour, of peak traffic. The agent moves its offset only after the acknowledgement, so delivery is at-least-once.",
+      "fix": "The ingest gateway does little more than authenticate the batch and append it to a replicated queue, partitioned by tenant and source, and acknowledge it. Consumers read from the queue at their own pace, so a burst becomes a backlog instead of a failure. The queue is sized to hold some time, such as half an hour, of peak traffic. The agent moves its offset only after the acknowledgement, so delivery is at-least-once (a batch may arrive twice, but is not lost).",
       "tradeoff": "Bursts are absorbed and downstream outages do not lose data. The cost is extra delay when there is a backlog, a cluster to run, and duplicates, which the next stages must tolerate. A queue is not infinite: when it is full, something has to give.",
       "concepts": [
         {
@@ -279,8 +279,8 @@
     },
     {
       "title": "Index only what you search by, and keep the text in cheap storage",
-      "problem": "Indexing every word of every line in an inverted index is fast to search but makes the index as large as the data, and at 2.6 TB of logs a day the cost is out of reach.",
-      "fix": "Split the work. A small index holds only labels (service, level, tenant, region) and the time range of each chunk, and the lines themselves are compressed into chunks in object storage, written in time order per label set. A query uses the time range and the labels to find the few chunks that can match, and then scans those chunks for the words in the message. A full inverted index over the message stays available, for a short window or for selected services that need instant free-text search.",
+      "problem": "Indexing every word of every line in an inverted index (a list from each word to the lines that contain it) is fast to search but makes the index as large as the data, and at 2.6 TB of logs a day the cost is out of reach.",
+      "fix": "Split the work. A small index holds only labels (service, level, tenant, region) and the time range of each chunk, and the lines themselves are compressed into chunks in object storage (cheap bulk storage, such as Amazon S3), written in time order per label set. A query uses the time range and the labels to find the few chunks that can match, and then scans those chunks for the words in the message. A full inverted index over the message stays available, for a short window or for selected services that need instant free-text search.",
       "tradeoff": "Storage and indexing cost fall several times over (about 7 times in the estimate here), since compressed text is a fraction of an index. A search by an unlabelled word must scan chunks, so it is slower than an inverted index lookup but is spread over many workers. Labels must have a small number of values, or the small index stops being small.",
       "concepts": [
         {
@@ -410,7 +410,7 @@
         {
           "name": "Labels only index over compressed chunks",
           "pro": "Very cheap to write and to keep, with fast filters by service, level and time",
-          "con": "Free-text search scans the matching chunks, and high-cardinality labels break it"
+          "con": "Free-text search scans the matching chunks, and labels with very many distinct values (high cardinality) break it"
         },
         {
           "name": "No index, grep at query time",
@@ -527,15 +527,15 @@
         "About 540 GB, which is 150 MB per second over a full hour"
       ],
       "answer": 0,
-      "explanation": "The queue grows only by what arrives above what consumers drain: (150 - 30) MB per second times 1,800 seconds is 216 GB. 270 GB ignores the draining. 54 GB is just half an hour of normal volume. In practice the queue is also replicated, so raw disk is a multiple of this."
+      "explanation": "The queue grows only by what arrives above what consumers drain: (150 - 30) MB per second times 1,800 seconds is 216 GB. 270 GB ignores the draining. 54 GB is only half an hour of normal volume, and 540 GB uses a full hour instead of the 30-minute burst and also ignores the draining. In practice the queue is also replicated, so raw disk is a multiple of this."
     },
     {
       "question": "A tenant leaves a debug flag on and sends ten times its usual volume. The queue is at 90% and another tenant is in the middle of an incident with many error lines. Which response protects the platform and the logs that matter most?",
       "options": [
         "Drop the oldest lines in the queue to make room for new ones, since the freshest lines are the most useful ones for the engineers during an incident",
         "Block the writers by making the agents refuse new lines until the queue has drained, so that nothing is ever lost for any tenant on the platform",
-        "Rate-limit the noisy tenant at the gateway and count what is refused. If the queue still fills, sample debug and info first and keep errors.",
-        "Double the queue size and the number of consumers, so that the extra volume is simply absorbed and no tenant has to be limited at all by anyone"
+        "Rate-limit the noisy tenant at the gateway and count what is refused, then sample debug and info first and keep errors if the queue still fills",
+        "Double the queue size and the number of consumers, so that the extra volume is absorbed and no tenant has to be limited"
       ],
       "answer": 2,
       "explanation": "A per-tenant quota stops one tenant from pushing out others, and a level-based drop policy keeps errors as long as there is room, with every drop counted. Dropping the oldest lines erases the start of the incident. Blocking writers would let a logging problem slow the services, and a bigger buffer only changes lost lines into late ones."

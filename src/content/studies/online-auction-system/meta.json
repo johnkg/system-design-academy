@@ -280,7 +280,7 @@
     {
       "title": "Fan out each change to the watchers",
       "problem": "Thousands of people watch the same hot auction. If each one polls the database, the read load lands on exactly the rows that are being written the most.",
-      "fix": "After a bid commits, the ledger publishes a bid event to a topic for that auction. A fleet of push gateways holds the watchers' connections, subscribes to the topics of the auctions its clients are looking at, and sends the new price, leader and end time. In the last seconds many bids arrive per second, so each gateway batches to the latest state every few hundred milliseconds instead of sending every bid. A new watcher gets a snapshot read from a cache, then the changes after it, numbered by version so a gap or reorder is detected and repaired by fetching the snapshot again.",
+      "fix": "After a bid commits, the ledger publishes a bid event to a topic (a named channel that subscribers listen to) for that auction. A fleet of push gateways holds the watchers' connections, subscribes to the topics of the auctions its clients are looking at, and sends the new price, leader and end time. In the last seconds many bids arrive per second, so each gateway batches to the latest state every few hundred milliseconds instead of sending every bid. A new watcher gets a snapshot read from a cache, then the changes after it, numbered by version so a gap or reorder is detected and repaired by fetching the snapshot again.",
       "tradeoff": "Watchers see changes almost at once and the database never sees them. Batching means a watcher can skip an intermediate price, which is fine because only the latest state matters. The bid is confirmed to the bidder from the write itself, never from the push, so a lost push message costs nothing but a refresh.",
       "concepts": [
         {
@@ -303,7 +303,7 @@
     {
       "title": "Close each auction exactly once",
       "problem": "At the end time the system must pick a winner, charge them and create an order. A timer that fires twice, a worker that crashes halfway, or a bid that arrives at the same moment must not produce two orders, no order, or a different winner.",
-      "fix": "The scheduler hands due auctions to close workers through a queue, which can deliver a job more than once. The worker closes with one conditional write: set the state from open to closed only if the version and the end time are the ones it read and the end time has passed. Only one worker wins that write. The order is created with the auction id as its idempotency key, in the same transaction or through an outbox, so a repeat finds the existing order. A sweeper looks for auctions past their end that are still open and re-enqueues them, so a missed timer costs seconds, not an auction.",
+      "fix": "The scheduler hands due auctions to close workers through a queue, which can deliver a job more than once. The worker closes with one conditional write: set the state from open to closed only if the version and the end time are the ones it read and the end time has passed. Only one worker wins that write. The order is created with the auction id as its idempotency key (a unique id, so a repeated request acts once), in the same transaction or through an outbox (a table row saved with the change and sent on afterwards), so a repeat finds the existing order. A sweeper looks for auctions past their end that are still open and re-enqueues them, so a missed timer costs seconds, not an auction.",
       "tradeoff": "At-least-once delivery with an idempotent effect behaves as exactly once, and every failure is repaired by simply running the job again. It needs a unique key and a stored state for every auction, and a payment charge needs its own idempotency key towards the payment provider.",
       "concepts": [
         {
@@ -553,7 +553,7 @@
         "Move the bids table to a larger database instance so the read, check and insert finish faster and the window for a clash becomes tiny."
       ],
       "answer": 2,
-      "explanation": "The flaw is that the check and the write are separate, so both bidders pass the check against the same price. A conditional write on a version makes them one atomic step. A unique index on amount does not help because 110 and 120 are different values, and a bigger machine only narrows the race."
+      "explanation": "The flaw is that the check and the write are separate, so both bidders pass the check against the same price. A conditional write on a version makes them one atomic step. A unique index on amount does not help because 110 and 120 are different values, a bigger machine only narrows the race, and a lock held while a form is open lets one idle bidder block everyone."
     },
     {
       "question": "A hot auction has 50,000 watchers and receives about 20 bids per second in its last minute. Sending every bid to every watcher would mean 1,000,000 messages per second. The goal is to stay near 100,000 messages per second while every watcher still ends on the true final price. Which design does that?",
@@ -564,7 +564,7 @@
         "Send every bid event, but only to the 5,000 watchers who have placed a bid on this auction before, since they care about price changes."
       ],
       "answer": 0,
-      "explanation": "Only the latest state matters to a watcher, so a snapshot every 500 ms means 2 updates per second per watcher, or 100,000 per second, and the last one is always the real price. Random dropping can lose the final event and leave a watcher on a stale price. Polling puts the same rate onto the hottest row in the database."
+      "explanation": "Only the latest state matters to a watcher, so a snapshot every 500 ms means 2 updates per second per watcher, or 100,000 per second, and the last one is always the real price. Random dropping can lose the final event and leave a watcher on a stale price. Polling puts the same rate onto the hottest row in the database, and sending only to past bidders leaves the other watchers on a stale price."
     },
     {
       "question": "Close jobs are delivered at least once, and a job can fire for an end time that a late bid has since extended. Worker A closes auction 77, creates the order, then crashes before it acknowledges, so worker B receives the same job. How should closing work to get one winner and one order?",
@@ -572,10 +572,10 @@
         "Take a distributed lock on the auction id with a 30 second TTL before closing, so only the current lock holder can run the close logic for that auction, one at a time.",
         "Switch the queue to its exactly-once delivery mode, so the close job reaches a single worker only and the order step needs no protection of its own.",
         "Run one close worker on one machine and restart it after a crash, so duplicates cannot happen because no two workers ever see the same job.",
-        "Close with one conditional write from open to closed that applies only if the version and end time match and the end time has passed, and key the order by its auction id in the same transaction."
+        "Close with one conditional write from open to closed that checks version, end time and the clock, and key the order by its auction id."
       ],
       "answer": 3,
-      "explanation": "A conditional write on the auction state makes the second delivery and the stale timer harmless, and the idempotency key on the order covers a crash between the two steps. A lock with a TTL can expire during a pause and does not remember that the auction is already closed. Queue-level exactly-once cannot cover a worker that crashes after its side effects."
+      "explanation": "A conditional write on the auction state makes the second delivery and the stale timer harmless, and the idempotency key on the order covers a crash between the two steps. A lock with a TTL can expire during a pause and does not remember that the auction is already closed. Queue-level exactly-once cannot cover a worker that crashes after its side effects, and a single worker is a single point of failure that still re-reads a half-finished job."
     }
   ]
 }

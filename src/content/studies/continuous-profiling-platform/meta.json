@@ -4,7 +4,7 @@
   "intent": "Profile every process in a large fleet all the time at a tiny cost, and let engineers see which code burns the CPU, compare two releases and trace it back to a service.",
   "codeTitle": "stack interning, flame graphs and a release diff",
   "finalIntro": "One profile from a running service, from a sample to a flame graph diff.",
-  "prompt": "Design a continuous profiling platform for a company with 5,000 hosts running about 30,000 processes in Go, Java, Python and C++. Engineers want an always-on view of where CPU time goes, flame graphs for any service and time range, a comparison of two releases, and the profiling itself must never hurt production.",
+  "prompt": "Design a continuous profiling platform for a company with 5,000 hosts running about 30,000 processes in Go, Java, Python and C++. Engineers want an always-on view of where CPU time goes, flame graphs (charts where box width shows how much CPU time a function and its callers use) for any service and time range, a comparison of two releases, and the profiling itself must never hurt production.",
   "functional": [
     "Collect CPU (and later memory and lock) profiles from every process, all the time",
     "Show a flame graph for any service, tag set and time range",
@@ -219,7 +219,7 @@
     {
       "title": "Put a low-overhead sampling agent in every process",
       "problem": "Profiling by hand misses the incident, covers one process, and a heavy profiler can hurt the process it is meant to help.",
-      "fix": "Run a sampler all the time. Instead of tracing every call, it wakes up about 20 to 100 times per second, records the call stack of the code that is running right now, and goes back to sleep. In Go the runtime does this with a timer signal, on Java an agent uses the JVM's stack-walking interface, and on Linux an eBPF program can sample native code in every process without changing it. Each sample is a list of return addresses with a count, so the cost is a few microseconds to a few hundred, and the total is a small fixed fraction of a core. The agent keeps counts in memory and uploads them once a minute to an ingest gateway, which authenticates it and tags the data with the service, version, host and region.",
+      "fix": "Run a sampler all the time. Instead of tracing every call, it wakes up about 20 to 100 times per second, records the call stack (the chain of functions being run) of the code that is running right now, and goes back to sleep. In Go the runtime does this with a timer signal, on Java an agent uses the JVM's stack-walking interface, and on Linux an eBPF program (a small safe program run inside the Linux kernel) can sample native code in every process without changing it. Each sample is a list of return addresses with a count, so the cost is a few microseconds to a few hundred, and the total is a small fixed fraction of a core. The agent keeps counts in memory and uploads them once a minute to an ingest gateway, which authenticates it and tags the data with the service, version, host and region.",
       "tradeoff": "Overhead stays tiny and nearly constant, and nothing needs a restart. Sampling is statistical, so a function that runs for a very short time may never be seen in one profile, and the timer must not tick in lockstep with the work, or it will always see the same moment.",
       "concepts": [
         {
@@ -239,7 +239,7 @@
     {
       "title": "Aggregate stacks and send them through a queue",
       "problem": "Shipping every raw sample means 600,000 stacks per second of about 336 bytes each, around 200 MB/s, and the same few hundred stacks repeat over and over.",
-      "fix": "Stacks repeat, so count them. The agent folds identical stacks into one entry with a count, and gives each stack an id that is a hash (for example a 64-bit hash of its frames). After the first upload it sends only the id and the count for stacks the server already knows, and the full stack just for new ones. That shrinks the traffic from about 200 MB/s to a few MB/s. The ingest gateway writes the uploads to a queue, and stack aggregators read from it, merge uploads and drop duplicates when an agent retries.",
+      "fix": "Stacks repeat, so count them. The agent folds identical stacks into one entry with a count, and gives each stack an id that is a hash (for example a 64-bit hash of its frames). After the first upload it sends only the id and the count for stacks the server already knows, and the full stack only for new ones. That shrinks the traffic from about 200 MB/s to a few MB/s. The ingest gateway writes the uploads to a queue, and stack aggregators read from it, merge uploads and drop duplicates when an agent retries.",
       "tradeoff": "Traffic and storage drop by well over an order of magnitude, and the agents are decoupled from slow storage. Individual samples lose their exact time within the minute, and the agent and the aggregator must agree on how stacks are hashed, or the same stack gets two ids.",
       "concepts": [
         {
@@ -280,7 +280,7 @@
       "title": "Store profiles as compressed blocks with a stack table",
       "problem": "10 billion rows per day cannot sit in a general database, and queries cover many services, tags and weeks.",
       "fix": "Keep two things. A stack table stores each distinct stack once, as a list of frame ids, and a frame table stores each function once. The samples are tiny rows of series (the service and its tags), minute, stack id and count, which are grouped into blocks per time window and written as columns. Timestamps use delta encoding, stack ids are dictionary-coded and counts use variable-length integers, and a general compressor such as zstd on top gives roughly 5 times. A tag index maps service, version and region to the series that carry them, so a query reads only the blocks it needs. Blocks are immutable files in object storage, with recent ones also in memory. Old data is rolled up: after a week, per-minute counts are merged into hourly ones.",
-      "tradeoff": "A month of profiles for a large fleet fits in under a terabyte, and queries read only the columns they need. Compression and block building add a delay of a few minutes before data is final, and high-cardinality tags such as user id would explode the number of series.",
+      "tradeoff": "A month of profiles for a large fleet fits in under a terabyte, and queries read only the columns they need. Compression and block building add a delay of a few minutes before data is final, and high-cardinality tags (tags with very many distinct values) such as user id would explode the number of series.",
       "concepts": [
         {
           "slug": "columnar-formats-and-partitioning"
@@ -547,7 +547,7 @@
         "Extend the manual profile to 10 minutes and run it on a larger set of hosts after each page"
       ],
       "answer": 1,
-      "explanation": "The evidence is gone by the time a person attaches, so profiling has to be always on and cheap, which sampling 20 to 100 times a second gives. A faster runbook still arrives after the spike. Tracing every call costs far too much to leave on in production."
+      "explanation": "The evidence is gone by the time a person attaches, so profiling has to be always on and cheap, which sampling 20 to 100 times a second gives. A faster runbook still arrives after the spike. Tracing every call costs far too much to leave on in production, and a longer manual profile started after the page still starts after the spike is over."
     },
     {
       "question": "A fleet produces 600,000 samples a second, and each raw sample is a stack of about 336 bytes, which is around 200 MB/s. Most samples repeat the same few hundred stacks. Which change cuts the network traffic the most?",
@@ -555,7 +555,7 @@
         "Compress each raw sample with zstd before it leaves the host, which saves roughly 5 times on the wire and needs no protocol change",
         "Send the raw samples unchanged and let the server deduplicate them before it writes them to storage, so agents stay trivial",
         "Halve the sampling rate on every host, which halves the bytes sent while the flame graph shapes stay the same",
-        "Let the agent fold identical stacks into one entry with a count, and send only the stack id and count once the server already knows the stack"
+        "Let the agent fold identical stacks into one entry with a count, and send only the id and count for stacks the server knows"
       ],
       "answer": 3,
       "explanation": "Folding in the agent turns a repeat into a short id plus a count, which takes the traffic from about 200 MB/s to a few MB/s. Compression alone still leaves about 40 MB/s. Server-side dedup pays the whole network cost first, and halving the rate loses detail for only a 2 times gain."
@@ -563,13 +563,13 @@
     {
       "question": "A single Java process runs a request loop that takes exactly 10 ms, and a fixed 100 Hz sampler is the only profile source. A function that really uses 30% of each loop shows up as 0% in one profile and 100% in the next. What is the most direct fix?",
       "options": [
-        "Randomise the sample gaps and timer phase",
+        "Randomise the gaps between samples and the timer's start phase, so it cannot lock to the loop",
         "Raise the rate to 1,000 Hz, so there are ten times more samples inside every loop of the process",
         "Switch to tracing so that every call is counted exactly, and keep it on permanently in the process",
         "Lower the rate to 50 Hz, so that the sampler is less likely to hit the same point of the loop twice in a row"
       ],
       "answer": 0,
-      "explanation": "The timer is locked in step with the work, so it keeps seeing the same moment. Random gaps and phase, with a rate such as 97 Hz, break that lock. A rate of 1,000 Hz or 50 Hz is still a multiple of the loop period and so stays aligned, while 1,000 Hz also costs ten times more."
+      "explanation": "The timer is locked in step with the work, so it keeps seeing the same moment. Random gaps and phase, with a rate such as 97 Hz, break that lock. A rate of 50 Hz still samples the same point of the loop every time. A rate of 1,000 Hz still ticks on a fixed grid and costs ten times the overhead, far past the 1% budget."
     }
   ]
 }
