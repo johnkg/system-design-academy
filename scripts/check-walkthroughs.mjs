@@ -6,7 +6,8 @@
 // Every number the list quotes must show up in the text of at least one of those states. A number that never shows up is a claim the reader
 // cannot reproduce: the list may be out of date, or the step may rely on a click the script does not make.
 //
-// Some claims cannot be reproduced this way (results of a button press, a unit conversion, a figure the author derived by hand).
+// When a step's numbers never show, the script follows the steps up to it on a fresh page and presses the buttons it names.
+// Some claims still cannot be reproduced (a sequence of clicks, a unit conversion, a figure the author derived by hand).
 // Those are kept in scripts/walkthrough-baseline.json, so the check fails only for a NEW unverified number. Edit a how list so a
 // number changes and the check asks you to look at it: fix the text, or run with --update to accept it on purpose.
 //
@@ -46,6 +47,7 @@ const APPROX_TOLERANCE = 0.05; // "about 300" may match 290 to 315
 const APPROX_WORDS = /(about|around|roughly|nearly|almost|over|under|above|below|up to|at least|at most|more than|less than|~)\s*$/i;
 const MIN_LABEL_WORD = 4; // a step names a control when it uses the label or any word of it this long
 const SEED = 20261024;
+const PRESSES = 6; // times each named button is pressed, with a look after each press ("press Send 3 times")
 
 const port = PORT_BASE + Math.floor(Math.random() * PORT_SPREAD);
 const origin = `http://127.0.0.1:${port}`;
@@ -75,7 +77,9 @@ pages.sort();
 const wanted = pages.filter((p) => p.includes(only));
 
 // Runs inside the page: drives one simulation and returns its "how" steps and every number it showed.
-async function drive({ index, settle, settleLooks, maxStates, minLabelWord }) {
+// mode 'explore' tries the controls; 'step' applies the settings of steps 0..step and then presses the buttons that step names
+// (Run, Send, Publish...); 'buttons' presses every button from the defaults. Each press is followed by a look at the numbers.
+async function drive({ index, settle, settleLooks, maxStates, minLabelWord, mode = 'explore', step = 0, presses = 0 }) {
   const section = document.querySelectorAll('section.playground')[index];
   const steps = [...section.querySelectorAll('ol.how > li')].map((li) => li.textContent.replace(/\s+/g, ' ').trim());
   const wait = (ms) => new Promise((r) => setTimeout(r, ms));
@@ -123,9 +127,31 @@ async function drive({ index, settle, settleLooks, maxStates, minLabelWord }) {
     snapshot();
   };
 
+  // Buttons, in the order a step names them. Pressing one up to `presses` times shows counters that grow with each press.
+  const escape = (s) => s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+  const buttons = [...section.querySelectorAll('button')].map((el) => ({ el, label: clean(el.textContent || el.getAttribute('aria-label')) })).filter((b) => b.label.length >= 3);
+  const named = (text) => {
+    const low = clean(text);
+    return buttons.map((b) => ({ b, at: low.search(new RegExp(`\\b${escape(b.label)}\\b`)) })).filter((x) => x.at >= 0).sort((x, y) => x.at - y.at).map((x) => x.b);
+  };
+  const press = async (list) => {
+    for (const b of list) {
+      for (let i = 0; i < presses; i++) {
+        if (b.el.disabled || !b.el.isConnected) break;
+        b.el.click();
+        await stable();
+        snapshot();
+      }
+    }
+  };
+
   snapshot();
+  if (mode === 'buttons') {
+    await press(buttons);
+    return { steps, numbers: [...seen] };
+  }
   // Each control on its own: every option, both ends of a slider, the other state of a box.
-  for (const c of controls) {
+  if (mode === 'explore') for (const c of controls) {
     if (c.kind === 'select') for (const o of c.el.options) await run([[c, o.value]]);
     else if (c.kind === 'range' || c.kind === 'number') { if (c.el.min !== '') await run([[c, c.el.min]]); if (c.el.max !== '') await run([[c, c.el.max]]); }
     else await run([[c, !c.def]]);
@@ -139,7 +165,12 @@ async function drive({ index, settle, settleLooks, maxStates, minLabelWord }) {
     for (const c of controls) {
       const mentioned = c.label.length >= 3 && (low.includes(c.label) || c.label.split(' ').some((w) => w.length >= minLabelWord && new RegExp(`\\b${w}`).test(low)));
       if (c.kind === 'select') {
-        for (const o of c.el.options) { const t = clean(o.textContent); if (t.length >= 3 && low.includes(t)) picks.push([[c, o.value]]); }
+        // An option is named by its text, or by all its longer words when the step fills in a placeholder ("Retry 3 times" for "Retry N times").
+        const words = new Set(clean(text).split(' '));
+        for (const o of c.el.options) {
+          const t = clean(o.textContent), long = t.split(' ').filter((w) => w.length >= 3);
+          if (t.length >= 3 && (low.includes(t) || (long.length >= 3 && long.every((w) => words.has(w))))) picks.push([[c, o.value]]);
+        }
       } else if ((c.kind === 'range' || c.kind === 'number') && mentioned) {
         const min = Number(c.el.min || 0), max = Number(c.el.max || 0), step = Number(c.el.step || 1) || 1;
         for (const q of quoted) if (q >= min && q <= max) picks.push([[c, min + Math.round((q - min) / step) * step]]);
@@ -147,6 +178,19 @@ async function drive({ index, settle, settleLooks, maxStates, minLabelWord }) {
     }
     return picks;
   });
+  if (mode === 'step') {
+    // A step that names no button usually continues from the last one that did ("now switch to Unordered").
+    let own = [];
+    for (let k = step; k >= 0 && !own.length; k--) own = named(steps[k]);
+    // The earlier steps' settings, then this step's settings one at a time and all together, pressing the buttons after each.
+    const before = plan.slice(0, step).flat().flat();
+    for (const p of [...plan[step], plan[step].flat()]) {
+      restore();
+      await run([...before, ...p]);
+      await press(own);
+    }
+    return { steps, numbers: [...seen] };
+  }
   const cumulative = [];
   for (const picks of plan) {
     for (const p of picks) await run(p); // the step on its own
@@ -156,36 +200,6 @@ async function drive({ index, settle, settleLooks, maxStates, minLabelWord }) {
   }
   return { steps, numbers: [...seen] };
 }
-
-const results = []; // one entry per simulation
-async function check(path, context) {
-  const page = await context.newPage();
-  await page.addInitScript((seed) => {
-    let s = seed >>> 0; // mulberry32, so every run draws the same "random" numbers
-    Math.random = () => { s = (s + 0x6D2B79F5) | 0; let t = Math.imul(s ^ (s >>> 15), 1 | s); t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t; return ((t ^ (t >>> 14)) >>> 0) / 4294967296; };
-  }, SEED);
-  await page.goto(origin + base + path, { waitUntil: 'load' });
-  const count = await page.$$eval('section.playground', (s) => s.map((x) => !!x.querySelector('ol.how')));
-  for (let i = 0; i < count.length; i++) {
-    if (!count[i]) continue;
-    if (i > 0) await page.goto(origin + base + path, { waitUntil: 'load' });
-    const out = await page.evaluate(drive, { index: i, settle: SETTLE_MS, settleLooks: SETTLE_LOOKS, maxStates: MAX_STATES, minLabelWord: MIN_LABEL_WORD });
-    results.push({ key: `${path}#${i}`, ...out });
-  }
-  await page.close();
-}
-
-const browser = await playwright.chromium.launch({ executablePath: process.env.CHROMIUM_PATH || undefined });
-const context = await browser.newContext({ reducedMotion: 'reduce', viewport: { width: 1280, height: 900 } });
-const queue = [...wanted];
-await Promise.all(Array.from({ length: PARALLEL }, async () => {
-  while (queue.length) {
-    const path = queue.shift();
-    try { await check(path, context); } catch (e) { results.push({ key: `${path}#?`, steps: [], numbers: [], error: String(e).split('\n')[0] }); }
-  }
-}));
-await browser.close();
-stop();
 
 // Which quoted numbers did the simulation never show?
 function claims(text) {
@@ -205,6 +219,52 @@ function claims(text) {
 const shown = (c, numbers) => numbers.some((o) => c.decimals
   ? Math.abs(Math.round(o * 10 ** c.decimals) / 10 ** c.decimals - c.value) < 1e-9
   : o === c.value || (c.approx && Math.abs(o - c.value) <= APPROX_TOLERANCE * c.value));
+
+const results = []; // one entry per simulation
+async function check(path, context) {
+  const page = await context.newPage();
+  await page.addInitScript((seed) => {
+    let s = seed >>> 0; // mulberry32, so every run draws the same "random" numbers
+    Math.random = () => { s = (s + 0x6D2B79F5) | 0; let t = Math.imul(s ^ (s >>> 15), 1 | s); t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t; return ((t ^ (t >>> 14)) >>> 0) / 4294967296; };
+  }, SEED);
+  await page.goto(origin + base + path, { waitUntil: 'load' });
+  const count = await page.$$eval('section.playground', (s) => s.map((x) => !!x.querySelector('ol.how')));
+  const opts = { settle: SETTLE_MS, settleLooks: SETTLE_LOOKS, maxStates: MAX_STATES, minLabelWord: MIN_LABEL_WORD, presses: PRESSES };
+  const fresh = async () => page.goto(origin + base + path, { waitUntil: 'load' });
+  let loaded = true;
+  for (let i = 0; i < count.length; i++) {
+    if (!count[i]) continue;
+    if (!loaded) await fresh();
+    loaded = false;
+    const out = await page.evaluate(drive, { ...opts, index: i });
+    const seen = new Set(out.numbers);
+    const open = () => out.steps.map((text, k) => (claims(text).some((c) => !shown(c, [...seen])) ? k : -1)).filter((k) => k >= 0);
+    // Numbers the controls alone never showed: follow each such step from a fresh page and press the buttons it names,
+    // then, for whatever is still missing, press every button from the defaults.
+    for (const k of open()) {
+      await fresh();
+      (await page.evaluate(drive, { ...opts, index: i, mode: 'step', step: k })).numbers.forEach((n) => seen.add(n));
+    }
+    if (open().length) {
+      await fresh();
+      (await page.evaluate(drive, { ...opts, index: i, mode: 'buttons' })).numbers.forEach((n) => seen.add(n));
+    }
+    results.push({ key: `${path}#${i}`, steps: out.steps, numbers: [...seen] });
+  }
+  await page.close();
+}
+
+const browser = await playwright.chromium.launch({ executablePath: process.env.CHROMIUM_PATH || undefined });
+const context = await browser.newContext({ reducedMotion: 'reduce', viewport: { width: 1280, height: 900 } });
+const queue = [...wanted];
+await Promise.all(Array.from({ length: PARALLEL }, async () => {
+  while (queue.length) {
+    const path = queue.shift();
+    try { await check(path, context); } catch (e) { results.push({ key: `${path}#?`, steps: [], numbers: [], error: String(e).split('\n')[0] }); }
+  }
+}));
+await browser.close();
+stop();
 
 const baseline = existsSync(baselinePath) ? JSON.parse(readFileSync(baselinePath, 'utf8')) : {};
 const fresh = {}; // what the baseline would be after this run
