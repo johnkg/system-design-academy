@@ -3,6 +3,15 @@ export interface Change { date: string; title: string; items: { text: string; hr
 
 export const changelog: Change[] = [
   {
+    date: '2026-10-25',
+    title: 'Three new concepts and three new case studies',
+    items: [
+      { text: 'New concepts: probabilistic data structures (Bloom filters, HyperLogLog and count-min sketches), service discovery, and geospatial indexing (geohash, quadtrees, S2 and H3), each with an animation, a simulation and code.', href: 'concepts/' },
+      { text: 'New case studies: a calendar and scheduling service, real-time ad bidding, and a flight search aggregator.', href: 'case-studies/' },
+      { text: 'Case studies that use these ideas (key-value store, web crawler, proximity service, ride sharing, service mesh and others) now link to the new concept pages.' },
+    ],
+  },
+  {
     date: '2026-10-23',
     title: 'Every case study reviewed',
     items: [

@@ -1,0 +1,107 @@
+{
+  "name": "Probabilistic Data Structures",
+  "area": "data",
+  "difficulty": "intermediate",
+  "intent": "Answer 'have I seen this?', 'how many distinct?' and 'how often?' over billions of items from a few kilobytes or megabytes of memory, by accepting a small, known error instead of storing every item.",
+  "scenario": "A web crawler has already seen 1 billion URLs and must check every new link against that set before fetching it. Stored exactly, at about 100 bytes per URL, the set is 100 GB: too big for memory, so every check would be a lookup in a database. A Bloom filter sized for 1% false positives needs 9.6 bits per URL, 1.2 GB, and fits in RAM. The same crawler, split into shards, also wants the number of distinct URLs it found today and the hosts that receive the most links, without keeping a second copy of every URL.",
+  "problem": "Exact answers need exact storage. A set that remembers every URL grows with every URL, and counting distinct items across shards means shipping and deduplicating every item. At billions of items that is hundreds of gigabytes and a network lookup per question. Many questions do not need exactness: a crawler can afford to skip 1 page in 100, a dashboard can show 50.2 million instead of 50.0 million, and a database only needs to know which files can be skipped. Probabilistic data structures (structures whose answers are right with a known probability) trade a small, tunable error for memory that is fixed or grows far more slowly than the data.",
+  "howItWorks": [
+    { "title": "Bloom filter: 'definitely not' or 'probably yes'", "text": "A Bloom filter is an array of m bits, all 0 at first, plus k hash functions. To add a URL, hash it k times and set those k bits to 1. To check a URL, hash it the same way: if any of the k bits is 0, the URL was definitely never added; if all k are 1, it was probably added. Bits are only ever set, so an added item always passes: there are no false negatives (a 'no' for an item that was added). A false positive happens when other items have already set all k bits of a new one. The filter never stores the URLs, so it cannot list them or tell you which item set a bit." },
+    { "title": "Sizing a Bloom filter from n and p", "text": "For n items and a target false-positive rate p, the best size is m = -n ln p / (ln 2)^2 bits and the best number of hashes is k = (m/n) ln 2. That gives about 9.6 bits per item and k = 7 for 1%, 14.4 bits and k = 10 for 0.1%: each 10 times fewer false positives costs about 4.8 more bits per item, whatever the size of the items. The rate is (1 - e^(-kn/m))^k, and at the best k about half the bits are 1. Too few hashes check too few bits; too many fill the array. The size is fixed when the filter is built: insert twice the planned items and 1% becomes about 16%. RocksDB uses about 10 bits per key for roughly 1%, and Cassandra sets the rate per table with bloom_filter_fp_chance." },
+    { "title": "Deleting, merging and rebuilding", "text": "You cannot delete from a plain Bloom filter: the bits of one item are shared with others, so clearing them creates false negatives for items that are still present. A counting Bloom filter replaces each bit with a small counter (4 bits is the usual choice) that is incremented on add and decremented on delete, at 4 times the memory; a cuckoo filter (which stores short fingerprints of items in a hash table) also supports deletion. Two Bloom filters built with the same m and hash functions merge by a bitwise OR, which gives exactly the filter of the union. To change the size or forget old items, rebuild from the source of truth or rotate filters per time window." },
+    { "title": "HyperLogLog: distinct counts in kilobytes", "text": "HyperLogLog estimates how many distinct items it has seen. It hashes each item, uses the first bits of the hash to pick one of m registers, and stores in that register the longest run of leading zeros seen in the rest of the hash (plus one). A run of 20 zeros is rare (1 in about a million hashes), so long runs mean many distinct items; averaging over many registers (a harmonic mean) makes the estimate stable. Seeing the same item again changes nothing, because it hashes to the same value. The standard error is about 1.04 / sqrt(m). Redis uses 16,384 registers of 6 bits: at most 12 KB per key (small counts use a more compact sparse encoding) and 0.81% standard error, whether it counts a million items or a billion. PFADD adds items, PFCOUNT returns the estimate and PFMERGE combines keys. BigQuery APPROX_COUNT_DISTINCT uses HyperLogLog++, an improved version." },
+    { "title": "Count-min sketch: approximate frequencies", "text": "A count-min sketch estimates how often each item appears. It is a table of d rows by w counters with one hash function per row. To count a host, add 1 to one counter in every row; to read a host's count, take the smallest of its d counters. Other items that collide in a counter only add to it, so the estimate is never below the true count, only above it. With w = e / epsilon and d = ln(1 / delta) the overestimate is at most epsilon x N (N is the total of all counts) with probability 1 - delta: 2,719 counters by 5 rows keeps the error under 0.1% of N with 99.3% probability. To list heavy hitters (the most frequent items), keep a small heap of the top candidates next to the sketch, because the sketch itself cannot list items." },
+    { "title": "Merge across shards, and know when exact is required", "text": "Sketches of the same size and hash functions merge without loss: Bloom filters by OR, HyperLogLog registers by taking the maximum, count-min counters by adding. So each shard or each minute keeps its own small sketch and a query merges only the ones it needs, which is how analytics engines such as Druid store distinct counts in rolled-up rows. Distinct counts cannot be added: two shards that both found a URL count it twice, and the merged sketch counts it once. Use exact structures when an error has a real cost: billing, deduplicating payments or clicks that are paid for, security decisions, or any set you must list, delete from or audit." }
+  ],
+  "pros": [
+    "Memory is fixed or small per item: 9.6 bits per URL for 1% instead of about 100 bytes, or 12 KB for any distinct count",
+    "The error is known in advance and set by the size, so you choose it instead of discovering it",
+    "Sketches merge across shards, partitions and time windows without shipping the raw items",
+    "Updates and lookups are a few hash computations and memory accesses, cheap enough to sit in front of every disk read",
+    "A Bloom filter saves the expensive operation for keys that do not exist, which are often most of the lookups"
+  ],
+  "cons": [
+    "Answers can be wrong: a Bloom filter says 'probably yes' for some new items, and counts are estimates",
+    "A plain Bloom filter cannot delete items, and none of these structures can list the items they hold",
+    "The size must be chosen up front; overfilling silently raises the error instead of failing",
+    "Merging needs identical parameters and hash functions on every shard, which becomes a versioning concern",
+    "Errors are probabilistic: a small share of answers will be off by more than the standard error"
+  ],
+  "whenToUse": [
+    "Skipping expensive lookups for keys that are probably absent: SSTables in Cassandra, HBase and RocksDB, or a crawler's seen-URL set",
+    "Distinct counts over large or high-cardinality data: unique visitors, distinct URLs, distinct users per dashboard row",
+    "Finding heavy hitters in a stream (top hosts, hot keys, abusive clients) where an overestimate is acceptable",
+    "Aggregates that must combine across shards or time windows without moving the raw items",
+    "Memory or network budgets far smaller than the data, where a known 1% error is acceptable"
+  ],
+  "whenNotToUse": [
+    "Money, billing and paid-click deduplication, where every error is a wrong charge",
+    "Security and access decisions, where a false 'yes' lets the wrong request through",
+    "Sets you must list, delete from or audit item by item",
+    "Small data that fits comfortably in an exact hash set: the error buys nothing"
+  ],
+  "pitfalls": [
+    "Sizing a Bloom filter for today's item count and then inserting twice as many: 9.6 bits per item become 4.8 and 1% becomes about 16%",
+    "Clearing bits to delete an item from a plain Bloom filter, which creates false negatives for unrelated items",
+    "Treating 'probably present' as 'present' where a wrong yes is costly, instead of confirming in the real store",
+    "Adding distinct counts from shards or days, which double-counts items seen in more than one; merge the sketches instead",
+    "Building sketches with different sizes, seeds or hash functions on different shards, so they cannot be merged",
+    "Using a weak or non-uniform hash (such as a language's default string hash), which breaks the error formulas",
+    "Reading count-min estimates for rare items as real counts: the error is relative to the total N, so small counts can be mostly noise",
+    "Forgetting the exact path: a billing report built on HyperLogLog will be off by about 1% and impossible to reconcile"
+  ],
+  "related": [
+    { "kind": "concept", "slug": "lsm-trees-vs-b-trees" },
+    { "kind": "concept", "slug": "cardinality-and-sampling" },
+    { "kind": "concept", "slug": "caching" },
+    { "kind": "concept", "slug": "database-indexing" },
+    { "kind": "concept", "slug": "database-sharding" },
+    { "kind": "concept", "slug": "consistent-hashing" },
+    { "kind": "concept", "slug": "stateful-stream-processing" },
+    { "kind": "concept", "slug": "crdts" },
+    { "kind": "concept", "slug": "columnar-formats-and-partitioning" },
+    { "kind": "concept", "slug": "idempotency" }
+  ],
+  "roles": [
+    { "id": "crawler", "label": "Crawler", "description": "Fetches pages, extracts links and must decide for each link whether it was already seen." },
+    { "id": "filter", "label": "Bloom filter", "description": "A bit array in memory, 9.6 bits per seen URL, that answers 'definitely new' or 'probably seen'." },
+    { "id": "store", "label": "URL store", "description": "The exact set of seen URLs on disk, about 100 GB: correct but slow to query for every link." },
+    { "id": "sketch", "label": "Sketch", "description": "A small fixed-size summary kept per shard: a HyperLogLog for distinct counts or a count-min sketch for frequencies." },
+    { "id": "stats", "label": "Stats service", "description": "Merges the shards' sketches and answers 'how many distinct URLs today?'." }
+  ],
+  "quiz": [
+    {
+      "question": "A key-value store keeps a Bloom filter for each of its 20 sorted files on disk, each sized for 1% false positives. Most reads ask for keys that do not exist. About how many disk reads does a lookup for a missing key cause on average?",
+      "options": [
+        "None: a Bloom filter never answers wrongly for a missing key",
+        "About 20, since every file must still be opened to be sure",
+        "About 0.2: each filter wrongly says 'maybe' 1% of the time",
+        "About 1, since the filters share a single 1% error budget"
+      ],
+      "answer": 2,
+      "explanation": "Each of the 20 filters independently passes a missing key 1% of the time, so the expected number of wasted reads is 20 x 0.01 = 0.2, instead of 20 without filters. 'Never wrong' confuses the two errors: a Bloom filter has no false negatives (it never misses a key that is present) but it does have false positives for missing keys. The error is per filter, not shared."
+    },
+    {
+      "question": "A crawler wants to recrawl each URL 30 days after its last visit. Its plan is to clear a URL's bits in the seen-URL Bloom filter when the 30 days are up. What goes wrong?",
+      "options": [
+        "Other URLs share those bits, so some look new and get fetched again",
+        "Nothing: clearing the bits removes exactly that URL and no other",
+        "The false-positive rate rises, because clearing bits leaves more of them set",
+        "The filter has to be resized, because its number of bits has changed"
+      ],
+      "answer": 0,
+      "explanation": "Each bit is shared by many URLs, so clearing one URL's bits turns other URLs' checks into a false 'definitely new' (a false negative), which a plain Bloom filter otherwise never produces. Removing exactly one item is what a counting Bloom filter or a cuckoo filter allows; another option is one filter per time window that is dropped as a whole. Clearing bits lowers, not raises, the false-positive rate, and the array size never changes."
+    },
+    {
+      "question": "Sixteen crawler shards each count the distinct URLs they found today. A dashboard adds the 16 counts and shows 61 million, but many URLs are found by more than one shard. What gives the right number cheaply?",
+      "options": [
+        "Send every shard's full URL list to one machine and remove duplicates",
+        "Average the 16 counts, then multiply the average by 16 shards",
+        "Divide the sum by the average number of shards that find a URL",
+        "Keep a HyperLogLog per shard and merge them register by register"
+      ],
+      "answer": 3,
+      "explanation": "Merging HyperLogLogs by taking the larger value in each register gives exactly the sketch of the union, so a URL found by several shards counts once, from 16 x 12 KB of data. Shipping full URL lists is exact but moves gigabytes for one number. Averaging and multiplying gives back the same double-counted sum, and the overlap factor is not known without the very data you are trying to avoid moving."
+    }
+  ]
+}

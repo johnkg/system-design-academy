@@ -1,0 +1,105 @@
+{
+  "name": "Geospatial Indexing",
+  "area": "databases",
+  "difficulty": "intermediate",
+  "intent": "Answer \"what is near this point?\" by reading only the few map cells around it, instead of measuring the distance to everything.",
+  "scenario": "A food app shows restaurants within 2 km of the user. The city is about 16 km across with 2,000 restaurants, crowded in the centre and sparse at the edges, and searches arrive at 5,000 per second at lunch. 3,000 couriers also report their position every 4 seconds so the app can find the nearest free one.",
+  "problem": "The obvious query computes the distance from the user to every restaurant and keeps the close ones: 2,000 distance calculations per search, 10 million per second at lunch, and 2.5 billion per second if the app grows to 500,000 restaurants nationwide. The cost grows with the size of the map, not with the size of the answer. An ordinary index does not fix it: a B-tree (the sorted tree behind most database indexes) sorts by one value, but nearness depends on latitude and longitude together. An index on latitude narrows the search to a band across the whole map, and the second column cannot narrow it further.",
+  "howItWorks": [
+    { "title": "Turn two coordinates into one sortable key", "text": "Cut the map into cells and give each point the id of its cell, built so that nearby cells usually have nearby ids. A geohash does this by halving the longitude range, then the latitude range, again and again, writing 1 for the upper half and 0 for the lower half, and interleaving the bits (longitude first). Every 5 bits become one base-32 character. Central Berlin is u33dc: every place in that cell starts with those letters, and an extra character cuts the cell into 32 smaller ones. The key is a plain string, so an ordinary index can find a whole cell with one prefix range scan (WHERE cell LIKE 'u33dc%')." },
+    { "title": "Pick the precision from the search radius", "text": "Each character shrinks the cell. At the equator, 4 characters is about 39 by 20 km, 5 about 4.9 by 4.9 km, 6 about 1.2 by 0.6 km, 7 about 153 by 153 m and 8 about 38 by 19 m. Cells get narrower away from the equator, because a degree of longitude shrinks with the cosine of the latitude: in Berlin a 5-character cell is about 3.0 km wide and 4.9 km tall. Choose the finest precision whose cells are still at least as wide and as tall as the radius, so for 2 km in Berlin that is 5 characters." },
+    { "title": "Read the cell and its 8 neighbours, then measure exactly", "text": "A user standing near a cell edge has half their circle in the next cell, and that cell's key can look unrelated: in Berlin, u33dc borders u33e1. Reading only the user's own cell silently drops results (the edge problem). So read the user's cell plus the 8 around it, which covers the whole circle when cells are at least as big as the radius. The 9 cells form a square about 3 times the cell size across, so many candidates are outside the circle: compute the true distance of each with the haversine formula (great-circle distance on a sphere of radius 6,371 km) and keep only those within the radius." },
+    { "title": "Adapt cell size to density: quadtrees and S2", "text": "A fixed cell size is wrong somewhere: a 5 km cell holds thousands of places downtown and one in the countryside. A quadtree starts with the whole map as one square and splits any square holding more than N points (for example 16 or 100) into four, so squares are small where points are dense and large where they are sparse. A search descends only into squares that touch the circle, which handles edges automatically. Google's S2 library projects the Earth onto the 6 faces of a cube, divides each face as a quadtree with 31 levels, and numbers cells along a Hilbert curve (a path that visits every cell and keeps neighbours close), so a circle is covered by a handful of cells of mixed sizes, each a range of 64-bit ids. MongoDB's 2dsphere index uses S2 cells." },
+    { "title": "Hexagons for equal neighbours: Uber H3", "text": "In a square grid the 4 diagonal neighbours are about 1.4 times farther away than the 4 side neighbours. H3, from Uber, tiles the Earth with hexagons at 16 resolutions (0 to 15), and all 6 neighbours of a hexagon are the same distance from its centre. That makes rings of neighbours ('everything within 2 hexagons') and per-area counts, such as riders and drivers per cell for surge pricing, simple and even. Each resolution also has 12 pentagons that code must tolerate, and a parent hexagon only approximately contains its 7 children." },
+    { "title": "Use the index your store already has", "text": "Redis GEOADD stores each member in a sorted set whose score is a 52-bit geohash, and GEOSEARCH (Redis 6.2 and later) reads the cell and its neighbours as score ranges, then filters by distance; note it takes longitude before latitude. PostgreSQL with PostGIS uses a GiST index, which works as an R-tree (a tree of nested bounding boxes), and ST_DWithin on the geography type to find rows within a distance in metres. Elasticsearch indexes geo_point fields in BKD trees. For moving objects such as couriers that report every few seconds, keep only the latest position in memory, overwrite it on each update, expire entries that stop reporting, and shard the index by cell, splitting hot cells such as a city centre or a stadium across more shards." }
+  ],
+  "pros": [
+    "A search reads a few cells near the user, so its cost follows the size of the answer, not the size of the map",
+    "Geohash and S2 ids are plain strings or integers, so any ordered store (a B-tree, a sorted set, an LSM tree) can index them",
+    "Cell ids double as shard keys and cache keys, and as buckets for counting things per area",
+    "Adaptive structures (quadtrees, S2 coverings, R-trees) keep the work per search even across dense and sparse areas",
+    "Built into common stores: Redis GEO commands, PostGIS, MongoDB 2dsphere and Elasticsearch geo_point"
+  ],
+  "cons": [
+    "Cells are approximate, so every candidate still needs an exact distance check",
+    "Edges need care: reading only one cell misses results, and keys of adjacent cells can look unrelated",
+    "One fixed cell size is too big in dense areas and too small in sparse ones",
+    "Fast-moving objects cause a stream of index writes and cell changes",
+    "Sharding by area creates hot shards wherever people and places cluster"
+  ],
+  "whenToUse": [
+    "\"Nearby\" searches: restaurants, shops or hotels within a radius of the user",
+    "Matching moving things to a point, such as the nearest free driver or courier",
+    "Counting or aggregating by area, such as demand per cell for surge pricing or a heat map",
+    "Geofencing (checking whether a point is inside a region) over many points or regions",
+    "Any data set large enough that measuring every distance per request is too slow"
+  ],
+  "whenNotToUse": [
+    "A few thousand points searched rarely: a scan in memory is simpler and fast enough",
+    "Route distance or travel time: cells find candidates by straight-line distance, and a road network or routing engine must rank them",
+    "Searches by name, category or price only, with no location: an ordinary index is enough",
+    "Similarity in many dimensions, such as embeddings: use a vector index, since a grid needs 3 to the power of the dimensions neighbour cells per search"
+  ],
+  "pitfalls": [
+    "Reading only the user's own cell, so places just across an edge are silently missing",
+    "Using cells smaller than the radius with only 8 neighbours, so the 3 by 3 block does not cover the circle",
+    "Treating degrees as distances: a degree of longitude is about 111 km at the equator but about 68 km in Berlin, so flat formulas on raw degrees stretch circles into ovals",
+    "Skipping the exact distance filter and returning the corners of the square of cells as if they were inside the circle",
+    "Swapping latitude and longitude: GeoJSON, PostGIS ST_MakePoint and Redis GEOADD all take longitude first",
+    "Ignoring the poles and the 180 degree meridian, where neighbour calculations wrap around and naive code breaks",
+    "Writing every courier position into the main database instead of overwriting one latest entry in memory, and never expiring couriers who went offline",
+    "Sharding by a coarse cell, so the whole city centre lands on one overloaded shard"
+  ],
+  "related": [
+    { "kind": "concept", "slug": "database-indexing" },
+    { "kind": "concept", "slug": "database-sharding" },
+    { "kind": "concept", "slug": "query-planning-and-joins" },
+    { "kind": "concept", "slug": "caching" },
+    { "kind": "concept", "slug": "embeddings-and-vector-search" },
+    { "kind": "concept", "slug": "real-time-communication" },
+    { "kind": "concept", "slug": "consistent-hashing" },
+    { "kind": "concept", "slug": "sql-vs-nosql" }
+  ],
+  "roles": [
+    { "id": "user", "label": "User app", "description": "Sends its position and a radius, such as 2 km, and shows the results." },
+    { "id": "service", "label": "Search API", "description": "Works out which cells to read, then checks the exact distance of each candidate." },
+    { "id": "index", "label": "Geo index", "description": "Maps cell keys (geohash, quadtree, S2 or H3 cells) to the places or couriers inside them." },
+    { "id": "database", "label": "Restaurants DB", "description": "The source of truth for full restaurant records; a scan here is the slow path." },
+    { "id": "courier", "label": "Courier app", "description": "A moving object that reports its position every few seconds." }
+  ],
+  "quiz": [
+    {
+      "question": "A table of 5 million shops has a B-tree index on (latitude, longitude). The query WHERE latitude BETWEEN a AND b AND longitude BETWEEN c AND d for a 2 km box is slow. Why?",
+      "options": [
+        "B-tree indexes cannot hold decimal numbers, so the database ignores this index and scans the table",
+        "The index narrows latitude only, so it reads every shop in a band around the world",
+        "Two range conditions stop the planner from using any index at all on the table",
+        "The query is fast in the index but slow because it returns millions of duplicate rows"
+      ],
+      "answer": 1,
+      "explanation": "A composite B-tree is sorted by latitude first, so the latitude range picks a contiguous slice, but inside it longitude values are scattered and every entry in that band must be read. A geohash or other cell key folds both coordinates into one value. B-trees index decimals fine, and the planner can use one range on a composite index."
+    },
+    {
+      "question": "A search for places within 2 km uses 6-character geohashes (about 1.2 by 0.6 km) and reads the user's cell plus its 8 neighbours. Users report places 1.5 km away are missing. What is the best fix?",
+      "options": [
+        "Use 7-character geohashes so each cell lookup is more precise",
+        "Read only the user's own cell, but at 4 characters",
+        "Use 5-character cells, at least 2 km across, plus 8 neighbours",
+        "Drop the exact distance check, since it may reject edge places"
+      ],
+      "answer": 2,
+      "explanation": "The 3 by 3 block reaches only one cell beyond the user's own, about 0.6 km north or south here, so the 2 km circle is not covered. Cells at least as large as the radius fix it. Finer cells make the gap worse, a single coarse cell brings back the edge problem, and the distance check removes only places truly outside the circle."
+    },
+    {
+      "question": "A ride app shards its in-memory driver index by 4-character geohash, and each driver reports every 4 seconds. At rush hour the shard holding downtown is overloaded while others sit idle. Which change helps most?",
+      "options": [
+        "Split the busy area into finer cells spread over several shards",
+        "Shard by a hash of the driver id so writes spread evenly",
+        "Write each position update to the main SQL database instead",
+        "Make every driver report once a minute instead of every 4 seconds"
+      ],
+      "answer": 0,
+      "explanation": "Finer cells in the hot area spread its load while a nearby search still reads only a few shards. Hashing by driver id spreads writes but scatters every neighbourhood across all shards, so each search must ask all of them. A database write per update is far heavier, and 1-minute positions make matching wrong."
+    }
+  ]
+}

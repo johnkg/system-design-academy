@@ -1,0 +1,117 @@
+{
+  "actors": [
+    { "id": "crawler", "label": "Crawler", "role": "crawler", "x": 12, "y": 45 },
+    { "id": "bloom", "label": "Bloom filter", "role": "filter", "x": 48, "y": 15 },
+    { "id": "store", "label": "URL store", "role": "store", "x": 86, "y": 15 },
+    { "id": "hll1", "label": "Shard 1 HLL", "role": "sketch", "x": 48, "y": 50 },
+    { "id": "hll2", "label": "Shard 2 HLL", "role": "sketch", "x": 48, "y": 82 },
+    { "id": "stats", "label": "Stats service", "role": "stats", "x": 86, "y": 66 },
+    { "id": "cms", "label": "Count-min", "role": "sketch", "x": 12, "y": 85 }
+  ],
+  "frames": [
+    {
+      "narration": "The crawler has seen 1 billion URLs. Stored exactly at about 100 bytes each that is 100 GB, so every check would be a lookup on disk. A Bloom filter with 9.6 bits per URL is 1.2 GB and fits in memory.",
+      "states": {
+        "crawler": "1 billion seen",
+        "bloom": "1.2 GB, k = 7",
+        "store": "100 GB on disk"
+      },
+      "highlight": ["bloom"]
+    },
+    {
+      "narration": "A page links to /pricing. The filter hashes it with 7 hash functions to 7 bit positions. One of those bits is 0, so /pricing was definitely never added: no store lookup is needed.",
+      "messages": [
+        { "from": "crawler", "to": "bloom", "label": "/pricing?" },
+        { "from": "bloom", "to": "crawler", "label": "a bit is 0: new" }
+      ],
+      "states": {
+        "crawler": "/pricing is new",
+        "bloom": "1 of 7 bits is 0",
+        "store": "not asked"
+      },
+      "highlight": ["bloom"]
+    },
+    {
+      "narration": "The crawler queues /pricing and sets its 7 bits to 1. Bits are only ever set, never cleared, so every later check of /pricing finds all 7 set: a Bloom filter has no false negatives.",
+      "messages": [
+        { "from": "crawler", "to": "bloom", "label": "set 7 bits" }
+      ],
+      "states": {
+        "crawler": "fetch /pricing",
+        "bloom": "7 more bits set"
+      }
+    },
+    {
+      "narration": "/about was crawled yesterday. All 7 of its bits are 1, so the answer is 'probably seen' and the link is skipped, again without touching the 100 GB store.",
+      "messages": [
+        { "from": "crawler", "to": "bloom", "label": "/about?" },
+        { "from": "bloom", "to": "crawler", "label": "all 7 set: seen" }
+      ],
+      "states": {
+        "crawler": "skip /about",
+        "bloom": "7 of 7 bits set",
+        "store": "not asked"
+      }
+    },
+    {
+      "narration": "/careers is new, but other URLs happen to have set all 7 of its bits: a false positive. At 1%, 1 in 100 new URLs looks seen, so of 50 million new links a day about 500,000 would be skipped. Where that matters, confirm 'probably seen' in the store: a false positive then costs one extra lookup.",
+      "messages": [
+        { "from": "crawler", "to": "bloom", "label": "/careers?" },
+        { "from": "bloom", "to": "crawler", "label": "all 7 set" },
+        { "from": "crawler", "to": "store", "label": "confirm /careers" },
+        { "from": "store", "to": "crawler", "label": "not found: new" }
+      ],
+      "states": {
+        "crawler": "fetch /careers",
+        "bloom": "false positive",
+        "store": "1 extra lookup"
+      },
+      "highlight": ["store"]
+    },
+    {
+      "narration": "To recrawl /about later, the crawler cannot clear its 7 bits: other URLs share them and would start to look new. A counting Bloom filter keeps a 4-bit counter per slot so items can be removed, at 4 times the memory: 4.8 GB.",
+      "states": {
+        "crawler": "recrawl /about?",
+        "bloom": "cannot clear bits",
+        "store": "source of truth"
+      },
+      "highlight": ["bloom"]
+    },
+    {
+      "narration": "To count distinct URLs found today, each crawler shard keeps a HyperLogLog: 16,384 registers of 6 bits, 12 KB. It hashes each URL, picks a register with the first 14 bits and keeps the longest run of leading zeros in the rest.",
+      "messages": [
+        { "from": "crawler", "to": "hll1", "label": "PFADD url" },
+        { "from": "crawler", "to": "hll2", "label": "PFADD url" }
+      ],
+      "states": {
+        "hll1": "12 KB sketch",
+        "hll2": "12 KB sketch"
+      },
+      "highlight": ["hll1", "hll2"]
+    },
+    {
+      "narration": "The stats service merges the two sketches by keeping the larger value in each register, like Redis PFMERGE. A URL found by both shards counts once. The estimate is about 50 million, typically within 0.81% (about 405,000), from 12 KB instead of a 5 GB list.",
+      "messages": [
+        { "from": "hll1", "to": "stats", "label": "12 KB" },
+        { "from": "hll2", "to": "stats", "label": "12 KB" }
+      ],
+      "states": {
+        "stats": "about 50 M ± 0.81%",
+        "hll1": "merged by max",
+        "hll2": "merged by max"
+      },
+      "highlight": ["stats"]
+    },
+    {
+      "narration": "To find the most-linked hosts, a count-min sketch adds 1 to one counter in each of 4 rows. news.example truly has 2,400 links; its counters read 2,412, 2,400, 2,455 and 2,403 because other hosts share some. The smallest, 2,400, is the estimate: it can be too high, never too low.",
+      "messages": [
+        { "from": "crawler", "to": "cms", "label": "+1 news.example" }
+      ],
+      "states": {
+        "cms": "min = 2,400",
+        "crawler": "link counted"
+      },
+      "highlight": ["cms"]
+    }
+  ]
+}

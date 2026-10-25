@@ -1,0 +1,217 @@
+{
+  "name": "Design a Real-Time Ad Bidding System",
+  "difficulty": "advanced",
+  "intent": "Answer a million auction requests a second from ad exchanges within a few tens of milliseconds, bid the right price for the right campaign, and spend each advertiser's daily budget evenly without one shared counter.",
+  "codeTitle": "pacing a daily budget with local slices, and counting each win once",
+  "finalIntro": "One bid request from an exchange, answered in 18 ms, won, and billed once.",
+  "prompt": "Design the bidder of a demand-side platform (DSP, the service that buys ad space for advertisers). Ad exchanges send it about a million OpenRTB bid requests per second at the peak, each describing one ad slot on a page or app and the user who will see it. For each request the bidder must choose one of 20,000 active campaigns and a price, or decline, within the exchange's time limit of about 100 ms, network included. Advertisers set daily budgets and frequency caps, and they pay only for ads that were really shown.",
+  "functional": [
+    "Receive OpenRTB bid requests (the IAB Tech Lab standard, JSON over HTTP) from several exchanges and answer with a bid or with no bid",
+    "Match each request against campaigns' targeting rules: country, device, site category, audience segments and time of day",
+    "Respect each user's frequency cap (the most times one person may see a campaign's ad, such as 3 a day) and each campaign's daily budget",
+    "Price each bid from the predicted value of the impression (one ad shown once), for first-price auctions",
+    "Record win notices, impressions and clicks, bill advertisers once for each impression, and report spend",
+    "Let advertisers create, change and pause campaigns, with the change in effect within a minute"
+  ],
+  "nonFunctional": [
+    "About 1 million bid requests per second at the peak, across 4 regions",
+    "The bidder answers within 40 ms of receiving a request, at the 99th percentile; a late answer is worth nothing",
+    "Spend each daily budget evenly across the day, and never more than 1% over it",
+    "Every impression is billed exactly once, even when a notice is delivered twice",
+    "A bidder node or a whole region can fail without losing more than that node's or region's requests",
+    "Invalid traffic (bots, spoofed sites) is filtered out before bidding where possible and before billing always"
+  ],
+  "firstAttempt": {
+    "text": "One bidder service in one data centre, with one SQL database. For each request it loads the active campaigns from the database and checks each one's targeting, reads the user's profile and today's view counts from the same database, and if a campaign fits, adds the price to the campaign's spend row and bids the full value of the impression. Win notices are written to the database as they arrive.",
+    "limits": [
+      "The data centre is far from most exchanges, so the round trip alone uses most of the 100 ms limit",
+      "Scanning 20,000 campaigns and making several database calls per request cannot fit a million requests per second into tens of milliseconds",
+      "Every bid updates one spend row per campaign, so all bidders queue on the same hot rows",
+      "Bidding the full value in a first-price auction means paying the full value every time it wins",
+      "A win notice delivered twice is written twice, so the advertiser is billed twice"
+    ]
+  },
+  "nodes": [
+    { "id": "exch", "label": "Ad exchanges", "kind": "client", "x": 12, "y": 50 },
+    { "id": "single", "label": "Bidder + SQL", "kind": "compute", "x": 50, "y": 50, "at": 0, "until": 1 },
+    { "id": "lb", "label": "Regional LB", "kind": "edge", "x": 37, "y": 50, "at": 1 },
+    { "id": "bidder", "label": "Bidder fleet", "kind": "compute", "x": 62, "y": 50, "at": 1 },
+    { "id": "ctrl", "label": "Campaign service", "kind": "compute", "x": 62, "y": 16, "at": 2 },
+    { "id": "profiles", "label": "Profile store", "kind": "data", "x": 87, "y": 16, "at": 3 },
+    { "id": "collect", "label": "Event collectors", "kind": "edge", "x": 37, "y": 84, "at": 4 },
+    { "id": "events", "label": "Event stream", "kind": "async", "x": 62, "y": 84, "at": 4 },
+    { "id": "spend", "label": "Spend and billing", "kind": "data", "x": 87, "y": 84, "at": 4 },
+    { "id": "pacer", "label": "Budget pacer", "kind": "compute", "x": 87, "y": 50, "at": 5 },
+    { "id": "model", "label": "Shading model", "kind": "compute", "x": 37, "y": 16, "at": 6 }
+  ],
+  "edges": [
+    { "from": "exch", "to": "single", "at": 0, "until": 1 },
+    { "from": "exch", "to": "lb", "at": 1 },
+    { "from": "lb", "to": "bidder", "at": 1 },
+    { "from": "ctrl", "to": "bidder", "at": 2 },
+    { "from": "bidder", "to": "profiles", "at": 3 },
+    { "from": "exch", "to": "collect", "at": 4 },
+    { "from": "collect", "to": "events", "at": 4 },
+    { "from": "events", "to": "spend", "at": 4 },
+    { "from": "spend", "to": "pacer", "at": 5 },
+    { "from": "pacer", "to": "bidder", "at": 5 },
+    { "from": "model", "to": "bidder", "at": 6 }
+  ],
+  "steps": [
+    {
+      "title": "Run stateless bidders next to the exchanges, and answer no-bid rather than late",
+      "problem": "An exchange waits about 100 ms for all bidders, counting the network. A bidder in Virginia answering an exchange in Frankfurt spends 80 to 90 ms on the round trip alone, and a bid that arrives late is simply dropped.",
+      "fix": "Run a bidder fleet in each region where the exchanges have data centres, for example US East, US West, Europe and Asia, behind a regional load balancer. The bidders keep no state of their own, so any node can answer any request and the fleet grows or shrinks with traffic. Each request gets a deadline: the bidder reads tmax (the OpenRTB field with the exchange's time limit), subtracts the measured network time and a safety margin, and aims to answer within 40 ms. Every stage checks the time left, and when it runs out the bidder answers HTTP 204 No Content, which is OpenRTB's no-bid. When the fleet is overloaded it sheds load the same way: a request that has already waited too long in a queue gets an immediate 204 instead of using CPU for an answer nobody will read.",
+      "tradeoff": "Most of the time limit is now left for real work, and overload turns into a few more no-bids instead of every answer being late. Each region is a separate fleet to run, and campaigns, budgets and user data now have to reach all of them, which the next steps deal with.",
+      "concepts": [{ "slug": "latency-and-round-trips" }, { "slug": "timeouts-and-deadlines" }, { "slug": "load-shedding" }, { "slug": "load-balancing" }]
+    },
+    {
+      "title": "Match campaigns from an in-memory index built by a control plane",
+      "problem": "Checking 20,000 campaigns' targeting rules one by one, or asking a database, takes far longer than the few milliseconds the matching stage has.",
+      "fix": "Split the system in two. A campaign service (the control plane) owns campaigns, targeting and creatives in an ordinary database where advertisers edit them. Every 30 seconds or so it builds a compact snapshot and publishes it, and each bidder loads it into memory and swaps it in at once. The snapshot is an inverted index (a map from each targeting value, such as country=DE or device=mobile, to the list of campaigns that want it), so matching a request means intersecting a few short lists instead of scanning every campaign. Cheap checks run first: a request from a seller that the site's ads.txt file (the IAB list of sellers a publisher authorises) does not list, or from an address on a blocklist, gets a no-bid before any matching. The blocklist is held as a Bloom filter (a compact set that can wrongly say yes but never wrongly says no). Pausing a campaign is also sent as an event, so it stops bidding in seconds without waiting for the next snapshot.",
+      "tradeoff": "Matching takes well under a millisecond and needs no network call. Every bidder holds the full index in memory, and campaign edits take up to a snapshot interval to apply. The Bloom filter makes a few good requests look blocked, which costs a few lost bids and never a bad one.",
+      "concepts": [{ "slug": "database-indexing" }, { "slug": "cqrs" }, { "slug": "pub-sub" }, { "slug": "probabilistic-data-structures" }]
+    },
+    {
+      "title": "Read user profiles and frequency caps from a fast store, with a strict timeout",
+      "problem": "Audience targeting and frequency caps need data about the user, which is far too large for each bidder's memory, and a slow read makes the whole answer late.",
+      "fix": "Keep profiles in a low-latency key-value store such as Aerospike or a Redis cluster, replicated in every region and sharded by user id with consistent hashing. The key is the id the exchange sends for the user (OpenRTB's buyeruid, matched to our id by cookie syncing). A profile holds the user's audience segments and how many times each campaign was shown today. The bidder reads it with a timeout of about 5 ms, taken from the request's deadline. If the read times out or the user is unknown, the bidder does not wait or retry: it bids only for campaigns that need no user data, and skips those with frequency caps. View counts are not written by the bidder but by the event pipeline after an impression really happens.",
+      "tradeoff": "One slow store node costs some value on some bids, never a late answer. Frequency caps are slightly loose, because a count is only written after the impression, so a user can see an ad once or twice more than the cap when several auctions run at the same moment.",
+      "concepts": [{ "slug": "consistent-hashing" }, { "slug": "timeouts-and-deadlines" }, { "slug": "hedged-requests-and-tail-latency" }, { "slug": "graceful-degradation" }]
+    },
+    {
+      "title": "Turn wins, impressions and clicks into an event stream counted once",
+      "problem": "Billing, pacing and frequency caps all depend on what was won and shown, and those signals arrive later from other places, sometimes twice, and sometimes from bots.",
+      "fix": "When the bidder wins, the exchange calls the win notice URL (nurl) in the bid, with the price paid filled in. The ad's impression pixel and click redirect are called later by the user's device. Stateless event collectors in each region append all of these to a partitioned event stream such as Kafka. A stream job keyed by auction id drops a notice it has already seen, keeping the ids for a day, so a retried notice is counted once. A second filter removes invalid traffic, such as data-centre addresses and impossible click rates, before anything is billed. Jobs then add up spend per campaign per minute (in windows by event time), update view counts in the profile store, and write billing records.",
+      "tradeoff": "Every consumer reads one clean, deduplicated stream, and a crash replays events without counting them twice. The totals are seconds behind the bids, which the pacer has to allow for, and the dedupe state for a day of auction ids is large and must survive restarts.",
+      "concepts": [{ "slug": "idempotency" }, { "slug": "stateful-stream-processing" }, { "slug": "windowing-and-watermarks" }, { "slug": "delivery-guarantees" }]
+    },
+    {
+      "title": "Pace budgets with local slices instead of a shared counter",
+      "problem": "Hundreds of bidder nodes in 4 regions bid for the same campaign. One central counter would put a cross-region round trip in every bid, and bidding on everything until the budget is gone spends it by late morning and misses the evening.",
+      "fix": "A budget pacer turns each daily budget into a plan that follows the expected traffic, so a quiet hour gets less than a busy one. Every few seconds it hands each bidder node a slice of the next interval's budget, sized by that node's share of the traffic, and the node spends its slice from local memory with no network call. When a slice runs low the node bids on fewer of the matching requests. The pacer reads actual spend from the event stream, and each new slice corrects for what was really spent, so an unused slice simply goes back. For example, a $50,000 campaign that expects 6% of its traffic between 3 and 4 pm plans $3,000 for that hour, or $50 a minute; a 10-second interval is about $8.33, which over 100 nodes is about 8 cents each, or about 40 wins at a $2 CPM (cost per thousand impressions).",
+      "tradeoff": "Bids never wait for a budget check, and spend follows the plan all day. The pacer works from spend that is a little old, so a campaign can go slightly over its budget, by roughly one interval's spend, which is credited back or accepted within the 1% target.",
+      "concepts": [{ "slug": "rate-limiting" }, { "slug": "consistency-models" }, { "slug": "leases-and-fencing-tokens" }]
+    },
+    {
+      "title": "Price for first-price auctions with bid shading",
+      "problem": "Since 2019 most exchanges, including Google Ad Manager, run first-price auctions, where the winner pays its own bid. Bidding the full value of an impression wins often but leaves no margin for the advertiser.",
+      "fix": "First predict the value: for a campaign paying $2 per click and a predicted click rate of 0.2%, an impression is worth $0.004, which is a $4.00 CPM. Then shade it: a model learned from past wins and losses (OpenRTB loss notices give the reason) estimates the chance of winning at each price for this kind of request, and the bidder chooses the price that gives the highest expected gain, the value minus the price times the chance of winning. With a 60% chance at $4.00 and 45% at $2.60, bidding $2.60 earns $1.40 x 0.45 = $0.63 per thousand requests instead of nothing. Models are trained offline, loaded into memory like the index, and rolled out to a small share of traffic first.",
+      "tradeoff": "Advertisers pay much less per impression, and the platform can keep its margin. A wrong model either loses auctions or overpays, and the market changes as other bidders shade too, so the win rate and price are watched per exchange and the model is retrained often.",
+      "concepts": [{ "slug": "model-evaluation-and-drift" }, { "slug": "canary-deployments" }, { "slug": "metrics" }]
+    }
+  ],
+  "failures": [
+    {
+      "scenario": "The profile store in Europe slows down, and its 99th percentile read goes from 3 ms to 40 ms",
+      "impact": "If bidders wait for it, every answer in the region is late, the exchanges drop the bids, and spend in Europe falls to nothing.",
+      "answer": "Each read has a timeout taken from the request's deadline, about 5 ms, and on a timeout the bidder bids only for campaigns that need no user data. If many reads time out, a circuit breaker skips the store for a few seconds, so bidders do not even wait. A hedged read to a second replica can be sent when the first is slow, but only if the store has spare capacity for it.",
+      "concepts": [{ "slug": "timeouts-and-deadlines" }, { "slug": "circuit-breaker" }, { "slug": "hedged-requests-and-tail-latency" }]
+    },
+    {
+      "scenario": "A large exchange doubles its traffic to us during a big sports event",
+      "impact": "CPU saturates, requests queue, and soon every answer is late, so the bidder wins nothing at all instead of less.",
+      "answer": "The bidder sheds load: a request that has queued past its deadline gets an immediate 204, and above a CPU threshold the least valuable traffic, such as sites where we rarely win, is declined first. The fleet scales out within minutes, and the QPS limit agreed with each exchange keeps a sudden flood from exceeding what the fleet was sized for.",
+      "concepts": [{ "slug": "load-shedding" }, { "slug": "autoscaling" }, { "slug": "backpressure" }]
+    },
+    {
+      "scenario": "An exchange does not get a fast reply from our win notice endpoint and calls it again",
+      "impact": "The win is counted twice, so the advertiser is billed twice and the pacer thinks the campaign has spent more than it has.",
+      "answer": "The stream job keeps the auction ids it has seen for a day and drops a repeat, so the notice is idempotent. Billing is based on the impression or the exchange's billing notice (burl), also deduplicated, rather than on the win alone, because a won ad is not always shown.",
+      "concepts": [{ "slug": "idempotency" }, { "slug": "stateful-stream-processing" }, { "slug": "delivery-guarantees" }]
+    },
+    {
+      "scenario": "The spend pipeline falls 15 minutes behind",
+      "impact": "The pacer keeps handing out slices based on old totals, so campaigns close to their budget can overspend.",
+      "answer": "Slices are small and expire, so a node that hears nothing new stops spending within an interval. The pacer watches how old its newest spend data is (the watermark) and shrinks slices as the data gets older, and it stops a campaign at a lower safety threshold until the pipeline catches up.",
+      "concepts": [{ "slug": "leases-and-fencing-tokens" }, { "slug": "windowing-and-watermarks" }, { "slug": "graceful-degradation" }]
+    },
+    {
+      "scenario": "Bid requests claim to come from a premium news site, but the traffic is from a bot farm",
+      "impact": "Advertisers pay for ads that no person saw, and the platform loses their trust.",
+      "answer": "Before bidding, requests are checked against the site's ads.txt and the exchange's sellers.json and supply chain object (IAB standards that list who may sell a site's ads), and against address and device blocklists. After the event, the stream drops impressions and clicks that look like invalid traffic before billing, and advertisers are not charged for them.",
+      "concepts": [{ "slug": "probabilistic-data-structures" }, { "slug": "stateful-stream-processing" }]
+    }
+  ],
+  "alternatives": [
+    {
+      "title": "How to keep a campaign within its budget",
+      "options": [
+        { "name": "No pacing: bid until the reported spend reaches the budget", "pro": "Nothing to build", "con": "The budget is gone by late morning, and spend goes on after the limit while reports catch up" },
+        { "name": "One central counter checked by every bid", "pro": "Exact", "con": "A cross-region round trip on every bid, and a hot key for every big campaign" },
+        { "name": "A fixed share of the day's budget per node", "pro": "No coordination at all", "con": "Traffic is uneven between nodes and hours, so some shares run out early and others are left unspent" },
+        { "name": "Short local slices from a pacer, corrected from the spend stream", "pro": "No call on the bid path, and spend follows the plan", "con": "Slightly over or under budget, by about one interval's spend" }
+      ],
+      "pick": "Local slices from a pacer. A bid cannot afford a remote call, and a small, bounded overspend is acceptable and credited back."
+    },
+    {
+      "title": "Where to keep user profiles",
+      "options": [
+        { "name": "In each bidder's memory", "pro": "Fastest possible read", "con": "Hundreds of gigabytes per node, and every node needs every update" },
+        { "name": "A key-value store replicated in each region", "pro": "A read in about a millisecond, and it scales by adding shards", "con": "Another system on the hot path, whose slow reads must be cut off by a timeout" },
+        { "name": "One central database", "pro": "One copy to keep correct", "con": "Cross-region reads cannot fit the deadline" }
+      ],
+      "pick": "A regional key-value store read with a strict timeout, with bidding on defaults when it does not answer in time."
+    },
+    {
+      "title": "How to choose the price",
+      "options": [
+        { "name": "Bid the predicted value", "pro": "Simple, and right for a second-price auction", "con": "In a first-price auction every win pays the full value" },
+        { "name": "Bid a fixed share of the value, such as 70%", "pro": "Easy to explain", "con": "Overpays where competition is weak and loses where it is strong" },
+        { "name": "Shade from a learned chance of winning", "pro": "Highest expected gain for each kind of request", "con": "Needs win and loss data, a model, and monitoring as the market shifts" }
+      ],
+      "pick": "Learned shading per exchange and kind of supply, with limits on how far below the value it may bid."
+    },
+    {
+      "title": "What to do when the deadline is close",
+      "options": [
+        { "name": "Wait for every lookup, then answer", "pro": "Every bid uses all the data", "con": "Slow lookups make answers late, and late answers win nothing" },
+        { "name": "Answer no-bid at once", "pro": "Never late, and cheap under overload", "con": "Gives up requests that could have been won with less data" },
+        { "name": "Bid with defaults for what is missing", "pro": "Keeps most of the value", "con": "A campaign that needs user data or a frequency cap cannot take part" }
+      ],
+      "pick": "Bid with defaults when a lookup is slow, and answer no-bid when the whole deadline is gone or the node is overloaded."
+    }
+  ],
+  "roles": [
+    { "id": "client", "label": "Ad exchanges", "description": "Send bid requests, run the auctions and call the win notices." },
+    { "id": "edge", "label": "Entry points", "description": "The regional load balancer and the event collectors." },
+    { "id": "compute", "label": "Bidding logic", "description": "The bidder, the campaign service, the pacer and the shading model." },
+    { "id": "data", "label": "State", "description": "User profiles, spend totals and billing records." },
+    { "id": "async", "label": "Event stream", "description": "Wins, impressions and clicks, deduplicated and filtered." }
+  ],
+  "quiz": [
+    {
+      "question": "A bidder aims to answer within 40 ms. Its profile store usually answers in 2 ms, but for a few minutes its 99th percentile read takes 60 ms, and the bidder waits for every read. The exchange's win rate for us drops to almost zero. What change fixes this?",
+      "options": [
+        "Retry each slow read once, to a second replica, after waiting the full 60 ms for the first one to answer",
+        "Ask the exchange to raise tmax for our bidder to 200 ms while the store is slow",
+        "Give each read a 5 ms timeout, and on expiry bid only for campaigns that need no user data",
+        "Load every user profile into each bidder's memory, so no network read is ever needed"
+      ],
+      "answer": 2,
+      "explanation": "A timeout taken from the deadline keeps the answer on time, and bidding without user data keeps most of the value. A retry after 60 ms is already too late. The exchange's limit is set for all bidders and the user is waiting for the page, so it will not be raised. Hundreds of gigabytes of profiles do not fit in each node's memory."
+    },
+    {
+      "question": "A campaign has a $10,000 daily budget. 300 bidder nodes in 4 regions bid for it, and today they bid on every match until the reported spend reaches the budget. The budget is gone by 10 am, and it ends $150 over. What should replace this?",
+      "options": [
+        "A pacer giving each node short budget slices that follow traffic, corrected from real spend",
+        "A central counter in US East that every bid must update before it is sent to the exchange",
+        "A fixed $33.33 for each node for the whole day, so no coordination is needed between nodes",
+        "A lock per campaign held while each bid is priced, so that two nodes never spend at the same moment"
+      ],
+      "answer": 0,
+      "explanation": "Slices follow the traffic through the day and cost no network call, and the pacer corrects them from real spend, so the overspend shrinks to about one interval's worth. A central counter is exact but puts a cross-region round trip in most bids, so they arrive late. A fixed share per node ignores uneven traffic, and a lock serialises all bids for the campaign."
+    },
+    {
+      "question": "An exchange switches from second-price to first-price auctions. A campaign keeps bidding its predicted value of $4.00 CPM. Its win rate stays the same, but its cost per thousand impressions rises from about $2.50 to $4.00. What should the bidder do?",
+      "options": [
+        "Keep bidding $4.00, because bidding the true value is always the best strategy in any kind of auction",
+        "Cut every bid on every exchange to 50% of the value, so the cost goes back down",
+        "Stop bidding on first-price exchanges, and send the budget only to second-price ones",
+        "Shade each bid to the price where value minus price, times the learned chance of winning, is highest"
+      ],
+      "answer": 3,
+      "explanation": "In a first-price auction the winner pays its bid, so the best bid is below the value, at the price with the highest expected gain, which shading learns from wins and losses. Bidding the value is best only in a second-price auction. A flat 50% cut overpays where competition is weak and loses where it is strong, and avoiding first-price exchanges gives up most of the supply."
+    }
+  ]
+}

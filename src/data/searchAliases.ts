@@ -46,4 +46,9 @@ export const aliasGroups: string[][] = [
   ['elasticsearch', 'autocomplete', 'full text', 'inverted index', 'search engine'],
   ['feed', 'timeline', 'news feed'],
   ['stripe', 'checkout', 'wallet', 'ledger', 'payment'],
+  ['bloom', 'hyperloglog', 'sketch', 'count-min', 'probabilistic', 'approximate count', 'distinct count'],
+  ['geohash', 'quadtree', 'geospatial', 'nearby', 'h3', 'location search'],
+  ['discovery', 'consul', 'eureka', 'service registry', 'service discovery'],
+  ['calendar', 'recurrence', 'rrule', 'timezone', 'time zone', 'meeting invite'],
+  ['rtb', 'bidding', 'advertising', 'ad exchange'],
 ];

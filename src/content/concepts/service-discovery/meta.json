@@ -1,0 +1,105 @@
+{
+  "name": "Service Discovery",
+  "area": "distributed",
+  "difficulty": "intermediate",
+  "intent": "Let callers find the current network addresses of a service's healthy instances by name, even though instances start, stop, move and crash all the time.",
+  "scenario": "An orders service sends 30 requests per second to a payment service. Payment runs 3 to 5 instances that an autoscaler adds and removes, each new instance gets a fresh IP address, and now and then one crashes without warning. With the first three addresses written into the orders config, every crash makes a share of payment calls fail until someone edits the file, and the instances added later never receive a single request.",
+  "problem": "A fixed list of IP addresses was fine when servers lived for years. With autoscaling and containers an instance may live for minutes, a replacement comes back on a different IP, and a crashed process cannot announce that it is gone. Every caller therefore needs a fresh answer to the question 'where is payment right now?', and every answer is a little out of date by the time it is used. The design questions are who keeps the list, how quickly a dead instance leaves it, how callers get changes, and what happens when the list itself is unavailable.",
+  "howItWorks": [
+    { "title": "Keep a registry: a live map from service name to instances", "text": "A service registry stores, for each service name, the set of instances with their address, port and metadata (zone, version, weight). Callers ask it by name instead of reading a config file. Common registries are Consul, etcd, ZooKeeper, Netflix Eureka, and in Kubernetes the API server's EndpointSlice objects (one Service lists the ready pods behind it). The map is small, about 20,000 entries of a few hundred bytes is a few megabytes, so registries keep it in memory and the hard part is keeping it true, not storing it." },
+    { "title": "Register: the instance itself, or someone watching it", "text": "With self-registration the instance calls the registry on start-up ('payment at 10.0.3.17:8080') and deregisters on a clean shutdown, as Eureka clients and Consul service definitions do. It is simple but every service, in every language, needs the code. With third-party registration a separate component watches the platform and registers on the instance's behalf: in Kubernetes the EndpointSlice controller adds each pod that matches a Service and marks it ready only after its readiness probe passes. A clean shutdown should deregister first, wait a few seconds for callers to catch up (draining), and only then exit." },
+    { "title": "Expire what stops talking: leases, heartbeats and health checks", "text": "A crashed process never deregisters, so registration is a lease with a time to live (TTL). The instance renews it with a heartbeat, for example every 10 s against a 30 s TTL, so two lost heartbeats are tolerated; when no renewal arrives within the TTL the registry removes the entry. Detection therefore takes between TTL minus one heartbeat interval and the full TTL (20 to 30 s here). etcd has leases with keep-alives, ZooKeeper deletes an ephemeral node when its client session expires, Consul supports TTL checks, and Eureka clients renew every 30 s with a 90 s expiry by default. A heartbeat only proves the process runs, so active health checks (the registry or an agent calling a health endpoint) also mark broken instances down." },
+    { "title": "Client-side or server-side discovery", "text": "In client-side discovery the caller fetches the list, keeps it in memory and picks an instance itself (round-robin, least requests), as Eureka clients or gRPC clients with a name resolver do. There is no extra hop, but every language needs the library. In server-side discovery the caller sends to one stable address and something in between picks: a load balancer, Kubernetes kube-proxy (which turns a Service's virtual IP into iptables or IPVS rules that pick a ready pod), or a service mesh sidecar such as Envoy, which receives the endpoint list from a control plane over its Endpoint Discovery Service (EDS) API. Callers stay simple, at the cost of another component on the path." },
+    { "title": "DNS-based discovery and the TTL trap", "text": "A registry can answer ordinary DNS queries: Consul serves names like payment.service.consul, and Kubernetes DNS answers my-svc.my-namespace.svc.cluster.local. A records give addresses and SRV records add the port. It works with every language, but DNS is built for caching: an answer is reused until its TTL (time to live) runs out, so a caller can keep a dead address for the lease TTL plus the DNS TTL, 30 + 30 = 60 s in the worst case. Worse, some clients ignore the TTL: a Java runtime can cache lookups for a long time or forever depending on networkaddress.cache.ttl, nginx by default resolves upstream names only when it loads its configuration, and a keep-alive or gRPC connection keeps using the old IP whatever DNS now says. A Kubernetes ClusterIP Service sidesteps this: the name resolves to a stable virtual IP and kube-proxy tracks the pods behind it." },
+    { "title": "Cache the answer, watch for changes, survive a registry outage", "text": "Asking the registry on every call adds a round trip and makes the registry part of every request, so callers keep a local copy and refresh it, either by polling (Eureka clients fetch changes every 30 s by default) or by holding a watch that pushes each change within about a second (etcd watches, Consul blocking queries, Kubernetes watches, xDS streams). If the registry goes down, callers keep using the last list: it slowly goes stale, but traffic flows. Registries also choose a side of the CAP trade-off: etcd, Consul servers and ZooKeeper replicate through a consensus protocol (Raft, or ZAB in ZooKeeper), so changes need a majority of servers and a minority side of a partition cannot register or deregister (CP). Eureka replicates between peers without a leader and keeps answering with possibly stale data, and its self-preservation mode stops expiring leases when renewals suddenly drop below 85% of the expected rate, on the bet that the network failed, not the instances (AP)." }
+  ],
+  "pros": [
+    "Instances can scale, move and be replaced without anyone editing a caller's configuration",
+    "Crashed instances leave the list by themselves within about one lease TTL",
+    "Metadata in the registry (zone, version, weight) enables zone-aware routing and canary releases",
+    "With cached lists and watches, the registry is off the request path and its load grows with changes, not with traffic",
+    "A single name works across environments, so the same code runs in test and production"
+  ],
+  "cons": [
+    "Every answer is stale by up to the lease TTL plus the cache or DNS TTL, so some calls still reach dead instances",
+    "The registry is critical infrastructure: it must be replicated, monitored and upgraded carefully",
+    "Client-side discovery needs a library in every language; server-side discovery adds a hop and a component",
+    "Short leases and fast health checks cost heartbeat traffic and can evict healthy instances during a pause",
+    "A CP registry stops accepting changes without a majority; an AP registry can serve entries that are wrong"
+  ],
+  "whenToUse": [
+    "Instances that come and go: autoscaling groups, containers, spot or preemptible machines",
+    "Many services calling each other, where hand-maintained lists cannot keep up with deploys",
+    "Platforms such as Kubernetes or Nomad, where discovery is built in and only needs to be used correctly",
+    "Routing that needs metadata such as zone, version or weight, beyond a bare address"
+  ],
+  "whenNotToUse": [
+    "A handful of long-lived servers with stable addresses: a load balancer with a fixed name is simpler",
+    "Calls to a third-party API on the internet: use its public DNS name and let the provider handle its instances",
+    "Running your own registry when the platform already provides one, such as Kubernetes Services, which adds a second source of truth",
+    "Looking up the registry on every request in a hot path: cache the list instead"
+  ],
+  "pitfalls": [
+    "Hard-coding IP addresses in config files or environment variables, which are wrong after the next deploy or scale event",
+    "Clients or proxies that cache DNS far longer than the TTL, or keep long-lived connections to an address that has moved",
+    "A lease TTL so short that a garbage-collection pause or a short network blip evicts healthy instances, or so long that dead ones get traffic for minutes",
+    "A health check that only proves the process answers HTTP, or one so deep that a shared dependency's hiccup marks every instance down at once",
+    "Shutting down without deregistering and draining first; in Kubernetes the pod's removal from the endpoints and its SIGTERM happen at the same time, so a short preStop delay avoids errors",
+    "Treating an empty or tiny answer as the truth: keep the last good list, as Envoy's panic threshold does by balancing across all hosts when fewer than 50% look healthy",
+    "Asking the registry on every call, which puts it on the request path so that a registry outage fails every request",
+    "All clients reconnecting or re-fetching at the same second after a registry restart; add jitter to watches and polls"
+  ],
+  "related": [
+    { "kind": "concept", "slug": "dns" },
+    { "kind": "concept", "slug": "health-checks" },
+    { "kind": "concept", "slug": "load-balancing" },
+    { "kind": "concept", "slug": "failure-detection" },
+    { "kind": "concept", "slug": "leases-and-fencing-tokens" },
+    { "kind": "concept", "slug": "cap-theorem" },
+    { "kind": "concept", "slug": "consensus" },
+    { "kind": "concept", "slug": "containers-and-orchestration" },
+    { "kind": "concept", "slug": "proxies" },
+    { "kind": "concept", "slug": "retries-and-backoff" }
+  ],
+  "roles": [
+    { "id": "caller", "label": "Caller", "description": "The orders service. It needs payment's current addresses and sends 30 requests per second spread over them." },
+    { "id": "registry", "label": "Registry", "description": "Keeps the map from service name to live instances, expires leases that are not renewed, and answers lookups or pushes changes." },
+    { "id": "dns", "label": "DNS", "description": "Serves the registry's data as DNS records with a TTL, which callers and resolvers cache." },
+    { "id": "instance", "label": "Payment instance", "description": "One copy of the payment service. It registers, sends heartbeats, and may scale away or crash." }
+  ],
+  "quiz": [
+    {
+      "question": "Payment instances renew a 30 second lease every 10 seconds, and the registry serves them as DNS records with a 30 second TTL. After an instance crashes, one caller keeps sending it requests for over 5 minutes, while other callers stop within a minute. What is the most likely cause?",
+      "options": [
+        "The lease is too long, so the registry keeps the dead entry for minutes",
+        "That caller keeps DNS answers or connections far past the TTL",
+        "DNS records cannot be removed once they have been published",
+        "The crashed instance still sends a heartbeat every 10 seconds"
+      ],
+      "answer": 1,
+      "explanation": "The registry dropped the entry about 30 seconds after the last heartbeat, and other callers stopped within lease plus DNS TTL, so the registry and DNS were fine. One client holding an answer or a pooled connection past the TTL explains minutes of errors. Blaming the lease is tempting, but a 30 second lease cannot keep an entry for 5 minutes, and a crashed process sends no heartbeats."
+    },
+    {
+      "question": "A switch fails and 40% of payment instances stop reaching the registry, but they can still serve callers. Renewals drop well below the expected rate. Which registry behaviour keeps the most orders succeeding?",
+      "options": [
+        "Expire their leases on time, so the list only holds proven instances",
+        "Refuse every lookup until a majority of registry servers agree again",
+        "Keep the last known list and pause lease expiry for a while",
+        "Ask callers to query the registry on every request for fresh answers"
+      ],
+      "answer": 2,
+      "explanation": "The instances are healthy, only silent, so keeping them listed (Eureka calls this self-preservation) keeps capacity in use, and callers handle any real deaths with retries. Expiring on time sounds safe but removes 40% of healthy capacity and overloads the rest. Refusing lookups or querying on every request turns a registry problem into an outage for callers."
+    },
+    {
+      "question": "A team of 2,000 instances uses a 10 second heartbeat and a 30 second TTL. To detect crashes faster they switch to a 1 second heartbeat and a 2 second TTL. What is the most likely result?",
+      "options": [
+        "Ten times the heartbeats, and short pauses evict healthy instances",
+        "Crashes are found in about 2 seconds, and nothing else changes",
+        "Callers stop caching the list, so the registry answers every request",
+        "Detection gets slower, because heartbeats stop being sent in batches"
+      ],
+      "answer": 0,
+      "explanation": "Heartbeat load grows tenfold, from 200 to 2,000 per second, and any garbage-collection pause or network blip longer than about 2 seconds removes a healthy instance, which then has to re-register. Faster detection is real, which is why the tempting option says nothing else changes, but the trade-off is load and false evictions. Callers' caching does not depend on the lease."
+    }
+  ]
+}

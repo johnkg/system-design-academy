@@ -1,0 +1,121 @@
+{
+  "actors": [
+    { "id": "orders", "label": "Orders", "role": "caller", "x": 15, "y": 50 },
+    { "id": "registry", "label": "Registry", "role": "registry", "x": 50, "y": 25 },
+    { "id": "dns", "label": "DNS", "role": "dns", "x": 50, "y": 75 },
+    { "id": "p1", "label": "Payment p1", "role": "instance", "x": 85, "y": 25 },
+    { "id": "p2", "label": "Payment p2", "role": "instance", "x": 85, "y": 50 },
+    { "id": "p3", "label": "Payment p3", "role": "instance", "x": 85, "y": 75 }
+  ],
+  "frames": [
+    {
+      "narration": "Orders has payment's addresses written into its config: p1 and p2. Round-robin spreads its 30 requests per second, 15 to each. At t=60 s the autoscaler starts p3 on a new IP address, and orders never sends it a single request.",
+      "messages": [
+        { "from": "orders", "to": "p1", "label": "15/s" },
+        { "from": "orders", "to": "p2", "label": "15/s" }
+      ],
+      "states": {
+        "orders": "config: p1, p2",
+        "p1": "15 req/s",
+        "p2": "15 req/s",
+        "p3": "idle: unknown"
+      },
+      "highlight": ["p3"]
+    },
+    {
+      "narration": "At t=155 s p2 crashes. The config still lists it, so half of all calls, 15 per second, go to a dead address: 900 failures a minute until someone edits the file and restarts orders.",
+      "messages": [
+        { "from": "orders", "to": "p2", "label": "15/s fail" }
+      ],
+      "states": {
+        "orders": "15 errors/s",
+        "p1": "15 req/s",
+        "p2": "crashed",
+        "p3": "idle: unknown"
+      },
+      "highlight": ["p2"]
+    },
+    {
+      "narration": "Fix: a registry. Each instance registers itself on start-up with its name, address and port. The entry is a lease with a 30 s time to live, renewed by a heartbeat every 10 s, so two lost heartbeats are tolerated.",
+      "messages": [
+        { "from": "p1", "to": "registry", "label": "register" },
+        { "from": "p2", "to": "registry", "label": "heartbeat" },
+        { "from": "p3", "to": "registry", "label": "register" }
+      ],
+      "states": {
+        "registry": "payment: p1 p2 p3",
+        "p1": "lease 30 s",
+        "p2": "lease 30 s",
+        "p3": "lease 30 s",
+        "orders": "no list yet"
+      },
+      "highlight": ["registry"]
+    },
+    {
+      "narration": "Orders opens a watch on 'payment'. It gets the list once, keeps it in memory, and each change is pushed within about 1 s. It picks instances itself (client-side discovery): 30 requests per second over 3 instances is 10 each, with no lookup per request.",
+      "messages": [
+        { "from": "registry", "to": "orders", "label": "p1 p2 p3" },
+        { "from": "orders", "to": "p1", "label": "10/s" },
+        { "from": "orders", "to": "p2", "label": "10/s" },
+        { "from": "orders", "to": "p3", "label": "10/s" }
+      ],
+      "states": {
+        "orders": "cache: p1 p2 p3",
+        "registry": "watched",
+        "p1": "10 req/s",
+        "p2": "10 req/s",
+        "p3": "10 req/s"
+      },
+      "highlight": ["orders"]
+    },
+    {
+      "narration": "p2 crashes at t=155 s. Its last heartbeat was at t=150 s, so its lease runs out at 150 + 30 = 180 s. The registry removes p2 and pushes the change, and orders stops calling it at 181 s: 26 s x 10 requests = 260 failed calls, or none if each failure is retried once on another instance.",
+      "messages": [
+        { "from": "registry", "to": "orders", "label": "p2 removed" }
+      ],
+      "states": {
+        "p2": "crashed at 155 s",
+        "registry": "lease expired 180 s",
+        "orders": "260 errors in 26 s",
+        "p1": "15 req/s",
+        "p3": "15 req/s"
+      },
+      "highlight": ["registry"]
+    },
+    {
+      "narration": "The same registry can answer DNS: payment.service.consul returns p1, p2 and p3 with a 30 s TTL. If orders resolved the name at t=179 s, it keeps p2 until 209 s, 54 s after the crash: 540 failed calls instead of 260. Worst case is lease TTL plus DNS TTL.",
+      "messages": [
+        { "from": "orders", "to": "dns", "label": "A? payment" },
+        { "from": "dns", "to": "orders", "label": "p1 p2 p3, TTL 30" }
+      ],
+      "states": {
+        "dns": "TTL 30 s",
+        "orders": "cached until 209 s",
+        "p2": "crashed at 155 s"
+      },
+      "highlight": ["dns"]
+    },
+    {
+      "narration": "Some clients ignore the TTL: a runtime that caches lookups for the life of the process, or a pooled keep-alive connection, keeps using p2's address long after DNS dropped it. That caller is back to the config-file problem.",
+      "messages": [
+        { "from": "orders", "to": "p2", "label": "still 10/s" }
+      ],
+      "states": {
+        "orders": "caches forever",
+        "dns": "p1 p3 only",
+        "p2": "still called"
+      },
+      "highlight": ["orders"]
+    },
+    {
+      "narration": "Now 2 of the registry's 3 Raft servers fail. Without a majority it accepts no registrations or removals. Orders keeps serving from its cached list, which goes slowly stale. A caller that asked the registry on every request would fail every call.",
+      "states": {
+        "registry": "no majority",
+        "orders": "uses cached list",
+        "p1": "15 req/s",
+        "p3": "15 req/s"
+      },
+      "highlight": ["registry", "orders"]
+    }
+  ]
+}

@@ -1,0 +1,155 @@
+---
+import PlaygroundShell from '../../components/PlaygroundShell.astro';
+---
+<PlaygroundShell title="Forty providers, one impatient traveller" hint="600 searches over three hours, each sent to 40 flight providers that answer at very different speeds, and some never. Change how long to wait, how results reach the page and how long fares are cached, with the same providers and the same searches every time.">
+  <ol class="how">
+    <li>With the defaults (<b>Wait for all providers</b>, no stored fares) the page stays empty for a median of <b>23.7 s</b>, and 44% of searches end with a provider that never answered.</li>
+    <li>Set the <b>global deadline</b> to <b>8 s</b>: every search ends by <b>8.0 s</b> and 92% of providers still answer. Then set the <b>per-provider timeout</b> to <b>3</b>: a stuck request is abandoned early and tried once more, so 94% answer, at 42.4 requests per search instead of 40.</li>
+    <li>Switch to <b>Stream partial results</b>: the first prices appear after <b>0.3 s</b>, while the search still closes at 8.0 s.</li>
+    <li>Set the <b>cache TTL</b> to <b>15</b>: requests per search fall to 8.0 and first prices show at once, but 2.8% of clicks find a changed price at the seller. At <b>60</b> it is 21.5%, which is why the price is checked live when the traveller selects a flight.</li>
+  </ol>
+  <div class="pg fsb" data-fsb>
+    <div class="pg-row">
+      <label>Results shown <select class="pg-in" data-mode><option value="wait">Wait for all providers</option><option value="stream">Stream partial results</option></select></label>
+      <label>Per-provider timeout (× typical) <input type="range" min="1" max="10" step="0.5" value="10" data-t /> <b data-tval></b></label>
+      <label>Global deadline (s) <input type="range" min="4" max="30" value="30" data-d /> <b data-dval></b></label>
+      <label>Cache TTL (min) <input type="range" min="0" max="60" step="5" value="0" data-c /> <b data-cval></b></label>
+      <label>Hung calls (%) <input type="range" min="0" max="30" step="5" value="5" data-h /> <b data-hval></b></label>
+    </div>
+    <div class="pg-grid">
+      <div class="pg-box" data-b1><h3>First prices on screen</h3><span class="pg-mono" data-o1></span><span class="pg-note" data-n1></span></div>
+      <div class="pg-box" data-b2><h3>Search complete</h3><span class="pg-mono" data-o2></span><span class="pg-note" data-n2></span></div>
+      <div class="pg-box" data-b3><h3>Providers with a price</h3><span class="pg-mono" data-o3></span><span class="pg-note" data-n3></span></div>
+      <div class="pg-box" data-b4><h3>Price at the seller</h3><span class="pg-mono" data-o4></span><span class="pg-note" data-n4></span></div>
+    </div>
+    <div class="fsb-strip-wrap">
+      <p class="pg-note fsb-cap" data-cap></p>
+      <ol class="fsb-strip" data-strip></ol>
+      <p class="pg-note">L = live answer in time, R = answered on the second try, C = from the cache, &times; = no price for this search.</p>
+    </div>
+    <p class="pg-out" data-verdict aria-live="polite"></p>
+    <p class="pg-note">Model: 600 searches spread over 3 hours on 12 routes, popular routes searched more often. Each goes to 40 providers: 14 airline systems that usually answer in 0.4 to 1.2 s, 16 agencies in 0.8 to 2.5 s and 10 slower sources such as GDSs in 2.5 to 6 s, with a random spread around each one's usual time. A hung call never answers. A call not answered by its timeout (the slider times that provider's usual time) is tried once more if the deadline leaves time. A call past its timeout is still left to finish, and fills the cache. A cached answer takes 0.1 s. Each provider's fare on a route changes about every 2 hours on average; the traveller clicks the cheapest price shown 1 minute after searching, and the click finds a changed price if that fare moved after it was fetched. A 30 s deadline stands for none (the browser gives up).</p>
+  </div>
+</PlaygroundShell>
+<style>
+  .fsb-strip-wrap { display: grid; gap: 6px; }
+  .fsb-cap { margin: 0; }
+  .fsb-strip { list-style: none; margin: 0; padding: 0; display: flex; flex-wrap: wrap; gap: 3px; }
+  .fsb-strip li { width: 1.6rem; height: 1.6rem; display: grid; place-items: center; border-radius: 5px; font: 600 .78rem ui-monospace, monospace; border: 1px solid var(--border); background: var(--surface); color: var(--text); transition: background-color .2s; }
+  .fsb-strip li[data-k='L'] { background: color-mix(in srgb, var(--good) 22%, var(--surface)); }
+  .fsb-strip li[data-k='R'] { background: color-mix(in srgb, var(--good) 12%, var(--surface)); border-style: dashed; }
+  .fsb-strip li[data-k='C'] { background: var(--accent-soft); }
+  .fsb-strip li[data-k='x'] { background: color-mix(in srgb, var(--bad) 16%, var(--surface)); color: var(--bad-text); }
+  @media (prefers-reduced-motion: reduce) { .fsb-strip li, .fsb .pg-box { transition: none; } }
+</style>
+<script>
+  document.querySelectorAll<HTMLElement>('[data-fsb]').forEach((root) => {
+    const q = <T extends HTMLElement>(s: string) => root.querySelector<T>(s)!;
+    const P = 40; const SEARCHES = 600; const ROUTES = 12;
+    const SPAN_MIN = 180; const HORIZON_MIN = 200; // searches over 3 hours; fare changes drawn a little beyond
+    const CHANGE_MEAN_MIN = 120; // a provider's fare on a route changes about every 2 hours
+    const CLICK_MIN = 1; // the traveller clicks 1 minute after searching
+    const HIT_S = 0.1; // answering from the cache
+    const SIGMA = 0.6; // spread of a call's latency around the provider's usual time (log-normal)
+    const TRIES = 2; // first call and one retry
+    const AIRLINES = 14, AGENCIES = 16; // the remaining 10 are slow sources
+    const SAMPLE = 300; // the search drawn in the strip
+    const PRICE_DRAWS = 12;
+    // Numerical Recipes LCG, so every visit draws the same providers, searches and fare changes.
+    let seed = 2024; const rnd = () => ((seed = (seed * 1664525 + 1013904223) % 4294967296) / 4294967296);
+    const normal = () => { const u = Math.max(rnd(), 1e-9), v = rnd(); return Math.sqrt(-2 * Math.log(u)) * Math.cos(2 * Math.PI * v); };
+    const usual = Array.from({ length: P }, (_, i) => (i < AIRLINES ? 0.4 + 0.8 * rnd() : i < AIRLINES + AGENCIES ? 0.8 + 1.7 * rnd() : 2.5 + 3.5 * rnd()));
+    const weights = Array.from({ length: ROUTES }, (_, r) => 1 / (r + 1)); const wsum = weights.reduce((a, b) => a + b, 0);
+    const pickRoute = (u: number) => { let acc = 0; for (let r = 0; r < ROUTES; r++) { acc += weights[r] / wsum; if (u < acc) return r; } return ROUTES - 1; };
+    const changes = Array.from({ length: P * ROUTES }, () => { const t: number[] = []; let x = 0; for (;;) { x += -Math.log(Math.max(rnd(), 1e-9)) * CHANGE_MEAN_MIN; if (x > HORIZON_MIN) break; t.push(x); } return t; });
+    const priceDraw = Array.from({ length: P * ROUTES }, () => Array.from({ length: PRICE_DRAWS }, () => rnd()));
+    const version = (k: number, t: number) => { let v = 0; for (const c of changes[k]) { if (c > t) break; v++; } return v; };
+    const price = (k: number, v: number, r: number) => Math.round((150 + 20 * r) * (0.85 + 0.4 * priceDraw[k][v % PRICE_DRAWS]));
+    const searches = Array.from({ length: SEARCHES }, (_, i) => ({
+      t: (i * SPAN_MIN) / SEARCHES, route: pickRoute(rnd()),
+      lat: Array.from({ length: P * TRIES }, (_, j) => usual[j % P] * Math.exp(SIGMA * normal())),
+      hang: Array.from({ length: P * TRIES }, () => rnd()),
+    }));
+    const strip = q('[data-strip]');
+    const cells = Array.from({ length: P }, () => { const li = document.createElement('li'); strip.append(li); return li; });
+
+    function simulate(timeout: number, deadline: number, stream: boolean, ttl: number, hung: number) {
+      const cache = new Map<number, { at: number; v: number }>();
+      const put = (k: number, at: number, v: number) => { const c = cache.get(k); if (!c || c.at < at) cache.set(k, { at, v }); };
+      const first: number[] = [], done: number[] = []; let answered = 0, calls = 0, stale = 0, clicks = 0, cut = 0, hits = 0;
+      let sample: string[] = [];
+      searches.forEach((s, idx) => {
+        let f = Infinity, end = 0, all = true; let best: { pr: number; k: number; v: number } | null = null;
+        const marks: string[] = [];
+        for (let p = 0; p < P; p++) {
+          const k = p * ROUTES + s.route; const c = cache.get(k);
+          let got: number | null = null, v = 0, mark = 'x';
+          if (ttl > 0 && c && c.at <= s.t && s.t - c.at < ttl) { got = HIT_S; v = c.v; mark = 'C'; hits++; }
+          else {
+            const to = timeout * usual[p]; let start = 0;
+            for (let a = 0; a < TRIES && got === null && start < deadline; a++) {
+              calls++;
+              const j = a * P + p; const ans = start + s.lat[j];
+              if (s.hang[j] >= hung / 100) {
+                const at = s.t + ans / 60; const ver = version(k, at); put(k, at, ver); // a late answer still fills the cache
+                if (ans <= Math.min(start + to, deadline)) { got = ans; v = ver; mark = a === 0 ? 'L' : 'R'; }
+              }
+              start += to;
+            }
+            if (got === null) { all = false; end = Math.max(end, Math.min(start, deadline)); marks.push(mark); continue; }
+          }
+          marks.push(mark);
+          answered++; f = Math.min(f, got); end = Math.max(end, got);
+          const pr = price(k, v, s.route); if (!best || pr < best.pr) best = { pr, k, v };
+        }
+        if (!all) cut++;
+        done.push(end); first.push(stream ? Math.min(f, end) : end);
+        if (best) { clicks++; if (version(best.k, s.t + CLICK_MIN) !== best.v) stale++; }
+        if (idx === SAMPLE) sample = marks;
+      });
+      const pick = (a: number[], x: number) => { const b = [...a].sort((m, n) => m - n); return b[Math.floor(b.length * x)]; };
+      return {
+        first: pick(first, 0.5), first95: pick(first, 0.95), done: pick(done, 0.5), done95: pick(done, 0.95),
+        answered: Math.round((100 * answered) / (P * SEARCHES)), calls: calls / SEARCHES, hits: Math.round((100 * hits) / (P * SEARCHES)),
+        stale: clicks ? (100 * stale) / clicks : 0, cut: Math.round((100 * cut) / SEARCHES), sample,
+      };
+    }
+
+    function draw() {
+      const mode = q<HTMLSelectElement>('[data-mode]').value; const stream = mode === 'stream';
+      const t = Number(q<HTMLInputElement>('[data-t]').value); const d = Number(q<HTMLInputElement>('[data-d]').value);
+      const c = Number(q<HTMLInputElement>('[data-c]').value); const h = Number(q<HTMLInputElement>('[data-h]').value);
+      q('[data-tval]').textContent = `${t}×`; q('[data-dval]').textContent = `${d} s`; q('[data-cval]').textContent = c ? `${c} min` : 'off'; q('[data-hval]').textContent = `${h}%`;
+      const r = simulate(t, d, stream, c, h);
+      const s1 = (x: number) => x.toFixed(1);
+      q('[data-o1]').textContent = `median ${s1(r.first)} s`;
+      q('[data-n1]').textContent = `slowest 5%: ${s1(r.first95)} s; ${stream ? 'offers are shown as each provider answers' : 'nothing is shown until the search is complete'}`;
+      q('[data-o2]').textContent = `median ${s1(r.done)} s`;
+      q('[data-n2]').textContent = `slowest 5%: ${s1(r.done95)} s; ${r.cut}% of searches closed with a provider missing`;
+      q('[data-o3]').textContent = `${r.answered}% of 40 providers`;
+      q('[data-n3]').textContent = `${s1(r.calls)} requests to providers per search (40 with no cache and no retries); ${r.hits}% of prices from the cache`;
+      q('[data-o4]').textContent = `${s1(r.stale)}% of clicks find a changed price`;
+      q('[data-n4]').textContent = c ? `cached fares are up to ${c} min old; a live check at selection shows the new price before hand-off` : 'every price was fetched live during the search';
+      const slowFirst = r.first > 2; const slowDone = r.done > 10; const staleBad = r.stale > 5;
+      q<HTMLElement>('[data-b1]').style.setProperty('--c', slowFirst ? 'var(--bad)' : 'var(--good)');
+      q<HTMLElement>('[data-b2]').style.setProperty('--c', slowDone ? 'var(--bad)' : 'var(--good)');
+      q<HTMLElement>('[data-b3]').style.setProperty('--c', r.answered < 90 ? 'var(--bad)' : 'var(--good)');
+      q<HTMLElement>('[data-b4]').style.setProperty('--c', staleBad ? 'var(--bad)' : 'var(--good)');
+      const counts = { L: 0, R: 0, C: 0, x: 0 } as Record<string, number>;
+      r.sample.forEach((m, i) => { cells[i].textContent = m === 'x' ? '×' : m; cells[i].dataset.k = m; counts[m]++; });
+      q('[data-cap]').textContent = `One search (number ${SAMPLE}), provider by provider:`;
+      strip.setAttribute('aria-label', `Search ${SAMPLE}: ${counts.L} live answers in time, ${counts.R} on the second try, ${counts.C} from the cache, ${counts.x} without a price`);
+      const out = q('[data-verdict]'); out.classList.toggle('bad', slowFirst || slowDone || staleBad);
+      let msg: string;
+      if (slowFirst) msg = `Travellers wait a median of ${s1(r.first)} s before seeing a single price. ${stream ? 'Even streaming cannot help while every provider is slow to reach.' : 'Show offers as they arrive instead of waiting for the slowest provider.'}`;
+      else if (slowDone) msg = `First prices appear after ${s1(r.first)} s, but the search runs for a median of ${s1(r.done)} s because of providers that never answer. A global deadline closes it on time.`;
+      else msg = `First prices after ${s1(r.first)} s and every search closes by ${s1(r.done95)} s, with ${r.answered}% of providers priced.`;
+      if (staleBad) msg += ` But ${s1(r.stale)}% of clicks would meet a different price at the seller: check the chosen fare live, or shorten the TTL.`;
+      else if (c > 0) msg += ` The cache cuts provider requests to ${s1(r.calls)} per search, and ${s1(r.stale)}% of clicks need the live check to correct the price.`;
+      out.textContent = msg;
+    }
+    root.addEventListener('input', draw);
+    root.addEventListener('change', draw);
+    draw();
+  });
+</script>

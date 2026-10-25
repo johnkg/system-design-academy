@@ -1,0 +1,165 @@
+---
+import PlaygroundShell from '../components/PlaygroundShell.astro';
+---
+<PlaygroundShell title="Simulate it" hint="Size a crawler's seen-URL Bloom filter and test it on URLs it never saw, then count distinct links across 4 shards with HyperLogLog.">
+  <ol class="how">
+    <li>Start as it is: <b>10,000</b> URLs inserted into a <b>12 KB</b> filter with <b>7</b> hash functions, which is 9.6 bits per URL. Of 20,000 URLs that were never inserted, 183 (0.92%) wrongly look already seen, against 1.00% from the formula, and false negatives stay at 0. Storing the URLs exactly would take 1,000 KB.</li>
+    <li>Set <b>Hash functions</b> to 1: the measured rate jumps to 9.92% (formula 9.89%), because each URL checks only one bit. Set it to 16: 3.50% (formula 3.51%), because 81.3% of the bits are now 1. The best k is (m/n) ln 2 = 6.65, so 7, which leaves about half the bits set.</li>
+    <li>Set hash functions back to 7 and raise <b>URLs inserted</b> to 20,000 without changing the filter: only 4.8 bits per URL remain and the measured rate climbs to 15.78% (formula 15.67%). A Bloom filter cannot grow, so raise <b>Filter size</b> to 24 KB: it falls back to 1.08%.</li>
+    <li>In the HyperLogLog panel keep 500 thousand distinct links and <b>16,384</b> registers, as Redis uses: the sketch is 12 KB and the merged estimate is off by 0.45%, inside the expected standard error of 0.81%. Adding the 4 shard counts instead gives about 666,000, because links found by two shards are counted twice.</li>
+    <li>Set <b>Registers</b> to 16: the sketch shrinks to 12 bytes, the expected error grows to 26.00% and this run is off by 10.57%. With 1,024 registers (768 bytes) the expected error is 3.25%.</li>
+  </ol>
+  <div class="pg pd" data-pd>
+    <h3 class="pd-h">Bloom filter</h3>
+    <div class="pg-row">
+      <label>URLs inserted <input type="range" min="1000" max="20000" step="1000" value="10000" data-n /> <b data-nval>10,000</b></label>
+      <label>Filter size (KB) <input type="range" min="1" max="48" step="1" value="12" data-kb /> <b data-kbval>12</b></label>
+      <label>Hash functions (k) <input type="range" min="1" max="16" step="1" value="7" data-k /> <b data-kval>7</b></label>
+    </div>
+    <div class="pg-grid">
+      <div class="pg-box" data-fpbox style="--c: var(--role-1)"><h3>False positives, measured</h3> <span class="pg-mono" data-fp></span> <span class="pg-note" data-fpnote></span></div>
+      <div class="pg-box" style="--c: var(--role-2)"><h3>Formula (1 - e^(-kn/m))^k</h3> <span class="pg-mono" data-formula></span> <span class="pg-note" data-formulanote></span></div>
+      <div class="pg-box" style="--c: var(--role-3)"><h3>Memory</h3> <span class="pg-mono" data-mem></span> <span class="pg-note" data-memnote></span></div>
+      <div class="pg-box" style="--c: var(--role-4)"><h3>Bits set to 1</h3> <span class="pg-mono" data-fill></span> <span class="pg-note" data-fn></span></div>
+    </div>
+    <div class="pd-meter" role="img" data-meter><span class="pd-meter-fill" data-meterfill></span></div>
+    <p class="pg-mono" data-scale></p>
+    <p class="pg-out" data-verdict aria-live="polite"></p>
+
+    <h3 class="pd-h">HyperLogLog across 4 shards</h3>
+    <div class="pg-row">
+      <label>Distinct links today (thousands) <input type="range" min="10" max="1000" step="10" value="500" data-d /> <b data-dval>500</b></label>
+      <label>Registers
+        <select class="pg-in" data-p>
+          <option value="4">16</option>
+          <option value="6">64</option>
+          <option value="8">256</option>
+          <option value="10">1,024</option>
+          <option value="12">4,096</option>
+          <option value="14" selected>16,384 (Redis)</option>
+        </select>
+      </label>
+    </div>
+    <div class="pg-grid">
+      <div class="pg-box" style="--c: var(--role-1)"><h3>Merged estimate</h3> <span class="pg-mono" data-est></span> <span class="pg-note" data-estnote></span></div>
+      <div class="pg-box" data-errbox style="--c: var(--role-2)"><h3>Error</h3> <span class="pg-mono" data-err></span> <span class="pg-note" data-errnote></span></div>
+      <div class="pg-box" style="--c: var(--role-3)"><h3>Sketch size</h3> <span class="pg-mono" data-size></span> <span class="pg-note" data-sizenote></span></div>
+      <div class="pg-box" style="--c: var(--role-4)"><h3>Adding the 4 shard counts</h3> <span class="pg-mono" data-sum></span> <span class="pg-note" data-sumnote></span></div>
+    </div>
+    <p class="pg-out" data-hverdict aria-live="polite"></p>
+    <p class="pg-note">Model: URLs and links are numbered items hashed with a fixed 32-bit hash (the MurmurHash3 finalizer), so every run gives the same numbers. The Bloom filter tests 20,000 URLs that were never inserted, and an exact URL is counted at 100 bytes. Shard i finds link number x when x mod 4 = i, and every third link is also found by the next shard. HyperLogLog uses 6-bit registers, the standard harmonic-mean estimate and linear counting for small counts; real sketches such as Redis add further corrections, and a 64-bit hash for very large counts.</p>
+  </div>
+</PlaygroundShell>
+<script>
+  const TEST = 20000; const TEST_BASE = 1_000_000; const SEED = 1; const GOLDEN = 0x9e3779b1;
+  const URL_BYTES = 100; const BITS_PER_KB = 8000; const SHARDS = 4; const REG_BITS = 6;
+  const BIG_N = 1e9; // the scenario: 1 billion seen URLs
+  const OVERFULL_BPI = 6; // below this many bits per URL the filter is badly overfilled
+
+  // MurmurHash3 finalizer: a fast, well-mixed 32-bit hash of an integer.
+  function fmix(h: number) { h ^= h >>> 16; h = Math.imul(h, 0x85ebca6b); h ^= h >>> 13; h = Math.imul(h, 0xc2b2ae35); h ^= h >>> 16; return h >>> 0; }
+
+  function bloom(n: number, kb: number, k: number) {
+    const m = kb * BITS_PER_KB; const bits = new Uint8Array(m);
+    const pos = (id: number, i: number) => fmix((fmix(id + SEED) + Math.imul(i + 1, GOLDEN)) | 0) % m;
+    for (let id = 0; id < n; id++) for (let i = 0; i < k; i++) bits[pos(id, i)] = 1;
+    let set = 0; for (let j = 0; j < m; j++) set += bits[j];
+    let fp = 0;
+    for (let t = 0; t < TEST; t++) { let all = true; for (let i = 0; i < k; i++) if (!bits[pos(TEST_BASE + t, i)]) { all = false; break; } if (all) fp++; }
+    let fn = 0;
+    for (let id = 0; id < n; id++) for (let i = 0; i < k; i++) if (!bits[pos(id, i)]) { fn++; break; }
+    const bpi = m / n;
+    return { m, bpi, fill: set / m, fp, fpRate: fp / TEST, formula: Math.pow(1 - Math.exp(-k / bpi), k), fn, bestK: bpi * Math.LN2 };
+  }
+
+  function hll(p: number, d: number) {
+    const m = 1 << p; const shards = Array.from({ length: SHARDS }, () => new Uint8Array(m)); const one = new Uint8Array(m);
+    const add = (reg: Uint8Array, id: number) => {
+      const h = fmix(fmix(id + SEED) ^ SEED); const j = h >>> (32 - p); const rest = (h << p) >>> 0;
+      const r = Math.min(Math.clz32(rest) + 1, 32 - p + 1); if (r > reg[j]) reg[j] = r;
+    };
+    for (let id = 0; id < d; id++) { add(one, id); add(shards[id % SHARDS], id); if (id % 3 === 0) add(shards[(id + 1) % SHARDS], id); }
+    const merged = new Uint8Array(m);
+    for (const s of shards) for (let j = 0; j < m; j++) if (s[j] > merged[j]) merged[j] = s[j];
+    const alpha = m === 16 ? 0.673 : m === 32 ? 0.697 : m === 64 ? 0.709 : 0.7213 / (1 + 1.079 / m);
+    const est = (reg: Uint8Array) => {
+      let sum = 0; let zeros = 0;
+      for (let j = 0; j < m; j++) { sum += 2 ** -reg[j]; if (!reg[j]) zeros++; }
+      let e = (alpha * m * m) / sum; if (e <= 2.5 * m && zeros) e = m * Math.log(m / zeros);
+      return Math.round(e);
+    };
+    const same = merged.every((v, j) => v === one[j]);
+    const sum = shards.reduce((a, s) => a + est(s), 0);
+    const e = est(merged);
+    return { m, est: e, same, sum, err: (e - d) / d, se: 1.04 / Math.sqrt(m), bytes: (m * REG_BITS) / 8 };
+  }
+
+  const fmt = (v: number) => v.toLocaleString('en-US');
+  const pct = (x: number) => `${(100 * x).toFixed(2)}%`;
+  const bytesText = (b: number) => (b < 1024 ? `${b} bytes` : `${fmt(b / 1024)} KB`);
+
+  document.querySelectorAll<HTMLElement>('[data-pd]').forEach((root) => {
+    const q = <T extends HTMLElement>(s: string) => root.querySelector<T>(s)!;
+    const num = (s: string) => Number(q<HTMLInputElement>(s).value);
+    let bFrame = 0; let hFrame = 0;
+
+    function drawBloom() {
+      bFrame = 0;
+      const n = num('[data-n]'); const kb = num('[data-kb]'); const k = num('[data-k]');
+      q('[data-nval]').textContent = fmt(n); q('[data-kbval]').textContent = String(kb); q('[data-kval]').textContent = String(k);
+      const r = bloom(n, kb, k);
+      const bpi = r.bpi.toFixed(1); const exactKb = (n * URL_BYTES) / 1000; const best = Math.max(1, Math.round(r.bestK));
+      q('[data-fp]').textContent = pct(r.fpRate);
+      q('[data-fpnote]').textContent = `${fmt(r.fp)} of ${fmt(TEST)} URLs never inserted look already seen`;
+      q('[data-formula]').textContent = pct(r.formula);
+      q('[data-formulanote]').textContent = `${bpi} bits per URL (m = ${fmt(r.m)} bits, n = ${fmt(n)}). Best k = (m/n) ln 2 = ${r.bestK.toFixed(2)}, so ${best}`;
+      q('[data-mem]').textContent = `${kb} KB`;
+      q('[data-memnote]').textContent = `exact URLs: ${fmt(exactKb)} KB at ${URL_BYTES} bytes each, ${(exactKb / kb).toFixed(1)} times more`;
+      q('[data-fill]').textContent = `${(100 * r.fill).toFixed(1)}%`;
+      q('[data-fn]').textContent = `false negatives: ${r.fn} of ${fmt(n)} inserted URLs`;
+      q<HTMLElement>('[data-meterfill]').style.width = `${(100 * r.fill).toFixed(1)}%`;
+      q('[data-meter]').setAttribute('aria-label', `${(100 * r.fill).toFixed(1)}% of the filter's bits are 1`);
+      const gb = (BIG_N * r.bpi) / 8 / 1e9;
+      q('[data-scale]').textContent = `At 1 billion URLs with ${bpi} bits each: ${gb.toFixed(2)} GB of filter instead of ${fmt((BIG_N * URL_BYTES) / 1e9)} GB of URLs. For 1% you need 9.6 bits per URL with k = 7; for 0.1%, 14.4 bits with k = 10.`;
+      const v = q('[data-verdict]');
+      let text: string; let bad = false;
+      if (r.bpi < OVERFULL_BPI) { bad = true; text = `Overfilled: only ${bpi} bits per URL, so ${pct(r.fpRate)} of new URLs are skipped as already seen. A Bloom filter cannot grow: build a bigger one (about 9.6 bits per URL for 1%) and insert the URLs again.`; }
+      else if (k <= best - 3) { bad = true; text = `Too few hash functions: each URL checks only ${k} bit${k === 1 ? '' : 's'}, so a new URL passes too easily (${pct(r.fpRate)}). Use about ${best}.`; }
+      else if (k >= best + 3) { bad = true; text = `Too many hash functions: ${(100 * r.fill).toFixed(1)}% of the bits are 1, so a new URL often finds all ${k} set (${pct(r.fpRate)}). Use about ${best}.`; }
+      else text = `Measured ${pct(r.fpRate)} against ${pct(r.formula)} from the formula, and no inserted URL was missed. ${kb} KB answers for ${fmt(n)} URLs that would take ${fmt(exactKb)} KB to store exactly.`;
+      v.textContent = text; v.classList.toggle('bad', bad);
+      q<HTMLElement>('[data-fpbox]').style.setProperty('--c', bad ? 'var(--bad)' : 'var(--role-1)');
+    }
+
+    function drawHll() {
+      hFrame = 0;
+      const d = num('[data-d]') * 1000; const p = num('[data-p]');
+      q('[data-dval]').textContent = String(num('[data-d]'));
+      const r = hll(p, d);
+      q('[data-est]').textContent = fmt(r.est);
+      q('[data-estnote]').textContent = `true: ${fmt(d)} distinct links. ${r.same ? 'Merging the 4 shard sketches (max per register) gives exactly the registers of one sketch over all links.' : 'Merged registers differ from one sketch over all links.'}`;
+      q('[data-err]').textContent = `${r.err >= 0 ? '+' : ''}${pct(r.err)}`;
+      q('[data-errnote]').textContent = `expected standard error 1.04 / sqrt(${fmt(r.m)}) = ${pct(r.se)}`;
+      q('[data-size]').textContent = bytesText(r.bytes);
+      q('[data-sizenote]').textContent = `${fmt(r.m)} registers of ${REG_BITS} bits per shard; an exact list is ${fmt((d * URL_BYTES) / 1e6)} MB at ${URL_BYTES} bytes per link`;
+      q('[data-sum]').textContent = fmt(r.sum);
+      q('[data-sumnote]').textContent = `${pct((r.sum - d) / d)} too high: links found by two shards are counted twice`;
+      const within = Math.abs(r.err) <= r.se;
+      q('[data-hverdict]').textContent = `${fmt(r.m)} registers (${bytesText(r.bytes)}) estimate ${fmt(d)} distinct links as ${fmt(r.est)}: off by ${pct(Math.abs(r.err))}, ${within ? 'inside' : 'outside'} one standard error (${pct(r.se)}). About two runs in three land inside it.`;
+      q<HTMLElement>('[data-errbox]').style.setProperty('--c', within ? 'var(--role-2)' : 'var(--bad)');
+    }
+
+    const bSched = () => { if (!bFrame) bFrame = requestAnimationFrame(drawBloom); };
+    const hSched = () => { if (!hFrame) hFrame = requestAnimationFrame(drawHll); };
+    ['[data-n]', '[data-kb]', '[data-k]'].forEach((s) => { q(s).addEventListener('input', bSched); q(s).addEventListener('change', bSched); });
+    ['[data-d]', '[data-p]'].forEach((s) => { q(s).addEventListener('input', hSched); q(s).addEventListener('change', hSched); });
+    drawBloom(); drawHll();
+  });
+</script>
+<style is:global>
+  .playground .pd-h { margin: 6px 0 0; font-size: 1rem; }
+  .playground .pd input[type=range] { min-width: 0; max-width: 100%; }
+  .playground .pd-meter { height: 14px; border-radius: 4px; background: var(--surface-2); overflow: hidden; border: 1px solid var(--border); }
+  .playground .pd-meter-fill { display: block; height: 100%; background: var(--role-4); }
+  @media (prefers-reduced-motion: no-preference) { .playground .pd-meter-fill { transition: width .2s; } }
+</style>

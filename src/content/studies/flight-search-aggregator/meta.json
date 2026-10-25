@@ -1,0 +1,218 @@
+{
+  "name": "Design a Flight Search Aggregator",
+  "difficulty": "intermediate",
+  "intent": "Ask dozens of slow, unreliable airline and agency systems for prices at once, show the first results within a second, keep the cost of searching under control with short-lived caches, and check the price again before handing the traveller to the seller.",
+  "codeTitle": "fan-out with timeouts, a fare cache, a circuit breaker and a live price check",
+  "finalIntro": "One traveller searching London to New York while one provider is down.",
+  "prompt": "Design a flight search site like Kayak, Skyscanner or Google Flights. A traveller enters an origin, a destination, dates and the number of passengers. The site asks about 40 sources at once: airlines' own systems, online travel agencies (OTAs) and global distribution systems (GDSs, such as Amadeus, Sabre and Travelport, which hold fares and seats for many airlines). It shows one merged, sorted list, and when the traveller picks a flight it sends them to that airline or agency to book. Sources answer in anything from 300 ms to 20 s, some fail, most limit how often we may ask, and there are hundreds of searches for every booking.",
+  "functional": [
+    "Search one-way or return flights by origin, destination, dates, passengers and cabin, across about 40 providers",
+    "Show the first prices within about a second and keep adding offers as more providers answer, with a progress indicator",
+    "Show each itinerary once, with every provider's price for it, and sort or filter by price, duration, stops and departure time",
+    "When the traveller selects an offer, confirm its live price and hand them over to the provider's booking page",
+    "Tell the traveller when a price has changed or when some providers could not be checked"
+  ],
+  "nonFunctional": [
+    "First prices on screen within 1.5 s for 95% of searches, and every search finished within an 8 s deadline",
+    "About 5,000 searches per second at the peak, each of which could reach 40 providers, so up to 200,000 provider calls per second without a cache",
+    "Stay within each provider's request-rate limit and search allowance, even during a traffic spike",
+    "One slow or failing provider must not slow other providers' results or use up the search servers' connections",
+    "Search results may be minutes old, but the price at hand-off must match the provider's live price for at least 98% of clicks, and any change must be shown before the hand-off"
+  ],
+  "firstAttempt": {
+    "text": "One web server receives a search, opens a thread per provider, calls all 40 in parallel and waits until the last one answers. It then sorts the combined offers by price and returns the page. There is no cache, so every search calls every provider, and the price shown is whatever each provider said at that moment.",
+    "limits": [
+      "The page is as slow as the slowest of 40 providers, and a provider that never answers holds the search open until the browser gives up",
+      "Every search becomes 40 provider calls, far beyond what providers allow or what the bookings can pay for",
+      "A slow provider holds threads and connections that the calls to every other provider need, so its trouble spreads",
+      "The same flight appears once per seller, in different formats and currencies, and the list is hard to compare",
+      "A price shown at search time may be gone when the traveller clicks, and nothing checks it"
+    ]
+  },
+  "nodes": [
+    { "id": "travellers", "label": "Travellers", "kind": "client", "x": 12, "y": 50 },
+    { "id": "single", "label": "Search server", "kind": "compute", "x": 50, "y": 50, "at": 0, "until": 1 },
+    { "id": "providers", "label": "Airlines, OTAs, GDSs", "kind": "external", "x": 87, "y": 50 },
+    { "id": "orch", "label": "Fan-out orchestrator", "kind": "compute", "x": 62, "y": 50, "at": 1 },
+    { "id": "api", "label": "Search API", "kind": "edge", "x": 37, "y": 50, "at": 2 },
+    { "id": "results", "label": "Results store", "kind": "data", "x": 12, "y": 84, "at": 2 },
+    { "id": "cache", "label": "Fare cache", "kind": "data", "x": 62, "y": 84, "at": 3 },
+    { "id": "gateway", "label": "Provider gateway", "kind": "compute", "x": 87, "y": 16, "at": 4 },
+    { "id": "merge", "label": "Merge and rank", "kind": "compute", "x": 37, "y": 84, "at": 5 },
+    { "id": "pricecheck", "label": "Live price check", "kind": "compute", "x": 62, "y": 16, "at": 6 }
+  ],
+  "edges": [
+    { "from": "travellers", "to": "single", "at": 0, "until": 1 },
+    { "from": "single", "to": "providers", "at": 0, "until": 1 },
+    { "from": "travellers", "to": "orch", "at": 1, "until": 2 },
+    { "from": "orch", "to": "providers", "at": 1, "until": 4 },
+    { "from": "travellers", "to": "api", "at": 2 },
+    { "from": "api", "to": "orch", "at": 2 },
+    { "from": "api", "to": "results", "at": 2 },
+    { "from": "orch", "to": "results", "at": 2, "until": 5 },
+    { "from": "orch", "to": "cache", "at": 3 },
+    { "from": "orch", "to": "gateway", "at": 4 },
+    { "from": "gateway", "to": "providers", "at": 4 },
+    { "from": "orch", "to": "merge", "at": 5 },
+    { "from": "merge", "to": "results", "at": 5 },
+    { "from": "api", "to": "pricecheck", "at": 6 },
+    { "from": "pricecheck", "to": "gateway", "at": 6 }
+  ],
+  "steps": [
+    {
+      "title": "Fan out with a timeout per provider and one deadline per search",
+      "problem": "Waiting for every provider makes each search as slow as the slowest of 40, and a provider that hangs holds it for ever. Even rare slowness adds up: if each provider takes more than 3 s on 2% of calls, at least one of 40 is that slow on 1 minus 0.98 to the power 40, about 55%, of searches.",
+      "fix": "A fan-out orchestrator sends all the calls at once with non-blocking I/O, so a waiting call costs a little memory instead of a thread. Each call has its own timeout taken from that provider's latency history, a little above its usual slow case: perhaps 1.5 s for a fast airline system and 6 s for a GDS. The search as a whole has a global deadline, such as 8 s, which caps every timeout, and where a provider's interface accepts it the remaining time is passed along so it can stop work nobody will read. A call that fails quickly, or reaches its own timeout well before the deadline, may be tried once more.",
+      "tradeoff": "A search now ends within 8 s whatever any provider does, and a dead provider costs at most its timeout instead of the whole search. Some offers are lost: a timeout set too tight cuts a slow provider that may have the cheapest fare, and a retry adds load to a provider that may already be struggling, so retries are limited to one and only while time remains.",
+      "concepts": [{ "slug": "timeouts-and-deadlines" }, { "slug": "hedged-requests-and-tail-latency" }, { "slug": "retries-and-backoff" }]
+    },
+    {
+      "title": "Stream partial results instead of waiting for the deadline",
+      "problem": "With a deadline the search ends on time, but the traveller still looks at an empty page for up to 8 s, although the fastest airlines answered in under a second.",
+      "fix": "Make the search asynchronous. POST /searches returns a search id at once, and the orchestrator writes each provider's offers into a results store as they arrive (an in-memory store such as Redis, keyed by the search id and kept for about 15 minutes). The browser either polls GET /searches/{id}?since=<version> about once a second, or keeps a server-sent events (SSE) stream open, and receives only the new offers and a progress figure such as '23 of 40 providers'. The page shows prices as soon as the first provider answers and says when the search is complete. Because the state is in the store, any API server can answer a poll.",
+      "tradeoff": "The time to the first result falls from the deadline to the latency of the fastest provider. The list now changes while the traveller reads it, so the page batches updates, for example every half second, and never moves a row under the traveller's pointer, and the cheapest fare may still arrive last. Partial results are state that must be stored, served and expired.",
+      "concepts": [{ "slug": "async-apis-and-long-running-operations" }, { "slug": "real-time-communication" }]
+    },
+    {
+      "title": "Cache fares for minutes, because searches far outnumber bookings",
+      "problem": "Each search is 40 provider calls, so 5,000 searches per second become 200,000 calls per second. There are hundreds or thousands of searches for each booking (the look-to-book ratio), and providers limit requests per second, and some contracts charge for searching beyond an agreed ratio. Calling everyone for every search costs more than the bookings earn.",
+      "fix": "Put a fare cache in front of the providers. An entry holds one provider's answer, keyed by provider, origin, destination, dates, passengers and cabin, with a short time to live (TTL) that depends on how fast fares move: for example 30 minutes for a departure months away and 5 minutes for one in the next few days. Searches cluster on popular routes and dates, so many are answered from the cache, and only misses go to providers. Identical searches that arrive while a call for them is already running wait for that call instead of making their own (request coalescing). A call that passes its timeout can be left to finish in the background, up to a longer limit: its answer is not shown, but it fills the cache for the next search.",
+      "tradeoff": "If 80% of calls are answered from the cache, 200,000 calls per second become 40,000, and the first prices of a cached search appear in milliseconds. A cached fare can be wrong, because the seats of a cheap fare class sell out and airlines change prices between searches, so the price on the results page is a good estimate, not a promise, and it must be checked again before the traveller is handed over.",
+      "concepts": [{ "slug": "caching" }, { "slug": "consistency-models" }]
+    },
+    {
+      "title": "Guard each provider with a rate limit, a circuit breaker and a bulkhead",
+      "problem": "A provider that allows us, say, 300 requests per second rejects the excess or blocks our key, a slow provider holds connections that calls to other providers need, and a provider that is down still receives every call and makes searches wait for its timeout.",
+      "fix": "A provider gateway applies three guards per provider. A rate limit: a token bucket per provider sized to its contract and shared by all servers, kept in a shared store such as Redis, with each server taking tokens in small batches; when the bucket is empty the search uses an older cached answer or leaves that provider out, and tokens go first to the routes where the provider is most often cheapest. A circuit breaker: when, say, half of a provider's last 20 calls failed or timed out, calls to it are skipped for 30 seconds, and then a few trial calls decide whether to resume. A bulkhead: each provider has its own connection pool and limit on calls in flight, so a hung provider can tie up only its own share. The gateway also asks only providers that sell the route, so an airline is never asked about a city pair it does not serve.",
+      "tradeoff": "Providers stay within their contracts, and one bad provider cannot slow every search or use up the servers. When a breaker or a limit cuts a provider, its fares are older or missing, so results can be less complete exactly when traffic is highest, and the page says that some sites could not be checked.",
+      "concepts": [{ "slug": "rate-limiting" }, { "slug": "circuit-breaker" }, { "slug": "bulkhead" }, { "slug": "load-shedding" }]
+    },
+    {
+      "title": "Normalise, merge and rank the same flight from many sellers",
+      "problem": "Each provider answers in its own format and currency: GDS web services, airline interfaces built on IATA's NDC (New Distribution Capability) XML standard, and agencies' own JSON APIs. The same flight comes back from five sellers at five prices, so the list is long, repetitive and hard to compare.",
+      "fix": "An adapter per provider turns its answer into one internal offer: the flight segments (carrier, flight number, origin, destination and departure time of each), the cabin and fare brand, conditions such as checked bags and changes, and a total price converted into the traveller's currency. Offers are grouped by an itinerary key built from the segments, cabin and fare brand, so one flight sold by four sellers becomes one row with four prices, cheapest first. A ranking step then sorts rows by price, by duration, or by a 'best' score that mixes price, duration and number of stops.",
+      "tradeoff": "The traveller sees one row per real trip with every seller's price, and a new provider needs only a new adapter. Grouping has edge cases: two offers on the same flights with different bag rules are not the same product, and a codeshare (one flight sold under several airlines' flight numbers) may appear under different keys, so the key and the rules for it need care and testing.",
+      "concepts": [{ "kind": "pattern", "slug": "adapter" }, { "kind": "pattern", "slug": "strategy" }]
+    },
+    {
+      "title": "Check the price live at selection, then hand over to the seller",
+      "problem": "The price on the results page may come from a cache entry several minutes old, or from a seller that has since sold the last seat in that fare class. A traveller who clicks a fare of 412 and sees 446 on the seller's page stops trusting the site.",
+      "fix": "When the traveller selects an offer, the API asks that seller for the live price (a re-price or availability call) with a tight timeout of a few seconds, through the same gateway and limits. If the price is unchanged, the traveller is handed over; if it changed, the new price is shown first ('the price went up from 412 to 446') and the cache entry is replaced with the live answer. The hand-off is a deep link (a URL that opens the seller's booking page with the chosen flights) carrying the seller's offer id and our click id, and the seller does the booking, payment and ticketing. Price accuracy, the share of checks that match the shown price, is tracked per provider and route and used to shorten the TTL where it falls.",
+      "tradeoff": "Travellers rarely meet a surprise at the seller, and a TTL that is too long shows up in the accuracy figures. Each selection costs one more live call, but selections are a small share of searches. If the price check itself times out, the site still hands over, with a note that the seller will confirm the price, instead of blocking the traveller.",
+      "concepts": [{ "slug": "consistency-models" }, { "slug": "caching" }, { "slug": "graceful-degradation" }]
+    }
+  ],
+  "failures": [
+    {
+      "scenario": "A GDS slows down from 2 s to 15 s per answer for an hour",
+      "impact": "Without guards every search waits for it, its slow calls pile up and hold connections, and the slowdown spreads to every search.",
+      "answer": "Its calls stop at its own timeout and never pass the 8 s deadline, so searches still finish on time, with its fares from the cache where there are any. Its bulkhead caps the connections it can hold, and once most of its calls time out its breaker opens, so searches stop calling it until a trial call succeeds.",
+      "concepts": [{ "slug": "timeouts-and-deadlines" }, { "slug": "bulkhead" }, { "slug": "circuit-breaker" }]
+    },
+    {
+      "scenario": "A television advert triples searches within ten minutes",
+      "impact": "Cache misses triple, calls pass the providers' rate limits, and providers answer with errors or block the key.",
+      "answer": "The per-provider token buckets hold calls at the contract rate. Searches beyond the budget are answered from older cache entries, allowed to be somewhat past their TTL while the spike lasts, or leave a provider out, and the gateway keeps its tokens for the routes where a provider is most often cheapest. Request coalescing turns identical searches into one call.",
+      "concepts": [{ "slug": "rate-limiting" }, { "slug": "load-shedding" }, { "slug": "graceful-degradation" }]
+    },
+    {
+      "scenario": "An OTA starts timing out, and the code retries each failed call twice",
+      "impact": "The struggling OTA receives three times its normal load and takes longer to recover (a retry storm).",
+      "answer": "A search call is retried at most once, with jitter, only while the deadline leaves time and only while the provider's breaker is closed. A retry budget, such as retries being at most 10% of the calls to that provider, stops a slowdown from multiplying the load.",
+      "concepts": [{ "slug": "retries-and-backoff" }, { "slug": "circuit-breaker" }]
+    },
+    {
+      "scenario": "During an airline sale, fares on a popular route change several times an hour",
+      "impact": "Cached prices are often wrong, and many travellers see a higher price at the price check.",
+      "answer": "The live check at selection catches every change before the hand-off. Accuracy is tracked per provider and route, and where it falls below its target that route's TTL is shortened automatically, trading more provider calls for fewer surprises.",
+      "concepts": [{ "slug": "caching" }, { "slug": "metrics" }]
+    },
+    {
+      "scenario": "The server running a search's fan-out crashes halfway through",
+      "impact": "The answers it was waiting for are lost, and a page that could only talk to that server would stop updating.",
+      "answer": "Polls are answered from the shared results store, so any API server can serve them. The search record lists which providers have answered, and when it stops changing for a few seconds before the deadline, another orchestrator calls the missing providers, most of which are answered from the cache.",
+      "concepts": [{ "slug": "async-apis-and-long-running-operations" }, { "slug": "retries-and-backoff" }]
+    }
+  ],
+  "alternatives": [
+    {
+      "title": "How results reach the browser",
+      "options": [
+        { "name": "Wait, then return one page", "pro": "Simplest, one request", "con": "The traveller waits for the deadline, up to 8 s, before seeing anything" },
+        { "name": "Search id and polling", "pro": "Plain HTTP requests that any server can answer and every proxy passes", "con": "Extra requests, and new offers wait for the next poll" },
+        { "name": "Server-sent events", "pro": "Offers are pushed the moment they arrive over one HTTP response", "con": "A long-lived connection per search, to keep open and to resume after a drop" },
+        { "name": "WebSocket", "pro": "Two-way and low latency", "con": "Data flows only one way here, and the connections need their own infrastructure" }
+      ],
+      "pick": "A search id with polling about once a second, or SSE where the servers and proxies handle long responses well. Nothing needs to flow from the browser during a search, so a WebSocket adds work for no gain."
+    },
+    {
+      "title": "Where the prices on the results page come from",
+      "options": [
+        { "name": "Always live", "pro": "The freshest prices", "con": "Slowest, and the provider calls cost more and break rate limits at this volume" },
+        { "name": "A cache with short TTLs", "pro": "Cheap and fast for popular searches", "con": "Prices can be minutes out of date" },
+        { "name": "Fares collected in the background", "pro": "Instant, and good for flexible views such as the cheapest day in a month", "con": "Covers only the routes and dates that were collected, and is older still" }
+      ],
+      "pick": "A cache with TTLs set by route and departure date, background refresh for the most popular searches, and always a live check when the traveller selects an offer."
+    },
+    {
+      "title": "How long to wait for providers",
+      "options": [
+        { "name": "Wait for every provider", "pro": "Complete results", "con": "As slow as the slowest provider, and forever if one hangs" },
+        { "name": "One fixed timeout for every provider", "pro": "Simple", "con": "Too short for slow GDSs, which may hold the cheapest fare, and too long for a fast airline that has hung" },
+        { "name": "A timeout per provider under a global deadline", "pro": "Each provider gets the time it usually needs, and the search still ends on time", "con": "Needs latency history per provider, and the values must follow its changes" }
+      ],
+      "pick": "A timeout per provider from its recent latency, capped by an 8 s deadline per search, with results streamed so that waiting for slow providers does not delay the first prices."
+    },
+    {
+      "title": "How to keep within a provider's rate limit across many servers",
+      "options": [
+        { "name": "Split the limit evenly between servers", "pro": "No coordination", "con": "Quota is wasted when load is uneven, and the share is wrong whenever servers are added or removed" },
+        { "name": "One shared token bucket", "pro": "Exact", "con": "A round trip to the shared store on every call, and a dependency that must stay up" },
+        { "name": "Shared bucket, tokens taken in batches", "pro": "Few round trips and close to exact", "con": "A server that crashes wastes the tokens it held" }
+      ],
+      "pick": "A shared bucket per provider with tokens taken in small batches, and a local fallback limit if the shared store is unreachable."
+    }
+  ],
+  "roles": [
+    { "id": "client", "label": "Travellers", "description": "People searching for flights in a browser or app." },
+    { "id": "edge", "label": "Search API", "description": "Starts searches, answers polls and handles selections." },
+    { "id": "compute", "label": "Search services", "description": "The orchestrator, provider gateway, merging and the live price check." },
+    { "id": "data", "label": "State", "description": "The fare cache and the store of partial results." },
+    { "id": "external", "label": "Providers", "description": "Airlines, online travel agencies and GDSs that hold the fares." }
+  ],
+  "quiz": [
+    {
+      "question": "A flight search waits for all 40 providers before it returns. One GDS sometimes takes 20 s, and the product team wants the first prices on screen within 2 s, even if the search keeps running longer. What should change?",
+      "options": [
+        "Return a search id at once and send each provider's offers to the page as they arrive",
+        "Give each server more threads, so that the slow GDS calls no longer block the calls to the other providers",
+        "Remove that GDS from every search, because one slow source should never delay the others",
+        "Cache the whole results page for each route for an hour, so most searches never wait"
+      ],
+      "answer": 0,
+      "explanation": "Streaming partial results makes the first prices appear when the fastest provider answers, while the search continues in the background. More threads do not help, because the page still waits for the slowest answer before it returns. Removing the GDS loses fares it may be cheapest on, and a page cached for an hour shows stale prices and still waits on every cache miss."
+    },
+    {
+      "question": "Fares are cached for 20 minutes per provider and route. Analytics show that 6% of clicks find a different price on the seller's page, and travellers complain. There are about 1,000 searches for each booking. What is the best change?",
+      "options": [
+        "Remove the cache entirely, so that every search asks every provider for a live price",
+        "Re-check the chosen offer live before hand-off, and cut TTLs where accuracy is low",
+        "Keep showing the cached price at hand-off, and let the seller explain any difference",
+        "Raise the TTL to an hour, so that cached prices are replaced less often and look stable"
+      ],
+      "answer": 1,
+      "explanation": "Only the clicked offer needs an exact price, and clicks are a small share of searches, so one live call per selection fixes the surprise cheaply, and accuracy figures show where a TTL is too long. Removing the cache multiplies provider calls by the whole search volume and breaks rate limits. A longer TTL makes prices older, and leaving the difference to the seller keeps the complaint."
+    },
+    {
+      "question": "One OTA starts timing out on every call. All 40 providers share one pool of 500 outgoing connections per server, and soon calls to healthy airlines wait for a free connection. Which change stops the trouble from spreading?",
+      "options": [
+        "Raise the shared pool to 5,000 connections, so there is room for the OTA's slow calls as well",
+        "Retry each failed OTA call twice more, so its fares are still found when a single attempt fails",
+        "Lower the global deadline to 1 s, so that no call can hold a connection for very long at all",
+        "Give each provider its own connection limit and a breaker that skips it while it fails"
+      ],
+      "answer": 3,
+      "explanation": "A bulkhead keeps the failing OTA inside its own share of connections, and an open breaker stops sending it calls that are bound to time out. A bigger shared pool only delays the moment it fills up with the OTA's waiting calls. Retries add load to a provider that is already failing, and a 1 s deadline cuts most healthy providers too."
+    }
+  ]
+}

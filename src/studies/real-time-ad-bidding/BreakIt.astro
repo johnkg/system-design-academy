@@ -1,0 +1,139 @@
+---
+import PlaygroundShell from '../../components/PlaygroundShell.astro';
+const HOURS = Array.from({ length: 24 }, (_, h) => h);
+const BOXES = [
+  { k: 1, title: 'No pacing: bid until the reported spend hits the budget' },
+  { k: 2, title: 'Central counter checked by every bid' },
+  { k: 3, title: 'Local slices from a pacer' },
+];
+---
+<PlaygroundShell title="Spending a daily budget across many bidders" hint="One campaign, one day. Bidding on every matching request would spend $14,400, more than the budget. Compare three ways of keeping the bidders within it, with the same traffic.">
+  <ol class="how">
+    <li>With the defaults (a <b>$5,000</b> budget and spend reports <b>60</b> seconds old), <b>no pacing</b> runs out of budget at <b>11:26</b>, ends <b>$12.00</b> over, and bids on nothing for the rest of the day, including the evening peak.</li>
+    <li><b>Local slices</b> spread the same budget to the end of the day: the last bid is at <b>23:59</b>, and the overspend is only <b>$3.11</b>, about one minute of late-evening spend.</li>
+    <li>Raise the <b>report delay</b> to <b>600</b> seconds: no pacing now ends <b>$120.00</b> over, because every node keeps bidding for ten minutes on an old total. Slices end <b>$29.08</b> over, still well inside 1% of the budget.</li>
+    <li>Set the <b>round trip to the counter</b> to <b>20</b> ms: the central counter fits in the deadline and spends exactly <b>$5,000.00</b>. At <b>60</b> ms, bids from 3 of the 4 regions arrive too late, and it spends only <b>$3,600.00</b>.</li>
+  </ol>
+  <div class="pg rtb" data-rtb>
+    <div class="pg-row">
+      <label>Daily budget ($) <input type="range" min="1000" max="14000" step="500" value="5000" data-bud /> <b data-budval></b></label>
+      <label>Report delay (seconds) <input type="range" min="10" max="600" step="10" value="60" data-d /> <b data-dval></b></label>
+      <label>Round trip to the counter (ms) <input type="range" min="1" max="100" value="60" data-rtt /> <b data-rttval></b></label>
+    </div>
+    <div class="pg-grid">
+      {BOXES.map((b) => (
+        <div class="pg-box" data-box={b.k}>
+          <h3>{b.title}</h3>
+          <span class="pg-mono" data-o={b.k}></span>
+          <span class="rtb-bars" aria-hidden="true">{HOURS.map(() => <span class="rtb-bar"></span>)}</span>
+          <span class="pg-note" data-n={b.k}></span>
+        </div>
+      ))}
+    </div>
+    <p class="pg-out" data-verdict aria-live="polite"></p>
+    <p class="pg-note">Model: the campaign's traffic follows a fixed daily curve, quiet at night and busiest from 18:00 to 21:00, and is simulated second by second. Bars show spend per hour from midnight to midnight. No pacing: every node bids on every match until the spend total it has heard about, which is as old as the report delay, reaches the budget. Central counter: every bid reserves its cost at one counter in one of 4 regions with equal traffic, and spends exactly to an even plan. A bidder answers within 40 ms and its own work takes 15 ms, so a round trip over 25 ms makes the bids from the other 3 regions late, and a late bid never wins. Local slices: each time a spend report arrives, the pacer hands out the next interval's share of the remaining budget, planned from that report, and the nodes spend it with no network call.</p>
+  </div>
+</PlaygroundShell>
+<script>
+  document.querySelectorAll<HTMLElement>('[data-rtb]').forEach((root) => {
+    const q = <T extends HTMLElement>(s: string) => root.querySelector<T>(s)!;
+    const HOURLY = [4, 3, 2, 2, 2, 3, 5, 7, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 10, 10, 10, 9, 7, 6]; // traffic weight per hour, 160 in all
+    const MILLS_PER_WEIGHT_SECOND = 25; // $0.025 a second per unit of weight, so $14,400 a day if we bid on everything
+    const DAY = 86400, HOUR = 3600, MILLS = 1000;
+    const REGIONS = 4, DEADLINE_MS = 40, WORK_MS = 15; // the counter lives in one region
+    const HEADROOM_MS = DEADLINE_MS - WORK_MS;
+    const rate = (s: number) => MILLS_PER_WEIGHT_SECOND * HOURLY[Math.floor(s / HOUR)];
+    const potFrom = new Array<number>(DAY + 1).fill(0); // spend possible from second s to midnight
+    for (let s = DAY - 1; s >= 0; s--) potFrom[s] = potFrom[s + 1] + rate(s);
+    const POTENTIAL = potFrom[0];
+
+    type Run = { total: number; hourly: number[]; lastBid: number; outAt: number };
+    const empty = (): Run => ({ total: 0, hourly: new Array(24).fill(0), lastBid: -1, outAt: -1 });
+    function noPacing(budget: number, delay: number): Run {
+      const r = empty(); const spent = [0];
+      for (let s = 0; s < DAY; s++) {
+        const known = s >= delay ? spent[s - delay] : 0;
+        const x = known < budget ? rate(s) : 0;
+        if (x > 0) { r.lastBid = s; r.hourly[Math.floor(s / HOUR)] += x; }
+        spent.push(spent[s] + x);
+        if (r.outAt < 0 && spent[s + 1] >= budget) r.outAt = s + 1;
+      }
+      r.total = spent[DAY]; return r;
+    }
+    function slices(budget: number, delay: number): Run & { count: number } {
+      const r = { ...empty(), count: 0 }; const spent = [0]; let left = 0;
+      for (let s = 0; s < DAY; s++) {
+        if (s % delay === 0) {
+          const known = s >= delay ? spent[s - delay] : 0;
+          const end = Math.min(s + delay, DAY);
+          left = Math.floor((Math.max(0, budget - known) * (potFrom[s] - potFrom[end])) / potFrom[s]);
+          r.count++;
+        }
+        const x = Math.min(rate(s), left); left -= x;
+        if (x > 0) { r.lastBid = s; r.hourly[Math.floor(s / HOUR)] += x; }
+        spent.push(spent[s] + x);
+      }
+      r.total = spent[DAY]; return r;
+    }
+    function counter(budget: number, reachable: number): Run {
+      const r = empty(); let scaled = 0; // spend times REGIONS, kept whole
+      for (let s = 0; s < DAY; s++) {
+        const target = Math.floor((budget * (POTENTIAL - potFrom[s + 1])) / POTENTIAL);
+        const x = Math.max(0, Math.min(rate(s) * reachable, target * REGIONS - scaled));
+        scaled += x;
+        if (x > 0) { r.lastBid = s; r.hourly[Math.floor(s / HOUR)] += x / REGIONS; }
+      }
+      r.total = Math.floor(scaled / REGIONS); return r;
+    }
+
+    const usd = (mills: number) => `$${(mills / MILLS).toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`;
+    const clock = (s: number) => `${String(Math.floor(s / HOUR)).padStart(2, '0')}:${String(Math.floor((s % HOUR) / 60)).padStart(2, '0')}`;
+    const bars = (k: number, hourly: number[], max: number) => root.querySelectorAll<HTMLElement>(`[data-box="${k}"] .rtb-bar`).forEach((b, h) => b.style.setProperty('--h', `${max > 0 ? Math.round((hourly[h] / max) * 100) : 0}%`));
+    const box = (k: number, bad: boolean) => q<HTMLElement>(`[data-box="${k}"]`).style.setProperty('--c', bad ? 'var(--bad)' : 'var(--good)');
+
+    function draw() {
+      const budgetUsd = Number(q<HTMLInputElement>('[data-bud]').value); const delay = Number(q<HTMLInputElement>('[data-d]').value); const rtt = Number(q<HTMLInputElement>('[data-rtt]').value);
+      q('[data-budval]').textContent = budgetUsd.toLocaleString('en-US'); q('[data-dval]').textContent = String(delay); q('[data-rttval]').textContent = String(rtt);
+      const budget = budgetUsd * MILLS;
+      const late = rtt > HEADROOM_MS ? REGIONS - 1 : 0;
+      const a = noPacing(budget, delay), b = counter(budget, REGIONS - late), c = slices(budget, delay);
+      const max = Math.max(...a.hourly, ...b.hourly, ...c.hourly);
+      [a, b, c].forEach((r, i) => bars(i + 1, r.hourly, max));
+      const over = (r: Run) => Math.max(0, r.total - budget);
+      const missedShare = a.outAt >= 0 ? Math.round((potFrom[Math.min(a.lastBid + 1, DAY)] / POTENTIAL) * 100) : 0;
+
+      q('[data-o="1"]').textContent = a.outAt >= 0 ? `Out of budget at ${clock(a.outAt)}, ${usd(over(a))} over` : `Spent ${usd(a.total)} and never ran out`;
+      q('[data-n="1"]').textContent = a.outAt >= 0 ? `Last bid at ${clock(a.lastBid)}. No bids after that, on ${missedShare}% of the day's traffic.` : 'The budget is larger than all the traffic.';
+      box(1, a.outAt >= 0);
+
+      q('[data-o="2"]').textContent = `Spent ${usd(b.total)} of ${usd(budget)}, ${usd(over(b))} over`;
+      q('[data-n="2"]').textContent = late
+        ? `Bids from ${late} of the ${REGIONS} regions wait ${rtt} ms, more than the ${HEADROOM_MS} ms left, so ${Math.round((late / REGIONS) * 100)}% of bids arrive late.`
+        : `Every bid waits ${rtt} ms for the counter, inside the ${HEADROOM_MS} ms left before the deadline.`;
+      box(2, late > 0);
+
+      q('[data-o="3"]').textContent = `Spent ${usd(c.total)}, ${usd(over(c))} over`;
+      q('[data-n="3"]').textContent = `Last bid at ${clock(c.lastBid)}. ${c.count.toLocaleString('en-US')} slices, and no network call on any bid.`;
+      box(3, over(c) > budget / 100);
+
+      const out = q('[data-verdict]');
+      const bad = a.outAt >= 0 || late > 0;
+      out.classList.toggle('bad', bad);
+      let msg = a.outAt >= 0
+        ? `Without pacing the budget was gone at ${clock(a.outAt)} and ended ${usd(over(a))} over, because nodes kept bidding for ${delay} seconds on an old total. Slices spent until ${clock(c.lastBid)} and ended ${usd(over(c))} over.`
+        : 'This budget is larger than all the traffic, so every design simply bids on everything.';
+      msg += late
+        ? ` The central counter is exact but too far away: ${Math.round((late / REGIONS) * 100)}% of its bids missed the deadline, so it spent only ${usd(b.total)}.`
+        : ` The central counter is exact here because a ${rtt} ms round trip fits in the deadline.`;
+      out.textContent = msg;
+    }
+    root.addEventListener('input', draw);
+    draw();
+  });
+</script>
+<style>
+  .rtb-bars { display: grid; grid-template-columns: repeat(24, minmax(0, 1fr)); gap: 1px; align-items: end; height: 48px; border-bottom: 1px solid var(--border); }
+  .rtb-bar { display: block; height: var(--h, 0%); min-height: 1px; background: var(--c, var(--accent)); border-radius: 2px 2px 0 0; transition: height .3s; }
+  .rtb :global(input) { min-width: 0; }
+  @media (prefers-reduced-motion: reduce) { .rtb-bar { transition: none; } }
+</style>

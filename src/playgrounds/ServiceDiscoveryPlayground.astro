@@ -1,0 +1,248 @@
+---
+import PlaygroundShell from '../components/PlaygroundShell.astro';
+---
+<PlaygroundShell title="Simulate it" hint="Ten minutes of an orders service calling payment at 30 requests per second while payment instances scale out, scale in and crash. Pick how orders finds them.">
+  <ol class="how">
+    <li>Start with <b>Static IP list</b>: orders keeps the 3 addresses it was given. The crashes of p2 and p3 are never noticed, so <b>6620</b> of 18000 requests fail, and the instances added later sit unused for 1360 instance-seconds.</li>
+    <li>Choose <b>Registry watch</b>: failures drop to <b>522</b> and a crash is noticed after 26.7 s on average (worst 28 s). Set <b>Lease TTL</b> to 6 s: only 117 fail, but the registry now handles 1234 heartbeats instead of 242 and wrongly removes the healthy p1 during its 12 s network blip. At 90 s, 1491 fail. Put it back to 30.</li>
+    <li>Switch to <b>DNS with TTL</b>: 577 fail, and one crash takes 37 s to notice, because the cached answer outlives the registry entry. Raise <b>Cache refresh / DNS TTL</b> to 120 s: 2197 fail, and even the clean scale-in of p4 is still called for 60 s. <b>DNS ignoring TTL</b> keeps answers for 5 minutes: 3715 fail and two crashes are never dropped.</li>
+    <li>Choose <b>Registry lookup on every call</b>: 502 fail, but orders sends the registry 1800 lookups a minute. Tick <b>Outage</b>: while the registry is down from 200 s to 320 s every call fails, 4282 in all.</li>
+    <li>Keep the outage and choose <b>Registry watch</b>: the cached list keeps traffic flowing and 859 fail, but the scale-in of p4 at 300 s goes unseen, so it is still called for 51 s. Tick <b>Retry elsewhere</b>: failures drop to 0, though the same 859 requests hit a dead instance first.</li>
+  </ol>
+  <div class="pg sd" data-sd>
+    <div class="pg-row">
+      <label>Discovery
+        <select class="pg-in" data-mode>
+          <option value="static" selected>Static IP list</option>
+          <option value="dnsignore">DNS ignoring TTL</option>
+          <option value="dns">DNS with TTL</option>
+          <option value="watch">Registry watch</option>
+          <option value="lookup">Registry lookup on every call</option>
+        </select>
+      </label>
+    </div>
+    <div class="pg-row sd-sliders">
+      <label>Lease TTL <input type="range" min="6" max="90" step="3" value="30" data-ttl /> <b data-ttlval>30</b> s</label>
+      <label>Cache refresh / DNS TTL <input type="range" min="1" max="120" value="30" data-refresh /> <b data-refreshval>30</b> s</label>
+    </div>
+    <p class="pg-note" data-modenote></p>
+    <div class="pg-row">
+      <label class="sd-check"><input type="checkbox" data-outage /> Outage 200 to 320 s</label>
+      <label class="sd-check"><input type="checkbox" data-retry /> Retry elsewhere</label>
+      <button class="btn" type="button" data-reset>Reset</button>
+    </div>
+    <div class="pg-grid">
+      <div class="pg-box" data-boxfail style="--c: var(--role-1)"><h3>Failed requests</h3><span class="pg-mono" data-failed></span><span class="pg-note" data-failnote></span></div>
+      <div class="pg-box" data-boxnotice style="--c: var(--role-2)"><h3>Crash noticed after</h3><span class="pg-mono" data-notice></span><span class="pg-note" data-noticenote></span></div>
+      <div class="pg-box" style="--c: var(--role-3)"><h3>Unused capacity</h3><span class="pg-mono" data-unused></span><span class="pg-note">instance-seconds alive but unknown to orders</span></div>
+      <div class="pg-box" style="--c: var(--role-4)"><h3>Registry load</h3><span class="pg-mono" data-hbs></span><span class="pg-note" data-loadnote></span></div>
+    </div>
+    <div class="sd-legend pg-note" aria-hidden="true">
+      <span><i class="sd-sw sd-ok"></i>alive, called</span>
+      <span><i class="sd-sw sd-unused"></i>alive, unknown to orders</span>
+      <span><i class="sd-sw sd-dead"></i>dead, still called</span>
+    </div>
+    <div class="sd-lanes" role="img" data-lanes></div>
+    <div class="sd-axis pg-note" aria-hidden="true"><span>0 s</span><span>300 s</span><span>600 s</span></div>
+    <p class="pg-out" data-verdict aria-live="polite"></p>
+    <p class="pg-code" data-detail></p>
+    <p class="pg-note">Model: one step is 1 second, 600 steps. Orders sends 30 requests per second round-robin over the payment addresses it knows; a request to an instance that is gone fails (with Retry elsewhere, it is tried once on the next address in the list). Payment p1 to p3 run from 0 s; p4 and p5 are added at 60 s; p2 crashes at 155 s, p3 at 383 s and p5 at 515 s; p4 is scaled in at 300 s and deregisters 5 s before it exits; p6, p7 and p8 start at 245, 420 and 470 s. Each instance renews its lease every TTL / 3 seconds, and p1 loses contact with the registry for 12 s at 440 s while still serving. A watch delivers changes 1 s later. During the outage nobody can register, renew or deregister; DNS and cached clients keep their last answer, and when the registry returns every lease restarts. Fixed timeline, no randomness.</p>
+  </div>
+</PlaygroundShell>
+<script>
+  type ModeId = 'static' | 'dnsignore' | 'dns' | 'watch' | 'lookup';
+  type Lane = 'ok' | 'unused' | 'dead' | 'none';
+  interface Cfg { mode: ModeId; ttl: number; refresh: number; retry: boolean; outage: boolean }
+  interface Inst { id: string; s: number; e: number; kind: 'runs' | 'crash' | 'stop' }
+
+  const HORIZON = 600; const RATE = 30; const DRAIN = 5; const IGNORED_TTL = 300; const HB_DIV = 3;
+  const OUTAGE = { from: 200, to: 320 }; const BLIP = { id: 'p1', from: 440, to: 452 };
+  const STATIC_LIST = ['p1', 'p2', 'p3'];
+  const SEC_PER_MIN = 60;
+  const INST: Inst[] = [
+    { id: 'p1', s: 0, e: Infinity, kind: 'runs' }, { id: 'p2', s: 0, e: 155, kind: 'crash' },
+    { id: 'p3', s: 0, e: 383, kind: 'crash' }, { id: 'p4', s: 60, e: 300, kind: 'stop' },
+    { id: 'p5', s: 60, e: 515, kind: 'crash' }, { id: 'p6', s: 245, e: Infinity, kind: 'runs' },
+    { id: 'p7', s: 420, e: Infinity, kind: 'runs' }, { id: 'p8', s: 470, e: Infinity, kind: 'runs' },
+  ];
+  const BY_ID = new Map(INST.map((x) => [x.id, x]));
+  const MODE_LABEL: Record<ModeId, string> = { static: 'Static IP list', dnsignore: 'DNS ignoring TTL', dns: 'DNS with TTL', watch: 'Registry watch', lookup: 'Registry lookup on every call' };
+
+  const alive = (x: Inst, t: number) => x.s <= t && t < x.e;
+
+  // Pure core: the same loop as the code samples, plus the outage, the network blip and the retry.
+  function simulate(cfg: Cfg) {
+    const hb = cfg.ttl / HB_DIV;
+    const reg = new Map<string, number>(); // id -> second of the last renewal
+    let view: string[] = []; let pending: string[] = []; let ctr = 0;
+    let failed = 0; let deadSent = 0; let lookupFailed = 0; let hbs = 0; let unused = 0; let lookups = 0;
+    const lanes: Record<string, Lane[]> = {}; const lastSeen: Record<string, number> = {}; const firstCalled: Record<string, number> = {};
+    const evicted: Record<string, number> = {};
+    INST.forEach((x) => { lanes[x.id] = []; });
+    for (let t = 0; t < HORIZON; t++) {
+      const up = !(cfg.outage && t >= OUTAGE.from && t < OUTAGE.to);
+      const recovered = cfg.outage && t === OUTAGE.to;
+      if (recovered) for (const k of reg.keys()) reg.set(k, t); // every lease restarts when the registry returns
+      for (const x of INST) {
+        const draining = x.kind === 'stop' && t >= x.e - DRAIN;
+        const blip = x.id === BLIP.id && t >= BLIP.from && t < BLIP.to;
+        if (!alive(x, t) || draining || blip || !up) continue;
+        const beat = (t - x.s) % hb === 0;
+        if (!reg.has(x.id)) { if (t === x.s || beat || recovered) reg.set(x.id, t); } // register (again)
+        else if (beat) { reg.set(x.id, t); hbs++; }
+      }
+      if (up) for (const x of INST) if (x.kind === 'stop' && t === x.e - DRAIN) reg.delete(x.id); // clean deregistration
+      if (up) for (const [k, last] of [...reg]) if (t - last >= cfg.ttl) {
+        reg.delete(k); // the lease ran out
+        if (alive(BY_ID.get(k)!, t)) evicted[k] = (evicted[k] ?? 0) + 1;
+      }
+      const current = [...reg.keys()].sort();
+      let lookupFail = false;
+      if (cfg.mode === 'static') { if (t === 0) view = STATIC_LIST; }
+      else if (cfg.mode === 'dnsignore') { if (t % IGNORED_TTL === 0 && up) view = current; if (t % IGNORED_TTL === 0) lookups++; }
+      else if (cfg.mode === 'dns') { if (t % cfg.refresh === 0) { lookups++; if (up) view = current; } }
+      else if (cfg.mode === 'watch') { if (t === 0) view = current; else if (up) { view = pending; pending = current; } }
+      else { lookups += RATE; if (up) view = current; else lookupFail = true; }
+      if (cfg.mode === 'watch' && t === 0) pending = current;
+
+      for (let r = 0; r < RATE; r++) {
+        if (lookupFail || !view.length) { failed++; lookupFailed++; continue; }
+        const i = ctr++ % view.length; const x = BY_ID.get(view[i])!;
+        if (alive(x, t)) { if (!(x.id in firstCalled)) firstCalled[x.id] = t; continue; }
+        deadSent++;
+        if (cfg.retry && view.length > 1 && alive(BY_ID.get(view[(i + 1) % view.length])!, t)) continue; // another instance answers
+        failed++;
+      }
+      for (const x of INST) {
+        const a = alive(x, t); const inView = !lookupFail && view.includes(x.id);
+        lanes[x.id].push(a ? (inView ? 'ok' : 'unused') : inView ? 'dead' : 'none');
+        if (a && !inView) unused++;
+        if (!a && t >= x.e && inView) lastSeen[x.id] = t;
+      }
+    }
+    return { failed, deadSent, lookupFailed, hbs, unused, lookups, lanes, lastSeen, firstCalled, evicted, hb };
+  }
+  type Sim = ReturnType<typeof simulate>;
+
+  // Seconds a dead instance stayed in orders' list: null = never listed, Infinity = still listed at the end.
+  function noticed(r: Sim, x: Inst): number | null {
+    const last = r.lastSeen[x.id];
+    if (last === undefined) return r.lanes[x.id].slice(0, x.e).some((l) => l === 'ok') ? 0 : null;
+    return last === HORIZON - 1 ? Infinity : last - x.e + 1;
+  }
+  const fmt1 = (v: number) => (Number.isInteger(v) ? String(v) : v.toFixed(1));
+
+  document.querySelectorAll<HTMLElement>('[data-sd]').forEach((root) => {
+    const q = <T extends HTMLElement>(s: string) => root.querySelector<T>(s)!;
+    const num = (s: string) => Number(q<HTMLInputElement>(s).value);
+    const lanesEl = q('[data-lanes]');
+    const rows = INST.map((x) => {
+      const row = document.createElement('div'); row.className = 'sd-row';
+      const label = document.createElement('span'); label.className = 'pg-mono'; label.textContent = x.id;
+      const track = document.createElement('div'); track.className = 'sd-track';
+      row.append(label, track); lanesEl.append(row);
+      return { x, track };
+    });
+    const band = document.createElement('div'); band.className = 'sd-band';
+    let raf = 0;
+
+    const cfg = (): Cfg => ({ mode: q<HTMLSelectElement>('[data-mode]').value as ModeId, ttl: num('[data-ttl]'), refresh: num('[data-refresh]'), retry: q<HTMLInputElement>('[data-retry]').checked, outage: q<HTMLInputElement>('[data-outage]').checked });
+
+    function drawLanes(r: Sim, c: Cfg) {
+      rows.forEach(({ x, track }) => {
+        track.textContent = '';
+        const lane = r.lanes[x.id]; let start = 0;
+        for (let t = 1; t <= HORIZON; t++) {
+          if (t < HORIZON && lane[t] === lane[start]) continue;
+          if (lane[start] !== 'none') {
+            const seg = document.createElement('span'); seg.className = `sd-seg sd-${lane[start]}`;
+            seg.style.left = `${(start / HORIZON) * 100}%`; seg.style.width = `${((t - start) / HORIZON) * 100}%`;
+            track.append(seg);
+          }
+          start = t;
+        }
+        if (c.outage) { const b = band.cloneNode() as HTMLElement; b.style.left = `${(OUTAGE.from / HORIZON) * 100}%`; b.style.width = `${((OUTAGE.to - OUTAGE.from) / HORIZON) * 100}%`; track.append(b); }
+      });
+    }
+
+    function draw() {
+      raf = 0;
+      const c = cfg(); const r = simulate(c);
+      q('[data-ttlval]').textContent = String(c.ttl); q('[data-refreshval]').textContent = String(c.refresh);
+      q('[data-modenote]').textContent = `Heartbeat every ${fmt1(r.hb)} s. ` + ({
+        static: 'Static IP list: orders uses p1, p2 and p3 forever. The registry still runs, but nobody asks it.',
+        dnsignore: `DNS ignoring TTL: the client keeps each answer for ${IGNORED_TTL / SEC_PER_MIN} minutes, whatever the record says. The refresh slider has no effect.`,
+        dns: `DNS with TTL: orders re-resolves every ${c.refresh} s, when its cached answer expires.`,
+        watch: 'Registry watch: orders keeps the list in memory and each change is pushed 1 s later. The refresh slider has no effect.',
+        lookup: 'Registry lookup on every call: always the registry\'s latest answer, but the registry is on every request. The refresh slider has no effect.',
+      } as Record<ModeId, string>)[c.mode];
+
+      const total = HORIZON * RATE;
+      q('[data-failed]').textContent = `${r.failed} of ${total} (${((100 * r.failed) / total).toFixed(1)}%)`;
+      q('[data-failnote]').textContent = `${r.deadSent} sent to a dead instance${c.retry ? ' (retried once elsewhere)' : ''}${r.lookupFailed ? `; ${r.lookupFailed} failed because the lookup failed` : ''}`;
+      q('[data-boxfail]').style.setProperty('--c', r.failed > total / 20 ? 'var(--bad)' : 'var(--role-1)');
+
+      const crashes = INST.filter((x) => x.kind === 'crash').map((x) => ({ x, n: noticed(r, x) }));
+      const known = crashes.filter((k) => k.n !== null && Number.isFinite(k.n)) as { x: Inst; n: number }[];
+      const never = crashes.filter((k) => k.n === Infinity).length;
+      if (known.length) {
+        const avg = known.reduce((a, k) => a + k.n, 0) / known.length; const worst = Math.max(...known.map((k) => k.n));
+        q('[data-notice]').textContent = `${avg.toFixed(1)} s average, worst ${worst} s`;
+      } else q('[data-notice]').textContent = 'never';
+      q('[data-noticenote]').textContent = never ? `${never} of ${crashes.length} crashes never dropped from orders' list` : `from the crash to orders' last request to it, over ${known.length} crashes`;
+      q('[data-boxnotice]').style.setProperty('--c', never ? 'var(--bad)' : 'var(--role-2)');
+
+      q('[data-unused]').textContent = String(r.unused);
+      const fe = Object.values(r.evicted).reduce((a, b) => a + b, 0);
+      q('[data-hbs]').textContent = `${r.hbs} heartbeats`;
+      const perMin = (r.lookups / HORIZON) * SEC_PER_MIN;
+      const lookupText = c.mode === 'watch' ? '1 open watch' : `${fmt1(Math.round(perMin * 10) / 10)} lookups a minute`;
+      q('[data-loadnote]').textContent = `renewals in 10 minutes; ${lookupText} from orders; healthy instances wrongly removed: ${fe}`;
+
+      drawLanes(r, c);
+      const lines: string[] = [];
+      for (const x of INST) {
+        const n = x.e < HORIZON ? noticed(r, x) : null;
+        if (x.s > 0) lines.push(`${x.id} started at ${x.s} s: ${x.id in r.firstCalled ? `first called at ${r.firstCalled[x.id]} s` : 'never called'}`);
+        if (x.kind === 'crash') lines.push(`${x.id} crashed at ${x.e} s: ${n === null ? 'never in orders\' list' : n === Infinity ? 'still called at 600 s' : n ? `called for ${n} s after the crash` : 'not called after the crash'}`);
+        else if (x.kind === 'stop') lines.push(`${x.id} scaled in at ${x.e} s (deregisters at ${x.e - DRAIN} s): ${n === null ? 'never in orders\' list' : n === Infinity ? 'still called at 600 s' : n ? `still called for ${n} s after it stopped` : 'no calls after it stopped'}`);
+        if (r.evicted[x.id]) lines.push(`${x.id} healthy, but removed after its 12 s network blip at ${BLIP.from} s`);
+      }
+      q('[data-detail]').textContent = lines.join('\n');
+      lanesEl.setAttribute('aria-label', `Timeline of payment instances over 600 s with ${MODE_LABEL[c.mode]}: ${lines.join('; ')}`);
+
+      const v = q('[data-verdict]'); v.classList.toggle('bad', r.failed > total / 20);
+      const pct = ((100 * r.failed) / total).toFixed(1);
+      v.textContent = r.lookupFailed > r.deadSent
+        ? `${MODE_LABEL[c.mode]}: ${r.failed} requests failed (${pct}%), ${r.lookupFailed} of them because the registry was down. Callers that need the registry on every request share its outages.`
+        : never
+          ? `${MODE_LABEL[c.mode]}: ${r.failed} requests failed (${pct}%). ${never} crashed instance${never > 1 ? 's were' : ' was'} never dropped, so orders kept calling a dead address.`
+          : r.failed === 0
+            ? `${MODE_LABEL[c.mode]}: no request failed, but ${r.deadSent} first went to a dead instance. The retry hides a stale list; it does not fix it.`
+            : `${MODE_LABEL[c.mode]}: ${r.failed} requests failed (${pct}%). Each crash still costs errors until the lease expires${c.mode === 'dns' ? ' and the cached DNS answer runs out' : ''}.`;
+    }
+    const schedule = () => { if (!raf) raf = requestAnimationFrame(draw); };
+    ['[data-mode]', '[data-ttl]', '[data-refresh]', '[data-retry]', '[data-outage]'].forEach((s) => { q(s).addEventListener('input', schedule); q(s).addEventListener('change', schedule); });
+    q('[data-reset]').addEventListener('click', () => {
+      q<HTMLSelectElement>('[data-mode]').value = 'static'; q<HTMLInputElement>('[data-ttl]').value = '30'; q<HTMLInputElement>('[data-refresh]').value = '30';
+      q<HTMLInputElement>('[data-retry]').checked = false; q<HTMLInputElement>('[data-outage]').checked = false; schedule();
+    });
+    draw();
+  });
+</script>
+<style is:global>
+  .playground .sd-check { display: inline-flex; align-items: center; gap: 6px; }
+  .playground .sd-sliders input[type=range] { min-width: 0; max-width: 100%; }
+  .playground .sd-legend { display: flex; flex-wrap: wrap; gap: 4px 16px; }
+  .playground .sd-legend span { display: inline-flex; align-items: center; gap: 6px; }
+  .playground .sd-sw { display: inline-block; width: 1.4em; height: .9em; border-radius: 2px; position: static; }
+  .playground .sd-lanes { display: grid; gap: 3px; }
+  .playground .sd-row { display: grid; grid-template-columns: 2rem minmax(0, 1fr); gap: 8px; align-items: center; }
+  .playground .sd-track { position: relative; height: 14px; background: var(--surface-2); border-radius: 3px; overflow: hidden; }
+  .playground .sd-seg { position: absolute; top: 0; bottom: 0; min-width: 2px; }
+  .playground .sd-ok { background: var(--accent); }
+  .playground .sd-unused { background: repeating-linear-gradient(45deg, color-mix(in srgb, var(--muted) 55%, transparent) 0 3px, transparent 3px 6px); outline: 1px solid var(--muted); outline-offset: -1px; }
+  .playground .sd-dead { background: repeating-linear-gradient(-45deg, var(--bad) 0 4px, color-mix(in srgb, var(--bad) 45%, var(--surface)) 4px 7px); }
+  .playground .sd-band { position: absolute; top: 0; bottom: 0; border-left: 2px dashed var(--text); border-right: 2px dashed var(--text); background: color-mix(in srgb, var(--text) 10%, transparent); pointer-events: none; }
+  .playground .sd-axis { display: flex; justify-content: space-between; padding-left: calc(2rem + 8px); }
+</style>

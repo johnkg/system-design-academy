@@ -1,0 +1,221 @@
+{
+  "name": "Design a Calendar and Scheduling Service",
+  "difficulty": "intermediate",
+  "intent": "Store meetings that repeat for ever without storing them for ever, keep a 09:00 meeting at 09:00 when the clocks change, find a free hour for many people at once, never give one room to two meetings, and keep every phone in step.",
+  "codeTitle": "a recurring series in wall time, free/busy by merging intervals, and a room that rejects overlaps",
+  "finalIntro": "One organiser in New York setting up a weekly meeting with a colleague in London and a meeting room.",
+  "prompt": "Design a calendar service like Google Calendar or Outlook for 100 million users. People create single and repeating events, invite others inside and outside the company, see when colleagues are free, book meeting rooms, get reminders before each meeting, and use the same calendar on the web, on phones and in desktop apps. People live in many time zones, and a weekly meeting at 09:00 must stay at 09:00 when the clocks change.",
+  "functional": [
+    "Create, edit and delete single events and repeating series, including 'only this one' and 'this and following' changes",
+    "Invite people, inside the company and by email outside it, and collect their replies (accept, decline, maybe)",
+    "Show free and busy times for a group of people and rooms, and suggest slots where everyone is free",
+    "Book meeting rooms and other shared resources, never twice for the same time",
+    "Send reminders a chosen number of minutes before each occurrence",
+    "Sync calendars to phones and desktop apps, which keep an offline copy"
+  ],
+  "nonFunctional": [
+    "A calendar week view loads in under 200 ms at the 99th percentile, including repeating events",
+    "A free/busy query for 20 people over 2 weeks answers in under 300 ms",
+    "A room is never booked by two overlapping meetings, whatever the number of simultaneous requests",
+    "Reminders fire within 30 seconds of their time, even when millions are due in the same minute",
+    "An invitation reaches internal attendees' calendars within a few seconds, and no change is lost if a server crashes",
+    "A phone that has seen no changes uses almost no data when it syncs"
+  ],
+  "firstAttempt": {
+    "text": "One events table with a start and an end stored in UTC (Coordinated Universal Time). A weekly meeting is saved as 52 separate rows, one for each week of the coming year. The week view and free/busy both query rows that overlap a time range. To book a room, the app checks for an overlapping booking and then inserts one. Creating a meeting sends the invitation emails inside the same request, a job scans the whole table every minute for reminders, and phones download the whole calendar every 15 minutes.",
+    "limits": [
+      "A series has to stop somewhere because an endless one would need endless rows, and changing 'every Monday' to 'every Tuesday' rewrites every row",
+      "A meeting stored as 14:00 UTC is 09:00 in New York in January and 10:00 in July, so the clock change moves it for the people who own it",
+      "Two people booking the same room at the same moment both see it free and both insert, because the check and the write are separate steps",
+      "Sending invitations inside the request is slow for big meetings and loses some of them if the server crashes halfway, and the reminder scan reads everything to find a few",
+      "Phones download thousands of unchanged events again and again"
+    ]
+  },
+  "nodes": [
+    { "id": "users", "label": "Users", "kind": "client", "x": 10, "y": 50 },
+    { "id": "single", "label": "App + events table", "kind": "compute", "x": 50, "y": 50, "at": 0, "until": 1 },
+    { "id": "api", "label": "Calendar API", "kind": "edge", "x": 32, "y": 50, "at": 1 },
+    { "id": "events", "label": "Events + rules", "kind": "data", "x": 56, "y": 50, "at": 1 },
+    { "id": "tz", "label": "tz database", "kind": "data", "x": 56, "y": 12, "at": 2 },
+    { "id": "freebusy", "label": "Free/busy", "kind": "compute", "x": 32, "y": 12, "at": 3 },
+    { "id": "busy", "label": "Busy intervals", "kind": "data", "x": 82, "y": 12, "at": 3 },
+    { "id": "rooms", "label": "Room bookings", "kind": "data", "x": 82, "y": 38, "at": 4 },
+    { "id": "relay", "label": "Outbox relay", "kind": "async", "x": 56, "y": 88, "at": 5 },
+    { "id": "timers", "label": "Reminder timers", "kind": "async", "x": 82, "y": 62, "at": 5 },
+    { "id": "mailer", "label": "Invite mailer", "kind": "compute", "x": 82, "y": 88, "at": 5 },
+    { "id": "feed", "label": "Change feed", "kind": "data", "x": 32, "y": 88, "at": 6 },
+    { "id": "devices", "label": "Phones, CalDAV", "kind": "client", "x": 10, "y": 88, "at": 6 }
+  ],
+  "edges": [
+    { "from": "users", "to": "single", "at": 0, "until": 1 },
+    { "from": "users", "to": "api", "at": 1 },
+    { "from": "api", "to": "events", "at": 1 },
+    { "from": "api", "to": "tz", "at": 2 },
+    { "from": "api", "to": "freebusy", "at": 3 },
+    { "from": "freebusy", "to": "busy", "at": 3 },
+    { "from": "events", "to": "busy", "at": 3 },
+    { "from": "api", "to": "rooms", "at": 4 },
+    { "from": "events", "to": "relay", "at": 5 },
+    { "from": "relay", "to": "timers", "at": 5 },
+    { "from": "relay", "to": "mailer", "at": 5 },
+    { "from": "events", "to": "feed", "at": 6 },
+    { "from": "devices", "to": "api", "at": 6 },
+    { "from": "api", "to": "feed", "at": 6 }
+  ],
+  "steps": [
+    {
+      "title": "Store a series once as a rule, and expand it only for the window being read",
+      "problem": "Copying a repeating meeting into one row per occurrence needs an end date, turns a two-year daily stand-up into 730 rows, and makes 'move every Monday to Tuesday' a rewrite of all of them.",
+      "fix": "Store a series as one master row: the first start, the duration, and a recurrence rule in the iCalendar format (RFC 5545), such as RRULE:FREQ=WEEKLY;BYDAY=MO;COUNT=10 or an UNTIL date, or no end at all. The row also keeps the first start and the last end (infinity for an endless series), and an index on calendar and that range finds every series that can touch a window. A request for one week loads the single events in that week plus the series whose range overlaps it, and expands each rule only inside the week. Changes to one occurrence are stored next to the series: EXDATE lists cancelled occurrences, and a moved or edited occurrence is an override row keyed by the series id and its RECURRENCE-ID (the original start of that occurrence). 'This and following' splits the series in two: the old rule gets an UNTIL just before the chosen date, and a new series starts on it. Expanded weeks are cached per calendar and dropped when the calendar changes.",
+      "tradeoff": "A series costs one row however long it runs, and an edit to all occurrences is one update. Every read now does work to expand rules, some rules are hard to get right (the last working day of each month), and a question such as 'every occurrence ever' has no direct answer, so anything that needs occurrences across many calendars uses the bounded table of step 3.",
+      "concepts": [{ "slug": "database-indexing" }, { "slug": "caching" }]
+    },
+    {
+      "title": "Store wall time and a time zone name, and keep UTC for instants",
+      "problem": "A weekly 09:00 meeting in New York created in January is 14:00 UTC. Stored as '14:00 UTC every 7 days', it starts at 10:00 local time from 9 March 2026, the first Monday after the US moves its clocks forward on 8 March.",
+      "fix": "A timed event that belongs to a place is stored as wall-clock time plus an IANA time zone name (the shared database of zone rules, with names such as America/New_York), never as a fixed offset like -05:00. The rule is expanded in that zone, and only then is each occurrence converted to UTC for indexing and comparison. Things that really are instants stay in UTC: when a row was written, when a reminder fires, and the expanded busy intervals. All-day events such as a birthday are stored as dates with no zone, so 5 May is 5 May everywhere. RFC 5545 also settles the awkward cases: a local time skipped when clocks go forward (02:30 on 8 March 2026 in New York) is read with the offset from before the gap, so it lands at 03:30, and a time that happens twice when clocks go back means the first one. Attendees in other zones see the meeting move when their country changes clocks on a different date: in London it is at 13:00 instead of 14:00 from 9 to 23 March 2026, because the UK changes on 29 March. That is correct, because the meeting follows its organiser's zone.",
+      "tradeoff": "Meetings stay where people expect them, all year. Every comparison now needs a conversion, servers and phones must use the same version of the tz database, and when a government changes its rules the future occurrences in that zone must be expanded again and their busy intervals and reminders rebuilt.",
+      "concepts": [{ "slug": "database-indexing" }, { "slug": "batch-vs-stream-processing" }]
+    },
+    {
+      "title": "Keep a table of busy intervals for free/busy, and merge them",
+      "problem": "The scheduling assistant asks about 12 people and 3 rooms over two weeks. Expanding every series of every one of them on each request is slow, and one person with 80 repeating meetings costs more than all the others together.",
+      "fix": "Keep a second, derived table: for each calendar, the UTC start and end of every occurrence that shows as busy, for a rolling horizon such as the next 12 months. Events marked as free (TRANSP:TRANSPARENT in iCalendar) and invitations the person declined are left out. The table is updated in the same transaction as the event, and a nightly job extends the horizon. A free/busy query is one index range scan per calendar on (calendar, start), run in parallel across shards. The answer merges the lists: sort all intervals by start, join any interval that starts before the previous one ends, and the gaps that are at least as long as the meeting, inside working hours, are the suggested slots. The answer says only busy or free, not titles, so it can be shown to anyone in the company. Questions beyond the horizon fall back to expanding the rules.",
+      "tradeoff": "Free/busy becomes a few cheap range scans whatever the rules look like. Writes grow: editing a daily series rewrites 365 rows of busy intervals, the horizon must be extended every night, and a change in time zone rules or in the series means the derived rows must be rebuilt.",
+      "concepts": [{ "slug": "cqrs" }, { "slug": "database-indexing" }, { "slug": "database-sharding" }]
+    },
+    {
+      "title": "Let the database refuse overlapping room bookings",
+      "problem": "Two organisers book Room 4B, one for 10:00 to 11:00 and one for 10:30 to 11:30, at the same moment. Each server checks for an overlap, finds none, and inserts, so the room has two meetings. A unique index does not help, because the two ranges are different values.",
+      "fix": "A room is a calendar whose bookings live in a table guarded by the database. In PostgreSQL an exclusion constraint does it: EXCLUDE USING gist (room_id WITH =, during WITH &&), where 'during' is a tstzrange (a range of timestamps with time zone) and && means 'overlaps' (the = on room_id needs the btree_gist extension). Ranges are half-open, [start, end), so 10:00 to 11:00 and 11:00 to 12:00 do not clash. The second insert fails with an exclusion violation (SQLSTATE 23P01), and the organiser is told the room has just been taken. A repeating booking inserts every occurrence inside the horizon in one transaction; if some occurrences clash, the organiser can drop those dates, which become EXDATEs. Without range constraints, the same guarantee comes from one row per room and 15-minute slot with a unique key, or a conditional write on a per-room-per-day record that carries a version number.",
+      "tradeoff": "No number of app servers can double-book a room, and the rule lives in one place. The constraint works only inside one database, so a building's rooms must live on the same shard, and occurrences beyond the horizon are not protected until the nightly job inserts them, so a clash found then has to be reported to the organiser.",
+      "concepts": [{ "slug": "acid-vs-base" }, { "slug": "mvcc-and-isolation-levels" }, { "slug": "optimistic-concurrency-and-etags" }]
+    },
+    {
+      "title": "Fan out invitations and reminders from an outbox",
+      "problem": "A meeting with 200 attendees must appear in 200 calendars, email the guests outside the company and schedule reminders. Doing it inside the request is slow and a crash halfway leaves some people invited and some not. The reminder scan reads the whole table each minute.",
+      "fix": "The event and an outbox row are written in one transaction, and a relay publishes the outbox to a queue. One consumer copies the event into each internal attendee's calendar and their busy intervals. A mailer sends external guests an iMIP email (RFC 6047): an iCalendar attachment with METHOD:REQUEST. Their replies come back as METHOD:REPLY with PARTSTAT=ACCEPTED, DECLINED or TENTATIVE, matched to the event by its UID; the organiser raises SEQUENCE on each important change, so a client can tell an old version from a new one. A reminder consumer hands timers to a delayed-job service: one timer per occurrence, attendee and offset, with its fire time in UTC and a key built from those three, so a moved meeting replaces its timer instead of adding one. Only the next day or two of occurrences get timers, and a rolling job adds more. Every consumer ignores a message id it has already handled, because delivery is at least once.",
+      "tradeoff": "Saving a meeting is fast, and nothing is lost on a crash. Attendees see the invitation a few seconds later, an email already sent cannot be taken back, and reminders bunch up: most meetings start on the hour or half hour, so the timer service must handle bursts far above its average.",
+      "concepts": [{ "slug": "transactional-outbox" }, { "slug": "message-queues" }, { "slug": "idempotency" }, { "slug": "delivery-guarantees" }]
+    },
+    {
+      "title": "Sync devices with a change feed and sync tokens",
+      "problem": "Phones and desktop apps keep an offline copy. Downloading a calendar of 3,000 events every 15 minutes mostly confirms that nothing changed, and an edit made offline on a phone can clash with an edit made on the web.",
+      "fix": "Each change to a calendar gets the next number in a per-calendar sequence, written in the same transaction into a change log. A client keeps a sync token (the last number it has seen) and asks for 'changes since token 812', and the answer lists the events added, changed or deleted since then, plus a new token, in pages. CalDAV clients (RFC 4791) such as Apple Calendar and Thunderbird can use the same idea through the WebDAV sync-collection report (RFC 6578). Deleted events are kept as tombstones (markers that say 'deleted') for a retention window such as 30 days, and an older token is refused, so the client starts a full sync. Every event has an ETag (a version tag), and a client updates with If-Match, so a change made elsewhere in the meantime returns 412 Precondition Failed and the client fetches the new version before trying again. A push message tells phones to sync now instead of polling.",
+      "tradeoff": "A sync costs as much as the changes, not the calendar, and offline edits cannot silently overwrite newer ones. The service must keep an ordered log and tombstones per calendar, clients must handle conflicts, and a device that was away too long pays for a full download.",
+      "concepts": [{ "slug": "optimistic-concurrency-and-etags" }, { "slug": "pagination" }, { "slug": "pub-sub" }]
+    }
+  ],
+  "failures": [
+    {
+      "scenario": "A country changes its daylight saving rules with a few weeks' notice",
+      "impact": "Future meetings in that zone would start an hour off, and their busy intervals and reminders would be wrong too.",
+      "answer": "Because series are stored as wall time and a zone name, only the tz database has to change. After the update, a job finds the series in the affected zone, expands their future occurrences again, and rebuilds busy intervals and reminder timers. Phones need the same tz update, so the service also sends UTC times in its answers as a fallback.",
+      "concepts": [{ "slug": "batch-vs-stream-processing" }, { "slug": "database-indexing" }]
+    },
+    {
+      "scenario": "Two organisers book the same room for overlapping times at the same moment",
+      "impact": "With a check and then an insert, both succeed and two meetings arrive at one room.",
+      "answer": "The exclusion constraint lets the first insert commit and rejects the second with an exclusion violation. The losing organiser sees that the room was just taken and is offered other free rooms from the busy-interval table.",
+      "concepts": [{ "slug": "acid-vs-base" }, { "slug": "mvcc-and-isolation-levels" }]
+    },
+    {
+      "scenario": "The outbox relay is down for 10 minutes",
+      "impact": "New invitations do not reach attendees, and reminders for meetings created in those minutes are not scheduled.",
+      "answer": "Nothing is lost: the outbox rows wait in the database, and the relay publishes them in order when it comes back. Consumers ignore repeats. Reminder timers whose time has already passed are sent at once if the meeting has not started yet, and dropped if it has.",
+      "concepts": [{ "slug": "transactional-outbox" }, { "slug": "idempotency" }]
+    },
+    {
+      "scenario": "Millions of reminders are due at 08:50 on a Monday",
+      "impact": "The timer service, sized for the average, falls behind, and reminders arrive after the meetings have started.",
+      "answer": "Timers are stored in buckets by minute and spread over many partitions, so many workers fire one minute at once. Workers are added before the busy minutes, which are known in advance, and push messages are sent a few seconds early rather than late. Phones also schedule reminders locally from their synced copy, so the server's push is a backup.",
+      "concepts": [{ "slug": "autoscaling" }, { "slug": "backpressure" }]
+    },
+    {
+      "scenario": "A phone comes back online after two months with edits made offline",
+      "impact": "Its sync token is older than the tombstone window, and its edits may clash with changes made on the web.",
+      "answer": "The server refuses the old token, so the phone does a full sync and keeps its local edits aside. It then sends each edit with If-Match and the ETag it last saw; edits to events that changed in the meantime get 412, and the app shows both versions or applies a rule such as 'newest wins per field'.",
+      "concepts": [{ "slug": "optimistic-concurrency-and-etags" }, { "slug": "pagination" }]
+    }
+  ],
+  "alternatives": [
+    {
+      "title": "How to store repeating events",
+      "options": [
+        { "name": "One row per occurrence", "pro": "Every query is a plain range query", "con": "Needs an end date, grows without limit, and edits to the series rewrite many rows" },
+        { "name": "One rule, expanded on every read", "pro": "One row per series, and edits are cheap", "con": "Every read does the expansion, including free/busy over many people" },
+        { "name": "Rule as the source, plus occurrences for a rolling horizon", "pro": "Cheap edits and cheap range queries", "con": "A derived table to keep in step and to rebuild when rules change" }
+      ],
+      "pick": "The rule is the source of truth and the week view expands it, while busy intervals for the next 12 months are kept as a derived table for free/busy and rooms."
+    },
+    {
+      "title": "How to store the time of an event",
+      "options": [
+        { "name": "A UTC instant", "pro": "Easy to compare and index", "con": "A repeating meeting moves by an hour for its owners when their clocks change" },
+        { "name": "Wall time plus an IANA zone name", "pro": "Follows the clock of the people who own the meeting, through every rule change", "con": "Needs conversion for every comparison and the same tz data everywhere" },
+        { "name": "Floating time with no zone", "pro": "Right for all-day events and personal habits such as 'gym at 07:00 wherever I am'", "con": "People in different zones join at different instants" }
+      ],
+      "pick": "Wall time plus a zone name for timed events, UTC for derived instants such as busy intervals and reminders, and floating dates only for all-day events."
+    },
+    {
+      "title": "How to stop double-booking a room",
+      "options": [
+        { "name": "Exclusion constraint on overlapping ranges", "pro": "Exact for any start and end, and enforced by the database", "con": "Needs PostgreSQL or a similar database, and works inside one database only" },
+        { "name": "One row per room and 15-minute slot with a unique key", "pro": "Works in any database with unique keys", "con": "A long booking writes many rows, and odd times must be rounded to slots" },
+        { "name": "Check then insert in the app", "pro": "Simple to write", "con": "Two simultaneous requests both pass the check" }
+      ],
+      "pick": "An exclusion constraint on (room, time range), with a building's rooms on one shard. Slot rows only where the database has no range constraint."
+    },
+    {
+      "title": "How devices stay in step",
+      "options": [
+        { "name": "Download everything on a timer", "pro": "Nothing to keep on the server", "con": "Costly, mostly useless downloads, and changes arrive late" },
+        { "name": "Sync tokens over a change log", "pro": "Each sync costs as much as the changes", "con": "Needs an ordered log, tombstones, and a full-sync fallback" },
+        { "name": "Push every change to every device", "pro": "Changes arrive at once", "con": "A device that missed a push has no way to know it" }
+      ],
+      "pick": "Sync tokens over a change log, with push messages that only say 'sync now', and a full sync when a token is too old."
+    }
+  ],
+  "roles": [
+    { "id": "client", "label": "Users and devices", "description": "People in the web app, and phones and desktop apps that sync." },
+    { "id": "edge", "label": "Entry point", "description": "The calendar API." },
+    { "id": "compute", "label": "Services", "description": "Free/busy and the invitation mailer." },
+    { "id": "data", "label": "State", "description": "Events and rules, busy intervals, room bookings, the change feed and the tz database." },
+    { "id": "async", "label": "Background work", "description": "The outbox relay and the reminder timers." }
+  ],
+  "quiz": [
+    {
+      "question": "A weekly stand-up is at 09:00 every Monday for a team in New York. The service saved it in January as 14:00 UTC repeating every 7 days. In March the team says it now starts at 10:00. What is the right fix?",
+      "options": [
+        "Keep UTC, and let each phone add an hour when summer time is active in the zone the phone is in",
+        "Store 09:00 with no zone at all, so that every attendee sees the meeting at 09:00 on their own clock",
+        "Store 09:00 with America/New_York, expand the rule in that zone, and convert each occurrence to UTC",
+        "Run a job twice a year that shifts every series stored in UTC by one hour in the right direction"
+      ],
+      "answer": 2,
+      "explanation": "The meeting belongs to the New York clock, so the rule must be expanded in that zone and only then turned into instants. A phone that adds an hour based on its own zone breaks for attendees in London or Tokyo, whose clocks change on other dates or not at all. Floating time puts people in different zones in the meeting at different instants, and a twice-yearly shift job gets every zone that changes on another date wrong."
+    },
+    {
+      "question": "Two app servers receive requests to book Room 4B, for 10:00 to 11:00 and for 10:30 to 11:30, at the same moment. Each runs a query for overlapping bookings, finds none, and inserts. Which change makes the database itself reject the second booking?",
+      "options": [
+        "An exclusion constraint on room id and time range, so overlapping rows cannot both exist",
+        "A unique index on room id, start time and end time, so the same booking cannot be stored twice",
+        "Run the check and the insert in one transaction at the default READ COMMITTED isolation level",
+        "Look for overlaps again a second after the insert and delete whichever booking was saved later"
+      ],
+      "answer": 0,
+      "explanation": "Only a constraint that understands overlap can refuse the second row whatever the timing. The unique index is tempting, but 10:00 to 11:00 and 10:30 to 11:30 are different values, so both pass. READ COMMITTED lets both transactions see no overlap, and a later clean-up leaves a window where two organisers believe they have the room."
+    },
+    {
+      "question": "The scheduling assistant suggests free hours for 12 attendees over the next two weeks. Each request loads every event of every attendee and expands every repeating series, and the slowest requests take 4 seconds because a few people have about 80 series each. What should change?",
+      "options": [
+        "Cache each finished answer for an hour, keyed by the set of attendees and the two weeks asked about",
+        "Allow at most 52 occurrences per series, so that no expansion can produce more than a year of meetings",
+        "Expand each attendee's series on a separate server in parallel, and keep the rest of the design as it is",
+        "Keep a busy-interval table per calendar for 12 months, updated on each write, and merge range scans"
+      ],
+      "answer": 3,
+      "explanation": "Precomputed busy intervals turn each attendee into one index range scan, and merging sorted intervals is cheap. Running the expansion in parallel is tempting, but the slowest attendee still pays the full cost on every request. A cache keyed by the attendee set rarely hits and shows stale gaps, and capping series breaks real meetings that repeat for years."
+    }
+  ]
+}
