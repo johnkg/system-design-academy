@@ -166,10 +166,10 @@ async function drive({ index, settle, settleLooks, maxStates, minLabelWord, mode
       const mentioned = c.label.length >= 3 && (low.includes(c.label) || c.label.split(' ').some((w) => w.length >= minLabelWord && new RegExp(`\\b${w}`).test(low)));
       if (c.kind === 'select') {
         // An option is named by its text, or by all its longer words when the step fills in a placeholder ("Retry 3 times" for "Retry N times").
-        const words = new Set(clean(text).split(' '));
+        const plain = clean(text), words = new Set(plain.split(/[^a-z-]+/));
         for (const o of c.el.options) {
-          const t = clean(o.textContent), long = t.split(' ').filter((w) => w.length >= 3);
-          if (t.length >= 3 && (low.includes(t) || (long.length >= 3 && long.every((w) => words.has(w))))) picks.push([[c, o.value]]);
+          const t = clean(o.textContent), long = t.split(/[^a-z-]+/).filter((w) => w.length >= 3);
+          if (t.length >= 3 && (low.includes(t) || plain.includes(t) || (long.length >= 3 && long.every((w) => words.has(w))))) picks.push([[c, o.value]]);
         }
       } else if ((c.kind === 'range' || c.kind === 'number') && mentioned) {
         const min = Number(c.el.min || 0), max = Number(c.el.max || 0), step = Number(c.el.step || 1) || 1;
@@ -182,9 +182,12 @@ async function drive({ index, settle, settleLooks, maxStates, minLabelWord, mode
     // A step that names no button usually continues from the last one that did ("now switch to Unordered").
     let own = [];
     for (let k = step; k >= 0 && !own.length; k--) own = named(steps[k]);
-    // The earlier steps' settings, then this step's settings one at a time and all together, pressing the buttons after each.
+    // The earlier steps' settings, then each value this step names on its own, then with the step's first value for every
+    // other control ("Own cell plus 8 neighbours" and a cell size of 1 km), then all of them in order, pressing the buttons after each.
     const before = plan.slice(0, step).flat().flat();
-    for (const p of [...plan[step], plan[step].flat()]) {
+    const mine = plan[step].flat();
+    const others = (c) => mine.filter(([o], i) => o !== c && mine.findIndex(([x]) => x === o) === i);
+    for (const p of [...plan[step], ...plan[step].map((p) => [...others(p[0][0]), ...p]), mine]) {
       restore();
       await run([...before, ...p]);
       await press(own);
