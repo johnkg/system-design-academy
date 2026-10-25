@@ -38,7 +38,8 @@ if (!playwright) { console.error('Playwright is not installed (npm install --no-
 const PORT_BASE = 4600, PORT_SPREAD = 300; // the preview server picks a port in this range
 const START_TRIES = 60, START_POLL_MS = 500; // wait up to 30 s for the server
 const PARALLEL = 4; // pages checked at once
-const SETTLE_MS = 40; // time given to a simulation to redraw after a control changes
+const SETTLE_MS = 40; // pause between looks at a simulation that is redrawing after a control changes
+const SETTLE_LOOKS = 25; // looks before giving up on a simulation that never stops changing (a running animation)
 const MAX_STATES = 60; // states tried per simulation
 const MIN_PLAIN = 10; // whole numbers below this are counts in prose ("3 copies", "step 2"), not claims
 const APPROX_TOLERANCE = 0.05; // "about 300" may match 290 to 315
@@ -74,7 +75,7 @@ pages.sort();
 const wanted = pages.filter((p) => p.includes(only));
 
 // Runs inside the page: drives one simulation and returns its "how" steps and every number it showed.
-async function drive({ index, settle, maxStates, minLabelWord }) {
+async function drive({ index, settle, settleLooks, maxStates, minLabelWord }) {
   const section = document.querySelectorAll('section.playground')[index];
   const steps = [...section.querySelectorAll('ol.how > li')].map((li) => li.textContent.replace(/\s+/g, ' ').trim());
   const wait = (ms) => new Promise((r) => setTimeout(r, ms));
@@ -103,12 +104,22 @@ async function drive({ index, settle, maxStates, minLabelWord }) {
       fire(c.el);
     } catch { /* a control that throws is reported by check:pages, not here */ }
   };
+  // Wait until the simulation has stopped redrawing: its text is the same on two looks in a row. A fixed pause is too short on a busy machine.
+  const stable = async () => {
+    let last = '';
+    for (let i = 0; i < settleLooks; i++) {
+      await wait(settle);
+      const now = section.textContent;
+      if (now === last) return;
+      last = now;
+    }
+  };
   const restore = () => controls.forEach((c) => put(c, c.def));
   let states = 0;
   const run = async (settings) => {
     if (states++ >= maxStates) return;
     settings.forEach(([c, v]) => put(c, v));
-    await wait(settle);
+    await stable();
     snapshot();
   };
 
@@ -118,7 +129,7 @@ async function drive({ index, settle, maxStates, minLabelWord }) {
     if (c.kind === 'select') for (const o of c.el.options) await run([[c, o.value]]);
     else if (c.kind === 'range' || c.kind === 'number') { if (c.el.min !== '') await run([[c, c.el.min]]); if (c.el.max !== '') await run([[c, c.el.max]]); }
     else await run([[c, !c.def]]);
-    restore(); await wait(settle);
+    restore(); await stable();
   }
   // What each step names: a control whose label it mentions, an option whose text it mentions, and the numbers it quotes that fit a slider.
   const plan = steps.map((text) => {
@@ -139,7 +150,7 @@ async function drive({ index, settle, maxStates, minLabelWord }) {
   const cumulative = [];
   for (const picks of plan) {
     for (const p of picks) await run(p); // the step on its own
-    restore(); await wait(settle);
+    restore(); await stable();
     for (const p of picks) cumulative.push(...p);
     await run(cumulative.slice()); // and together with the earlier steps
   }
@@ -158,7 +169,7 @@ async function check(path, context) {
   for (let i = 0; i < count.length; i++) {
     if (!count[i]) continue;
     if (i > 0) await page.goto(origin + base + path, { waitUntil: 'load' });
-    const out = await page.evaluate(drive, { index: i, settle: SETTLE_MS, maxStates: MAX_STATES, minLabelWord: MIN_LABEL_WORD });
+    const out = await page.evaluate(drive, { index: i, settle: SETTLE_MS, settleLooks: SETTLE_LOOKS, maxStates: MAX_STATES, minLabelWord: MIN_LABEL_WORD });
     results.push({ key: `${path}#${i}`, ...out });
   }
   await page.close();
