@@ -3,6 +3,16 @@ export interface Change { date: string; title: string; items: { text: string; hr
 
 export const changelog: Change[] = [
   {
+    date: '2026-10-26',
+    title: 'A new look',
+    items: [
+      { text: 'A calmer, more technical design in light and dark themes, with self-hosted IBM Plex Sans for text and JetBrains Mono for numbers and code.' },
+      { text: 'The home page shows your progress, the next step on a start-here path and how many review questions are due today. The catalog has an area list, a level filter and a "Hide done" switch.' },
+      { text: 'Concept, pattern and case-study pages have an "On this page" list that follows you as you read, numbered sections, and the time each page takes.', href: 'concepts/caching/' },
+      { text: 'On a phone the main sections sit in a tab bar at the bottom of the screen, within reach of your thumb.' },
+    ],
+  },
+  {
     date: '2026-10-25',
     title: 'Three new concepts and three new case studies',
     items: [

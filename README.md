@@ -51,13 +51,18 @@ No page or component changes are needed.
 2. In Settings, Pages, set Source to "GitHub Actions".
 3. `.github/workflows/deploy.yml` checks samples, builds with the correct `SITE` and `BASE`, and deploys on every push to `main`.
 
+## Design
+
+The look ("Blueprint") lives in the tokens at the top of `src/styles/global.css`: an ink-blue `--accent` for navigation, links and focus, and an amber `--signal` reserved for scenarios and simulations, each redefined for the dark theme. Text uses IBM Plex Sans and numbers, labels and code use JetBrains Mono (`--font-sans`, `--font-mono`). Both are self-hosted variable fonts, latin subset only, in `public/fonts/` with their SIL Open Font License files; `Layout.astro` declares them so the URLs follow `BASE`. Concept, pattern and case-study pages share `src/components/LessonShell.astro` (breadcrumb, header, "On this page" list) and `SectionHeading.astro` for numbered headings; build a page's section list with `numbered()` from `src/lib.ts`. On screens up to 640px the main nav becomes a bottom tab bar.
+
 ## Accessibility
 
 What is built in:
 
 - Skip link, landmarks, a single `h1` per page, and a heading order that never skips a level.
-- Visible focus rings on every control, `scroll-padding` so the sticky header never covers a focused item, and 30px minimum control height.
+- Visible focus rings (3px) on every control, `scroll-padding` so neither the sticky header nor the phone tab bar covers a focused item, 40px minimum button height and 44px targets in the header, tab bar and filters.
 - Colour contrast meets WCAG AA in light and dark themes (code colours use the GitHub "default" Shiki themes for that reason; accent buttons use `--on-accent`).
+- Difficulty is shown as a word plus a three-bar meter, and amber marks the parts you can drive yourself (scenario cards, simulation headers), never as the only signal.
 - Diagrams expose a generated text description (classes, members, relationships) through `<title>`/`<desc>`.
 - The step player narrates each step in an `aria-live` region, keeps focus on Prev/Next at the ends (`aria-disabled`, not `disabled`), and skips motion when the user prefers reduced motion.
 - A small script in `Layout.astro` restores keyboard focus when a playground rebuilds or disables the button you just pressed.
