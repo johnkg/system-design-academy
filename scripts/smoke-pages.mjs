@@ -98,6 +98,8 @@ async function check(path) {
       await exercise(page);
       if (await page.evaluate(() => document.documentElement.scrollWidth > document.documentElement.clientWidth)) problems.push(`[${width}] horizontal scroll`);
       if (axeSource) { // both passes: light at desktop width, and dark at 320px, so both palettes are contrast-checked
+        // Let running animations and transitions finish first: a half-faded control reads as low contrast and would fail on a slow runner.
+        await page.evaluate(() => Promise.all(document.getAnimations().filter((a) => a.effect?.getComputedTiming().iterations !== Infinity).map((a) => a.finished.catch(() => {}))));
         await page.addScriptTag({ content: axeSource });
         const res = await page.evaluate(() => axe.run());
         for (const v of res.violations) problems.push(`[${width}] axe ${v.id} x${v.nodes.length}: ${v.nodes[0].target.join(' ').slice(0, 100)}`);
