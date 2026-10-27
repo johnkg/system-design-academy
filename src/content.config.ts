@@ -101,6 +101,8 @@ const studies = defineCollection({
       pick: z.string(),
     })),
     roles: z.array(z.object({ id: z.string(), label: z.string(), description: z.string() })),
+    // Public write-ups a company-named study is built from. Shown at the end of the page; check:content requires https links.
+    sources: z.array(z.object({ title: z.string(), publisher: z.string(), year: z.number().int(), url: z.string().url() })).optional(),
   }),
 });
 

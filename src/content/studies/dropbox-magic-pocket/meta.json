@@ -1,0 +1,607 @@
+{
+  "name": "How Dropbox Built Magic Pocket",
+  "difficulty": "advanced",
+  "intent": "Follow how Dropbox moved the file content of hundreds of petabytes onto its own immutable block store, and the choices it describes for the data model, copies versus erasure coding, repair, verification and cooling data, using only what Dropbox has published.",
+  "codeTitle": "append-only volumes, cooling to an erasure code, repair with a generation number",
+  "finalIntro": "One block stored, then read, and then a storage node lost, following the protocols Dropbox described in 2016.",
+  "prompt": "In March 2016 Dropbox reported that it held more than 500 petabytes of user data and was storing and serving over 90% of its users' data on its own system, Magic Pocket, after years of keeping file content on Amazon. How can a system like that be built? Files are cut into blocks that are never edited in place, they must survive disks that fail routinely at this scale, and they should move to cheaper encodings as they age. This study follows what Dropbox says in its own engineering posts, which are listed at the end, but in a teaching order and not the order in which Dropbox built things. Every Dropbox number is named with its post. The simulation, the estimator and the code samples are small models for learning, not Dropbox's code or data.",
+  "functional": [
+    "Store a block of up to 4 MB, named by its content hash, and confirm it only once it is safely on disk",
+    "Read a block back by its hash, quickly, even when it is years old",
+    "Keep every block for years, even when disks, machines or a whole region fail",
+    "Let files change by writing new blocks, with the history of changes held by a separate metadata system (Dropbox calls it FileJournal)",
+    "Give back the disk space of deleted blocks"
+  ],
+  "nonFunctional": [
+    "Dropbox's 2016 targets: annual data durability of over 99.9999999999% (twelve nines) and availability of over 99.99%, with data encrypted at rest",
+    "Fast reads for old data too, although most reads are for new data: Dropbox's 2019 post says over 40% of retrievals are for data uploaded in the last day and over 90% for data uploaded in the last year",
+    "Every block stored independently in at least two separate geographic zones, so one regional disaster cannot destroy it",
+    "Growth from about 40 PB of user data in 2012 to 500 PB in 2016, and operation by a small team: the 2016 post says most of Magic Pocket was built by fewer than six people",
+    "Low disk cost per byte of user data, which Dropbox calls storage efficiency"
+  ],
+  "firstAttempt": {
+    "text": "Keep doing what Dropbox did at first: its own servers hold the metadata and the web servers, and the file content sits on Amazon (Dropbox says it was an early adopter of S3). In this study's model, each block is stored as an object in the rented service, and Dropbox's servers do everything else.",
+    "limits": [
+      "Dropbox says that performance is one of its key product differences. A rented storage service gives less room to tune the whole stack for its own workload (this study's reading of Dropbox's reasons)",
+      "Dropbox says its block storage use is unusual, and that at its scale it could customise both hardware and software for its use case and get better unit economics. A general service is harder to shape like that (this study's reading)",
+      "The amount of data kept growing from about 40 PB in 2012 to 500 PB in 2016 (over 12 times in four years), so every inefficiency in cost or control grows with it"
+    ]
+  },
+  "nodes": [
+    {
+      "id": "users",
+      "label": "Dropbox apps",
+      "kind": "client",
+      "x": 8,
+      "y": 50
+    },
+    {
+      "id": "app",
+      "label": "Dropbox servers (web, metadata)",
+      "kind": "compute",
+      "x": 29,
+      "y": 50
+    },
+    {
+      "id": "s3",
+      "label": "Amazon S3",
+      "kind": "external",
+      "x": 8,
+      "y": 84
+    },
+    {
+      "id": "fe",
+      "label": "Frontends",
+      "kind": "edge",
+      "x": 50,
+      "y": 50,
+      "at": 1
+    },
+    {
+      "id": "index",
+      "label": "Block Index (sharded MySQL)",
+      "kind": "data",
+      "x": 50,
+      "y": 16,
+      "at": 1
+    },
+    {
+      "id": "rtable",
+      "label": "Replication Table",
+      "kind": "data",
+      "x": 71,
+      "y": 16,
+      "at": 1
+    },
+    {
+      "id": "vols",
+      "label": "Storage nodes with volumes",
+      "kind": "data",
+      "x": 71,
+      "y": 50,
+      "at": 1
+    },
+    {
+      "id": "master",
+      "label": "Master (one per cell)",
+      "kind": "compute",
+      "x": 71,
+      "y": 84,
+      "at": 2
+    },
+    {
+      "id": "zone2",
+      "label": "Second zone",
+      "kind": "data",
+      "x": 50,
+      "y": 84,
+      "at": 2
+    },
+    {
+      "id": "coder",
+      "label": "Volume Managers (erasure coding)",
+      "kind": "compute",
+      "x": 92,
+      "y": 50,
+      "at": 3
+    },
+    {
+      "id": "watch",
+      "label": "Verifiers",
+      "kind": "async",
+      "x": 92,
+      "y": 16,
+      "at": 5
+    },
+    {
+      "id": "racks",
+      "label": "New racks in three regions",
+      "kind": "data",
+      "x": 92,
+      "y": 84,
+      "at": 6
+    },
+    {
+      "id": "cold",
+      "label": "Cold tier (fragments over regions)",
+      "kind": "data",
+      "x": 29,
+      "y": 16,
+      "at": 7
+    }
+  ],
+  "edges": [
+    {
+      "from": "users",
+      "to": "app"
+    },
+    {
+      "from": "app",
+      "to": "s3"
+    },
+    {
+      "from": "app",
+      "to": "fe",
+      "at": 1
+    },
+    {
+      "from": "fe",
+      "to": "index",
+      "at": 1
+    },
+    {
+      "from": "fe",
+      "to": "rtable",
+      "at": 1
+    },
+    {
+      "from": "fe",
+      "to": "vols",
+      "at": 1
+    },
+    {
+      "from": "vols",
+      "to": "zone2",
+      "at": 2
+    },
+    {
+      "from": "master",
+      "to": "vols",
+      "at": 2
+    },
+    {
+      "from": "master",
+      "to": "rtable",
+      "at": 2
+    },
+    {
+      "from": "master",
+      "to": "coder",
+      "at": 3
+    },
+    {
+      "from": "coder",
+      "to": "vols",
+      "at": 3
+    },
+    {
+      "from": "vols",
+      "to": "master",
+      "at": 4
+    },
+    {
+      "from": "watch",
+      "to": "vols",
+      "at": 5
+    },
+    {
+      "from": "watch",
+      "to": "index",
+      "at": 5
+    },
+    {
+      "from": "master",
+      "to": "racks",
+      "at": 6
+    },
+    {
+      "from": "vols",
+      "to": "cold",
+      "at": 7
+    },
+    {
+      "from": "fe",
+      "to": "cold",
+      "at": 7
+    }
+  ],
+  "steps": [
+    {
+      "title": "Store immutable blocks named by their hash, in 1 GB volumes that are open or closed",
+      "problem": "Editing data in place turns every update into a distributed-systems problem, on disks that fail all the time. And a block of up to 4 MB is far too small a unit to track one by one, to move when a disk is replaced, or to protect with erasure coding (explained in step 3).",
+      "fix": "In its 2016 post 'Inside the Magic Pocket', Dropbox says Magic Pocket stores encrypted chunks of files of up to 4 MB, called blocks, and that once a block is written it never changes. When a user edits a file, the changes are recorded in a separate system called FileJournal, so the logic for change lives higher in the stack. Each block needs a name, which for most uses is the SHA-256 hash of the block, so a Frontend can first ask whether a block already exists. Dropbox groups blocks into 1 GB containers called buckets, made of blocks that happened to be uploaded around the same time. Buckets are stored in volumes, which are one or more buckets placed on a set of storage nodes, either as full copies or in an erasure coded form. A volume is open or closed: an open volume accepts new writes and nothing else, a closed volume is immutable and safe to move, and only a small number of volumes are open at any time. The copy of a volume on one storage node is what the 2016 verification post calls an extent, a 1 GB unit. Two databases keep track. The Block Index maps each hash to a cell, a bucket and a checksum, and is a large sharded MySQL cluster. The Replication Table maps each bucket to a volume, and each volume to its storage nodes with an open flag, a type and a generation number.",
+      "tradeoff": "Writes and reads become simple, and the open and closed split keeps live traffic away from background work. The price is that nothing is freed in place. Dropbox's 2026 post says a delete leaves the old data in a closed volume, garbage collection only marks blobs as unreferenced, and a separate compaction process must copy the live data into new volumes and retire the old ones. It adds that a volume with half of its data live uses twice the storage that data needs, and one with 10% live about ten times. The same layout later suited a new kind of disk: the 2018 post says Magic Pocket's extents are written append-only and are immutable, which suits SMR (shingled magnetic recording) drives, whose tracks overlap and so can only be written in order.",
+      "concepts": [
+        {
+          "slug": "idempotency"
+        },
+        {
+          "slug": "database-sharding"
+        },
+        {
+          "slug": "sql-vs-nosql"
+        },
+        {
+          "slug": "lsm-trees-vs-b-trees"
+        }
+      ]
+    },
+    {
+      "title": "Split storage into cells and zones, and keep one Master per cell",
+      "problem": "If every storage node had to understand the whole system, any mistake or overload could spread everywhere. Growth was also fast and uneven: the 2016 post says Magic Pocket had to grow from prototypes of double-digit petabytes within about six months, and at one point traffic saturated the routers between network clusters.",
+      "fix": "Dropbox describes several zones, with clusters in the western, central and eastern United States. Each block is stored independently in at least two separate zones, and a cross-zone replication daemon copies every put to the other zone, within one second of the local upload. Inside a zone, storage is divided into cells, self-contained clusters of about 50 PB of raw data. To add space, Dropbox typically brings up a new cell. In a cell the storage nodes, which Dropbox calls OSDs (object storage devices), are deliberately 'dumb': they store blocks but do not know the cell's layout or take part in distributed protocols. One Master per cell does the complex work: it watches the nodes, creates new buckets when they fill, triggers garbage collection and merges small buckets, and starts repairs. Its state can be rebuilt from the Replication Table, and it is not on the data path, so reads continue if it is down. Volume Managers, which run on the same machines as the nodes, move and erasure code volumes when the Master asks. To put a block, a Frontend checks the Block Index for the hash, picks an open volume, asks the Replication Table for its nodes and sends the block to all of them. Each node fsyncs it (forces it onto the disk) before answering. Then the Frontend adds the Block Index entry and replies. If a node fails, it retries with another volume, perhaps in another cell. To get a block, it looks up the Block Index and the Replication Table and reads from one node.",
+      "tradeoff": "One Master gives one place for complex placement decisions and avoids a distributed protocol, but it caps a cell: Dropbox says about a hundred petabytes before the Master's memory and CPU become the limit, one reason to have several cells, which also stop failures from cascading. Writing to every node and retrying elsewhere is simpler than a quorum scheme. Dropbox notes that a quorum could avoid some retries and lower tail latency, but at the cost of complexity, and that careful timeouts already give it low tail latency. It also chose a sharded MySQL cluster for the Block Index over a custom key-value store, partly because it already ran thousands of database nodes.",
+      "concepts": [
+        {
+          "slug": "consensus"
+        },
+        {
+          "slug": "quorums"
+        },
+        {
+          "slug": "retries-and-backoff"
+        },
+        {
+          "slug": "database-replication"
+        }
+      ]
+    },
+    {
+      "title": "Copy new data, then erasure code it as it cools",
+      "problem": "New files are read soon and often, so they need fast and safe access. But keeping several full copies of every block for years would multiply the disk bill. Dropbox's 2016 post says much of its data is accessed very frequently within an hour of upload and less and less afterwards, yet every block still needs low-latency reads.",
+      "fix": "Dropbox says it uses a high degree of initial replication and caching for recent uploads, and a more efficient encoding for the rest. Recently uploaded blocks are copied directly onto several machines. Later, in the background, buckets are aggregated and erasure coded. Erasure coding cuts data into fragments and adds a few parity fragments, extra pieces from which lost fragments can be rebuilt. Dropbox's 2026 post says it gives the same fault tolerance as replication with significantly less extra storage, and that Magic Pocket uses it for nearly all data. Dropbox says it encodes so that each block can be read whole from a single node, so most reads touch one disk. Only if that node is unavailable does the Frontend rebuild the block from other nodes, with the help of a Volume Manager. In the 2016 post 'Pocket watch', Dropbox says it uses a variant of Reed-Solomon coding similar to Local Reconstruction Codes, which gives high durability with low storage overhead and network demands. The code sample on this page uses the simplest erasure code, a single XOR parity shard, to show the idea. Dropbox's codes are more elaborate, and the posts used here do not give their parameters.",
+      "tradeoff": "Disk per byte of user data falls a lot (the estimator lets you try different codes), but encoding is background work that moves large amounts of data, and a read of a lost shard must read several nodes. Dropbox also says that replication, however well it is modelled, is necessary but not sufficient for durability. Its Markov model of worst-case disk failure rates and repair times gave 27 nines, and it says it does not trust that number alone, because software bugs, operator mistakes and bad configuration changes cause wider failures.",
+      "concepts": [
+        {
+          "slug": "caching"
+        },
+        {
+          "slug": "database-replication"
+        }
+      ]
+    },
+    {
+      "title": "Repair quickly, and commit every move with a generation number",
+      "problem": "Disks fail routinely at this scale, and durability depends on how long data stays under-protected after a failure. A storage node can hold over a petabyte and several thousand volumes, so a lost node means a lot of work, and the repair itself must never leave two nodes believing different things.",
+      "fix": "The Master watches node health through service discovery and starts a repair once a node has been offline for 15 minutes: long enough to restart a node without needless repairs, short enough to keep the window of vulnerability small. Volumes are spread somewhat randomly across a cell, so a lost node's volumes can be rebuilt from hundreds of other nodes at once, spreading the traffic over hundreds of network cards and thousands of disks. First the Master closes all volumes that were on the node, so they take no more writes and are safe to move. Then it builds a reconstruction plan that spreads the load evenly. Volume Managers copy the data and erasure code it where needed. To commit, the Master raises the generation number on the volumes on the new nodes and then updates the Replication Table with the new nodes and generation. That update is the commit point. If the Master fails before it, the volume stays where it was and a new Master repairs it again. The generation number removes any doubt about which nodes hold the volume, even if the failed node comes back. The 2016 verification post says a bad disk is usually re-replicated in less than an hour, and that the durability model depends on this time.",
+      "tradeoff": "A central Master makes it possible to produce a balanced plan, which Dropbox says would be hard without central coordination, but the Master must be disposable, so its state is kept in the Replication Table. The 15 minute wait is a trade: shorter means needless repair traffic after reboots, longer means a wider window of risk. Dropbox tells of a database frontend that froze for a full hour and then forwarded a request, while the Master had failed and restarted and issued entirely different repairs. Dropbox says its consistency protocols have to hold up against arbitrary failures like this.",
+      "concepts": [
+        {
+          "slug": "failure-detection"
+        },
+        {
+          "slug": "leases-and-fencing-tokens"
+        },
+        {
+          "slug": "health-checks"
+        }
+      ]
+    },
+    {
+      "title": "Verify the system all the time, not only the design",
+      "problem": "A durability model is only a model. Dropbox says disks lie: with over half a million disks in production they develop bad sectors, silent corruption, bit flips and fsyncs that do not fsync, and many such errors slip past S.M.A.R.T. monitoring. An undetected failure stretches the repair window from hours to potentially months.",
+      "fix": "The 2016 post 'Pocket watch' describes a stack of checkers that run all the time. The Disk Scrubber reads back every bit on disk and checks it against checksums, sweeping each disk about every one to two weeks. A delete first moves an extent to a trash area, and the Trash Inspector checks that every block in it was deleted or moved safely. The inspected extent then stays one more day. The Extent Referee watches file system changes and alerts on any move or unlink that was not a passed inspection plus a Master instruction. The Metadata Scanner walks the whole Block Index at around a million blocks per second and asks the storage nodes whether each block is there, aiming for a full pass about weekly over hundreds of billions of blocks. The Storage Watcher is a black-box check written by someone not involved in building the storage system: it samples 1% of written blocks and tries to fetch them after a minute, an hour, a day, a week and a month. The Cross-zone Verifier walks FileJournal and checks that every file is stored in all of its zones. New code runs the verifiers for at least a week on a staging cluster of tens of petabytes before release. In one test an engineer secretly corrupted data in staging, and every error was found except two that the system repaired first.",
+      "tradeoff": "Dropbox says a large fraction of the Magic Pocket code is verification, and more than 50% of the workload on its disks and databases is its own verification traffic. In return, it can say what state the system is in, and it moves faster on new code. A checker that only ever prints zeros proves little, so the checkers themselves must be tested with induced failures, as in the corruption test.",
+      "concepts": [
+        {
+          "slug": "merkle-trees-and-anti-entropy"
+        },
+        {
+          "slug": "synthetic-monitoring-and-rum"
+        },
+        {
+          "slug": "metrics"
+        }
+      ]
+    },
+    {
+      "title": "Move over in stages, keeping extra backups",
+      "problem": "Hundreds of petabytes cannot be switched in one go, nothing in open source was proven at that scale (Dropbox's words), and customers' files cannot be risked on an untried system.",
+      "fix": "The March 2016 post 'Scaling to exabytes and beyond' gives the timeline. A small prototype came first, to learn about workloads and file sizes. Magic Pocket became a major initiative in the summer of 2013, validated rigorously at every stage. In August 2014 came the dark launch: data was mirrored between two regional locations and the system was considered ready to store user data, and Dropbox kept extra backups for another six months. On 27 February 2015 Dropbox began storing and serving user files exclusively in-house for the first time, with a goal of passing 500 PB within six months. From 30 April 2015 a race began to install servers in three regional locations fast enough to keep up, helped by a network that reached a peak of over half a terabit per second. On 7 October 2015 Dropbox reached 90% of its data on its own infrastructure, almost a month ahead of its 30 October goal, with no major disruption and no data loss. The post does not describe how the existing data was copied out of Amazon, so this study does not either.",
+      "tradeoff": "A staged launch costs months of running with extra backups, and the speed was limited by physical things: Dropbox says it pushed against how many racks of hardware could fit in its loading dock. It also did not leave Amazon entirely. The post says it would keep partnering with Amazon where it makes sense, and planned to store data in Germany with AWS for European business customers that asked for it.",
+      "concepts": [
+        {
+          "slug": "canary-deployments"
+        },
+        {
+          "slug": "backups-and-point-in-time-recovery"
+        }
+      ]
+    },
+    {
+      "title": "Cool again across regions, and measure what it saves",
+      "problem": "By 2019 every block lived in at least two regions thousands of miles apart. Dropbox's 2019 post says that effectively doubles the data stored. Cold data is rarely read, so this was an inefficiency Dropbox wanted to remove without lowering durability.",
+      "fix": "In 'How we optimized Magic Pocket for cold storage' Dropbox describes a second tier. The original system became the warm tier and a new cold tier takes data as it becomes cold, migrated asynchronously. Cold writes can be paused at any time, because user writes go to the warm tier. Two ideas failed first. A single erasure code spanning all regions was prototyped in staging and killed after more than nine months of work, because one software bug could then damage every copy: independent regions had been a last line of defence. Facebook's idea of pairing blocks in two regions and storing their XOR in a third was dropped because it needed a global pairing structure and a way to reclaim space after deletes. The design that worked splits each block into fragments and stripes them across regions, leaving each region's insides unchanged. With three regions, two get a data fragment each and the third holds their XOR as a parity fragment. A get asks all three regions and uses the fastest two. Each region deletes its own fragments independently, with different software versions.",
+      "tradeoff": "The warm tier is a 1+1 scheme, so it stores 2 times the in-region footprint, and a 2+1 cold tier stores 1.5 times: 25% less disk, and Dropbox says 3+1 across four regions would save 33%. Every cold read now crosses a region. Dropbox measured a difference of roughly one network round trip from the 25th to the 95th percentile (the 5th is higher still), and a lower 99th percentile than the warm tier, because the cold tier uses the fastest two of three requests. It changed the warm tier to retry after a time budget as a result. Dropbox also does not purge data from the warm tier right after migration, but only after several rounds of validation.",
+      "concepts": [
+        {
+          "slug": "hedged-requests-and-tail-latency"
+        },
+        {
+          "slug": "multi-region-failover"
+        }
+      ]
+    }
+  ],
+  "failures": [
+    {
+      "scenario": "A storage node goes offline, because of a dead disk, a crash or a reboot",
+      "impact": "Every volume that had a copy or shard there is now less protected, and the longer it stays that way the more likely a second loss becomes.",
+      "answer": "Reads continue from the other nodes. If the node is still gone after 15 minutes, the Master closes its volumes, plans a rebuild spread over hundreds of other nodes, and commits the new layout by raising the generation number, so a returning node cannot confuse things. Dropbox says a bad disk is usually re-replicated in under an hour.",
+      "concepts": [
+        {
+          "slug": "failure-detection"
+        },
+        {
+          "slug": "leases-and-fencing-tokens"
+        }
+      ]
+    },
+    {
+      "scenario": "The Master fails or restarts in the middle of a repair",
+      "impact": "A half-finished move could leave two sets of nodes both believing they own a volume.",
+      "answer": "Nothing is committed until the Replication Table is updated with the new generation. Before that, the volume stays in its old place and the new Master repairs it again. Live reads do not pass through the Master, and a cell can even keep taking writes for a while without it. Other cells can take writes if it is out for long.",
+      "concepts": [
+        {
+          "slug": "graceful-degradation"
+        },
+        {
+          "slug": "leases-and-fencing-tokens"
+        }
+      ]
+    },
+    {
+      "scenario": "A disk silently corrupts data, such as a bit flip or an fsync that did not reach the platter",
+      "impact": "Normal monitoring does not notice, the data looks present, and the window of vulnerability quietly grows from hours to months.",
+      "answer": "The Disk Scrubber reads every bit and compares it with its checksum, sweeping each disk every one to two weeks, and sends bad data for re-replication. The Metadata Scanner and the Storage Watcher look for missing or unreadable blocks from the outside. In Dropbox's secret corruption test in staging, every injected error was detected except two that the system had already repaired.",
+      "concepts": [
+        {
+          "slug": "merkle-trees-and-anti-entropy"
+        },
+        {
+          "slug": "synthetic-monitoring-and-rum"
+        }
+      ]
+    },
+    {
+      "scenario": "A bug or a rogue script deletes extents that were not yet safely stored elsewhere",
+      "impact": "Moving or rewriting a volume always passes through a stage where the old copy is deleted. A mistake at that stage would destroy data for good.",
+      "answer": "Deletes only move the extent to trash. The Trash Inspector checks every block in it against the Block Index, a passed extent stays one more day, and the Extent Referee alerts on any file system change that does not match an inspection and a Master instruction. Dropbox also names Unix access controls and TOMOYO mandatory access control as protection against operators and stray processes.",
+      "concepts": [
+        {
+          "slug": "backups-and-point-in-time-recovery"
+        },
+        {
+          "slug": "access-control-models"
+        }
+      ]
+    },
+    {
+      "scenario": "A change in data placement leaves many volumes almost empty (an incident Dropbox described in 2026)",
+      "impact": "Dropbox says a new on-the-fly erasure coding service wrote volumes that in the worst cases held under 5% live data. Each fixed-size volume still takes a full disk allocation, so storage overhead rose, and the existing compaction strategy could not reclaim space fast enough.",
+      "answer": "Dropbox added two strategies beside its first (L1). L2 solves a bounded packing problem with dynamic programming to combine several under-filled volumes into one nearly full volume, and Dropbox reports that in production it reduced overhead two to three times faster than L1, and that over a week compaction overhead was 30 to 50% lower than in cells running L1 alone. L3 streams the live blobs of the sparsest volumes through the coding service. Rate limits, a control loop for the eligibility threshold, local traffic and new metrics and monitoring protect the rest of the system.",
+      "concepts": [
+        {
+          "slug": "alerting"
+        },
+        {
+          "slug": "metrics"
+        }
+      ]
+    },
+    {
+      "scenario": "A whole region is unreachable, for a cold-tier block",
+      "impact": "With fragments spread over three regions, one region down means a fragment is missing for every cold block.",
+      "answer": "A get already asks all regions and uses the fastest two, so nothing new happens: the cold tier always works in its worst case, and Dropbox says a region outage does not shift traffic or raise disk I/O in the surviving regions. Migration into the cold tier simply pauses until all regions are back.",
+      "concepts": [
+        {
+          "slug": "multi-region-failover"
+        },
+        {
+          "slug": "hedged-requests-and-tail-latency"
+        }
+      ]
+    }
+  ],
+  "alternatives": [
+    {
+      "title": "How to cut the cost of keeping cold data in several regions",
+      "options": [
+        {
+          "name": "A full copy in each of two regions",
+          "pro": "Simple, and the two regions stay independent",
+          "con": "Dropbox says it effectively doubles the data stored"
+        },
+        {
+          "name": "One erasure code across all regions",
+          "pro": "Less disk for the same fault tolerance on paper",
+          "con": "One software instance spans everything, so one bug can harm all copies. Dropbox prototyped it in staging and killed the project after more than nine months of work"
+        },
+        {
+          "name": "Pair blocks in two regions and keep their XOR in a third",
+          "pro": "No change inside a region",
+          "con": "Needs a global pairing structure and a way to reclaim space when one block of a pair is deleted"
+        },
+        {
+          "name": "Split each block into fragments and stripe them over regions with a parity fragment",
+          "pro": "Regions stay independent, and 2+1 over three regions needs 1.5 times instead of 2 times the footprint",
+          "con": "Every cold read crosses regions and needs two fragments"
+        }
+      ],
+      "pick": "Striped fragments, as Dropbox did for the cold tier: the layers stay simple and independent, and reads of cold data are rare enough to pay the network cost."
+    },
+    {
+      "title": "Where to keep the map from block hash to location",
+      "options": [
+        {
+          "name": "A distributed hash table or trie",
+          "pro": "Built for key lookups, with no central database",
+          "con": "Another distributed system to build and run, with unknown behaviour"
+        },
+        {
+          "name": "A dedicated key-value store",
+          "pro": "High performance, and fashionable",
+          "con": "Dropbox planned to build one, then found that MySQL was more than capable"
+        },
+        {
+          "name": "A sharded MySQL cluster behind an RPC layer",
+          "pro": "Reliable, an expressive data model that was easy to extend, and years of Dropbox experience in running it",
+          "con": "Needs a lot of tooling for database operations and reliability"
+        }
+      ],
+      "pick": "Sharded MySQL, which Dropbox says turned out to be a really good decision for simplicity and for keeping unknowns low."
+    },
+    {
+      "title": "How a volume is protected",
+      "options": [
+        {
+          "name": "Several full copies for ever",
+          "pro": "Simplest, and reads are easy",
+          "con": "The most disk per byte, for data that is rarely read after the first days"
+        },
+        {
+          "name": "Erasure code at write time",
+          "pro": "Skips the copy stage, and suits background work where throughput matters (Dropbox's Live Coder)",
+          "con": "Dropbox says it is not ideal for latency-sensitive traffic"
+        },
+        {
+          "name": "Copies first, then erasure code in the background",
+          "pro": "Fast and safe while the data is hot, cheap once it is cold",
+          "con": "Two states to manage, and background work that moves a lot of data"
+        }
+      ],
+      "pick": "Copies for new data and erasure coding for the rest, the main path Dropbox describes, with direct erasure coding for background writes."
+    },
+    {
+      "title": "How a write reaches the storage nodes",
+      "options": [
+        {
+          "name": "Write to every node of a volume and retry on another volume if any fails",
+          "pro": "Simple. Careful timeouts give low tail latency, Dropbox says",
+          "con": "Some retries that a quorum would have avoided"
+        },
+        {
+          "name": "Write to a quorum of the nodes",
+          "pro": "Fewer retries and potentially lower tail latency",
+          "con": "A more complex protocol, which Dropbox chose to avoid"
+        }
+      ],
+      "pick": "Write to all and retry elsewhere, in line with Dropbox's rule of keeping it simple."
+    }
+  ],
+  "roles": [
+    {
+      "id": "client",
+      "label": "Dropbox apps and servers",
+      "description": "Cut files into blocks, compress and encrypt them, and record changes in FileJournal."
+    },
+    {
+      "id": "edge",
+      "label": "Frontends",
+      "description": "Accept puts and gets, check the Block Index, choose a volume and talk to the storage nodes."
+    },
+    {
+      "id": "compute",
+      "label": "Master and Volume Managers",
+      "description": "Plan and carry out repairs, moves and erasure coding in a cell."
+    },
+    {
+      "id": "data",
+      "label": "Indexes and storage nodes",
+      "description": "The Block Index, the Replication Table, and storage nodes that hold volumes."
+    },
+    {
+      "id": "async",
+      "label": "Verifiers",
+      "description": "Background checkers such as the Disk Scrubber, the Metadata Scanner and the Storage Watcher."
+    },
+    {
+      "id": "external",
+      "label": "Amazon S3",
+      "description": "Where file content was stored before the move."
+    }
+  ],
+  "quiz": [
+    {
+      "question": "A team copies cold data across regions as Dropbox describes. Warm data keeps a full copy in each of 2 regions. Cold blocks are cut into 4 data fragments plus 1 parity fragment, one per region, over 5 regions. Ignoring copies inside each region, by how much does the disk used for cold data fall?",
+      "options": [
+        "25%, because adding a parity fragment always saves a quarter",
+        "50%, because each of the 5 regions holds only a fifth",
+        "37.5%, because it stores 1.25 times the data instead of 2 times",
+        "20%, because one region in five holds only parity"
+      ],
+      "answer": 2,
+      "explanation": "Two full copies cost 2 times the data. Four data fragments plus one parity fragment cost 5/4, which is 1.25 times, so the saving is (2 minus 1.25) divided by 2, which is 37.5%. The 25% figure belongs to the 2+1 layout over three regions (1.5 times instead of 2 times), not to every parity layout. Fifty percent would need the data stored just once, with no parity. And 20% mixes up the share of fragments that are parity with the disk saved."
+    },
+    {
+      "question": "A storage node is offline for 20 minutes. The Master repairs its closed volumes onto other nodes and commits the change. The node then reboots and comes back with its old data. What stops the system from treating its old copies as current?",
+      "options": [
+        "The Replication Table lists a higher generation for those volumes than the node reports",
+        "The node's disks are wiped as it rejoins the cell, so it has no stale data left to serve",
+        "Each read compares the block with its Block Index checksum, so a stale block never matches",
+        "The Master keeps the node out for 15 minutes after it returns, so that its old state expires"
+      ],
+      "answer": 0,
+      "explanation": "A repair commits by raising the generation number and updating the Replication Table, so the table says exactly which nodes hold the volume now, even if the failed node returns. Nothing in Dropbox's description wipes a returning node. A checksum would match, because blocks never change, so it cannot show which nodes own a volume. And 15 minutes is how long a node must be offline before repair starts, not a delay after it returns."
+    },
+    {
+      "question": "In an append-only store, a closed 1 GB volume is now 10% live because most of its blocks were deleted. Garbage collection has marked the dead blocks as unreferenced. How much disk does this volume use for each live byte, and what gives the space back?",
+      "options": [
+        "About 1 time over (no overhead), because garbage collection already removed the dead blocks from the volume",
+        "About 10 times, and the volume must be reopened so that its dead blocks can be overwritten",
+        "About 10 times, and encoding the volume with more parity shards frees the dead space",
+        "About 10 times, until compaction copies its live blocks to a new volume and retires it"
+      ],
+      "answer": 3,
+      "explanation": "A volume that is 10% live uses about ten times the space its live data needs. Garbage collection only marks blobs as unreferenced and frees nothing. Closed volumes are never reopened or changed, so nothing can be overwritten. A tighter erasure code changes the redundancy, not the dead space inside the volume. Compaction gathers live data from several volumes into new ones and retires the old ones, which is what actually frees the space."
+    }
+  ],
+  "sources": [
+    {
+      "title": "Scaling to exabytes and beyond",
+      "publisher": "Dropbox",
+      "year": 2016,
+      "url": "https://dropbox.tech/infrastructure/magic-pocket-infrastructure"
+    },
+    {
+      "title": "Inside the Magic Pocket",
+      "publisher": "Dropbox",
+      "year": 2016,
+      "url": "https://dropbox.tech/infrastructure/inside-the-magic-pocket"
+    },
+    {
+      "title": "Pocket watch: Verifying exabytes of data",
+      "publisher": "Dropbox",
+      "year": 2016,
+      "url": "https://dropbox.tech/infrastructure/pocket-watch"
+    },
+    {
+      "title": "Extending Magic Pocket Innovation with the first petabyte scale SMR drive deployment",
+      "publisher": "Dropbox",
+      "year": 2018,
+      "url": "https://dropbox.tech/infrastructure/extending-magic-pocket-innovation-with-the-first-petabyte-scale-smr-drive-deployment"
+    },
+    {
+      "title": "How we optimized Magic Pocket for cold storage",
+      "publisher": "Dropbox",
+      "year": 2019,
+      "url": "https://dropbox.tech/infrastructure/how-we-optimized-magic-pocket-for-cold-storage"
+    },
+    {
+      "title": "Improving storage efficiency in Magic Pocket, our immutable blob store",
+      "publisher": "Dropbox",
+      "year": 2026,
+      "url": "https://dropbox.tech/infrastructure/improving-storage-efficiency-in-magic-pocket-our-immutable-blob-store"
+    }
+  ]
+}

@@ -65,6 +65,7 @@ for (const s of kinds.studies) {
   if (!existsSync(join(d, 'visuals/final.json'))) warn(`studies/${s}`, 'no visuals/final.json');
   if (!existsSync(join(root, 'studies', s, 'Estimator.astro'))) warn(`studies/${s}`, 'no Estimator.astro');
   if (!meta[`studies/${s}`].quiz) err(`studies/${s}`, 'no quiz');
+  for (const src of meta[`studies/${s}`].sources ?? []) if (!/^https:\/\//.test(src.url)) err(`studies/${s}`, `source "${src.title}" must use an https link`);
 }
 for (const s of kinds.patterns) if (!meta[`patterns/${s}`].quiz) err(`patterns/${s}`, 'no quiz');
 

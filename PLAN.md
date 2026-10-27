@@ -59,4 +59,4 @@ Simulation ideas: caching (hit/miss ratio with eviction policies), sharding and 
 - Site generalised: area-based catalog with search and filters, concept pages, breadcrumbs, `/compare/` for patterns
 - Accessibility pass done (axe-core clean in light and dark, keyboard checks)
 - Concepts: 114 across thirteen areas (waves 1 to 6, including AI & ML systems: waves 3 and 4 added Cloud & deployment, Databases & storage, Data engineering, and 28 deeper concepts in Security, Observability, Networking, API design, Reliability, Distributed systems and Messaging), each with a diagram, an animation, a simulation, and JS, C# and Python samples where there is meaningful code
-- Case studies: 128 (every area has at least one), each with a build-up diagram, an estimator, a break-it simulation and JS, C# and Python samples
+- Case studies: 131 (every area has at least one; three are named after real companies and cite their public write-ups), each with a build-up diagram, an estimator, a break-it simulation and JS, C# and Python samples

@@ -51,4 +51,7 @@ export const aliasGroups: string[][] = [
   ['discovery', 'consul', 'eureka', 'service registry', 'service discovery'],
   ['calendar', 'recurrence', 'rrule', 'timezone', 'time zone', 'meeting invite'],
   ['rtb', 'bidding', 'advertising', 'ad exchange'],
+  ['discord', 'cassandra', 'scylladb', 'hot partition', 'tombstone', 'request coalescing', 'chat history'],
+  ['dropbox', 'magic pocket', 'erasure coding', 'append-only storage', 'blob store', 'cold storage'],
+  ['figma', 'multiplayer', 'real-time collaboration', 'last writer wins', 'fractional indexing', 'operational transform'],
 ];
