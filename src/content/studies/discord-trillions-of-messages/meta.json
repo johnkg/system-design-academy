@@ -24,12 +24,12 @@
       "Around November 2015, at 100 million stored messages, the data and the index no longer fit in RAM and latencies became unpredictable",
       "Reads were random, so returning just 50 messages could mean many random seeks on disk and could push other data out of the disk cache",
       "Quiet servers, private chat servers and huge public servers each stress the cache differently, and Discord planned features (mentions, pinned messages, search) that would add yet more random reads",
-      "One replica set has no clear way to scale out without the sharding Discord had decided to avoid"
+      "One replica set has no clear way to scale out without the sharding Discord had decided to avoid (this study's reading)"
     ]
   },
   "nodes": [
     { "id": "users", "label": "Users", "kind": "client", "x": 10, "y": 50 },
-    { "id": "api", "label": "API monolith", "kind": "edge", "x": 32, "y": 50 },
+    { "id": "api", "label": "API", "kind": "edge", "x": 32, "y": 50 },
     { "id": "mongo", "label": "MongoDB replica set", "kind": "data", "x": 62, "y": 22, "at": 0, "until": 1 },
     { "id": "cassandra", "label": "cassandra-messages", "kind": "data", "x": 62, "y": 50, "at": 1 },
     { "id": "buckets", "label": "Partitions: channel + time bucket", "kind": "data", "x": 88, "y": 50, "at": 2 },
@@ -67,7 +67,7 @@
       "title": "Design for eventual consistency and tombstones",
       "problem": "During the dark launch, errors reported author_id as null even though it is required. Cassandra trades strong consistency for availability, and every write is an upsert (insert or update) resolved per column by 'last write wins'. When one user edited a message while another deleted it, the result was a row with only its primary key and text. Deletes are also writes: a delete leaves a tombstone, a marker that is skipped on reads and removed at compaction when its lifespan ends, and writing null creates one too. Discord's message schema has 16 columns and the average message sets only 4, so most writes created 12 useless tombstones. Later, a public server's channel that had millions of messages deleted through the API (leaving 1) took 20 seconds to load, because reading it meant scanning millions of tombstones while Cassandra ran constant 10-second stop-the-world garbage collections.",
       "fix": "Discord treats a row that is missing a required column (author_id) as corrupt and deletes it, which it preferred to rewriting the whole message on every edit because that could resurrect deleted messages. It writes only non-null values. It cut the tombstone lifespan from 10 days to 2 days, because it runs Cassandra repairs (an anti-entropy process that compares and fixes replicas) every night on the message cluster. And it changed the query code to remember empty buckets and skip them in future, so that at worst a query scans the most recent bucket.",
-      "tradeoff": "The cluster no longer drowns in avoidable tombstones, and one emptied channel cannot stall it. The costs: the application must repair or delete inconsistent rows itself, a shorter tombstone lifespan is only safe if repairs run often enough (Discord's reason was its nightly repairs), and the empty-bucket memory is extra logic in the query code.",
+      "tradeoff": "Far fewer avoidable tombstones pile up, and for an emptied channel the worst case shrinks to scanning only the most recent bucket. The costs: the application must repair or delete inconsistent rows itself, a shorter tombstone lifespan is only safe if repairs run often enough (Discord's reason was its nightly repairs), and the empty-bucket memory is extra logic in the query code.",
       "concepts": [{ "slug": "acid-vs-base" }, { "slug": "consistency-models" }, { "slug": "merkle-trees-and-anti-entropy" }, { "slug": "lsm-trees-vs-b-trees" }]
     },
     {
@@ -81,7 +81,7 @@
       "title": "Move to ScyllaDB, which has no garbage collector",
       "problem": "Besides hot partitions, Discord describes upkeep that kept growing: the cluster often fell behind on compactions, which made reads cost more and added cascading latency. Its team took a node out of rotation to compact, brought it back to receive hinted handoff data (writes that other nodes held for it while it was away), and repeated until the backlog was empty, which it called the 'gossip dance'. It also spent a lot of time tuning the JVM's garbage collector, and sometimes a node's long GC pauses needed an operator to reboot it and nurse it back to health.",
       "fix": "ScyllaDB is a Cassandra-compatible database written in C++, with a shard-per-core design (each CPU core manages its own slice of the data), better workload isolation and no garbage collector. Discord's 2017 post had already named it as an idea to explore, and by 2020 Discord had moved every database except cassandra-messages. Messages came last because the cluster was big (trillions of messages, nearly 200 nodes), because it wanted to tune the new database and learn it in production, and because in testing the speed of reverse queries (scanning in the opposite order to the table's sort, such as oldest first) was not good enough. The ScyllaDB team prioritised and shipped faster reverse queries, which Discord says removed the last blocker. The new cluster uses local SSDs for speed, mirrored with RAID to a persistent disk for durability.",
-      "tradeoff": "The data model stays the same, so the application keeps its (channel, bucket) design, and the garbage collector is gone. Discord says plainly that ScyllaDB has its own issues and that hot partitions can still happen there, which is why the data services came first and stay in place. The cost is another migration, this time of trillions of messages.",
+      "tradeoff": "ScyllaDB is Cassandra-compatible, so the (channel, bucket) design can plausibly carry over (the post does not spell this out), and the garbage collector is gone. Discord says plainly that ScyllaDB has its own issues and that hot partitions can still happen there, which is why Discord also invested in the data services. The cost is another migration, this time of trillions of messages.",
       "concepts": [{ "slug": "lsm-trees-vs-b-trees" }, { "slug": "database-replication" }, { "slug": "quorums" }]
     },
     {
@@ -101,7 +101,7 @@
     },
     {
       "scenario": "Someone deletes millions of messages in a channel through the API, then another user opens it",
-      "impact": "The channel holds one message but Cassandra has to scan millions of tombstones to find it. In 2017 Discord saw constant 10-second stop-the-world garbage collections and a channel that took 20 seconds to load.",
+      "impact": "The channel holds one message but Cassandra has to scan millions of tombstones to find it. Discord described constant 10-second stop-the-world garbage collections and a channel that took 20 seconds to load.",
       "answer": "Shorter tombstone lifespan (10 days down to 2, safe because of nightly repairs), plus query code that remembers empty buckets so a later query scans at worst the most recent bucket.",
       "concepts": [{ "slug": "merkle-trees-and-anti-entropy" }, { "slug": "lsm-trees-vs-b-trees" }]
     },
@@ -148,7 +148,7 @@
   ],
   "roles": [
     { "id": "client", "label": "Users", "description": "People reading and writing messages in channels." },
-    { "id": "edge", "label": "API monolith", "description": "The application that receives requests and calls the data services." },
+    { "id": "edge", "label": "API", "description": "The application that receives requests and calls the data services." },
     { "id": "compute", "label": "Data services and migrator", "description": "Rust programs: the data services that coalesce reads, and the tool that copied the old data." },
     { "id": "data", "label": "Databases", "description": "MongoDB, then Cassandra, then ScyllaDB, and the partitions inside them." }
   ],
@@ -184,7 +184,7 @@
         "About 3.6 days"
       ],
       "answer": 3,
-      "explanation": "1,000,000,000,000 / 3,200,000 = 312,500 seconds, which is about 87 hours or 3.6 days. Fifty-two minutes is the answer for 10 billion messages, one hundred times too few. Thirty-six days is ten times too many. Nine days was Discord's estimate for its entire migration, which was a different (and larger) job, not the result of this calculation."
+      "explanation": "1,000,000,000,000 / 3,200,000 = 312,500 seconds, which is about 87 hours or 3.6 days. Fifty-two minutes is the answer for 10 billion messages, one hundred times too few. Thirty-six days is ten times too many. Nine days was Discord's estimate for its entire migration, which was a different job (Discord gives its size only as \"trillions\"), not the result of this calculation."
     }
   ],
   "sources": [

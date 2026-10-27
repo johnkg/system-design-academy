@@ -3,6 +3,14 @@ export interface Change { date: string; title: string; items: { text: string; hr
 
 export const changelog: Change[] = [
   {
+    date: '2026-10-27',
+    title: 'Three case studies from real companies',
+    items: [
+      { text: 'How Discord stores trillions of messages, how Dropbox built Magic Pocket, and how Figma built multiplayer editing. Each is built only from the company\'s own public engineering posts, which are listed at the end of the page. Numbers and decisions are theirs as published at the time; the simulations and code are small teaching models, not their systems.', href: 'case-studies/' },
+      { text: 'Search finds them by everyday words such as "hot partition", "erasure coding" or "multiplayer".', href: 'search/' },
+    ],
+  },
+  {
     date: '2026-10-26',
     title: 'A new look',
     items: [
