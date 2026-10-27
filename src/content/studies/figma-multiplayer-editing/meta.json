@@ -1,0 +1,488 @@
+{
+  "name": "How Figma Built Multiplayer Editing",
+  "difficulty": "advanced",
+  "intent": "Let many people change one design at the same time with a server that decides the order, a last-writer-wins rule for each property, instant local feedback, a tree whose layers keep their identity when moved, offline edits that merge back, and a journal that aims to make a server crash cost a second of work or less.",
+  "codeTitle": "property-level last-writer-wins, optimistic clients and a cycle-safe layer tree",
+  "finalIntro": "An illustration with invented numbers: two designers change one rectangle while the server journals and checkpoints.",
+  "prompt": "Design the editing core of a browser-based design tool in the style of Figma. A design is a tree of layers (frames, shapes, text) that many people can open and change at the same time, each seeing the others' edits within a moment. Your own edit must feel instant, everyone must end up looking at the same design, work must survive a dropped connection or a server crash, and a file may stay in use for years. This study follows what Figma has published about its own system: Evan Wallace's 2019 post on how its multiplayer technology works and Darren Tsung's 2022 post on making multiplayer more reliable (linked under Sources). Every claim about Figma is attributed to one of them and describes the system as of that post, not today. Numbers that are not attributed to Figma, in the simulations and the code, are round figures made up for teaching.",
+  "functional": [
+    "Open a design, see its current state and then see other people's changes as they happen",
+    "Change any property of any layer, create and delete layers, move a layer to another parent and put layers in order",
+    "Your own change appears on your screen at once, before the server has confirmed it",
+    "Keep editing with no connection, and have those edits merged back when the connection returns",
+    "After a server crash or a deployment, the design comes back with nearly all recent edits"
+  ],
+  "nonFunctional": [
+    "Every open copy of a design ends up identical once all updates have arrived. Figma's 2019 post treats this as a correctness requirement: two clients must never diverge and stay diverged",
+    "Two people changing different things on the same layer must both succeed",
+    "A conflict must not make the screen flicker or jump under someone's hand",
+    "Keep the algorithm no more complex than the job needs, so it is easy to reason about, implement, debug, test and maintain (the primary goal Figma states for its design)",
+    "Lose very little on a crash: Figma states a goal of under 1 second of data loss for its journal (2022)",
+    "Comments, users and teams can be synced by a different system. Figma does this, so this design covers only the design file itself"
+  ],
+  "firstAttempt": {
+    "text": "The browser downloads the whole design, edits it locally and, on Save or every few seconds, uploads the whole file to storage, replacing what is there. To see other people's work it downloads the file again at intervals and shows the new copy. (This is a simple starting point for the study, not something Figma describes.)",
+    "limits": [
+      "Two people editing at once overwrite each other: the last upload wins and the other person's whole session of edits vanishes",
+      "Downloading again replaces the design under someone's hands, so a drag or selection in progress is lost",
+      "Changes show up only after the next upload and the next download, which takes seconds",
+      "Uploading the entire file for a one-pixel nudge is slow for a large design",
+      "A crash or a lost connection loses everything since the last upload"
+    ]
+  },
+  "nodes": [
+    {
+      "id": "browsers",
+      "label": "Designers' browsers",
+      "kind": "client",
+      "x": 12,
+      "y": 50
+    },
+    {
+      "id": "storage",
+      "label": "Checkpoint storage",
+      "kind": "data",
+      "x": 88,
+      "y": 50
+    },
+    {
+      "id": "multiplayer",
+      "label": "Multiplayer server (one per open file)",
+      "kind": "compute",
+      "x": 50,
+      "y": 50,
+      "at": 1
+    },
+    {
+      "id": "doc",
+      "label": "Document in memory",
+      "kind": "data",
+      "x": 50,
+      "y": 84,
+      "at": 2
+    },
+    {
+      "id": "local",
+      "label": "Local copy and unconfirmed edits",
+      "kind": "client",
+      "x": 12,
+      "y": 16,
+      "at": 3
+    },
+    {
+      "id": "tree",
+      "label": "Tree rules and child order",
+      "kind": "compute",
+      "x": 50,
+      "y": 16,
+      "at": 4
+    },
+    {
+      "id": "offline",
+      "label": "Offline edit queue",
+      "kind": "client",
+      "x": 12,
+      "y": 84,
+      "at": 5
+    },
+    {
+      "id": "journal",
+      "label": "Journal (DynamoDB)",
+      "kind": "data",
+      "x": 88,
+      "y": 84,
+      "at": 6
+    },
+    {
+      "id": "lock",
+      "label": "File ownership lock",
+      "kind": "data",
+      "x": 88,
+      "y": 16,
+      "at": 7
+    }
+  ],
+  "edges": [
+    {
+      "from": "browsers",
+      "to": "storage",
+      "at": 0,
+      "until": 1
+    },
+    {
+      "from": "browsers",
+      "to": "multiplayer",
+      "at": 1
+    },
+    {
+      "from": "multiplayer",
+      "to": "storage",
+      "at": 1
+    },
+    {
+      "from": "multiplayer",
+      "to": "doc",
+      "at": 2
+    },
+    {
+      "from": "browsers",
+      "to": "local",
+      "at": 3
+    },
+    {
+      "from": "multiplayer",
+      "to": "tree",
+      "at": 4
+    },
+    {
+      "from": "browsers",
+      "to": "offline",
+      "at": 5
+    },
+    {
+      "from": "multiplayer",
+      "to": "journal",
+      "at": 6
+    },
+    {
+      "from": "multiplayer",
+      "to": "lock",
+      "at": 7
+    }
+  ],
+  "steps": [
+    {
+      "title": "Keep one live connection per file, with one server as the authority",
+      "problem": "The first attempt makes people take turns by accident: the last whole-file upload wins. Changes have to flow in both directions within a moment, and when two changes disagree somebody has to decide which comes first.",
+      "fix": "In its 2019 post Figma says its clients are web pages that talk to a cluster of servers over WebSockets (a WebSocket is a long-lived, two-way connection between a browser and a server), and that its servers spin up a separate process for each multiplayer document, which everyone editing that document connects to. When a file is opened the client downloads a copy, and from then on updates travel both ways over the connection. The 2022 post adds that this service, called multiplayer, is authoritative: it handles validation, ordering and conflict resolution, and keeps the state of the file in memory to stay fast. It writes that state to storage every 30 to 60 seconds, a step Figma calls checkpointing: the entire file is encoded into a binary format, compressed and uploaded to S3.",
+      "tradeoff": "One authority per file makes ordering easy, because there is exactly one place where who was first is decided. The costs are that every editor of a file must reach the one process that has it open, and that the in-memory copy is lost if that process dies (step 6 deals with that). Figma also keeps comments, users, teams and projects out of this system: its 2019 post says they live in Postgres and sync through a separate system with different trade-offs in performance, offline availability and security.",
+      "concepts": [
+        {
+          "slug": "real-time-communication"
+        },
+        {
+          "slug": "consistency-models"
+        },
+        {
+          "slug": "latency-and-round-trips"
+        }
+      ]
+    },
+    {
+      "title": "Model the design as objects with properties, and let the last change to each property win",
+      "problem": "The unit of conflict decides how often people clash. If it is the whole file or even the whole layer, one person recolouring a rectangle collides with another resizing the same rectangle.",
+      "fix": "Figma describes a document as a tree of objects, like the HTML page structure in a browser, where each object has an ID and a collection of properties. One way to picture it is a two-level map from object ID to property to value, or a database table of (object ID, property, value) rows. The server keeps the latest value any client has sent for each property of each object. Changing different properties of one object, or the same property of different objects, never conflicts; two clients changing the same property of the same object end with whichever value reached the server last. Figma compares this to a last-writer-wins register from the research on CRDTs (a CRDT, or conflict-free replicated data type, is a data structure whose copies are guaranteed to converge to the same value; a last-writer-wins register holds one value and keeps the latest write), except that it needs no timestamp because the server defines the order. Figma says it chose this over operational transformation (OT, the standard algorithm behind Google Docs, which rewrites each concurrent text edit so it still makes sense after the others), which it found overkill: very complicated and hard to implement correctly for a tool that is not a text editor. It describes its system as inspired by several CRDTs combined, not as a true CRDT, because CRDTs are built for systems with no central authority and that costs performance and memory a centralised system does not need to pay.",
+      "tradeoff": "The rule is simple to reason about, test and maintain, which was Figma's stated goal. The price is that a change is atomic at the property value: if a text value is B and one person changes it to AB while another changes it to BC, the result is AB or BC, never ABC. Figma says that is fine for a design tool, and that simultaneous editing of one text value is not a case it optimises for.",
+      "concepts": [
+        {
+          "slug": "crdts"
+        },
+        {
+          "slug": "consistency-models"
+        },
+        {
+          "slug": "logical-clocks"
+        }
+      ]
+    },
+    {
+      "title": "Apply your own change at once and set aside conflicting server changes until it is confirmed",
+      "problem": "Waiting for the server to confirm every change would make dragging feel slow. But applying local changes at once and also applying every server change as it arrives makes a conflicting property flicker, because an older acknowledged value briefly overwrites your newer unacknowledged one.",
+      "fix": "Figma says property changes on a client are applied immediately instead of waiting for the server's acknowledgement, to keep the tool responsive, and that to avoid the flicker the client discards incoming server changes that conflict with its own unacknowledged property changes. Its reasoning: your change has not been acknowledged but every change coming from the server has, so in last-to-the-server order your change is the most recent one you know about, which makes it your best prediction of the final value. The sample code and the simulation below keep a count of unacknowledged edits for each property and skip incoming changes to a property while that count is above zero. That bookkeeping is this study's sketch, not a description of Figma's code.",
+      "tradeoff": "The screen shows a prediction that can turn out wrong: if the server put someone else's change after yours, you see theirs when yours is acknowledged. That is acceptable because every copy converges to the server's order anyway, and the flicker is avoided. Figma notes that a client cannot reject changes from the server, because the server is the ultimate authority on what the document looks like, so the client has to hold its guess without breaking that rule.",
+      "concepts": [
+        {
+          "slug": "consistency-models"
+        },
+        {
+          "slug": "latency-and-round-trips"
+        },
+        {
+          "slug": "real-time-communication"
+        }
+      ]
+    },
+    {
+      "title": "Give objects stable IDs, store the parent on the child and order children by fraction",
+      "problem": "Creating, deleting and moving layers is harder than setting a colour. Moving a layer by deleting it and re-creating it under another parent gives it a new identity, so edits made to it at the same moment are dropped, and two people moving the same layer could leave two copies of it. Children also need an order, and two concurrent moves can even make two layers each other's parent.",
+      "fix": "From the 2019 post. Creating and removing an object are explicit actions: writing a property to an unknown ID does not bring an object into existence. Removing an object deletes all data about it from the server; the properties of a deleted object are kept only in the undo buffer of the client that deleted it, which restores them if it undoes the delete, so long-lived documents do not keep growing. New IDs are made by the clients, which include a unique client ID in each object ID; the server cannot assign them because creating objects has to work offline. For the tree, Figma stores the link to the parent as a property of the child. That preserves the object's identity, and an object cannot end up with two parents, as it could if each parent stored a list of children. The server rejects any parent update that would create a cycle. A client can still briefly hold one (it sent A under B while the server's change put B under A); Figma's answer is to temporarily parent the two objects to each other and take them out of the tree until the server rejects the client's change and they return to where they belong, which it accepts because the case is rare and temporary. Children are ordered by fractional indexing: each object's position among its siblings is a fraction between 0 and 1 (exclusive), siblings are sorted by that fraction, and an object is inserted between two neighbours by giving it the average of their positions. The parent link and the position are stored as one property so that they change together.",
+      "tradeoff": "Keeping the parent on the child avoids duplicate copies and keeps unrelated property edits safe, but allows cycles that must be detected. The temporary disappearance of two layers in a cycle is a visible flaw that Figma judged cheaper than a more complex fix. Deleted data lives with the client that deleted it, which keeps the server small but makes undo the client's job. The 2019 post points to a separate article for the details of reordering when several people insert at once, which this study does not cover.",
+      "concepts": [
+        {
+          "slug": "crdts"
+        },
+        {
+          "slug": "ordering-and-partitioning"
+        },
+        {
+          "slug": "consistency-models"
+        }
+      ]
+    },
+    {
+      "title": "Let people go offline, then download a fresh copy and replay their edits",
+      "problem": "A laptop on a train or a dropped connection must not freeze the design or throw away the edits made meanwhile.",
+      "fix": "Figma says it lets you go offline for an arbitrary amount of time and keep editing. When you come back online the client downloads a fresh copy of the document, reapplies any offline edits on top of that latest state, and continues syncing over a new WebSocket connection. Figma points out that this makes connecting and reconnecting simple: all the hard parts of multiplayer are in handling updates to documents that are already connected. The earlier steps are what make this work: edits are per property, so edits to different properties merge, and object IDs are created by clients so layers can be created offline. By last-writer-wins, an offline edit to a property someone else changed in the meantime is applied later and so replaces their value; that follows from the rules above rather than being something the post spells out.",
+      "tradeoff": "No special merge protocol is needed, and a long offline stretch is handled the same way as a short one. The cost is that an old intention can quietly beat newer work on the same property. The 2019 post does not describe any warning or prompt to the person, and this study does not claim one. Opening the file after a gap also means downloading a full fresh copy.",
+      "concepts": [
+        {
+          "slug": "consistency-models"
+        },
+        {
+          "slug": "cap-theorem"
+        },
+        {
+          "slug": "crdts"
+        }
+      ]
+    },
+    {
+      "title": "Add a journal so a crash costs about a second of edits, not a minute",
+      "problem": "In its 2022 post Figma explains that a system built around checkpoints taken every 60 seconds or so could lose up to 60 seconds of work if multiplayer crashed. Checkpoints also cause load spikes: before a file can be closed it must be saved to a checkpoint, so when multiplayer is redeployed and every in-memory file closes at once, a surge of checkpoints hits the database.",
+      "fix": "Figma added a transaction log it calls the journal: a durable datastore that is written to asynchronously as multiplayer accepts changes. Each change gets a sequence number, an incrementing integer for that file, and every checkpoint is stored with the sequence number it reflects. After a crash, multiplayer loads the latest checkpoint, which may be 60 seconds old, then reads all journal entries with a higher sequence number and applies them to recover the latest state. The goal was less than 1 second of data loss. Journal entries are the incremental changes, whereas a checkpoint grows with the whole file, often by orders of magnitude. Clients send updates every 33 ms (30 per second), more detail than the journal needs, so Figma batches changes and writes entries with a start and an end sequence number. A checkpoint at sequence 7 may meet an entry covering 5 to 9, and applying it still gives the right file at 9 because of last-writer-wins. For a deployment, multiplayer closes connections and waits for unsaved changes to reach the journal, which Figma says takes under 1 second at the 99th percentile, so no checkpoint surge. Figma used DynamoDB (Amazon's key-value database) for the journal. It also uses Postgres heavily but chose not to use it here because the write volume would need a horizontally scalable database and it was not there yet.",
+      "tradeoff": "Two datastores now matter for durability, and replaying the journal on a checkpoint must produce exactly the right file. In return the cost of a crash drops from up to a minute to a goal of under a second, and a deployment stops causing a checkpoint spike. Figma reports that, as of October 2022, 95% of edits were saved within about 600 ms and the journal handled more than 2.2 billion received changes a day.",
+      "concepts": [
+        {
+          "slug": "write-ahead-log"
+        },
+        {
+          "slug": "backups-and-point-in-time-recovery"
+        },
+        {
+          "slug": "blue-green-and-rolling-deployments"
+        }
+      ]
+    },
+    {
+      "title": "Allow one writer per file, then prove the journal against real files before trusting it",
+      "problem": "A journal makes failure cases harder. If two multiplayer instances both think they own a file, clients see different things (Figma calls this split brain) and the two could write conflicting histories into the journal and corrupt it. A journal that misses one code path loses data silently, and entries only make sense in context: if update A moves a child out of a parent and update B deletes that parent, applying B without A deletes the child.",
+      "fix": "From the 2022 post. To keep one writer, multiplayer writes a (lock UUID, file key) entry to a new DynamoDB table to take ownership of a file. Each journal write is conditional on the lock UUID still matching, and journal entries are not read until ownership is acquired, with strongly consistent reads, so only one instance writes at a time and a handover is safe. To cover every code path, Figma refactored the Rust multiplayer code so that ownership of the file sits in one encapsulated type, which made it easy to audit that every update writes its payload to the journal and increments the sequence number. To validate, it checked that rebuilding checkpoint B from checkpoint A plus the journal entries in between gives a byte-for-byte identical file. These checks ran asynchronously on a fraction of checkpoints during a dark launch, where changes were written to the journal but not read from it. After about 400,000 consecutive successful validations it began rolling the journal out to a fraction of files, then to all of them. For recovery from a lost region, Figma wanted file data replicated across regions within 30 minutes. DynamoDB global tables would have raised the feature's cost by an estimated 6 times, and exporting a backup of the table would take longer than 30 minutes, so the journal itself is not replicated across regions. The checkpoints in S3 already are, so Figma makes sure every journal change is checkpointed within 30 minutes, and when multiplayer closes a file without checkpointing, it queues a job that checkpoints after a random delay, so a redeployment does not bring back a write spike.",
+      "tradeoff": "The conditional write adds work to every journal write, and a dark launch delays the benefit while validation builds confidence. The cross-region goal is met by reusing checkpoints instead of paying for replicated journal writes. Figma says the journal has helped prevent a number of incidents from causing data loss and is part of several teams' on-call handbooks.",
+      "concepts": [
+        {
+          "slug": "leases-and-fencing-tokens"
+        },
+        {
+          "slug": "multi-region-failover"
+        },
+        {
+          "slug": "database-replication"
+        }
+      ]
+    }
+  ],
+  "failures": [
+    {
+      "scenario": "Two designers set the fill colour of the same rectangle at the same moment",
+      "impact": "If every change were applied in the order it reached each browser, the two screens could settle on different colours and never agree, and a person's own change could flicker back and forth while the others arrive.",
+      "answer": "The server puts the two changes in one order and the later one wins, so every copy settles on the same colour. Each browser sets aside the incoming change to that property while its own change is unacknowledged, so the screen does not flicker, and shows the server's order once its own change is acknowledged.",
+      "concepts": [
+        {
+          "slug": "crdts"
+        },
+        {
+          "slug": "consistency-models"
+        }
+      ]
+    },
+    {
+      "scenario": "One designer drags layer A into layer B while another drags B into A",
+      "impact": "If both moves were accepted, A and B would be each other's parents and neither would be reachable from the page: the design tree would no longer be a tree.",
+      "answer": "The server rejects the parent update that would create a cycle. In the browser whose own change is still unacknowledged, Figma says it temporarily parents the two objects to each other and removes them from the tree until the server rejects that change and they return where they belong.",
+      "concepts": [
+        {
+          "slug": "crdts"
+        },
+        {
+          "slug": "consistency-models"
+        }
+      ]
+    },
+    {
+      "scenario": "A multiplayer process crashes while many people are editing a file",
+      "impact": "The file's state lived in the process's memory. With checkpoints alone, up to about 60 seconds of work since the last one would be lost.",
+      "answer": "On the next load multiplayer reads the latest checkpoint, then every journal entry with a higher sequence number, and is back at the latest state. Figma's goal for this design was under 1 second of data loss.",
+      "concepts": [
+        {
+          "slug": "write-ahead-log"
+        },
+        {
+          "slug": "backups-and-point-in-time-recovery"
+        }
+      ]
+    },
+    {
+      "scenario": "Two multiplayer instances both believe they own the same file",
+      "impact": "Clients on different instances would see different documents, and both instances could write conflicting histories into the journal and corrupt the file.",
+      "answer": "Ownership is a lock row in DynamoDB, and every journal write is conditional on the lock UUID still matching, so a second writer is refused. Journal reads wait until ownership is acquired and are strongly consistent, so a handover does not read a stale history.",
+      "concepts": [
+        {
+          "slug": "leases-and-fencing-tokens"
+        },
+        {
+          "slug": "write-ahead-log"
+        }
+      ]
+    },
+    {
+      "scenario": "Multiplayer is redeployed and every open file has to be closed",
+      "impact": "In a checkpoint-only system each file must first be saved to a checkpoint, so all files check in at once and the database takes a surge of heavy writes.",
+      "answer": "Multiplayer closes the connections and waits for unsaved changes to reach the journal, which Figma says takes under 1 second at the 99th percentile. The journal's write load stays steady, and a delayed checkpoint job later avoids a spike of heavy writes.",
+      "concepts": [
+        {
+          "slug": "blue-green-and-rolling-deployments"
+        },
+        {
+          "slug": "write-ahead-log"
+        }
+      ]
+    }
+  ],
+  "alternatives": [
+    {
+      "title": "How concurrent edits are merged",
+      "options": [
+        {
+          "name": "Operational transformation",
+          "pro": "Powers most collaborative text editors and handles editing long text with low memory and performance overhead",
+          "con": "Figma found it very complicated and hard to implement correctly, with a combinatorial explosion of states that is difficult to reason about"
+        },
+        {
+          "name": "True CRDTs",
+          "pro": "Replicas can accept updates without any central authority and still converge",
+          "con": "Figma says that decentralised design carries performance and memory overhead that a system with a central authority does not need"
+        },
+        {
+          "name": "Server order with last-writer-wins per property",
+          "pro": "Simple to reason about, implement, test and maintain; edits to different properties never conflict",
+          "con": "Two edits to the same value do not merge: the result is one of them, never a mix"
+        }
+      ],
+      "pick": "Figma picked the third, a custom system inspired by CRDTs, because it is a design tool with a central server and not a text editor. For text-heavy products the trade-off could differ."
+    },
+    {
+      "title": "Where a file's recent edits are made durable",
+      "options": [
+        {
+          "name": "Checkpoints only",
+          "pro": "Simple and easy to understand",
+          "con": "A crash can lose up to the checkpoint interval (about 60 seconds), and a deployment makes every file checkpoint at once"
+        },
+        {
+          "name": "Journal plus checkpoints",
+          "pro": "Small incremental writes often, whole-file writes rarely; recovery replays journal entries newer than the checkpoint",
+          "con": "A second datastore, one-writer locking and validation to build and run"
+        },
+        {
+          "name": "Journal in the existing Postgres",
+          "pro": "A database Figma already knew well",
+          "con": "Figma judged that the write volume would need a horizontally scalable database, and said it was not there yet with Postgres"
+        }
+      ],
+      "pick": "Figma's 2022 post describes the second, with DynamoDB as the journal. The choice of store follows its write volume and what it already ran."
+    },
+    {
+      "title": "Replicating journal data to another region",
+      "options": [
+        {
+          "name": "DynamoDB global tables",
+          "pro": "Built-in cross-region replication",
+          "con": "Figma estimated the cost of replicated writes would raise the feature's cost by 6 times"
+        },
+        {
+          "name": "Scheduled table backups exported to S3",
+          "pro": "Backups can be copied across regions",
+          "con": "At Figma's write load and table size, creating a backup would take longer than the 30-minute goal"
+        },
+        {
+          "name": "Checkpoint everything within 30 minutes",
+          "pro": "Checkpoints in S3 are already replicated across regions, so no extra replication is paid for",
+          "con": "Needs a job that checkpoints files closed without one, with a random delay to avoid write spikes"
+        }
+      ],
+      "pick": "Figma chose the third to meet its 30-minute goal. Figma says its ideal would have been point-in-time backups replicated across regions, which were not supported at the time."
+    },
+    {
+      "title": "What goes through the multiplayer system",
+      "options": [
+        {
+          "name": "One sync system for everything",
+          "pro": "One mechanism to build and operate",
+          "con": "Document edits and data such as comments or team membership need different trade-offs in performance, offline availability and security"
+        },
+        {
+          "name": "Multiplayer for the document, a separate system for the rest",
+          "pro": "Each system is tuned to its own needs; Figma stores comments, users, teams and projects in Postgres and syncs them separately",
+          "con": "Two systems that look alike but have separate implementations"
+        }
+      ],
+      "pick": "Figma's 2019 post describes the second. Figma says the two systems are similar but have separate implementations because of those different trade-offs."
+    }
+  ],
+  "roles": [
+    {
+      "id": "client",
+      "label": "Browsers",
+      "description": "The design tool running in each person's browser, with its local copy of the file and its unconfirmed edits."
+    },
+    {
+      "id": "compute",
+      "label": "Multiplayer servers",
+      "description": "The process that owns an open file: it orders changes, resolves conflicts, enforces the tree rules and broadcasts the result."
+    },
+    {
+      "id": "data",
+      "label": "State and storage",
+      "description": "The file held in memory, plus the checkpoints in S3, the journal and the ownership locks that make it durable."
+    }
+  ],
+  "quiz": [
+    {
+      "question": "Two designers rename the same layer at the same moment. Its name is B. One changes it to AB, the other to BC. Under the rules Figma describes for its server, what do all copies show once everything has arrived?",
+      "options": [
+        "ABC, because the server merges the two edits letter by letter",
+        "Either AB or BC, whichever change the server received last",
+        "Whichever edit carries the later time on the designer's own computer clock",
+        "B, because two conflicting edits cancel and the server keeps the old value"
+      ],
+      "answer": 1,
+      "explanation": "Figma's server keeps the latest value sent for each property, and a change is atomic at the property value, so the result is AB or BC and never ABC. ABC would need text-merging machinery such as operational transformation, which Figma chose not to build. Figma does not need client clocks, because the server defines the order. Cancelling both edits would throw away work that last-writer-wins is designed to keep."
+    },
+    {
+      "question": "A file is recovered after a crash. Its latest checkpoint was written at sequence number 7. The journal holds three entries: one covering changes 1 to 4, one covering 5 to 9 and one covering 10 to 12. Which entries does multiplayer apply on top of the checkpoint, and which sequence number does it reach?",
+      "options": [
+        "All three entries, ending at 12, so that nothing is ever missed",
+        "Only the entry for 10 to 12, because the checkpoint is close enough to 9",
+        "Only the entry for 5 to 9, because it contains the checkpoint's number",
+        "The entries for 5 to 9 and 10 to 12, ending at 12"
+      ],
+      "answer": 3,
+      "explanation": "Multiplayer applies the entries newer than the checkpoint. The entry for 5 to 9 reaches past 7, and applying it gives the correct state at 9 because the changes are last-writer-wins. The entry for 10 to 12 follows, so the file ends at 12. Applying the entry for 1 to 4 would put older values on top of the checkpoint's newer ones. Skipping 5 to 9 loses changes 8 and 9, and stopping at 9 loses 10 to 12."
+    },
+    {
+      "question": "A parent holds layers at positions 0.2 and 0.6, ordered by those fractions. A designer drags a layer X between them. Then another layer Y is dragged between X and the layer at 0.6. Using the average of the neighbouring positions, where do X and Y end up?",
+      "options": [
+        "X at 0.4, then Y at 0.5",
+        "X at 0.4, then Y at 0.3, the average of X and the layer at 0.2",
+        "X at 0.8, then Y at 1.4, adding the neighbours instead of averaging them",
+        "X at 0.4, then Y at 0.4, and the server renumbers the siblings later"
+      ],
+      "answer": 0,
+      "explanation": "X goes to (0.2 + 0.6) / 2 = 0.4, and Y goes between X and the layer at 0.6, so (0.4 + 0.6) / 2 = 0.5. The order is 0.2, 0.4 (X), 0.5 (Y), 0.6. Averaging X with the layer at 0.2 gives 0.3, which would put Y before X instead of after it. Adding without halving gives 0.8 and then 1.4, which are not between the neighbours, or even below 1. Two siblings at the same position would leave their order undecided, and Figma's description involves no renumbering of the other siblings."
+    }
+  ],
+  "sources": [
+    {
+      "title": "How Figma's multiplayer technology works",
+      "publisher": "Figma",
+      "year": 2019,
+      "url": "https://www.figma.com/blog/how-figmas-multiplayer-technology-works/"
+    },
+    {
+      "title": "Making multiplayer more reliable",
+      "publisher": "Figma",
+      "year": 2022,
+      "url": "https://www.figma.com/blog/making-multiplayer-more-reliable/"
+    }
+  ]
+}
