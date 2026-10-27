@@ -1,0 +1,132 @@
+---
+import PlaygroundShell from '../../components/PlaygroundShell.astro';
+---
+<PlaygroundShell title="Why append-only volumes need compaction" hint="A toy store with 1,200 volumes written over 120 days. Deleting a block frees nothing inside a closed volume. Change how data is encoded, how fast files are deleted and when volumes are compacted, and watch the disk used for each byte of live data.">
+  <ol class="how">
+    <li>With the defaults the store uses <b>2.32</b> bytes of disk for every byte of live user data, and no volume is compacted.</li>
+    <li>Set <b>Re-encode after</b> to <b>0</b> (never): the old volumes stay as three copies and the figure rises to <b>4.38</b>.</li>
+    <li>Press <b>Reset settings</b>, then choose <b>10+2 erasure code</b> for older data: it falls to <b>1.91</b>.</li>
+    <li>Press <b>Reset settings</b>, then set <b>Compact volumes below</b> to <b>50</b>: the figure drops to <b>2.02</b>, but <b>12%</b> of all live data has to be rewritten to get there.</li>
+    <li>Press <b>Reset settings</b> and set <b>Volumes written under-filled</b> to <b>20</b>: the figure is <b>2.90</b> and <b>253</b> volumes are under 20% live. Now set <b>Compact volumes below</b> to <b>10</b>: it falls to <b>2.31</b> with only <b>1%</b> of live data rewritten, because the sparsest volumes are cheap to empty.</li>
+  </ol>
+  <div class="pg mpk" data-mpk>
+    <div class="pg-row">
+      <label>Older data stored as <select class="pg-in" data-enc><option value="3">3 full copies</option><option value="1.5" selected>6+3 erasure code</option><option value="1.2">10+2 erasure code</option></select></label>
+      <label>Re-encode after (days) <input type="range" min="0" max="60" step="1" value="7" data-cool /> <b data-coolval></b></label>
+      <label>Files deleted per month (%) <input type="range" min="1" max="40" step="1" value="20" data-del /> <b data-delval></b></label>
+      <label>Compact volumes below (% live) <input type="range" min="0" max="90" step="10" value="0" data-thr /> <b data-thrval></b></label>
+      <label>Volumes written under-filled (%) <input type="range" min="0" max="30" step="5" value="0" data-bug /> <b data-bugval></b></label>
+      <button type="button" class="btn" data-reset>Reset settings</button>
+    </div>
+    <div class="pg-grid">
+      <div class="pg-box" data-b1><h3>Disk used per live byte</h3><span class="pg-mono" data-o1></span><span class="pg-note" data-n1></span></div>
+      <div class="pg-box" data-b2><h3>Cost of compaction</h3><span class="pg-mono" data-o2></span><span class="pg-note" data-n2></span></div>
+      <div class="pg-box" data-b3><h3>Volumes before compaction</h3><span class="pg-mono" data-o3></span><span class="pg-note" data-n3></span></div>
+    </div>
+    <div class="mpk-hist">
+      <p class="pg-note mpk-cap">Volumes by how much of them is still live (before compaction):</p>
+      <ul class="mpk-bins" data-bins></ul>
+    </div>
+    <p class="pg-out" data-verdict aria-live="polite"></p>
+    <p class="pg-note">This is a teaching model, not Dropbox data. One region only. Every volume has the same size and is allocated in full, even when little of it is live. Ten new volumes are closed every day for 120 days. Each volume loses blocks at its own steady rate, some at one tenth of the average and some at almost twice the average. Young volumes (and all volumes if re-encoding is never) are kept as 3 full copies. Compaction copies the live blocks of every volume below the chosen share into new, full volumes stored in the older-data encoding, then drops the old volumes. A volume written under-filled starts with 4% of its space in use.</p>
+  </div>
+</PlaygroundShell>
+<style>
+  .mpk-hist { display: grid; gap: 6px; }
+  .mpk-cap { margin: 0; }
+  .mpk-bins { list-style: none; margin: 0; padding: 0; display: grid; gap: 4px; }
+  .mpk-bins li { display: grid; grid-template-columns: minmax(7.5rem, 9rem) minmax(0, 1fr) 3.5rem; align-items: center; gap: 8px; font: .82rem var(--font-mono); }
+  .mpk-bins .bar { display: block; height: .8rem; border: 1px solid var(--border); border-radius: 4px; background: var(--surface); overflow: hidden; }
+  .mpk-bins .bar i { display: block; height: 100%; background: var(--accent-soft); border-right: 2px solid var(--accent); transition: width .2s; }
+  .mpk-bins .n { text-align: right; }
+  @media (prefers-reduced-motion: reduce) { .mpk-bins .bar i, .mpk .pg-box { transition: none; } }
+</style>
+<script>
+  document.querySelectorAll<HTMLElement>('[data-mpk]').forEach((root) => {
+    const q = <T extends HTMLElement>(s: string) => root.querySelector<T>(s)!;
+    const VOLUMES = 1200; const PER_DAY = 10; // ten volumes close every day for 120 days
+    const COPIES = 3; // young volumes are kept as full copies
+    const UNDERFILL = 0.04; // share of a volume in use when it was written under-filled
+    const BINS = 5; // volumes are counted in steps of 20% live
+    const HIGH_COST = 10; // % of live data rewritten that we call heavy
+    const DEFAULTS = { enc: '1.5', cool: '7', del: '20', thr: '0', bug: '0' };
+    // Numerical Recipes LCG, so every visit draws the same volumes.
+    let seed = 4242; const rnd = () => ((seed = (seed * 1664525 + 1013904223) % 4294967296) / 4294967296);
+    const bias = Array.from({ length: VOLUMES }, () => 0.1 + 1.8 * rnd()); // how fast this volume loses blocks, relative to the average
+    const bugPick = Array.from({ length: VOLUMES }, () => rnd());
+    const num = (s: string) => Number(q<HTMLInputElement>(s).value);
+
+    function simulate(del: number, enc: number, cool: number, thr: number, bug: number) {
+      const rate = -Math.log(1 - del / 100) / 30; // per day
+      const old = cool > 0 ? enc : COPIES;
+      let raw = 0; let live = 0; const lives: number[] = [];
+      for (let i = 0; i < VOLUMES; i++) {
+        const age = Math.floor(i / PER_DAY);
+        const fill = bugPick[i] < bug / 100 ? UNDERFILL : 1;
+        const l = fill * Math.exp(-rate * bias[i] * age);
+        lives.push(l); live += l;
+        raw += cool > 0 && age >= cool ? enc : COPIES;
+      }
+      let rawAfter = raw; let moved = 0; let madeVols = 0; let compacted = 0;
+      if (thr > 0) {
+        let sum = 0; let rawOut = 0;
+        lives.forEach((l, i) => { if (l < thr / 100) { sum += l; compacted++; rawOut += cool > 0 && Math.floor(i / PER_DAY) >= cool ? enc : COPIES; } });
+        const made = Math.ceil(sum);
+        rawAfter = raw - rawOut + made * old; moved = sum / live; madeVols = made;
+      }
+      const bins = Array.from({ length: BINS }, () => 0);
+      lives.forEach((l) => { bins[Math.min(BINS - 1, Math.floor(l * BINS))]++; });
+      return { before: raw / live, after: rawAfter / live, moved: Math.round(100 * moved), madeVols, compacted, bins };
+    }
+
+    const binList = q('[data-bins]');
+    const rows = Array.from({ length: BINS }, (_, i) => {
+      const li = document.createElement('li');
+      const label = document.createElement('span'); const bar = document.createElement('span'); const fill = document.createElement('i'); const n = document.createElement('span');
+      bar.className = 'bar'; bar.append(fill); n.className = 'n';
+      label.textContent = i === 0 ? 'under 20% live' : i === BINS - 1 ? '80% to 100% live' : `${i * 20}% to ${(i + 1) * 20}% live`;
+      li.append(label, bar, n); binList.append(li);
+      return { fill, n };
+    });
+
+    function draw() {
+      const enc = num('[data-enc]'); const cool = num('[data-cool]'); const del = num('[data-del]'); const thr = num('[data-thr]'); const bug = num('[data-bug]');
+      q('[data-coolval]').textContent = cool ? `${cool}` : 'never';
+      q('[data-delval]').textContent = `${del}`;
+      q('[data-thrval]').textContent = thr ? `${thr}` : 'off';
+      q('[data-bugval]').textContent = `${bug}`;
+      const r = simulate(del, enc, cool, thr, bug);
+      const f2 = (x: number) => x.toFixed(2);
+      q('[data-o1]').textContent = `${f2(r.after)} bytes`;
+      q('[data-n1]').textContent = thr ? `${f2(r.before)} before compaction` : 'compaction is off';
+      q('[data-o2]').textContent = thr ? `${r.moved}% of live data rewritten` : 'nothing rewritten';
+      q('[data-n2]').textContent = thr ? `${r.compacted} volumes emptied into ${r.madeVols} new full ones` : 'closed volumes are never changed, so deleted blocks stay on disk';
+      const half = r.bins[0] + r.bins[1]; // under 40% live
+      q('[data-o3]').textContent = `${half} of ${VOLUMES} under 40% live`;
+      q('[data-n3]').textContent = `${r.bins[0]} of them under 20% live`;
+      const top = Math.max(...r.bins);
+      rows.forEach((row, i) => { row.n.textContent = String(r.bins[i]); row.fill.style.width = `${Math.round((100 * r.bins[i]) / top)}%`; });
+      const heavy = thr > 0 && r.moved >= HIGH_COST;
+      const wasteful = r.after > 2.5;
+      q<HTMLElement>('[data-b1]').style.setProperty('--c', wasteful ? 'var(--bad)' : 'var(--good)');
+      q<HTMLElement>('[data-b2]').style.setProperty('--c', heavy ? 'var(--bad)' : 'var(--good)');
+      const out = q('[data-verdict]'); out.classList.toggle('bad', wasteful || heavy);
+      let msg: string;
+      if (r.after > 4) msg = `Every live byte costs ${f2(r.after)} bytes of disk: old volumes are still full copies. Re-encode cold volumes to an erasure code.`;
+      else if (wasteful && !thr) msg = `${f2(r.after)} bytes of disk per live byte, and the gap is mostly deleted blocks that cannot be removed from closed volumes. Compaction rewrites the live blocks into new volumes.`;
+      else if (wasteful) msg = `Still ${f2(r.after)} bytes per live byte. Raise the compaction threshold to reach more of the half-empty volumes.`;
+      else if (heavy) msg = `Disk use is down to ${f2(r.after)} bytes per live byte, but compaction rewrites ${r.moved}% of all live data, which loads storage and metadata systems.`;
+      else if (thr) msg = `${f2(r.after)} bytes per live byte for ${r.moved}% of live data rewritten. Emptying the sparsest volumes first gives the most space back for the least copying.`;
+      else msg = `${f2(r.after)} bytes of disk per live byte with compaction off.`;
+      out.textContent = msg;
+    }
+    q('[data-reset]').addEventListener('click', () => {
+      q<HTMLSelectElement>('[data-enc]').value = DEFAULTS.enc;
+      (['cool', 'del', 'thr', 'bug'] as const).forEach((k) => { q<HTMLInputElement>(`[data-${k}]`).value = DEFAULTS[k]; });
+      draw();
+    });
+    root.addEventListener('input', draw);
+    root.addEventListener('change', draw);
+    draw();
+  });
+</script>

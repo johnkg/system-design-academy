@@ -1,0 +1,194 @@
+{
+  "name": "How Discord Stores Trillions of Messages",
+  "difficulty": "advanced",
+  "intent": "Follow Discord's own account of how its chat history storage changed as it grew: one MongoDB machine, then Cassandra with the partition key (channel, time bucket), then Rust data services that coalesce reads, then ScyllaDB and a fast migration. Each step is tied to the numbers Discord published.",
+  "codeTitle": "time-bucketed partitions and request coalescing, as a small model",
+  "finalIntro": "One announcement in a huge channel, and thousands of readers asking for the same newest messages (round numbers for illustration).",
+  "prompt": "Discord is a chat service where every message is kept so people can come back to any channel at any time. Design the storage for message history. Readers load the newest messages in a channel, scroll or jump back through years of history, and writers add messages all day; some channels are a few friends and some have hundreds of thousands of members. This study follows what Discord says in two of its own engineering posts: 'How Discord Stores Billions of Messages' (January 2017) and 'How Discord Stores Trillions of Messages' (March 2023). Everything about Discord below comes from those two posts; the simulations and code samples are small teaching models with made-up round numbers, not Discord's code or data.",
+  "functional": [
+    "Store every message of a channel for ever, as Discord said in 2017 it decided to do from early on",
+    "Load the newest messages of a channel, and keep loading older ones while the reader scrolls back",
+    "Jump to a message from a long time ago, for example one from over a year back in a channel with millions of messages (an example Discord gave in 2017)",
+    "Write new messages, and let users edit and delete them, including at the same moment"
+  ],
+  "nonFunctional": [
+    "Discord's 2017 list of needs for the database: linear scalability (no manual re-sharding), automatic failover, low maintenance, proven technology, predictable performance, not a store of blobs that must be rewritten on every append, and open source",
+    "Predictable latency: in 2017 Discord had alerts when its API's 95th percentile response time went above 80 ms, and did not want to put a Redis or Memcached cache in front of messages",
+    "Random reads: Discord measured that reads were very random and the read/write ratio was about 50/50, with servers ranging from near silent to thousands of messages a day",
+    "Sudden spikes: a big announcement in a large server sends many readers to the same channel at once",
+    "In 2022, a migration of trillions of messages with no downtime, done quickly because the old cluster was causing frequent firefighting"
+  ],
+  "firstAttempt": {
+    "text": "Discord's first version, built in early 2015, kept everything in one MongoDB replica set. Messages sat in one collection with a single compound index (an index on two fields at once) on channel_id and created_at. Discord says it deliberately avoided MongoDB sharding, which it described as complicated to use and not known for stability, and planned from the start for an easy move to another database.",
+    "limits": [
+      "Around November 2015, at 100 million stored messages, the data and the index no longer fit in RAM and latencies became unpredictable",
+      "Reads were random, so returning just 50 messages could mean many random seeks on disk and could push other data out of the disk cache",
+      "Quiet servers, private chat servers and huge public servers each stress the cache differently, and Discord planned features (mentions, pinned messages, search) that would add yet more random reads",
+      "One replica set has no clear way to scale out without the sharding Discord had decided to avoid"
+    ]
+  },
+  "nodes": [
+    { "id": "users", "label": "Users", "kind": "client", "x": 10, "y": 50 },
+    { "id": "api", "label": "API monolith", "kind": "edge", "x": 32, "y": 50 },
+    { "id": "mongo", "label": "MongoDB replica set", "kind": "data", "x": 62, "y": 22, "at": 0, "until": 1 },
+    { "id": "cassandra", "label": "cassandra-messages", "kind": "data", "x": 62, "y": 50, "at": 1 },
+    { "id": "buckets", "label": "Partitions: channel + time bucket", "kind": "data", "x": 88, "y": 50, "at": 2 },
+    { "id": "ds", "label": "Rust data services", "kind": "compute", "x": 46, "y": 82, "at": 4 },
+    { "id": "scylla", "label": "ScyllaDB cluster", "kind": "data", "x": 76, "y": 82, "at": 5 },
+    { "id": "migrator", "label": "Rust migrator", "kind": "compute", "x": 90, "y": 66, "at": 6 }
+  ],
+  "edges": [
+    { "from": "users", "to": "api", "at": 0 },
+    { "from": "api", "to": "mongo", "at": 0, "until": 1 },
+    { "from": "api", "to": "cassandra", "at": 1, "until": 4 },
+    { "from": "cassandra", "to": "buckets", "at": 2 },
+    { "from": "api", "to": "ds", "at": 4 },
+    { "from": "ds", "to": "cassandra", "at": 4, "until": 6 },
+    { "from": "ds", "to": "scylla", "at": 5 },
+    { "from": "cassandra", "to": "migrator", "at": 6 },
+    { "from": "migrator", "to": "scylla", "at": 6 }
+  ],
+  "steps": [
+    {
+      "title": "Partition by channel and sort by Snowflake ID in Cassandra",
+      "problem": "One MongoDB machine's index no longer fit in memory, and Discord could not keep adding capacity by hand. Its reads were random, its read/write ratio was about 50/50, and it wanted a database it could scale by adding nodes, with failover and little upkeep.",
+      "fix": "Discord moved messages to Cassandra, which it describes as a 'KKV store': a table with a two-part primary key. The first key, the partition key, decides which nodes hold the data and where it sits on disk. Inside a partition, rows are kept sorted by the second key, the clustering key, so a partition behaves like an ordered dictionary. channel_id became the partition key because every query is about one channel. created_at was a poor clustering key because two messages can share a creation time, but every Discord ID is a Snowflake (an ID that sorts by creation time), so the key became (channel_id, message_id). Loading a channel is then one range scan of one partition. Discord first double-read and double-wrote to MongoDB and Cassandra as a dark launch (a launch whose results users do not see), and in a week of testing reported writes under a millisecond and reads under 5 milliseconds. It phased MongoDB out within a week of making Cassandra primary.",
+      "tradeoff": "Messages of a channel sit together on disk and the cluster grows by adding nodes, and Discord found Cassandra the only candidate that met its whole list of needs. The price is that the table is shaped around the one query (a channel's messages in order), and a channel that lives for years keeps growing inside a single partition, which the next step has to fix.",
+      "concepts": [{ "slug": "sql-vs-nosql" }, { "slug": "ordering-and-partitioning" }, { "slug": "database-sharding" }, { "slug": "lsm-trees-vs-b-trees" }]
+    },
+    {
+      "title": "Add a time bucket to the partition key to bound partition size",
+      "problem": "While importing messages, Discord saw log warnings about partitions over 100 MB. Cassandra advertises support for 2 GB partitions, but Discord says that large partitions put heavy garbage collection pressure on Cassandra during compaction and cluster expansion (compaction is the background merging of on-disk files), and that a partition too big cannot be spread around the cluster. A channel can live for years, so its partition would only grow.",
+      "fix": "Discord bucketed messages by time: the partition key became (channel_id, bucket) and the primary key ((channel_id, bucket), message_id). After looking at the largest channels, it chose a bucket of about 10 days so that partitions stay comfortably under 100 MB, and a bucket can be worked out from a message ID or a timestamp. To get recent messages, the code lists the buckets from the current time back to the channel's creation (the channel ID is also a Snowflake and is older than its first message) and queries those partitions one after another until it has enough messages.",
+      "tradeoff": "Partition size is bounded and the data spreads over the cluster. The cost, which Discord names, is that a rarely active channel may have to query several buckets to find enough messages, which it found acceptable in practice because active channels usually find enough in the first partition and are the majority. In 2023 Discord adds that a static time window means very different amounts of data and traffic per partition: a group of friends sends orders of magnitude fewer messages than a server with hundreds of thousands of people.",
+      "concepts": [{ "slug": "ordering-and-partitioning" }, { "slug": "database-sharding" }, { "slug": "lsm-trees-vs-b-trees" }]
+    },
+    {
+      "title": "Design for eventual consistency and tombstones",
+      "problem": "During the dark launch, errors reported author_id as null even though it is required. Cassandra trades strong consistency for availability, and every write is an upsert (insert or update) resolved per column by 'last write wins'. When one user edited a message while another deleted it, the result was a row with only its primary key and text. Deletes are also writes: a delete leaves a tombstone, a marker that is skipped on reads and removed at compaction when its lifespan ends, and writing null creates one too. Discord's message schema has 16 columns and the average message sets only 4, so most writes created 12 useless tombstones. Later, a public server's channel that had millions of messages deleted through the API (leaving 1) took 20 seconds to load, because reading it meant scanning millions of tombstones while Cassandra ran constant 10-second stop-the-world garbage collections.",
+      "fix": "Discord treats a row that is missing a required column (author_id) as corrupt and deletes it, which it preferred to rewriting the whole message on every edit because that could resurrect deleted messages. It writes only non-null values. It cut the tombstone lifespan from 10 days to 2 days, because it runs Cassandra repairs (an anti-entropy process that compares and fixes replicas) every night on the message cluster. And it changed the query code to remember empty buckets and skip them in future, so that at worst a query scans the most recent bucket.",
+      "tradeoff": "The cluster no longer drowns in avoidable tombstones, and one emptied channel cannot stall it. The costs: the application must repair or delete inconsistent rows itself, a shorter tombstone lifespan is only safe if repairs run often enough (Discord's reason was its nightly repairs), and the empty-bucket memory is extra logic in the query code.",
+      "concepts": [{ "slug": "acid-vs-base" }, { "slug": "consistency-models" }, { "slug": "merkle-trees-and-anti-entropy" }, { "slug": "lsm-trees-vs-b-trees" }]
+    },
+    {
+      "title": "Put Rust data services in front of the database and coalesce reads",
+      "problem": "In 2017 cassandra-messages had 12 nodes; at the start of 2022 it had 177 nodes and trillions of messages, and Discord's on-call team was frequently paged. In Cassandra reads cost more than writes (a read checks the in-memory table and possibly several on-disk files), so many concurrent reads of one channel and bucket make a hot partition. Because Discord reads and writes at quorum consistency (a majority of replicas must answer), every query to the nodes holding the hot partition slows down, and the extra latency feeds on itself as the node falls further behind: high traffic to one partition means unbounded concurrency and cascading latency.",
+      "fix": "Discord wrote data services, intermediary services between its API monolith and its database clusters, in Rust. Each has roughly one gRPC endpoint (a typed remote call) per database query, and intentionally no business logic. Their main feature is request coalescing: the first request for a row starts a worker task in the service, later requests for the same row find the task and subscribe to it, and the worker queries the database once and returns the row to all subscribers. Upstream, requests are routed with consistent hashing on a routing key; for messages the key is the channel ID, so all requests for a channel reach the same service instance and can be coalesced. Discord's example is an @everyone announcement on a large server, which used to risk a hot partition and a page to on-call.",
+      "tradeoff": "Spikes against the database drop sharply and the database no longer sees every reader. Discord is clear that it does not remove the problem: it still saw hot partitions and extra latency on the Cassandra cluster, just less often, and the change bought time for the next two steps. As with any added layer there is one more service to run, and the service's own capacity and routing now matter. Discord chose Rust for fast C or C++ style speed with safety, the Tokio library for asynchronous I/O, and drivers for both Cassandra and ScyllaDB.",
+      "concepts": [{ "slug": "consistent-hashing" }, { "slug": "backpressure" }, { "slug": "proxies" }, { "slug": "quorums" }]
+    },
+    {
+      "title": "Move to ScyllaDB, which has no garbage collector",
+      "problem": "Besides hot partitions, Discord describes upkeep that kept growing: the cluster often fell behind on compactions, which made reads cost more and added cascading latency. Its team took a node out of rotation to compact, brought it back to receive hinted handoff data (writes that other nodes held for it while it was away), and repeated until the backlog was empty, which it called the 'gossip dance'. It also spent a lot of time tuning the JVM's garbage collector, and sometimes a node's long GC pauses needed an operator to reboot it and nurse it back to health.",
+      "fix": "ScyllaDB is a Cassandra-compatible database written in C++, with a shard-per-core design (each CPU core manages its own slice of the data), better workload isolation and no garbage collector. Discord's 2017 post had already named it as an idea to explore, and by 2020 Discord had moved every database except cassandra-messages. Messages came last because the cluster was big (trillions of messages, nearly 200 nodes), because it wanted to tune the new database and learn it in production, and because in testing the speed of reverse queries (scanning in the opposite order to the table's sort, such as oldest first) was not good enough. The ScyllaDB team prioritised and shipped faster reverse queries, which Discord says removed the last blocker. The new cluster uses local SSDs for speed, mirrored with RAID to a persistent disk for durability.",
+      "tradeoff": "The data model stays the same, so the application keeps its (channel, bucket) design, and the garbage collector is gone. Discord says plainly that ScyllaDB has its own issues and that hot partitions can still happen there, which is why the data services came first and stay in place. The cost is another migration, this time of trillions of messages.",
+      "concepts": [{ "slug": "lsm-trees-vs-b-trees" }, { "slug": "database-replication" }, { "slug": "quorums" }]
+    },
+    {
+      "title": "Migrate everything at once with a fast Rust migrator",
+      "problem": "The requirement was to move trillions of messages with no downtime, quickly, because the Cassandra cluster was still causing firefighting. Discord's first plan was to start serving newer data from ScyllaDB after a cutover time and migrate history behind it, dual-writing new data to both databases, using ScyllaDB's Spark migrator. After tuning, the estimate was three months.",
+      "fix": "Discord extended its data service library, in an afternoon, into a migrator: it reads token ranges (slices of the key space) from the old database, saves its progress locally in SQLite, and writes the data quickly into ScyllaDB. The estimate fell to nine days, so Discord dropped the time-based plan and migrated everything at once, at speeds of up to 3.2 million messages per second. The migration stuck at 99.9999% because the last token ranges held huge ranges of tombstones that Cassandra had never compacted away; after compacting that range it finished within seconds. For validation, a small percentage of reads went to both databases and the results were compared. Discord made ScyllaDB the primary database in May 2022.",
+      "tradeoff": "A simpler plan and a far faster copy, at the cost of building a custom tool and meeting the old cluster's leftover tombstones. Discord's reported results in its March 2023 post: 177 Cassandra nodes became 72 ScyllaDB nodes, each with 9 TB of disk against an average of 4 TB per Cassandra node; p99 latency (the time 99% of requests beat) for fetching historical messages went from 40-125 ms to 15 ms, and for inserts from 5-70 ms to a steady 5 ms. Discord also said the cluster was quiet and well behaved in the months after.",
+      "concepts": [{ "slug": "online-schema-migrations" }, { "slug": "database-replication" }, { "slug": "lsm-trees-vs-b-trees" }]
+    }
+  ],
+  "failures": [
+    {
+      "scenario": "A moderator posts an @everyone announcement in a very large server, and thousands of readers open the same channel at the same moment",
+      "impact": "Without a shield, every reader's request becomes a database read of the same partition. In Cassandra Discord describes unbounded concurrency on that partition, a node that falls further and further behind, and higher latency for every query served by the nodes that hold it.",
+      "answer": "The data service routes all requests for the channel to one instance by channel ID, and request coalescing lets that instance read the row once for all waiting requests. Discord says this significantly reduces traffic spikes, but also that hot partitions can still happen in ScyllaDB.",
+      "concepts": [{ "slug": "consistent-hashing" }, { "slug": "backpressure" }]
+    },
+    {
+      "scenario": "Someone deletes millions of messages in a channel through the API, then another user opens it",
+      "impact": "The channel holds one message but Cassandra has to scan millions of tombstones to find it. In 2017 Discord saw constant 10-second stop-the-world garbage collections and a channel that took 20 seconds to load.",
+      "answer": "Shorter tombstone lifespan (10 days down to 2, safe because of nightly repairs), plus query code that remembers empty buckets so a later query scans at worst the most recent bucket.",
+      "concepts": [{ "slug": "merkle-trees-and-anti-entropy" }, { "slug": "lsm-trees-vs-b-trees" }]
+    },
+    {
+      "scenario": "One user edits a message at the same moment another user deletes it",
+      "impact": "Every Cassandra write is an upsert merged per column, so Discord ended up with a row holding only its primary key and text, and no author.",
+      "answer": "Discord checks a required column (author_id) and deletes any row where it is null. Rewriting the whole message on every edit could resurrect deleted messages, so it did not choose that.",
+      "concepts": [{ "slug": "acid-vs-base" }, { "slug": "consistency-models" }]
+    },
+    {
+      "scenario": "The migration stalls at 99.9999% because the migrator times out on the last few token ranges",
+      "impact": "Those ranges contained gigantic runs of tombstones that were never compacted away in Cassandra, so reading them timed out and the migration could not finish.",
+      "answer": "Discord compacted that token range, and the migration finished seconds later. It then validated by sending a small percentage of reads to both databases and comparing the results before switching the primary.",
+      "concepts": [{ "slug": "lsm-trees-vs-b-trees" }, { "slug": "online-schema-migrations" }]
+    }
+  ],
+  "alternatives": [
+    {
+      "title": "What the message partition key should be",
+      "options": [
+        { "name": "channel only", "pro": "One range scan loads a channel, in order", "con": "A channel that lives for years makes one partition that only grows; Discord saw warnings over 100 MB" },
+        { "name": "channel and time bucket", "pro": "Bounded partitions, still ordered, and a bucket can be worked out from an ID or a timestamp", "con": "A quiet channel may need several bucket queries, and a static window gives very uneven partition traffic" },
+        { "name": "hash of the message ID", "pro": "Spreads writes evenly over the cluster", "con": "A channel's messages would be scattered, so loading recent messages would touch many partitions (a general trade-off, not something Discord tested)" }
+      ],
+      "pick": "Discord's posts describe channel plus time bucket, with a bucket of about 10 days chosen in 2017 to stay under 100 MB."
+    },
+    {
+      "title": "How to protect the database from a read spike",
+      "options": [
+        { "name": "A cache such as Redis or Memcached in front", "pro": "Common and quick to add", "con": "Discord listed 'no Redis or Memcached cache for messages' as part of its 2017 predictable-performance goal" },
+        { "name": "Request coalescing behind channel-based routing", "pro": "Many identical reads become one database read, and no cached copy can go stale", "con": "One more service, and hot partitions can still occur (Discord's 2023 post)" },
+        { "name": "A bigger cluster", "pro": "More capacity with no new code", "con": "Cassandra's cluster had already grown from 12 to 177 nodes, and the hot partition lives on only the few nodes that hold it" }
+      ],
+      "pick": "Discord built coalescing data services with routing by channel ID, and kept ScyllaDB as the database behind them."
+    },
+    {
+      "title": "How to copy trillions of messages",
+      "options": [
+        { "name": "Cutover time plus a Spark migrator for history", "pro": "New data benefits from ScyllaDB early", "con": "More complexity, dual writes, and an estimate of three months" },
+        { "name": "A Rust migrator over token ranges, then switch all at once", "pro": "Estimate of nine days, up to 3.2 million messages per second, and no time-based logic", "con": "A custom tool, and it hit uncompacted tombstones at the very end" }
+      ],
+      "pick": "Discord took the Rust migrator and flipped everything together, after validating with reads sent to both databases."
+    }
+  ],
+  "roles": [
+    { "id": "client", "label": "Users", "description": "People reading and writing messages in channels." },
+    { "id": "edge", "label": "API monolith", "description": "The application that receives requests and calls the data services." },
+    { "id": "compute", "label": "Data services and migrator", "description": "Rust programs: the data services that coalesce reads, and the tool that copied the old data." },
+    { "id": "data", "label": "Databases", "description": "MongoDB, then Cassandra, then ScyllaDB, and the partitions inside them." }
+  ],
+  "quiz": [
+    {
+      "question": "Discord's 2017 post says it aimed to keep a partition under 100 MB, and chose a bucket of about 10 days for its largest channels. Suppose a busy channel adds about 35 MB of messages per day. Which bucket length is the longest one that still keeps its partitions under 100 MB?",
+      "options": [
+        "1 day, because a bucket should hold the least data possible",
+        "3 days, because 100 divided by 35 rounds to 3",
+        "2 days, because it holds about 70 MB and 3 days would hold about 105 MB",
+        "10 days, because that is the window Discord reported using"
+      ],
+      "answer": 2,
+      "explanation": "Two days is 2 x 35 = 70 MB, under the limit, and three days is 3 x 35 = 105 MB, over it. One day is safe, but it is not the longest, and shorter buckets make a quiet channel's history span more partitions, so more queries. Rounding 2.86 up to 3 crosses the limit, so it must be rounded down. Ten days suits Discord's own largest channels as it measured them; for this channel it would be about 350 MB."
+    },
+    {
+      "question": "An announcement sends 6,000 requests per second for the newest messages of one channel. All of them are routed to one data service instance. A database read takes 20 ms, and the instance starts a new read for that row only when the previous one has finished, with later requests joining the read in progress. About how many reads per second reach the database?",
+      "options": [
+        "About 50 reads per second, because one read takes 20 ms and 1,000 ms holds 50 of them",
+        "About 6,000 reads per second, because every reader still triggers its own read",
+        "About 1 read per second, because the first read is shared for the whole spike",
+        "About 3,000 reads per second, because coalescing shares each read between two requests"
+      ],
+      "answer": 0,
+      "explanation": "With one read at a time per row, an instance can start at most 1,000 / 20 = 50 reads a second, however many readers join each one. 6,000 is what the database would see with no coalescing. One read per second would mean a read is shared for a whole second, but a read ends after 20 ms and then the next request starts a new one. Coalescing has no fixed sharing ratio of two; the number of requests that join depends on how many arrive while a read is running."
+    },
+    {
+      "question": "Discord says its Rust migrator reached up to 3.2 million messages per second. If that rate stayed steady, about how long would it take to copy a hypothetical 1 trillion messages (1,000,000 million)?",
+      "options": [
+        "About 52 minutes",
+        "About 9 days",
+        "About 36 days",
+        "About 3.6 days"
+      ],
+      "answer": 3,
+      "explanation": "1,000,000,000,000 / 3,200,000 = 312,500 seconds, which is about 87 hours or 3.6 days. Fifty-two minutes is the answer for 10 billion messages, one hundred times too few. Thirty-six days is ten times too many. Nine days was Discord's estimate for its entire migration, which was a different (and larger) job, not the result of this calculation."
+    }
+  ],
+  "sources": [
+    { "title": "How Discord Stores Billions of Messages", "publisher": "Discord", "year": 2017, "url": "https://discord.com/blog/how-discord-stores-billions-of-messages" },
+    { "title": "How Discord Stores Trillions of Messages", "publisher": "Discord", "year": 2023, "url": "https://discord.com/blog/how-discord-stores-trillions-of-messages" }
+  ]
+}
