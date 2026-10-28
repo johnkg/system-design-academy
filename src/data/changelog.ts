@@ -4,8 +4,13 @@ export interface Change { date: string; title: string; items: { text: string; hr
 export const changelog: Change[] = [
   {
     date: '2026-10-28',
-    title: 'Moving dots in the animations',
+    title: 'New look for four more pages, and moving dots in the animations',
     items: [
+      { text: 'Case studies: a strip for the studies built from real company posts, a search box with level filters, and cards that show the level, how many fixes and how many concepts each study uses.', href: 'case-studies/' },
+      { text: 'Practice: Review and Mock interview lead the page (with how many questions are due today), and the other tools sit underneath.', href: 'practice/' },
+      { text: 'Search: results are marked as concept, pattern or case study, with counts for each, and a few ideas to try before you type.', href: 'search/' },
+      { text: 'Compare: switch between design patterns and system design concepts with one control, and numbered sections.', href: 'compare/' },
+      { text: 'The three coloured logos in the header are now one menu labelled "Code in", so it is clear that it chooses the language of every code sample.' },
       { text: 'In Load Balancing, Caching and the URL shortener case study, requests now stream along the lines as moving dots while you read each step. Pick 0.5×, 1× or 2×, or pause the motion.', href: 'concepts/load-balancing/' },
       { text: '"Step by step" brings back the one-dot-per-step player. Your choice is remembered, and people who ask their device for reduced motion get the still version.' },
     ],
