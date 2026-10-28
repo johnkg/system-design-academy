@@ -8,10 +8,11 @@ interface Frame {
   // Persistent connections (e.g. "subscribed"). Cumulative across frames.
   links?: { add?: [string, string][]; remove?: [string, string][] };
 }
-interface Props { steps: { actors: Actor[]; frames: Frame[]; linkLabel?: string }; colors: Record<string, string> }
-const { steps, colors } = Astro.props;
+// flow: show the Flow / Step by step switch, and stream moving dots along each message by default.
+interface Props { steps: { actors: Actor[]; frames: Frame[]; linkLabel?: string }; colors: Record<string, string>; flow?: boolean }
+const { steps, colors, flow = false } = Astro.props;
 ---
-<div class="player" role="group" aria-label="Step-by-step animation" data-player data-frames={JSON.stringify(steps.frames)} tabindex="-1">
+<div class="player" role="group" aria-label="Step-by-step animation" data-player data-flow={flow ? '' : undefined} data-frames={JSON.stringify(steps.frames)} tabindex="-1">
   <div class="stage" data-stage>
     <svg class="arrows" data-arrows aria-hidden="true"></svg>
     {steps.actors.map((a) => (
@@ -31,6 +32,18 @@ const { steps, colors } = Astro.props;
     <div class="progress" aria-hidden="true">{steps.frames.map(() => <i></i>)}</div>
     <span class="count" data-count></span>
   </div>
+  {flow && (
+    <div class="flowbar" data-flowbar>
+      <div class="seg" role="group" aria-label="Animation style">
+        <button class="btn" type="button" data-mode="flow" aria-pressed="true">Flow</button>
+        <button class="btn" type="button" data-mode="step" aria-pressed="false">Step by step</button>
+      </div>
+      <div class="seg" role="group" aria-label="Flow speed" data-speed-group>
+        {[0.5, 1, 2].map((v) => <button class="btn" type="button" data-speed={v} aria-pressed={v === 1}>{v}×</button>)}
+      </div>
+      <button class="btn" type="button" data-act="motion" aria-pressed="false">Pause motion</button>
+    </div>
+  )}
   {steps.linkLabel && <p class="key"><svg width="30" height="8" aria-hidden="true"><line x1="0" y1="4" x2="30" y2="4" /></svg> {steps.linkLabel}</p>}
 </div>
 <script>
@@ -51,6 +64,9 @@ const { steps, colors } = Astro.props;
   const MAX_STAGE_HEIGHT = 1400; // px: the stage grows taller on a narrow screen, but never beyond this
   // The dot's flight as fractions of TRAVEL: it grows in, crosses, then pops on arrival; the receiver reacts just before it lands.
   const DOT = { start: 0.4, pop: 1.8, inEnd: 0.12, outStart: 0.88 }, STATE_AT = 0.9, PULSE_AT = 0.88;
+  const STREAM_DOTS = 3; // dots in flight at once along each message in Flow mode
+  const STREAM_GAP = 250; // ms of rest between one dot's landing and its next start
+  const SPEEDS = [0.5, 1, 2];
   const SVG_NS = 'http://www.w3.org/2000/svg';
 
   document.querySelectorAll<HTMLElement>('[data-player]').forEach((root) => {
@@ -66,6 +82,14 @@ const { steps, colors } = Astro.props;
     let timer: number | undefined;
     let token = 0; // bumps on every render so stale timeouts from an interrupted animation do nothing
     let running: Animation[] = [];
+
+    // Flow mode (pilot lessons only): dots keep streaming along each message until the next step. "Step by step" is the original one-dot-per-step player.
+    const flowCapable = root.hasAttribute('data-flow');
+    const saved = (() => { try { return JSON.parse(localStorage.getItem('sda-flow') ?? '{}'); } catch { return {}; } })();
+    let mode: 'flow' | 'step' = saved.mode === 'step' ? 'step' : 'flow';
+    let speed: number = SPEEDS.includes(saved.speed) ? saved.speed : 1;
+    let motionPaused = false;
+    const flowing = () => flowCapable && mode === 'flow' && !reduceMotion.matches;
 
     type Box = { x: number; y: number; w: number; h: number };
     function box(el: HTMLElement): Box {
@@ -139,13 +163,34 @@ const { steps, colors } = Astro.props;
       entries.forEach(([, el], i) => { el.style.left = `${pos[i].x}px`; el.style.top = `${pos[i].y}px`; });
     }
 
+    const at = (p: { x: number; y: number }, scale: number, opacity: number, offset: number) => ({
+      transform: `translate(${p.x}px, ${p.y}px) translate(-50%, -50%) scale(${scale})`, opacity, offset,
+    });
+    // Dots that loop along one message, evenly spaced, coloured like the sender. They fade in at the sender, cross, and pop at the receiver.
+    function stream(from: string, p1: { x: number; y: number }, p2: { x: number; y: number }, travel: number) {
+      const gap = STREAM_GAP / speed, period = travel + gap, f = travel / period;
+      const color = actors.get(from)!.style.getPropertyValue('--c');
+      for (let i = 0; i < STREAM_DOTS; i++) {
+        const dot = document.createElement('i');
+        dot.className = 'dot flow';
+        if (color) dot.style.setProperty('--dc', color);
+        labels.appendChild(dot);
+        running.push(dot.animate(
+          [at(p1, DOT.start, 0, 0), at(p1, 1, 1, DOT.inEnd * f), at(p2, 1, 1, DOT.outStart * f), at(p2, DOT.pop, 0, f), at(p1, DOT.start, 0, 1)],
+          { duration: period, delay: (i * period) / STREAM_DOTS, iterations: Infinity, easing: 'linear' },
+        ));
+      }
+    }
+
     // animate=true only when stepping forward one frame; Prev/Restart/resize jump straight to the final picture.
     function render(animate: boolean) {
       placeActors();
       const my = ++token;
       running.forEach((a) => a.cancel());
       running = [];
-      const motion = animate && !reduceMotion.matches;
+      const flow = flowing(), streaming = flow && !motionPaused;
+      const travel = flow ? TRAVEL / speed : TRAVEL;
+      const motion = animate && !reduceMotion.matches && !(flow && motionPaused);
       const frame = frames[index];
       const states = stateAt(index);
       const links = linksAt(index);
@@ -174,6 +219,7 @@ const { steps, colors } = Astro.props;
       messages.forEach((m) => {
         const { p1, p2 } = line(m.from, m.to, motion ? 'trail draw' : 'trail');
         svg.lastElementChild!.setAttribute('marker-end', 'url(#sp-arrow)');
+        if (motion) (svg.lastElementChild as SVGElement).style.animationDuration = `${travel}ms`;
         const tag = document.createElement('span');
         tag.className = motion ? 'tag in' : 'tag';
         tag.textContent = m.label;
@@ -182,16 +228,14 @@ const { steps, colors } = Astro.props;
         // Keep long labels inside the stage so they never cause horizontal page scroll.
         const half = tag.offsetWidth / 2 + 2;
         tag.style.left = `${Math.min(Math.max((p1.x + p2.x) / 2, half), Math.max(half, rect.width - half))}px`;
+        if (streaming) return stream(m.from, p1, p2, travel);
         if (!motion) return;
         const dot = document.createElement('i');
         dot.className = 'dot';
         labels.appendChild(dot);
-        const at = (p: { x: number; y: number }, scale: number, opacity: number, offset: number) => ({
-          transform: `translate(${p.x}px, ${p.y}px) translate(-50%, -50%) scale(${scale})`, opacity, offset,
-        });
         running.push(dot.animate(
           [at(p1, DOT.start, 0, 0), at(p1, 1, 1, DOT.inEnd), at(p2, 1, 1, DOT.outStart), at(p2, DOT.pop, 0, 1)],
-          { duration: TRAVEL, easing: 'cubic-bezier(.45,0,.25,1)', fill: 'forwards' },
+          { duration: travel, easing: 'cubic-bezier(.45,0,.25,1)', fill: 'forwards' },
         ));
       });
 
@@ -200,7 +244,7 @@ const { steps, colors } = Astro.props;
         const target = el.querySelector<HTMLElement>('[data-state]')!;
         const text = states[id] ?? '';
         if (motion && receivers.has(id) && target.textContent !== text) {
-          window.setTimeout(() => { if (my === token) setState(target, text, true); }, TRAVEL * STATE_AT);
+          window.setTimeout(() => { if (my === token) setState(target, text, true); }, travel * STATE_AT);
         } else {
           setState(target, text, motion);
         }
@@ -209,7 +253,7 @@ const { steps, colors } = Astro.props;
         window.setTimeout(() => {
           if (my !== token) return;
           receivers.forEach((id) => restart(actors.get(id)!, 'pulse'));
-        }, TRAVEL * PULSE_AT);
+        }, travel * PULSE_AT);
       }
 
       root.querySelector('[data-narration]')!.textContent = frame.narration;
@@ -241,14 +285,38 @@ const { steps, colors } = Astro.props;
       timer = window.setInterval(() => {
         if (index >= frames.length - 1) return stop();
         go(index + 1);
-      }, AUTOPLAY_MS);
+      }, flowing() ? AUTOPLAY_MS / speed : AUTOPLAY_MS);
     });
+    // The Flow / Step by step switch, speed and pause. Hidden for people who ask the system for reduced motion: they get the still step view.
+    const bar = root.querySelector<HTMLElement>('[data-flowbar]');
+    function syncBar() {
+      if (!bar) return;
+      bar.hidden = reduceMotion.matches;
+      bar.querySelectorAll<HTMLButtonElement>('[data-mode]').forEach((b) => b.setAttribute('aria-pressed', String(b.dataset.mode === mode)));
+      bar.querySelectorAll<HTMLButtonElement>('[data-speed]').forEach((b) => b.setAttribute('aria-pressed', String(Number(b.dataset.speed) === speed)));
+      bar.querySelector<HTMLElement>('[data-speed-group]')!.hidden = mode !== 'flow';
+      const pause = bar.querySelector<HTMLButtonElement>('[data-act=motion]')!;
+      pause.hidden = mode !== 'flow';
+      pause.setAttribute('aria-pressed', String(motionPaused));
+    }
+    function remember() { try { localStorage.setItem('sda-flow', JSON.stringify({ mode, speed })); } catch { /* private window: keep the choice for this visit only */ } }
+    bar?.addEventListener('click', (e) => {
+      const b = (e.target as Element).closest<HTMLButtonElement>('button');
+      if (!b) return;
+      if (b.dataset.mode) mode = b.dataset.mode as 'flow' | 'step';
+      else if (b.dataset.speed) speed = Number(b.dataset.speed);
+      else if (b.dataset.act === 'motion') motionPaused = !motionPaused;
+      else return;
+      remember(); stop(); syncBar(); render(false);
+    });
+    reduceMotion.addEventListener('change', () => { syncBar(); render(false); });
     root.addEventListener('keydown', (e) => {
       if (e.key === 'ArrowRight') { stop(); go(index + 1); }
       if (e.key === 'ArrowLeft') { stop(); go(index - 1); }
     });
     // Re-layout on resize without replaying the animation.
     new ResizeObserver(() => { if (stage.clientWidth !== laidFor) render(false); }).observe(stage);
+    syncBar();
     render(false);
   });
 </script>
@@ -267,6 +335,7 @@ const { steps, colors } = Astro.props;
   @keyframes draw { to { stroke-dashoffset: 0; } }
   @keyframes fade-in { from { opacity: 0; } }
   @keyframes fade-out { to { opacity: 0; } }
+  .labels :global(.dot.flow) { width: 12px; height: 12px; background: var(--dc, var(--accent)); box-shadow: 0 0 0 4px color-mix(in srgb, var(--dc, var(--accent)) 28%, transparent), 0 0 12px var(--dc, var(--accent)); }
   .labels :global(.tag) { position: absolute; z-index: 1; transform: translate(-50%, -140%); background: var(--bg); border: 1px solid var(--border); border-radius: 6px; padding: 1px 8px; font: .78rem var(--font-mono); max-width: 90%; text-align: center; }
   .labels :global(.tag.in) { animation: tag-in .4s ease both; }
   @keyframes tag-in { from { opacity: 0; transform: translate(-50%, -100%); } }
@@ -284,6 +353,10 @@ const { steps, colors } = Astro.props;
   .progress :global(i) { width: 18px; height: 5px; border-radius: 3px; background: var(--border); transition: background .3s, transform .3s; }
   .progress :global(i.done) { background: color-mix(in srgb, var(--accent) 55%, var(--border)); }
   .progress :global(i.now) { background: var(--accent); transform: scaleY(1.5); }
+  .flowbar { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; margin-top: 10px; }
+  .flowbar[hidden], .flowbar [hidden] { display: none; }
+  .seg { display: inline-flex; gap: 4px; }
+  .flowbar .btn[aria-pressed='true'] { background: var(--accent-soft); border-color: var(--accent); color: var(--text); font-weight: 600; }
   .count { margin-left: auto; color: var(--muted); font-size: .85rem; }
   .key { display: flex; align-items: center; gap: 8px; margin: 10px 0 0; color: var(--muted); font-size: .8rem; }
   .key line { stroke: var(--accent); stroke-width: 1.5; stroke-dasharray: 5 5; }

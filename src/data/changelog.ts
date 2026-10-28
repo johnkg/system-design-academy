@@ -3,6 +3,14 @@ export interface Change { date: string; title: string; items: { text: string; hr
 
 export const changelog: Change[] = [
   {
+    date: '2026-10-28',
+    title: 'Moving dots in the animations',
+    items: [
+      { text: 'In Load Balancing, Caching and the URL shortener case study, requests now stream along the lines as moving dots while you read each step. Pick 0.5×, 1× or 2×, or pause the motion.', href: 'concepts/load-balancing/' },
+      { text: '"Step by step" brings back the one-dot-per-step player. Your choice is remembered, and people who ask their device for reduced motion get the still version.' },
+    ],
+  },
+  {
     date: '2026-10-27',
     title: 'Three case studies from real companies',
     items: [
