@@ -60,13 +60,20 @@ const { steps, colors, flow = false } = Astro.props;
   const TRAVEL = 850; // ms for a message to cross the stage
   const AUTOPLAY_MS = 3000; // time on each step when playing
   const SELF_ARROW = 26; // px: length of the arrow drawn into an actor that messages itself
-  const PAD = 14; // px kept clear between two boxes
+  const PAD = 32; // px kept clear between two boxes: room for a label between boxes stacked one above the other
+  const PAD_NARROW = 44; // the same on a phone, where labels wrap to two lines
+  const NARROW = 520; // px: stage width up to which the phone layout is used
   const MAX_STAGE_HEIGHT = 1400; // px: the stage grows taller on a narrow screen, but never beyond this
   // The dot's flight as fractions of TRAVEL: it grows in, crosses, then pops on arrival; the receiver reacts just before it lands.
   const DOT = { start: 0.4, pop: 1.8, inEnd: 0.12, outStart: 0.88 }, STATE_AT = 0.9, PULSE_AT = 0.88;
   const STREAM_DOTS = 3; // dots in flight at once along each message in Flow mode
   const STREAM_GAP = 250; // ms of rest between one dot's landing and its next start
   const SPEEDS = [0.5, 1, 2];
+  const LANE = 26; // px between the lines of messages that join the same two boxes
+  const TAG_GAP = 3; // px kept clear around a label
+  const LIFTS = [0, ...Array.from({ length: 40 }, (_, i) => (i % 2 ? 1 : -1) * 10 * (Math.floor(i / 2) + 1))]; // px a label may move off its line, nearest first
+  const FREE_STEP = 8; // px between the spots tried when a label has nowhere to go near its line
+  const TAG_SPOTS = [0.5, 0.38, 0.62, 0.26, 0.74, 0.14, 0.86]; // where along its line a label may sit, in order of preference
   const SVG_NS = 'http://www.w3.org/2000/svg';
 
   document.querySelectorAll<HTMLElement>('[data-player]').forEach((root) => {
@@ -115,12 +122,19 @@ const { steps, colors, flow = false } = Astro.props;
       }
       return out;
     }
-    function line(a: string, b: string, cls: string) {
+    // offset slides the line sideways (px) so two messages between the same boxes, such as a request and its reply, do not lie on top of each other.
+    function line(a: string, b: string, cls: string, offset = 0) {
       const ca = box(actors.get(a)!), cb = box(actors.get(b)!);
       // A message from an actor to itself (a == b) has no direction: draw a short arrow coming down into the box from above.
       const self = a === b;
       const p1 = self ? { x: ca.x, y: ca.y - ca.h / 2 - SELF_ARROW } : edge(ca, cb);
       const p2 = self ? { x: ca.x, y: ca.y - ca.h / 2 } : edge(cb, ca);
+      if (offset && !self) {
+        // The normal is taken from the pair in a fixed order, so a message and its reply move to opposite sides.
+        const len = Math.hypot(cb.x - ca.x, cb.y - ca.y) || 1, sign = a <= b ? 1 : -1;
+        const nx = (-(cb.y - ca.y) / len) * sign * offset, ny = ((cb.x - ca.x) / len) * sign * offset;
+        p1.x += nx; p1.y += ny; p2.x += nx; p2.y += ny;
+      }
       const el = document.createElementNS(SVG_NS, 'line');
       el.setAttribute('x1', String(p1.x)); el.setAttribute('y1', String(p1.y));
       el.setAttribute('x2', String(p2.x)); el.setAttribute('y2', String(p2.y));
@@ -157,10 +171,13 @@ const { steps, colors, flow = false } = Astro.props;
       laidFor = width;
       stage.style.height = '';
       const entries = [...actors.entries()];
+      entries.forEach(([, el]) => { el.style.minWidth = ''; el.style.minHeight = ''; });
+      const gap = width <= NARROW ? PAD_NARROW : PAD;
       const wanted = entries.map(([id, el]) => ({ fx: parseFloat(el.dataset.x!) / 100, fy: parseFloat(el.dataset.y!) / 100, ...reserved(id, el) }));
-      const { pos, height } = spread(wanted, width, stage.getBoundingClientRect().height, { pad: PAD, top: SELF_ARROW + PAD, maxHeight: MAX_STAGE_HEIGHT });
+      const { pos, height } = spread(wanted, width, stage.getBoundingClientRect().height, { pad: gap, top: SELF_ARROW + gap, maxHeight: MAX_STAGE_HEIGHT });
       stage.style.height = `${height}px`;
-      entries.forEach(([, el], i) => { el.style.left = `${pos[i].x}px`; el.style.top = `${pos[i].y}px`; });
+      // A box keeps the size of its longest text, so changing its text never moves a label that was placed beside it.
+      entries.forEach(([, el], i) => { el.style.left = `${pos[i].x}px`; el.style.top = `${pos[i].y}px`; el.style.minWidth = `${wanted[i].w}px`; el.style.minHeight = `${wanted[i].h}px`; });
     }
 
     const at = (p: { x: number; y: number }, scale: number, opacity: number, offset: number) => ({
@@ -216,18 +233,58 @@ const { steps, colors, flow = false } = Astro.props;
       });
 
       // Messages: faint trail with arrowhead, label chip, and a dot that travels sender -> receiver.
-      messages.forEach((m) => {
-        const { p1, p2 } = line(m.from, m.to, motion ? 'trail draw' : 'trail');
+      const pair = (m: { from: string; to: string }) => [m.from, m.to].sort().join('>');
+      const lanes = new Map<string, number>(), used = new Map<string, number>();
+      messages.forEach((m) => lanes.set(pair(m), (lanes.get(pair(m)) ?? 0) + 1));
+      const drawn = messages.map((m) => {
+        const key = pair(m), index = used.get(key) ?? 0;
+        used.set(key, index + 1);
+        const offset = m.from === m.to ? 0 : (index - (lanes.get(key)! - 1) / 2) * LANE;
+        const { p1, p2 } = line(m.from, m.to, motion ? 'trail draw' : 'trail', offset);
         svg.lastElementChild!.setAttribute('marker-end', 'url(#sp-arrow)');
         if (motion) (svg.lastElementChild as SVGElement).style.animationDuration = `${travel}ms`;
         const tag = document.createElement('span');
         tag.className = motion ? 'tag in' : 'tag';
         tag.textContent = m.label;
-        tag.style.top = `${(p1.y + p2.y) / 2}px`;
         labels.appendChild(tag);
-        // Keep long labels inside the stage so they never cause horizontal page scroll.
-        const half = tag.offsetWidth / 2 + 2;
-        tag.style.left = `${Math.min(Math.max((p1.x + p2.x) / 2, half), Math.max(half, rect.width - half))}px`;
+        return { m, p1, p2, tag };
+      });
+      // Put each label where it touches neither a box nor another label: on its line first, then just above or below it.
+      type Rect = { l: number; t: number; r: number; b: number };
+      const area = (a: Rect, c: Rect) => Math.max(0, Math.min(a.r, c.r) - Math.max(a.l, c.l)) * Math.max(0, Math.min(a.b, c.b) - Math.max(a.t, c.t));
+      const taken: Rect[] = [...actors.values()].map((el) => { const b = box(el); return { l: b.x - b.w / 2 - TAG_GAP, t: b.y - b.h / 2 - TAG_GAP, r: b.x + b.w / 2 + TAG_GAP, b: b.y + b.h / 2 + TAG_GAP }; });
+      drawn.forEach(({ p1, p2, tag }) => {
+        const w = tag.offsetWidth + 2 * TAG_GAP, h = tag.offsetHeight + 2 * TAG_GAP;
+        const len = Math.hypot(p2.x - p1.x, p2.y - p1.y) || 1, nx = -(p2.y - p1.y) / len, ny = (p2.x - p1.x) / len;
+        let best = { x: (p1.x + p2.x) / 2, y: (p1.y + p2.y) / 2, cost: Infinity };
+        search: for (const lift of LIFTS) {
+          for (const at of TAG_SPOTS) {
+            // Inside the stage, so a long label never causes sideways scroll.
+            const x = Math.min(Math.max(p1.x + (p2.x - p1.x) * at + nx * lift, w / 2), Math.max(w / 2, rect.width - w / 2));
+            const y = Math.min(Math.max(p1.y + (p2.y - p1.y) * at + ny * lift, h / 2), Math.max(h / 2, rect.height - h / 2));
+            const me = { l: x - w / 2, t: y - h / 2, r: x + w / 2, b: y + h / 2 };
+            const cost = taken.reduce((sum, o) => sum + area(me, o), 0);
+            if (cost < best.cost) best = { x, y, cost };
+            if (!cost) break search;
+          }
+        }
+        // Still crowded: take the free spot nearest the middle of its line, anywhere in the stage.
+        if (best.cost) {
+          const mx = (p1.x + p2.x) / 2, my = (p1.y + p2.y) / 2;
+          let near = Infinity;
+          for (let y = h / 2; y <= Math.max(h / 2, rect.height - h / 2); y += FREE_STEP) {
+            for (let x = w / 2; x <= Math.max(w / 2, rect.width - w / 2); x += FREE_STEP) {
+              const d = Math.hypot(x - mx, y - my);
+              if (d >= near) continue;
+              const me = { l: x - w / 2, t: y - h / 2, r: x + w / 2, b: y + h / 2 };
+              if (taken.every((o) => !area(me, o))) { near = d; best = { x, y, cost: 0 }; }
+            }
+          }
+        }
+        tag.style.left = `${best.x}px`; tag.style.top = `${best.y}px`;
+        taken.push({ l: best.x - w / 2, t: best.y - h / 2, r: best.x + w / 2, b: best.y + h / 2 });
+      });
+      drawn.forEach(({ m, p1, p2 }) => {
         if (streaming) return stream(m.from, p1, p2, travel);
         if (!motion) return;
         const dot = document.createElement('i');
@@ -318,6 +375,8 @@ const { steps, colors, flow = false } = Astro.props;
     new ResizeObserver(() => { if (stage.clientWidth !== laidFor) render(false); }).observe(stage);
     syncBar();
     render(false);
+    // Text is wider once the web font has loaded, so lay everything out again then.
+    if (document.fonts && document.fonts.status !== 'loaded') document.fonts.ready.then(() => { laidFor = 0; render(false); });
   });
 </script>
 <style>
@@ -336,9 +395,9 @@ const { steps, colors, flow = false } = Astro.props;
   @keyframes fade-in { from { opacity: 0; } }
   @keyframes fade-out { to { opacity: 0; } }
   .labels :global(.dot.flow) { width: 12px; height: 12px; background: var(--dc, var(--accent)); box-shadow: 0 0 0 4px color-mix(in srgb, var(--dc, var(--accent)) 28%, transparent), 0 0 12px var(--dc, var(--accent)); }
-  .labels :global(.tag) { position: absolute; z-index: 1; transform: translate(-50%, -140%); background: var(--bg); border: 1px solid var(--border); border-radius: 6px; padding: 1px 8px; font: .78rem var(--font-mono); max-width: 90%; text-align: center; }
+  .labels :global(.tag) { position: absolute; z-index: 1; transform: translate(-50%, -50%); background: var(--bg); border: 1px solid var(--border); border-radius: 6px; padding: 1px 8px; font: .78rem var(--font-mono); width: max-content; max-width: min(60%, 300px); text-align: center; overflow-wrap: anywhere; }
   .labels :global(.tag.in) { animation: tag-in .4s ease both; }
-  @keyframes tag-in { from { opacity: 0; transform: translate(-50%, -100%); } }
+  @keyframes tag-in { from { opacity: 0; transform: translate(-50%, -30%); } }
   .labels :global(.dot) { position: absolute; left: 0; top: 0; width: 14px; height: 14px; border-radius: 50%; background: var(--accent); box-shadow: 0 0 0 4px color-mix(in srgb, var(--accent) 30%, transparent), 0 0 14px var(--accent); opacity: 0; will-change: transform; }
   .actor { position: absolute; transform: translate(-50%, -50%); width: max-content; min-width: 130px; max-width: 42%; text-align: center; padding: 8px 10px; border: 2px solid var(--c); border-radius: 10px; background: var(--surface); transition: box-shadow .35s, background .35s, opacity .35s; z-index: 1; }
   .actor.active { background: color-mix(in srgb, var(--c) 14%, var(--surface)); box-shadow: 0 0 0 4px color-mix(in srgb, var(--c) 28%, transparent); }
@@ -360,5 +419,5 @@ const { steps, colors, flow = false } = Astro.props;
   .count { margin-left: auto; color: var(--muted); font-size: .85rem; }
   .key { display: flex; align-items: center; gap: 8px; margin: 10px 0 0; color: var(--muted); font-size: .8rem; }
   .key line { stroke: var(--accent); stroke-width: 1.5; stroke-dasharray: 5 5; }
-  @media (max-width: 520px) { .stage { height: 340px; } .actor { min-width: 78px; max-width: 32%; font-size: .75rem; padding: 6px 6px; } .progress { order: 5; width: 100%; margin: 4px 0 0; } .progress :global(i) { flex: 1; } }
+  @media (max-width: 520px) { .stage { height: 340px; } .labels :global(.tag) { max-width: 50%; font-size: .72rem; } .actor { min-width: 78px; max-width: 32%; font-size: .75rem; padding: 6px 6px; } .progress { order: 5; width: 100%; margin: 4px 0 0; } .progress :global(i) { flex: 1; } }
 </style>
