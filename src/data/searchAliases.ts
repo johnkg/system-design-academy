@@ -54,4 +54,7 @@ export const aliasGroups: string[][] = [
   ['discord', 'cassandra', 'scylladb', 'hot partition', 'tombstone', 'request coalescing', 'chat history'],
   ['dropbox', 'magic pocket', 'erasure coding', 'append-only storage', 'blob store', 'cold storage'],
   ['figma', 'multiplayer', 'real-time collaboration', 'last writer wins', 'fractional indexing', 'operational transform'],
+  ['slack', 'job queue', 'kafka', 'kafkagate', 'jqrelay', 'background jobs', 'async jobs', 'redis out of memory'],
+  ['shopify', 'flash sale', 'black friday', 'pods', 'sorting hat', 'checkout queue', 'semian', 'toxiproxy', 'load testing'],
+  ['cloudflare', 'quicksilver', 'configuration distribution', 'lmdb', 'kyoto tycoon', 'edge config', 'negative lookup'],
 ];
