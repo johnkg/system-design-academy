@@ -1,0 +1,96 @@
+---
+import PlaygroundShell from '../../components/PlaygroundShell.astro';
+---
+<PlaygroundShell title="One flash sale, three ways to fail" hint="6,000 buyers arrive in one minute for 1,000 items. Change how checkout is protected and watch who is hurt, how long buyers wait and who gets an item. A small model with round numbers, not Shopify's system or data.">
+  <ol class="how" data-how></ol>
+  <div class="pg shf" data-shf>
+    <div class="pg-row">
+      <label>Datastores <select class="pg-in" data-iso><option value="shared">Shops share a shard</option><option value="pods">Isolated pods</option></select></label>
+      <label>Checkout protection <select class="pg-in" data-queue><option value="none">None, everyone at once</option><option value="random">Waiting page, random retries</option><option value="fair">Waiting page, earliest first</option></select></label>
+      <label>Session store <select class="pg-in" data-dep><option value="ok">Healthy</option><option value="slow">Slow, no guard</option><option value="guard">Slow, with fallback and limit</option></select></label>
+      <label>Buyers who arrive in one minute <input type="range" min="1000" max="12000" step="1000" value="6000" data-b /> <b data-bval></b></label>
+      <label>Items for sale <input type="range" min="100" max="3000" step="100" value="1000" data-s /> <b data-sval></b></label>
+      <label>Checkouts the app can take per 5 seconds <input type="range" min="50" max="1000" step="50" value="200" data-l /> <b data-lval></b></label>
+      <label>Session store timeout (seconds) <input type="range" min="1" max="10" value="5" data-t /> <b data-tval></b></label>
+      <button type="button" class="btn" data-reset>Reset</button>
+    </div>
+    <div class="pg-grid">
+      <div class="pg-box" data-b1><h3>Load on checkout</h3><span class="pg-mono" data-o1></span><span class="pg-note" data-n1></span></div>
+      <div class="pg-box" data-b2><h3>Other shops hurt</h3><span class="pg-mono" data-o2></span><span class="pg-note" data-n2></span></div>
+      <div class="pg-box" data-b3><h3>Longest wait</h3><span class="pg-mono" data-o3></span><span class="pg-note" data-n3></span></div>
+      <div class="pg-box" data-b4><h3>Earliest arrivals who got an item</h3><span class="pg-mono" data-o4></span><span class="pg-note" data-n4></span></div>
+    </div>
+    <p class="pg-out" data-verdict aria-live="polite"></p>
+    <p class="pg-note">Model: buyers arrive evenly over 60 seconds. Checkout can take a set number of buyers per 5 second period, the leaky bucket idea from Shopify's 2017 post. With no protection, all arrivals hit checkout and the load is arrivals per period divided by what it can take. With a waiting page, the rest wait and each period the bucket admits buyers: random picks any waiting buyer, earliest first picks the oldest arrival, which stands in for Shopify's signed arrival time cookie and threshold. A slow session store with no guard makes every checkout wait for the timeout on top of a half second of work, so the app takes fewer buyers per period. With a fallback (guest checkout) and a limit on workers, calls fail fast and checkout keeps its full rate. Each admitted buyer takes an item until none are left. With shared shards, a shard-mate count of 99 stands for the other shops on the same shard; the real number is not given here. Shuffles use a fixed seed so results repeat.</p>
+  </div>
+</PlaygroundShell>
+<script>
+  document.querySelectorAll<HTMLElement>('[data-shf]').forEach((root) => {
+    const q = <T extends HTMLElement>(s: string) => root.querySelector<T>(s)!;
+    const PERIOD_S = 5; // leaky bucket period (Shopify, 2017)
+    const ARRIVE_S = 60; // buyers arrive over one minute
+    const ARRIVE_PERIODS = ARRIVE_S / PERIOD_S;
+    const BASE_S = 0.5; // checkout work per buyer without any wait on the session store
+    const SHARD_MATES = 99; // other shops on the same shard in this model
+    const MAX_PERIODS = 5000;
+    const DEFAULTS: Record<string, string> = { iso: 'shared', queue: 'none', dep: 'ok', b: '6000', s: '1000', l: '200', t: '5' };
+    const fmt = (n: number) => Math.round(n).toLocaleString('en-US');
+    const input = (k: string) => q<HTMLInputElement>(`[data-${k}]`);
+    const sel = (k: string) => q<HTMLSelectElement>(`[data-${k}]`).value;
+    const mins = (s: number) => (s >= 120 ? `${(s / 60).toFixed(1)} min` : `${fmt(s)} s`);
+    function rng(seed: number) { // small seeded random number generator
+      return () => { seed = (seed + 0x6d2b79f5) | 0; let t = Math.imul(seed ^ (seed >>> 15), 1 | seed); t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t; return ((t ^ (t >>> 14)) >>> 0) / 4294967296; };
+    }
+    function run(mode: string, buyers: number, stock: number, rate: number) {
+      const arrive = Array.from({ length: buyers }, (_, i) => Math.floor((i * ARRIVE_PERIODS) / buyers));
+      const passAt = new Array<number>(buyers).fill(-1);
+      const rand = rng(7);
+      let next = 0; const pool: number[] = []; let left = buyers; let period = 0;
+      while (left > 0 && period < MAX_PERIODS) {
+        while (next < buyers && arrive[next] <= period) pool.push(next++);
+        const take = Math.min(rate, pool.length);
+        if (mode === 'random') { for (let k = 0; k < take; k++) { const j = k + Math.floor(rand() * (pool.length - k)); [pool[k], pool[j]] = [pool[j], pool[k]]; } }
+        pool.splice(0, take).forEach((b) => (passAt[b] = period));
+        left -= take; period++;
+      }
+      const waits = passAt.map((p, i) => (p - arrive[i]) * PERIOD_S);
+      const firstGroup = Math.min(stock, buyers);
+      const winners = passAt.map((p, i) => ({ p, i })).sort((a, b) => a.p - b.p || a.i - b.i).slice(0, stock);
+      const early = winners.filter((w) => w.i < firstGroup).length;
+      return { longest: Math.max(...waits), early: (100 * early) / firstGroup };
+    }
+    function draw() {
+      const iso = sel('iso'); const queue = sel('queue'); const dep = sel('dep');
+      const buyers = Number(input('b').value); const stock = Number(input('s').value); const limit = Number(input('l').value); const timeout = Number(input('t').value);
+      q('[data-bval]').textContent = fmt(buyers); q('[data-sval]').textContent = fmt(stock); q('[data-lval]').textContent = fmt(limit); q('[data-tval]').textContent = String(timeout);
+      const rate = Math.max(1, Math.floor(dep === 'slow' ? (limit * BASE_S) / (BASE_S + timeout) : limit)); // checkouts per period
+      const arrivals = buyers / ARRIVE_PERIODS; // buyers per period
+      const load = queue === 'none' ? (100 * arrivals) / rate : Math.min(100, (100 * arrivals) / rate);
+      const overloaded = queue === 'none' && load > 100;
+      const res = queue === 'none' ? null : run(queue, buyers, stock, rate);
+      q('[data-o1]').textContent = `${fmt(load)}% of what checkout can take`;
+      q('[data-n1]').textContent = queue === 'none' ? `${fmt(arrivals)} buyers per period against ${fmt(rate)} checkouts per period` : `at most ${fmt(rate)} buyers per 5 seconds reach checkout; the rest wait`;
+      q('[data-o2]').textContent = overloaded ? (iso === 'shared' ? `${SHARD_MATES} shops` : '0 shops') : '0 shops';
+      q('[data-n2]').textContent = overloaded ? (iso === 'shared' ? 'shops on the same shard go down with it, and so do actions that loop over every shard' : 'the overloaded pod stays down, but other pods keep serving') : 'checkout is not overloaded, so nobody else is hurt';
+      q('[data-o3]').textContent = res ? mins(res.longest) : 'no queue';
+      q('[data-n3]').textContent = res ? (dep === 'slow' ? `the slow store cuts checkout to ${fmt(rate)} per period` : 'time from arriving to getting into checkout') : 'buyers are not held back, they overload checkout instead';
+      q('[data-o4]').textContent = res ? `${fmt(res.early)}%` : 'not measured';
+      q('[data-n4]').textContent = res ? `of the first ${fmt(Math.min(stock, buyers))} buyers to arrive` : 'needs a waiting page to measure';
+      const bad = [overloaded, overloaded && iso === 'shared', !!res && res.longest > 600, !!res && res.early < 90];
+      ['b1', 'b2', 'b3', 'b4'].forEach((b, i) => q<HTMLElement>(`[data-${b}]`).style.setProperty('--c', bad[i] ? 'var(--bad)' : 'var(--good)'));
+      const out = q('[data-verdict]'); out.classList.toggle('bad', bad.some(Boolean));
+      if (overloaded) out.textContent = `Checkout gets ${fmt(load)}% of what it can take. ${iso === 'shared' ? `The ${SHARD_MATES} other shops on the shard go down too. Move to isolated pods to keep them up.` : 'Other pods keep serving, but this shop is down. Add a waiting page to protect checkout.'}`;
+      else if (res && res.longest > 600) out.textContent = `Checkout is protected, but the last buyer waits ${mins(res.longest)}. ${dep === 'slow' ? 'The slow session store is cutting checkout capacity. Add a fallback and a worker limit.' : 'Raise what checkout can take or accept long waits.'}`;
+      else if (res && res.early < 90) out.textContent = `Checkout is protected and waits are short, but only ${fmt(res.early)}% of the earliest ${fmt(Math.min(stock, buyers))} buyers got an item. Random retries are a lottery. Serve earliest arrivals first.`;
+      else if (res) out.textContent = `Checkout is protected: the longest wait is ${mins(res.longest)} and ${fmt(res.early)}% of the earliest buyers got an item.`;
+      else out.textContent = 'Nothing is overloaded at this size.';
+    }
+    ['change', 'input'].forEach((e) => root.addEventListener(e, draw));
+    q('[data-reset]').addEventListener('click', () => {
+      ['iso', 'queue', 'dep'].forEach((k) => (q<HTMLSelectElement>(`[data-${k}]`).value = DEFAULTS[k]));
+      ['b', 's', 'l', 't'].forEach((k) => (input(k).value = DEFAULTS[k]));
+      draw();
+    });
+    draw();
+  });
+</script>
