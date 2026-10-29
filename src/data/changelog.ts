@@ -11,7 +11,7 @@ export const changelog: Change[] = [
       { text: 'Search: results are marked as concept, pattern or case study, with counts for each, and a few ideas to try before you type.', href: 'search/' },
       { text: 'Compare: switch between design patterns and system design concepts with one control, and numbered sections.', href: 'compare/' },
       { text: 'The three coloured logos in the header are now one menu labelled "Code in", so it is clear that it chooses the language of every code sample.' },
-      { text: 'In 12 lessons (Load Balancing, Caching, DNS, Circuit Breaker, CDN, Rate Limiting, Message Queues and five case studies including the URL shortener and chat system), requests now stream along the lines as moving dots while you read each step. Pick 0.5×, 1× or 2×, or pause the motion.', href: 'concepts/load-balancing/' },
+      { text: 'In every animated lesson, requests now stream along the lines as moving dots while you read each step. Pick 0.5×, 1× or 2×, or pause the motion.', href: 'concepts/load-balancing/' },
       { text: '"Step by step" brings back the one-dot-per-step player. Your choice is remembered, and people who ask their device for reduced motion get the still version.' },
     ],
   },
