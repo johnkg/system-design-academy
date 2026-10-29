@@ -1,0 +1,579 @@
+{
+  "name": "How Cloudflare Distributes Configuration with Quicksilver",
+  "difficulty": "advanced",
+  "intent": "Follow how Cloudflare gets configuration changes to servers in every data center within seconds: why it left Kyoto Tycoon, how a numbered log keeps replicas correct, and how Quicksilver later stopped storing everything everywhere, using only what Cloudflare has published.",
+  "codeTitle": "a numbered log, versions as of an index, and a window of recent updates",
+  "finalIntro": "One cache miss on an edge server in Quicksilver v2, from the cache in the data center to a replica that keeps older versions.",
+  "prompt": "Every time a Cloudflare customer changes a DNS record, adds a Worker, or edits any of hundreds of other settings, the change must reach the servers that answer Internet requests. Cloudflare's 2020 post says it distributes such changes to 200 cities in 90 countries within seconds, and that servers read this configuration while handling requests, so the store has to be fast and very reliable. How can a key-value store (a database that looks up a value by its key) do that? This study follows Cloudflare's three engineering posts, which are listed at the end, in a teaching order and not exactly the order they were written. Cloudflare's numbers are named with the post that gives them. The code samples are small models for learning, not Cloudflare's code or data.",
+  "functional": [
+    "Take a configuration change made centrally and make it visible on servers in every data center, in the order it was made",
+    "Answer reads on the edge servers without any request to a central place, so a data center cut off from the centre can still serve traffic",
+    "Catch up a server that was offline, or that missed an update, without a person copying databases by hand",
+    "Let services keep relying on one rule: if key A was written before key B, nobody reads B and then fails to find A (Cloudflare calls this sequential consistency)",
+    "Let a new version of the software be rolled out without downtime"
+  ],
+  "nonFunctional": [
+    "Speed of change: the 2020 post says changes reach 200 cities in 90 countries within seconds",
+    "Very fast reads: the 2025 post says 90% of requests are answered in under 1 ms and 99.9% in under 7 ms",
+    "Scale of reads: 2.5 trillion reads and 30 million writes a day in 2020, and over three billion keys a second in 2025",
+    "Growth of the data: about 100 million key-value pairs in 2015, over a billion in 2019 (2020 post), and over five billion pairs with a combined size of 1.6 TB in 2025 (2025 post)",
+    "Disk space on each server is limited, because the 2025 post notes that the more Quicksilver stores, the less room is left for caching content",
+    "Safe to run: replication that cannot silently drop an update, a store that survives crashes, and a way to see how far behind each server is"
+  ],
+  "firstAttempt": {
+    "text": "Do what Cloudflare did at first: run a general key-value server called Kyoto Tycoon (KT) on thousands of machines. Cloudflare's central web services write values to a few root nodes, the root nodes pass them to management nodes in every data center, and each server eventually gets its own copy from a management node in its data center. Every DNS or HTTP request reads from KT on the machine, and each TLS handshake (the start of an encrypted connection) loads certificates from it.",
+    "limits": [
+      "Writes slow down reads. Cloudflare measured reads of 20 tiny keys in a loop: with no writer the 99th percentile (the level that 99% of reads beat) was 9 ms, with one writer adding 40 kB values it was 154 ms, and with two writers the 99.9th percentile passed one second. Its code review found a lock taken while data is flushed to disk",
+      "Turning off the flush to disk (fsync) on every write made it faster but allowed corruption after a crash. On the largest databases, repair took a very long time or never finished, so staff copied healthy databases by hand. Cloudflare says corruption happened multiple times a day across thousands of servers",
+      "Replication followed a timestamp only. If a log entry was dropped and nobody noticed, the timestamp moved on and the entry was never replayed, so a copy could be quietly wrong. After a crash, days of old log could be replayed and old values could show up again",
+      "A database file could be opened by only one process, and stopping KT often took over 15 minutes, so upgrades had to wait for the quarterly 'CDN Release' (a full upgrade of a server's software, down to the kernel, after traffic is moved away). It also had no automatic failover for its top root node, and Cloudflare says keeping it running consumed 48 hours a week of its site reliability engineers' (SRE) time at one point"
+    ]
+  },
+  "nodes": [
+    {
+      "id": "api",
+      "label": "Central services and API",
+      "kind": "client",
+      "x": 8,
+      "y": 50
+    },
+    {
+      "id": "root",
+      "label": "Root nodes",
+      "kind": "data",
+      "x": 29,
+      "y": 50
+    },
+    {
+      "id": "dc",
+      "label": "Data center nodes",
+      "kind": "data",
+      "x": 50,
+      "y": 50
+    },
+    {
+      "id": "edge",
+      "label": "Edge servers (leaf nodes)",
+      "kind": "edge",
+      "x": 71,
+      "y": 50
+    },
+    {
+      "id": "lmdb",
+      "label": "Local store (LMDB)",
+      "kind": "data",
+      "x": 71,
+      "y": 16,
+      "at": 1
+    },
+    {
+      "id": "log",
+      "label": "Numbered log of changes",
+      "kind": "data",
+      "x": 29,
+      "y": 16,
+      "at": 2
+    },
+    {
+      "id": "heartbeat",
+      "label": "Heartbeat and lag monitor",
+      "kind": "async",
+      "x": 50,
+      "y": 16,
+      "at": 3
+    },
+    {
+      "id": "replica",
+      "label": "Replicas (full dataset)",
+      "kind": "data",
+      "x": 92,
+      "y": 50,
+      "at": 4
+    },
+    {
+      "id": "mvcc",
+      "label": "Older versions and recent window",
+      "kind": "data",
+      "x": 92,
+      "y": 16,
+      "at": 5
+    },
+    {
+      "id": "oracle",
+      "label": "Network Oracle (gossip)",
+      "kind": "async",
+      "x": 92,
+      "y": 84,
+      "at": 6
+    },
+    {
+      "id": "relay",
+      "label": "Relays",
+      "kind": "compute",
+      "x": 71,
+      "y": 84,
+      "at": 7
+    },
+    {
+      "id": "shards",
+      "label": "Sharded cache in the data center",
+      "kind": "data",
+      "x": 50,
+      "y": 84,
+      "at": 7
+    }
+  ],
+  "edges": [
+    {
+      "from": "api",
+      "to": "root"
+    },
+    {
+      "from": "root",
+      "to": "dc"
+    },
+    {
+      "from": "dc",
+      "to": "edge"
+    },
+    {
+      "from": "edge",
+      "to": "lmdb",
+      "at": 1
+    },
+    {
+      "from": "root",
+      "to": "log",
+      "at": 2
+    },
+    {
+      "from": "log",
+      "to": "dc",
+      "at": 2
+    },
+    {
+      "from": "root",
+      "to": "heartbeat",
+      "at": 3
+    },
+    {
+      "from": "heartbeat",
+      "to": "edge",
+      "at": 3
+    },
+    {
+      "from": "edge",
+      "to": "replica",
+      "at": 4,
+      "until": 7
+    },
+    {
+      "from": "replica",
+      "to": "mvcc",
+      "at": 5
+    },
+    {
+      "from": "oracle",
+      "to": "edge",
+      "at": 6
+    },
+    {
+      "from": "oracle",
+      "to": "replica",
+      "at": 6
+    },
+    {
+      "from": "edge",
+      "to": "relay",
+      "at": 7
+    },
+    {
+      "from": "edge",
+      "to": "shards",
+      "at": 7
+    },
+    {
+      "from": "relay",
+      "to": "shards",
+      "at": 7
+    },
+    {
+      "from": "relay",
+      "to": "replica",
+      "at": 7
+    }
+  ],
+  "steps": [
+    {
+      "title": "Replace Kyoto Tycoon with a store built for many reads and few writes (LMDB)",
+      "problem": "Reads were on the critical path of almost every Cloudflare service, and KT let writes and disk flushes slow them down. Starting a new machine was also slow: replication is a slow way to fill an empty database, and KT had to be shut down before it could be snapshotted (a snapshot is a copy of the data at one moment).",
+      "fix": "The 2020 post says the project began in the summer of 2015, after KT had no maintainer (its last update was April 2012) and about 100,000 lines of C++. Cloudflare built its own replicated key-value store and named it Quicksilver. For storage it chose LMDB (a small database library that other programs link in) 'after extensive analysis'. Cloudflare gives these reasons. LMDB can take a consistent snapshot while running without hurting readers, so a new machine can start from a snapshot and use replication only to catch up. It is built for fast reads, which fits tens of millions of reads a second and rare changes. Several processes can use the same database at once, with no exclusive write lock. And it only appends and never writes data in a state that counts as corrupted, so after a crash it restarts without repair tools. The post says that for the DNS service, the 99th percentile of reads dropped by two orders of magnitude, and that LMDB had run in production for over three years with one bug and no data corruption, on over 90,000 database instances.",
+      "tradeoff": "LMDB is tuned for reads, so heavy writing is its weak side. The post says big values need one continuous region of disk, so as disks fill, finding room can take minutes. Compaction (rewriting the database) helps for about two months, so Cloudflare began splitting the log into page-sized chunks and added a checksum on every key-value pair to catch bugs in that code. The team says it normally prefers quality over defensive checks, but database consistency mattered too much to argue.",
+      "concepts": [
+        {
+          "slug": "write-ahead-log"
+        },
+        {
+          "slug": "lsm-trees-vs-b-trees"
+        },
+        {
+          "slug": "caching"
+        }
+      ]
+    },
+    {
+      "title": "Copy changes with a numbered log, so a missing entry is always noticed",
+      "problem": "A network can break, or a machine can be down for just long enough to miss an update. Yet when someone changes their configuration, the change has to arrive correctly whatever the state of the network. KT's timestamp-only protocol could lose entries silently.",
+      "fix": "Cloudflare uses a log of changes with a sequence number that always goes up by one, such as '0023 SET hello world', '0024 SET lorem ipsum', '0025 DEL 42'. A receiver can check that each entry is exactly one higher than the last it applied; if not, it knows something is missing. The post says this is simple because Quicksilver does not need writes anywhere in the world, only reads: writes are rare, so one data center can be elected to collect them and keep the counter in order. Further safety checks follow from mistakes the team thought of. Each database has a unique ID that must be given when replication starts, so the DNS database cannot be fed Page Rules changes. Each process has a random ID, so a node cannot replicate from itself. Log entries carry an incremental hash that helps show a message was not lost or put in the wrong order. To stop replication from using up disk speed, all updates in a 500 ms window are committed in one write, which the post says made highly durable writes manageable. The log is stored in the same LMDB database as the data, so an update and its log entry are committed together.",
+      "tradeoff": "A single place that numbers all writes makes the order easy to reason about, but it is a deliberate limit: this design suits data that is read much more than written. Keeping the log inside the database is simpler, but it added to the fragmentation problem in step 1. Each log entry is also bigger than the value it represents, so Cloudflare compresses entries with Snappy and cleans up old ones, keeping only what replication needs.",
+      "concepts": [
+        {
+          "slug": "write-ahead-log"
+        },
+        {
+          "slug": "database-replication"
+        },
+        {
+          "slug": "idempotency"
+        },
+        {
+          "slug": "ordering-and-partitioning"
+        }
+      ]
+    },
+    {
+      "title": "Spread the log through a tree, with long history for stragglers and a heartbeat to watch lag",
+      "problem": "Thousands of machines cannot all ask one place for updates, and machines that were down for a while still need to catch up. Replication that has quietly fallen behind is also hard to see, because a server keeps working while its changes are not taking effect.",
+      "fix": "Cloudflare chose a fan-out: nodes ask main nodes, who ask top mains, for the newest entries. The 2025 post names the roles: root nodes (dozens of servers with terabytes of storage in a few large core data centers), intermediate nodes that copy from other intermediates or from the roots, and leaf nodes that serve end-user traffic. Every server runs 10 Quicksilver instances, which are independent databases used by services such as DNS, the CDN or the WAF (web application firewall). Each instance has a list of primary and secondary sources and tries a primary, often a nearby Quicksilver node, first. If a machine's database is too old for that source's log, the secondary mains keep a much longer history so a machine can be offline for a full week and still be brought up to date on start. For monitoring, the post says availability is easy to see because many alerts fire at once, but replication lag is harder. So Cloudflare writes a heartbeat at the top of the replication tree and every server computes how long it took to arrive. Metrics use Prometheus and Grafana, with a global view, one view per data center and one per server.",
+      "tradeoff": "A tree gives scale and lets a leaf copy from a node near it. In this study's reading, an update takes several hops and each hop can lag by a different amount, so lag has to be measured, which is what the heartbeat does. Longer history costs disk space, and the post says it is the secondary mains that keep it (this study's reading: that is the cost of letting machines be offline for a week).",
+      "concepts": [
+        {
+          "slug": "database-replication"
+        },
+        {
+          "slug": "gossip-protocol"
+        },
+        {
+          "slug": "metrics"
+        },
+        {
+          "slug": "alerting"
+        }
+      ]
+    },
+    {
+      "title": "Keep a cache, not a full copy, on most servers, with some servers holding everything (v1.5)",
+      "problem": "Every server held a full copy of every dataset, so data used in one region was stored everywhere. Cloudflare's 2025 post says this became expensive as the number of data centers and the dataset grew, and that more disk used by Quicksilver means less disk left for content caching.",
+      "fix": "The 2025 posts describe an interim design, Quicksilver v1.5, with two roles. A replica keeps the full dataset. A proxy keeps a persistent cache and asks a replica when a key is not in it. On each server, about half of the 10 instances became proxies and half replicas, so that every data center still has at least one replica. Before building it, Cloudflare checked whether a cache could be small. It sent accessed keys from across the network to ClickHouse and estimated that about 20% of the keys were in use in large data centers and about 1% in small ones. The cache is kept on disk, in RocksDB, because memory is too small for billions of keys and a restart must not leave the cache cold. The cache removes the least recently used data through a RocksDB compaction filter (a hook that runs while the database tidies its files) once free disk drops below a soft limit. Below a harder limit, the proxy stops adding new keys. The post says the 99.9th percentile latency of a proxy and a replica was hard to tell apart.",
+      "tradeoff": "The 2025 part 2 post is frank about its limits. Cloudflare says the split of instances between the two roles became unbalanced as teams changed how they used Quicksilver, that the working-set estimate (made from keys used in three days) was 'wildly off' for some instances, and that cutting disk use by as much as 40% did not fix scaling, since the number of keys kept growing and disk ran low again in about two years.",
+      "concepts": [
+        {
+          "slug": "caching"
+        },
+        {
+          "slug": "load-balancing"
+        },
+        {
+          "slug": "service-discovery"
+        }
+      ]
+    },
+    {
+      "title": "Make the reads from a replica match a copy that is slightly behind (versions and a recent window)",
+      "problem": "Replication is asynchronous, so a proxy and the replicas can be at different log indexes. Cloudflare's 2025 post says that if a proxy asks replicas at different positions, it can read keys in an order that never happened, and that Quicksilver has always promised that if A was written before B, nobody can read B without A. Many teams rely on it, so changing it would break them.",
+      "fix": "When the replica is ahead of the proxy, it keeps old versions. This is multiversion concurrency control (MVCC), where a database keeps several versions of a key so readers get a consistent view without locks. The replica stores overwritten values in a separate RocksDB column family (a named group of keys) together with the log index they were written at. A request carries the proxy's index. The replica returns the current value if it was written at or before that index. Otherwise it scans the older versions, and answers 'not found' if there are none. Deletes leave a special marker called a tombstone, so a gap between a delete and a rewrite is recorded. History is cleaned up after two hours, which the post says is more than enough and costs only about 500 MB. When the replica is behind the proxy, the post says the first version simply returned an error, and the metrics showed this would not work. Only recently updated keys are affected, so the proxy fixes it itself: it keeps a sliding window of all recent updates that cannot be evicted until they leave the window, with the window defined by a lower and an upper pointer that move together when a new update arrives.",
+      "tradeoff": "Versions and a window keep the old promise without locking servers together, which would hurt the tree's speed. The price is extra storage and extra code in a path that must be fast, and a few reads must go to a replica that can answer 'as of' an earlier index. Items in the window cannot be evicted until they leave it, so the window takes some space that eviction cannot reclaim.",
+      "concepts": [
+        {
+          "slug": "mvcc-and-isolation-levels"
+        },
+        {
+          "slug": "consistency-models"
+        },
+        {
+          "slug": "logical-clocks"
+        }
+      ]
+    },
+    {
+      "title": "Make 'this key does not exist' answers cheap, and let servers find replicas by themselves",
+      "problem": "The 2025 part 1 post says that Quicksilver workloads see about ten times more lookups for keys that do not exist than for keys that do. On a proxy, each of these would be a cache miss that travels to a replica, which could overload replicas and the data center network. Also, proxies need to find replicas, including those in other nearby data centers, as machines come and go.",
+      "fix": "In version 1, a Bloom filter (a compact structure that can say a key is definitely absent or possibly present) in RocksDB serves 99% of such lookups from memory. For proxies Cloudflare considered caching the 'not found' answers, but the set of missing keys was far larger than the real set (by a thousand times for some instances) and these cached answers would skip the fast filters. It also tried Cuckoo filters, but for 5 billion keys the post says one with a false-positive rate similar to a Bloom filter needs about 18 GB against 6 GB. It chose key and value separation: a proxy stores all keys but keeps values only for cached keys, and evicting a key drops only its value. The post says that all keys together are about 11 times smaller than the whole dataset, and that the Bloom filter stays in use. For discovery, each data center runs its own Consul cluster, so one DNS request returns its replicas. For other data centers, Cloudflare uses the Network Oracle, an overlay of intermediate nodes that gossip about their status and measure round-trip time to each other. This replaced a statically configured replication tree and lets replication organise and repair itself. Proxies keep connections to several replicas, spread requests, and deprioritise ones that look unhealthy.",
+      "tradeoff": "Storing every key costs disk on every proxy, but much less than storing values. The post chooses it because it keeps a fast, simple check and allows range queries to be optimised, and adds that Cloudflare may revisit it. Gossip means constant messages and probes, so Cloudflare keeps the overlay to intermediate nodes only. The post says that adding every machine running Quicksilver would be inefficient, with more network traffic and slower message delivery.",
+      "concepts": [
+        {
+          "slug": "probabilistic-data-structures"
+        },
+        {
+          "slug": "gossip-protocol"
+        },
+        {
+          "slug": "service-discovery"
+        },
+        {
+          "slug": "load-balancing"
+        }
+      ]
+    },
+    {
+      "title": "Quicksilver v2: three levels, relays, prefetching and a cache sharded within each data center",
+      "problem": "Cloudflare's 2025 part 2 post says the team found that many key-value pairs were almost never used, such as old keys, keys used only in some places, and a domain or script that is never requested. Storing them on every server was waste, but some instances (one called dnsv2, which serves DNS queries) needed an even higher hit rate, because several lookups can be needed for a single DNS query and delays add up.",
+      "fix": "Apart from a handful of storage servers with large disks, servers now hold only a cache. Level 1 is the local cache on each server. Level 2 is a cache shared across the data center. Level 3 is the replicas on storage nodes, which hold the full dataset and are queried only for cold keys. Because too many direct connections to the storage nodes were a worry, a few servers per data center act as relays and keep those connections. Then cache hit rates were improved in two steps. First, relays publish every resolved miss and all servers in the data center subscribe and store it (reactive prefetching). Cloudflare found that a key missed on one server is likely to be missed on another soon. It also tried predicting which keys would be requested, with no improvement, and dropped the idea. This took the worst instance to about 99.9%. Second, for dnsv2 Cloudflare reintroduced sharding, but of the cache rather than the data. Key hashes are divided by range into 1024 logical shards, which are divided by range into physical shards, one per server, chosen from the server's hostname. A key that belongs to a server's shard is kept longer there. A miss goes to the local cache, then the data center's cache shard, and only then a storage node. Doubling the number of shards gives each server a subset of its old shard, so no cache has to be moved. Cache shards do not store old versions, since a read can always fall back to a replica when the shard's version is too new. The result, the post says, is a combined level 1 and 2 hit rate of over 99.99% for the worst instance and over 99.999% for the rest.",
+      "tradeoff": "A cache can leave things out, so it can skip corner cases that make sharding a full dataset hard. A cache also adapts to what is used and keeps locality. The costs are an extra hop on a miss, more moving parts (relays, a stream of resolved misses, shard assignment) and a read of the cold keys that is slower, since they live only on a few storage nodes. The post closes on method: the move took several years, covered hundreds of thousands of live databases, was invisible to customers, and was done in small, reversible steps.",
+      "concepts": [
+        {
+          "slug": "caching"
+        },
+        {
+          "slug": "consistent-hashing"
+        },
+        {
+          "slug": "database-sharding"
+        },
+        {
+          "slug": "pub-sub"
+        }
+      ]
+    }
+  ],
+  "failures": [
+    {
+      "scenario": "A server is offline for days, or misses a few updates",
+      "impact": "Its copy of the configuration is out of date, and if the missing update is not noticed, it is silently wrong.",
+      "answer": "Each log entry has a number one higher than the last, so a gap is visible. The server asks again from its last applied index. Secondary mains keep a longer history, so a machine can be offline for a full week and still catch up on start. New machines can start from a snapshot, because LMDB can take one while running, and then use replication only to catch up.",
+      "concepts": [
+        {
+          "slug": "write-ahead-log"
+        },
+        {
+          "slug": "database-replication"
+        }
+      ]
+    },
+    {
+      "scenario": "A process crashes, or a machine loses power, in the middle of a write",
+      "impact": "With KT and its flush turned off, the database could be corrupted, and repair on the largest databases could take very long or never finish.",
+      "answer": "LMDB only appends and never writes data in a state that counts as corrupted, so after any termination it can be restarted without recovery tools. Cloudflare reports one bug and no data corruption in over three years on over 90,000 instances. It also keeps a checksum for each key-value pair to catch bugs in the fragmenting code.",
+      "concepts": [
+        {
+          "slug": "write-ahead-log"
+        }
+      ]
+    },
+    {
+      "scenario": "A database is wired to the wrong source, or a node is told to replicate from itself",
+      "impact": "Another database's changes could be written into it, for example Page Rules data landing in the DNS database.",
+      "answer": "Replication starts with a handshake that carries a database ID, which must match, and a random process ID, which must differ between client and main. A mismatch stops replication before any data moves.",
+      "concepts": [
+        {
+          "slug": "database-replication"
+        }
+      ]
+    },
+    {
+      "scenario": "Replication is slow, so changes are not taking effect, but nothing seems to be down",
+      "impact": "A customer's change does not reach all servers within seconds, yet no availability alert fires.",
+      "answer": "Cloudflare writes a heartbeat at the top of the replication tree and every server computes the delay when it arrives, shown on global, per-data-center and per-server dashboards, with alerts through Prometheus and PagerDuty.",
+      "concepts": [
+        {
+          "slug": "metrics"
+        },
+        {
+          "slug": "alerting"
+        },
+        {
+          "slug": "slos-and-error-budgets"
+        }
+      ]
+    },
+    {
+      "scenario": "A proxy has seen more updates than the replica it asks, or fewer",
+      "impact": "Reads can show an order of changes that never existed, which breaks the promise that if A was written before B, B is never visible without A.",
+      "answer": "When the replica is ahead, it answers 'as of' the proxy's index using older versions kept for two hours. When the replica is behind, the proxy keeps a window of its latest updates and does not ask for them. Cache shards simply let the relay fall back to a replica when their version is too new.",
+      "concepts": [
+        {
+          "slug": "mvcc-and-isolation-levels"
+        },
+        {
+          "slug": "consistency-models"
+        }
+      ]
+    },
+    {
+      "scenario": "A proxy's disk fills up faster than its cache can evict",
+      "impact": "Disk on an edge server is shared with other work such as content caching, so Quicksilver must not use it all (this study's reading of the post's wish to keep proxies stable).",
+      "answer": "Eviction starts at a soft limit of free space. Below a harder, critical limit, the proxy temporarily stops adding new keys to its cache. Cloudflare says this hurts performance but keeps proxies stable during a surge of requests.",
+      "concepts": [
+        {
+          "slug": "caching"
+        },
+        {
+          "slug": "backpressure"
+        },
+        {
+          "slug": "graceful-degradation"
+        }
+      ]
+    },
+    {
+      "scenario": "Thousands of servers send every cache miss straight to the few storage nodes",
+      "impact": "The storage nodes could be overwhelmed by connections and requests.",
+      "answer": "A few servers per data center are elected as relays and keep the connections to the replicas. All proxies in the data center discover and use the relays, and the sharded cache answers most misses before they reach a storage node.",
+      "concepts": [
+        {
+          "slug": "load-balancing"
+        },
+        {
+          "slug": "service-discovery"
+        }
+      ]
+    }
+  ],
+  "alternatives": [
+    {
+      "title": "How to answer lookups for keys that do not exist on a proxy",
+      "options": [
+        {
+          "name": "Cache the 'not found' answers",
+          "pro": "Simple idea, and a repeated miss is answered locally",
+          "con": "Cloudflare found the set of missing keys is vast, up to a thousand times bigger than the real keyspace for some instances, and the cache would be slower than the Bloom filters in RocksDB"
+        },
+        {
+          "name": "Keep a Cuckoo filter of all keys",
+          "pro": "A compact structure that can say a key is not there",
+          "con": "The post says it takes about 18 GB for 5 billion keys at a false-positive rate like a Bloom filter that needs 6 GB, and it would have to live in memory"
+        },
+        {
+          "name": "Keep all keys but only the values of cached keys",
+          "pro": "Reuses the fast RocksDB Bloom filters, and all keys are about 11 times smaller than the full dataset",
+          "con": "Every proxy still stores every key, which costs some disk"
+        }
+      ],
+      "pick": "Cloudflare chose key and value separation, and says it may revisit it one day."
+    },
+    {
+      "title": "How to stop storing the whole dataset on every server",
+      "options": [
+        {
+          "name": "Split the full dataset into shards, one per server",
+          "pro": "Each key lives on a known server, so no cache is needed",
+          "con": "The 2025 part 2 post says it adds complexity and corner cases, gives poor locality (with four shards a server can answer only 25% of requests from its own database), and still stores cold keys"
+        },
+        {
+          "name": "Half of the instances become proxies, half replicas (v1.5)",
+          "pro": "Easy to start, reuses the proxy cache, and gave the team experience",
+          "con": "The split became unbalanced over time, some instances needed far more than the estimated 20% in cache, and the saving did not last"
+        },
+        {
+          "name": "A handful of storage servers hold everything and the rest hold caches (v2)",
+          "pro": "Follows the use of the data, drops cold keys from most servers, and builds on code that had been in production since 2021",
+          "con": "Needs relays, prefetching and a sharded cache, and a miss on a cold key travels farther"
+        }
+      ],
+      "pick": "Cloudflare moved to the third option, as the end of a step-by-step path from v1."
+    },
+    {
+      "title": "How to fill a cache before a key is asked for",
+      "options": [
+        {
+          "name": "Wait for each server to miss on its own",
+          "pro": "No extra traffic",
+          "con": "Every server in a data center pays for the same miss"
+        },
+        {
+          "name": "Predict the keys that will be needed",
+          "pro": "Could avoid misses altogether",
+          "con": "The post says a few approaches were tried and gave no improvement, so the idea was dropped"
+        },
+        {
+          "name": "Share every resolved miss with the whole data center (reactive prefetching)",
+          "pro": "A key missed on one server is likely to be missed on another soon, so it is ready in advance",
+          "con": "Needs a stream of resolved misses, and every server stores what it receives"
+        }
+      ],
+      "pick": "Cloudflare uses reactive prefetching, which took the worst instance to about 99.9% hit rate."
+    }
+  ],
+  "roles": [
+    {
+      "id": "client",
+      "label": "Central services and API",
+      "description": "Take changes from customers and write them to Quicksilver at the top of the tree."
+    },
+    {
+      "id": "edge",
+      "label": "Edge servers",
+      "description": "Serve Internet traffic and read configuration from the local Quicksilver instance while handling each request."
+    },
+    {
+      "id": "data",
+      "label": "Nodes that store and copy data",
+      "description": "Root, intermediate, replica and cache-shard nodes, which hold the log, the database or a part of the cache."
+    },
+    {
+      "id": "compute",
+      "label": "Relays",
+      "description": "Keep the connections to the storage nodes and forward cache misses for the proxies in a data center."
+    },
+    {
+      "id": "async",
+      "label": "Background helpers",
+      "description": "The heartbeat that measures replication lag and the Network Oracle that helps servers find their neighbours."
+    }
+  ],
+  "quiz": [
+    {
+      "question": "A replica has applied log entry 0024 and next receives entry 0026. What does the numbered log let it do?",
+      "options": [
+        "Apply 0026 now and fill in 0025 later, because the entries are independent",
+        "Notice that 0026 is not exactly one more than 0024, and ask again from 0024",
+        "Ignore the number and use the newest timestamp, as Kyoto Tycoon did",
+        "Wait until the next heartbeat arrives and compare its time with the clock"
+      ],
+      "answer": 1,
+      "explanation": "Each entry must be one higher than the last applied, so a jump shows that 0025 is missing. Applying 0026 first could show a later change without the earlier one. Following only a timestamp is the weakness Cloudflare describes in Kyoto Tycoon, where a dropped entry could go unnoticed because the timestamp kept moving on. The heartbeat measures how far behind a server is overall, but it does not detect a single missing entry."
+    },
+    {
+      "question": "A proxy at log index 5 asks a replica at index 8 for key H, which was written once, at index 8. What should the replica answer?",
+      "options": [
+        "The value, because the newest value is always the right one",
+        "An error, because the replica is ahead of the proxy",
+        "Not found, because at index 5 the key did not exist yet",
+        "The value, then tell the proxy to catch up to index 8 before the next read"
+      ],
+      "answer": 2,
+      "explanation": "The proxy must see what a copy at index 5 would have shown, and at that point H had not been written, so 'not found' is correct. Returning the newest value would show a change from the future and could break the rule that earlier writes are never missing when later ones are visible. The first version Cloudflare built did return an error, but for the case where the replica is behind the proxy, and the proxy's recent window fixed that. Asking the proxy to catch up would couple the servers together, which Cloudflare avoided because it would slow the tree."
+    },
+    {
+      "question": "Cloudflare saw about ten times more lookups for missing keys than for existing ones. Why did it not simply cache 'not found' on proxies?",
+      "options": [
+        "The set of missing keys was far larger than the set of real keys, and cached answers would skip the fast Bloom filters",
+        "Bloom filters can wrongly say a key is absent, so a cache is needed as a safety net",
+        "A missing key could be created at any moment, and a proxy has no way to learn about new keys",
+        "Proxies have no disk, so they cannot store any entries at all"
+      ],
+      "answer": 0,
+      "explanation": "The post says the space of missing keys was vast, up to a thousand times the real keyspace for some instances, and that cached 'not found' entries would no longer use the fast Bloom filter check. Bloom filters never give a false 'absent', only a false 'present', so the idea that they need a safety net for missing keys has it the wrong way round. Proxies do learn about new keys through the log, so that is not the reason either. And proxies keep their cache on disk, in RocksDB, so a lack of disk is simply false."
+    }
+  ],
+  "sources": [
+    {
+      "title": "Introducing Quicksilver: Configuration Distribution at Internet Scale",
+      "publisher": "Cloudflare",
+      "year": 2020,
+      "url": "https://blog.cloudflare.com/introducing-quicksilver-configuration-distribution-at-internet-scale/"
+    },
+    {
+      "title": "Quicksilver v2: evolution of a globally distributed key-value store (Part 1)",
+      "publisher": "Cloudflare",
+      "year": 2025,
+      "url": "https://blog.cloudflare.com/quicksilver-v2-evolution-of-a-globally-distributed-key-value-store-part-1/"
+    },
+    {
+      "title": "Quicksilver v2: evolution of a globally distributed key-value store (Part 2)",
+      "publisher": "Cloudflare",
+      "year": 2025,
+      "url": "https://blog.cloudflare.com/quicksilver-v2-evolution-of-a-globally-distributed-key-value-store-part-2-of-2/"
+    }
+  ]
+}
