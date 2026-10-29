@@ -72,4 +72,8 @@ export const numbered = (list: (readonly [string, string] | false | undefined | 
   list.filter((x): x is readonly [string, string] => !!x).map(([id, label], i) => ({ id, label, num: pad(i + 1) }));
 
 // Lessons that stream moving dots by default (Flow mode in StepPlayer). A pilot: widen it once the look is approved.
-export const FLOW_PILOT = new Set(['load-balancing', 'caching', 'url-shortener']);
+export const FLOW_PILOT = new Set([
+  'load-balancing', 'caching', 'url-shortener',
+  'dns', 'circuit-breaker', 'cdn', 'rate-limiting', 'message-queues',
+  'chat-system', 'news-feed', 'notification-system', 'rate-limiter-service',
+]);
