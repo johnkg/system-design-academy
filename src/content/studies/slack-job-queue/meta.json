@@ -1,0 +1,430 @@
+{
+  "name": "How Slack Scaled Its Job Queue",
+  "difficulty": "intermediate",
+  "intent": "Follow the first big change Slack describes making to its job queue after an outage: putting a durable Kafka log in front of Redis, and rolling it out without a big-bang switch, using only what Slack has published.",
+  "codeTitle": "a durable log in front of a small queue, with a rate-limited relay",
+  "finalIntro": "One job going from the web app to a worker, and then what happens when the workers fall behind.",
+  "prompt": "Slack runs a job queue for work that is too slow to do inside a web request. In its 2017 engineering post 'Scaling Slack's Job Queue', Slack says every message post, push notification, URL unfurl (the preview of a link), calendar reminder and billing calculation uses it, and that on its busiest days it processes over 1.4 billion jobs at a peak of 33,000 per second. About a year before that post, a slowdown in the database layer made jobs run slowly, Redis (an in-memory data store) hit its memory limit, and no new jobs could be added. How would you change the queue so that this cannot happen again, without stopping Slack to do it? This study follows what Slack says in that post, which is listed at the end. The post describes the first stage of a larger plan, so this study stops where the post stops. The simulation and the code samples are small models for learning, not Slack's code or data.",
+  "functional": [
+    "Accept a job from the web app quickly, and say clearly whether it was accepted",
+    "Hold jobs until a worker can run them, even when jobs arrive faster than workers finish them",
+    "Run each job on a pool of worker machines, retrying failed jobs a set number of times and then listing them as permanently failed for people to inspect",
+    "Let operators slow down or pause the flow of jobs into the part workers read from",
+    "Keep the existing enqueue and dequeue interfaces working, so that the applications that depend on the queue do not have to change"
+  ],
+  "nonFunctional": [
+    "Scale in Slack's post: over 1.4 billion jobs on the busiest days, a peak of 33,000 jobs per second, and run times from a few milliseconds to several minutes",
+    "Enqueuing must stay available when workers fall behind, because everything that depends on the queue fails when jobs cannot be added",
+    "Low latency to enqueue a job, since it happens while a user's request is waiting",
+    "No 'stop the world' changeovers or one-way migrations: Slack's stated aim was minimal disruption to the systems that depend on the queue, and room for later improvements",
+    "Clear rules about what the queue promises, because Slack says engineers were reluctant to use it when its guarantees were unclear"
+  ],
+  "firstAttempt": {
+    "text": "This is the design Slack describes as its starting point. When the web app enqueues a job, it first creates an identifier from the job type and its arguments. It picks one of the configured Redis hosts from a hash of that identifier and the logical queue (the named line a job belongs to). The host does a limited deduplication, which means that if a job with the same identifier is already queued, the new request is thrown away. Pools of worker machines poll Redis (they keep asking it for new work). A worker moves a job from the pending queue to a list of in-flight jobs and starts it. When the job finishes it leaves the in-flight list. A failed job goes to a retry queue, and after a set number of retries to a list of permanently failed jobs that people inspect and repair by hand.",
+    "limits": [
+      "Slack says Redis had little headroom, especially in memory. If jobs were added faster than they were taken for long enough, Redis ran out of memory. Taking a job needs a little free memory too, because the job is moved into a processing list, so a full Redis could not even drain itself",
+      "Every job queue client had to connect to every Redis instance. Slack calls this a complete bipartite graph, which just means every client was linked to every server, and so each client needed correct and current information about all of them",
+      "Workers could not grow on their own: adding a worker meant more polling, which put more load on a Redis that might already be struggling. Trying to add capacity could make an overload worse",
+      "Slack says the data structures chosen meant that taking a job cost work in proportion to the length of the queue, so long queues were harder to empty",
+      "The promises made to engineers were unclear and hard to define, and risky to change because many jobs relied on the limited deduplication"
+    ]
+  },
+  "nodes": [
+    {
+      "id": "web",
+      "label": "Web app (PHP/Hack)",
+      "kind": "client",
+      "x": 8,
+      "y": 50
+    },
+    {
+      "id": "redis",
+      "label": "Redis clusters",
+      "kind": "data",
+      "x": 92,
+      "y": 50
+    },
+    {
+      "id": "workers",
+      "label": "Job workers",
+      "kind": "compute",
+      "x": 92,
+      "y": 84
+    },
+    {
+      "id": "gate",
+      "label": "Kafkagate",
+      "kind": "edge",
+      "x": 29,
+      "y": 50,
+      "at": 1
+    },
+    {
+      "id": "kafka",
+      "label": "Kafka (durable log)",
+      "kind": "data",
+      "x": 50,
+      "y": 50,
+      "at": 1
+    },
+    {
+      "id": "relay",
+      "label": "JQRelay",
+      "kind": "async",
+      "x": 71,
+      "y": 50,
+      "at": 1
+    },
+    {
+      "id": "consul",
+      "label": "Consul (locks and rate limits)",
+      "kind": "data",
+      "x": 71,
+      "y": 16,
+      "at": 2
+    },
+    {
+      "id": "canary",
+      "label": "Heartbeat canaries",
+      "kind": "async",
+      "x": 29,
+      "y": 16,
+      "at": 4
+    }
+  ],
+  "edges": [
+    {
+      "from": "web",
+      "to": "redis",
+      "until": 1
+    },
+    {
+      "from": "workers",
+      "to": "redis"
+    },
+    {
+      "from": "web",
+      "to": "gate",
+      "at": 1
+    },
+    {
+      "from": "gate",
+      "to": "kafka",
+      "at": 1
+    },
+    {
+      "from": "kafka",
+      "to": "relay",
+      "at": 1
+    },
+    {
+      "from": "relay",
+      "to": "redis",
+      "at": 1
+    },
+    {
+      "from": "relay",
+      "to": "consul",
+      "at": 2
+    },
+    {
+      "from": "canary",
+      "to": "gate",
+      "at": 4
+    }
+  ],
+  "steps": [
+    {
+      "title": "Put a durable log in front of Redis and leave the rest alone",
+      "problem": "In the old design Redis was both the place where jobs waited and the thing that ran out of memory. When jobs arrived faster than workers finished them, nothing could absorb the difference except Redis memory, and when that was full the whole company's background work stopped.",
+      "fix": "After the outage Slack's post-mortem concluded that just scaling the existing system was untenable. It named three aspects to work on: durable storage (such as Kafka) in place of the in-memory store, a new scheduler that can do rate limiting and prioritisation, and running jobs without depending on Redis so that workers can scale separately. Slack chose to do the first one first. It considered replacing Redis with Kafka completely, but saw that this would need big changes to the application logic for scheduling, executing and deduplicating jobs. So, in the spirit of a minimum viable change, it added Kafka in front of Redis and kept the existing enqueue and dequeue interfaces. Kafka is a distributed log: producers append records to a topic, a topic is split into partitions, and every record is kept on disk and copied to several brokers (the Kafka servers) until a retention period ends. The web app now writes jobs to Kafka through Kafkagate, a stateless Go service with a simple HTTP POST interface whose requests carry a Kafka topic, partition and content. Another stateless Go service, JQRelay, reads jobs from a topic and writes them to the matching Redis cluster, where workers pick them up as before.",
+      "tradeoff": "This fixes the most pressing problem, which was that Slack could not guarantee that jobs could still be added while the queue was building up, and it changes little else. The price is a new moving part and two extra hops for every job. It also leaves the other limits in place on purpose: workers still poll Redis, and the scheduler is unchanged. Slack's post presents these as later goals, not as solved. A step-by-step change like this also let the team gain production experience with each new component before relying on more of them.",
+      "concepts": [
+        {
+          "slug": "message-queues"
+        },
+        {
+          "slug": "backpressure"
+        },
+        {
+          "slug": "ordering-and-partitioning"
+        },
+        {
+          "slug": "queueing-theory-and-littles-law"
+        }
+      ]
+    },
+    {
+      "title": "Get jobs into Kafka quickly, with a clear answer, and prefer availability",
+      "problem": "Jobs come from a PHP and Hack web app, and adding a job happens while a person's request is waiting. Slack looked at existing ways to get jobs into Kafka and found none that suited it.",
+      "fix": "Kafkagate keeps persistent connections to the Kafka brokers, follows changes of partition leader (the broker that currently takes writes for a partition), and gives the web app a cheap, simple HTTP interface. Slack lists three design aims. First, availability over consistency: Kafkagate waits only for the leader broker to confirm a write, not for copies on other brokers. This gives the lowest latency, but Slack says it does create a small risk of lost jobs if a broker dies before copying, and that this is the right trade-off for most of Slack's application semantics. Slack is also considering an option for critical jobs to wait for stronger guarantees. Second, simple client semantics: the write is synchronous, so a job that reaches the queue is positively acknowledged, and failures and timeouts come back as errors. Third, minimum latency: Slack runs in several AWS availability zones per region, links between zones are slower and cost money, so the job queue prefers a Kafkagate in the same zone as the web host, with failover to other zones. Slack is considering running a Kafkagate on each web host to remove another hop.",
+      "tradeoff": "A leader-only acknowledgement is fast, and a rare broker failure at the wrong moment can lose a job. Slack accepts that for most jobs and says it may give critical jobs a stronger option. Preferring the same zone saves time and transfer cost, and the failover keeps it from becoming a single point of failure. A clear success or error is only as good as the promise behind it, which is why the post says 'notwithstanding the risk of lost writes'.",
+      "concepts": [
+        {
+          "slug": "cap-theorem"
+        },
+        {
+          "slug": "delivery-guarantees"
+        },
+        {
+          "slug": "latency-and-round-trips"
+        },
+        {
+          "slug": "database-replication"
+        }
+      ]
+    },
+    {
+      "title": "Relay jobs to Redis at a controlled rate, with one relay per topic",
+      "problem": "Something has to move jobs out of Kafka and into Redis without losing them, without doing it twice for the same topic, and without pushing Redis over the edge. It also has to cope with job formats passing through a new language.",
+      "fix": "JQRelay is stateless and gets its work from Consul (a service that stores shared settings and locks). When it starts, it tries to take a lock on a Consul entry for a Kafka topic. If it gets it, it relays all partitions of that topic. If it loses the lock, it releases everything and restarts so another instance can take over. JQRelay runs in an EC2 auto-scaling group (a group of machines that replaces any that fail), so every topic has exactly one relay and failures heal themselves. For failures, it tracks its place with Kafka commit offsets and advances an offset only when the job has been written to Redis. If Redis has a problem, it retries indefinitely until Redis returns or is replaced. A job-specific error does not block the partition: the job is added back to Kafka instead of being dropped, so it can be examined and fixed without being lost. For rate limiting, JQRelay follows the limits configured in Consul and uses the Consul watch API to react when they change. There is also a hazard with the data format: the old system was PHP only, but now Go decodes and re-encodes the JSON. Slack found that Go by default replaces the characters <, > and & with unicode escapes, while PHP by default escapes the / character. This made the same data look different in the two languages.",
+      "tradeoff": "Moving the offset only after a successful write means a job is not lost on the way to Redis, and Slack's post does not discuss what happens if a relay stops in the gap between the write and the offset update. This study's reading is that such a gap could replay a job, so the queue's existing deduplication and well-behaved jobs matter. Rate limits give operators a dial between Kafka and Redis, and Slack names tying it to Redis memory as a possible next step. One relay per topic is simple to reason about, with the lock deciding who it is.",
+      "concepts": [
+        {
+          "slug": "leader-election"
+        },
+        {
+          "slug": "rate-limiting"
+        },
+        {
+          "slug": "retries-and-backoff"
+        },
+        {
+          "slug": "dead-letter-queues-and-poison-messages"
+        },
+        {
+          "slug": "idempotency"
+        }
+      ]
+    },
+    {
+      "title": "Size the Kafka cluster, then try to break it",
+      "problem": "A durable buffer that is itself under-sized or badly understood would just move the outage somewhere else. The team needed to know how the application would see each kind of Kafka failure before relying on it.",
+      "fix": "Slack gives these cluster settings: Kafka version 0.10.1.2, 16 brokers on i3.2xlarge EC2 machines, and for every topic 32 partitions, a replication factor of 3 (three copies of each partition) and a retention period of 2 days. It uses rack-aware replication, where a 'rack' is an AWS availability zone so copies sit in different zones, and it has unclean leader election enabled (which lets a replica that is behind become leader when no up-to-date one is available, trading possible data loss for availability). For load testing, Slack set up a test environment and enqueued jobs to various topics at their expected production rate, which let it give the production cluster enough headroom for brokers going down, leadership changes, administrative actions and future growth. For failure testing, it checked what the application would see in each case (connection failures, enqueue failures, missing jobs, duplicate jobs) by hard-killing and gracefully stopping a broker, doing the same to two brokers in one availability zone, hard-killing all three brokers of a partition to force an unclean leader, and restarting the whole cluster. Slack reports that the system behaved as expected and met its availability goals in all of these. Load tests also gave a safe throttle rate for moving data between brokers.",
+      "tradeoff": "Headroom costs money, and every failure test is work, but they turn guesses into known behaviours. Slack is open about what is still ahead: with 1.4 billion jobs a day it would prefer to migrate single partitions instead of whole topics between brokers, and that is listed as future work.",
+      "concepts": [
+        {
+          "slug": "failure-detection"
+        },
+        {
+          "slug": "health-checks"
+        },
+        {
+          "slug": "quorums"
+        },
+        {
+          "slug": "autoscaling"
+        }
+      ]
+    },
+    {
+      "title": "Roll out in shadow mode and watch every part with canaries",
+      "problem": "The job queue is used by almost everything in Slack. A new path that is wrong, even slightly, could lose jobs for every customer, and a change that can only go one way leaves no way back.",
+      "fix": "Slack's rollout had four stages. First, double writes: each job was enqueued both to Redis and to Kafka. JQRelay ran in 'shadow' mode, dropping every job after reading it, so the new path from the web app to JQRelay could be tested with real production traffic while the old path still did the work. Second, correctness checks: Slack tracked and compared the number of jobs through each part, from the web app to Kafkagate, Kafkagate to Kafka, and Kafka to Redis. Third, heartbeat canaries: to check end to end all 50 Redis clusters and 1,600 Kafka partitions (50 topics of 32 partitions), a canary job was enqueued for every Kafka partition every minute, and Slack monitored and alerted on the flow and timing of these canaries. Fourth, the final roll-out: enabled internally at Slack for a few weeks and, with no problems, switched on for customers one job type at a time.",
+      "tradeoff": "Double writing costs extra load and effort for a while, and counting jobs at every hop takes work, but it makes mistakes visible before any job depends on the new path. Rolling out by job type is slower than one switch and can be undone in small pieces. The post reports the outcome as a success in protecting the infrastructure from Redis memory exhaustion, and names clearer client semantics and configurable rate limits as gains.",
+      "concepts": [
+        {
+          "slug": "canary-deployments"
+        },
+        {
+          "slug": "synthetic-monitoring-and-rum"
+        },
+        {
+          "slug": "feature-flags"
+        },
+        {
+          "slug": "blue-green-and-rolling-deployments"
+        }
+      ]
+    }
+  ],
+  "failures": [
+    {
+      "scenario": "Jobs arrive faster than workers finish them for a long time",
+      "impact": "In the old design Redis filled up, new jobs were refused and, because taking a job also needed free memory, the queue could stay stuck even after the cause was fixed.",
+      "answer": "The web app keeps adding jobs to Kafka, which stores them on disk. Slack says it instead adjusts the rate limits in JQRelay to match the rate at which workers take jobs, or pauses adding jobs to Redis altogether, so Redis memory is not exhausted.",
+      "concepts": [
+        {
+          "slug": "backpressure"
+        },
+        {
+          "slug": "load-shedding"
+        }
+      ]
+    },
+    {
+      "scenario": "Redis has a problem while JQRelay is relaying",
+      "impact": "Jobs cannot be written to the cluster. If the relay moved on anyway, they would be lost.",
+      "answer": "JQRelay only advances its Kafka offset after a successful write to Redis, and it retries indefinitely until Redis is back or replaced. Meanwhile the jobs stay in Kafka, which keeps them for the retention period of 2 days.",
+      "concepts": [
+        {
+          "slug": "retries-and-backoff"
+        },
+        {
+          "slug": "delivery-guarantees"
+        }
+      ]
+    },
+    {
+      "scenario": "A JQRelay machine dies, or loses its lock",
+      "impact": "No process is moving jobs for that topic, so jobs would wait in Kafka while the queue looked quiet.",
+      "answer": "A relay that loses its Consul lock gives up its resources and restarts so another instance can take the topic. The auto-scaling group replaces failed machines, which then go through the same lock flow, so every topic ends up with exactly one relay. This study's reading: the heartbeat canaries Slack monitors would show a topic or partition that stops flowing.",
+      "concepts": [
+        {
+          "slug": "leader-election"
+        },
+        {
+          "slug": "leases-and-fencing-tokens"
+        }
+      ]
+    },
+    {
+      "scenario": "A broker dies before it has copied a recently accepted job",
+      "impact": "The web app was told the job was accepted, but the job may be gone.",
+      "answer": "Slack names this explicitly as a small risk of lost jobs from acknowledging after the leader's write only, and calls it the right trade-off for most of its application semantics. It is considering an option for critical jobs to wait for stronger guarantees. Its failure tests, including hard-killing brokers, were meant to show how the application sees such events.",
+      "concepts": [
+        {
+          "slug": "cap-theorem"
+        },
+        {
+          "slug": "quorums"
+        }
+      ]
+    },
+    {
+      "scenario": "One job keeps failing in the relay because of the job itself",
+      "impact": "If the relay kept retrying it in place, every job behind it in that partition would be stuck.",
+      "answer": "Slack says job-specific errors are handled by adding the job back to Kafka, so that it does not block all progress on that queue, and it is kept so that the error can be diagnosed and fixed without losing the job.",
+      "concepts": [
+        {
+          "slug": "dead-letter-queues-and-poison-messages"
+        }
+      ]
+    }
+  ],
+  "alternatives": [
+    {
+      "title": "Replace Redis with Kafka, or put Kafka in front of it",
+      "options": [
+        {
+          "name": "Replace Redis with Kafka",
+          "pro": "One storage system, with durable storage all the way to the workers",
+          "con": "Slack says it would need significant changes to the application logic around scheduling, executing and deduplicating jobs"
+        },
+        {
+          "name": "Add Kafka in front of Redis",
+          "pro": "Fixes the biggest problem, running out of Redis memory, and keeps the existing enqueue and dequeue interfaces",
+          "con": "Another system to run, and the problems around workers polling Redis stay for a later stage"
+        },
+        {
+          "name": "Keep scaling Redis and the workers as before",
+          "pro": "No new parts",
+          "con": "The post-mortem found this untenable: Redis kept little headroom, and adding workers put more load on it"
+        }
+      ],
+      "pick": "Kafka in front of Redis, as Slack did: a minimum viable change that protects against the failure that caused the outage."
+    },
+    {
+      "title": "How long Kafkagate waits when it writes a job",
+      "options": [
+        {
+          "name": "Wait for the leader only",
+          "pro": "The lowest latency, and Slack says it is the right trade-off for most of its jobs",
+          "con": "A small risk of losing a job if the leader dies before it copies the job"
+        },
+        {
+          "name": "Wait for the copies on other brokers too",
+          "pro": "Stronger protection against losing a job",
+          "con": "Slower, while a person's request waits. Slack says it is considering this only as an option for critical jobs"
+        }
+      ],
+      "pick": "Leader only by default, with a stronger option under consideration for critical jobs, as the post describes."
+    },
+    {
+      "title": "How to switch to the new path",
+      "options": [
+        {
+          "name": "Switch every job at once",
+          "pro": "Fast and simple to describe",
+          "con": "Any mistake would hit every job type at once, which is what Slack set out to avoid with its aim of no 'stop the world' changeovers"
+        },
+        {
+          "name": "Double write with a shadow relay, check counts, use canaries, then enable job type by job type",
+          "pro": "Real traffic tests the new path while the old one still does the work, and mistakes are found early and in small pieces",
+          "con": "More work and extra load for a while"
+        }
+      ],
+      "pick": "The staged rollout Slack describes: double writes, shadow mode, counts at each hop, heartbeat canaries, then job type by job type."
+    }
+  ],
+  "roles": [
+    {
+      "id": "client",
+      "label": "Web app",
+      "description": "Makes a job from a type and its arguments and sends it to Kafkagate."
+    },
+    {
+      "id": "edge",
+      "label": "Kafkagate",
+      "description": "A stateless Go service that turns an HTTP POST into a write to Kafka and reports success or failure."
+    },
+    {
+      "id": "data",
+      "label": "Kafka, Redis and Consul",
+      "description": "Where jobs wait (the Kafka log and the Redis queues), and where locks and rate limits are kept (Consul)."
+    },
+    {
+      "id": "async",
+      "label": "JQRelay and canaries",
+      "description": "Background parts: the relay moves jobs from Kafka to Redis, and canaries test every partition end to end."
+    },
+    {
+      "id": "compute",
+      "label": "Job workers",
+      "description": "Poll Redis, run jobs and retry failures."
+    }
+  ],
+  "quiz": [
+    {
+      "question": "With Kafka in front of Redis, jobs arrive faster than the workers can finish them for several hours. What does Slack's post say is the way to keep Redis healthy?",
+      "options": [
+        "Add many more worker machines, because they no longer put any load on Redis",
+        "Make Kafkagate wait for every replica before it answers, so that producers slow down",
+        "Lower JQRelay's rate limit, or pause it, while the jobs wait in Kafka",
+        "Have the web app refuse new jobs until Redis shows a lot of free memory"
+      ],
+      "answer": 2,
+      "explanation": "Kafka stores the extra jobs on disk, so Slack adjusts the rate limits in JQRelay to match how fast workers take jobs, or pauses adding jobs to Redis. More workers would add polling load on Redis, which Slack lists as a problem of the old design because workers still read from Redis. Waiting for all replicas would make every enqueue slower without limiting what reaches Redis. Refusing jobs at the web app is exactly the failure the change was meant to avoid, because things like message posts depend on the queue accepting jobs."
+    },
+    {
+      "question": "Redis stops accepting writes for a while. JQRelay is holding a job that it has read from Kafka. What does it do?",
+      "options": [
+        "It keeps retrying without moving its offset, so the job stays in Kafka until Redis returns",
+        "It drops the job and moves its offset on, so that the rest of the partition is not blocked",
+        "It adds the job back to Kafka at once, as it does for a job-specific error",
+        "It saves the job to its own local disk and moves on, to be replayed when Redis is back"
+      ],
+      "answer": 0,
+      "explanation": "Slack says a partition consumer only advances the offset if the job was written to Redis, and that in a Redis issue it retries indefinitely until Redis comes back or is replaced. Dropping the job would lose it. Adding it back to Kafka is how Slack handles errors caused by one job, which would not help when the whole Redis is the problem. The post does not describe any local copy on the relay, and JQRelay is described as stateless."
+    },
+    {
+      "question": "Slack's rollout enqueued a heartbeat canary for every Kafka partition every minute, across 50 topics of 32 partitions each. About how many canary jobs is that per day, and why check each partition?",
+      "options": [
+        "About 1,600 a day, because one canary per topic proves that every partition works",
+        "About 72,000 a day, because partitions are copies of one another and so share the same fate",
+        "About 50 a minute, because each Redis cluster only needs a single test",
+        "About 2.3 million a day, and a single stuck partition would otherwise go unseen"
+      ],
+      "answer": 3,
+      "explanation": "There are 50 times 32, which is 1,600 partitions, and 1,600 canaries per minute over 1,440 minutes is about 2.3 million a day. Slack describes canaries for every partition so it can alert on the end-to-end flow and timing. Checking only one per topic could hide a single stuck partition. The 1,600 figure is the number of partitions, not canaries per day. The 72,000 figure is 50 topics times 1,440 minutes, which also assumes one canary per topic, and partitions are different slices of a topic's jobs, not copies. And 50 a minute counts topics, ignoring that each has 32 partitions."
+    }
+  ],
+  "sources": [
+    {
+      "title": "Scaling Slack's Job Queue",
+      "publisher": "Slack Engineering",
+      "year": 2017,
+      "url": "https://slack.engineering/scaling-slacks-job-queue/"
+    }
+  ]
+}

@@ -1,0 +1,48 @@
+{
+  "actors": [
+    { "id": "web", "label": "Web app (PHP/Hack)", "role": "client", "x": 14, "y": 16 },
+    { "id": "gate", "label": "Kafkagate", "role": "edge", "x": 50, "y": 16 },
+    { "id": "kafka", "label": "Kafka topic partition", "role": "data", "x": 86, "y": 16 },
+    { "id": "relay", "label": "JQRelay", "role": "async", "x": 14, "y": 84 },
+    { "id": "redis", "label": "Redis cluster", "role": "data", "x": 50, "y": 84 },
+    { "id": "worker", "label": "Job worker", "role": "compute", "x": 86, "y": 84 }
+  ],
+  "frames": [
+    {
+      "narration": "A user posts a message. The web app has work that is too slow for the web request, such as a push notification, so it makes a job. It builds an identifier from the job type and its arguments and sends it to Kafkagate with an HTTP POST that names a Kafka topic and partition (a partition is one ordered slice of a topic), choosing a Kafkagate in its own availability zone (a separate data center building in the same region) when it can.",
+      "messages": [{ "from": "web", "to": "gate", "label": "POST topic, partition, job" }],
+      "states": { "gate": "request received" },
+      "highlight": ["web", "gate"]
+    },
+    {
+      "narration": "Kafkagate writes the job to the leader broker of that partition and waits only for the leader to say it has the job, not for the copies on other brokers. That is quick, and it is why Slack describes a small risk of losing a job if the leader dies before copying it. The web app gets a clear yes or no.",
+      "messages": [{ "from": "gate", "to": "kafka", "label": "append job (leader ack)" }, { "from": "kafka", "to": "gate", "label": "ok" }, { "from": "gate", "to": "web", "label": "job accepted" }],
+      "states": { "kafka": "job stored on disk" },
+      "highlight": ["gate", "kafka"]
+    },
+    {
+      "narration": "The job now waits in the log. One JQRelay process is responsible for this topic, because it holds a lock on a Consul entry (Consul is a service that stores shared settings and locks). It reads the next job after its last committed offset, which is its place in the partition.",
+      "messages": [{ "from": "relay", "to": "kafka", "label": "read next job from my offset" }, { "from": "kafka", "to": "relay", "label": "job" }],
+      "states": { "relay": "holds the topic lock" },
+      "highlight": ["relay", "kafka"]
+    },
+    {
+      "narration": "JQRelay checks the rate limit set in Consul, decodes the JSON job and writes it again to the matching Redis cluster. Redis keeps working as before, with its existing queue behaviour. Only after the write succeeds does JQRelay move its offset forward.",
+      "messages": [{ "from": "relay", "to": "redis", "label": "enqueue job (within rate limit)" }, { "from": "redis", "to": "relay", "label": "stored" }],
+      "states": { "redis": "job queued", "relay": "offset advanced" },
+      "highlight": ["relay", "redis"]
+    },
+    {
+      "narration": "A worker polls Redis, moves the job from the pending queue to the list of in-flight jobs, and runs it. When it finishes it removes the job from the in-flight list. A failed job goes to a retry queue instead.",
+      "messages": [{ "from": "worker", "to": "redis", "label": "poll, take job" }, { "from": "redis", "to": "worker", "label": "job" }],
+      "states": { "worker": "running job", "redis": "job in flight" },
+      "highlight": ["worker", "redis"]
+    },
+    {
+      "narration": "Now workers fall behind. Before this design, a full Redis would have refused new jobs. Here the web app keeps writing to Kafka, JQRelay's rate limit is lowered to match the workers, and the extra jobs wait safely in the log instead of in memory.",
+      "messages": [{ "from": "web", "to": "gate", "label": "more jobs keep arriving" }, { "from": "gate", "to": "kafka", "label": "appended, they wait" }, { "from": "relay", "to": "redis", "label": "slower, by rate limit" }],
+      "states": { "kafka": "backlog growing", "relay": "rate limit lowered", "redis": "memory stays bounded" },
+      "highlight": ["kafka", "relay"]
+    }
+  ]
+}

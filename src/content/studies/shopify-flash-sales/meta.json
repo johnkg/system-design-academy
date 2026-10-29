@@ -1,0 +1,582 @@
+{
+  "name": "How Shopify Survives Flash Sales",
+  "difficulty": "intermediate",
+  "intent": "Follow how Shopify says it keeps a sale that sends a burst of buyers to one shop from taking down the rest of the platform, using pods, a fair checkout queue at the edge, resilient dependencies and full-scale load tests, using only what Shopify has published.",
+  "codeTitle": "pods, a fair checkout queue, and guards for a slow dependency",
+  "finalIntro": "One checkout during a flash sale, then a slow dependency and a pod moved to another data center, as Shopify described them.",
+  "prompt": "A merchant announces a sale. Within seconds thousands of buyers load the same shop and try to check out at the same moment. Shopify, an online store platform, says its first big flash sale was in 2007, and that by 2017 merchants could send it \"Super Bowl-sized traffic\" on any day, often without notice. A sale in February 2016 took down not only that merchant's store but every other store on the same database shard. How do you keep one shop's rush from hurting everyone else, and keep buyers calm while you do it? This study follows what Shopify says in its own engineering posts, listed at the end, in a teaching order and not the order Shopify built things. Every Shopify claim is tied to its post. The simulation, the code samples and the diagram are small models for learning, not Shopify's code, data or exact design.",
+  "functional": [
+    "Serve storefronts and checkout for very many shops, with some shops sending far more traffic than others",
+    "Keep a rush on one shop from making other shops unavailable",
+    "When checkout cannot take every buyer at once, show buyers a waiting page and let them in fairly",
+    "Keep buying possible when a non-essential dependency fails or is slow (for example, a guest can still check out when sign-in is down)",
+    "Move work to a recovery data center when one fails"
+  ],
+  "nonFunctional": [
+    "Failure stays small: Shopify's pods post says a single pod's failure should not spiral into a platform outage",
+    "Protect the platform without it looking broken to buyers: a plain error page would be read as a crash (Shopify's 2017 post)",
+    "Fairness: buyers who arrived earlier should not lose to buyers who arrived later",
+    "Prepared before the peak: Shopify's 2023 and 2025 posts describe testing at Black Friday Cyber Monday (BFCM) scale months ahead, as an iterative process and not a guarantee"
+  ],
+  "firstAttempt": {
+    "text": "Shard the database and keep everything else shared. In Shopify's account, by 2015 it could no longer buy a bigger database server, so it split the data across shards. Code that touched every shop looped over every shard, and a busy shop shared a shard with other shops.",
+    "limits": [
+      "Shopify says sharding gave it performance and scale but cost resilience: if any shard went down, any action that looped over all shards was unavailable across the platform",
+      "Shopify says a February 2016 sale took down the merchant's store and all other stores on the same database shard",
+      "Shopify says every checkout created a MySQL record and every step of the flow changed that same record, so checkout produced a very large number of writes that took down parts of the platform"
+    ]
+  },
+  "nodes": [
+    {
+      "id": "users",
+      "label": "Buyers",
+      "kind": "client",
+      "x": 8,
+      "y": 50
+    },
+    {
+      "id": "lb",
+      "label": "Edge load balancers (Nginx + Lua)",
+      "kind": "edge",
+      "x": 28,
+      "y": 50,
+      "at": 1
+    },
+    {
+      "id": "app",
+      "label": "Shopify servers",
+      "kind": "compute",
+      "x": 52,
+      "y": 50
+    },
+    {
+      "id": "db",
+      "label": "Sharded MySQL, shops share shards",
+      "kind": "data",
+      "x": 82,
+      "y": 50,
+      "until": 1
+    },
+    {
+      "id": "podA",
+      "label": "Pod A datastores",
+      "kind": "data",
+      "x": 82,
+      "y": 30,
+      "at": 1
+    },
+    {
+      "id": "podB",
+      "label": "Pod B datastores",
+      "kind": "data",
+      "x": 82,
+      "y": 70,
+      "at": 1
+    },
+    {
+      "id": "queue",
+      "label": "Queue page (cached at the edge)",
+      "kind": "edge",
+      "x": 20,
+      "y": 14,
+      "at": 2
+    },
+    {
+      "id": "fair",
+      "label": "Arrival time cookie and threshold",
+      "kind": "edge",
+      "x": 46,
+      "y": 14,
+      "at": 3
+    },
+    {
+      "id": "guard",
+      "label": "Circuit breaker and Semian",
+      "kind": "compute",
+      "x": 56,
+      "y": 86,
+      "at": 4
+    },
+    {
+      "id": "deps",
+      "label": "Other services (session store)",
+      "kind": "external",
+      "x": 88,
+      "y": 90,
+      "at": 4
+    },
+    {
+      "id": "toxi",
+      "label": "Toxiproxy in tests",
+      "kind": "async",
+      "x": 30,
+      "y": 86,
+      "at": 4
+    },
+    {
+      "id": "mover",
+      "label": "Pod Mover",
+      "kind": "compute",
+      "x": 70,
+      "y": 12,
+      "at": 5
+    },
+    {
+      "id": "dc2",
+      "label": "Recovery data center",
+      "kind": "data",
+      "x": 92,
+      "y": 12,
+      "at": 5
+    },
+    {
+      "id": "load",
+      "label": "Load test tools (Cronograma, Genghis)",
+      "kind": "async",
+      "x": 8,
+      "y": 84,
+      "at": 6
+    }
+  ],
+  "edges": [
+    {
+      "from": "users",
+      "to": "app",
+      "until": 1
+    },
+    {
+      "from": "app",
+      "to": "db",
+      "until": 1
+    },
+    {
+      "from": "users",
+      "to": "lb",
+      "at": 1
+    },
+    {
+      "from": "lb",
+      "to": "app",
+      "at": 1
+    },
+    {
+      "from": "app",
+      "to": "podA",
+      "at": 1
+    },
+    {
+      "from": "app",
+      "to": "podB",
+      "at": 1
+    },
+    {
+      "from": "lb",
+      "to": "queue",
+      "at": 2
+    },
+    {
+      "from": "lb",
+      "to": "fair",
+      "at": 3
+    },
+    {
+      "from": "app",
+      "to": "guard",
+      "at": 4
+    },
+    {
+      "from": "guard",
+      "to": "deps",
+      "at": 4
+    },
+    {
+      "from": "toxi",
+      "to": "guard",
+      "at": 4
+    },
+    {
+      "from": "mover",
+      "to": "podA",
+      "at": 5
+    },
+    {
+      "from": "mover",
+      "to": "dc2",
+      "at": 5
+    },
+    {
+      "from": "load",
+      "to": "lb",
+      "at": 6
+    }
+  ],
+  "steps": [
+    {
+      "title": "Split the platform into pods, each with its own datastores",
+      "problem": "Sharding spreads data, but the platform still shares fate. A shard that goes down can break any action that touches all shards, and a busy shop can use up database time that other shops need.",
+      "fix": "In its 2018 post, Shopify says it introduced pods (not Kubernetes pods) in 2016. A pod is a set of shops that live on a fully isolated set of datastores. Shared resources such as job workers, app servers and load balancers can talk to only one pod at a time, and no action may reach across pods. Every unit of work, meaning a web request or a delayed job, is assigned to a single pod, so serving a request needs only one pod to be online. To find the pod, Shopify put software called Sorting Hat in its load balancers. It matches each request to a pod using a list of rules, adds a header, and forwards the request to the right place. App servers read that header to connect to that pod's datastores, so they query one pod at a time while the platform still shares capacity. The code sample at the end models this with a lookup table.",
+      "tradeoff": "Each pod can be considered independently, and Shopify says adding a pod should not interfere with existing ones because pods do not talk to each other. The price is a routing layer that must always know which pod owns a shop, and the rule that nothing may cross pods, which Shopify says it holds to.",
+      "concepts": [
+        {
+          "slug": "database-sharding"
+        },
+        {
+          "slug": "bulkhead"
+        },
+        {
+          "slug": "load-balancing"
+        },
+        {
+          "slug": "proxies"
+        }
+      ]
+    },
+    {
+      "title": "Throttle checkout at the edge with a leaky bucket and a waiting page",
+      "problem": "Even with isolation, the shop that is having the sale needs protection. Checkout is write heavy, and a full rewrite was not possible before the next sale, which Shopify's 2017 post says was the following week. A plain 429 Too Many Requests (an HTTP code meaning slow down) would look like a crash to buyers.",
+      "fix": "In its 2017 post, Shopify says its edge tier uses Nginx with OpenResty's Lua module, which lets a small team write scripts that act on requests and responses of the whole Rails app. It used that to build a checkout throttle based on a leaky bucket: a gate that lets a set number of requests through per period and rejects the rest. Shopify says the period was 5 seconds and that the limit is whatever load the app can handle. Rejected buyers were redirected to a queue page that the merchant could design, rendered by Shopify but cached in Nginx, with a JavaScript snippet that kept polling the checkout endpoint. A buyer who got through received a securely signed cookie to skip the throttle for the rest of the session. Buyers without JavaScript used a meta refresh. Shopify calls this giving off back pressure: telling clients in a friendly way to hold off.",
+      "tradeoff": "The platform survived the next sale. But the waiting page only looked like a queue. Shopify says buyers were in effect polling at random, which made it a lottery, and some waited up to 40 minutes during a sale that lasted 40 minutes.",
+      "concepts": [
+        {
+          "slug": "backpressure"
+        },
+        {
+          "slug": "rate-limiting"
+        },
+        {
+          "slug": "load-shedding"
+        },
+        {
+          "slug": "proxies"
+        }
+      ]
+    },
+    {
+      "title": "Make the queue fair without a shared database",
+      "problem": "Buyers who arrived first were not favoured, so a buyer could wait out the whole sale and find it sold out. The obvious fix is to store every buyer's arrival time and compare, but Shopify says a data store would be a new point of failure under high load, and its load balancers are in several data centers, where replicating a store such as Redis is not simple and reading from another data center is slow.",
+      "fix": "In its second 2017 post, Shopify says it gave each buyer a timestamp of their first checkout attempt, kept in a securely signed cookie so it cannot be tampered with. Each load balancer works out on its own a threshold: buyers with an earlier timestamp are high priority and go on to the leaky bucket, and later ones wait. The threshold moves with a feedback loop borrowed from control theory, a PID controller (proportional, integral, derivative), which compares the desired state with the current state and corrects the difference. Here the aim is that exactly the bucket's limit passes the first phase, and the error is the bucket limit minus the number passed on. After simulations in MATLAB, Shopify settled on using only the proportional part. Because each load balancer decides alone, the edge stays stateless. Shopify says its graphs afterwards showed median and 95th percentile queue times much closer together, and there were no reports of long waits or unfairness. The code sample models the threshold with a simpler rule and whole numbers.",
+      "tradeoff": "Fairness costs a cookie and a small control loop at the edge, in place of a shared store. It also depends on the signed cookie. The posts do not say how a buyer who clears cookies is treated, so this study does not either.",
+      "concepts": [
+        {
+          "slug": "rate-limiting"
+        },
+        {
+          "slug": "queueing-theory-and-littles-law"
+        },
+        {
+          "slug": "backpressure"
+        },
+        {
+          "slug": "slos-and-error-budgets"
+        }
+      ]
+    },
+    {
+      "title": "Keep buying possible when a dependency is down or slow",
+      "problem": "A minor dependency can become a single point of failure. Shopify's 2015 post gives an example: only sign-in depends on the session store, so if it is unavailable, buyers should still be able to check out as guests. Slow dependencies are worse than dead ones, because every request waits for its timeout, which cuts the capacity of the whole cluster.",
+      "fix": "Shopify says it filled in a matrix of services against application sections, for both degraded and unavailable services, then wrote tests for it so it could not drift. Existing tools needed root access, so it wrote Toxiproxy, a TCP proxy that simulates network conditions such as latency and downtime and has an HTTP API, and used it for its resiliency integration tests. Data stores are wrapped in decorators that provide fallbacks, so developers do not need to add handling everywhere. For slow services Shopify uses circuit breakers: after repeated timeouts, mark the resource dead for a while and fail instantly. Timeouts alone are not enough, so Shopify also built Semian, which treats a service like a connection pool. Only a limited number of workers on a server may use a resource at once, and the next worker fails immediately instead of waiting. The post's example: if workers are talking to a shard 10% of the time, five at once is a 0.001% event, so allowing five costs little. The sample models both guards with simple counters.",
+      "tradeoff": "A few requests are refused when they could have worked, a false positive that Shopify accepts by design. Fallbacks also mean some features quietly degrade, so the matrix must say what the buyer sees in each case.",
+      "concepts": [
+        {
+          "slug": "circuit-breaker"
+        },
+        {
+          "slug": "bulkhead"
+        },
+        {
+          "slug": "graceful-degradation"
+        },
+        {
+          "slug": "timeouts-and-deadlines"
+        }
+      ]
+    },
+    {
+      "title": "Give every pod a recovery data center and be able to move it",
+      "problem": "Isolation helps only if a failed pod, or a whole data center, can be recovered without a platform-wide outage, and Shopify wanted to move pods around regularly for a variety of reasons.",
+      "fix": "In its 2018 post, Shopify says it already had a recovery data center before podding, and that each pod was assigned a pair of data centers: one active, one recovery site. It built a tool called the Pod Mover that, it says, can move a pod to its recovery data center in a minute without dropping requests or jobs. A pod is a convenient unit: evacuating a data center is evacuating each active pod there, one at a time. Shopify adds that it wants to move pods around on a daily basis. This study does not know how the Pod Mover works, as the post leaves that for later posts.",
+      "tradeoff": "Recovery needs spare capacity and a tested move. The 2023 and 2025 posts describe testing exactly that, by sending all traffic to one region or evacuating regions in scale tests.",
+      "concepts": [
+        {
+          "slug": "multi-region-failover"
+        },
+        {
+          "slug": "database-replication"
+        },
+        {
+          "slug": "health-checks"
+        }
+      ]
+    },
+    {
+      "title": "Rehearse the peak: full-scale load tests and game days",
+      "problem": "A design that looks right can still fail under real load, and many problems only appear at scale. Shopify's 2023 post says that when you scale a system up by large amounts, things often break from the larger baseline alone, for example from many more TCP connections.",
+      "fix": "Shopify's 2023 post says it scales the core platform to its BFCM profile, runs load tests, scales back down, runs a blameless retrospective and repeats several times a year. It chose full-scale tests over a scaled-down model, which is cheaper but is hard to extrapolate for components such as databases and assumes predictable horizontal scaling. The tests use five flows, one of which is a dedicated flash sale flow with a burst of buyers purchasing one product, run by its own tool, Cronograma, at rates it controls, increased slowly, with an abort switch. Some tests send all traffic to one US region to check that a single region has enough capacity. Shopify notes that load generators sit behind a few CDN points of presence, so part of the traffic skips the CDN, and some requests deliberately bypass caches. It also states that surviving a synthetic test does not guarantee readiness: only real traffic is a substitute for real traffic. In 2025 it describes bimonthly fire drills, a tool called Genghis, flash sale bursts added on top of baseline load, Toxiproxy faults, five scale tests from April to October, regional failovers, and a Resiliency Matrix updated all year. It also describes Game Days, which inject faults on purpose, and says each test exposed issues that were then fixed.",
+      "tradeoff": "Full-scale tests cost real money, need cloud capacity booked in advance and coordination across many teams, and can still miss real traffic. Shopify says it treats them as an iterative process and not an assurance of success.",
+      "concepts": [
+        {
+          "slug": "autoscaling"
+        },
+        {
+          "slug": "synthetic-monitoring-and-rum"
+        },
+        {
+          "slug": "slos-and-error-budgets"
+        },
+        {
+          "slug": "queueing-theory-and-littles-law"
+        }
+      ]
+    }
+  ],
+  "failures": [
+    {
+      "scenario": "One shop's sale sends a huge burst of buyers to its pod",
+      "impact": "Without isolation, the same burst would also hurt other shops on the same shard, as in the February 2016 sale Shopify describes.",
+      "answer": "Datastores are isolated per pod and each request needs only its own pod, so other pods keep serving. Inside the pod, the checkout throttle at the edge limits how much reaches checkout and shows a waiting page.",
+      "concepts": [
+        {
+          "slug": "bulkhead"
+        },
+        {
+          "slug": "rate-limiting"
+        }
+      ]
+    },
+    {
+      "scenario": "Buyers in the waiting page are served at random, not in order",
+      "impact": "Some buyers wait the whole sale and find the product sold out. Shopify saw complaints of waits of up to 40 minutes in a 40 minute sale.",
+      "answer": "Stamp each buyer's first attempt in a signed cookie and let each load balancer compute a threshold, so earlier arrivals go first and no shared store is needed.",
+      "concepts": [
+        {
+          "slug": "backpressure"
+        },
+        {
+          "slug": "queueing-theory-and-littles-law"
+        }
+      ]
+    },
+    {
+      "scenario": "The session store, which only sign-in needs, becomes slow",
+      "impact": "Workers pile up waiting on timeouts, and capacity drops across the cluster even though checkout does not need that store.",
+      "answer": "A fallback lets the buyer continue as a guest, Semian fails extra workers at once, and a circuit breaker stops further calls for a while.",
+      "concepts": [
+        {
+          "slug": "circuit-breaker"
+        },
+        {
+          "slug": "graceful-degradation"
+        }
+      ]
+    },
+    {
+      "scenario": "A data center holding active pods fails",
+      "impact": "Every pod active there is down until it runs somewhere else.",
+      "answer": "Each pod has a recovery data center. Evacuating a data center means moving its active pods one at a time, and Shopify says the Pod Mover can move one in about a minute without dropping requests or jobs.",
+      "concepts": [
+        {
+          "slug": "multi-region-failover"
+        },
+        {
+          "slug": "health-checks"
+        }
+      ]
+    },
+    {
+      "scenario": "Scaling up for a test breaks something before any extra traffic arrives",
+      "impact": "More app instances open more connections, which can overload an upstream service or the streaming infrastructure even when the platform is idle.",
+      "answer": "Shopify says it finds such issues in early scale tests, then scales the dependency up or adds intermediary software that multiplexes connections, and scales down in the reverse order so upstream services stay safe.",
+      "concepts": [
+        {
+          "slug": "autoscaling"
+        },
+        {
+          "slug": "load-balancing"
+        }
+      ]
+    },
+    {
+      "scenario": "Test traffic does not look like real traffic",
+      "impact": "Load comes from few places and may hit caches, so the test can look better or worse than reality, and passing is not proof the platform is ready.",
+      "answer": "Send part of the traffic past the CDN, bust caches on some requests, add authenticated checkout as 2025's tests did, watch for small rises in latency or errors, and keep repeating the tests.",
+      "concepts": [
+        {
+          "slug": "synthetic-monitoring-and-rum"
+        },
+        {
+          "slug": "slos-and-error-budgets"
+        }
+      ]
+    }
+  ],
+  "alternatives": [
+    {
+      "title": "How to contain the damage from one busy shop",
+      "options": [
+        {
+          "name": "Buy a bigger database server",
+          "pro": "No change to the code",
+          "con": "Shopify says that by 2015 this was no longer possible"
+        },
+        {
+          "name": "Shard the database only",
+          "pro": "Spreads data and load",
+          "con": "Shopify says it lost resilience: one shard down broke actions that looped over all shards"
+        },
+        {
+          "name": "Pods: isolated datastores and one pod per request",
+          "pro": "A failure stays inside a pod, and adding a pod does not disturb the others",
+          "con": "Needs routing such as Sorting Hat and a strict no-cross-pod rule"
+        }
+      ],
+      "pick": "Shopify chose pods. This study's reading is that they keep the horizontal scale of sharding and add isolation."
+    },
+    {
+      "title": "How to protect checkout during the rush",
+      "options": [
+        {
+          "name": "Reject with 429",
+          "pro": "Simple, and common for API clients",
+          "con": "Buyers would read anything that looks like a crash as one"
+        },
+        {
+          "name": "Waiting page with random retries",
+          "pro": "Looks like a queue and protects the platform",
+          "con": "A lottery: Shopify saw waits of up to 40 minutes in a 40 minute sale"
+        },
+        {
+          "name": "Waiting page with a data store of arrival times",
+          "pro": "Direct to build (this study's reading)",
+          "con": "Shopify says it would be a new point of failure and is hard to replicate across data centers"
+        },
+        {
+          "name": "Signed timestamp cookie plus a threshold on each load balancer",
+          "pro": "Fair, and the edge stays stateless",
+          "con": "Needs a control loop that is subtle to tune (this study's reading). Shopify simulated it in MATLAB first"
+        }
+      ],
+      "pick": "Shopify chose the stateless version and wrote that no unfairness reports followed."
+    },
+    {
+      "title": "How to load test before the peak",
+      "options": [
+        {
+          "name": "A scaled-down model",
+          "pro": "Cheaper and easier to run",
+          "con": "Shopify says it is hard to translate databases and other vertically scaled parts, and it assumes predictable horizontal scaling"
+        },
+        {
+          "name": "A full-scale test",
+          "pro": "Finds problems that only appear at the full profile and unexpected dependencies",
+          "con": "A significant extra expense, plus coordination of many teams and cloud capacity"
+        }
+      ],
+      "pick": "Shopify says it chooses full-scale tests for BFCM, repeated several times a year."
+    }
+  ],
+  "roles": [
+    {
+      "id": "client",
+      "label": "Buyers",
+      "description": "Load storefronts and try to check out, often all at the same moment."
+    },
+    {
+      "id": "edge",
+      "label": "Edge load balancers",
+      "description": "Run Sorting Hat, the checkout throttle and the waiting page, using Nginx with Lua."
+    },
+    {
+      "id": "compute",
+      "label": "App servers and guards",
+      "description": "Serve one pod at a time and call other services through breakers and limits."
+    },
+    {
+      "id": "data",
+      "label": "Pods and data centers",
+      "description": "Isolated sets of datastores per pod, with an active and a recovery data center."
+    },
+    {
+      "id": "async",
+      "label": "Test tools",
+      "description": "Load generators and fault injection used to rehearse before the peak."
+    },
+    {
+      "id": "external",
+      "label": "Other services",
+      "description": "Dependencies such as the session store that can be slow or down."
+    }
+  ],
+  "quiz": [
+    {
+      "question": "In a pods design like the one Shopify describes, the database of pod 2 goes down during a sale. What happens to a buyer whose shop lives in pod 1?",
+      "options": [
+        "Their requests slow down, because pod 1 has to borrow database capacity from the failed pod 2",
+        "Their requests fail until pod 2 returns, because all pods share one routing table for every request",
+        "Their requests keep working, because each request needs only its own pod to be online",
+        "Their requests keep working only if the shops in pod 2 pause their sale until the database returns"
+      ],
+      "answer": 2,
+      "explanation": "Shopify says every web request and job is assigned to a single pod, so serving one needs only that pod online. The routing table only chooses a pod and does not need the other pods to answer. Borrowing capacity from the failed pod would be the cross-pod reach that Shopify says it does not allow. And nothing a shop in pod 2 does matters to pod 1, since the datastores are isolated."
+    },
+    {
+      "question": "Shopify's first queue made buyers poll at random, and some waited as long as the sale lasted. Why did Shopify not simply keep every buyer's arrival time in a central data store?",
+      "options": [
+        "A cookie is always more secure than a database, so storing arrival times centrally would risk leaking them",
+        "It would add a new point of failure under load and be hard to replicate across data centers",
+        "A data store cannot hold a timestamp for each buyer once the number of waiting buyers is large",
+        "Buyers whose times are stored centrally would be able to skip the leaky bucket entirely"
+      ],
+      "answer": 1,
+      "explanation": "Shopify's post names two problems: a new point of failure under high load, and load balancers spread over several data centers, where replication and cross data center reads are hard or slow. A database can store a timestamp per buyer, so that is not the limit. The leaky bucket would still apply to anyone the store ranked as high priority. And Shopify never claims cookies are more secure than databases: it signs the cookie only so that it cannot be tampered with."
+    },
+    {
+      "question": "A service that the session code calls hangs, and every call waits 10 seconds before timing out. Why did Shopify build Semian in addition to circuit breakers?",
+      "options": [
+        "A circuit breaker has no way to trigger a fallback response when a call to the service fails",
+        "A circuit breaker needs a shared database to keep its failure count between the servers",
+        "A circuit breaker makes a struggling service worse, because it calls the service more often",
+        "Workers are already blocked before the breaker opens, so Semian caps how many may wait"
+      ],
+      "answer": 3,
+      "explanation": "With a 10 second timeout, workers keep waiting until enough failures are counted, so capacity is lost first. Semian limits how many workers can use the resource at once and fails the rest immediately. Breakers can trigger fallbacks, so a missing fallback is not the issue. This study's model keeps its count in memory, so a database is not needed. And an open circuit makes fewer calls to the service, not more."
+    }
+  ],
+  "sources": [
+    {
+      "title": "A Pods Architecture To Allow Shopify To Scale",
+      "publisher": "Shopify Engineering",
+      "year": 2018,
+      "url": "https://shopify.engineering/a-pods-architecture-to-allow-shopify-to-scale"
+    },
+    {
+      "title": "Surviving Flashes of High-Write Traffic Using Scriptable Load Balancers (Part I)",
+      "publisher": "Shopify Engineering",
+      "year": 2017,
+      "url": "https://shopify.engineering/surviving-flashes-of-high-write-traffic-using-scriptable-load-balancers-part-i"
+    },
+    {
+      "title": "Surviving Flashes of High-Write Traffic Using Scriptable Load Balancers (Part II)",
+      "publisher": "Shopify Engineering",
+      "year": 2017,
+      "url": "https://shopify.engineering/surviving-flashes-of-high-write-traffic-using-scriptable-load-balancers-part-ii"
+    },
+    {
+      "title": "Building and Testing Resilient Ruby on Rails Applications",
+      "publisher": "Shopify Engineering",
+      "year": 2015,
+      "url": "https://shopify.engineering/building-and-testing-resilient-ruby-on-rails-applications"
+    },
+    {
+      "title": "Performance Testing At Scale for BFCM and Beyond",
+      "publisher": "Shopify Engineering",
+      "year": 2023,
+      "url": "https://shopify.engineering/scale-performance-testing"
+    },
+    {
+      "title": "How we prepare Shopify for BFCM",
+      "publisher": "Shopify Engineering",
+      "year": 2025,
+      "url": "https://shopify.engineering/bfcm-readiness-2025"
+    }
+  ]
+}
