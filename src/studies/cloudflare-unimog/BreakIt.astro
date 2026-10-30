@@ -1,0 +1,144 @@
+---
+import PlaygroundShell from '../../components/PlaygroundShell.astro';
+---
+<PlaygroundShell title="Drain a server without breaking connections" hint="Open connections are spread over 4 servers. Drain one or two of them, choose a table with one slot or two slots per bucket, and see how many connections break. A simple model with round numbers, not Cloudflare's code or data.">
+  <ol class="how">
+    <li>Press <b>Reset</b>. With <b>Two slots</b>, <b>Drain A only</b> and <b>1,000</b> connections, <b>0</b> connections break, <b>254</b> (25.4%) now arrive through a second hop, and <b>0</b> of 400 new connections go to the drained server.</li>
+    <li>Set <b>Table</b> to <b>One slot</b>: the table forgets A, so all <b>254</b> connections on A break (25.4%). The new connections still avoid A.</li>
+    <li>Keep <b>One slot</b> and set <b>Changes</b> to <b>Drain A, then B at once</b>: <b>492</b> connections break, because B's are lost too.</li>
+    <li>Set <b>Table</b> back to <b>Two slots</b>, still draining A then B at once: <b>93</b> connections break. B took over some of A's buckets, so when B was drained the table forgot A, and those connections on A had nowhere to go.</li>
+    <li>Set <b>Changes</b> to <b>Drain A, wait, then drain B</b> with <b>100%</b> of A's connections ended: <b>0</b> break. Lower the share to <b>50%</b> and <b>49</b> break, because the connections still open on A reach a bucket that has forgotten A.</li>
+  </ol>
+  <div class="pg unb" data-unb>
+    <div class="pg-row">
+      <label>Table <select class="pg-in" data-slots><option value="two">Two slots (current and previous server)</option><option value="one">One slot (current server only)</option></select></label>
+      <label>Changes <select class="pg-in" data-mode><option value="one">Drain A only</option><option value="both">Drain A, then B at once</option><option value="wait">Drain A, wait, then drain B</option></select></label>
+      <label>Open connections <input type="range" min="200" max="2000" step="200" value="1000" data-n /> <b data-nval></b></label>
+      <label>Connections on A that end during the wait (%) <input type="range" min="0" max="100" step="10" value="100" data-e /> <b data-eval></b></label>
+      <button type="button" class="btn" data-reset>Reset</button>
+    </div>
+    <div class="pg-grid">
+      <div class="pg-box" data-b1><h3>Connections broken</h3><span class="pg-mono" data-o1></span><span class="pg-note" data-n1></span></div>
+      <div class="pg-box" data-b2><h3>Connections arriving by a second hop</h3><span class="pg-mono" data-o2></span><span class="pg-note" data-n2></span></div>
+      <div class="pg-box" data-b3><h3>New connections sent to a drained server</h3><span class="pg-mono" data-o3></span><span class="pg-note" data-n3></span></div>
+      <div class="pg-box" data-b4><h3>Connections that ended during the wait</h3><span class="pg-mono" data-o4></span><span class="pg-note" data-n4></span></div>
+    </div>
+    <div class="unb-strip-wrap">
+      <p class="pg-note unb-cap">Each server, with the connections that were open on it:</p>
+      <ol class="unb-strip" data-strip></ol>
+      <p class="pg-note">ok = none of its connections broke, broken = some did.</p>
+    </div>
+    <p class="pg-out" data-verdict aria-live="polite"></p>
+    <p class="pg-note">Model, invented for teaching and not Cloudflare data: 4 servers, A to D, and a table of 64 buckets that starts with 16 buckets for each (Cloudflare says real tables have more than 100 times as many buckets as servers). Each connection is hashed into a bucket and is open on that bucket's server. Draining a server gives each of its buckets to whichever remaining server has the fewest buckets, and a two-slot table also keeps the drained server in the bucket's second slot. A packet then goes to the first server if it has the connection, to the second server if only that one has it, and otherwise the connection breaks. Only the first and second slot are kept, as Cloudflare says Unimog does, so a second change to the same bucket forgets the server from before the first one. Packets for new connections always go to the first server. The connections that end are the lowest-numbered ones on A. Real systems are more complicated than this.</p>
+  </div>
+</PlaygroundShell>
+<style>
+  .unb-strip-wrap { display: grid; gap: 6px; }
+  .unb-cap { margin: 0; }
+  .unb-strip { list-style: none; margin: 0; padding: 0; display: flex; flex-wrap: wrap; gap: 3px; }
+  .unb-strip li { flex: 1 1 9rem; min-width: 0; padding: 4px 6px; display: grid; place-items: center; text-align: center; border-radius: 5px; font: 600 .75rem var(--font-mono); border: 1px solid var(--border); background: var(--surface); color: var(--text); overflow-wrap: anywhere; }
+  .unb-strip li[data-k='ok'] { background: color-mix(in srgb, var(--good) 22%, var(--surface)); }
+  .unb-strip li[data-k='broken'] { background: color-mix(in srgb, var(--bad) 16%, var(--surface)); color: var(--bad-text); border-style: dashed; }
+</style>
+<script>
+  document.querySelectorAll<HTMLElement>('[data-unb]').forEach((root) => {
+    const q = <T extends HTMLElement>(s: string) => root.querySelector<T>(s)!;
+    const NAMES = ['A', 'B', 'C', 'D'];
+    const BUCKETS = 64; // a power of 2, so the low 6 bits of the hash pick the bucket
+    const MASK = BUCKETS - 1;
+    const NONE = -1;
+    const FRESH = 400; // new connections tried after the changes
+    const DEFAULTS: Record<string, string> = { slots: 'two', mode: 'one', n: '1000', e: '100' };
+    const strip = q('[data-strip]');
+    const cells = NAMES.map(() => { const li = document.createElement('li'); strip.append(li); return li; });
+    const fmt = (n: number) => Math.round(n).toLocaleString('en-US');
+    const pct = (a: number, b: number) => `${(Math.round((1000 * a) / b) / 10).toFixed(1)}%`;
+    const input = (k: string) => q<HTMLInputElement>(`[data-${k}]`);
+    const select = (k: string) => q<HTMLSelectElement>(`[data-${k}]`);
+
+    // 32-bit FNV-1a of the connection's name, mixed so that the low bits are well spread
+    function hash(text: string) {
+      let h = 0x811c9dc5;
+      for (let i = 0; i < text.length; i++) h = Math.imul(h ^ text.charCodeAt(i), 0x01000193) >>> 0;
+      h ^= h >>> 16; h = Math.imul(h, 0x85ebca6b) >>> 0; h ^= h >>> 13; h = Math.imul(h, 0xc2b2ae35) >>> 0; h ^= h >>> 16;
+      return h >>> 0;
+    }
+    const bucketOf = (c: number) => hash(`conn-${c}`) & MASK;
+
+    function simulate(twoSlots: boolean, mode: string, conns: number, endPct: number) {
+      const table = Array.from({ length: BUCKETS }, (_, i) => [i % NAMES.length, NONE]);
+      const sockets = NAMES.map(() => new Set<number>());
+      for (let c = 0; c < conns; c++) sockets[table[bucketOf(c)][0]].add(c);
+      const drained = new Set<number>();
+      const drain = (victim: number) => {
+        drained.add(victim);
+        const others = NAMES.map((_, s) => s).filter((s) => !drained.has(s));
+        for (const b of table) {
+          if (b[0] !== victim) continue;
+          const counts = NAMES.map((_, s) => table.filter((x) => x[0] === s).length);
+          let best = others[0];
+          for (const s of others) if (counts[s] < counts[best]) best = s;
+          b[0] = best; b[1] = twoSlots ? victim : NONE;
+        }
+      };
+      drain(0);
+      let ended = 0;
+      if (mode !== 'one') {
+        if (mode === 'wait') {
+          const mine = [...sockets[0]].sort((x, y) => x - y);
+          for (const c of mine.slice(0, Math.floor((mine.length * endPct) / 100))) { sockets[0].delete(c); ended++; }
+        }
+        drain(1);
+      }
+      let broken = 0, hops = 0, open = 0;
+      const per = NAMES.map(() => ({ open: 0, broken: 0 }));
+      sockets.forEach((set, owner) => set.forEach((c) => {
+        open++; per[owner].open++;
+        const [first, second] = table[bucketOf(c)];
+        if (sockets[first].has(c)) return;
+        if (second !== NONE && sockets[second].has(c)) { hops++; return; }
+        broken++; per[owner].broken++;
+      }));
+      let toDrained = 0;
+      for (let k = 0; k < FRESH; k++) if (drained.has(table[bucketOf(100000 + k)][0])) toDrained++;
+      return { broken, hops, ended, toDrained, per, open, drained: [...drained] };
+    }
+
+    function draw() {
+      const two = select('slots').value === 'two'; const mode = select('mode').value;
+      const conns = Number(input('n').value); const endPct = Number(input('e').value);
+      q('[data-nval]').textContent = fmt(conns); q('[data-eval]').textContent = String(endPct);
+      input('e').disabled = mode !== 'wait';
+      const r = simulate(two, mode, conns, endPct);
+      q('[data-o1]').textContent = fmt(r.broken);
+      q('[data-n1]').textContent = r.broken ? `${pct(r.broken, conns)} of the ${fmt(conns)} connections that were open` : 'every open connection kept working';
+      q('[data-o2]').textContent = fmt(r.hops);
+      q('[data-n2]').textContent = two ? `${pct(r.hops, conns)} of the connections, each needing one extra forward` : 'a one-slot table has no second hop';
+      q('[data-o3]').textContent = `${fmt(r.toDrained)} of ${FRESH}`;
+      q('[data-n3]').textContent = 'a new connection starts with a SYN, which always stays on the first server';
+      q('[data-o4]').textContent = fmt(r.ended);
+      q('[data-n4]').textContent = mode === 'wait' ? `${pct(r.ended, conns)} of the connections, closed by themselves before B was drained` : 'only used by the wait option';
+      const bad = [r.broken > 0, false, r.toDrained > 0, false];
+      ['b1', 'b2', 'b3', 'b4'].forEach((b, i) => q<HTMLElement>(`[data-${b}]`).style.setProperty('--c', bad[i] ? 'var(--bad)' : 'var(--good)'));
+      cells.forEach((c, i) => {
+        const p = r.per[i]; const k = p.broken ? 'broken' : 'ok';
+        c.textContent = `${NAMES[i]}${r.drained.includes(i) ? ' (drained)' : ''}: ${fmt(p.open)} open, ${fmt(p.broken)} broken`;
+        c.dataset.k = k;
+      });
+      const nBad = r.per.filter((p) => p.broken > 0).length;
+      strip.setAttribute('aria-label', `${nBad} of ${NAMES.length} servers had broken connections`);
+      const out = q('[data-verdict]'); out.classList.toggle('bad', r.broken > 0);
+      if (!r.broken) out.textContent = `Nothing broke. ${two ? `${fmt(r.hops)} connections now arrive on a server that passes them on to the one that holds them.` : 'Only one server was drained, and its connections were closed or moved without a break.'}`;
+      else if (!two) out.textContent = `${fmt(r.broken)} connections broke. With one slot per bucket the table forgets the drained server, so its packets reach a server that has no socket for them and is answered with a reset. Use two slots.`;
+      else out.textContent = `${fmt(r.broken)} connections broke even with two slots. A bucket remembers only one previous server, and the second drain changed buckets that still pointed at A. Wait for A's connections to end before the next change.`;
+    }
+    root.addEventListener('input', draw);
+    root.addEventListener('change', draw);
+    q('[data-reset]').addEventListener('click', () => {
+      ['slots', 'mode'].forEach((k) => (select(k).value = DEFAULTS[k]));
+      ['n', 'e'].forEach((k) => (input(k).value = DEFAULTS[k]));
+      draw();
+    });
+    draw();
+  });
+</script>

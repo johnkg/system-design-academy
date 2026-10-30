@@ -57,4 +57,7 @@ export const aliasGroups: string[][] = [
   ['slack', 'job queue', 'kafka', 'kafkagate', 'jqrelay', 'background jobs', 'async jobs', 'redis out of memory'],
   ['shopify', 'flash sale', 'black friday', 'pods', 'sorting hat', 'checkout queue', 'semian', 'toxiproxy', 'load testing'],
   ['cloudflare', 'quicksilver', 'configuration distribution', 'lmdb', 'kyoto tycoon', 'edge config', 'negative lookup'],
+  ['meta', 'facebook', 'cache invalidation', 'stale cache', 'cache consistency', 'polaris', 'tao', 'cache fill race'],
+  ['linkedin', 'kafka', 'commit log', 'kafka partitions', 'kafka replication', 'venice', 'log throughput'],
+  ['unimog', 'cloudflare load balancer', 'layer 4 load balancer', 'xdp', 'ebpf', 'ecmp', 'connection draining'],
 ];

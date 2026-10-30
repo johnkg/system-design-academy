@@ -4,9 +4,10 @@ export interface Change { date: string; title: string; items: { text: string; hr
 export const changelog: Change[] = [
   {
     date: '2026-10-29',
-    title: 'Three more case studies from real companies',
+    title: 'Six more case studies from real companies',
     items: [
       { text: 'How Slack scaled its job queue, how Shopify survives flash sales, and how Cloudflare distributes configuration with Quicksilver. Like the earlier company studies, each is built only from the company\'s own public engineering posts, listed at the end of the page; the simulations and code are small teaching models, not their systems.', href: 'case-studies/' },
+      { text: 'Three more: how Meta keeps its caches consistent with the database, how LinkedIn made Kafka a cheap, fast log, and how Cloudflare built Unimog, its edge load balancer.', href: 'case-studies/' },
     ],
   },
   {
