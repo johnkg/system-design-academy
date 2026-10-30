@@ -3,6 +3,13 @@ export interface Change { date: string; title: string; items: { text: string; hr
 
 export const changelog: Change[] = [
   {
+    date: '2026-10-30',
+    title: 'An interview guide',
+    items: [
+      { text: 'What a system design interview is judged on, how to spend 45 minutes, what to say at each stage, common mistakes, short answers to the usual follow-up questions, and a table that maps 18 classic questions to the case study and ideas to read.', href: 'interview-guide/' },
+    ],
+  },
+  {
     date: '2026-10-29',
     title: 'Six more case studies from real companies',
     items: [
