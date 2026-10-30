@@ -3,6 +3,14 @@ export interface Change { date: string; title: string; items: { text: string; hr
 
 export const changelog: Change[] = [
   {
+    date: '2026-10-31',
+    title: 'Interview questions with model answers',
+    items: [
+      { text: '24 interview questions: ideas like caching and retries, classic designs like a rate limiter, and the "tell me about a time" kind. Open one to see what a strong answer covers, the follow-ups to expect, common slips and which pages to read next.', href: 'interview-questions/' },
+      { text: 'A "Drill me" mode picks a question you have not tried, runs a 2, 3 or 5 minute clock you can pause, then lets you tick the points you covered. Your grades stay in this browser.', href: 'interview-questions/' },
+    ],
+  },
+  {
     date: '2026-10-30',
     title: 'An interview guide',
     items: [

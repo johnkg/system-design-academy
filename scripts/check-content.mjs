@@ -130,6 +130,31 @@ if (share > MAX_LONGEST_SHARE) err('quizzes', `the correct option is the single 
   }
 }
 
+// 6. Interview questions: ids unique, 4 to 6 covers, at least 2 follow-ups, at least 1 pitfall, and every read link points at a real page.
+{
+  const text = readFileSync(join(root, 'data/interviewQuestions.ts'), 'utf8');
+  const start = text.indexOf('export const interviewQuestions');
+  const blocks = text.slice(start).split(/\n  \{\n    id: /).slice(1);
+  const seen = new Set();
+  const list = (b, key) => { const m = b.match(new RegExp(`\\n    ${key}: \\[\\n([\\s\\S]*?)\\n    \\],`)); return m ? m[1].split('\n').filter((l) => l.trim()) : []; };
+  if (blocks.length < 20) err('data/interviewQuestions.ts', `only ${blocks.length} questions found`);
+  for (const b of blocks) {
+    const id = b.match(/^'([^']+)'/)?.[1] ?? '(no id)';
+    const w = `data/interviewQuestions.ts [${id}]`;
+    if (seen.has(id)) err(w, 'duplicate id'); seen.add(id);
+    if (!/kind: '(concept|design|tradeoff)'/.test(b)) err(w, 'kind must be concept, design or tradeoff');
+    if (!/level: '(beginner|intermediate|advanced)'/.test(b)) err(w, 'level must be beginner, intermediate or advanced');
+    const covers = list(b, 'covers'), follow = list(b, 'followUps'), pit = list(b, 'pitfalls');
+    if (covers.length < 4 || covers.length > 6) err(w, `covers has ${covers.length} points (needs 4 to 6)`);
+    if (follow.length < 2 || follow.length > 3) err(w, `followUps has ${follow.length} (needs 2 or 3)`);
+    if (pit.length < 1 || pit.length > 2) err(w, `pitfalls has ${pit.length} (needs 1 or 2)`);
+    if (/[—–]/.test(b)) warn(w, 'contains a dash character (house style prefers commas or full stops)');
+    const reads = [...b.matchAll(/\{ kind: '(concept|study)', slug: '([^']+)' \}/g)];
+    if (!reads.length) err(w, 'no read links');
+    for (const [, k, slug] of reads) if (!has(k === 'concept' ? 'concepts' : 'studies', slug)) err(w, `read ${k} "${slug}" does not exist`);
+  }
+}
+
 for (const w of warnings) console.warn(`warn  ${w}`);
 for (const e of errors) console.error(`ERROR ${e}`);
 console.log(`checked ${Object.keys(meta).length} pages and ${dist.total} quiz questions (correct option longest in ${share}%): ${errors.length} error(s), ${warnings.length} warning(s)`);
