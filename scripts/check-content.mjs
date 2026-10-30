@@ -59,6 +59,17 @@ for (const [kind, list] of Object.entries(kinds)) for (const s of list) for (con
 for (const s of kinds.concepts) {
   if (!existsSync(join(root, 'content/concepts', s, 'visuals/steps.json'))) err(`concepts/${s}`, 'missing visuals/steps.json');
   if (!meta[`concepts/${s}`].quiz) err(`concepts/${s}`, 'no quiz');
+  // Meters under the animation: every reading names a defined meter and stays within 0..max.
+  const stepsPath = join(root, 'content/concepts', s, 'visuals/steps.json');
+  if (existsSync(stepsPath)) {
+    const st = read(stepsPath), defs = new Map((st.meters ?? []).map((m) => [m.id, m]));
+    if (defs.size !== (st.meters ?? []).length) err(`concepts/${s}`, 'two meters share an id');
+    st.frames.forEach((fr, i) => Object.entries(fr.meters ?? {}).forEach(([id, v]) => {
+      const m = defs.get(id);
+      if (!m) err(`concepts/${s}`, `frame ${i + 1} sets unknown meter "${id}"`);
+      else if (typeof v !== 'number' || v < 0 || v > m.max) err(`concepts/${s}`, `frame ${i + 1} meter "${id}" is ${v}, outside 0 to ${m.max}`);
+    }));
+  }
 }
 for (const s of kinds.studies) {
   const d = join(root, 'content/studies', s);
