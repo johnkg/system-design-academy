@@ -4,10 +4,12 @@ export interface Change { date: string; title: string; items: { text: string; hr
 export const changelog: Change[] = [
   {
     date: '2026-10-31',
-    title: 'Interview questions with model answers',
+    title: 'Interview questions, readings under the animations and tidier how-to steps',
     items: [
       { text: '24 interview questions: ideas like caching and retries, classic designs like a rate limiter, and the "tell me about a time" kind. Open one to see what a strong answer covers, the follow-ups to expect, common slips and which pages to read next.', href: 'interview-questions/' },
       { text: 'A "Drill me" mode picks a question you have not tried, runs a 2, 3 or 5 minute clock you can pause, then lets you tick the points you covered. Your grades stay in this browser.', href: 'interview-questions/' },
+      { text: 'Seven animations (caching, load balancing, rate limiting, circuit breaker, message queues, CDN and backpressure) now show small readings under the picture, such as tokens left in the bucket or database queries so far, that change as you step through.', href: 'concepts/rate-limiting/' },
+      { text: 'Thirty-six "how to try it" steps now say what to press or set first, and 68 button and option names match the simulation exactly. The app icons and share image use the new colours.' },
     ],
   },
   {
