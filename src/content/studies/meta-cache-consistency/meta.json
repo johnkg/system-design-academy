@@ -1,0 +1,435 @@
+{
+  "name": "How Meta Keeps Its Caches Consistent with the Database",
+  "difficulty": "advanced",
+  "intent": "Follow Meta's own account of cache consistency: why TAO was built in front of MySQL, why a cache that uses invalidations can end up holding a stale value for ever, how Meta measures that with a service called Polaris, how it traces only the moments where a cache can go wrong, and one rare bug that this found.",
+  "codeTitle": "a cache race, a buggy error handler and a Polaris-style check, as a small model",
+  "finalIntro": "One cache fill that races a write on the same item, and the check that would catch a stale copy (simple version numbers for illustration).",
+  "prompt": "A cache keeps copies of data that really lives in a database (the source of truth), so reads are fast and the database is protected. When the data changes, something has to tell the cache; this is called cache invalidation (removing or updating a cached copy because the source changed). Design a cache that stays consistent with its database, and a way to know how consistent it really is. This study follows what Meta says in two of its own engineering posts: 'Cache made consistent' (Lu Pan, June 2022) and 'TAO: The power of the graph' (Mark Marchukov, June 2013). TAO is Meta's graph data store and Memcache is its key-value cache. Everything about Meta below comes from those two posts. The simulations and code samples are small teaching models with made-up round numbers, not Meta's code, systems or data.",
+  "functional": [
+    "Answer most reads from a cache, and fill the cache from the database when a value is missing",
+    "When data is written, make sure cached copies are invalidated or updated, even when the write races with a read that is filling the cache",
+    "Measure how often a cache holds a value that differs from the database, and raise an alarm when it does",
+    "Give engineers enough history to explain why a cache ended up with a wrong value"
+  ],
+  "nonFunctional": [
+    "The core promise Meta describes in 2022: the cache should eventually be consistent with the database, which Meta calls a client-observable invariant (a rule that a client could check from outside)",
+    "Trustworthy measurement: the 2022 post says a metric with false positives would be ignored, and that it must be precise enough to measure more than 10 nines of consistency",
+    "Huge scale: the 2022 post says TAO serves more than one quadrillion queries a day, so even at a 99 percent hit rate there would be more than 10 trillion cache fills a day",
+    "Protect the database: the 2022 post says queries that bypass the cache are compute-intensive and put the database at risk, and protecting the database is one of the most common reasons to have a cache",
+    "Availability over perfect freshness by default: the 2013 post says TAO chose eventual consistency as its default, and lets clients that need strong consistency ask for it at a higher cost",
+    "Fast diagnosis: the 2022 post describes finding a rare bug in under 30 minutes, where it says such a bug could once take weeks, if it was found at all"
+  ],
+  "firstAttempt": {
+    "text": "The 2013 post describes the first approach: Memcache (a networked in-memory key-value store) in front of MySQL, used since 2005. Product engineers worked with both stores directly, through a data access library: MySQL for relational tables, and Memcache for flat key-value pairs derived from SQL queries. The post says Memcache will not fill itself on a cache miss or maintain cache consistency, so that work fell to every product team.",
+    "limits": [
+      "Using Memcache and MySQL well took knowledge of system internals, and the 2013 post says some engineers made mistakes that led to bugs, user-visible inconsistencies and site performance issues",
+      "Changing a table schema needed coordination between product engineers and MySQL cluster operators, which slowed releases",
+      "The 2013 post says a first client-side version of a graph API on top of this had the cache consistency problem too, and that small updates to a list of edges invalidated the whole cached list, lowering the hit rate",
+      "Nothing in this setup measured how often a cached value was wrong (this study's reading: the posts do not describe any measurement at this stage)"
+    ]
+  },
+  "nodes": [
+    {
+      "id": "app",
+      "label": "Products",
+      "kind": "client",
+      "x": 10,
+      "y": 50
+    },
+    {
+      "id": "memcache",
+      "label": "Memcache, used directly",
+      "kind": "edge",
+      "x": 40,
+      "y": 16,
+      "at": 0,
+      "until": 1
+    },
+    {
+      "id": "follower",
+      "label": "TAO follower cache",
+      "kind": "edge",
+      "x": 38,
+      "y": 50,
+      "at": 1
+    },
+    {
+      "id": "leader",
+      "label": "TAO leader cache",
+      "kind": "edge",
+      "x": 62,
+      "y": 50,
+      "at": 1
+    },
+    {
+      "id": "mysql",
+      "label": "MySQL",
+      "kind": "data",
+      "x": 90,
+      "y": 50
+    },
+    {
+      "id": "inval",
+      "label": "Invalidation events",
+      "kind": "async",
+      "x": 62,
+      "y": 84,
+      "at": 2
+    },
+    {
+      "id": "polaris",
+      "label": "Polaris",
+      "kind": "compute",
+      "x": 30,
+      "y": 84,
+      "at": 3
+    },
+    {
+      "id": "trace",
+      "label": "Consistency tracing log",
+      "kind": "compute",
+      "x": 90,
+      "y": 84,
+      "at": 4
+    }
+  ],
+  "edges": [
+    {
+      "from": "app",
+      "to": "memcache",
+      "at": 0,
+      "until": 1
+    },
+    {
+      "from": "app",
+      "to": "mysql",
+      "at": 0,
+      "until": 1
+    },
+    {
+      "from": "app",
+      "to": "follower",
+      "at": 1
+    },
+    {
+      "from": "follower",
+      "to": "leader",
+      "at": 1
+    },
+    {
+      "from": "leader",
+      "to": "mysql",
+      "at": 1
+    },
+    {
+      "from": "mysql",
+      "to": "inval",
+      "at": 2
+    },
+    {
+      "from": "inval",
+      "to": "leader",
+      "at": 2
+    },
+    {
+      "from": "inval",
+      "to": "polaris",
+      "at": 3
+    },
+    {
+      "from": "polaris",
+      "to": "follower",
+      "at": 3
+    },
+    {
+      "from": "follower",
+      "to": "trace",
+      "at": 4
+    },
+    {
+      "from": "inval",
+      "to": "trace",
+      "at": 4
+    }
+  ],
+  "quiz": [
+    {
+      "question": "A cache keeps a version number with each entry and ignores any incoming value whose version is older. It fills x as 42 at version 1, but before that reply arrives, a write sets x to 43 at version 2 and the invalidation for it is applied. Then the entry for x is evicted to make room. The slow fill reply for 42 at version 1 now arrives. What does the 2022 post's reasoning say happens?",
+      "options": [
+        "The cache rejects 42, because a version check works even when the entry is gone",
+        "The cache rejects 42, because evicting an entry also cancels fills that are still running",
+        "The cache accepts 42, because it has lost any knowledge of version 2",
+        "The cache accepts 42 for a moment, and the database then pushes 43 again within seconds"
+      ],
+      "answer": 2,
+      "explanation": "The post says a version field lets the cache refuse older data, but cache memory is not durable and an entry can be evicted, and then the cache host loses knowledge of the newer data. With no entry there is nothing to compare against, so 42 is stored while the database holds 43. A version check only works while the version is still known, so rejecting 42 is wrong. Eviction does not cancel an in-flight fill, which is exactly why the late reply can still land. Nothing in the post says the database re-sends the value later; the post says such a wrong value can stay indefinitely."
+    },
+    {
+      "question": "Polaris receives an invalidation saying x is at version 4, asks a cache replica for x, and gets the answer that x does not exist. Why does it not immediately query the database to settle it?",
+      "options": [
+        "Bypassing the cache is costly and risky for the database, and most mismatches clear on retry",
+        "Polaris has no way to read the database, so it can only compare the cache replicas with each other",
+        "A missing key is always correct, because deleted keys never appear in invalidations",
+        "The database might hold version 3, and Polaris must wait for the cache to expire it"
+      ],
+      "answer": 0,
+      "explanation": "The post says bypassing the cache is compute-intensive and exposes the database to risk, and that real inconsistencies and racing writes on the same key are rare. So Polaris retries the check and only does the expensive check once a sample has stayed inconsistent past a reporting timescale such as one or five minutes. The statement that Polaris cannot read the database is wrong, since the post says it does bypass the cache at that point. A missing key is not always correct: it could be a real inconsistency, or a newer version 5 write that deleted x, and telling these apart is the reason for the database check. Waiting for the cache to expire entries is not part of the design described."
+    },
+    {
+      "question": "In the real bug in the 2022 post, an error handler ran drop_cache(key, version) after a rare transient error, and the stale entry stayed in the cache for good. The handler drops the cached item only if its version is less than the version given. Why did it do nothing?",
+      "options": [
+        "The handler was called with the wrong key, so a different entry was dropped",
+        "The database transaction rolled back, so there was no newer version to compare with",
+        "The cache entry had been evicted already, so there was nothing left for it to drop",
+        "The entry already had the latest version, so it was not lower than the one given"
+      ],
+      "answer": 3,
+      "explanation": "The stale item held metadata 0 at version 4 while the database held metadata 1 at version 4, because the cache fill interleaved with a transaction that updates two tables. The entry therefore already had the latest version, so the rule 'drop if the version is lower' did not apply and the wrong metadata stayed. The post does not say the key was wrong, and does not say the transaction rolled back: the database held the new data. If the entry had been evicted there would be no stale value left to find, yet the cache still held the wrong one."
+    }
+  ],
+  "steps": [
+    {
+      "title": "Put one cache service, TAO, between products and MySQL",
+      "problem": "In the 2013 post, product engineers had to use Memcache and MySQL by hand. Memcache does not fill itself or keep itself consistent, so mistakes led to bugs and inconsistencies users could see. Meta first tried a client-side graph API (objects and associations) on the web servers, but it had limits: a small update to a list of edges invalidated the whole cached list, whole lists were moved over the network, cache consistency was hard to maintain, and avoiding thundering herds (many requests rushing to refill the same missing value at once) needed coordination that Memcache could not give.",
+      "fix": "A team of infrastructure engineers started TAO in early 2009: a distributed service built around the graph model, where objects are nodes and associations are edges. The 2013 post says clients talk to TAO servers in caching clusters, which satisfy most reads from a write-through cache (a cache that is updated as part of the write), run the writes and maintain cache consistency across all TAO clusters. Each region has two tiers of caching clusters: followers, which clients talk to, and leaders, which followers ask on a miss and which talk to MySQL. All writes go through followers to leaders, caches are updated as the reply to a successful write passes back down the chain, and leaders are responsible for consistency within a region. Data is split into hundreds of thousands of shards. Each shard has one primary region, and MySQL replication carries updates to the other regions, which forward their writes to the primary.",
+      "tradeoff": "Product engineers no longer write against two stores, and the cache is shaped for the graph workload. The cost is a consistency model that is deliberately relaxed: the 2013 post says eventual consistency is the default, chosen for performance and because failures and network partitions are certain, and that for many products losing some consistency is a lesser evil than losing availability. TAO tries hard, with high probability, to let users see their own updates, and a client that needs strong consistency can ask for it at a higher cost and a risk to availability.",
+      "concepts": [
+        {
+          "slug": "caching"
+        },
+        {
+          "slug": "database-replication"
+        },
+        {
+          "slug": "consistency-models"
+        },
+        {
+          "slug": "cap-theorem"
+        }
+      ]
+    },
+    {
+      "title": "Treat invalidation as a race between the fill path and the write path",
+      "problem": "The 2022 post explains why this is hard with an example. A cache host tries to fill x from the database, but before the reply 'x=42' reaches it, someone changes x to 43. The invalidation for 43 arrives first and sets x to 43. Then the old fill reply arrives and sets x to 42. The database holds 43 and the cache holds 42, and it can stay that way indefinitely. The post stresses that a cache like TAO or Memcache changes on both the read path (a fill) and the write path (an invalidation), and that its contents are not durable, so this combination allows many races.",
+      "fix": "The post names one way to solve it: keep a version field on each item, so older data never overwrites newer data. The post then points out where this is not enough: if the entry 'x=43 at version 2' is evicted before 'x=42' arrives, the cache host loses knowledge of the newer data. The post does not say how this was resolved in TAO. This study uses the idea only to show the shape of the problem.",
+      "tradeoff": "A version check settles most races cheaply, but it relies on remembering versions inside a cache that is allowed to forget. Keeping versions for evicted entries would cost memory, which is this study's reading of the trade-off and not something the post describes. The post's broader point is that the protocol is only half of the difficulty: designing a consistent cache is different from operating one, much like designing Paxos is different from running Paxos in production.",
+      "concepts": [
+        {
+          "slug": "optimistic-concurrency-and-etags"
+        },
+        {
+          "slug": "logical-clocks"
+        },
+        {
+          "slug": "caching"
+        }
+      ]
+    },
+    {
+      "title": "Measure consistency from outside with Polaris",
+      "problem": "The post says the first step is measurement, and the measurement must not contain false positives, because people tune out noise and a distrusted metric becomes useless. It must also be precise enough to show a fix improved things when the numbers have more than 10 nines. The post also argues that an anomaly only matters if clients can observe it.",
+      "fix": "Meta built Polaris, which acts as a client of a stateful service and assumes nothing about its internals, so it can be generic; the post says there are dozens of Polaris integrations at Meta. For caches, Polaris pretends to be a cache server and receives invalidation events. When it sees, say, 'x=4 at version 4', it asks the cache replicas as a client, and if one returns 'x=3 at version 3' it flags a mismatch and requeues the sample to check the same host again later. A sample is only reported if it is still inconsistent after a timescale, for example one, five or ten minutes. A special flag in the query lets Polaris tell whether the cache host has already processed the invalidation, which separates transient inconsistency (usually replication or invalidation lag) from a stale value that stays after the latest invalidation was processed. The result is a metric of the form 'N nines of cache writes are consistent in M minutes'. For TAO at the five-minute timescale it showed 99.99999999 percent, meaning fewer than 1 in 10 billion cache writes inconsistent after five minutes. Polaris runs as a separate service so it scales independently, and measuring more nines means more throughput or a longer window.",
+      "tradeoff": "Retries and long timescales keep false alarms and database load down, because the expensive cache-bypassing query is delayed until a sample has crossed a timescale boundary. The cost, in this study's reading, is that an inconsistency that clears before a timescale ends is not counted in that timescale's number, by design. Polaris also tells you that a cache is wrong and how often, but not why.",
+      "concepts": [
+        {
+          "slug": "metrics"
+        },
+        {
+          "slug": "synthetic-monitoring-and-rum"
+        },
+        {
+          "slug": "alerting"
+        }
+      ]
+    },
+    {
+      "title": "Trace only the small window where a cache can go wrong",
+      "problem": "To explain a mismatch you want a history of every change to that cache entry. The post says that is almost impractical: caches usually exist for read-heavy workloads, so most state changes are fills. With TAO serving more than one quadrillion queries a day, even a 99 percent hit rate means more than 10 trillion fills a day, and logging all of them would turn a read-heavy cache into a write-heavy load on the logging system.",
+      "fix": "The post looks at the problem from one cache server's view: did it receive the invalidation, did it process it correctly, and did the item become inconsistent afterwards. On a space-time diagram, after a client write there is a short window in which the invalidation and a cache fill can race. After that the entry is quiet, and the cache behaves like a static one. Meta built a stateful tracing library that logs cache mutations only in that window. It keeps an index of recently modified data to decide whether a later change should be logged, covers evictions, lets a missing log line show that an invalidation never arrived, and can trace the code path of each traced query. It is embedded in a few major cache services and throughout the invalidation pipeline.",
+      "tradeoff": "Logging cost stays small because only the moments that matter are recorded, and it turned a hopeless debugging problem into a tractable one. The cost is a library inside cache servers and the invalidation pipeline, and an index of recent writes to keep. By this study's reading, anything that goes wrong outside the traced window is not recorded.",
+      "concepts": [
+        {
+          "slug": "distributed-tracing"
+        },
+        {
+          "slug": "structured-logging"
+        },
+        {
+          "slug": "cardinality-and-sampling"
+        }
+      ]
+    },
+    {
+      "title": "Use the timeline to find a rare bug",
+      "problem": "The post describes a bug found in 2022. In one system the cache held 'metadata=0 at version 4' while the database held 'metadata=1 at version 4', and it stayed that way, which the post says should have been impossible. The cause was hidden behind a very rare ordering of events.",
+      "fix": "Consistency tracing gave the timeline. A rare operation updates a metadata table and a version table in one database transaction. The cache's first fill got the old metadata; then the transaction updated both tables; then a second fill, interleaved with that transaction, filled the new version while the metadata stayed old. That alone should still be repaired by the invalidation. But the invalidation hit a rare transient error on the cache host, and the error handler ran drop_cache(key, version), which drops the item only if its version is less than the given one. The stale item already had the latest version, so nothing was dropped. Polaris raised the alarm at once, and with the timeline on-call engineers located the bug in under 30 minutes. The post says that years earlier this could take weeks for someone who knew the code well. It says the bug was found and fixed, and does not describe the fix.",
+      "tradeoff": "Rare, ordered, cross-system bugs become findable. The post is clear that this is an ongoing effort and lists future work: getting all caches as close to 100 percent consistent as physically possible, the harder case of secondary indices kept apart from the data, measuring and improving consistency at read time, and a high-level consistency API for distributed systems.",
+      "concepts": [
+        {
+          "slug": "distributed-tracing"
+        },
+        {
+          "slug": "mvcc-and-isolation-levels"
+        },
+        {
+          "slug": "retries-and-backoff"
+        }
+      ]
+    }
+  ],
+  "failures": [
+    {
+      "scenario": "A cache fill reads x=42 from the database, a write then sets x=43, the invalidation for 43 arrives first, and the slow fill reply arrives last",
+      "impact": "The 2022 post says the cache ends with x=42 while the database holds 43, and the cache can keep the wrong value indefinitely.",
+      "answer": "Keep a version with each item so that older data never overwrites newer data. The post adds that this fails if the newer entry is evicted before the old reply arrives, because the cache host loses knowledge of the newer data.",
+      "concepts": [
+        {
+          "slug": "optimistic-concurrency-and-etags"
+        },
+        {
+          "slug": "caching"
+        }
+      ]
+    },
+    {
+      "scenario": "A messaging feature moves Alice's primary message storage from region 2 to region 1, and one TAO replica still holds the old location",
+      "impact": "The 2022 post says that years ago, when TAO was less consistent, this happened: Bob's message went to region 1 and Mary's, which hit the stale replica, went to region 2, and neither store had a complete copy of Alice's messages. The post says cache inconsistency can be almost as bad as data loss, and from a user's view can look the same.",
+      "answer": "Make the cache more consistent and measure it. The post says that by one measure TAO's consistency rose from 99.9999 percent to 99.99999999 percent over the years.",
+      "concepts": [
+        {
+          "slug": "consistency-models"
+        },
+        {
+          "slug": "database-replication"
+        }
+      ]
+    },
+    {
+      "scenario": "An invalidation hits a rare transient error on the cache host, and the error handler only drops items whose version is lower than the one it was given",
+      "impact": "The stale item already had the latest version, so nothing was dropped and the cache held the wrong metadata indefinitely (the post's real bug, simplified).",
+      "answer": "Polaris alarmed, and consistency tracing showed every step, so on-call engineers found the cause in under 30 minutes. The post says the bug was fixed but does not describe how.",
+      "concepts": [
+        {
+          "slug": "retries-and-backoff"
+        },
+        {
+          "slug": "distributed-tracing"
+        }
+      ]
+    },
+    {
+      "scenario": "The consistency checker sees that the cache has no value for x although an invalidation said x is at version 4",
+      "impact": "It could be a real inconsistency, or a version 5 write may have deleted x and the checker is seeing newer data than the invalidation. Settling it means a query that bypasses the cache, which the post says is compute-intensive and a risk to the database.",
+      "answer": "Polaris retries the check and sends the database query only when a sample is still inconsistent at a reporting timescale such as one or five minutes. Real inconsistencies and racing writes on one key are rare, so the retries remove most of those queries.",
+      "concepts": [
+        {
+          "slug": "backpressure"
+        },
+        {
+          "slug": "metrics"
+        }
+      ]
+    }
+  ],
+  "alternatives": [
+    {
+      "title": "How to keep cached copies fresh",
+      "options": [
+        {
+          "name": "Expiry only (a time to live)",
+          "pro": "No invalidation messages to lose or mishandle",
+          "con": "A changed value can be served until it expires (a general trade-off; the 2022 post sets this case aside as out of scope)"
+        },
+        {
+          "name": "Invalidation sent when data changes",
+          "pro": "Changes reach the cache soon after the write",
+          "con": "Races between fills and invalidations and lost or mishandled messages, which is what the 2022 post is about"
+        },
+        {
+          "name": "Write-through caching",
+          "pro": "The 2013 post says it simplifies read-after-write consistency for writes made in a secondary region",
+          "con": "The write path has more to do (a general trade-off), and the 2022 post still describes invalidations as part of TAO's consistency work"
+        }
+      ],
+      "pick": "The 2013 post describes TAO as a write-through cache whose leaders maintain consistency, and the 2022 post is about getting caches that use invalidations to be consistent and measuring it."
+    },
+    {
+      "title": "How to find out that a cache is inconsistent and why",
+      "options": [
+        {
+          "name": "Log every cache state change",
+          "pro": "A complete history of every entry",
+          "con": "The 2022 post says TAO would do more than 10 trillion cache fills a day at a 99 percent hit rate, and logging them would make the logging system extremely write-heavy"
+        },
+        {
+          "name": "Check from outside, as a client (Polaris)",
+          "pro": "Generic, needs no knowledge of the service's internals, and counts only what clients can observe",
+          "con": "Says that and how often a cache is wrong, but not why"
+        },
+        {
+          "name": "Trace only the window where a race can happen",
+          "pro": "Small volume, and shows the exact order of events for a bad entry",
+          "con": "Needs a library inside cache servers and the invalidation pipeline"
+        }
+      ],
+      "pick": "Meta describes using both: Polaris to detect and measure, and consistency tracing to explain, as in the bug it found in 2022."
+    },
+    {
+      "title": "When to check the database after a mismatch",
+      "options": [
+        {
+          "name": "Immediately, on any mismatch",
+          "pro": "A definite answer at once",
+          "con": "Many extra queries that bypass the cache, which the 2022 post calls compute-intensive and risky for the database"
+        },
+        {
+          "name": "After the sample stays wrong past a timescale",
+          "pro": "Retries clear most transient mismatches and racing writes first, so far fewer expensive checks",
+          "con": "A short-lived inconsistency is not reported at that timescale"
+        }
+      ],
+      "pick": "Polaris delays the cache-bypassing check until a sample crosses a reporting timescale such as one or five minutes."
+    }
+  ],
+  "roles": [
+    {
+      "id": "client",
+      "label": "Products",
+      "description": "The applications that read and write data. In the 2013 post they first had to use Memcache and MySQL by hand."
+    },
+    {
+      "id": "edge",
+      "label": "Cache servers",
+      "description": "Memcache, and TAO's follower and leader caches. They answer most reads and have to be kept consistent with the database."
+    },
+    {
+      "id": "async",
+      "label": "Invalidation events",
+      "description": "The messages that tell a cache a value changed. Drawn as one box here for simplicity; the posts do not describe this pipeline in detail."
+    },
+    {
+      "id": "compute",
+      "label": "Polaris and tracing",
+      "description": "Polaris measures consistency from outside as a client. The tracing library records cache changes inside the window where a race can happen."
+    },
+    {
+      "id": "data",
+      "label": "MySQL",
+      "description": "The database that holds the source of truth for TAO's objects and associations."
+    }
+  ],
+  "sources": [
+    {
+      "title": "Cache made consistent",
+      "publisher": "Engineering at Meta",
+      "year": 2022,
+      "url": "https://engineering.fb.com/2022/06/08/core-infra/cache-made-consistent/"
+    },
+    {
+      "title": "TAO: The power of the graph",
+      "publisher": "Engineering at Meta",
+      "year": 2013,
+      "url": "https://engineering.fb.com/2013/06/25/core-infra/tao-the-power-of-the-graph/"
+    }
+  ]
+}

@@ -1,0 +1,473 @@
+{
+  "name": "How LinkedIn Made Kafka a Cheap, Fast Log",
+  "difficulty": "intermediate",
+  "intent": "Follow the design choices in LinkedIn's 2014 Kafka benchmark post: a topic as a sharded log, records kept on disk, linear disk I/O with batching, replication by default, cheap consumers, and scaling out. A last step shows how a 2015 post on Venice used the log as its only way in. Every LinkedIn number comes from those posts.",
+  "codeTitle": "partitions and offsets, a crashed consumer, and a lagging follower, as a small model",
+  "finalIntro": "One record from a producer to a consumer, with a follower copy, as the 2014 post describes it (a teaching walk-through, not a measurement).",
+  "prompt": "LinkedIn describes Apache Kafka as a central publish-subscribe log (a place where programs publish records and other programs read them) that integrates data between applications, stream processing and Hadoop data ingestion. Its author, Jay Kreps, argues that such a hub only works if it is cheap: fast, predictable and easy to scale, so people can put all their data on it. How can a system that keeps every record on disk, copies it to other machines and serves many readers still handle hundreds of thousands of small records per second? This study follows two LinkedIn engineering posts, listed at the end: 'Benchmarking Apache Kafka: 2 Million Writes Per Second (On Three Cheap Machines)' (April 2014), which supplies almost everything, and the interview 'Prototyping Venice: Derived Data Platform' (August 2015), used only for the last step. The benchmark ran on three machines borrowed from a Hadoop cluster, not on LinkedIn's usual Kafka hardware, and the steps are in a teaching order, not the order in which Kafka was built. The simulations, estimator and code samples are small teaching models, not LinkedIn's or Kafka's code or data.",
+  "functional": [
+    "Let programs publish records to a named topic, and let other programs subscribe to one or more topics",
+    "Keep records for a configurable time (the post says a few days or a week, as an example), even after they are read, so a consumer can reload data",
+    "Give each record a number in its partition (the offset), and let a consumer resume from a saved offset after a crash",
+    "Copy each partition to other machines, and answer a producer only when the chosen safety level is met"
+  ],
+  "nonFunctional": [
+    "A cheap abstraction: the post says a central hub has to be fast, predictable and easy to scale, because fragile or expensive systems grow a wall of protective process that keeps people from using them",
+    "Throughput on small records: the post tests 100-byte records because the overhead of each message dominates, which makes small records the harder case",
+    "Throughput that does not depend on how much data is waiting: the post says it should hold when consumers lag, since a queue exists to absorb exactly that",
+    "Safety that the owner can choose: the post compares acknowledging after the leader's write with acknowledging after all in-sync copies have it",
+    "Scaling by adding partitions and machines, since the post says a topic can hold more data than any one machine",
+    "The post's claim for its own production clusters in 2014 is tens of millions of reads and writes per second all day on pretty modest hardware"
+  ],
+  "firstAttempt": {
+    "text": "Start from the kind of messaging system the post contrasts Kafka with. In this study's model, each consumer gets its own queue, records are held in memory for speed, and keeping them on disk is an optional extra for special cases. The post does not say LinkedIn ran such a system as its hub. It is the contrast the post draws, used here as a starting point.",
+    "limits": [
+      "The post says that in traditional messaging systems there is usually a queue per consumer, so adding a consumer doubles your data size",
+      "The post says many messaging systems treat persistence as an expensive add-on that decimates performance, and that some work well only while the retained data fits in memory",
+      "When consumers lag, data backs up and goes to disk, and the post says throughput can fall by an order of magnitude or more, exactly when the queue is needed most",
+      "A consumer that is down for hours, such as an offline Hadoop load, has to be buffered for, which a queue sized for fast consumers handles badly (this study's reading)"
+    ]
+  },
+  "nodes": [
+    {
+      "id": "producers",
+      "label": "Producers",
+      "kind": "client",
+      "x": 10,
+      "y": 24
+    },
+    {
+      "id": "consumers",
+      "label": "Consumers (apps, stream jobs, Hadoop loads)",
+      "kind": "client",
+      "x": 10,
+      "y": 76
+    },
+    {
+      "id": "queues",
+      "label": "A queue per consumer",
+      "kind": "data",
+      "x": 46,
+      "y": 50,
+      "at": 0,
+      "until": 1
+    },
+    {
+      "id": "topic",
+      "label": "Topic: partitioned logs with offsets",
+      "kind": "data",
+      "x": 46,
+      "y": 50,
+      "at": 1
+    },
+    {
+      "id": "disk",
+      "label": "Filesystem, records kept for a set time",
+      "kind": "data",
+      "x": 78,
+      "y": 24,
+      "at": 2
+    },
+    {
+      "id": "batch",
+      "label": "Batches and sequential appends",
+      "kind": "compute",
+      "x": 30,
+      "y": 10,
+      "at": 3
+    },
+    {
+      "id": "followers",
+      "label": "Follower copies (fetch like consumers)",
+      "kind": "compute",
+      "x": 78,
+      "y": 62,
+      "at": 4
+    },
+    {
+      "id": "cache",
+      "label": "OS page cache and sendfile",
+      "kind": "data",
+      "x": 40,
+      "y": 90,
+      "at": 5
+    },
+    {
+      "id": "more",
+      "label": "More partitions on more machines",
+      "kind": "data",
+      "x": 90,
+      "y": 42,
+      "at": 6
+    },
+    {
+      "id": "venice",
+      "label": "Venice (a design and prototype in 2015)",
+      "kind": "compute",
+      "x": 88,
+      "y": 88,
+      "at": 7
+    }
+  ],
+  "edges": [
+    {
+      "from": "producers",
+      "to": "queues",
+      "at": 0,
+      "until": 1
+    },
+    {
+      "from": "queues",
+      "to": "consumers",
+      "at": 0,
+      "until": 1
+    },
+    {
+      "from": "producers",
+      "to": "topic",
+      "at": 1
+    },
+    {
+      "from": "topic",
+      "to": "consumers",
+      "at": 1
+    },
+    {
+      "from": "topic",
+      "to": "disk",
+      "at": 2
+    },
+    {
+      "from": "producers",
+      "to": "batch",
+      "at": 3
+    },
+    {
+      "from": "batch",
+      "to": "topic",
+      "at": 3
+    },
+    {
+      "from": "topic",
+      "to": "followers",
+      "at": 4
+    },
+    {
+      "from": "topic",
+      "to": "cache",
+      "at": 5
+    },
+    {
+      "from": "cache",
+      "to": "consumers",
+      "at": 5
+    },
+    {
+      "from": "topic",
+      "to": "more",
+      "at": 6
+    },
+    {
+      "from": "topic",
+      "to": "venice",
+      "at": 7
+    }
+  ],
+  "steps": [
+    {
+      "title": "Make a topic a sharded log, so a consumer is just a position",
+      "problem": "The post says a log used as a central data hub has to be cheap: fast, predictable and easy to scale, so that people can dump all their data on it. It also argues that a log is a much simpler thing than a database or key-value store. The question is what the simplest useful shape is.",
+      "fix": "In the post, the key abstraction is the topic: producers publish records (key and value pairs) to a topic and consumers subscribe to topics. A topic is described as 'just a sharded write-ahead log' (a write-ahead log is a file where records are only ever added at the end). The key is used to pick the partition, the shard (one slice of the topic), unless the publisher names the partition directly. Every record gets an entry number in its partition, the offset, which a consumer uses to say where it is in each log. The partitions are spread over a cluster of machines, so a topic can hold more data than fits on any one machine.",
+      "tradeoff": "Adding records is the only write, and a consumer only needs to remember a number per partition. The cost, in this study's reading, is that offsets belong to one partition, so order is clear inside a partition and not across the whole topic. Choosing the key matters for that reason.",
+      "concepts": [
+        {
+          "slug": "write-ahead-log"
+        },
+        {
+          "slug": "ordering-and-partitioning"
+        },
+        {
+          "slug": "pub-sub"
+        },
+        {
+          "slug": "message-queues"
+        }
+      ]
+    },
+    {
+      "title": "Write every record to disk and let all consumers share one log",
+      "problem": "With a queue per consumer, adding a consumer doubles the data, and a slow consumer pushes data out of memory and onto disk, where the post says some messaging systems lose an order of magnitude of throughput. A hub for offline systems such as Hadoop also has to cope with readers that load only at intervals or go down for hours.",
+      "fix": "Kafka, the post says, always persists: messages are written to the filesystem immediately when received, and are not deleted when read. They are retained for a configurable time, for example a few days or a week. There is a single shared log however many consumers there are, and each consumer saves its place by committing its offset now and then, so that another instance can resume from it if one crashes. The post says Kafka can buffer even terabytes of unconsumed data for an offline system, that performance is O(1) with respect to unconsumed data, and shows a test where throughput after writing a TB was as good as for the first few hundred MB. The variance it saw came from how Linux flushes data to disk.",
+      "tradeoff": "Adding a consumer costs no extra storage, and a slow consumer does not change the write speed. The price is that the disk must hold the retention period at the full write rate (the estimator below puts numbers on that), and, in this study's reading, a consumer that stays away longer than the retention period misses records.",
+      "concepts": [
+        {
+          "slug": "pub-sub"
+        },
+        {
+          "slug": "delivery-guarantees"
+        },
+        {
+          "slug": "backpressure"
+        },
+        {
+          "slug": "batch-vs-stream-processing"
+        }
+      ]
+    },
+    {
+      "title": "Do linear disk I/O and group small records into batches",
+      "problem": "People expect a persistent store to manage about 5,000 to 50,000 requests per second, the post says, which is close to what a good RPC layer can do for remote requests on a random-access database or key-value store. Small records are the hardest case, because the overhead of handling each message dominates.",
+      "fix": "The post says two design principles let Kafka exceed that. First, it works hard to do linear disk I/O (reading and writing in order, not seeking around). The six cheap disks in the test machines gave an aggregate of 822 MB per second of linear I/O, more than the 1 gigabit network card could use. Second, at every stage it batches small pieces into larger network and disk operations. The new producer uses a group-commit-like mechanism, so that records sent while another I/O is in progress are grouped together. In the first test, one producer thread wrote 50 million 100-byte records to a topic with six partitions and no replication at 821,557 records per second (78.3 MB per second), likely saturating the 1 gigabit card on the client machine. The post also found that with 10-byte records the producer was limited by the CPU, taking a lock and queuing each message.",
+      "tradeoff": "The post's point is that persistence need not be a large cost. The number of bytes per second grows with record size while records per second falls. The setup was chosen for its simplicity and not tuned, which the post calls 'lazy benchmarking', so it is a benchmark of off-the-shelf settings, not of LinkedIn's production tuning.",
+      "concepts": [
+        {
+          "slug": "write-ahead-log"
+        },
+        {
+          "slug": "latency-and-round-trips"
+        },
+        {
+          "slug": "lsm-trees-vs-b-trees"
+        }
+      ]
+    },
+    {
+      "title": "Replicate by default, and let the owner choose what an acknowledgement means",
+      "problem": "A log that lives on one machine loses data when that machine fails. But the post says replication is often treated as an exotic bolt-on needing complex configuration, and used only in specialised cases.",
+      "fix": "Kafka treats replication as the default: un-replicated data is the special case where the replication factor (the number of copies) happens to be one. Each partition has a leader that takes the producer's writes, and followers that copy it. In the post's asynchronous test the server acknowledges a write as soon as it is in its own local log, so if the leader crashed it would likely lose the last few messages not yet replicated. With three copies this gave 786,980 records per second (75.1 MB per second) from a single producer thread. In the synchronous test the leader waits for all in-sync replicas before answering, so messages are not lost as long as one in-sync replica remains, and the result was 421,823 records per second (40.2 MB per second). The leader tracks the followers' progress to watch their liveness, and consumers are never given a message until the replicas have fully acknowledged it.",
+      "tradeoff": "The owner picks between more throughput and the stronger guarantee. The post also notes that the cluster's total write capacity is three times lower with three copies, because each write is done three times, and that it could probably reduce the synchronous penalty with more aggressive batching and more outstanding requests, but it deliberately did not tune.",
+      "concepts": [
+        {
+          "slug": "database-replication"
+        },
+        {
+          "slug": "quorums"
+        },
+        {
+          "slug": "failure-detection"
+        },
+        {
+          "slug": "delivery-guarantees"
+        }
+      ]
+    },
+    {
+      "title": "Make consumers cheap, so that readers and replicas cost little",
+      "problem": "If handing out data is expensive, it has to be controlled tightly for scalability reasons, which brings back the wall of process. Replication also depends on it, because the post says the replicas are themselves consumers.",
+      "fix": "The post says Kafka's consumer works by fetching chunks of log directly from the filesystem, using the sendfile API to move them through the operating system without copying through the application. In production, it says, consumers read almost exclusively out of the OS page cache (memory the operating system uses for recently used files), because they read data that was just written, and iostat showed no physical reads even while a great deal of data was consumed. In the test, which started at the beginning of the log and so did real reads, one consumer read 940,521 records per second (89.7 MB per second) from a six-partition topic with three copies, and three consumers on different machines reached 2,615,968 (249.5 MB per second), near linear scaling. A consumer reads from only one replica, and only sees fully acknowledged messages, so what it saw is still there after a change of leader. End to end, the post measured a median of 2 ms, 3 ms at the 99th percentile and 14 ms at the 99.9th.",
+      "tradeoff": "Because readers are cheap, adding one is not something to ration. Because consumers wait for full acknowledgement, a record becomes visible a little later than it was written, and the post's latency figures are the same for both producer acknowledgement settings.",
+      "concepts": [
+        {
+          "slug": "caching"
+        },
+        {
+          "slug": "latency-and-round-trips"
+        },
+        {
+          "slug": "hedged-requests-and-tail-latency"
+        }
+      ]
+    },
+    {
+      "title": "Scale out with more partitions, more machines and more clients",
+      "problem": "A single producer thread did not stress the three-machine cluster, and the cluster can only be as useful as it is easy to grow. The post's aim was a hub that can take everyone's data.",
+      "fix": "The post notes that more partitions can always be added, spreading data over more machines. In its test, three producers on three machines, with three copies and asynchronous replication, wrote 2,024,032 records per second (193.0 MB per second) in total to the three-machine cluster. A producer and a consumer running together on an empty six-partition topic gave 795,064 records per second, close to the producer-only result, which the post expected because consumers are cheap. It also states that LinkedIn's production clusters take tens of millions of reads and writes per second all day on pretty modest hardware, and that the benchmark hardware was borrowed from a Hadoop cluster because the usage patterns are similar.",
+      "tradeoff": "Capacity grows by adding machines and partitions, not by redesigning anything. The numbers are a benchmark on three machines in 2014 with default settings, and the post itself says the results could be improved with tuning, so they show the shape of the design and not what a modern cluster does.",
+      "concepts": [
+        {
+          "slug": "ordering-and-partitioning"
+        },
+        {
+          "slug": "horizontal-vs-vertical-scaling"
+        },
+        {
+          "slug": "load-balancing"
+        }
+      ]
+    },
+    {
+      "title": "Use the log as the only way in to a derived data store (Venice, 2015)",
+      "problem": "In the 2015 interview, LinkedIn's Venice team describes how derived data (data computed from other data, such as aggregates or recommendations, as opposed to source-of-truth data) reached online applications. A Hadoop job computed it, and a process called Build and Push, a MapReduce job, built an immutable partitioned store from the whole dataset. It had to be rebuilt and re-pushed whenever new data arrived, typically daily or more often, which the interview says caused a large amount of staleness, and pushing more often was expensive because only whole datasets could be pushed.",
+      "fix": "The interview says Venice, at that point a design and prototype worked on during an internship with the Voldemort team, makes use of Kafka's log-based structure to unify inputs from both batch and stream processing jobs. All writes are asynchronously funneled through Kafka, which serves as the only entry point to Venice. Applications then query a single system, because the reconciliation of batch and real-time data happens as it is ingested, which the interview says is better for latency and stability than serving two systems and merging at query time.",
+      "tradeoff": "The interview names the trade-off itself: since all writes are asynchronous, Venice does not provide read-your-writes semantics (a reader seeing its own write at once), and is meant strictly for serving data derived from offline and nearline systems. This study uses the interview only to show how the log from the earlier steps was used. It does not describe Venice as it runs today.",
+      "concepts": [
+        {
+          "slug": "batch-vs-stream-processing"
+        },
+        {
+          "slug": "consistency-models"
+        },
+        {
+          "slug": "pub-sub"
+        }
+      ]
+    }
+  ],
+  "failures": [
+    {
+      "scenario": "The leader of a partition crashes while followers are a little behind, with the producer waiting only for the leader",
+      "impact": "In the post's words, the leader would likely lose the last few messages that had been written but not yet replicated, even though the producer was told they were written.",
+      "answer": "Choose the stronger setting when that loss matters. With acknowledgement from all in-sync replicas, the post says messages are not lost as long as one in-sync replica remains. Consumers never saw the unreplicated records either, because they only read fully acknowledged messages.",
+      "concepts": [
+        {
+          "slug": "database-replication"
+        },
+        {
+          "slug": "delivery-guarantees"
+        },
+        {
+          "slug": "quorums"
+        }
+      ]
+    },
+    {
+      "scenario": "A consumer instance crashes in the middle of its work",
+      "impact": "Its place in each log would be lost, and the work would have to start again from the beginning or be skipped.",
+      "answer": "Consumers commit their offsets periodically, and the post says another instance can resume from the saved position. In this study's reading, records processed since the last commit are read again, so the processing should cope with repeats.",
+      "concepts": [
+        {
+          "slug": "delivery-guarantees"
+        },
+        {
+          "slug": "idempotency"
+        }
+      ]
+    },
+    {
+      "scenario": "An offline consumer such as a Hadoop load goes down for several hours, or consumers fall behind",
+      "impact": "In many messaging systems the backlog would push data out of memory to disk and throughput would fall by an order of magnitude or more, so the system could no longer keep up with new data.",
+      "answer": "Kafka writes every record to disk anyway, so the post says its performance does not depend on the volume of unconsumed data, and that it can buffer even terabytes for offline systems. Its test showed no effect of data size on throughput. The limit is the retention time, after which records are removed.",
+      "concepts": [
+        {
+          "slug": "backpressure"
+        },
+        {
+          "slug": "message-queues"
+        }
+      ]
+    },
+    {
+      "scenario": "Records are very small, so the cost of handling each one dominates",
+      "impact": "Throughput in megabytes per second drops, because the fixed work per message is a large share of the total. With 10-byte records the post found the producer limited by the CPU, taking a lock and queuing each message.",
+      "answer": "Group records into batches, so many records share one network or disk operation. The post shows that bytes per second rise with record size while records per second fall, and that network saturation appears from 100 bytes.",
+      "concepts": [
+        {
+          "slug": "latency-and-round-trips"
+        },
+        {
+          "slug": "queueing-theory-and-littles-law"
+        }
+      ]
+    }
+  ],
+  "alternatives": [
+    {
+      "title": "What the producer's acknowledgement should mean",
+      "options": [
+        {
+          "name": "No replication (a replication factor of one)",
+          "pro": "Highest throughput in the post's test: 821,557 records per second from one producer thread",
+          "con": "The post treats it as the special case. All data of a partition lives on one machine"
+        },
+        {
+          "name": "Acknowledge after the leader's write (asynchronous replication)",
+          "pro": "Close to that speed with three copies: 786,980 records per second, and lower acknowledgement latency",
+          "con": "If the leader crashed, it would likely lose the last few messages not yet replicated"
+        },
+        {
+          "name": "Acknowledge after all in-sync replicas have it (synchronous)",
+          "pro": "No loss as long as one in-sync replica remains",
+          "con": "421,823 records per second in the post's untuned test, about 54% of the asynchronous figure"
+        }
+      ],
+      "pick": "The post presents both replicated modes and leaves the choice to the owner. It measured them with default settings and says tuning could narrow the gap for the synchronous mode."
+    },
+    {
+      "title": "How to serve many consumers of the same data",
+      "options": [
+        {
+          "name": "A queue for each consumer",
+          "pro": "Each consumer's queue is simple and independent",
+          "con": "The post says adding a consumer doubles your data size"
+        },
+        {
+          "name": "One shared log with an offset for each consumer",
+          "pro": "One copy of the data however many consumers, and a consumer can reload by going back to an older offset",
+          "con": "The disk must hold the whole retention period, and consumers who are away longer than that miss records (this study's reading)"
+        },
+        {
+          "name": "Hold unread records in memory only",
+          "pro": "Fast while consumers keep up",
+          "con": "The post says throughput can fall by an order of magnitude or more once data backs up onto disk"
+        }
+      ],
+      "pick": "Kafka uses the shared log. The post says it makes publish-subscribe space-efficient and fits offline systems that load at intervals."
+    }
+  ],
+  "roles": [
+    {
+      "id": "client",
+      "label": "Producers and consumers",
+      "description": "Programs that publish records to topics, and programs that read them from a saved position."
+    },
+    {
+      "id": "compute",
+      "label": "Brokers and clients that batch",
+      "description": "Machines that lead or follow a partition, and the producer code that groups records before sending."
+    },
+    {
+      "id": "data",
+      "label": "Logs, disk and page cache",
+      "description": "The partitioned logs with their offsets, the files they are kept in, and the memory the operating system uses to serve recent reads."
+    }
+  ],
+  "quiz": [
+    {
+      "question": "In LinkedIn's 2014 benchmark, one producer thread wrote 786,980 records per second when the leader acknowledged after its own write, and 421,823 when it waited for all in-sync replicas. About how much throughput did waiting cost in that test?",
+      "options": [
+        "About 67%, because three copies means each write costs three times as much work",
+        "About 46%, because 421,823 is roughly 54% of 786,980",
+        "About 4%, which is the cost the post measured when it moved from no replication to asynchronous replication",
+        "Nothing in throughput, because waiting only changes how long each reply takes"
+      ],
+      "answer": 1,
+      "explanation": "421,823 divided by 786,980 is about 0.54, so about 46% was lost. The 67% figure assumes the work triples in the producer's path, but the asynchronous run already did all three writes and the cluster simply waited less. Going from 821,557 records per second with no replication to 786,980 with asynchronous replication is a drop of about 4%, a different comparison. Waiting for replies does change throughput in this test, because the producer finishes fewer requests per second (the post says more outstanding requests and bigger batches could narrow the gap, but it did not tune)."
+    },
+    {
+      "question": "A team keeps 150 GB of new records per day for 7 days, and 4 independent consumers read all of them. Ignoring replica copies, how much more disk does a queue per consumer use than one shared log with an offset per consumer?",
+      "options": [
+        "The same amount, because every consumer reads the same records",
+        "About 1.3 times as much, because queues only keep records until they are read",
+        "7 times as much, because each day of retention is stored separately for each consumer",
+        "4 times as much: 4,200 GB for four queues against 1,050 GB for the shared log"
+      ],
+      "answer": 3,
+      "explanation": "The shared log holds 150 x 7 = 1,050 GB once, however many consumers read it. Four queues each hold their own copy: 4 x 1,050 = 4,200 GB. The post says that with a queue per consumer, adding a consumer doubles your data size, and that the single shared log is what makes publish-subscribe space-efficient. A queue per consumer is not the same as the shared log, since each queue stores its own copy. The 1.3 figure would only hold if queues emptied as they are read, which does not apply when consumers lag. Retention days multiply both designs equally, so 7 is not the ratio."
+    },
+    {
+      "question": "A consumer has committed offset 4. It processes offsets 4 and 5 and then crashes before committing again. A replacement instance takes over the same partition. Where does it start, and what follows?",
+      "options": [
+        "At offset 4, so offsets 4 and 5 are processed a second time, and the processing should tolerate that",
+        "At offset 6, because the crashed instance already handled everything before it",
+        "At offset 0, because a replacement cannot trust any saved position",
+        "At the end of the log, because records that were handed out once are not handed out again"
+      ],
+      "answer": 0,
+      "explanation": "The post says consumers save their place by committing the offset, so that another instance can resume from it. The saved position is 4, so the replacement starts there and sees offsets 4 and 5 again (this repeat is this study's reading of the post, shown in the code sample). It cannot start at 6, because the instance never recorded that it got that far. Starting from 0 is not needed, since the commit exists for this case. And the log keeps records after they are read, so skipping to the end is not how it works; that would lose the records in between."
+    }
+  ],
+  "sources": [
+    {
+      "title": "Benchmarking Apache Kafka: 2 Million Writes Per Second (On Three Cheap Machines)",
+      "publisher": "LinkedIn Engineering",
+      "year": 2014,
+      "url": "https://engineering.linkedin.com/kafka/benchmarking-apache-kafka-2-million-writes-second-three-cheap-machines"
+    },
+    {
+      "title": "Prototyping Venice: Derived Data Platform",
+      "publisher": "LinkedIn Engineering",
+      "year": 2015,
+      "url": "https://engineering.linkedin.com/distributed-systems/prototyping-venice-derived-data-platform"
+    }
+  ]
+}

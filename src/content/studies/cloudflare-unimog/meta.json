@@ -1,0 +1,499 @@
+{
+  "name": "How Cloudflare Built Unimog",
+  "difficulty": "advanced",
+  "intent": "Follow how Cloudflare spreads connections across the servers inside each of its edge data centers with Unimog, a layer 4 load balancer that runs on every server, using only what Cloudflare's 2020 engineering post says.",
+  "codeTitle": "a forwarding table with two slots, the second-hop redirect, a drain and a load-balancing loop",
+  "finalIntro": "One connection through Unimog, then the server that holds it is drained and the connection carries on.",
+  "prompt": "Cloudflare's network is anycast: in 2020 its data centers in 200+ cities served the same IP addresses, so a connection reaches a nearby data center, and inside it any server can handle a connection for any service. So what decides which server gets each connection? Servers are added, removed for maintenance or marked unhealthy all the time. Servers differ in speed. Some connections stay open for days, and one misdirected packet can break a connection. And the balancer must cost very little, because it shares the machines with the products. This study follows what Cloudflare says in its September 2020 post about Unimog, listed at the end, in a teaching order. Every Cloudflare fact is taken from that post. The code samples, the estimator and the simulation are small teaching models, not Cloudflare's code or data, and their numbers are invented unless they are labelled as Cloudflare's.",
+  "functional": [
+    "Send each new connection to a server that is in service and healthy, for any Cloudflare service on any of its anycast addresses",
+    "Keep every packet of an established connection going to the same server, including connections that last for days",
+    "Let an operator or a health check take a server out of rotation (drain it) without breaking the connections it already holds",
+    "Spread the load by measurements of how busy each server is, not by fixed shares",
+    "Handle large ranges of IP addresses as ranges (Cloudflare serves hundreds of thousands of IPv4 addresses), and handle UDP as well as TCP"
+  ],
+  "nonFunctional": [
+    "Cheap: Cloudflare measured Unimog at less than 1% of processor utilization, compared with using no load balancing at all",
+    "No special servers: it runs on the same general-purpose servers that run the products, so there is no separate load balancing tier to size",
+    "Fits with attack defence: the DDoS filter l4drop must drop attack packets before Unimog forwards anything",
+    "Even load across a mix of server hardware: Cloudflare says a data center can hold several server models, up to its 10th generation",
+    "Easy to change: the post says new versions of the XDP code can be deployed weekly if needed, and the components tolerate each other's brief absences so each can be upgraded"
+  ],
+  "firstAttempt": {
+    "text": "Do what Cloudflare did before Unimog: let the router spread packets over the servers with ECMP (equal cost multipath routing, a router feature that hashes each packet's connection details to pick one of several next hops). Every server can serve any connection, so no other component is needed.",
+    "limits": [
+      "When servers go in or out of service, ECMP rehashes, and Cloudflare says that breaks connections to all the servers in an ECMP group",
+      "Routers limit the size of an ECMP group, so one group cannot cover all the servers in the larger data centers",
+      "ECMP cannot change the share of connections that each server gets, so it cannot balance servers of different speeds, or react to how busy each one is",
+      "Cloudflare notes that commodity routers are essentially fixed-function devices, so the router cannot simply be taught better logic"
+    ]
+  },
+  "nodes": [
+    {
+      "id": "users",
+      "label": "Clients",
+      "kind": "client",
+      "x": 8,
+      "y": 50
+    },
+    {
+      "id": "router",
+      "label": "Router (ECMP)",
+      "kind": "edge",
+      "x": 28,
+      "y": 50
+    },
+    {
+      "id": "servers",
+      "label": "Servers (any server can serve any connection)",
+      "kind": "compute",
+      "x": 75,
+      "y": 50
+    },
+    {
+      "id": "xdp",
+      "label": "XDP on every server: l4drop, then Unimog",
+      "kind": "edge",
+      "x": 50,
+      "y": 50,
+      "at": 1
+    },
+    {
+      "id": "ftable",
+      "label": "Forwarding table (buckets of server addresses)",
+      "kind": "data",
+      "x": 50,
+      "y": 16,
+      "at": 2
+    },
+    {
+      "id": "redir",
+      "label": "Redirector on every server (cls-redirect)",
+      "kind": "edge",
+      "x": 75,
+      "y": 84,
+      "at": 3
+    },
+    {
+      "id": "old",
+      "label": "Previous server of the bucket",
+      "kind": "compute",
+      "x": 92,
+      "y": 84,
+      "at": 3
+    },
+    {
+      "id": "prom",
+      "label": "Prometheus (load metrics)",
+      "kind": "data",
+      "x": 50,
+      "y": 84,
+      "at": 4
+    },
+    {
+      "id": "consul",
+      "label": "Consul (key-value store, health, locks)",
+      "kind": "data",
+      "x": 28,
+      "y": 84,
+      "at": 4
+    },
+    {
+      "id": "conductor",
+      "label": "Conductor (control loop)",
+      "kind": "compute",
+      "x": 8,
+      "y": 84,
+      "at": 4
+    },
+    {
+      "id": "xdpd",
+      "label": "xdpd (loads the programs and tables)",
+      "kind": "async",
+      "x": 28,
+      "y": 16,
+      "at": 4
+    }
+  ],
+  "edges": [
+    {
+      "from": "users",
+      "to": "router"
+    },
+    {
+      "from": "router",
+      "to": "servers",
+      "until": 1
+    },
+    {
+      "from": "router",
+      "to": "xdp",
+      "at": 1
+    },
+    {
+      "from": "xdp",
+      "to": "servers",
+      "at": 1
+    },
+    {
+      "from": "xdp",
+      "to": "ftable",
+      "at": 2
+    },
+    {
+      "from": "servers",
+      "to": "redir",
+      "at": 3
+    },
+    {
+      "from": "redir",
+      "to": "old",
+      "at": 3
+    },
+    {
+      "from": "prom",
+      "to": "conductor",
+      "at": 4
+    },
+    {
+      "from": "conductor",
+      "to": "consul",
+      "at": 4
+    },
+    {
+      "from": "consul",
+      "to": "xdpd",
+      "at": 4
+    },
+    {
+      "from": "xdpd",
+      "to": "ftable",
+      "at": 4
+    }
+  ],
+  "steps": [
+    {
+      "title": "Make every server a load balancer, and run the balancer in the kernel with XDP",
+      "problem": "ECMP alone cannot keep connections when servers change or balance their load, and the router cannot be programmed to do better. The usual fix is a group of dedicated load balancer servers behind the router, but Cloudflare avoids giving servers special roles: it runs the same software stack on every edge server.",
+      "fix": "Cloudflare describes Unimog as a Layer 4 load balancer (L4LB). It inspects packets only up to layer 4 of the network model (addresses and ports) and does not process their payload, so it is efficient, but it cannot take part in TLS or HTTP the way a Layer 7 load balancer, which acts as a proxy, can. Unimog makes every server a load balancer: the router may send any packet to any server, and that server forwards it to the right one for the connection. It does this with XDP, a Linux kernel facility that runs a program for every packet arriving at a network interface, before the kernel's normal network stack. XDP programs are written as eBPF (a safe bytecode that the kernel checks and compiles) and return an action: PASS to carry on as normal, DROP to discard the packet, or TX to send it back out, possibly changed. Unimog forwards with TX. Cloudflare's DDoS filter, l4drop, is also an XDP program, uses DROP, and runs before Unimog, so attack packets are filtered out as early as possible. Cloudflare gives this as a reason for Unimog to run on all servers too. A daemon called xdpd, written in Go, loads and chains these programs, fills the maps (data tables shared with the programs) and exposes their metrics to Prometheus (a metrics and alerting system). Cloudflare measured Unimog at less than 1% of processor utilization.",
+      "tradeoff": "The servers do two jobs, so the balancer takes a little CPU from the products, and Cloudflare says that sets a high bar for its efficiency. In return there is no separate tier to size, new versions deploy like other services, and the DDoS filter sits in front naturally. Cloudflare also rejected kernel-bypass networking such as DPDK, which works best on dedicated servers (one reason GitHub's GLB did not suit), and kernel modules such as IPVS, which are harder to develop, test and deploy than XDP.",
+      "concepts": [
+        {
+          "slug": "load-balancing"
+        },
+        {
+          "slug": "anycast-and-bgp-routing"
+        },
+        {
+          "slug": "proxies"
+        },
+        {
+          "slug": "metrics"
+        }
+      ]
+    },
+    {
+      "title": "Choose the server by hashing the connection into a forwarding table, then wrap the packet for that server",
+      "problem": "Any server may receive any packet, so all the load balancers must agree which server owns each connection without talking to each other. Cloudflare says the rate of new connections is large, so it is not practical for the balancers to share information about them.",
+      "fix": "A connection is identified by its 4-tuple: the source and destination addresses and ports in the packet headers. Unimog hashes the 4-tuple to get a key and uses the low N bits of the key to pick an entry of the forwarding table, an array whose entries, called buckets, each hold the address of a server (its DIP, direct IP). The control plane builds the table and broadcasts it, so every load balancer has the same one, and it does not matter which server the router picked. The table is always a power of 2 in size, and Cloudflare makes it more than 100 times as large as the number of servers, so that load can be tuned finely. A data center can hold hundreds of servers, so tens of thousands of buckets is normal. A server's address appears in many buckets, and giving it more or fewer buckets changes its share of connections. Buckets do not carry exactly equal traffic at any moment, because the hash makes it a matter of statistics, but Cloudflare says the link is strong enough for good balancing. Customer traffic is addressed to a virtual IP (VIP), which belongs to no single server, and the server needs the original destination, so Unimog does not overwrite the address. It encapsulates the packet: it wraps the whole packet in new outer headers addressed to the DIP. Cloudflare uses GUE (Generic UDP Encapsulation), partly so it could reuse glb-redirect from GitHub's GLB. A 1500-byte packet becomes 1536 bytes, so Cloudflare enabled jumbo frames (larger packets) inside its data centers. There can be several tables, one per traffic set (the traffic for one service, found by its VIP ranges).",
+      "tradeoff": "No per-connection state is shared, and lookups are fast because the table is simple and immutable. But a bucket covers many connections, so control is coarse, and changing a bucket sends every connection in it to another server. That is the problem of the next step. Encapsulation also makes a 1500-byte packet 1536 bytes, so the inside network needs larger packets.",
+      "concepts": [
+        {
+          "slug": "consistent-hashing"
+        },
+        {
+          "slug": "tcp-vs-udp"
+        },
+        {
+          "slug": "load-balancing"
+        }
+      ]
+    },
+    {
+      "title": "Remember the previous server in every bucket, and let a server pass on packets it does not know",
+      "problem": "If a bucket changes from server A to server B, a packet from an existing connection now reaches B. B has no socket for it, so its TCP stack answers with a reset (RST), and the client closes the connection. Cloudflare stresses that a misdirected packet is much worse than a dropped one. Some connections, such as websockets and the arbitrary TCP connections of its Spectrum product, can stay open for hours or days.",
+      "fix": "Cloudflare uses the daisy-chaining technique from the Beamer paper. Each bucket gets two slots: the current server, for the first hop, and the previous server, for a possible second hop. To drain A, its address in the first slot is replaced by another server's and kept in the second slot. The XDP program places the second address in a GUE extension header. A redirector on each server then decides: a SYN packet (the one that starts a new connection) is always handled on the first-hop server, so new connections go to the new server. Any other packet is handled there if a TCP socket for it exists. Otherwise it is forwarded to the second-hop server, in the expectation that it belongs to a connection set up there. Cloudflare first used glb-redirect from GitHub's GLB, then wrote its own in eBPF, called cls-redirect, as a TC classifier (Linux traffic control) instead of XDP, because XDP packets are invisible to tools like tcpdump. It also removes the encapsulation. Cloudflare says that usually fewer than 1% of forwarded packets take the second hop.",
+      "tradeoff": "Two slots remember only one change, because Cloudflare does not use Beamer's third and later hops. A careful choice of buckets, for example the least recently modified ones, still permits connection lifetimes of days, it says. It also does not implement Beamer's generation numbers, which cover a rare case where an ECMP rehash coincides with a table update still spreading, because it believes few connections would be affected. The second hop costs some extra forwarding.",
+      "concepts": [
+        {
+          "slug": "graceful-degradation"
+        },
+        {
+          "slug": "load-balancing"
+        },
+        {
+          "slug": "health-checks"
+        }
+      ]
+    },
+    {
+      "title": "Build the tables with a control plane: a conductor fed by health, load and server information",
+      "problem": "The tables must follow which servers exist, which are healthy and how busy each one is. Cloudflare warns that incorrect or stale tables could drop incoming traffic or overload servers, to the point where a data center would have to be taken out of service.",
+      "fix": "The control plane is a process called the conductor. Each data center has one active conductor and standby instances that take over if it goes away. It reads server information (the servers present, their DIPs, their status and transitions such as draining), health at node and service level, load, and the IP address ranges, which are treated as a dynamic resource. Cloudflare uses HashiCorp's Consul, with an independent Consul server cluster per data center, as a key-value store with blocking queries (a reader is told promptly when a value changes), which carries the forwarding tables and VIP information to xdpd on the servers. Consul also supplies the health checks and the distributed locks that keep just one conductor active. The conductor keeps its state in Consul and reads load from Prometheus. It balances load with a control loop: load is a Prometheus expression measuring processor utilization, a server counts as over or underloaded by comparison with the average, and the table changes are proportional to the deviation from the average, so that all the loads converge on it. Cloudflare says it achieves load balancing largely by exchanging the first and second server of a bucket, which changes only where new connections go and never affects established ones.",
+      "tradeoff": "A fixed share per server is not enough, Cloudflare says. Server models differ (it is on its 10th generation, and a data center can mix them), connections do not all cost the same CPU, and other work also uses CPU. So it measures and adjusts. The cost is a complex system with feedback loops, whose behaviour can be hard to predict or test (see the failures). Each component must tolerate brief absences of the others, so any of them can be upgraded.",
+      "concepts": [
+        {
+          "slug": "leader-election"
+        },
+        {
+          "slug": "service-discovery"
+        },
+        {
+          "slug": "metrics"
+        },
+        {
+          "slug": "health-checks"
+        }
+      ]
+    },
+    {
+      "title": "Carry the same idea to UDP, including sessions that survive a change of address",
+      "problem": "UDP has no connections and no SYN packet. Cloudflare lists three kinds of UDP traffic: simple request and response (such as DNS), long-lived flows between a client and a server, and protocols with session identifiers in each packet, such as QUIC.",
+      "fix": "For request-response traffic such as DNS, Unimog hashes the 4-tuple as before but the buckets have a single slot, because there is no connection to keep. It still spreads the requests. For flows, daisy chaining is adapted: the redirector sends a packet on to the second hop if the first-hop server has no matching UDP socket. Without a SYN, new flows go to the second-hop server, so the roles of the two servers swap, and the control plane puts a new server in the second slot of a UDP traffic set. Services must use connected UDP sockets so that the redirector can match packets to them by 4-tuple. For protocols with a session identifier, which lets a session continue after the 4-tuple changes (for example when a phone moves from WiFi to cellular), a flow dissector, the code that extracts the value to hash, can be configured per traffic set. Cloudflare used this for WARP, by extending the WireGuard protocol in a backwards-compatible way to carry a session identifier.",
+      "tradeoff": "UDP costs more second hops. For TCP, as old connections end, fewer packets need the second hop, but for UDP the new flows always do. Services have to create connected sockets, and each protocol with sessions needs its own flow dissector.",
+      "concepts": [
+        {
+          "slug": "tcp-vs-udp"
+        },
+        {
+          "slug": "real-time-communication"
+        },
+        {
+          "slug": "load-balancing"
+        }
+      ]
+    }
+  ],
+  "failures": [
+    {
+      "scenario": "A server is taken out for maintenance, or health checks say it is not working",
+      "impact": "If its buckets are simply given to other servers, every connection open on it breaks. If it stays in the table, new connections still reach a server that cannot serve them.",
+      "answer": "The conductor builds a new table with the server's address replaced in the first slot of its buckets and kept in the second slot. New connections go elsewhere and old ones continue through the second hop until they end. Cloudflare says servers should only receive connections when in operation, and it takes node and service health from Consul.",
+      "concepts": [
+        {
+          "slug": "health-checks"
+        },
+        {
+          "slug": "graceful-degradation"
+        },
+        {
+          "slug": "load-balancing"
+        }
+      ]
+    },
+    {
+      "scenario": "The router changes which server it sends a packet to (an ECMP rehash)",
+      "impact": "With ECMP alone, such changes broke connections. A different server now receives the packets of a connection.",
+      "answer": "Every server holds the same forwarding table and forwards a packet the same way, so the router's choice does not matter. One corner case is left: a rehash at the same moment as a table update that is still spreading. Beamer's generation numbers address it, but Cloudflare does not use them, because it believes the number of affected connections is negligible.",
+      "concepts": [
+        {
+          "slug": "consistent-hashing"
+        },
+        {
+          "slug": "load-balancing"
+        }
+      ]
+    },
+    {
+      "scenario": "A data center becomes overloaded",
+      "impact": "Cloudflare reports that health information from the servers could show many of them as degraded, so Unimog stopped sending them new connections. That pushed load onto the other servers, which became degraded while the first ones recovered. A data center could get stuck with servers flipping between healthy and degraded, even after demand returned to normal.",
+      "answer": "The conductor now has logic to tell isolated degraded servers from data center-wide problems. Cloudflare also has automated systems that remove traffic from overloaded data centers.",
+      "concepts": [
+        {
+          "slug": "health-checks"
+        },
+        {
+          "slug": "load-shedding"
+        },
+        {
+          "slug": "graceful-degradation"
+        }
+      ]
+    },
+    {
+      "scenario": "The Consul agent on a server restarts, for example to upgrade Consul",
+      "impact": "Consul can briefly report wrong health for that server and its services, which could make the control plane act on something that is not true.",
+      "answer": "The conductor has logic to detect and disregard these transient health changes. More generally, Cloudflare designs the components to tolerate brief absences of one another, and keeps standby conductors ready to take over.",
+      "concepts": [
+        {
+          "slug": "failure-detection"
+        },
+        {
+          "slug": "leader-election"
+        },
+        {
+          "slug": "service-discovery"
+        }
+      ]
+    },
+    {
+      "scenario": "The same bucket changes twice before the old connections have ended",
+      "impact": "Unimog uses only two hops, so it can keep connections across a single update to a bucket. A connection on the server from before the first change is no longer reachable and breaks.",
+      "answer": "The control plane chooses which buckets to change with care, for example the least recently modified ones, and often only swaps the first and second server of a bucket. With that strategy Cloudflare says connection lifetimes of days are possible even with two hops.",
+      "concepts": [
+        {
+          "slug": "consistent-hashing"
+        },
+        {
+          "slug": "load-balancing"
+        }
+      ]
+    }
+  ],
+  "alternatives": [
+    {
+      "title": "Where the load balancing runs",
+      "options": [
+        {
+          "name": "ECMP in the router alone",
+          "pro": "Nothing extra to run, and it was what Cloudflare used before Unimog",
+          "con": "Rehashing breaks connections when servers change, group sizes are limited, and it cannot adjust each server's share"
+        },
+        {
+          "name": "A separate group of load balancer servers",
+          "pro": "A common design for L4 load balancers, and the balancers act consistently, so the router can spread packets over them with ECMP",
+          "con": "A specialised server role, and Cloudflare would have to manage how many there are in each data center"
+        },
+        {
+          "name": "Every server is a load balancer (Unimog)",
+          "pro": "No specialised roles, and it fits with l4drop, which already runs on every server before Unimog",
+          "con": "It shares the servers' CPU, so it has to stay very cheap (Cloudflare measured under 1%)"
+        }
+      ],
+      "pick": "Every server, because Cloudflare keeps all edge servers uniform and its attack filter already runs everywhere ahead of the balancer."
+    },
+    {
+      "title": "What the balancer looks at",
+      "options": [
+        {
+          "name": "Layer 7 (a proxy)",
+          "pro": "It can modify the data on the connection and take part in TLS and HTTP",
+          "con": "It carries the overheads of the higher-level protocols"
+        },
+        {
+          "name": "Layer 4 (Unimog)",
+          "pro": "It directs packets without processing their payload, so it is efficient",
+          "con": "It can only decide which connection goes to which server, and cannot modify the data or take part in TLS or HTTP"
+        }
+      ],
+      "pick": "Layer 4 inside the data center, where efficiency matters most. Cloudflare also sells a Layer 7 load balancing product to customers and uses load balancing elsewhere, which is a different job."
+    },
+    {
+      "title": "How to process packets quickly",
+      "options": [
+        {
+          "name": "Kernel bypass (such as DPDK)",
+          "pro": "A userspace program drives the network interface directly",
+          "con": "It works best when servers are dedicated to the job, and integrates awkwardly with the normal network stack"
+        },
+        {
+          "name": "A kernel module (such as IPVS)",
+          "pro": "Runs in the kernel",
+          "con": "Developing, testing and deploying kernel modules is cumbersome compared with XDP"
+        },
+        {
+          "name": "XDP with eBPF",
+          "pro": "Runs in the kernel before the network stack, deploys like userspace services (weekly if needed), and good Linux network tuning still applies",
+          "con": "Packets are not visible to tools like tcpdump before the XDP program has run, which complicates debugging"
+        }
+      ],
+      "pick": "XDP, because it works on shared servers and is easy to change, which Cloudflare says has been a significant benefit."
+    },
+    {
+      "title": "How to keep connections when the table changes",
+      "options": [
+        {
+          "name": "Share connection state between the balancers",
+          "pro": "Each balancer would know exactly where each connection lives",
+          "con": "Cloudflare says the rate of new connections is large, so it is not practical for balancers to agree by communicating about them"
+        },
+        {
+          "name": "Hash only, with no memory of the previous server",
+          "pro": "No second slot to keep, which is how Unimog treats request-response UDP such as DNS, where there is no connection to preserve",
+          "con": "A changed bucket sends its existing TCP connections to a server that does not know them"
+        },
+        {
+          "name": "Two slots and one extra hop (Unimog)",
+          "pro": "Preserves connections across a bucket update, and the second hop is used by usually under 1% of packets",
+          "con": "Remembers only one change per bucket, so the control plane has to pick buckets carefully"
+        },
+        {
+          "name": "Full Beamer with more hops and generation numbers",
+          "pro": "Preserves connections across a series of changes, and covers the rehash corner case",
+          "con": "Cloudflare judged the added complexity of the generation numbers not worthwhile, and its two-hop version already gives connection lifetimes of days"
+        }
+      ],
+      "pick": "Two slots, because careful update choices give connections lifetimes of days and the extra complexity of full Beamer is not worth it, in Cloudflare's judgment."
+    }
+  ],
+  "roles": [
+    {
+      "id": "client",
+      "label": "Clients",
+      "description": "Browsers and other programs that open connections to a Cloudflare IP address."
+    },
+    {
+      "id": "edge",
+      "label": "Router and per-server programs",
+      "description": "The router, the XDP programs (l4drop and Unimog) and the redirector that run on each server."
+    },
+    {
+      "id": "compute",
+      "label": "Servers and conductor",
+      "description": "The servers that run the products and take connections, and the conductor that builds the tables."
+    },
+    {
+      "id": "data",
+      "label": "Tables and metrics",
+      "description": "The forwarding table, Consul's key-value store and health checks, and Prometheus metrics."
+    },
+    {
+      "id": "async",
+      "label": "xdpd",
+      "description": "The daemon on each server that loads the XDP programs and fills their tables."
+    }
+  ],
+  "quiz": [
+    {
+      "question": "A data center has 300 servers. Unimog's forwarding table is always a power of 2 in size, and Cloudflare says it has more than 100 times as many buckets as servers. What is the smallest table that fits both rules?",
+      "options": [
+        "30,000 buckets, exactly 100 for each server",
+        "16,384 buckets, the power of 2 just below 30,000",
+        "32,768 buckets, the power of 2 just above 30,000",
+        "65,536 buckets, the next power of 2 after that"
+      ],
+      "answer": 2,
+      "explanation": "More than 100 buckets for each of 300 servers means above 30,000, and the next power of 2 is 32,768, which is about 109 buckets per server. A table of exactly 30,000 is not a power of 2, so the low bits of the hash could not index it. At 16,384 buckets each server would get only about 55, which is too coarse for fine adjustment. A table of 65,536 also satisfies both rules, but the question asks for the smallest, and nothing says the size must double."
+    },
+    {
+      "question": "An operator drains server A. In every bucket that listed A, the first slot now names server B and the second slot still names A. A packet of an old connection, which is open on A, hashes to one of those buckets. What happens to it?",
+      "options": [
+        "The load balancer looks the connection up in a shared table of open connections and sends it to A",
+        "B has no socket for it, so its redirector forwards it on to A and the connection survives",
+        "B resets the connection, so the client has to open a new one and start the request again",
+        "The router notices the table change and rehashes the packet over to server A instead"
+      ],
+      "answer": 1,
+      "explanation": "The packet is not a SYN and B has no matching socket, so the redirector sends it on to the second-hop server, A, whose address travels with the packet. A new connection's SYN to the same bucket would be handled by B. Unimog does not keep a table of open connections, because new connections arrive too fast for balancers to share that. A reset is what happens with only one slot per bucket. The router plays no part in this, and since every server holds the same table, which server the router picks does not matter."
+    },
+    {
+      "question": "Three servers in one data center are at 90%, 60% and 30% processor use, so the average is 60%. How does Cloudflare's conductor use the forwarding table to correct this?",
+      "options": [
+        "It gives each server the same number of buckets, because equal buckets always mean equal load",
+        "It stops all new connections to the busiest server until its load falls below that of the idlest one",
+        "It moves buckets from the 90% server to the 30% one, in proportion to each server's distance from the average",
+        "It moves buckets from the 30% server to the 90% one, because the busiest server has shown it can take more work"
+      ],
+      "answer": 2,
+      "explanation": "The conductor compares each server's load with the average and changes the table in proportion to the deviation, so the loads converge on the average. Equal bucket counts ignore that servers differ in speed and that connections cost different amounts of CPU, which is why Cloudflare measures load. Cutting off the busy server entirely until it is idler than the idlest one would overshoot, and is not a proportional step. Moving buckets toward the busier server would make the imbalance worse, because the idle server is the one with spare capacity."
+    }
+  ],
+  "sources": [
+    {
+      "title": "Unimog - Cloudflare's edge load balancer",
+      "publisher": "Cloudflare",
+      "year": 2020,
+      "url": "https://blog.cloudflare.com/unimog-cloudflares-edge-load-balancer/"
+    }
+  ]
+}
