@@ -12,6 +12,18 @@ export const fmt = (n: number): string => Math.round(n).toLocaleString('en-US');
 
 export const prefersReducedMotion = (): boolean => matchMedia('(prefers-reduced-motion: reduce)').matches;
 
+/** Seeded random numbers in [0, 1): the same seed always gives the same sequence, so a simulation replays identically (mulberry32). */
+export function mulberry32(seed: number): () => number {
+  let state = seed >>> 0;
+  return () => {
+    state = (state + 0x6d2b79f5) >>> 0;
+    let t = state;
+    t = Math.imul(t ^ (t >>> 15), t | 1);
+    t ^= t + Math.imul(t ^ (t >>> 7), t | 61);
+    return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+  };
+}
+
 /** Resolves after `ms`, or at once when the reader asked for reduced motion. */
 export const wait = (ms: number): Promise<void> => new Promise((resolve) => setTimeout(resolve, prefersReducedMotion() ? 0 : ms));
 
