@@ -1,0 +1,178 @@
+{
+  "name": "Unique ID Generation",
+  "area": "distributed",
+  "difficulty": "intermediate",
+  "intent": "Give every record a key that no other machine will ever produce, without asking a central counter each time, and choose what else the key should do: be small, sort by time, or reveal nothing.",
+  "scenario": "An online shop runs 8 order-service instances behind a load balancer. Orders are saved in a database split into 4 shards, and copied to a search index and a message queue that are both keyed by order id. Peak load is 20,000 orders per second, so each instance makes about 2,500 ids per second, roughly 2.5 per millisecond. When every shard counts 1, 2, 3 on its own, shard 1 and shard 3 both hand out order 1,000,001, and the search index keeps only one of them.",
+  "problem": "A single database can number rows 1, 2, 3 because one place decides the next number. Split the data over several databases, or let many servers create ids, and that guarantee disappears. Each counter starts from 1 and does not know about the others, so the same number appears twice. The id also has several jobs at once. It must be unique forever across every machine. It should be small, because it is stored in every row, index and foreign key. It is often expected to sort by creation time, so that new rows are added at the end of an index and \"newest first\" needs no extra column. And it should not give away how big the business is or let a stranger guess the next one. No single scheme wins on all of these, so the work is to pick the trade-off and to know how each scheme fails.",
+  "howItWorks": [
+    {
+      "title": "Why auto-increment breaks across many nodes",
+      "text": "An auto-increment column is a counter inside one database. It is unique only because exactly one process owns it. With 4 shards, each shard counts on its own, so order 1,000,001 exists on shard 1 and on shard 3. The numbers collide the moment the rows are brought together in a search index, a queue, a report or a new database after a re-shard. Making one database own the counter fixes uniqueness but turns every insert into a call to that database, and it becomes a bottleneck and a single point of failure. Auto-increment also ties the id to the insert: the id does not exist until the database has stored the row, so a client or a service cannot name a record before it is saved."
+    },
+    {
+      "title": "Ticket servers: a few counters that step apart",
+      "text": "A ticket server is a small database whose only job is to hand out numbers. One counter is a single point of failure, so run several that count in steps. With two, one gives 1, 3, 5 and the other 2, 4, 6, and most databases let you set the step and the starting offset. Ids are small numbers, unique, and increase on each server. The costs: every new id is a network call, the ticket servers must be highly available because every write depends on them, ids are only roughly ordered across servers, and adding a third server means changing the step for every counter. A common refinement is to ask for a block, for example 1,000 numbers at once, and use them from memory. That removes most calls, but numbers are lost when a service restarts and the ids it hands out are no longer in time order."
+    },
+    {
+      "title": "Random UUIDs: no coordination, but a cost for indexes",
+      "text": "A UUID (universally unique identifier) is 128 bits. In version 4, 122 of those bits are random, so any service can create one alone with no network call. Chance of a repeat is so low that nobody plans for it: you would need to create about a billion per second for roughly 85 years to reach even odds of a single duplicate. The costs are different. A UUID is 16 bytes in binary and 36 characters as text, twice the size of a 64-bit number, and it is repeated in every secondary index and foreign key. Worse, random values have no order. In a B-tree primary key, each insert goes to a random leaf page. Once the index is larger than memory, many inserts must read a page from disk, change it, and sometimes split it, and the pages stay half empty. A time-ordered id appends to the right-hand end of the index, where the pages are already in memory. Version 7 UUIDs (RFC 9562) start with a 48-bit millisecond timestamp and then random bits, so they keep the 128-bit size and the no-coordination property but insert at the end of the index like a time-ordered id."
+    },
+    {
+      "title": "A Snowflake-style layout: time, machine, sequence",
+      "text": "Pack three fields into one 64-bit integer. The first bit stays 0 so the number is positive. Then come 41 bits of time in milliseconds since a custom start date, 10 bits that identify the machine, and 12 bits of sequence. Time makes later ids larger. The machine bits separate two machines that act in the same millisecond. The sequence separates one machine from itself: the first id in a millisecond gets 0, the next 1, up to 4,095. The ranges follow from the bits. 41 time bits last 2 to the power of 41 milliseconds, about 69.7 years from the start date. 10 machine bits allow 1,024 machines. 12 sequence bits allow 4,096 ids per millisecond per machine, over 4 million per second. The id is built with shifts: time shifted left by 22, plus machine shifted left by 12, plus sequence. Nobody calls anyone: each machine needs only its own clock, its own machine number and a counter in memory. The split is a design choice. More machine bits means more machines but fewer ids per machine per millisecond, and the total of machine and sequence bits is fixed at 22 if you keep 41 time bits."
+    },
+    {
+      "title": "Machine ids must really be unique",
+      "text": "Uniqueness here rests on one rule: no two live generators share a machine id. If two services start with the same id, they produce the same value whenever they create ids in the same millisecond with the same sequence number, and nothing fails loudly. Copied configuration, a container image with the number baked in, or an old instance that was never switched off can all cause it. Safer options are to hand out machine ids from a small registry when an instance starts, using a lease (a claim that expires unless it is renewed), and to release a number for reuse only after a delay longer than any clock problem, so the old holder's last ids are in the past. Deriving the number from an IP address or a pod name works only if you are sure those are never reused while an old instance might still be alive."
+    },
+    {
+      "title": "When the clock goes backwards or the sequence runs out",
+      "text": "Two things break the \"time never repeats\" assumption. First, the clock can move backwards after a time correction, a virtual machine pause or a restore from a snapshot. A naive generator sees a new time, resets its sequence to 0, and repeats ids it already gave out. The fix is to remember the last millisecond used and compare: if the clock is earlier, refuse to issue ids, or wait until the clock passes that value. A short wait is fine, and a long one should raise an alert and take the instance out of service. After a restart the memory is gone, so persist the last time, or wait a safe interval before the first id. Second, the sequence is finite. If a machine needs 5,000 ids in one millisecond and the sequence holds 4,096, the 4,097th must not wrap round to 0 in the same millisecond, because that repeats id number 1. It waits for the next millisecond. Both guards trade a short pause for never repeating an id."
+    },
+    {
+      "title": "Sortable by time, but only roughly",
+      "text": "Because time is in the high bits, comparing two ids compares their creation times first. Sorting by id gives newest-first lists, lets a query ask for rows after a given id (keyset pagination), and keeps index inserts near the end. The ordering is only as good as the clocks. Ids from one machine are in order, since the generator never goes back. Ids from different machines are ordered by the millisecond on each machine's clock, so two machines whose clocks differ by 20 ms can issue a later event with a smaller id. Inside one millisecond, ordering between machines follows the machine number, not what actually happened first. Treat the id as sortable by time to within clock error, not as a record of causality. If you need to know which event came first, use a logical clock or a version column. A hotspot is the other side of time order: if ids are the shard key in a range-partitioned store, all new writes land on the last range, so hash the id or add a prefix when sharding."
+    },
+    {
+      "title": "Ids leak information",
+      "text": "A sequential id tells outsiders how many records you have. Two order numbers seen a day apart, such as 41,823 and 43,201, show 1,378 orders in that day, and the same trick works on any counter, even when it does not start at 1. It also makes ids guessable: if /orders/41823 works, a stranger will try /orders/41824, and the real problem is a missing permission check, which guessable ids make easy to find. A Snowflake-style id leaks its creation time to the millisecond and the machine that made it, and its sequence bits can hint at how busy that machine was. Version 7 UUIDs also show the creation time. Random version 4 UUIDs reveal nothing, and are also hard to guess. The remedy is not secrecy: check access on every request, and if the id appears in URLs and the leak matters, expose a separate random public id and keep the sortable one internal. Also, a 64-bit id is larger than the biggest integer a JavaScript number holds exactly (2 to the power of 53 minus 1), so send it to browsers as a string."
+    }
+  ],
+  "pros": [
+    "Time-based layouts need no call to any other machine, so creating an id adds almost nothing to a write and keeps working when the network is down",
+    "A 64-bit id fits a standard integer key, is half the size of a UUID, and makes smaller indexes and foreign keys",
+    "Ids that grow with time insert at the end of a B-tree and sort newest first without an extra timestamp column",
+    "Random UUIDs need no setup at all: no registry, no clock, and nothing to configure",
+    "The layout is a set of bit widths you can tune for machines, ids per millisecond and years of life",
+    "Ids can be created before the record is saved, which helps with offline clients and idempotent retries"
+  ],
+  "cons": [
+    "Uniqueness depends on assumptions that can break silently: a shared machine id, or a clock that moves backwards, produces duplicates with no error",
+    "Time-ordered ids are only roughly ordered across machines, because clocks differ",
+    "Random UUIDs are twice the size of a 64-bit id and scatter inserts across an index",
+    "Ticket servers add a network call and a dependency to every write",
+    "Sequential ids leak volume and are easy to guess, and time-based ids leak when and where they were made",
+    "The bit layout is hard to change once ids are stored and in other systems"
+  ],
+  "whenToUse": [
+    "Many machines or shards create records and the ids must never collide when the data is merged",
+    "You need compact numeric keys that sort by creation time, such as orders, messages or events",
+    "Records must be named before they reach a database, for example by an offline app or a retrying client",
+    "A write path cannot afford a call to a central counter for every new row",
+    "A random UUID is enough when you need no ordering, and size and index locality do not matter yet"
+  ],
+  "whenNotToUse": [
+    "A single database with one writer: its own auto-increment is simple, small and correct",
+    "Ids used as secrets or access tokens: use long random values from a secure random source, and never a time-based id",
+    "You need to know exactly which event happened first across machines: ids sorted by time are not a causal order",
+    "Records must have gap-free, strictly consecutive numbers, such as legal invoice numbers: use a controlled sequence in one place",
+    "Very small systems where clocks, machine ids and extra libraries add more risk than they remove"
+  ],
+  "pitfalls": [
+    "Starting two generators with the same machine id, through copied config or an image with the number baked in, so they repeat each other's ids without any error",
+    "Not remembering the last timestamp, so a clock that moves backwards resets the sequence and reissues ids already used",
+    "Letting the sequence wrap to 0 inside the same millisecond instead of waiting for the next one",
+    "Treating ids from different machines as an exact order of events, when clocks can differ by tens of milliseconds",
+    "Using random UUIDs as the primary key of a very large table and then wondering why inserts slow down once the index no longer fits in memory",
+    "Using the time-ordered id as the shard key of a range-partitioned store, so all new writes hit the last range",
+    "Sending 64-bit ids to a browser as JSON numbers, which round above 2 to the power of 53 and silently change the id",
+    "Relying on hard-to-guess ids instead of permission checks, or exposing a sequential id that shows daily volume"
+  ],
+  "related": [
+    {
+      "kind": "concept",
+      "slug": "database-sharding"
+    },
+    {
+      "kind": "concept",
+      "slug": "database-indexing"
+    },
+    {
+      "kind": "concept",
+      "slug": "lsm-trees-vs-b-trees"
+    },
+    {
+      "kind": "concept",
+      "slug": "logical-clocks"
+    },
+    {
+      "kind": "concept",
+      "slug": "leases-and-fencing-tokens"
+    },
+    {
+      "kind": "concept",
+      "slug": "idempotency"
+    },
+    {
+      "kind": "concept",
+      "slug": "pagination"
+    },
+    {
+      "kind": "concept",
+      "slug": "ordering-and-partitioning"
+    }
+  ],
+  "roles": [
+    {
+      "id": "service",
+      "label": "Order service",
+      "description": "Creates orders and needs a new id for each one."
+    },
+    {
+      "id": "tickets",
+      "label": "Ticket servers",
+      "description": "Small databases that only hand out numbers, each stepping by the number of servers."
+    },
+    {
+      "id": "database",
+      "label": "Orders database",
+      "description": "Stores the orders and builds an index on the id."
+    },
+    {
+      "id": "registry",
+      "label": "Machine id registry",
+      "description": "Gives each running generator a machine number that no one else holds, using an expiring lease."
+    },
+    {
+      "id": "clock",
+      "label": "Clock",
+      "description": "The machine's time source, kept close to real time by a sync protocol, and able to be corrected backwards."
+    }
+  ],
+  "quiz": [
+    {
+      "question": "A team replaces auto-increment with random version 4 UUIDs as the primary key of an orders table that now holds 500 million rows. Duplicates never happen, but inserts have become slower and the index is much larger. What is the main cause?",
+      "options": [
+        "Each insert lands at a random place in the B-tree, so it touches pages not in memory, and keys are twice as big",
+        "UUIDs often collide, so the database must retry every insert several times before one is accepted",
+        "Random ids force the database to lock the whole table for each insert, so every writer waits in a single queue behind the others",
+        "A UUID has to be generated by a central service, and that service has become the bottleneck for every insert"
+      ],
+      "answer": 0,
+      "explanation": "Random keys have no locality: each insert goes to some leaf page, which may need to be read from disk and may split, and the 16-byte key is copied into every index. Collisions are practically impossible with 122 random bits, a UUID is made locally with no central service, and B-tree inserts do not lock the whole table."
+    },
+    {
+      "question": "A Snowflake-style generator has been issuing ids. A time correction then sets its clock back 40 ms, and the generator does not store its last timestamp. What can go wrong, and what prevents it?",
+      "options": [
+        "Nothing, because the machine bits keep the ids apart from every other generator",
+        "It may reissue recent ids, so it should remember its last time and refuse or wait",
+        "Later ids become larger than they should be, so it should subtract 40 ms from every timestamp it writes from now on",
+        "The ids now sort by machine instead of time, so it should add more machine bits to the layout"
+      ],
+      "answer": 1,
+      "explanation": "Machine bits separate different machines, not one machine from its own past. After the clock goes back, this generator can produce a time, machine and sequence it already used, so it must compare with its last time and refuse or wait. Subtracting a fixed amount drifts away from real time and still repeats ids later, and more machine bits change nothing about a machine repeating itself."
+    },
+    {
+      "question": "A service that makes 2,500 ids per second suddenly imports a file and asks for 5,000 ids within one millisecond. Its layout has a 12-bit sequence. What should a correct generator do?",
+      "options": [
+        "Wrap the sequence to 0 and continue, since the machine bits keep the ids unique anyway",
+        "Borrow some bits from the time field for the rest of that millisecond",
+        "Issue 4,096 ids, then wait for the next millisecond before issuing the rest",
+        "Return the same id to several callers and let the database sort out repeats"
+      ],
+      "answer": 2,
+      "explanation": "Twelve bits hold 4,096 values, so the 4,097th id in that millisecond has nowhere to go. Waiting for the next millisecond keeps every id unique at the cost of a pause of at most 1 ms. Wrapping to 0 repeats the first id of that millisecond from the same machine, borrowing time bits changes the layout for some ids only and breaks the ordering, and handing out duplicates defeats the purpose."
+    }
+  ]
+}

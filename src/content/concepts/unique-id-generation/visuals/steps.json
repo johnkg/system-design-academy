@@ -1,0 +1,107 @@
+{
+  "actors": [
+    { "id": "a", "label": "Order service A", "role": "service", "x": 12, "y": 24 },
+    { "id": "b", "label": "Order service B", "role": "service", "x": 12, "y": 76 },
+    { "id": "tickets", "label": "Ticket servers", "role": "tickets", "x": 46, "y": 24 },
+    { "id": "clock", "label": "Clock", "role": "clock", "x": 46, "y": 50 },
+    { "id": "registry", "label": "Machine id registry", "role": "registry", "x": 46, "y": 78 },
+    { "id": "db", "label": "Orders database", "role": "database", "x": 86, "y": 50 }
+  ],
+  "meters": [
+    { "id": "dup", "label": "Duplicate ids", "max": 4, "start": 0, "warnAt": 1, "good": "low" },
+    { "id": "calls", "label": "Network calls to get one id", "max": 2, "start": 0 },
+    { "id": "bytes", "label": "Size of one id (bytes)", "max": 16, "start": 8 }
+  ],
+  "frames": [
+    {
+      "narration": "Two order services save orders on different shards, and each shard counts on its own. The next order on shard 1 and the next order on shard 3 both become 1,000,001. When they meet in a search index or a queue keyed by order id, one overwrites the other. Each id also costs a call to its shard.",
+      "messages": [
+        { "from": "a", "to": "db", "label": "save, id 1000001" },
+        { "from": "b", "to": "db", "label": "save, id 1000001" }
+      ],
+      "states": { "a": "shard 1 counter", "b": "shard 3 counter", "db": "same id twice" },
+      "highlight": ["db"],
+      "meters": { "dup": 1, "calls": 1, "bytes": 8 }
+    },
+    {
+      "narration": "Fix one: ticket servers. One hands out odd numbers and one even, so ids never repeat and stay small. But every id is now a network call, and the ticket servers sit on the path of every write. The earlier duplicate stays on the count.",
+      "messages": [
+        { "from": "a", "to": "tickets", "label": "next id?" },
+        { "from": "tickets", "to": "a", "label": "1000001" },
+        { "from": "b", "to": "tickets", "label": "next id?" },
+        { "from": "tickets", "to": "b", "label": "1000002" }
+      ],
+      "states": { "tickets": "odd and even counters", "a": "waits for a ticket", "b": "waits for a ticket" },
+      "highlight": ["tickets"],
+      "meters": { "calls": 1, "bytes": 8 }
+    },
+    {
+      "narration": "Fix two: random UUIDs. Each service makes a 128-bit id alone, with no call, and 122 of its bits are random. The costs are size and order. An id is 16 bytes instead of 8, and the random values land all over the primary key index, so inserts touch pages that are not in memory.",
+      "messages": [
+        { "from": "a", "to": "db", "label": "save, 3f9c… (random)" },
+        { "from": "b", "to": "db", "label": "save, b07a… (random)" }
+      ],
+      "states": { "a": "makes its own id", "b": "makes its own id", "db": "inserts land everywhere" },
+      "highlight": ["db"],
+      "meters": { "calls": 0, "bytes": 16 }
+    },
+    {
+      "narration": "Fix three: a Snowflake-style layout. Each id is time in milliseconds, then a machine number, then a sequence number, packed into 63 bits plus a sign bit that stays 0. At 5,000 ms, A makes machine 1 sequence 0 and B makes machine 2 sequence 0. The ids differ, need no call, and fit 8 bytes. Later ids are larger, so the index grows at its end.",
+      "messages": [
+        { "from": "a", "to": "db", "label": "5000 | 1 | 0" },
+        { "from": "b", "to": "db", "label": "5000 | 2 | 0" }
+      ],
+      "states": { "a": "time, machine 1, seq 0", "b": "time, machine 2, seq 0", "db": "ids sorted by time" },
+      "highlight": ["a", "b"],
+      "meters": { "calls": 0, "bytes": 8 }
+    },
+    {
+      "narration": "Now a mistake: both services were deployed with machine number 1. At 5,000 ms both make time 5000, machine 1, sequence 0, which is the same id. Nothing fails; the database or index just sees two records with one key. That is one more repeated id on the count.",
+      "messages": [
+        { "from": "a", "to": "db", "label": "5000 | 1 | 0" },
+        { "from": "b", "to": "db", "label": "5000 | 1 | 0" }
+      ],
+      "states": { "a": "configured as machine 1", "b": "configured as machine 1", "db": "same key twice" },
+      "highlight": ["db"],
+      "meters": { "dup": 2 }
+    },
+    {
+      "narration": "A registry fixes it. When a service starts it takes a lease on a free machine number, A gets 1 and B gets 2, and renews the lease while it runs. If a service dies, the number goes back to the pool only after a delay, so its last ids are safely in the past.",
+      "messages": [
+        { "from": "a", "to": "registry", "label": "lease a number" },
+        { "from": "registry", "to": "a", "label": "you are 1" },
+        { "from": "b", "to": "registry", "label": "lease a number" },
+        { "from": "registry", "to": "b", "label": "you are 2" }
+      ],
+      "states": { "registry": "1 held by A, 2 held by B", "a": "machine 1", "b": "machine 2" },
+      "highlight": ["registry"],
+      "meters": { "dup": 2 }
+    },
+    {
+      "narration": "Clocks can move backwards. A had issued ids for 5,003 ms, then a time correction sets its clock back to 5,000. A naive generator would start the sequence again at 0 and repeat ids it already made. A safe one remembers 5,003 as its last time and refuses, or waits until the clock is past it. No new duplicate appears.",
+      "messages": [
+        { "from": "clock", "to": "a", "label": "time is now 5000" },
+        { "from": "a", "to": "clock", "label": "last used 5003, wait" }
+      ],
+      "states": { "clock": "set back 3 ms", "a": "waits, no new ids" },
+      "highlight": ["clock", "a"],
+      "meters": { "dup": 2 }
+    },
+    {
+      "narration": "The sequence is finite too. A gets a burst of 5,000 ids in one millisecond, and 12 sequence bits hold only 4,096 values. A issues 4,096 ids, then waits for the next millisecond for the other 904. If it wrapped to 0 instead, it would repeat the first ids of that millisecond.",
+      "messages": [
+        { "from": "a", "to": "db", "label": "4,096 ids at 5010" },
+        { "from": "a", "to": "db", "label": "904 ids at 5011" }
+      ],
+      "states": { "a": "sequence full, waits 1 ms", "db": "5,000 distinct ids" },
+      "highlight": ["a"],
+      "meters": { "dup": 2 }
+    },
+    {
+      "narration": "Last, ids leak. If order numbers 41,823 and 43,201 are seen a day apart, anyone can compute 1,378 orders that day and try 41,824 next. A Snowflake-style id shows the creation time and the machine. Check access on every request, and show a separate random public id where the leak matters.",
+      "states": { "db": "ids reveal volume or time" },
+      "highlight": ["db"],
+      "meters": { "dup": 2 }
+    }
+  ]
+}
