@@ -1,0 +1,90 @@
+{
+  "actors": [
+    { "id": "user", "label": "Shopper", "role": "user", "x": 14, "y": 30 },
+    { "id": "api", "label": "Search API", "role": "api", "x": 46, "y": 30 },
+    { "id": "db", "label": "Products DB", "role": "db", "x": 84, "y": 30 },
+    { "id": "index", "label": "Inverted index", "role": "index", "x": 62, "y": 70 },
+    { "id": "writer", "label": "Indexer", "role": "writer", "x": 20, "y": 70 }
+  ],
+  "meters": [
+    { "id": "read", "label": "Entries read on one machine per search", "max": 10000000, "start": 0, "warnAt": 1000000, "good": "low" },
+    { "id": "segs", "label": "Segments a search must open", "max": 16, "start": 0, "warnAt": 10, "good": "low" },
+    { "id": "shards", "label": "Shards that hold the index", "max": 8, "start": 1 }
+  ],
+  "frames": [
+    {
+      "narration": "A shopper searches \"apple case\". The first version runs LIKE '%apple%' AND LIKE '%case%' on the products table. A leading wildcard cannot use a B-tree, so the database reads all 10 million rows, for every one of 2,000 searches per second.",
+      "messages": [
+        { "from": "user", "to": "api", "label": "apple case" },
+        { "from": "api", "to": "db", "label": "LIKE '%apple%'" }
+      ],
+      "states": { "api": "no index", "db": "scans 10,000,000 rows" },
+      "highlight": ["db"],
+      "meters": { "read": 10000000, "segs": 0, "shards": 1 }
+    },
+    {
+      "narration": "Indexing starts by tokenising and normalising. The indexer cuts a title like \"Red Apple CASES!\" into words, lowercases them and strips the plural, giving red, apple, case. The same steps are applied to the shopper's query, so both sides use the same words.",
+      "messages": [
+        { "from": "writer", "to": "db", "label": "read listings" },
+        { "from": "writer", "to": "index", "label": "red apple case" }
+      ],
+      "states": { "writer": "Red Apple CASES! -> red apple case", "api": "query -> apple case" },
+      "highlight": ["writer"]
+    },
+    {
+      "narration": "The index maps each term to a sorted postings list of the listings that contain it, with counts. Over 10 million listings, apple has 50,000 entries and case has 400,000. Looking a term up costs one lookup in the term dictionary, not a scan.",
+      "messages": [
+        { "from": "writer", "to": "index", "label": "term -> postings" }
+      ],
+      "states": { "index": "apple: 50,000 entries, case: 400,000", "db": "not read by searches" },
+      "highlight": ["index"]
+    },
+    {
+      "narration": "Now the search for apple AND case walks the two sorted lists with one pointer each, keeping numbers that appear in both. That takes at most 50,000 + 400,000 = 450,000 steps instead of 10 million row reads, about 22 times less work.",
+      "messages": [
+        { "from": "api", "to": "index", "label": "apple AND case" },
+        { "from": "index", "to": "api", "label": "3,000 matches" }
+      ],
+      "states": { "api": "tokenises the query", "index": "merge 2 sorted lists" },
+      "highlight": ["index"],
+      "meters": { "read": 450000 }
+    },
+    {
+      "narration": "Matches are ranked, not just listed. Each gets term frequency times inverse document frequency for each query word: apple is rarer, so its idf is about 5.30 against 3.26 for case, and a match on apple counts more. The API returns the top 10 of the 3,000.",
+      "messages": [
+        { "from": "index", "to": "api", "label": "scores, top 10" },
+        { "from": "api", "to": "user", "label": "10 results" }
+      ],
+      "states": { "api": "sort by score", "user": "best match first" },
+      "highlight": ["api", "user"]
+    },
+    {
+      "narration": "Sellers change 300 listings per second. The indexer never edits an index file. It collects changes in memory and writes a small immutable segment every 5 seconds, 1,500 listings each. After one minute that is 12 segments, and every search must open all of them.",
+      "messages": [
+        { "from": "writer", "to": "index", "label": "new segment" }
+      ],
+      "states": { "writer": "300 changes/s, flush every 5 s", "index": "12 segments after 1 min" },
+      "highlight": ["writer", "index"],
+      "meters": { "segs": 12 }
+    },
+    {
+      "narration": "A background merge joins the 12 small segments into 1 larger one, joining the postings lists and dropping deleted listings, then removes the old segments. Searches open 1 segment again, and keep working during the merge.",
+      "messages": [
+        { "from": "index", "to": "index", "label": "merge 12 into 1" }
+      ],
+      "states": { "index": "1 segment" },
+      "highlight": ["index"],
+      "meters": { "segs": 1 }
+    },
+    {
+      "narration": "One machine cannot serve this load forever, so the index is split into 8 shards by document, about 1.25 million listings each. The API asks all 8 in parallel, each returns its top 10, and the API merges 80 candidates into the final 10. Each machine walks lists about 8 times shorter: 56,250 entries.",
+      "messages": [
+        { "from": "api", "to": "index", "label": "ask 8 shards" },
+        { "from": "index", "to": "api", "label": "8 x top 10" }
+      ],
+      "states": { "api": "merge 80 into top 10", "index": "8 shards x 1.25M listings" },
+      "highlight": ["api", "index"],
+      "meters": { "read": 56250, "shards": 8 }
+    }
+  ]
+}

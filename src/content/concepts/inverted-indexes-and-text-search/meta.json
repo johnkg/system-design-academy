@@ -1,0 +1,130 @@
+{
+  "name": "Inverted Indexes and Text Search",
+  "area": "databases",
+  "difficulty": "intermediate",
+  "intent": "Find the documents that contain a word by looking the word up in a ready-made list, instead of reading every document, then sort the matches by how well they fit.",
+  "scenario": "An online shop has 10 million product listings and gets 2,000 searches per second. A shopper types \"apple case\". The first version runs WHERE title LIKE '%apple%' AND title LIKE '%case%', which reads all 10 million rows for every search: 20 billion row reads per second. In the listings, \"apple\" appears in 50,000 titles and \"case\" in 400,000, and about 3,000 titles contain both. Sellers also add or edit 300 listings per second, and the new ones must show up in search within a few seconds.",
+  "problem": "A pattern with a wildcard at the front, such as '%word%', cannot use a normal database index. A B-tree (the sorted tree behind most indexes) is ordered by the first characters of the text, so a word in the middle of a title has no place to jump to, and the database checks every row. The cost grows with the size of the table, not with the size of the answer. A scan also cannot say which of the 3,000 matches is the best one, and it misses \"Cases\" when the shopper typed \"case\" or \"cases\". Text search needs a structure built around words, not around whole values.",
+  "howItWorks": [
+    {
+      "title": "Why LIKE '%word%' scans everything",
+      "text": "A B-tree keeps values in sorted order and finds one by comparing from the first character, like looking up a name in a phone book. That makes LIKE 'app%' (a prefix) fast, because all values starting with app sit together. A pattern that starts with a wildcard has no such starting point: \"wireless apple case\" and \"apple\" would be far apart in the sorted order, so the database reads every row and searches inside each string. The cost is the table size times the text length, on every search. Some databases offer trigram indexes (pg_trgm in PostgreSQL) that speed up substring matching, but they still do not rank results or understand words, so full-text search uses the structure below."
+    },
+    {
+      "title": "Tokenise and normalise",
+      "text": "Before indexing, cut each text into tokens (words) and make equal words look equal. A simple analyzer lowercases (\"Apple\" becomes \"apple\"), splits on spaces and punctuation, and may remove stop words such as \"the\" and \"with\". It may also stem: cut words to a root so that \"cases\", and for a stemmer such as Porter's \"running\" and \"runs\", match their base form. \"Red Apple CASES!\" becomes red, apple, case. The most important rule: use the same analyzer when indexing and when searching, or the query \"Cases\" produces a token the index never stored. Stemming and stop words are choices with costs (a stemmer sometimes merges words that mean different things, and a phrase such as \"to be or not to be\" is nothing without its stop words), so many engines keep stop words and let the scoring give them a low weight."
+    },
+    {
+      "title": "The term to postings list index",
+      "text": "An inverted index flips the table. A table maps a document to its words; an inverted index maps each word (term) to the list of documents containing it, called its postings list. For the terms above: apple maps to [3, 8, 20, 41, ...] and case to [8, 9, 41, 77, ...]. Each entry usually carries the term frequency (how many times the term occurs in that document) and sometimes the positions, so phrase searches such as \"apple case\" as two neighbouring words work. Postings lists are kept sorted by document number and stored compactly as gaps between numbers (3, then +5, then +12). A small dictionary of terms (often held in memory or as a sorted structure) points at the lists, so finding a word costs a lookup, not a scan. This is the same structure as the index at the back of a book."
+    },
+    {
+      "title": "AND and OR by merging sorted lists",
+      "text": "To find documents containing apple AND case, take the two postings lists and walk them together with one pointer each. If both pointers see the same document number, keep it. Otherwise advance the pointer with the smaller number. Every step moves a pointer forward, so the work is at most the sum of the two list lengths: for 50,000 and 400,000 entries, at most 450,000 steps, instead of 10 million rows. Real engines add skip pointers so a short list can jump over long stretches of a long list. OR uses the same walk but keeps every number it meets once, so the result is the union. NOT removes the numbers found in a second list. Because lists are sorted, there is no sorting and no nested loop at query time, and any number of terms is just more walking (start with the shortest list)."
+    },
+    {
+      "title": "Relevance: term frequency and inverse document frequency",
+      "text": "Matching documents are not equally good. TF-IDF scores each document from two ideas in plain words. Term frequency (tf): a document that mentions \"apple\" three times is probably more about apples than one that mentions it once. Inverse document frequency (idf): a word found in nearly every document tells you little, and a rare word tells you a lot, so a match on a rare word counts for more. One common form is idf = ln(1 + N / df), where N is the number of documents and df is how many contain the term. With N = 10 million, \"apple\" (df 50,000) has idf about 5.30 and \"case\" (df 400,000) about 3.26, so a match on apple is worth more. A document's score is the sum of tf times idf over the query terms, and the top few are returned. Modern engines, such as Lucene-based Elasticsearch, OpenSearch and Solr, default to BM25, a refinement that stops repeated words from counting without limit and takes document length into account, so a long page does not win just by containing more words."
+    },
+    {
+      "title": "Updates: segments and merging",
+      "text": "Editing one big sorted index in place for every new listing would be slow, so engines such as Lucene never change an index file once it is written. New documents collect in memory (and in a log for crash safety), and every second or so they are written as a small, new, immutable segment: a complete mini inverted index of its own. A search looks in every segment and merges the answers. A delete only marks a document as gone, and an edit is a delete plus a new add. Too many segments make every search slower, so a background process merges small segments into bigger ones, writing a new segment with the lists joined and the deleted documents dropped, then removes the old ones. This is the same idea as an LSM tree (see Related). Elasticsearch calls making new documents searchable a refresh and by default does it about once a second, so search is near real time, not instant."
+    },
+    {
+      "title": "Sharding a search index",
+      "text": "When one machine cannot hold or serve the index, split it into shards. The usual choice is to split by document: each shard holds a full inverted index for its own subset of documents (for example document number modulo the shard count, or a hash of the id). A search is sent to every shard (scatter), each shard returns its best 10 results with scores, and the coordinator merges those lists into the overall top 10 (gather). With 10 million listings on 8 shards, each shard holds about 1.25 million and walks lists about 8 times shorter, in parallel. Replicas of each shard add read capacity and survive machine loss. The alternative, splitting by term, puts all of \"apple\" on one machine, but then a query with several terms must ship long lists between machines, so it is rare. One subtle cost: if every shard computes idf from its own documents, the same document can score differently depending on which shard holds it, and with few documents per shard rankings wobble. Engines can collect global statistics first at the price of an extra round trip."
+    }
+  ],
+  "pros": [
+    "Search cost follows the length of the postings lists for the query words, not the size of the table",
+    "AND, OR and NOT are plain merges of sorted lists, with no nested loops",
+    "Results can be ranked by relevance, not just filtered",
+    "Normalising lets \"Cases\", \"case\" and \"CASE\" find each other",
+    "Immutable segments make writes cheap, make caching easy and allow background merging",
+    "Splitting by document scales with more machines: each shard searches only its share, in parallel"
+  ],
+  "cons": [
+    "The index is extra storage, often a good fraction of the size of the original text, and must be kept up to date",
+    "New data is searchable a little late (a refresh interval), so it is not strictly consistent with the source database",
+    "Rankings depend on the analyzer, the scoring formula and shard statistics, so they need testing and tuning",
+    "Common words have huge postings lists, and a query made only of them is expensive",
+    "Merging segments uses disk and CPU in the background and can slow searches while it runs",
+    "It matches words, not meaning: synonyms, typos and intent need extra work (synonym lists, fuzzy matching, vectors)"
+  ],
+  "whenToUse": [
+    "Searching text by word: product titles, articles, tickets, logs, emails, documentation",
+    "Results should be ranked by relevance, not just listed",
+    "The table is large enough that scanning it on each search is too slow or too costly",
+    "Queries combine words, filters and sorting, such as \"apple case\" under 20 dollars in stock",
+    "Log and event search where new data arrives constantly and old data is read mostly in bulk"
+  ],
+  "whenNotToUse": [
+    "A few thousand short rows searched rarely: a scan or a simple LIKE is easier and fast enough",
+    "Exact lookups by id, email or code: an ordinary index on that column is smaller and faster",
+    "Search by meaning where the words differ (\"cheap laptop\" and \"budget notebook\"): add or use a vector index",
+    "The index would be the only copy of the data: treat it as a derived view that can be rebuilt from the source of truth",
+    "Reads that must see a write immediately, because the index can lag by a second or more"
+  ],
+  "pitfalls": [
+    "Using a different analyzer at query time than at index time, so \"Cases\" is looked up as a token that was never stored",
+    "Stemming or removing stop words blindly, so different words merge or a phrase loses its meaning",
+    "Ranking only by term frequency, so a long document that repeats a common word beats a short, precise one",
+    "Rewriting a whole index for each change instead of adding small segments and merging them later",
+    "Forgetting that deleted and edited documents stay in old segments until a merge, so disk use and counts lag behind",
+    "Splitting by term, so every multi-word query has to move long postings lists between machines",
+    "Trusting scores across shards that each computed idf from only their own few documents",
+    "Treating the search index as the source of truth, then having no way to rebuild it after a bug or a schema change"
+  ],
+  "related": [
+    { "kind": "concept", "slug": "database-indexing" },
+    { "kind": "concept", "slug": "lsm-trees-vs-b-trees" },
+    { "kind": "concept", "slug": "database-sharding" },
+    { "kind": "concept", "slug": "embeddings-and-vector-search" },
+    { "kind": "concept", "slug": "retrieval-augmented-generation" },
+    { "kind": "concept", "slug": "query-planning-and-joins" },
+    { "kind": "concept", "slug": "caching" },
+    { "kind": "concept", "slug": "sql-vs-nosql" }
+  ],
+  "roles": [
+    { "id": "user", "label": "Shopper", "description": "Types a few words in the search box and expects the best matches first." },
+    { "id": "api", "label": "Search API", "description": "Runs the query text through the analyzer, asks the index, merges the answers and returns the top results." },
+    { "id": "index", "label": "Inverted index", "description": "Maps each term to its sorted postings list, stored as immutable segments and split into shards." },
+    { "id": "db", "label": "Products DB", "description": "The source of truth for listings. A LIKE scan here is the slow path." },
+    { "id": "writer", "label": "Indexer", "description": "Reads new and changed listings, tokenises them and writes them into new segments." }
+  ],
+  "quiz": [
+    {
+      "question": "A table of 5 million products has a normal B-tree index on the title column. Why does WHERE title LIKE '%case%' still read every row?",
+      "options": [
+        "The index is sorted from the first characters of each title, so a word in the middle has no place to jump to",
+        "B-tree indexes only work on numbers, so text columns are always scanned in full after the first query",
+        "The database rewrites every LIKE query into a join, and joins cannot use an index on the same table",
+        "The index would work, but only after the table is split into one partition for every word in a title"
+      ],
+      "answer": 0,
+      "explanation": "A B-tree orders values from the first character, so a leading wildcard gives it no starting point and every row must be checked. B-trees index text fine, and LIKE 'case%' (a prefix) can use one. The query is not rewritten into a join, and partitioning by word is not how text indexes work: an inverted index maps each word to its documents."
+    },
+    {
+      "question": "The index holds apple -> [3, 8, 20, 41] and case -> [8, 9, 41, 77]. A shopper searches for apple AND case. What does the search return, and how?",
+      "options": [
+        "Documents 8 and 41, by moving one pointer along each sorted list",
+        "Documents 3, 8, 9, 20, 41 and 77, by joining both lists into one list",
+        "Document 41 only, since it is the last entry that both lists share",
+        "Documents 3 and 77, the entries that appear in only one of the lists"
+      ],
+      "answer": 0,
+      "explanation": "AND keeps the numbers present in both lists: 8 and 41. Walking both sorted lists with one pointer each finds them in a single pass, without a nested loop. The six-document answer is OR, which keeps every number once. Document 8 also matches both words, so 41 alone is wrong, and 3 and 77 are the ones that fail the AND."
+    },
+    {
+      "question": "A query is \"the apple case\". Among 10 million listings, \"the\" is in 9.8 million, \"case\" in 400,000 and \"apple\" in 50,000. Which word moves the TF-IDF ranking most?",
+      "options": [
+        "apple, because the fewer documents contain a word, the more a match on it tells you",
+        "the, because it appears in the most documents and so is the most popular word",
+        "case, because it is the last word typed and engines weight later words more",
+        "None of them, because TF-IDF only counts which words matched and not how rare they are"
+      ],
+      "answer": 0,
+      "explanation": "Inverse document frequency gives rare words a high weight, so apple (the rarest) counts most and the (in almost every document) counts close to nothing. Popularity is the opposite of what idf rewards. TF-IDF ignores word order when weighting, and it is exactly the rarity of a word that it measures, together with how often the word occurs in the document."
+    }
+  ]
+}

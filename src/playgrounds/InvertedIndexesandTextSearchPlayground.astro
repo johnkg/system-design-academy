@@ -1,0 +1,262 @@
+---
+import PlaygroundShell from '../components/PlaygroundShell.astro';
+const DOCS = [
+  'Red apple pie recipe',
+  'Green apple juice and red apple cider',
+  'Apple pie with cream',
+  'Red wine, red grapes and red jam',
+  'Grape juice recipe',
+  'Pie crust recipe with butter',
+].join('\n');
+---
+<PlaygroundShell title="Simulate it" hint="Type a few documents, build the index, then run a query and watch the postings lists merge and the scores rank the results.">
+  <ol class="how">
+    <li>Press <b>Reset</b>, then press <b>Build index</b>: 6 documents become 13 distinct terms, and each term keeps a postings list of the documents that contain it. Set <b>Query</b> to <i>apple pie</i> and <b>Match mode</b> to <b>All words (AND)</b>: documents 0 and 2 match, found by walking two sorted lists with 3 comparisons. A <code>LIKE</code> scan would have read all 6 documents.</li>
+    <li>Press <b>Reset</b>, set <b>Query</b> to <i>juice grape</i> and <b>Match mode</b> to <b>Any word (OR)</b>: documents 1, 3 and 4 match, after 3 comparisons that merge the two lists into one sorted list without repeats.</li>
+    <li>Press <b>Reset</b>, set <b>Query</b> to <i>red apple juice</i> and <b>Match mode</b> to <b>Ranked (TF-IDF)</b>: document 1 scores 4.682, document 3 scores 3.296 and document 0 scores 2.197. Juice is in only 2 documents, so its weight (1.386) is higher than the 1.099 of red and apple, which are in 3 documents each.</li>
+    <li>Press <b>Reset</b>, set <b>Query</b> to <i>grape</i> and <b>Match mode</b> to <b>Any word (OR)</b>, then change <b>Normalising</b> to <b>Exact words only</b>: 0 documents match, because the words are stored as written (Grape, grapes). Choose <b>Lowercase</b>: 1 document matches. Choose <b>Lowercase, plurals, stop words</b>: 2 documents match.</li>
+    <li>Press <b>Reset</b>, set <b>Query</b> to <i>red apple juice</i>, <b>Match mode</b> to <b>Ranked (TF-IDF)</b> and <b>Shards</b> to <b>2 shards</b>: each shard counts rarity from its own 3 documents, so document 1 now scores 5.075 instead of 4.682 and document 3 scores 2.749 instead of 3.296. The order here is unchanged, but the numbers shift when an index is split, and sometimes the order does too.</li>
+  </ol>
+  <div class="pg idx" data-idx>
+    <div class="pg-row">
+      <label class="idx-docs">Documents, one per line
+        <textarea class="pg-in" rows="7" data-docs spellcheck="false">{DOCS}</textarea>
+      </label>
+    </div>
+    <div class="pg-row">
+      <label>Normalising
+        <select class="pg-in" data-norm>
+          <option value="raw">Exact words only</option>
+          <option value="lower">Lowercase</option>
+          <option value="full" selected>Lowercase, plurals, stop words</option>
+        </select>
+      </label>
+      <label>Shards
+        <select class="pg-in" data-shards>
+          <option value="1" selected>1 shard</option>
+          <option value="2">2 shards</option>
+          <option value="3">3 shards</option>
+        </select>
+      </label>
+      <button class="btn pg-primary" type="button" data-build>Build index</button>
+    </div>
+    <div class="pg-row">
+      <label>Query <input class="pg-in" type="text" value="apple pie" data-query autocomplete="off" /></label>
+      <label>Match mode
+        <select class="pg-in" data-mode>
+          <option value="and" selected>All words (AND)</option>
+          <option value="or">Any word (OR)</option>
+          <option value="rank">Ranked (TF-IDF)</option>
+        </select>
+      </label>
+      <button class="btn" type="button" data-reset>Reset</button>
+    </div>
+    <p class="pg-note" data-dirty></p>
+    <p class="pg-out" data-verdict aria-live="polite"></p>
+    <div class="pg-grid">
+      <div class="pg-box" style="--c: var(--role-1)"><h3>Documents</h3><span class="pg-mono" data-sdocs></span><span class="pg-note" data-sdocsnote></span></div>
+      <div class="pg-box" style="--c: var(--role-2)"><h3>Distinct terms</h3><span class="pg-mono" data-sterms></span><span class="pg-note" data-stermsnote></span></div>
+      <div class="pg-box" style="--c: var(--role-3)"><h3>Postings read</h3><span class="pg-mono" data-sread></span><span class="pg-note" data-sreadnote></span></div>
+      <div class="pg-box" style="--c: var(--role-4)"><h3>Comparisons</h3><span class="pg-mono" data-scmp></span><span class="pg-note" data-scmpnote></span></div>
+    </div>
+    <h4 class="idx-h">Results</h4>
+    <ol class="idx-res" data-results></ol>
+    <h4 class="idx-h">Merge steps</h4>
+    <ol class="pg-log" data-trace></ol>
+    <h4 class="idx-h">Postings lists (term, then document:count)</h4>
+    <ul class="idx-post" data-post></ul>
+    <h4 class="idx-h">Documents as tokens</h4>
+    <ol class="idx-tok" data-tokens start="0"></ol>
+    <p class="pg-note">Model: a word is a run of letters and digits. Normalising "Lowercase, plurals, stop words" lowercases, drops the words and, with, the, a and of, and removes a trailing s from words of 4 or more letters (not ss). Postings lists are sorted by document number. AND and OR walk two lists at a time with one pointer each; a comparison is one step of that walk. Ranked mode scores each document as the sum over query terms of count x ln(1 + N / df), where N is the number of documents and df the number containing the term, and sorts by score (ties by document number). With several shards, a document goes to shard number (id mod shards) and each shard scores with its own N and df. Real engines also normalise for document length and use refinements such as BM25.</p>
+  </div>
+</PlaygroundShell>
+<script>
+  type Postings = Map<string, [number, number][]>;
+  type Norm = 'raw' | 'lower' | 'full';
+  type Mode = 'and' | 'or' | 'rank';
+
+  const STOP_WORDS = new Set(['and', 'with', 'the', 'a', 'of']);
+  const MIN_PLURAL = 4; const MAX_TERMS_SHOWN = 30; const MAX_RESULTS = 8; const MAX_TRACE = 40;
+  const DEFAULTS = { query: 'apple pie', mode: 'and', norm: 'full', shards: '1' };
+
+  function tokenize(text: string, norm: Norm): string[] {
+    const t = norm === 'raw' ? text : text.toLowerCase();
+    let words = t.split(/[^A-Za-z0-9]+/).filter(Boolean);
+    if (norm === 'full') {
+      words = words.filter((w) => !STOP_WORDS.has(w))
+        .map((w) => (w.length >= MIN_PLURAL && w.endsWith('s') && !w.endsWith('ss') ? w.slice(0, -1) : w));
+    }
+    return words;
+  }
+  function buildIndex(docs: string[], ids: number[], norm: Norm): Postings {
+    const index: Postings = new Map();
+    ids.forEach((id) => {
+      const counts = new Map<string, number>();
+      for (const w of tokenize(docs[id], norm)) counts.set(w, (counts.get(w) ?? 0) + 1);
+      counts.forEach((tf, w) => { if (!index.has(w)) index.set(w, []); index.get(w)!.push([id, tf]); });
+    });
+    return index;
+  }
+  // Walk two sorted lists with one pointer each. Each loop turn is one comparison and one trace line.
+  function walk(a: number[], b: number[], how: 'and' | 'or', an: string, bn: string, trace: string[]) {
+    const out: number[] = []; let i = 0; let j = 0; let cmp = 0;
+    while (i < a.length && j < b.length) {
+      cmp++;
+      if (a[i] === b[j]) { trace.push(`${a[i]} is in ${an} and ${bn}: keep ${a[i]}`); out.push(a[i]); i++; j++; }
+      else if (a[i] < b[j]) { trace.push(`${a[i]} < ${b[j]}: ${how === 'or' ? `keep ${a[i]}` : `${a[i]} is not in ${bn}, skip it`}`); if (how === 'or') out.push(a[i]); i++; }
+      else { trace.push(`${b[j]} < ${a[i]}: ${how === 'or' ? `keep ${b[j]}` : `${b[j]} is not in ${an}, skip it`}`); if (how === 'or') out.push(b[j]); j++; }
+    }
+    if (how === 'or') { while (i < a.length) out.push(a[i++]); while (j < b.length) out.push(b[j++]); }
+    return { out, cmp };
+  }
+  const fmt = (n: number) => n.toLocaleString('en-US');
+  const plural = (n: number, w: string) => `${fmt(n)} ${w}${n === 1 ? '' : 's'}`;
+  function el(tag: string, cls: string | null, text: string): HTMLElement {
+    const e = document.createElement(tag); if (cls) e.className = cls; e.textContent = text; return e;
+  }
+
+  document.querySelectorAll<HTMLElement>('[data-idx]').forEach((root) => {
+    const q = <T extends Element>(s: string) => root.querySelector<T>(s)!;
+    const docsBox = q<HTMLTextAreaElement>('[data-docs]');
+    const defaultDocs = docsBox.value;
+    let docs: string[] = []; let builtNorm: Norm = 'full'; let builtShards = 1;
+    let shardIdx: Postings[] = []; let shardIds: number[][] = [];
+    let builtFrom = '';
+
+    function build() {
+      docs = docsBox.value.split('\n').map((l) => l.trim()).filter(Boolean);
+      builtFrom = docsBox.value; builtNorm = q<HTMLSelectElement>('[data-norm]').value as Norm; builtShards = Number(q<HTMLSelectElement>('[data-shards]').value);
+      shardIds = Array.from({ length: builtShards }, () => []);
+      docs.forEach((_, id) => shardIds[id % builtShards].push(id));
+      shardIdx = shardIds.map((ids) => buildIndex(docs, ids, builtNorm));
+      render();
+    }
+
+    function render() {
+      const mode = q<HTMLSelectElement>('[data-mode]').value as Mode;
+      const queryText = q<HTMLInputElement>('[data-query]').value;
+      const terms = [...new Set(tokenize(queryText, builtNorm))];
+      const stale = docsBox.value !== builtFrom || q<HTMLSelectElement>('[data-norm]').value !== builtNorm || Number(q<HTMLSelectElement>('[data-shards]').value) !== builtShards;
+      q('[data-dirty]').textContent = stale ? 'Documents, Normalising or Shards changed: press Build index to apply them. The results below still use the last build.' : '';
+
+      const allTerms = new Set<string>(); shardIdx.forEach((ix) => ix.forEach((_, t) => allTerms.add(t)));
+      let entries = 0; shardIdx.forEach((ix) => ix.forEach((l) => { entries += l.length; }));
+      q('[data-sdocs]').textContent = fmt(docs.length);
+      q('[data-sdocsnote]').textContent = builtShards > 1 ? `split over ${builtShards} shards: ${shardIds.map((s) => s.length).join(', ')}` : 'in one index';
+      q('[data-sterms]').textContent = fmt(allTerms.size);
+      q('[data-stermsnote]').textContent = `${fmt(entries)} postings entries in total`;
+
+      // Run the query on every shard, then gather.
+      let read = 0; let cmpTotal = 0; const trace: string[] = [];
+      const hits: { id: number; score: number }[] = [];
+      shardIdx.forEach((ix, s) => {
+        const tag = builtShards > 1 ? `Shard ${s + 1}: ` : '';
+        const lists = terms.map((t) => ix.get(t) ?? []);
+        lists.forEach((l) => { read += l.length; });
+        if (!terms.length) return;
+        if (mode === 'rank') {
+          const n = shardIds[s].length; const scores = new Map<number, number>();
+          terms.forEach((t, k) => { const l = lists[k]; if (!l.length) return; const idf = Math.log(1 + n / l.length); l.forEach(([d, tf]) => scores.set(d, (scores.get(d) ?? 0) + tf * idf)); });
+          scores.forEach((score, id) => hits.push({ id, score }));
+          return;
+        }
+        let acc = lists[0].map((p) => p[0]); let name = terms[0];
+        for (let k = 1; k < terms.length; k++) {
+          const lines: string[] = [];
+          const w = walk(acc, lists[k].map((p) => p[0]), mode, name, terms[k], lines);
+          cmpTotal += w.cmp; lines.forEach((l) => trace.push(`${tag}${l}`));
+          acc = w.out; name = `${name} ${mode === 'and' ? 'AND' : 'OR'} ${terms[k]}`;
+        }
+        acc.forEach((id) => hits.push({ id, score: 0 }));
+      });
+      if (mode === 'rank') hits.sort((a, b) => b.score - a.score || a.id - b.id); else hits.sort((a, b) => a.id - b.id);
+
+      q('[data-sread]').textContent = fmt(read);
+      q('[data-sreadnote]').textContent = terms.length ? `entries in the ${plural(terms.length, 'list')} for ${terms.join(', ')}` : 'type a query first';
+      q('[data-scmp]').textContent = mode === 'rank' ? '-' : fmt(cmpTotal);
+      q('[data-scmpnote]').textContent = mode === 'rank' ? 'ranked mode adds up scores, there is no list merge' : 'one step of the pointer walk over two lists';
+
+      // Results
+      const res = q('[data-results]'); res.replaceChildren();
+      const top = hits[0]?.score || 1;
+      hits.slice(0, MAX_RESULTS).forEach((h) => {
+        const li = document.createElement('li'); li.value = h.id;
+        const head = el('span', 'idx-doc', `doc ${h.id}${mode === 'rank' ? `, score ${h.score.toFixed(3)}` : ''}: `);
+        li.append(head, document.createTextNode(docs[h.id]));
+        if (mode === 'rank') { const bar = document.createElement('span'); bar.className = 'idx-bar'; bar.setAttribute('aria-hidden', 'true'); bar.style.setProperty('--w', `${Math.round((100 * h.score) / top)}%`); li.append(bar); }
+        res.append(li);
+      });
+      if (!hits.length) res.append(el('li', 'pg-note', terms.length ? 'No document matches.' : 'No query terms left after normalising.'));
+      if (hits.length > MAX_RESULTS) res.append(el('li', 'pg-note', `${hits.length - MAX_RESULTS} more not shown`));
+
+      // Idf lines (ranked) or merge trace.
+      const tr = q('[data-trace]'); tr.replaceChildren();
+      if (mode === 'rank') {
+        terms.forEach((t) => {
+          shardIdx.forEach((ix, s) => {
+            const l = ix.get(t) ?? []; const n = shardIds[s].length; const tag = builtShards > 1 ? `Shard ${s + 1}: ` : '';
+            tr.append(el('li', null, l.length ? `${tag}${t} is in ${l.length} of ${n} documents, weight ln(1 + ${n}/${l.length}) = ${Math.log(1 + n / l.length).toFixed(3)}` : `${tag}${t} is in no document, adds nothing`));
+          });
+        });
+        if (!terms.length) tr.append(el('li', 'pg-note', 'Nothing to weigh.'));
+      } else {
+        trace.slice(0, MAX_TRACE).forEach((l) => tr.append(el('li', null, l)));
+        if (trace.length > MAX_TRACE) tr.append(el('li', 'pg-note', `${trace.length - MAX_TRACE} more steps not shown`));
+        if (!trace.length) tr.append(el('li', 'pg-note', terms.length < 2 ? 'A query of one word needs no merge: its postings list is the answer.' : 'No lists to walk.'));
+      }
+
+      // Postings lists
+      const post = q('[data-post]'); post.replaceChildren();
+      const merged = new Map<string, [number, number][]>();
+      shardIdx.forEach((ix) => ix.forEach((l, t) => merged.set(t, [...(merged.get(t) ?? []), ...l])));
+      const names = [...merged.keys()].sort((a, b) => (terms.includes(b) ? 1 : 0) - (terms.includes(a) ? 1 : 0) || a.localeCompare(b));
+      names.slice(0, MAX_TERMS_SHOWN).forEach((t) => {
+        const li = document.createElement('li'); if (terms.includes(t)) li.className = 'in-query';
+        li.append(el('b', null, t), document.createTextNode(` (${merged.get(t)!.length}) `), el('span', 'pg-mono', merged.get(t)!.sort((a, b) => a[0] - b[0]).map(([d, tf]) => `${d}:${tf}`).join(' ')));
+        post.append(li);
+      });
+      if (names.length > MAX_TERMS_SHOWN) post.append(el('li', 'pg-note', `${names.length - MAX_TERMS_SHOWN} more terms not shown`));
+
+      // Tokens per document
+      const tk = q('[data-tokens]'); tk.replaceChildren();
+      docs.slice(0, MAX_RESULTS * 2).forEach((d, id) => { const li = document.createElement('li'); li.value = id; li.append(document.createTextNode(`${d} `), el('span', 'pg-mono', `-> ${tokenize(d, builtNorm).join(' ') || '(nothing)'}`)); tk.append(li); });
+
+      // Verdict (live region)
+      const label = mode === 'and' ? 'All words (AND)' : mode === 'or' ? 'Any word (OR)' : 'Ranked (TF-IDF)';
+      let text: string;
+      if (!docs.length) text = 'Add at least one document, then press Build index.';
+      else if (!terms.length) text = 'The query has no words after normalising. Type a query.';
+      else {
+        const ids = hits.map((h) => h.id).join(', ');
+        const scan = `A LIKE scan would read all ${plural(docs.length, 'document')}; the index read ${plural(read, 'posting')}.`;
+        if (mode === 'rank') text = hits.length ? `${label} for "${queryText.trim()}": ${plural(hits.length, 'document')} scored, best is doc ${hits[0].id} with ${hits[0].score.toFixed(3)}. ${scan}` : `${label} for "${queryText.trim()}": no document contains any of the words. ${scan}`;
+        else text = `${label} for "${queryText.trim()}": ${plural(hits.length, 'match')}${hits.length ? ` (docs ${ids})` : ''} after ${plural(cmpTotal, 'comparison')}. ${scan}`;
+      }
+      q('[data-verdict]').textContent = text;
+    }
+
+    q('[data-build]').addEventListener('click', build);
+    ['[data-query]', '[data-mode]'].forEach((sel) => { q(sel).addEventListener('input', render); q(sel).addEventListener('change', render); });
+    ['[data-docs]', '[data-norm]', '[data-shards]'].forEach((sel) => { q(sel).addEventListener('input', render); q(sel).addEventListener('change', render); });
+    q('[data-reset]').addEventListener('click', () => {
+      docsBox.value = defaultDocs;
+      q<HTMLInputElement>('[data-query]').value = DEFAULTS.query; q<HTMLSelectElement>('[data-mode]').value = DEFAULTS.mode;
+      q<HTMLSelectElement>('[data-norm]').value = DEFAULTS.norm; q<HTMLSelectElement>('[data-shards]').value = DEFAULTS.shards;
+      build();
+    });
+    build();
+  });
+</script>
+<style is:global>
+  .playground .idx-docs { width: 100%; }
+  .playground .idx-docs textarea { width: 100%; box-sizing: border-box; font: .85rem var(--font-mono); resize: vertical; }
+  .playground .idx-h { margin: 16px 0 6px; }
+  .playground .idx-res, .playground .idx-tok, .playground .pg-log { overflow-wrap: anywhere; }
+  .playground .idx-res { padding-left: 2.1rem; display: grid; gap: 4px; }
+  .playground .idx-doc { font: 600 .85rem var(--font-mono); }
+  .playground .idx-bar { display: block; height: 6px; width: var(--w, 0); max-width: 100%; margin-top: 2px; border-radius: 3px; background: var(--role-3); }
+  .playground .idx-post { list-style: none; margin: 0; padding: 0; display: grid; gap: 4px; overflow-wrap: anywhere; }
+  .playground .idx-post li { padding: 2px 8px; border-left: 3px solid var(--border); }
+  .playground .idx-post li.in-query { border-left-color: var(--role-4); background: color-mix(in srgb, var(--role-4) 10%, transparent); }
+  .playground .idx-tok { padding-left: 2.1rem; display: grid; gap: 2px; font-size: .9rem; }
+</style>
