@@ -52,7 +52,7 @@ Simulation ideas: caching (hit/miss ratio with eviction policies), sharding and 
 
 ## Later
 - More areas: none queued; propose the next one
-- Lighthouse performance check; deploy
+- Deploy checks beyond the build (the Lighthouse check exists: `npm run check:lighthouse`)
 
 ## Status
 - Design patterns: all 23 built, with JS, Python and C# samples (verified by `npm run check:samples`)
