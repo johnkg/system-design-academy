@@ -12,6 +12,8 @@ export const changelog: Change[] = [
       { text: 'Thirty-six "how to try it" steps now say what to press or set first, and 68 button and option names match the simulation exactly. The app icons and share image use the new colours.' },
       { text: 'Eighteen more animations now show small readings under the picture: sharding, replication, consensus, retries, timeouts, load shedding, bulkheads, idempotency, quorums, leader election, consistent hashing, pub/sub, CQRS, sagas, health checks, autoscaling, DNS and failure detection.', href: 'concepts/autoscaling/' },
       { text: 'Interview questions you grade in the Drill come back on the same schedule as Review, and the Practice page shows your last mock interview score. Pages no longer jump while loading on a phone, and the concept map is filled in before the page finishes loading.' },
+      { text: 'Four new concepts: back-of-the-envelope estimation, inverted indexes and text search, cache eviction with stampedes and write policies, and unique ID generation. Each has an animation with readings, a simulation, code in three languages and a quiz.', href: 'concepts/back-of-the-envelope-estimation/' },
+      { text: 'Forty-two more animations show readings under the picture (nearly every security, networking, API, database, messaging and distributed-systems lesson).' },
     ],
   },
   {

@@ -60,4 +60,8 @@ export const aliasGroups: string[][] = [
   ['meta', 'facebook', 'cache invalidation', 'stale cache', 'cache consistency', 'polaris', 'tao', 'cache fill race'],
   ['linkedin', 'kafka', 'commit log', 'kafka partitions', 'kafka replication', 'venice', 'log throughput'],
   ['unimog', 'cloudflare load balancer', 'layer 4 load balancer', 'xdp', 'ebpf', 'ecmp', 'connection draining'],
+  ['estimation', 'capacity planning', 'back of the envelope', 'qps', 'napkin math', 'requests per second', 'how many servers', 'latency numbers'],
+  ['inverted index', 'full-text search', 'full text', 'postings list', 'tf-idf', 'bm25', 'lucene', 'elasticsearch', 'tokenizer', 'stemming', 'relevance'],
+  ['cache eviction', 'lru', 'lfu', 'stampede', 'thundering herd', 'dogpile', 'singleflight', 'request coalescing', 'negative caching', 'write-through', 'write-back', 'ttl jitter'],
+  ['unique id', 'snowflake', 'uuid', 'id generation', 'auto increment', 'ticket server', 'sortable id', 'machine id'],
 ];
