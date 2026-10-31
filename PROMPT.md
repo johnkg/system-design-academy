@@ -18,4 +18,4 @@ Rules:
 - Quality over quantity: one accurate, well-tested concept beats three shallow ones.
 - Keep accessibility intact: headings never skip a level, controls are labelled, colours use the existing tokens, motion respects reduced-motion, and focus is never lost. Re-check with axe-core on new pages in light and dark.
 - Verify before saying done: build, sample checks, and open each page in the browser (desktop and 375px wide).
-- Do not add dependencies. Put ideas in `IDEAS.md` rather than building them unasked.
+- Do not add dependencies (the pinned test tools Playwright and axe-core in `devDependencies` are the only exception). Put ideas in `IDEAS.md` rather than building them unasked.

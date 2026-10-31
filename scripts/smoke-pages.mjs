@@ -3,15 +3,17 @@
 // WCAG text-spacing overrides applied,
 // and any control inside a playground that throws when set to each of its options.
 //
-// Usage (after `npm run build`): node scripts/smoke-pages.mjs [--only substring] [--no-axe]
-// Needs Playwright (with a Chromium browser) and axe-core. CI installs both with `npm install --no-save playwright axe-core`;
-// they are deliberately not dependencies of the site. `--font "DejaVu Sans"` forces a wider font to mimic a CI runner or an Android phone.
+// Usage (after `npm run build`): node scripts/smoke-pages.mjs [--only substring] [--no-axe] [--shard 2/5]
+// Needs Playwright (with a Chromium browser: `npx playwright install chromium`) and axe-core; both are pinned in devDependencies. `--font "DejaVu Sans"` forces a wider font to mimic a CI runner or an Android phone.
 import { createRequire } from 'node:module';
 import { spawn } from 'node:child_process';
 import { existsSync, readdirSync, readFileSync, statSync } from 'node:fs';
+import { availableParallelism } from 'node:os';
 import { join, relative } from 'node:path';
+import { parseShard } from './shard.mjs';
 
 const args = process.argv.slice(2);
+const shard = parseShard(args);
 const only = args.includes('--only') ? args[args.indexOf('--only') + 1] : '';
 const font = args.includes('--font') ? args[args.indexOf('--font') + 1] : '';
 const root = new URL('..', import.meta.url).pathname;
@@ -43,7 +45,7 @@ const pages = [];
   }
 })(dist);
 pages.sort();
-const targets = pages.filter((p) => p.includes(only));
+const targets = shard.pick(pages.filter((p) => p.includes(only)));
 
 // Serve dist/ with `astro preview` (our own child process, stopped at the end). The site may live under a base path.
 const PORT_BASE = 4400, PORT_SPREAD = 400; // a random port, so parallel runs on one machine do not collide
@@ -83,7 +85,8 @@ async function exercise(page) {
 // Two passes per page: a desktop in light mode, and 320 px (a 1280 px screen at 400% zoom, WCAG 1.4.10) in dark mode.
 const DESKTOP = 1280, REFLOW = 320, VIEW_HEIGHT = 900;
 const LOG_CHARS = 160; // console errors are cut to this length in the report
-const PARALLEL_PAGES = 4;
+const MAX_PARALLEL = 6;
+const PARALLEL_PAGES = Math.min(MAX_PARALLEL, Math.max(2, availableParallelism())); // one page per core, so a bigger machine is not left idle
 async function check(path) {
   const problems = [];
   for (const [width, scheme] of [[DESKTOP, 'light'], [REFLOW, 'dark']]) {

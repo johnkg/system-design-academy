@@ -3,6 +3,7 @@
 // Usage: node scripts/check-content.mjs
 import { readdirSync, readFileSync, existsSync, statSync } from 'node:fs';
 import { join } from 'node:path';
+import { BASELINE_CAP } from './baseline-cap.mjs';
 
 const root = new URL('../src/', import.meta.url).pathname;
 const read = (p) => JSON.parse(readFileSync(p, 'utf8'));
@@ -177,6 +178,13 @@ if (share > MAX_LONGEST_SHARE) err('quizzes', `the correct option is the single 
     const kb = statSync(join(root, 'content', kind, s, 'meta.json')).size / 1024;
     if (kb > MAX_META_KB) warn(`${kind}/${s}`, `meta.json is ${kb.toFixed(1)} KB (budget ${MAX_META_KB} KB): trim it or move a long section out`);
   }
+}
+
+// 9. The walkthrough baseline (numbers in how-to lists that the browser check cannot reproduce) has a fixed cap, so it cannot grow unnoticed.
+{
+  const total = Object.values(read(new URL('./walkthrough-baseline.json', import.meta.url).pathname)).flat().length;
+  if (total > BASELINE_CAP) err('scripts/walkthrough-baseline.json', `holds ${total} numbers, over the cap of ${BASELINE_CAP}: confirm each new number by hand, then raise BASELINE_CAP in scripts/baseline-cap.mjs`);
+  else if (total < BASELINE_CAP) warn('scripts/walkthrough-baseline.json', `holds ${total} numbers but the cap is ${BASELINE_CAP}: lower BASELINE_CAP in scripts/baseline-cap.mjs to ${total} so the gain is kept`);
 }
 
 for (const w of warnings) console.warn(`warn  ${w}`);

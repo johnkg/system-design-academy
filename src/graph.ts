@@ -1,6 +1,6 @@
 // A reading map derived from the existing data (no new content): concepts are linked by their `related` lists
 // (same area, or both list each other), and a link points "backwards" when the other concept is easier. "Read first" = related and easier; "Opens the door to" = related and harder.
-import { url } from './lib';
+import { url } from './url.ts';
 
 const rank = { beginner: 0, intermediate: 1, advanced: 2 } as const;
 type Level = keyof typeof rank;

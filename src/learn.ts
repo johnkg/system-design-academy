@@ -1,7 +1,7 @@
 // "Why was I wrong?": for a quiz question, find the part of its page that teaches the idea, so a missed answer links to a lesson.
 // It compares the words of the question, correct answer and explanation with each section of the page and picks the closest one.
 // No per-question data is needed, so new quizzes get links automatically.
-import { url } from './lib';
+import { url } from './url.ts';
 
 export interface LearnLink { where: string; href: string; concepts: { name: string; href: string }[] }
 type Ref = { kind?: string; slug: string };
