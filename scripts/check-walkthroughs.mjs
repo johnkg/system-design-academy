@@ -11,14 +11,17 @@
 // Those are kept in scripts/walkthrough-baseline.json, so the check fails only for a NEW unverified number. Edit a how list so a
 // number changes and the check asks you to look at it: fix the text, or run with --update to accept it on purpose.
 //
-// Usage (after `npm run build`): node scripts/check-walkthroughs.mjs [--only substring] [--update] [--verbose]
+// Usage (after `npm run build`): node scripts/check-walkthroughs.mjs [--only substring] [--update] [--verbose] [--shard 2/3]
 // Needs Playwright with a Chromium browser, like check:pages. Random numbers are seeded and animation is reduced, so a run is repeatable.
 import { createRequire } from 'node:module';
 import { spawn } from 'node:child_process';
 import { existsSync, readdirSync, readFileSync, writeFileSync, statSync } from 'node:fs';
 import { join, relative } from 'node:path';
+import { parseShard } from './shard.mjs';
+import { BASELINE_CAP } from './baseline-cap.mjs';
 
 const args = process.argv.slice(2);
+const shard = parseShard(args);
 const only = args.includes('--only') ? args[args.indexOf('--only') + 1] : '';
 const update = args.includes('--update');
 const verbose = args.includes('--verbose');
@@ -74,7 +77,7 @@ const pages = [];
   }
 })(dist);
 pages.sort();
-const wanted = pages.filter((p) => p.includes(only));
+const wanted = shard.pick(pages.filter((p) => p.includes(only)));
 
 // Runs inside the page: drives one simulation and returns its "how" steps and every number it showed.
 // mode 'explore' tries the controls; 'step' applies the settings of steps 0..step and then presses the buttons that step names
@@ -288,12 +291,17 @@ for (const r of results.sort((a, b) => a.key.localeCompare(b.key))) {
 }
 const stale = Object.entries(baseline).flatMap(([k, list]) => list.filter((n) => !(fresh[k] ?? []).includes(n)).map((n) => `${k}: "${n}"`));
 
+if (update && shard.active) { console.error('--update needs a full run: drop --shard.'); process.exit(2); }
+if (update && Object.values(fresh).flat().length > BASELINE_CAP) {
+  console.error(`Refusing to write the baseline: ${Object.values(fresh).flat().length} numbers is over the cap of ${BASELINE_CAP}. Confirm each new number by hand in a browser, then raise BASELINE_CAP in scripts/baseline-cap.mjs.`);
+  process.exit(1);
+}
 if (update) {
   writeFileSync(baselinePath, JSON.stringify(Object.fromEntries(Object.entries(fresh).sort(([a], [b]) => a.localeCompare(b))), null, 1) + '\n');
   console.log(`Baseline written: ${Object.keys(fresh).length} simulations, ${Object.values(fresh).flat().length} numbers the check cannot reproduce.`);
   process.exit(0);
 }
-if (!only) for (const s of stale) console.warn(`warn  baseline entry no longer needed: ${s} (run with --update to tidy)`);
+if (!only && !shard.active) for (const s of stale) console.warn(`warn  baseline entry no longer needed: ${s} (run with --update to tidy)`);
 for (const p of problems) console.error(`ERROR ${p}`);
 console.log(`checked ${total} numbers in ${results.length} how-to lists: ${problems.length} new unverified, ${Object.values(baseline).flat().length} known unverified in the baseline`);
 process.exit(problems.length ? 1 : 0);

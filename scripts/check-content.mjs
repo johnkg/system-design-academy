@@ -1,8 +1,9 @@
 // Fast content checks that run before the build (no browser, no dependencies): links between pages, quiz sanity,
 // and that every page ships the pieces readers expect. Errors fail the run; warnings only print.
 // Usage: node scripts/check-content.mjs
-import { readdirSync, readFileSync, existsSync } from 'node:fs';
+import { readdirSync, readFileSync, existsSync, statSync } from 'node:fs';
 import { join } from 'node:path';
+import { BASELINE_CAP } from './baseline-cap.mjs';
 
 const root = new URL('../src/', import.meta.url).pathname;
 const read = (p) => JSON.parse(readFileSync(p, 'utf8'));
@@ -153,6 +154,37 @@ if (share > MAX_LONGEST_SHARE) err('quizzes', `the correct option is the single 
     if (!reads.length) err(w, 'no read links');
     for (const [, k, slug] of reads) if (!has(k === 'concept' ? 'concepts' : 'studies', slug)) err(w, `read ${k} "${slug}" does not exist`);
   }
+}
+
+// 7. Counts written in PLAN.md ("- Concepts: 118 ...", "- Case studies: 137 ...", "- Design patterns: all 23 built") must match the folders,
+// so the roadmap cannot drift away from the site again.
+{
+  const plan = readFileSync(new URL('../PLAN.md', import.meta.url), 'utf8');
+  for (const [label, kind] of [['Concepts', 'concepts'], ['Case studies', 'studies']]) {
+    const n = plan.match(new RegExp(`^- ${label}: (\\d+)`, 'm'))?.[1];
+    if (n === undefined) err('PLAN.md', `status line "- ${label}: <count>" not found`);
+    else if (Number(n) !== kinds[kind].length) err('PLAN.md', `says ${n} ${label.toLowerCase()} but src/content/${kind} has ${kinds[kind].length}`);
+  }
+  const p = plan.match(/^- Design patterns: all (\d+)/m)?.[1];
+  if (p === undefined) err('PLAN.md', 'status line "- Design patterns: all <count> built" not found');
+  else if (Number(p) !== kinds.patterns.length) err('PLAN.md', `says ${p} patterns but src/content/patterns has ${kinds.patterns.length}`);
+}
+
+// 8. Size budget: a meta.json past this is hard to review in a diff. Warn so the page gets trimmed or split before it grows further
+// (the two largest, cloudflare-quicksilver and dropbox-magic-pocket, are about 38 KB today).
+{
+  const MAX_META_KB = 45;
+  for (const kind of Object.keys(kinds)) for (const s of kinds[kind]) {
+    const kb = statSync(join(root, 'content', kind, s, 'meta.json')).size / 1024;
+    if (kb > MAX_META_KB) warn(`${kind}/${s}`, `meta.json is ${kb.toFixed(1)} KB (budget ${MAX_META_KB} KB): trim it or move a long section out`);
+  }
+}
+
+// 9. The walkthrough baseline (numbers in how-to lists that the browser check cannot reproduce) has a fixed cap, so it cannot grow unnoticed.
+{
+  const total = Object.values(read(new URL('./walkthrough-baseline.json', import.meta.url).pathname)).flat().length;
+  if (total > BASELINE_CAP) err('scripts/walkthrough-baseline.json', `holds ${total} numbers, over the cap of ${BASELINE_CAP}: confirm each new number by hand, then raise BASELINE_CAP in scripts/baseline-cap.mjs`);
+  else if (total < BASELINE_CAP) warn('scripts/walkthrough-baseline.json', `holds ${total} numbers but the cap is ${BASELINE_CAP}: lower BASELINE_CAP in scripts/baseline-cap.mjs to ${total} so the gain is kept`);
 }
 
 for (const w of warnings) console.warn(`warn  ${w}`);
