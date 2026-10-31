@@ -1,0 +1,104 @@
+{
+  "name": "Cache Eviction, Stampedes and Write Policies",
+  "area": "scaling",
+  "difficulty": "intermediate",
+  "intent": "Decide what a full cache throws away, stop a popular entry's expiry from flooding the database, and choose how writes reach the cache and the database.",
+  "scenario": "A shop's home page block, \"top deals\", is read 1,000 times per second. It sits in a cache with a 60 second TTL and takes 2 seconds to rebuild from the database. The database serves about 500 queries per second and the rest of the site already uses 100. Product pages share the same cache, which holds 10,000 entries. Bots also ask 300 times per second for 50 product ids that do not exist, and sellers change prices a few times a minute.",
+  "problem": "A basic cache-aside setup works until it meets real traffic. First, memory runs out and something must leave, and the wrong choice throws away exactly the entries you needed: one big batch read can wipe out every popular item. Second, when the top-deals entry expires, all 1,000 requests per second miss at once, and each one runs the same 2 second rebuild: about 1,000 identical queries per second, which takes the database to 1,100 per second against the 500 it can serve. Slow answers make requests pile up and the rebuild take longer still. Third, lookups for things that do not exist can never be cached as a hit, so they reach the database every time. Finally, every write forces a choice between speed, freshness and not losing data.",
+  "howItWorks": [
+    { "title": "Eviction: who leaves when the cache is full", "text": "LRU (least recently used) removes the entry that has gone unused longest. It suits traffic where what was used lately will be used again soon, and it adapts quickly when favourites change. LFU (least frequently used) removes the entry with the fewest requests. It suits stable popularity, and it resists a one-time scan because scanned keys have a count of 1. But old favourites keep their high counts, so it can cling to yesterday's hits. FIFO (first in, first out) removes the oldest entry and ignores how often it was used. It is the cheapest, and it fits data where age matters more than popularity. Many caches, Redis among them, offer LRU and LFU and approximate them by sampling a few entries instead of tracking every one." },
+    { "title": "The stampede: a hot key expires", "text": "When a popular entry expires, every request that arrives before the rebuild finishes sees a miss, and each goes to the database for the same answer. With 1,000 requests per second and a 2 second rebuild, that is about 2,000 identical queries. The database slows down, so the rebuild takes longer, so more requests miss. The same thing happens after a cache restart, which is why a cold cache is dangerous, and when many entries were stored with the same TTL and expire together." },
+    { "title": "Fix 1: one rebuild, everyone else waits", "text": "Request coalescing (called single flight in Go) keeps a record of loads under way. The first request for a key starts the rebuild, and later requests for that key wait for its answer instead of starting their own. The database sees 1 query rather than 2,000. A lock in the shared cache (a key that only one caller can create, with its own short expiry) does the same across many servers. Waiters can also be handed the old, expired copy instead of waiting, if slightly stale data is acceptable." },
+    { "title": "Fix 2: refresh early and spread the expiry", "text": "Early refresh rebuilds an entry shortly before it expires, say at 54 seconds of a 60 second TTL, in the background while the old copy is still served, so requests normally never see a miss. TTL jitter adds a random amount, such as plus or minus 10%, to each TTL so that entries stored together do not expire together. Jitter does not help one hot key by itself. It protects against many keys expiring in the same second." },
+    { "title": "Negative caching: remember that something is missing", "text": "A lookup for an id that does not exist finds nothing to store, so every repeat goes to the database. Negative caching stores a \"not found\" marker with a short TTL, such as 30 seconds. If bots ask 300 times per second for the same 50 missing ids, the database sees about 2 queries per second instead of 300. The short TTL matters: if the item is created later, readers see \"not found\" until the marker expires, unless creating it also deletes the marker. Cache only a real \"not found\", never a timeout or an error." },
+    { "title": "Write policies: when does the write reach each store", "text": "Write-through writes the cache and the database before replying, so reads are fresh and nothing is lost, at the cost of slower writes. Write-back writes only the cache, replies, and flushes to the database later in batches: writes are fast and repeated updates to one key become one database write, but anything not yet flushed is lost if the cache node dies. Write-around writes only the database and lets the next read refill the cache: it avoids filling the cache with data that is written but rarely read, but the first read after a write is a miss." }
+  ],
+  "pros": [
+    "The right eviction policy raises the hit rate without adding memory",
+    "Coalescing turns thousands of identical rebuilds into one database query",
+    "Early refresh and jitter remove the expiry spike instead of surviving it",
+    "Negative caching protects the database from repeated lookups of missing items",
+    "Write policies let you pick speed, freshness or durability on purpose"
+  ],
+  "cons": [
+    "LFU and other scan-resistant policies need extra bookkeeping and can be slow to react when popularity shifts",
+    "Locks and waiting add code paths that can fail: a crashed lock holder can stall every waiter",
+    "Serving a stale copy while refreshing trades freshness for availability",
+    "Write-back can lose acknowledged writes, and write-through makes every write slower",
+    "More policies mean more settings to tune and to monitor"
+  ],
+  "whenToUse": [
+    "A few keys receive far more traffic than the database could serve if they all missed at once",
+    "A batch job or crawler reads many items once and must not push out the working set",
+    "The same missing keys are requested again and again, by bots, typos or deleted items",
+    "Many entries are written to the cache together, such as after a deploy or a restart",
+    "Writes to one key are frequent and the database cannot keep up with each of them"
+  ],
+  "whenNotToUse": [
+    "The data is rarely requested twice, so no eviction or refresh trick will raise the hit rate",
+    "Traffic is low enough that a few duplicate rebuilds do no harm",
+    "Money or inventory must never be lost: avoid write-back and keep the database as the single source of truth",
+    "The rebuild is cheap and fast, so a plain miss costs less than the machinery to avoid it"
+  ],
+  "pitfalls": [
+    "A one-time scan or export under LRU pushes out the real working set and the hit rate collapses",
+    "LFU counts never fade, so entries that were popular last month can hold their seats and starve new favourites",
+    "Setting the same TTL on everything at warm-up makes the whole cache expire in the same second",
+    "A rebuild lock without its own expiry: if the holder crashes, every waiter blocks forever",
+    "Coalescing inside each server only: with 200 servers you still get 200 queries, so use a shared lock if that is too many",
+    "Waiting requests with no timeout: when the rebuild is slow, the waiters pile up and exhaust threads or connections",
+    "Caching a timeout or error as \"not found\", so a brief database problem looks like missing data for the whole TTL",
+    "Using write-back for data that must not be lost, or forgetting that unflushed writes vanish with the cache node"
+  ],
+  "related": [
+    { "kind": "concept", "slug": "caching" },
+    { "kind": "concept", "slug": "http-caching-headers" },
+    { "kind": "concept", "slug": "cdn" },
+    { "kind": "concept", "slug": "consistency-models" },
+    { "kind": "concept", "slug": "probabilistic-data-structures" },
+    { "kind": "concept", "slug": "load-shedding" },
+    { "kind": "concept", "slug": "retries-and-backoff" },
+    { "kind": "concept", "slug": "consistent-hashing" }
+  ],
+  "roles": [
+    { "id": "client", "label": "Clients", "description": "Browsers and bots sending requests for pages." },
+    { "id": "app", "label": "App server", "description": "Checks the cache, rebuilds on a miss and decides how writes are applied." },
+    { "id": "cache", "label": "Cache", "description": "Fast, small store with a size limit and a TTL on each entry." },
+    { "id": "database", "label": "Database", "description": "Slow source of truth with a limited number of queries per second." }
+  ],
+  "quiz": [
+    {
+      "question": "A cache holds 100 entries and the site keeps asking for 50 popular products. A nightly job reads 1 million records once each through the same cache, and afterwards the popular products all miss. Which change protects them best?",
+      "options": [
+        "Use FIFO instead, since it never reorders entries and so cannot be disturbed by a burst of one-time reads.",
+        "Use LFU instead, so the one-time records, each requested once, are removed before the popular products.",
+        "Halve the TTL on every entry, so that the records from the job expire faster and free their slots.",
+        "Double the TTL on the popular products, so they outlive the records from the job and stay cached."
+      ],
+      "answer": 1,
+      "explanation": "Under LRU, a million new keys each count as the most recently used and push the popular ones out. LFU keeps entries with high request counts and removes the count-of-1 records first. FIFO removes entries by age, so the scan still flushes the old popular products. A shorter TTL does not stop the scan from evicting entries to make room, and a longer TTL has no effect on eviction at all, because eviction happens when the cache is full, whatever the TTL says."
+    },
+    {
+      "question": "After a deploy, 5,000 product entries are loaded into the cache in the same minute, all with a 300 second TTL. Every 5 minutes the database load spikes, though no single entry is especially popular. What is the best fix?",
+      "options": [
+        "Raise the TTL to 10 minutes, so the spike comes half as often and is easier to ignore.",
+        "Switch the eviction policy from LRU to LFU, so that entries stored together are removed at different times.",
+        "Add a small random amount to each TTL, so the entries stop expiring in the same second.",
+        "Switch to a write-through policy, so the cache is refreshed whenever the data changes in the database."
+      ],
+      "answer": 2,
+      "explanation": "The entries expire together because they were stored together with an identical TTL, so jitter spreads the rebuilds out. A longer TTL only makes the same spike rarer and bigger. Eviction policy matters when the cache is full, not when a TTL runs out, and write policy decides how writes are applied, which has nothing to do with expiry timing."
+    },
+    {
+      "question": "A game keeps player scores with write-back caching and flushes them to the database every 5 seconds. Then a cache node crashes and the product team says no confirmed score may ever be lost. What should change?",
+      "options": [
+        "Shorten the TTL to 1 second, so that scores leave the cache sooner and are saved sooner.",
+        "Switch to LFU eviction, so that scores with many updates stay in memory and are less likely to be removed.",
+        "Use write-through, so the database holds each score before the app confirms it.",
+        "Add jitter to the flush interval, so that the cache nodes do not all write to the database at once."
+      ],
+      "answer": 2,
+      "explanation": "Write-back confirms after writing only the cache, so up to 5 seconds of scores exist nowhere else. Write-through (or write-around) puts the data in the database before the confirmation. A TTL does not trigger a flush of unsaved data, eviction policy is about what leaves a full cache, and jitter on the flush spreads load but still leaves a window of unsaved writes."
+    }
+  ]
+}

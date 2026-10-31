@@ -1,0 +1,71 @@
+{
+  "actors": [
+    { "id": "client", "label": "Clients", "role": "client", "x": 10, "y": 50 },
+    { "id": "app", "label": "App server", "role": "app", "x": 38, "y": 50 },
+    { "id": "cache", "label": "Cache", "role": "cache", "x": 66, "y": 24 },
+    { "id": "db", "label": "Database", "role": "database", "x": 88, "y": 70 }
+  ],
+  "meters": [
+    { "id": "dbq", "label": "Database queries per second", "max": 1200, "start": 100, "warnAt": 500, "good": "low" },
+    { "id": "same", "label": "Requests rebuilding the same entry", "max": 1000, "start": 0, "warnAt": 100, "good": "low" },
+    { "id": "miss", "label": "Missing-id lookups at the database per second", "max": 300, "start": 0, "warnAt": 100, "good": "low" }
+  ],
+  "frames": [
+    {
+      "narration": "Normal minute. The top-deals entry sits in the cache with a 60 second TTL. All 1,000 requests per second are hits, and the database only sees the 100 queries per second from the rest of the site.",
+      "messages": [{ "from": "client", "to": "app", "label": "1,000 req/s" }, { "from": "app", "to": "cache", "label": "get top-deals" }, { "from": "cache", "to": "app", "label": "hit" }],
+      "states": { "cache": "top-deals, 12 s old", "db": "100 q/s from other traffic" }
+    },
+    {
+      "narration": "At 60 seconds the TTL runs out and the entry disappears. Nothing is wrong yet: the next request will find an empty slot.",
+      "states": { "cache": "top-deals expired", "app": "next request will miss" },
+      "highlight": ["cache"]
+    },
+    {
+      "narration": "The stampede. The rebuild takes 2 seconds, so every request that arrives in that time misses, and each one asks the database for the same answer. That is about 1,000 identical queries in the first second, on top of the 100 already running.",
+      "messages": [{ "from": "client", "to": "app", "label": "1,000 req/s" }, { "from": "app", "to": "cache", "label": "miss, miss, miss..." }, { "from": "app", "to": "db", "label": "1,000 identical queries" }],
+      "states": { "db": "1,100 queries per second", "app": "1,000 rebuilds under way" },
+      "highlight": ["db"],
+      "meters": { "dbq": 1100, "same": 1000 }
+    },
+    {
+      "narration": "The database can serve about 500 queries per second, so it slows down. The rebuild now takes longer than 2 seconds, so even more requests arrive before the entry is back, and the pile grows. Retrying clients make it worse.",
+      "messages": [{ "from": "db", "to": "app", "label": "slow, timeouts" }],
+      "states": { "db": "over its 500 q/s limit", "app": "requests piling up" },
+      "highlight": ["db", "app"]
+    },
+    {
+      "narration": "Fix 1: request coalescing. At the next expiry the first request starts the rebuild and the app records \"top-deals is loading\". The other 999 requests wait for that answer. The database gets 1 query, so it is back to 101 per second.",
+      "messages": [{ "from": "app", "to": "db", "label": "1 query" }, { "from": "client", "to": "app", "label": "999 wait for it" }],
+      "states": { "app": "one load, 999 waiting", "db": "101 queries per second" },
+      "highlight": ["app"],
+      "meters": { "dbq": 101, "same": 1 }
+    },
+    {
+      "narration": "Fix 2: refresh early. At 54 seconds, 90% of the TTL, one background task rebuilds the entry while the old copy is still served. Requests normally never see a miss. TTL jitter of plus or minus 10% also keeps different entries from expiring in the same second.",
+      "messages": [{ "from": "app", "to": "db", "label": "refresh at 54 s" }, { "from": "app", "to": "cache", "label": "store new copy, TTL 60 s" }],
+      "states": { "cache": "old copy served until new one lands", "db": "101 queries per second" },
+      "highlight": ["cache"]
+    },
+    {
+      "narration": "A different leak. Bots repeat 300 requests per second for 50 product ids that do not exist. There is nothing to store, so each lookup misses and goes to the database, which answers \"not found\". The database now carries 401 queries per second.",
+      "messages": [{ "from": "client", "to": "app", "label": "300 req/s, missing ids" }, { "from": "app", "to": "db", "label": "300 queries, no rows" }],
+      "states": { "cache": "nothing cached for them", "db": "401 queries per second" },
+      "highlight": ["db"],
+      "meters": { "dbq": 401, "miss": 300 }
+    },
+    {
+      "narration": "Negative caching: the app stores a \"not found\" marker for each missing id with a 30 second TTL. Each of the 50 ids is now looked up once per 30 seconds, about 2 queries per second, and the database is down to 103.",
+      "messages": [{ "from": "app", "to": "cache", "label": "store: not found, 30 s" }, { "from": "cache", "to": "app", "label": "hit: not found" }],
+      "states": { "cache": "50 \"not found\" markers", "db": "103 queries per second" },
+      "highlight": ["cache"],
+      "meters": { "dbq": 103, "miss": 2 }
+    },
+    {
+      "narration": "Now a seller changes a price. Write-through updates the database and the cache before replying: slower, but reads are fresh and nothing is lost. Write-back would reply after writing only the cache and flush later, which is faster but loses the change if the cache node dies first. Write-around would write only the database and let the next read refill the cache.",
+      "messages": [{ "from": "client", "to": "app", "label": "set price" }, { "from": "app", "to": "db", "label": "write" }, { "from": "app", "to": "cache", "label": "write" }],
+      "states": { "app": "replies after both writes", "cache": "price is fresh", "db": "price is saved" },
+      "highlight": ["app"]
+    }
+  ]
+}
