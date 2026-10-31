@@ -26,3 +26,30 @@ export function watchVisibility(root: Element, update: (onScreen: boolean) => vo
   }
   document.addEventListener('visibilitychange', () => update(onScreen));
 }
+
+export type Every = (fn: () => void, ms: number) => void;
+export interface Clock {
+  /** Re-evaluate: stop every interval, then start them again if the simulation is wanted, on screen and the tab is visible. */
+  (): void;
+  /** True while the simulation is on screen and the tab is visible; use it to skip drawing in an animation-frame loop. */
+  active(): boolean;
+}
+
+/**
+ * The timer life cycle every running simulation needs: its intervals exist only while `wanted()` (usually "the Play button is on"),
+ * the simulation is scrolled into view and the tab is visible. `start(every)` registers the intervals with `every(fn, ms)`;
+ * the clock keeps their ids and clears them all on each `clock()` call, so none can leak or run twice.
+ * Call the returned clock whenever what is wanted changes: Play/Pause, a slider that sets a rate, a reset.
+ */
+export function createClock(root: Element, wanted: () => boolean, start: (every: Every) => void): Clock {
+  let onScreen = true;
+  let ids: ReturnType<typeof setInterval>[] = [];
+  const clock = (() => {
+    ids.forEach((id) => clearInterval(id));
+    ids = [];
+    if (wanted() && clock.active()) start((fn, ms) => { ids.push(setInterval(fn, ms)); });
+  }) as Clock;
+  clock.active = () => onScreen && !document.hidden;
+  watchVisibility(root, (on) => { onScreen = on; clock(); });
+  return clock;
+}

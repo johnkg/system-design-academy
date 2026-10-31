@@ -62,7 +62,8 @@ for (let i = 0; i < START_TRIES; i++) {
 }
 const base = (() => { try { return new URL(process.env.BASE ? `http://x${process.env.BASE}/` : origin + '/').pathname.replace(/\/$/, ''); } catch { return ''; } })();
 
-const executablePath = existsSync('/opt/pw-browsers/chromium-1194/chrome-linux/chrome') ? '/opt/pw-browsers/chromium-1194/chrome-linux/chrome' : undefined;
+// CHROMIUM_PATH points at a Chromium you already have (a sandbox with a different Playwright build); CI downloads its own with `playwright install`.
+const executablePath = process.env.CHROMIUM_PATH || undefined;
 const browser = await playwright.chromium.launch({ executablePath });
 
 const CONTROL_TIMEOUT_MS = 500; // a control that does not respond in this time is skipped, not a failure

@@ -1,6 +1,6 @@
-import { test, beforeEach, afterEach } from 'node:test';
+import { test, beforeEach, afterEach, mock } from 'node:test';
 import assert from 'node:assert/strict';
-import { fmt, numberValue, prefersReducedMotion, query, wait, watchVisibility } from '../src/playground.ts';
+import { createClock, fmt, numberValue, prefersReducedMotion, query, wait, watchVisibility } from '../src/playground.ts';
 
 const g = globalThis as any;
 const saved: Record<string, unknown> = {};
@@ -72,4 +72,72 @@ test('watchVisibility assumes "on screen" when IntersectionObserver is missing, 
   watchVisibility({} as Element, (on) => calls.push(on));
   listeners.visibilitychange();
   assert.deepEqual(calls, [true]);
+});
+
+// ---- createClock: the timer life cycle of a running simulation ----
+function clockHarness(initiallyWanted: boolean) {
+  const { listeners, observers } = stubBrowser();
+  g.document.hidden = false;
+  mock.timers.enable({ apis: ['setInterval'] });
+  const state = { wanted: initiallyWanted, a: 0, b: 0, starts: 0 };
+  const clock = createClock({} as Element, () => state.wanted, (every) => { state.starts++; every(() => state.a++, 100); every(() => state.b++, 250); });
+  return { state, clock, listeners, observers, scroll: (on: boolean) => observers[0].cb([{ isIntersecting: on }]) };
+}
+
+test('createClock: does nothing until it is wanted, then runs every interval on schedule', () => {
+  const h = clockHarness(false);
+  h.clock();
+  mock.timers.tick(1000);
+  assert.deepEqual([h.state.a, h.state.b, h.state.starts], [0, 0, 0]);
+  h.state.wanted = true; h.clock();
+  mock.timers.tick(500);
+  assert.deepEqual([h.state.a, h.state.b], [5, 2]);
+  mock.timers.reset();
+});
+
+test('createClock: calling it again restarts rather than doubling the intervals', () => {
+  const h = clockHarness(true);
+  h.clock(); h.clock(); h.clock();
+  mock.timers.tick(100);
+  assert.equal(h.state.a, 1, 'one interval, not three');
+  assert.equal(h.state.starts, 3);
+  mock.timers.reset();
+});
+
+test('createClock: pausing clears every interval', () => {
+  const h = clockHarness(true);
+  h.clock(); mock.timers.tick(200);
+  h.state.wanted = false; h.clock();
+  mock.timers.tick(1000);
+  assert.deepEqual([h.state.a, h.state.b], [2, 0]);
+  mock.timers.reset();
+});
+
+test('createClock: stops when scrolled out of view and resumes when scrolled back', () => {
+  const h = clockHarness(true);
+  h.clock(); mock.timers.tick(100);
+  h.scroll(false); assert.equal(h.clock.active(), false);
+  mock.timers.tick(1000); assert.equal(h.state.a, 1, 'no ticks while off screen');
+  h.scroll(true); assert.equal(h.clock.active(), true);
+  mock.timers.tick(100); assert.equal(h.state.a, 2);
+  mock.timers.reset();
+});
+
+test('createClock: stops when the tab is hidden and resumes when it is shown', () => {
+  const h = clockHarness(true);
+  h.clock();
+  g.document.hidden = true; h.listeners.visibilitychange();
+  assert.equal(h.clock.active(), false);
+  mock.timers.tick(1000); assert.equal(h.state.a, 0);
+  g.document.hidden = false; h.listeners.visibilitychange();
+  mock.timers.tick(100); assert.equal(h.state.a, 1);
+  mock.timers.reset();
+});
+
+test('createClock: a paused simulation stays paused when it scrolls back into view', () => {
+  const h = clockHarness(false);
+  h.scroll(false); h.scroll(true);
+  mock.timers.tick(1000);
+  assert.equal(h.state.a, 0);
+  mock.timers.reset();
 });
