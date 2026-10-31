@@ -10,7 +10,7 @@ export const changelog: Change[] = [
       { text: 'A "Drill me" mode picks a question you have not tried, runs a 2, 3 or 5 minute clock you can pause, then lets you tick the points you covered. Your grades stay in this browser.', href: 'interview-questions/' },
       { text: 'Seven animations (caching, load balancing, rate limiting, circuit breaker, message queues, CDN and backpressure) now show small readings under the picture, such as tokens left in the bucket or database queries so far, that change as you step through.', href: 'concepts/rate-limiting/' },
       { text: 'Thirty-six "how to try it" steps now say what to press or set first, and 68 button and option names match the simulation exactly. The app icons and share image use the new colours.' },
-      { text: 'Twelve more animations now show small readings under the picture: sharding, replication, consensus, retries, timeouts, load shedding, bulkheads, idempotency, quorums, leader election, consistent hashing, pub/sub, CQRS, sagas, health checks, autoscaling, DNS and failure detection.', href: 'concepts/autoscaling/' },
+      { text: 'Eighteen more animations now show small readings under the picture: sharding, replication, consensus, retries, timeouts, load shedding, bulkheads, idempotency, quorums, leader election, consistent hashing, pub/sub, CQRS, sagas, health checks, autoscaling, DNS and failure detection.', href: 'concepts/autoscaling/' },
       { text: 'Interview questions you grade in the Drill come back on the same schedule as Review, and the Practice page shows your last mock interview score. Pages no longer jump while loading on a phone, and the concept map is filled in before the page finishes loading.' },
     ],
   },
