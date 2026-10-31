@@ -1,6 +1,6 @@
 import { test, beforeEach, afterEach } from 'node:test';
 import assert from 'node:assert/strict';
-import { fmt, numberValue, prefersReducedMotion, query, wait, watchVisibility } from '../src/playground.ts';
+import { fmt, mulberry32, numberValue, prefersReducedMotion, query, wait, watchVisibility } from '../src/playground.ts';
 
 const g = globalThis as any;
 const saved: Record<string, unknown> = {};
@@ -72,4 +72,17 @@ test('watchVisibility assumes "on screen" when IntersectionObserver is missing, 
   watchVisibility({} as Element, (on) => calls.push(on));
   listeners.visibilitychange();
   assert.deepEqual(calls, [true]);
+});
+
+test('mulberry32 replays the same sequence for a seed and stays inside [0, 1)', () => {
+  const first = mulberry32(42), again = mulberry32(42);
+  const draws = Array.from({ length: 1000 }, () => first());
+  assert.deepEqual(draws, Array.from({ length: 1000 }, () => again()));
+  assert.ok(draws.every((x) => x >= 0 && x < 1));
+  assert.notDeepEqual(draws.slice(0, 5), Array.from({ length: 5 }, mulberry32(43)));
+});
+
+test('mulberry32 gives the reference values the simulations were tuned against', () => {
+  // Pinned from the copies this function replaced; a change here shifts every number quoted in the lesson text.
+  assert.deepEqual(Array.from({ length: 3 }, mulberry32(1)).map((x) => x.toFixed(6)), ['0.627074', '0.002736', '0.527447']);
 });
