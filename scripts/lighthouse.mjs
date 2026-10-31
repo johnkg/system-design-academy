@@ -44,14 +44,16 @@ const base = process.env.BASE && process.env.BASE !== '/' ? process.env.BASE.rep
 const out = mkdtempSync(join(tmpdir(), 'lighthouse-'));
 const categories = Object.keys(budgets);
 const SCORE_SCALE = 100;
+const PAGE_TIMEOUT_MS = 180_000; // one audit normally takes 15 to 30 s; a hung Chrome must fail the run, not stall it
 const problems = []; // { text, fatal }
 let ran = 0;
 for (const path of pages.filter((p) => p.includes(only))) {
   const file = join(out, `${path.replace(/\W+/g, '_')}.json`);
+  console.log(`auditing ${path} ...`);
   try {
-    execFileSync('npx', ['--yes', LIGHTHOUSE, origin + base + path, '--output=json', `--output-path=${file}`, '--quiet',
+    execFileSync('npx', ['--yes', LIGHTHOUSE, origin + base + path, '--output=json', `--output-path=${file}`, '--quiet', `--max-wait-for-load=45000`,
       `--only-categories=${categories.join(',')}`, '--chrome-flags=--headless=new --no-sandbox'],
-    { env: { ...process.env, CHROME_PATH: chrome }, stdio: ['ignore', 'ignore', 'inherit'] });
+    { env: { ...process.env, CHROME_PATH: chrome }, stdio: ['ignore', 'inherit', 'inherit'], timeout: PAGE_TIMEOUT_MS, killSignal: 'SIGKILL' });
   } catch (e) { problems.push({ text: `${path}: Lighthouse did not run (${String(e.message).split('\n')[0]})`, fatal: true }); continue; }
   const lhr = JSON.parse(readFileSync(file, 'utf8'));
   const scores = Object.fromEntries(categories.map((c) => [c, Math.round((lhr.categories[c]?.score ?? 0) * SCORE_SCALE)]));
