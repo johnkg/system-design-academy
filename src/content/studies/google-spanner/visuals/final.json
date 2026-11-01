@@ -1,0 +1,60 @@
+{
+  "actors": [
+    { "id": "client", "label": "Application (F1)", "role": "client", "x": 14, "y": 16 },
+    { "id": "leaderA", "label": "Group A leader (coordinator)", "role": "compute", "x": 50, "y": 16 },
+    { "id": "leaderB", "label": "Group B leader (participant)", "role": "compute", "x": 86, "y": 16 },
+    { "id": "truetime", "label": "TrueTime", "role": "async", "x": 14, "y": 84 },
+    { "id": "replicas", "label": "Replicas in other zones", "role": "data", "x": 50, "y": 84 },
+    { "id": "reader", "label": "Snapshot reader", "role": "client", "x": 86, "y": 84 }
+  ],
+  "frames": [
+    {
+      "narration": "A transaction moves budget between two campaigns whose rows live in two different Paxos groups. The client reads each row from its group's leader, which takes a read lock, using wound-wait to avoid deadlocks. The client keeps its writes to itself, buffered, until it is ready to commit.",
+      "messages": [{ "from": "client", "to": "leaderA", "label": "read row (read lock)" }, { "from": "client", "to": "leaderB", "label": "read row (read lock)" }],
+      "states": { "client": "writes buffered locally" },
+      "highlight": ["client", "leaderA", "leaderB"]
+    },
+    {
+      "narration": "The client starts two-phase commit and drives it itself, so the data does not cross wide-area links twice. It chooses group A as the coordinator and sends each leader the buffered writes and the identity of the coordinator.",
+      "messages": [{ "from": "client", "to": "leaderA", "label": "commit: you coordinate, here are your writes" }, { "from": "client", "to": "leaderB", "label": "commit: coordinator is A, here are your writes" }],
+      "states": { "leaderA": "coordinator", "leaderB": "participant" },
+      "highlight": ["client", "leaderA", "leaderB"]
+    },
+    {
+      "narration": "Leader B takes its write locks, picks a prepare timestamp larger than any it has already assigned, and logs a prepare record through Paxos, which sends it to the replicas in other zones. Then it tells the coordinator its prepare timestamp.",
+      "messages": [{ "from": "leaderB", "to": "replicas", "label": "log prepare record (Paxos)" }, { "from": "leaderB", "to": "leaderA", "label": "prepared, prepare timestamp" }],
+      "states": { "leaderB": "prepared, locks held" },
+      "highlight": ["leaderB", "replicas", "leaderA"]
+    },
+    {
+      "narration": "Leader A also takes its write locks. It now picks the commit timestamp s: at least every prepare timestamp, no earlier than the latest end of TrueTime's interval at the moment the commit request arrived, and later than any timestamp it has given before.",
+      "messages": [{ "from": "leaderA", "to": "truetime", "label": "TT.now()" }, { "from": "truetime", "to": "leaderA", "label": "interval [earliest, latest]" }],
+      "states": { "leaderA": "s = TT.now().latest or more" },
+      "highlight": ["leaderA", "truetime"]
+    },
+    {
+      "narration": "The coordinator logs the commit record through Paxos, but before any replica may apply it, and before any client may see the data, it waits until TT.after(s) is true: until s is certainly in the past. That is commit wait. It takes about twice the clock uncertainty and overlaps with the Paxos round trip.",
+      "messages": [{ "from": "leaderA", "to": "replicas", "label": "log commit record (Paxos)" }, { "from": "leaderA", "to": "truetime", "label": "TT.after(s)? not yet... now yes" }],
+      "states": { "leaderA": "commit wait" },
+      "highlight": ["leaderA", "replicas", "truetime"]
+    },
+    {
+      "narration": "Commit wait is over. The coordinator sends the commit timestamp to the client and to the other leader, and every participant applies the writes at that same timestamp and releases its locks. The client is told the transaction committed.",
+      "messages": [{ "from": "leaderA", "to": "client", "label": "committed at s" }, { "from": "leaderA", "to": "leaderB", "label": "commit at s" }],
+      "states": { "leaderA": "applied, locks released", "leaderB": "applied, locks released", "client": "done" },
+      "highlight": ["leaderA", "leaderB", "client"]
+    },
+    {
+      "narration": "Any transaction that starts after this one has committed, anywhere in the world, will pick a larger timestamp. This is what external consistency means, and it holds because the first transaction waited until its timestamp had certainly passed before anyone could see it.",
+      "messages": [],
+      "states": { "client": "later transactions get later timestamps" },
+      "highlight": ["client"]
+    },
+    {
+      "narration": "A reporting job reads the whole database as of a timestamp t. It takes no locks, so it blocks no writers. Any replica can answer if its safe time has reached t, meaning it has applied everything up to t. A replica that is not up to date yet waits briefly, and an idle group advances its safe time by promising that no write will use an earlier timestamp.",
+      "messages": [{ "from": "reader", "to": "replicas", "label": "read at timestamp t" }, { "from": "replicas", "to": "reader", "label": "consistent snapshot at t" }],
+      "states": { "replicas": "safe time >= t, no locks taken" },
+      "highlight": ["reader", "replicas"]
+    }
+  ]
+}
