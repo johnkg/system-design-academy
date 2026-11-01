@@ -1,0 +1,60 @@
+{
+  "actors": [
+    { "id": "client", "label": "API client", "role": "client", "x": 14, "y": 16 },
+    { "id": "limiters", "label": "Rate and concurrency limiters", "role": "edge", "x": 50, "y": 16 },
+    { "id": "redis", "label": "Redis (limiter state)", "role": "data", "x": 86, "y": 16 },
+    { "id": "store", "label": "Saved results by key", "role": "data", "x": 14, "y": 84 },
+    { "id": "workers", "label": "API workers", "role": "compute", "x": 50, "y": 84 },
+    { "id": "shedder", "label": "Load shedders", "role": "edge", "x": 86, "y": 84 }
+  ],
+  "frames": [
+    {
+      "narration": "A shop creates a charge. The client sends a POST with an Idempotency-Key header, a unique value it made up for this charge, so that it can safely send the request again if it never hears back.",
+      "messages": [{ "from": "client", "to": "limiters", "label": "POST charge, Idempotency-Key: key-1" }],
+      "states": { "client": "waiting for an answer" },
+      "highlight": ["client", "limiters"]
+    },
+    {
+      "narration": "The request rate limiter takes one token from this user's bucket, which is kept in Redis. The bucket still has tokens, so the request passes. The concurrent requests limiter also checks how many requests this user has in progress, and that is under the cap too.",
+      "messages": [{ "from": "limiters", "to": "redis", "label": "take a token, count in-progress" }, { "from": "redis", "to": "limiters", "label": "allowed" }],
+      "states": { "limiters": "within the limits", "redis": "bucket updated" },
+      "highlight": ["limiters", "redis"]
+    },
+    {
+      "narration": "Next come the load shedders. Creating a charge is a critical method, so it falls in the share of capacity that is kept back for critical requests, and it is let through even if the fleet is busy.",
+      "messages": [{ "from": "limiters", "to": "shedder", "label": "critical request" }, { "from": "shedder", "to": "workers", "label": "admitted" }],
+      "states": { "shedder": "critical share has room" },
+      "highlight": ["shedder", "workers"]
+    },
+    {
+      "narration": "The worker looks up the key. It has never seen key-1, so this is a new request: it creates the charge and saves the result under the key.",
+      "messages": [{ "from": "workers", "to": "store", "label": "key-1 new, save result ch_1" }],
+      "states": { "workers": "charge created", "store": "key-1 saved: ch_1" },
+      "highlight": ["workers", "store"]
+    },
+    {
+      "narration": "The answer is on its way back when the connection drops. The charge has happened, but the client never hears it, so it cannot tell whether the request worked.",
+      "messages": [{ "from": "workers", "to": "client", "label": "response lost" }],
+      "states": { "client": "timed out, unsure" },
+      "highlight": ["client", "workers"]
+    },
+    {
+      "narration": "The client waits and tries again. Stripe's advice is to back off exponentially, waiting a time proportional to 2 to the power n after n failures, and to add random jitter so that many clients do not all retry at the same moment. It sends the same key.",
+      "messages": [{ "from": "client", "to": "limiters", "label": "retry after backoff + jitter, key-1" }],
+      "states": { "client": "retrying with the same key" },
+      "highlight": ["client", "limiters"]
+    },
+    {
+      "narration": "The retry passes the same checks. This time the worker finds key-1 already saved, so it does not charge again. It replies with the saved result of the first attempt, and the customer is charged once.",
+      "messages": [{ "from": "limiters", "to": "workers", "label": "passes the checks" }, { "from": "workers", "to": "store", "label": "key-1 seen" }, { "from": "store", "to": "workers", "label": "saved result ch_1" }, { "from": "workers", "to": "client", "label": "ch_1, no second charge" }],
+      "states": { "store": "one charge recorded", "client": "done" },
+      "highlight": ["workers", "store", "client"]
+    },
+    {
+      "narration": "Later the whole fleet runs short of capacity. A request to list old charges is non-critical, so the fleet usage load shedder rejects it with HTTP 503, while charge requests keep going through. On each host, a last line of defence drops test-mode traffic first.",
+      "messages": [{ "from": "client", "to": "shedder", "label": "list old charges" }, { "from": "shedder", "to": "client", "label": "503, short of capacity" }],
+      "states": { "shedder": "shedding non-critical" },
+      "highlight": ["client", "shedder"]
+    }
+  ]
+}
