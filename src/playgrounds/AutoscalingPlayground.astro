@@ -50,86 +50,25 @@ import RangeField from '../components/RangeField.astro';
   </div>
 </PlaygroundShell>
 <script>
-  import { query, numberValue, prefersReducedMotion, createTicker, mulberry32 } from '../playground';
-  type Policy = 'target' | 'step' | 'scheduled';
-  interface Params { policy: Policy; metric: 'cpu' | 'rps'; target: number; warmup: number; cooldown: number; patient: boolean; min: number; max: number }
-  interface Result { ready: number[]; total: number[]; util: number[]; dropped: number[]; over: number[]; actions: number[]; flaps: number[] }
-  const CAP = 100; const N = 120; const SVG_W = 600; const SVG_H = 190;
-  const TRAFFIC_SEED = 7;
-  const TRAFFIC = { quiet: 200, rampFrom: 24, peakFrom: 34, peak: 1200, declineFrom: 50, declineEnd: 300, nightFrom: 72, night: 80, noiseMin: 0.92, noiseSpan: 0.16 }; // req/s by minute; noise is +-8%
-  const START_INSTANCES = 4;
-  const LONG_AGO = -99; // "no previous action" minute
-  const EPS = 1e-9; // keeps ceil() from rounding an exact ratio up
-  const STEP = { bigGap: 0.2, bigAdd: 3, inGap: 0.3 }; // step policy: +3 when 20 points over target, -1 when 30 under
-  const SCHEDULE = { from: 28, to: 64, instances: 12 }; // scheduled policy: 12 instances for minutes 28..63
-  const PATIENT_CALM_MIN = 5; // minutes of low demand before a patient scale-in
-  const FLAP_WINDOW_MIN = 12; // a reversal this soon counts as a flap
-  const SEC_PER_MIN = 60;
+  import { query, numberValue, prefersReducedMotion, createTicker } from '../playground';
+  import { FLAP_WINDOW_MIN, REQUESTS_PER_INSTANCE, SIMULATED_MINUTES, TRAFFIC_SEED, makeTraffic, simulate, summarize, type Params, type Policy, type Result } from '../models/autoscaling.ts';
+  const SVG_W = 600; const SVG_H = 190;
   const LOAD_WARN_PCT = 85, FLAP_BAD = 6;
   const CHART = { minY: 1400, headroom: 1.05, overH: 10 }; // y-axis floor in req/s, 5% top margin, height of the overload strip
   const TICK_MS = 90; // animation step per simulated minute
-
-  // A quiet baseline, a sharp spike, a noisy decline, then a quiet night. Integers, seeded.
-  function makeTraffic(seed: number): number[] {
-    const rnd = mulberry32(seed); const out: number[] = [];
-    for (let t = 0; t < N; t++) {
-      const T = TRAFFIC; let base = T.quiet;
-      if (t >= T.rampFrom && t < T.peakFrom) base = T.quiet + ((T.peak - T.quiet) * (t - T.rampFrom)) / (T.peakFrom - T.rampFrom);
-      else if (t >= T.peakFrom && t < T.declineFrom) base = T.peak;
-      else if (t >= T.declineFrom && t < T.nightFrom) base = T.peak - ((T.peak - T.declineEnd) * (t - T.declineFrom)) / (T.nightFrom - T.declineFrom);
-      else if (t >= T.nightFrom) base = T.night;
-      out.push(Math.round(base * (T.noiseMin + T.noiseSpan * rnd())));
-    }
-    return out;
-  }
-  // Cumulative series per minute: what the tier looked like at the end of each step.
-  function simulate(p: Params, traffic: number[]): Result {
-    const lo = Math.min(p.min, p.max); const hi = Math.max(p.min, p.max);
-    let ready = Math.max(lo, Math.min(hi, START_INSTANCES)); let pending: number[] = [];
-    let cool = 0; let calm = 0; let lastDir = 0; let lastAt = LONG_AGO; let actions = 0; let flaps = 0;
-    const r: Result = { ready: [], total: [], util: [], dropped: [], over: [], actions: [], flaps: [] };
-    for (let t = 0; t < traffic.length; t++) {
-      ready += pending.filter((x) => x <= t).length; pending = pending.filter((x) => x > t);
-      const load = traffic[t]; const total = ready + pending.length; const cap = ready * CAP;
-      const raw = load / cap; const drop = load - Math.min(load, cap);
-      r.ready.push(ready); r.total.push(total); r.util.push(raw); r.dropped.push(drop); r.over.push(raw > 1 ? 1 : 0);
-      const T = p.target / 100; const util = p.metric === 'cpu' ? Math.min(1, raw) : raw;
-      let want = total;
-      if (p.policy === 'target') want = p.metric === 'cpu' ? Math.ceil((ready * util) / T - EPS) : Math.ceil(load / (CAP * T) - EPS);
-      else if (p.policy === 'step') want = util > T + STEP.bigGap ? total + STEP.bigAdd : util > T ? total + 1 : util < T - STEP.inGap ? total - 1 : total;
-      else want = t >= SCHEDULE.from && t < SCHEDULE.to ? SCHEDULE.instances : lo;
-      want = Math.max(lo, Math.min(hi, want));
-      if (want < total) calm++; else calm = 0;
-      if (cool > 0) cool--;
-      else {
-        let next = total;
-        if (want > total) next = want;
-        else if (want < total && (!p.patient || calm >= PATIENT_CALM_MIN)) next = p.patient ? total - 1 : want;
-        if (next !== total) {
-          const dir = next > total ? 1 : -1;
-          if (dir > 0) for (let i = 0; i < next - total; i++) pending.push(t + 1 + p.warmup);
-          else { let k = total - next; while (k > 0 && pending.length > 0) { pending.pop(); k--; } ready -= k; }
-          if (lastDir !== 0 && dir !== lastDir && t - lastAt <= FLAP_WINDOW_MIN) flaps++;
-          lastDir = dir; lastAt = t; actions++; cool = p.cooldown;
-        }
-      }
-      r.actions.push(actions); r.flaps.push(flaps);
-    }
-    return r;
-  }
 
   document.querySelectorAll<HTMLElement>('[data-as]').forEach((root) => {
     const q = query(root);
     const val = numberValue(q);
     const traffic = makeTraffic(TRAFFIC_SEED);
     const reduce = prefersReducedMotion();
-    let res: Result; let shown = N; let raf = 0; let running = false;
+    let res: Result; let shown = SIMULATED_MINUTES; let raf = 0; let running = false;
     const ticker = createTicker(root, advance, TICK_MS);
     const SVGNS = 'http://www.w3.org/2000/svg';
     const overRects: SVGRectElement[] = [];
-    for (let i = 0; i < N; i++) {
+    for (let i = 0; i < SIMULATED_MINUTES; i++) {
       const rc = document.createElementNS(SVGNS, 'rect');
-      rc.setAttribute('x', String((i * SVG_W) / N)); rc.setAttribute('y', String(SVG_H - CHART.overH)); rc.setAttribute('width', String(SVG_W / N)); rc.setAttribute('height', String(CHART.overH));
+      rc.setAttribute('x', String((i * SVG_W) / SIMULATED_MINUTES)); rc.setAttribute('y', String(SVG_H - CHART.overH)); rc.setAttribute('width', String(SVG_W / SIMULATED_MINUTES)); rc.setAttribute('height', String(CHART.overH));
       rc.setAttribute('fill', 'var(--bad)'); rc.setAttribute('opacity', '0');
       q('[data-overg]').appendChild(rc); overRects.push(rc);
     }
@@ -147,18 +86,17 @@ import RangeField from '../components/RangeField.astro';
       q('[data-minval]').textContent = String(pr.min); q('[data-maxval]').textContent = String(pr.max);
       const usesMetric = pr.policy !== 'scheduled';
       q<HTMLSelectElement>('[data-metric]').disabled = !usesMetric; q<HTMLInputElement>('[data-target]').disabled = !usesMetric;
-      const ymax = Math.max(CHART.minY, ...res.total.map((x) => x * CAP)) * CHART.headroom;
-      const X = (i: number) => (((i + 0.5) * SVG_W) / N).toFixed(1); const Y = (v: number) => (SVG_H - 14 - (v / ymax) * (SVG_H - 20)).toFixed(1);
+      const ymax = Math.max(CHART.minY, ...res.total.map((x) => x * REQUESTS_PER_INSTANCE)) * CHART.headroom;
+      const X = (i: number) => (((i + 0.5) * SVG_W) / SIMULATED_MINUTES).toFixed(1); const Y = (v: number) => (SVG_H - 14 - (v / ymax) * (SVG_H - 20)).toFixed(1);
       const pts = (f: (i: number) => number) => Array.from({ length: shown }, (_, i) => `${X(i)},${Y(f(i))}`).join(' ');
       q('[data-demand]').setAttribute('points', pts((i) => traffic[i]));
-      q('[data-capline]').setAttribute('points', pts((i) => res.ready[i] * CAP));
-      q('[data-booked]').setAttribute('points', pts((i) => res.total[i] * CAP));
+      q('[data-capline]').setAttribute('points', pts((i) => res.ready[i] * REQUESTS_PER_INSTANCE));
+      q('[data-booked]').setAttribute('points', pts((i) => res.total[i] * REQUESTS_PER_INSTANCE));
       overRects.forEach((rc, i) => rc.setAttribute('opacity', i < shown && res.over[i] ? '1' : '0'));
       const cur = q('[data-cursor]'); cur.setAttribute('x1', X(n - 1)); cur.setAttribute('x2', X(n - 1));
-      let drop = 0; let cost = 0; let over = 0;
-      for (let i = 0; i < shown; i++) { drop += res.dropped[i] * SEC_PER_MIN; cost += res.total[i]; over += res.over[i]; }
+      const { dropped: drop, cost, overloadedMinutes: over } = summarize(res, shown);
       const i = n - 1; const warming = res.total[i] - res.ready[i];
-      q('[data-clock]').textContent = `minute ${shown} of ${N} · demand ${traffic[i]} req/s`;
+      q('[data-clock]').textContent = `minute ${shown} of ${SIMULATED_MINUTES} · demand ${traffic[i]} req/s`;
       q('[data-inst]').textContent = String(res.total[i]);
       q('[data-instnote]').textContent = warming > 0 ? `${res.ready[i]} ready, ${warming} still warming up` : `${res.ready[i]} ready`;
       const load = Math.round(res.util[i] * 100); q('[data-load]').textContent = `${load}%`;
@@ -171,19 +109,19 @@ import RangeField from '../components/RangeField.astro';
       q('[data-flapnote]').textContent = `${res.flaps[i]} flap${res.flaps[i] === 1 ? '' : 's'} (a reversal within ${FLAP_WINDOW_MIN} minutes)`;
       q<HTMLElement>('[data-flapbox]').style.setProperty('--c', res.flaps[i] >= FLAP_BAD ? 'var(--bad)' : 'var(--role-5)');
       q('[data-run]').textContent = running ? 'Pause' : 'Run';
-      if (!running) q('[data-status]').textContent = `Minute ${shown} of ${N}: ${over} overloaded minute${over === 1 ? '' : 's'}, ${drop.toLocaleString('en-US')} dropped or slow requests, cost ${cost.toLocaleString('en-US')} instance-minutes, ${res.actions[i]} scaling actions.`;
+      if (!running) q('[data-status]').textContent = `Minute ${shown} of ${SIMULATED_MINUTES}: ${over} overloaded minute${over === 1 ? '' : 's'}, ${drop.toLocaleString('en-US')} dropped or slow requests, cost ${cost.toLocaleString('en-US')} instance-minutes, ${res.actions[i]} scaling actions.`;
     }
     function stop() { running = false; clock(); }
-    function advance() { if (shown >= N) { stop(); } else shown++; schedule(); }
+    function advance() { if (shown >= SIMULATED_MINUTES) { stop(); } else shown++; schedule(); }
     function clock() { ticker.setWanted(running); }
     q('[data-run]').addEventListener('click', () => {
       if (running) { stop(); schedule(); return; }
-      if (shown >= N) shown = 1;
-      if (reduce) { shown = N; schedule(); return; }
+      if (shown >= SIMULATED_MINUTES) shown = 1;
+      if (reduce) { shown = SIMULATED_MINUTES; schedule(); return; }
       running = true; clock(); schedule();
     });
-    q('[data-step]').addEventListener('click', () => { stop(); if (shown >= N) shown = 1; else shown++; schedule(); });
-    q('[data-end]').addEventListener('click', () => { stop(); shown = N; schedule(); });
+    q('[data-step]').addEventListener('click', () => { stop(); if (shown >= SIMULATED_MINUTES) shown = 1; else shown++; schedule(); });
+    q('[data-end]').addEventListener('click', () => { stop(); shown = SIMULATED_MINUTES; schedule(); });
     q('[data-reset]').addEventListener('click', () => { stop(); shown = 1; schedule(); });
     root.querySelectorAll('select, input[type="range"]').forEach((el) => el.addEventListener('input', recompute));
     recompute();
