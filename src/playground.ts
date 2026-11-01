@@ -24,15 +24,18 @@ export const clamp = (value: number, min: number, max: number): number => Math.m
 
 export const prefersReducedMotion = (): boolean => matchMedia('(prefers-reduced-motion: reduce)').matches;
 
+const MULBERRY32_INCREMENT = 0x6d2b79f5; // the generator's fixed step through its 32-bit state
+const UINT32_RANGE = 2 ** 32; // 4294967296, so a 32-bit unsigned result divides down to [0, 1)
+
 /** Seeded random numbers in [0, 1): the same seed always gives the same sequence, so a simulation replays identically (mulberry32). */
 export function mulberry32(seed: number): () => number {
   let state = seed >>> 0;
   return () => {
-    state = (state + 0x6d2b79f5) >>> 0;
+    state = (state + MULBERRY32_INCREMENT) >>> 0;
     let t = state;
     t = Math.imul(t ^ (t >>> 15), t | 1);
     t ^= t + Math.imul(t ^ (t >>> 7), t | 61);
-    return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+    return ((t ^ (t >>> 14)) >>> 0) / UINT32_RANGE;
   };
 }
 
