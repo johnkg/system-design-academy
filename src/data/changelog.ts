@@ -3,6 +3,13 @@ export interface Change { date: string; title: string; items: { text: string; hr
 
 export const changelog: Change[] = [
   {
+    date: '2026-11-01',
+    title: 'Three more case studies from real companies',
+    items: [
+      { text: 'How Stripe protects its API with four kinds of rate limiter and idempotency keys, how GitHub changes huge MySQL tables without stopping with gh-ost, and how Notion split one Postgres database into 480 logical shards. Each is built only from the company\'s own public posts and documentation, listed at the end of the page, and says plainly when a post does not give a number. The simulations and code are small teaching models, not the companies\' own.', href: 'case-studies/' },
+    ],
+  },
+  {
     date: '2026-10-31',
     title: 'Interview questions, readings under the animations and tidier how-to steps',
     items: [
