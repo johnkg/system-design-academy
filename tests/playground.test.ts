@@ -1,10 +1,10 @@
 import { test, beforeEach, afterEach } from 'node:test';
 import assert from 'node:assert/strict';
-import { clamp, formatOneDecimalBelow100, formatThousands, formatWholeNumber, mulberry32, numberValue, prefersReducedMotion, query, wait, watchVisibility } from '../src/playground.ts';
+import { clamp, createTicker, formatOneDecimalBelow100, formatThousands, formatWholeNumber, mulberry32, numberValue, prefersReducedMotion, query, wait, watchVisibility } from '../src/playground.ts';
 
 const g = globalThis as any;
 const saved: Record<string, unknown> = {};
-beforeEach(() => { for (const k of ['matchMedia', 'IntersectionObserver', 'document']) saved[k] = g[k]; });
+beforeEach(() => { for (const k of ['matchMedia', 'IntersectionObserver', 'document', 'window']) saved[k] = g[k]; });
 afterEach(() => { for (const k of Object.keys(saved)) { if (saved[k] === undefined) delete g[k]; else g[k] = saved[k]; } });
 
 const fakeRoot = (map: Record<string, any>) => ({ querySelector: (s: string) => map[s] ?? null }) as any;
@@ -103,4 +103,29 @@ test('clamp keeps a value inside its bounds', () => {
   assert.equal(clamp(5, 0, 10), 5);
   assert.equal(clamp(-3, 0, 10), 0);
   assert.equal(clamp(42, 0, 10), 10);
+});
+
+test('createTicker ticks only while wanted, on screen and in a visible tab', () => {
+  const timers = new Map<number, () => void>(); let nextId = 1;
+  let onScreenCallback: (on: boolean) => void = () => {};
+  const visibilityListeners: (() => void)[] = [];
+  g.window = { setInterval: (fn: () => void) => { timers.set(nextId, fn); return nextId++; }, clearInterval: (id: number) => { timers.delete(id); } };
+  g.document = { hidden: false, addEventListener: (_: string, fn: () => void) => visibilityListeners.push(fn) };
+  g.IntersectionObserver = class { constructor(cb: (e: { isIntersecting: boolean }[]) => void) { onScreenCallback = (on) => cb([{ isIntersecting: on }]); } observe() {} };
+  const ticker = createTicker({} as Element, () => {}, 100);
+  assert.equal(timers.size, 0, 'idle until wanted');
+  ticker.setWanted(true);
+  assert.equal(timers.size, 1);
+  ticker.setWanted(true);
+  assert.equal(timers.size, 1, 'asking twice never doubles the timer');
+  onScreenCallback(false);
+  assert.equal(timers.size, 0, 'paused when scrolled away');
+  onScreenCallback(true);
+  assert.equal(timers.size, 1, 'resumes when scrolled back');
+  g.document.hidden = true; visibilityListeners.forEach((fn) => fn());
+  assert.equal(timers.size, 0, 'paused in a hidden tab');
+  g.document.hidden = false; visibilityListeners.forEach((fn) => fn());
+  assert.equal(timers.size, 1);
+  ticker.setWanted(false);
+  assert.equal(timers.size, 0, 'stopped when no longer wanted');
 });

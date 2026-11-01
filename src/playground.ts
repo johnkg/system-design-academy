@@ -50,3 +50,21 @@ export function watchVisibility(root: Element, update: (onScreen: boolean) => vo
   }
   document.addEventListener('visibilitychange', () => update(onScreen));
 }
+
+/**
+ * A repeating timer that runs only while the simulation wants it AND `root` is on screen AND the tab is visible.
+ * `setWanted(true)` is "Run was pressed"; `setWanted(false)` is "paused or finished". Replaces the usual hand-kept
+ * timer id, on-screen flag and clock() function.
+ */
+export function createTicker(root: Element, onTick: () => void, intervalMs: number): { setWanted: (wanted: boolean) => void } {
+  let wanted = false;
+  let onScreen = true;
+  let timerId: number | undefined;
+  const sync = () => {
+    window.clearInterval(timerId);
+    timerId = undefined;
+    if (wanted && onScreen && !document.hidden) timerId = window.setInterval(onTick, intervalMs);
+  };
+  watchVisibility(root, (visible) => { onScreen = visible; sync(); });
+  return { setWanted: (value) => { wanted = value; sync(); } };
+}
