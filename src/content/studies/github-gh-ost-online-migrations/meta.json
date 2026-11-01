@@ -1,0 +1,247 @@
+{
+  "name": "How GitHub Changes Huge MySQL Tables Without Stopping",
+  "difficulty": "advanced",
+  "intent": "Follow how GitHub built gh-ost to change the shape of a large, busy MySQL table without triggers, with throttling and a swap that never leaves the table missing, using only what GitHub has published.",
+  "codeTitle": "copy in chunks, replay the log, throttle, then swap",
+  "finalIntro": "One schema change from start to cut-over, while the application keeps writing to the table.",
+  "prompt": "GitHub changes the structure of its MySQL tables many times a day, and some of those tables hold many hundreds of gigabytes. A plain ALTER TABLE on a table that size would hold up the site, so teams use tools that build a new copy of the table in the new shape and swap it in. In its 2016 engineering post 'gh-ost: GitHub’s online schema migration tool for MySQL', GitHub explains why the existing tools did not work well for it and how it built its own. How would you change a table this size while the site keeps reading and writing it, and be able to stop the migration the moment the database is under strain? This study follows that post and gh-ost's own documentation of its cut-over, both listed at the end. The post gives few production numbers, so the numbers in the estimator, the simulation and the code samples are round teaching figures, not GitHub's data or code.",
+  "functional": [
+    "Change a table's structure, for example add a column or an index, while the application keeps reading and writing it",
+    "Copy the existing rows into the new shape, and keep the copy up to date with every write that happens during the copy",
+    "Pause, resume and reconfigure a running migration without restarting it",
+    "Swap the new table in for the old one without queries failing",
+    "Let the whole procedure be tried on production data before it is run on the primary"
+  ],
+  "nonFunctional": [
+    "Scale in the post: schema changes many times a day, on tables as small as empty and as large as many hundreds of GB",
+    "As little added load on the primary as possible, and the ability to back off when the primary is busy or a replica lags",
+    "Controllable at any moment, because an operator may need to stop the work during a traffic peak",
+    "Safe to interrupt: if the final swap fails, the original table must still be in place",
+    "Trustworthy: the migration is tested on production replicas, with checksums, before it touches the primary"
+  ],
+  "firstAttempt": {
+    "text": "This study starts from the trigger-based approach that the post compares gh-ost with. The tool creates a shadow copy of the table with the new structure, puts triggers on the original table so that every insert, update and delete is also made on the copy, copies the old rows across in chunks, and finally swaps the two tables by renaming them. Tools of this kind are named in the post: pt-online-schema-change, Facebook's OSC, LHM and oak-online-alter-table.",
+    "limits": [
+      "Triggers are interpreted by MySQL, so they add parsing and interpreting work to every query on the table",
+      "Triggers compete for locks on the other table. The post says GitHub saw near or complete lockdowns in production",
+      "Removing the triggers at the end caused metadata-lock stalls that the post puts at many seconds to a minute",
+      "Triggers cannot be paused. Removing them would lose data, so they run for the whole migration and can overload a busy primary even while the row copying is throttled",
+      "Running several trigger-based migrations at once was impractical, and testing on replicas was limited to statement-based replication and single-threaded replica workloads"
+    ]
+  },
+  "nodes": [
+    { "id": "app", "label": "Application", "kind": "client", "x": 8, "y": 50 },
+    { "id": "primary", "label": "MySQL primary: original table", "kind": "data", "x": 50, "y": 50 },
+    { "id": "ghosttable", "label": "Ghost table (new shape)", "kind": "data", "x": 71, "y": 84, "at": 1 },
+    { "id": "ghost", "label": "gh-ost", "kind": "async", "x": 29, "y": 84, "at": 1 },
+    { "id": "replica", "label": "Replica (binary log)", "kind": "data", "x": 92, "y": 50, "at": 2 },
+    { "id": "operator", "label": "Operator (socket, flag file)", "kind": "client", "x": 8, "y": 84, "at": 3 },
+    { "id": "sentry", "label": "Sentry table", "kind": "data", "x": 50, "y": 16, "at": 5 }
+  ],
+  "edges": [
+    { "from": "app", "to": "primary" },
+    { "from": "ghost", "to": "primary", "at": 1 },
+    { "from": "ghost", "to": "ghosttable", "at": 1 },
+    { "from": "primary", "to": "replica", "at": 2 },
+    { "from": "replica", "to": "ghost", "at": 2 },
+    { "from": "operator", "to": "ghost", "at": 3 },
+    { "from": "ghost", "to": "sentry", "at": 5 },
+    { "from": "sentry", "to": "primary", "at": 5 }
+  ],
+  "steps": [
+    {
+      "title": "Build a ghost table and copy the rows across in small chunks",
+      "problem": "GitHub ran schema changes many times a day and wanted to cause as little user-facing impact as possible. The built-in options each had a cost. Migrating replica by replica meant tracking every host, repeating the work, and a brief outage when a replica is promoted. MySQL's Online DDL is online only on the server where it runs, its change is serialised in replication and so causes lag, it cannot be safely interrupted, and it cannot be throttled.",
+      "fix": "gh-ost works like other online tools at this level. It creates a 'ghost' table modelled on the original, with the change applied, copies rows from the original into it incrementally, and replaces the original once the two are in sync. The post says it was tested on tables from empty to many hundreds of GB.",
+      "tradeoff": "Copying in chunks means the work can be paced and paused between chunks, but it also means the original and the ghost table exist side by side for the whole migration. The post does not give a disk figure. This study's reading: room for a second copy of the table is needed while it runs.",
+      "concepts": [
+        { "slug": "online-schema-migrations" },
+        { "slug": "database-replication" },
+        { "slug": "backups-and-point-in-time-recovery" }
+      ]
+    },
+    {
+      "title": "Read the binary log instead of using triggers",
+      "problem": "While the rows are being copied, the application keeps writing to the original table. Those writes have to reach the ghost table too, or the copy will be out of date when it is swapped in. Triggers do this inside every write, which is the source of the problems listed above.",
+      "fix": "gh-ost tails MySQL's binary log, the record of every change, to learn about writes to the table, so it needs no triggers. It works asynchronously, applying changes some time after they were committed. It expects row-based replication, where the log holds the changed rows, and it can also migrate a primary that uses statement-based replication by reading from a replica that converts the log to row-based form. It serialises its writes: the row copying and the log events are written in turn, so the primary sees one connection writing to the ghost table, one change after another.",
+      "tradeoff": "Because the changes are applied by gh-ost itself and not inside the application's transactions, they can be held back when needed, and the application's own queries carry no extra work. The price is that the ghost table is a little behind the original by design, and that row-based logging must be available. The post describes the log events as arriving asynchronously and does not give a lag figure.",
+      "concepts": [
+        { "slug": "write-ahead-log" },
+        { "slug": "database-replication" },
+        { "slug": "event-sourcing" }
+      ]
+    },
+    {
+      "title": "Throttle, and let an operator steer a running migration",
+      "problem": "A migration adds writes to a database that is already busy. It must back off when the primary is under strain or the replicas fall behind, and an operator must be able to stop it at once during an incident.",
+      "fix": "When gh-ost throttles, it stops all writes to the primary: no row copying and no row updates. It still writes small heartbeat events to an internal table. It throttles on load thresholds for MySQL metrics, with Threads_running=30 as the post's example, on replication lag measured with its own heartbeat and optional control replicas, on a query whose result says when to throttle (the example is a business-hours check), on a flag file that an operator creates or removes, or on a command sent over the network. All of these can be changed while the migration runs: gh-ost listens on a unix socket and optionally on TCP, and accepts commands such as throttle, no-throttle, chunk-size and max-lag-millis. The same interface reports progress and configuration.",
+      "tradeoff": "Throttling everything means the migration can be made as gentle as the situation needs, at the price of taking longer. The values in the post, such as Threads_running=30 and a 2000 ms lag, are examples, and the post does not say what GitHub uses in production.",
+      "concepts": [
+        { "slug": "backpressure" },
+        { "slug": "rate-limiting" },
+        { "slug": "health-checks" },
+        { "slug": "load-shedding" }
+      ]
+    },
+    {
+      "title": "Choose where it runs: through a replica, on the primary, or as a test",
+      "problem": "Reading the binary log and writing to the ghost table add load wherever they run, and a new tool should not be tried first on the machine that takes the money.",
+      "fix": "gh-ost has three modes. In the default mode, it connects to a replica, finds the primary from there, reads the binary log events on the replica and writes to the primary. The post calls this the least intrusive to the primary, even with row-based replication, and it requires the binary log to be on, with log_slave_updates and binlog_format=ROW on the replica. In the second mode it connects straight to the primary, which needs row-based replication on the primary and explicit approval with the allow-on-master option. In the third it migrates on a replica with migrate-on-replica, or tests on a replica with test-on-replica, which stops replication before the cut-over, swaps the tables and then swaps them back so both are left for comparison.",
+      "tradeoff": "Going through a replica spreads the work, but the replica must itself be healthy and keep a binary log. The test mode costs a replica's time but gives a full rehearsal on real data without any risk to the primary.",
+      "concepts": [
+        { "slug": "database-replication" },
+        { "slug": "canary-deployments" }
+      ]
+    },
+    {
+      "title": "Swap the tables without a gap",
+      "problem": "The last step replaces the original table with the ghost table. If it is done by renaming the original out of the way and then renaming the ghost into place, there is a moment when no table with that name exists, and queries fail.",
+      "fix": "gh-ost's documentation describes the gap in the two-step method of Facebook's tool: 'your table just does not exist, and queries will fail'. Its default cut-over avoids this with two connections. One connection holds a lock, and another attempts an atomic RENAME. A sentry table blocks the RENAME until gh-ost confirms that everything is ready, so it cannot run early. MySQL supports an atomic swap but does not let a connection swap tables that it holds under lock, which is why two connections are used. On success, pending queries are blocked for a brief time and then continue against the new table, and the table never disappears. If the attempt fails, for example from a timeout or a connection that dies, the original table is still in place, the waiting connections are released and can write again, and gh-ost can try again. The two-step method is still available with the cut-over option set to two-step. A flag file also lets gh-ost finish copying and keep applying changes, but wait for the operator before it cuts over.",
+      "tradeoff": "The atomic method is harder to build, and queries are held for a short time during the swap, but nothing fails and a failed attempt can simply be repeated. The documentation gives no figures for how long the hold lasts, so the half second in the simulation is invented. The documentation calls the atomic method battle tested in GitHub's production environments.",
+      "concepts": [
+        { "slug": "blue-green-and-rolling-deployments" },
+        { "slug": "online-schema-migrations" }
+      ]
+    },
+    {
+      "title": "Test it on production replicas before trusting it with the primary",
+      "problem": "A migration tool that has a subtle bug could silently corrupt a table that the whole site depends on, and the first sign could be a customer's missing data.",
+      "fix": "The post describes testing at GitHub. Designated production replicas run continuous covering migrations, with engine=innodb, on every production table. Each run ends with replication stopped and checksums of the original and the ghost table compared, after which replication resumes. GitHub says it completed thousands of successful migrations on replicas before it tried gh-ost on a primary.",
+      "tradeoff": "Running every table through a migration continuously uses replica capacity, but it exercises the tool against real data of every shape and size. The post reports the number of successful replica runs as 'thousands' and gives no failure counts.",
+      "concepts": [
+        { "slug": "canary-deployments" },
+        { "slug": "merkle-trees-and-anti-entropy" },
+        { "slug": "metrics" }
+      ]
+    }
+  ],
+  "failures": [
+    {
+      "scenario": "A replica starts to fall behind while the copy runs",
+      "impact": "Reads from that replica become stale, and a long lag makes the replica a poor stand-in for the primary.",
+      "answer": "gh-ost measures replication lag with its own heartbeat, and with control replicas if configured, and throttles when the lag passes the limit that can be changed at any time, such as max-lag-millis. While it is throttled it stops all writes to the primary apart from the tiny heartbeat events.",
+      "concepts": [
+        { "slug": "backpressure" },
+        { "slug": "database-replication" }
+      ]
+    },
+    {
+      "scenario": "The primary becomes busy during the migration",
+      "impact": "The extra writes would slow the application's own queries.",
+      "answer": "gh-ost can throttle on load thresholds for MySQL metrics, with Threads_running=30 as the post's example, so the migration steps aside when the primary is busy and resumes when it is not.",
+      "concepts": [
+        { "slug": "load-shedding" },
+        { "slug": "health-checks" }
+      ]
+    },
+    {
+      "scenario": "An incident starts and the operator must stop the migration now",
+      "impact": "With triggers, the writes could not be stopped, because removing the triggers loses data.",
+      "answer": "The operator touches the flag file, or sends the throttle command over gh-ost's socket, and all of its writes stop at once. Removing the file or sending no-throttle lets the work continue from where it was.",
+      "concepts": [
+        { "slug": "feature-flags" },
+        { "slug": "graceful-degradation" }
+      ]
+    },
+    {
+      "scenario": "The final swap fails, for example from a timeout or a connection that dies",
+      "impact": "If the table were left half swapped, queries would fail.",
+      "answer": "In the atomic cut-over the original table stays in place and accessible, the waiting connections are released and can write again, and gh-ost can make another attempt at the cut-over.",
+      "concepts": [
+        { "slug": "retries-and-backoff" },
+        { "slug": "idempotency" }
+      ]
+    },
+    {
+      "scenario": "A bug makes the ghost table differ from the original",
+      "impact": "Swapping it in would silently change the data the site serves.",
+      "answer": "The continuous test migrations on replicas end with a comparison of checksums of the two tables, so a difference shows up on a replica long before the tool is used on a primary.",
+      "concepts": [
+        { "slug": "merkle-trees-and-anti-entropy" },
+        { "slug": "canary-deployments" }
+      ]
+    }
+  ],
+  "alternatives": [
+    {
+      "title": "How to keep the new table up to date during the copy",
+      "options": [
+        { "name": "Triggers on the original table", "pro": "Every change is copied at once, inside the same write", "con": "Adds work and lock contention to every query, cannot be paused, and removing them caused stalls of many seconds to a minute at GitHub" },
+        { "name": "Read the binary log, asynchronously", "pro": "No extra work inside the application's queries, and the replay can be throttled and paused. This is what gh-ost does", "con": "The ghost table is behind by design, and row-based logging is expected" },
+        { "name": "Migrate on a replica, then promote it", "pro": "The primary is not touched until the end", "con": "The post says it takes heavy operational work, per-host tracking and repeated runs, and a brief outage when the replica is promoted" }
+      ],
+      "pick": "Read the binary log, as GitHub did with gh-ost."
+    },
+    {
+      "title": "Where to run gh-ost",
+      "options": [
+        { "name": "Connect to a replica and write to the primary", "pro": "The default, and the post calls it the least intrusive on the primary", "con": "Needs a replica with the binary log on, log_slave_updates and row-based logging" },
+        { "name": "Connect to the primary", "pro": "No replica is needed", "con": "Needs row-based replication on the primary and explicit approval with allow-on-master" },
+        { "name": "Test on a replica", "pro": "A full rehearsal, including the swap and the swap back, with no risk to the primary", "con": "Takes a replica's time and stops its replication for the cut-over" }
+      ],
+      "pick": "A replica by default, with test runs on replicas first, as the post describes."
+    },
+    {
+      "title": "How to swap the tables",
+      "options": [
+        { "name": "Rename in two steps", "pro": "Simple. gh-ost still offers it as the two-step cut-over", "con": "There is a moment when the table does not exist and queries fail" },
+        { "name": "Atomic swap with a lock and a sentry table", "pro": "The table never disappears, a failure leaves the original in place, and the attempt can be repeated", "con": "More complicated, and queries are held for a short time" }
+      ],
+      "pick": "The atomic swap, which is gh-ost's default."
+    }
+  ],
+  "roles": [
+    { "id": "client", "label": "Application and operator", "description": "The application keeps writing to the table. The operator throttles, pauses and decides when to cut over." },
+    { "id": "data", "label": "Primary, replica and tables", "description": "The original table, the ghost table, the replica that holds the binary log and the sentry table used in the swap." },
+    { "id": "async", "label": "gh-ost", "description": "Copies rows, reads the binary log, applies changes to the ghost table, throttles and runs the cut-over." }
+  ],
+  "quiz": [
+    {
+      "question": "GitHub's post says a trigger-based migration tool could overload a busy primary even when its row copying was throttled. Why?",
+      "options": [
+        "The triggers keep running inside every application write, and removing them would lose data, so they cannot be paused",
+        "Throttling in those tools also pauses the application, which then retries its queries in a flood",
+        "The tool copies the whole table again each time it is throttled and resumed",
+        "The triggers run only on replicas, which then send their load back to the primary"
+      ],
+      "answer": 0,
+      "explanation": "The post gives this as one of the problems of triggers: they cannot be paused, because removing them loses data, so they run throughout and can overload the primary while the copy is throttled. Throttling does not pause the application, and the post does not describe a flood of retries. Resuming a trigger-based copy does not start the table again from the beginning, and triggers fire on the table being written, which is on the primary."
+    },
+    {
+      "question": "gh-ost's atomic cut-over tries to rename the tables but the connection holding the lock dies. What does its documentation say happens?",
+      "options": [
+        "The table is lost, so the migration has to be restored from a backup",
+        "The ghost table is renamed anyway and the old one is dropped to save time",
+        "The original table stays in place and usable, waiting connections are released, and gh-ost can try the cut-over again",
+        "All queries are blocked until an operator removes the sentry table by hand"
+      ],
+      "answer": 2,
+      "explanation": "The documentation says that after a timeout or the death of a connection the original table is still in place and accessible, pending connections are released and can write again, and gh-ost can make another attempt. Losing the table is exactly what the two-connection design avoids. The documentation does not describe dropping the old table in that case. The sentry table's job is to keep the rename from running early, and nothing in the page requires removing it by hand."
+    },
+    {
+      "question": "How does gh-ost learn about the writes the application makes to the table while it is copying rows?",
+      "options": [
+        "It places triggers on the table, as other tools do, but removes them quickly",
+        "It reads MySQL's binary log, asynchronously, and applies those changes to the ghost table",
+        "It stops all application writes for a moment each time it copies a chunk",
+        "It compares the two tables every few seconds and repairs the differences"
+      ],
+      "answer": 1,
+      "explanation": "The post says gh-ost tails the binary logs to capture changes, works asynchronously and applies them some time after they were committed, with no triggers. It does not briefly add triggers. Stopping the application's writes for every chunk would defeat the point of an online migration. Comparing the two tables repeatedly is not how it works: the post describes the checksum comparison only in GitHub's replica tests."
+    }
+  ],
+  "sources": [
+    {
+      "title": "gh-ost: GitHub’s online schema migration tool for MySQL",
+      "publisher": "GitHub Engineering, Shlomi Noach",
+      "year": 2016,
+      "url": "https://github.blog/news-insights/company-news/gh-ost-github-s-online-migration-tool-for-mysql/"
+    },
+    {
+      "title": "gh-ost documentation: cut-over",
+      "publisher": "GitHub, gh-ost repository",
+      "year": 2016,
+      "url": "https://github.com/github/gh-ost/blob/master/doc/cut-over.md"
+    }
+  ]
+}

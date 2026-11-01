@@ -1,0 +1,97 @@
+---
+import PlaygroundShell from '../../components/PlaygroundShell.astro';
+---
+<PlaygroundShell title="Migrate a busy table" hint="A 3,000,000 row table is copied to a new shape while the application keeps writing. Choose the tool, whether it throttles, what the traffic does and how the swap is done, and watch the finish time, the load on the primary, the replica lag and what happens at the cut-over. A simple model with round numbers, not GitHub's code or data.">
+  <ol class="how">
+    <li>Press <b>Reset</b>. A trigger-based tool copies the table in <b>500</b> seconds and the application is never slowed (<b>0</b> seconds), but the tool never looks at the replica and its lag climbs to <b>50,000</b> milliseconds. The rename in two steps then leaves the table missing for a moment, and <b>4,000</b> queries fail.</li>
+    <li>Set <b>Throttle</b> to <b>Pause when replica lag passes the limit</b>: the lag stays near the limit (<b>1,600</b> milliseconds at its highest) and the copy is held back for <b>242</b> seconds in all, so it finishes later, at <b>742</b> seconds.</li>
+    <li>Set <b>Write traffic</b> to <b>A burst of 16,000 writes a second for 100 seconds</b>. The throttle pauses the copy, but the triggers keep writing inside every application write, so the primary is over its capacity for <b>100</b> seconds, the lag reaches <b>61,600</b> milliseconds and the migration is <b>not finished in 900 seconds</b>.</li>
+    <li>Set <b>Tool</b> to <b>gh-ost, reading the binary log</b>. Throttling now also stops the changes that keep the new table up to date, so the primary is over capacity for only <b>18</b> seconds, the lag peaks at <b>2,400</b> milliseconds, and the migration finishes at <b>660</b> seconds.</li>
+    <li>Set <b>Operator</b> to <b>Steps in for a minute when the burst starts</b>: the operator pauses the migration by hand, the primary is over capacity for just <b>9</b> seconds, and the migration finishes at <b>671</b> seconds.</li>
+    <li>Set <b>Cut-over</b> to <b>Atomic, with a sentry table</b>: no query fails (<b>0</b> failed). The <b>4,000</b> queries that arrive during the swap are held for a moment and then run against the new table.</li>
+  </ol>
+  <div class="pg ghm" data-ghm>
+    <div class="pg-row">
+      <label>Tool <select class="pg-in" data-tool><option value="triggers">Trigger-based tool</option><option value="ghost">gh-ost, reading the binary log</option></select></label>
+      <label>Throttle <select class="pg-in" data-throttle><option value="off">Not used</option><option value="on">Pause when replica lag passes the limit</option></select></label>
+      <label>Write traffic <select class="pg-in" data-spike><option value="off">Steady, 8,000 writes a second</option><option value="on">A burst of 16,000 writes a second for 100 seconds</option></select></label>
+      <label>Operator <select class="pg-in" data-operator><option value="off">Does not pause</option><option value="on">Steps in for a minute when the burst starts</option></select></label>
+      <label>Cut-over <select class="pg-in" data-cutover><option value="twoStep">Rename in two steps</option><option value="atomic">Atomic, with a sentry table</option></select></label>
+      <button type="button" class="btn" data-reset>Reset</button>
+    </div>
+    <div class="pg-grid">
+      <div class="pg-box" data-b1><h3>Time to finish</h3><span class="pg-mono" data-o1></span><span class="pg-note" data-n1></span></div>
+      <div class="pg-box" data-b2><h3>Primary over its capacity</h3><span class="pg-mono" data-o2></span><span class="pg-note" data-n2></span></div>
+      <div class="pg-box" data-b3><h3>Highest replica lag</h3><span class="pg-mono" data-o3></span><span class="pg-note" data-n3></span></div>
+      <div class="pg-box" data-b4><h3>Queries at the cut-over</h3><span class="pg-mono" data-o4></span><span class="pg-note" data-n4></span></div>
+    </div>
+    <svg class="ghm-chart" viewBox="0 0 600 130" role="img" data-chart preserveAspectRatio="none">
+      <rect data-spike-band y="0" height="130" fill="var(--bad)" opacity=".08" />
+      <line data-capacity-line x1="0" x2="600" stroke="var(--muted)" stroke-width="1.5" stroke-dasharray="5 4" />
+      <polyline data-load fill="none" stroke="var(--role-3)" stroke-width="2.5" />
+    </svg>
+    <p class="pg-note">Writes the primary is asked for each second, as a multiple of what it can do (dashed line = 1.0 times). The shaded band is the burst of traffic, if there is one. A comb shape means the throttle is switching on and off as the replica's lag crosses its limit.</p>
+    <p class="pg-out" data-verdict aria-live="polite"></p>
+    <p class="pg-note">Model, invented for teaching and not GitHub data: the table has 3,000,000 rows and copying runs at 6,000 rows a second. The application writes 8,000 times a second, or 16,000 during the burst. The primary can do 30,000 writes a second and a replica can apply 20,000. Keeping the new table up to date costs one extra write for every application write. A trigger does that inside the application's own write and cannot be paused. gh-ost applies the changes itself, so when it is throttled that stops too. The throttle holds everything back while the replica lags by more than 1,500 milliseconds. The replica's lag grows, or shrinks, each second by how far the writes it is sent are above or below what it can apply. The swap takes half a second: in two steps the table is missing for that half second and queries fail, and in the atomic swap they are held and then run. GitHub's post and documentation give no such figures, and real systems are more complicated than this.</p>
+  </div>
+</PlaygroundShell>
+<style>
+  .ghm-chart { width: 100%; height: 130px; display: block; background: var(--surface-2); border: 1px solid var(--border); border-radius: 8px; }
+</style>
+<script>
+  import { query, formatWholeNumber } from '../../playground';
+  import { RUN_SECONDS, SPIKE_SECONDS, SPIKE_START, simulate, type CutOver, type Tool } from '../../models/gh-ost.ts';
+  document.querySelectorAll<HTMLElement>('[data-ghm]').forEach((root) => {
+    const q = query(root);
+    const CHART_WIDTH = 600, CHART_HEIGHT = 130, CHART_PAD = 8;
+    const MIN_CHART_MAX = 2; // the chart always reaches at least twice capacity
+    const BAD_LAG_MS = 10_000; // a lag above this turns the box red
+    const DEFAULTS: Record<string, string> = { tool: 'triggers', throttle: 'off', spike: 'off', operator: 'off', cutover: 'twoStep' };
+    const select = (key: string) => q<HTMLSelectElement>(`[data-${key}]`);
+    const x = (second: number) => (second * CHART_WIDTH) / RUN_SECONDS;
+    const plural = (n: number, word: string) => `${formatWholeNumber(n)} ${word}${n === 1 ? '' : 's'}`;
+
+    function draw() {
+      const result = simulate({
+        tool: select('tool').value as Tool, throttle: select('throttle').value === 'on', spike: select('spike').value === 'on',
+        operatorPauses: select('operator').value === 'on', cutOver: select('cutover').value as CutOver,
+      });
+      const done = result.finishedAt !== null;
+      q('[data-o1]').textContent = done ? plural(result.finishedAt as number, 'second') : `not finished in ${RUN_SECONDS} seconds`;
+      q('[data-n1]').textContent = result.pausedSeconds > 0 ? `the copy was held back for ${plural(result.pausedSeconds, 'second')}` : 'the copy was never held back';
+      q('[data-o2]').textContent = plural(result.appSlowedSeconds, 'second');
+      q('[data-n2]').textContent = result.appSlowedSeconds > 0 ? 'seconds in which the application was slowed down' : 'the application was never slowed';
+      q('[data-o3]').textContent = `${formatWholeNumber(result.peakLagMs)} ms`;
+      q('[data-n3]').textContent = result.peakLagMs > BAD_LAG_MS ? 'the replica fell far behind' : 'the replica stayed close';
+      q('[data-o4]').textContent = !done ? 'no cut-over yet' : result.failedAtCutOver > 0 ? `${formatWholeNumber(result.failedAtCutOver)} failed` : `${formatWholeNumber(result.blockedAtCutOver)} held, none failed`;
+      q('[data-n4]').textContent = !done ? 'the copy had not finished' : result.failedAtCutOver > 0 ? 'the table was missing while it was swapped' : 'held for a moment, then run against the new table';
+      const bad = [!done, result.appSlowedSeconds > 0, result.peakLagMs > BAD_LAG_MS, !done || result.failedAtCutOver > 0];
+      ['b1', 'b2', 'b3', 'b4'].forEach((b, i) => q<HTMLElement>(`[data-${b}]`).style.setProperty('--c', bad[i] ? 'var(--bad)' : 'var(--good)'));
+
+      const peak = Math.max(...result.loadBySecond);
+      const top = Math.max(MIN_CHART_MAX, peak * 1.05);
+      const y = (v: number) => CHART_HEIGHT - CHART_PAD - (v / top) * (CHART_HEIGHT - 2 * CHART_PAD);
+      q('[data-load]').setAttribute('points', result.loadBySecond.map((v, i) => `${x(i + 0.5).toFixed(1)},${y(v).toFixed(1)}`).join(' '));
+      const line = q('[data-capacity-line]'); line.setAttribute('y1', y(1).toFixed(1)); line.setAttribute('y2', y(1).toFixed(1));
+      const band = q('[data-spike-band]'); const spiking = select('spike').value === 'on';
+      band.setAttribute('x', String(x(SPIKE_START))); band.setAttribute('width', String(spiking ? x(SPIKE_SECONDS) : 0));
+      q('[data-chart]').setAttribute('aria-label', `Writes asked of the primary over ${result.loadBySecond.length} seconds, peaking at ${peak.toFixed(1)} times what it can do`);
+
+      const out = q('[data-verdict]'); const broken = bad.some(Boolean); out.classList.toggle('bad', broken);
+      if (!broken) out.textContent = `The migration finished in ${plural(result.finishedAt as number, 'second')} with the application never slowed, the replica close behind and no query failed at the cut-over.`;
+      else if (!done) out.textContent = `The migration had not finished after ${RUN_SECONDS} seconds: the trigger-based tool keeps writing during the burst even when its copy is paused. Try gh-ost, which can stop all of its writes.`;
+      else if (result.failedAtCutOver > 0) out.textContent = `${formatWholeNumber(result.failedAtCutOver)} queries failed while the tables were being swapped. Use the atomic cut-over so queries are held and not failed.`;
+      else {
+        const hint = select('throttle').value !== 'on' ? 'Try the throttle.' : select('operator').value !== 'on' && select('spike').value === 'on' ? 'Try pausing it by hand when the burst starts.' : '';
+        out.textContent = `The migration finished, but the application was slowed for ${plural(result.appSlowedSeconds, 'second')} and the replica lagged by up to ${formatWholeNumber(result.peakLagMs)} ms. ${hint}`.trim();
+      }
+    }
+    root.addEventListener('input', draw);
+    root.addEventListener('change', draw);
+    q('[data-reset]').addEventListener('click', () => {
+      Object.keys(DEFAULTS).forEach((k) => (select(k).value = DEFAULTS[k]));
+      draw();
+    });
+    draw();
+  });
+</script>
