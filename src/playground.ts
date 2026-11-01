@@ -7,8 +7,20 @@ export const query = (root: ParentNode) => <T extends Element = HTMLElement>(sel
 /** `val('[data-rate]')` reads the number in a range, number or select control found with `q`. */
 export const numberValue = (q: ReturnType<typeof query>) => (selector: string): number => Number(q<HTMLInputElement | HTMLSelectElement>(selector).value);
 
-/** Whole number with thousands separators, the same in every locale so the page and its screenshots agree. */
-export const fmt = (n: number): string => Math.round(n).toLocaleString('en-US');
+const LOCALE = 'en-US'; // fixed, so the page and its screenshots agree whatever the reader's locale
+const ADAPTIVE_ROUNDING_THRESHOLD = 100; // from here up, decimals are noise
+
+/** Rounded to a whole number, with thousands separators: 1234.6 becomes "1,235". */
+export const formatWholeNumber = (n: number): string => Math.round(n).toLocaleString(LOCALE);
+
+/** Thousands separators only, nothing rounded: for values that are already whole numbers. */
+export const formatThousands = (n: number): string => n.toLocaleString(LOCALE);
+
+/** One decimal below 100, a whole number from 100 up, with thousands separators: 42.37 becomes "42.4", 1234.6 becomes "1,235". */
+export const formatOneDecimalBelow100 = (n: number): string =>
+  (n >= ADAPTIVE_ROUNDING_THRESHOLD ? Math.round(n) : Math.round(n * 10) / 10).toLocaleString(LOCALE);
+
+export const clamp = (value: number, min: number, max: number): number => Math.max(min, Math.min(max, value));
 
 export const prefersReducedMotion = (): boolean => matchMedia('(prefers-reduced-motion: reduce)').matches;
 
