@@ -1,0 +1,418 @@
+{
+  "name": "How Notion Sharded Its Postgres Database",
+  "difficulty": "advanced",
+  "intent": "Follow how Notion split one Postgres database into 480 logical shards on 32 physical databases, and moved its data across without long downtime, using only what Notion has published.",
+  "codeTitle": "route by workspace, double-write through an audit log, then switch over",
+  "finalIntro": "One write and one read through the finished layout, and how the data got there.",
+  "prompt": "For five years Notion grew on a single Postgres database, by four orders of magnitude. In its 2021 engineering post 'Herding elephants: Lessons learned from sharding Postgres at Notion', Notion says the database had become a risk: on-call engineers were often woken by CPU spikes, schema changes were unsafe, Postgres's VACUUM process had started to stall, and running out of transaction IDs was an existential worry. Buying a bigger machine was not a long-term answer. How would you split the data across many databases, and then move live data into them without losing any of it? This study follows that post, which is listed at the end. The post does not give table sizes, row counts or most instance types, so the numbers in the estimator and the simulation are round teaching figures, not Notion's data.",
+  "functional": [
+    "Keep every query for one workspace on one database, so the application does not have to join across databases",
+    "Route each request to the right physical database and logical shard from the workspace it belongs to",
+    "Move the existing data into the new databases while the application keeps writing to the old one",
+    "Check that the copy is correct before anything reads from it",
+    "Switch the application over, with a way back if something is wrong"
+  ],
+  "nonFunctional": [
+    "Capacity targets in the post: at least 60,000 IOPS in total to meet the existing demand, no more than 500 GB in any one table and no more than 10 TB on any one physical database",
+    "Headroom to grow for the post's two-year usage projection, and to add hosts in even steps without reshuffling everything",
+    "No data loss: the migration is checked, and a rollback path is prepared",
+    "Little downtime: the post describes a short scheduled maintenance window at switch-over",
+    "One place that decides where data lives, so the routing rules cannot disagree with themselves"
+  ],
+  "firstAttempt": {
+    "text": "The design this study starts from is the one Notion had: a single large Postgres database holding everything, scaled up by buying bigger machines. Every workspace's data sits in the same tables, and every query, write and schema change goes to the same place.",
+    "limits": [
+      "On-call engineers often woke to database CPU spikes, as the post puts it",
+      "Schema changes that only touch the catalog, which should be quick, had become unsafe and uncertain",
+      "Postgres's VACUUM, which reclaims disk space from dead rows, had started to stall consistently, and the post names transaction ID wraparound as an existential risk",
+      "Vertical scaling was rejected as a long-term plan, because the post says query performance and upkeep degrade before hardware limits are reached"
+    ]
+  },
+  "nodes": [
+    {
+      "id": "app",
+      "label": "Application",
+      "kind": "client",
+      "x": 8,
+      "y": 50
+    },
+    {
+      "id": "monolith",
+      "label": "Postgres monolith",
+      "kind": "data",
+      "x": 50,
+      "y": 16
+    },
+    {
+      "id": "shards",
+      "label": "32 databases, 480 logical shards",
+      "kind": "data",
+      "x": 92,
+      "y": 50,
+      "at": 2
+    },
+    {
+      "id": "router",
+      "label": "Routing in application code",
+      "kind": "edge",
+      "x": 50,
+      "y": 50,
+      "at": 3
+    },
+    {
+      "id": "audit",
+      "label": "Audit log and catch-up script",
+      "kind": "async",
+      "x": 71,
+      "y": 84,
+      "at": 4
+    },
+    {
+      "id": "verify",
+      "label": "Dark reads and sampling",
+      "kind": "async",
+      "x": 29,
+      "y": 84,
+      "at": 5
+    }
+  ],
+  "edges": [
+    {
+      "from": "app",
+      "to": "monolith",
+      "until": 3
+    },
+    {
+      "from": "app",
+      "to": "router",
+      "at": 3
+    },
+    {
+      "from": "router",
+      "to": "monolith",
+      "at": 3,
+      "until": 6
+    },
+    {
+      "from": "router",
+      "to": "shards",
+      "at": 3
+    },
+    {
+      "from": "router",
+      "to": "audit",
+      "at": 4
+    },
+    {
+      "from": "audit",
+      "to": "shards",
+      "at": 4
+    },
+    {
+      "from": "verify",
+      "to": "monolith",
+      "at": 5
+    },
+    {
+      "from": "verify",
+      "to": "shards",
+      "at": 5
+    }
+  ],
+  "steps": [
+    {
+      "title": "Shard in the application, and shard by workspace",
+      "problem": "Usage was expected to outgrow the single database. The monolith's CPU, VACUUM and transaction ID problems would only get worse as data grew, and a bigger machine could not fix them for long.",
+      "fix": "Notion chose application-level sharding. It preferred this to packaged tools such as Citus and Vitess because it wanted control over how data is spread, and it also looked at DynamoDB and bare-metal NVMe instances. It sharded every table reachable from the block table through foreign keys, noting that not all of them strictly needed it. The partition key is the workspace ID. Every block belongs to exactly one workspace, so most queries stay within a single shard.",
+      "tradeoff": "Sharding by workspace keeps related data together. This study's reading: a very large workspace cannot be split further, because all of its data is kept together by design. The post does not say how big its largest workspaces are. Doing the sharding in application code gives control, at the cost of owning all of the routing, migration and verification logic.",
+      "concepts": [
+        {
+          "slug": "database-sharding"
+        },
+        {
+          "slug": "sql-vs-nosql"
+        },
+        {
+          "slug": "mvcc-and-isolation-levels"
+        },
+        {
+          "slug": "horizontal-vs-vertical-scaling"
+        }
+      ]
+    },
+    {
+      "title": "Spread 480 logical shards over 32 physical databases",
+      "problem": "How many databases, and how should data be placed on them? Too few shards makes each one too big and too hard to move. Too many makes it hard to run them. And a layout has to be able to grow later.",
+      "fix": "Notion's layout has 480 logical shards on 32 physical databases, 15 logical shards on each. Each logical shard is a Postgres schema, for example schema001.block, with its own copy of every sharded table. It chose separate tables over Postgres's native partitioning so that routing happens in one place. The workspace UUIDs are divided into uniform buckets. The limits it set were at least 60,000 IOPS in total, at most 500 GB per table and at most 10 TB per physical database. It picked 480 because it divides evenly in many ways, so hosts can be added in even steps, for example from 32 to 40 to 48.",
+      "tradeoff": "More logical shards than databases make each unit small and easy to move, and let the cluster grow without splitting any shard. But every shard is a set of schemas and tables to manage, and a shard count that does not divide evenly leaves some databases with more than others. The post does not give the achieved IOPS or the production instance types.",
+      "concepts": [
+        {
+          "slug": "database-sharding"
+        },
+        {
+          "slug": "consistent-hashing"
+        },
+        {
+          "slug": "horizontal-vs-vertical-scaling"
+        }
+      ]
+    },
+    {
+      "title": "Route in application code, from one source of truth",
+      "problem": "Every query now has to find its way to the right database and the right schema inside it. If two parts of the system disagree about where a workspace lives, data can be written to the wrong place.",
+      "fix": "Routing is done entirely in application code: the workspace ID decides the physical database, and then the logical schema inside it. The post explicitly rejects a partition table for routing, so that there is a single source of truth in code. Together with the choice of separate tables, this keeps the rule for where data lives in one place.",
+      "tradeoff": "One routing function is easy to reason about and test, but every part of the application that touches sharded data must go through it, and a bug there affects everything. The post does not describe how the routing is tested.",
+      "concepts": [
+        {
+          "slug": "database-sharding"
+        },
+        {
+          "slug": "consistent-hashing"
+        }
+      ]
+    },
+    {
+      "title": "Double-write through an audit log, with a catch-up script",
+      "problem": "The data has to be copied while the application keeps changing it, and the new databases must not miss any change. Notion says the block table's write volume was very high.",
+      "fix": "The migration starts by writing to both the old and the new databases. The post compares three ways to do this: direct dual writes, logical replication, and an audit log with a catch-up script. It chose the audit log, because logical replication could not keep up with the write volume on the block table during the initial snapshot. The audit log records each change, and a catch-up script replays it into the new databases.",
+      "tradeoff": "The post says that if Notion had sharded earlier, it could have used logical replication, which would have avoided writing a custom backfill that added load on the system while it ran. It also says a zero-downtime switch-over would have needed the catch-up script to finish in under 30 seconds.",
+      "concepts": [
+        {
+          "slug": "online-schema-migrations"
+        },
+        {
+          "slug": "event-sourcing"
+        },
+        {
+          "slug": "write-ahead-log"
+        },
+        {
+          "slug": "database-replication"
+        }
+      ]
+    },
+    {
+      "title": "Backfill the old data, then verify with dark reads",
+      "problem": "Writes now reach both sides, but the old data is only on the monolith. It must be copied across without overwriting newer changes, and then proved correct before anything reads from the new databases.",
+      "fix": "The backfill copies the old records, comparing record versions and skipping any record that has a newer update. The final backfill ran on an m5.24xlarge instance, which has 96 CPUs, and took about three days. Verification used two checks. A script randomly samples UUIDs and checks the adjacent ranges against the monolith. 'Dark' reads fetch from both databases, compare the results, discard the sharded copy and log any discrepancy, so users still see the monolith's answer. The post says dark reads increased API latency. It also says the migration and the verification were written by different people, to reduce correlated errors.",
+      "tradeoff": "Dark reads give real traffic as a test, but they make requests slower while they run. Skipping a record that has a newer version avoids overwriting fresh data, and relies on the audit log to carry that newer version across. The post does not give the size of the verification sample or the duration of the double-write phase.",
+      "concepts": [
+        {
+          "slug": "merkle-trees-and-anti-entropy"
+        },
+        {
+          "slug": "optimistic-concurrency-and-etags"
+        },
+        {
+          "slug": "canary-deployments"
+        }
+      ]
+    },
+    {
+      "title": "Switch over in a short window, with a way back",
+      "problem": "At some point reads and writes must move to the new databases. If it goes wrong, the team needs to be able to return to the old database without losing the changes made in the meantime.",
+      "fix": "Notion switched over in a five-minute scheduled maintenance window, and had planned to move reads over in stages, for example by double-reading first. As a rollback path, it prepared a reverse audit log and script, which would have carried changes from the new databases back to the monolith. They were not needed.",
+      "tradeoff": "A short maintenance window is simpler and safer than a live switch, at the price of five minutes of planned downtime. The post says a zero-downtime switch would have needed the catch-up script to finish in under 30 seconds, and it does not say whether the final switch-over was staged or done all at once beyond the stated window. Another lesson it names: a combined primary key could have replaced the separate id and space_id composite key.",
+      "concepts": [
+        {
+          "slug": "blue-green-and-rolling-deployments"
+        },
+        {
+          "slug": "feature-flags"
+        },
+        {
+          "slug": "backups-and-point-in-time-recovery"
+        }
+      ]
+    }
+  ],
+  "failures": [
+    {
+      "scenario": "VACUUM keeps stalling on the monolith and dead rows pile up",
+      "impact": "Disk space cannot be reclaimed, and the post names transaction ID wraparound as an existential risk.",
+      "answer": "The answer Notion chose was to split the data so that each physical database is far smaller. Every shard is then vacuumed on its own, and a problem on one is confined to it.",
+      "concepts": [
+        {
+          "slug": "mvcc-and-isolation-levels"
+        },
+        {
+          "slug": "database-sharding"
+        }
+      ]
+    },
+    {
+      "scenario": "Logical replication cannot keep up with the writes on the block table",
+      "impact": "The new databases would fall behind during the initial snapshot and might never catch up.",
+      "answer": "Notion used an audit log with a catch-up script instead. The log records each change, and the script replays it into the new databases.",
+      "concepts": [
+        {
+          "slug": "database-replication"
+        },
+        {
+          "slug": "event-sourcing"
+        }
+      ]
+    },
+    {
+      "scenario": "A record is changed while the backfill is copying it",
+      "impact": "The backfill could overwrite the newer version with the old one it had already read.",
+      "answer": "The backfill compares record versions and skips any record that has a newer update.",
+      "concepts": [
+        {
+          "slug": "optimistic-concurrency-and-etags"
+        }
+      ]
+    },
+    {
+      "scenario": "The copy differs from the original somewhere",
+      "impact": "Switching over would show users wrong or missing data.",
+      "answer": "Two checks look for it: a script that samples random UUIDs and compares adjacent ranges against the monolith, and dark reads that fetch from both databases, compare, discard the sharded copy and log every discrepancy.",
+      "concepts": [
+        {
+          "slug": "merkle-trees-and-anti-entropy"
+        },
+        {
+          "slug": "canary-deployments"
+        }
+      ]
+    },
+    {
+      "scenario": "The switch-over goes wrong",
+      "impact": "Changes made on the new databases would be stranded if the team went back to the monolith.",
+      "answer": "Notion prepared a reverse audit log and script to carry changes back to the monolith. The post says it was not needed.",
+      "concepts": [
+        {
+          "slug": "backups-and-point-in-time-recovery"
+        },
+        {
+          "slug": "blue-green-and-rolling-deployments"
+        }
+      ]
+    }
+  ],
+  "alternatives": [
+    {
+      "title": "How to shard",
+      "options": [
+        {
+          "name": "Application-level sharding",
+          "pro": "Full control over how data is distributed. This is what Notion chose",
+          "con": "Notion owns all of the routing, migration and verification code"
+        },
+        {
+          "name": "A packaged tool such as Citus or Vitess",
+          "pro": "Less code to write",
+          "con": "The post says Notion wanted control over the data distribution"
+        },
+        {
+          "name": "A different database, such as DynamoDB",
+          "pro": "Built to scale out",
+          "con": "The post lists it as considered, and gives no detail of why it was not chosen"
+        }
+      ],
+      "pick": "Application-level sharding by workspace ID, as Notion did."
+    },
+    {
+      "title": "How to keep the new databases in step during the migration",
+      "options": [
+        {
+          "name": "Direct dual writes",
+          "pro": "Every write goes to both places at once",
+          "con": "The application must handle a write that succeeds on one side and fails on the other"
+        },
+        {
+          "name": "Logical replication",
+          "pro": "The database does the copying",
+          "con": "The post says it could not keep up with the block table's writes during the initial snapshot"
+        },
+        {
+          "name": "An audit log with a catch-up script",
+          "pro": "Keeps up with the write volume. This is what Notion chose",
+          "con": "A custom backfill and catch-up script to write, and a switch-over that needs the script to finish quickly"
+        }
+      ],
+      "pick": "The audit log and catch-up script, as Notion did, though the post says logical replication would have been better had it sharded earlier."
+    },
+    {
+      "title": "How to lay out the shards in Postgres",
+      "options": [
+        {
+          "name": "Separate tables in separate schemas",
+          "pro": "Routing happens in one place, in the application. This is what Notion chose",
+          "con": "Many schemas and tables to manage"
+        },
+        {
+          "name": "Postgres native partitioning",
+          "pro": "The database knows about the partitions",
+          "con": "The post says Notion chose separate tables to keep routing in one place"
+        }
+      ],
+      "pick": "Separate tables in logical-shard schemas such as schema001.block."
+    }
+  ],
+  "roles": [
+    {
+      "id": "client",
+      "label": "Application",
+      "description": "Handles requests from users and decides where each workspace's data lives."
+    },
+    {
+      "id": "edge",
+      "label": "Routing in application code",
+      "description": "Turns a workspace ID into a physical database and then a logical schema."
+    },
+    {
+      "id": "data",
+      "label": "Postgres databases",
+      "description": "The old monolith, and the 32 physical databases that hold 480 logical shards."
+    },
+    {
+      "id": "async",
+      "label": "Audit log, backfill and checks",
+      "description": "Background work: replaying changes, copying old data and comparing the two sides."
+    }
+  ],
+  "quiz": [
+    {
+      "question": "While double-writing to the new databases, Notion chose an audit log with a catch-up script over logical replication. What reason does the post give?",
+      "options": [
+        "Logical replication could not keep up with the write volume on the block table during the initial snapshot",
+        "Logical replication does not work on a table that has foreign keys to other tables in the same database",
+        "The audit log let the final switch-over skip verification, because every change was already recorded twice",
+        "Postgres had removed logical replication from the version Notion was running then, so it was unavailable"
+      ],
+      "answer": 0,
+      "explanation": "The post says the audit log was chosen because logical replication could not keep up with the block table's write volume during the initial snapshot, and adds that sharding earlier would have allowed logical replication. Nothing in the post says foreign keys prevented it. The audit log did not remove the need for verification, which used sampling and dark reads. The post does not claim logical replication was unavailable."
+    },
+    {
+      "question": "Why does Notion's post say a workspace's queries mostly stay within one shard?",
+      "options": [
+        "Each logical shard keeps its own copy of every user's account and of the pages that user opened recently",
+        "A routing table sends all of one user's requests to the same host, whichever workspace they are working in",
+        "Every block belongs to exactly one workspace, and the partition key is the workspace ID",
+        "Postgres native partitioning places the rows of related tables next to each other on the same physical disk"
+      ],
+      "answer": 2,
+      "explanation": "The partition key is the workspace ID, and each block belongs to exactly one workspace, which keeps most queries within a single shard. The post rejects a routing table in favour of routing in application code, and it chose separate tables in separate schemas over native partitioning. It does not describe a per-user copy."
+    },
+    {
+      "question": "Notion chose 480 logical shards for 32 physical databases. What reason does the post give for that number?",
+      "options": [
+        "It matches the number of workspaces that existed in the system when the migration was planned, rounded up",
+        "It is the largest number of schemas that Postgres allows inside one physical database, so Notion used it all",
+        "It was the smallest number of shards that keeps every table under the 500 GB limit at the two-year projection",
+        "It divides evenly in many ways, so hosts can be added in even steps, such as 32 to 40 to 48"
+      ],
+      "answer": 3,
+      "explanation": "The post says it picked 480 for its divisibility: 15 logical shards on each of 32 databases now, and even steps to 40 or 48 databases later. The post does not tie the number to the count of workspaces or to a Postgres limit on schemas. The 500 GB figure is a limit on any one table that the layout has to respect, not the way 480 was derived."
+    }
+  ],
+  "sources": [
+    {
+      "title": "Herding elephants: Lessons learned from sharding Postgres at Notion",
+      "publisher": "Notion, Garrett Fidalgo",
+      "year": 2021,
+      "url": "https://www.notion.com/blog/sharding-postgres-at-notion"
+    }
+  ]
+}
