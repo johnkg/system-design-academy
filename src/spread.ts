@@ -3,7 +3,7 @@
 // This nudges boxes apart (and makes the stage taller when there is no room sideways) without changing their order.
 
 export interface Wanted { fx: number; fy: number; w: number; h: number } // fractions (0 to 1) of the stage; size in px
-export interface Placed { x: number; y: number } // centre of the box, in px
+interface Placed { x: number; y: number } // centre of the box, in px
 export interface Options {
   pad: number; // clear space kept between two boxes, px
   top: number; // clear space kept above the first row, px (room for an arrow that comes into a box from above)

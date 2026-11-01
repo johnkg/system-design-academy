@@ -218,7 +218,7 @@ function claims(text) {
     const decimals = raw.includes('.') ? raw.split('.')[1].length : 0;
     if (!Number.isFinite(value) || (!decimals && value < MIN_PLAIN)) continue;
     if (!decimals && value >= 1990 && value <= 2100) continue; // a year
-    out.push({ raw: m[0], value, decimals, approx: APPROX_WORDS.test(text.slice(Math.max(0, m.index - 14), m.index)), at: m.index });
+    out.push({ raw: m[0].replace(/,$/, ''), value, decimals, approx: APPROX_WORDS.test(text.slice(Math.max(0, m.index - 14), m.index)), at: m.index });
   }
   return out;
 }

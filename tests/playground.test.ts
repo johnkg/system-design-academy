@@ -1,10 +1,10 @@
 import { test, beforeEach, afterEach } from 'node:test';
 import assert from 'node:assert/strict';
-import { fmt, mulberry32, numberValue, prefersReducedMotion, query, wait, watchVisibility } from '../src/playground.ts';
+import { clamp, createTicker, formatOneDecimalBelow100, formatThousands, formatWholeNumber, mulberry32, numberValue, prefersReducedMotion, query, wait, watchVisibility } from '../src/playground.ts';
 
 const g = globalThis as any;
 const saved: Record<string, unknown> = {};
-beforeEach(() => { for (const k of ['matchMedia', 'IntersectionObserver', 'document']) saved[k] = g[k]; });
+beforeEach(() => { for (const k of ['matchMedia', 'IntersectionObserver', 'document', 'window']) saved[k] = g[k]; });
 afterEach(() => { for (const k of Object.keys(saved)) { if (saved[k] === undefined) delete g[k]; else g[k] = saved[k]; } });
 
 const fakeRoot = (map: Record<string, any>) => ({ querySelector: (s: string) => map[s] ?? null }) as any;
@@ -22,11 +22,11 @@ test('numberValue reads a control as a number', () => {
   assert.equal(val('[data-empty]'), 0);
 });
 
-test('fmt rounds and uses en-US thousands separators whatever the locale', () => {
-  assert.equal(fmt(1234567.6), '1,234,568');
-  assert.equal(fmt(0.4), '0');
-  assert.equal(fmt(-1500), '-1,500');
-  assert.equal(fmt(999), '999');
+test('formatWholeNumber rounds and uses en-US thousands separators whatever the locale', () => {
+  assert.equal(formatWholeNumber(1234567.6), '1,234,568');
+  assert.equal(formatWholeNumber(0.4), '0');
+  assert.equal(formatWholeNumber(-1500), '-1,500');
+  assert.equal(formatWholeNumber(999), '999');
 });
 
 test('prefersReducedMotion follows the media query', () => {
@@ -85,4 +85,47 @@ test('mulberry32 replays the same sequence for a seed and stays inside [0, 1)', 
 test('mulberry32 gives the reference values the simulations were tuned against', () => {
   // Pinned from the copies this function replaced; a change here shifts every number quoted in the lesson text.
   assert.deepEqual(Array.from({ length: 3 }, mulberry32(1)).map((x) => x.toFixed(6)), ['0.627074', '0.002736', '0.527447']);
+});
+
+test('formatThousands adds separators and leaves decimals alone', () => {
+  assert.equal(formatThousands(1234567), '1,234,567');
+  assert.equal(formatThousands(1234.5), '1,234.5');
+});
+
+test('formatOneDecimalBelow100 keeps one decimal below 100 and rounds from 100 up', () => {
+  assert.equal(formatOneDecimalBelow100(42.37), '42.4');
+  assert.equal(formatOneDecimalBelow100(99.94), '99.9');
+  assert.equal(formatOneDecimalBelow100(100.4), '100');
+  assert.equal(formatOneDecimalBelow100(1234.6), '1,235');
+});
+
+test('clamp keeps a value inside its bounds', () => {
+  assert.equal(clamp(5, 0, 10), 5);
+  assert.equal(clamp(-3, 0, 10), 0);
+  assert.equal(clamp(42, 0, 10), 10);
+});
+
+test('createTicker ticks only while wanted, on screen and in a visible tab', () => {
+  const timers = new Map<number, () => void>(); let nextId = 1;
+  let onScreenCallback: (on: boolean) => void = () => {};
+  const visibilityListeners: (() => void)[] = [];
+  g.window = { setInterval: (fn: () => void) => { timers.set(nextId, fn); return nextId++; }, clearInterval: (id: number) => { timers.delete(id); } };
+  g.document = { hidden: false, addEventListener: (_: string, fn: () => void) => visibilityListeners.push(fn) };
+  g.IntersectionObserver = class { constructor(cb: (e: { isIntersecting: boolean }[]) => void) { onScreenCallback = (on) => cb([{ isIntersecting: on }]); } observe() {} };
+  const ticker = createTicker({} as Element, () => {}, 100);
+  assert.equal(timers.size, 0, 'idle until wanted');
+  ticker.setWanted(true);
+  assert.equal(timers.size, 1);
+  ticker.setWanted(true);
+  assert.equal(timers.size, 1, 'asking twice never doubles the timer');
+  onScreenCallback(false);
+  assert.equal(timers.size, 0, 'paused when scrolled away');
+  onScreenCallback(true);
+  assert.equal(timers.size, 1, 'resumes when scrolled back');
+  g.document.hidden = true; visibilityListeners.forEach((fn) => fn());
+  assert.equal(timers.size, 0, 'paused in a hidden tab');
+  g.document.hidden = false; visibilityListeners.forEach((fn) => fn());
+  assert.equal(timers.size, 1);
+  ticker.setWanted(false);
+  assert.equal(timers.size, 0, 'stopped when no longer wanted');
 });

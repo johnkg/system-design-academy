@@ -16,5 +16,4 @@ export const areas = [
   { id: 'patterns', label: 'Design patterns', blurb: 'The 23 classic Gang of Four patterns for structuring code' },
 ] as const;
 
-export type AreaId = (typeof areas)[number]['id'];
 export const areaLabel = (id: string) => areas.find((a) => a.id === id)?.label ?? id;

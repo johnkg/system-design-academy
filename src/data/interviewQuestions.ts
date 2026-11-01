@@ -3,7 +3,7 @@
 export type QuestionKind = 'concept' | 'design' | 'tradeoff';
 export type QuestionLevel = 'beginner' | 'intermediate' | 'advanced';
 export interface ReadLink { kind: 'concept' | 'study'; slug: string }
-export interface InterviewQuestion {
+interface InterviewQuestion {
   id: string;
   kind: QuestionKind;
   level: QuestionLevel;

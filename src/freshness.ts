@@ -3,7 +3,7 @@
 // pages that use them simply show less, so a build never fails because of it.
 import { execFileSync } from 'node:child_process';
 
-export interface Dates { added: Map<string, string>; updated: Map<string, string> }
+interface Dates { added: Map<string, string>; updated: Map<string, string> }
 let cache: Dates | null = null;
 
 function parse(log: string, keepFirst: boolean) {

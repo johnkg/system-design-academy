@@ -1,3 +1,4 @@
+import type { AstroComponentFactory } from 'astro/runtime/server/index.js';
 import { languages } from './languages.config';
 
 type RawModules = Record<string, string>;
@@ -42,7 +43,7 @@ export function getVisual<T>(slug: string, name: string, collection: Collection 
 
 // A concept or pattern may ship an interactive simulation at src/playgrounds/<Name>Playground.astro,
 // matched by its display name ignoring case, spaces and punctuation (scripts/check-content.mjs uses the same rule).
-const playgrounds = import.meta.glob('/src/playgrounds/*.astro', { eager: true }) as Record<string, { default: any }>;
+const playgrounds = import.meta.glob('/src/playgrounds/*.astro', { eager: true }) as Record<string, { default: AstroComponentFactory }>;
 export const playgroundFor = (name: string) => {
   const want = `/${name.replace(/[^a-z0-9]+/gi, '')}playground.astro`.toLowerCase();
   return Object.entries(playgrounds).find(([p]) => p.toLowerCase().endsWith(want))?.[1].default;

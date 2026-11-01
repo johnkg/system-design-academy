@@ -2,8 +2,8 @@ import { defineCollection, z } from 'astro:content';
 import { glob } from 'astro/loaders';
 
 // Self-check shown at the end of a page: scenario questions with one best answer each.
-export const QUIZ_QUESTIONS = 3; // per page
-export const QUIZ_OPTIONS = 4; // per question
+const QUIZ_QUESTIONS = 3; // per page
+const QUIZ_OPTIONS = 4; // per question
 const quizSchema = z.array(z.object({
   question: z.string(),
   options: z.array(z.string()).length(QUIZ_OPTIONS),
