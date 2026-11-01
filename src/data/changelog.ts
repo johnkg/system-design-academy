@@ -3,6 +3,13 @@ export interface Change { date: string; title: string; items: { text: string; hr
 
 export const changelog: Change[] = [
   {
+    date: '2026-11-01',
+    title: 'Five more case studies from famous systems',
+    items: [
+      { text: 'How Amazon built Dynamo (always-writable shopping carts, sloppy quorums, hinted handoff, vector clocks), how Google built Spanner (TrueTime and commit wait) and Bigtable (tablets, memtables and SSTables), how Stripe scales its API with four kinds of rate limiter, and how Facebook built TAO. Each is built only from the original paper or post, which is listed at the end, and has a diagram that grows step by step, an animation and code in three languages.', href: 'case-studies/' },
+    ],
+  },
+  {
     date: '2026-10-31',
     title: 'Interview questions, readings under the animations and tidier how-to steps',
     items: [

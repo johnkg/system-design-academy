@@ -1,0 +1,422 @@
+{
+  "name": "How Google Built Bigtable",
+  "difficulty": "advanced",
+  "intent": "Follow the design in Google's 2006 Bigtable paper for a storage system that holds petabytes across thousands of machines: a sorted sparse table split into tablets, found through a three-level lookup, written through a log and memtable, and kept alive with Chubby, using only what the paper says.",
+  "codeTitle": "a tablet with a commit log, memtable, SSTables and Bloom filters",
+  "finalIntro": "One write and one read through a tablet server, then a crash and the recovery from the log.",
+  "prompt": "The 2006 paper 'Bigtable: A Distributed Storage System for Structured Data' says Google needed to store structured data at very large scale, petabytes of data across thousands of commodity servers, for products as different as web indexing, Google Earth and Google Finance. More than sixty products used Bigtable when the paper was written, with workloads that ranged from throughput-oriented batch jobs to latency-sensitive serving. How would you build a store that grows by adding machines, lets each product choose how its data is laid out, finds the right machine for a row without a bottleneck, and survives machine failures? This study follows the paper, which is listed at the end. The simulation and the code samples are small models for learning, not Google's code or data.",
+  "functional": [
+    "Store rows of data, each with columns that can differ from row to row, and keep several timestamped versions of a cell",
+    "Read and write one row atomically, and scan a range of rows in order",
+    "Grow automatically as tables grow, spreading the data over more machines",
+    "Let applications place related rows next to each other through their choice of row key",
+    "Work as input and output for batch jobs such as MapReduce as well as for serving traffic"
+  ],
+  "nonFunctional": [
+    "Scale described in the paper: petabytes of data and thousands of machines, with clusters from a handful to thousands of servers",
+    "Reads of short row ranges should touch only a few machines",
+    "The master must not be a bottleneck: the paper says most clients never talk to it",
+    "Machines fail often, so a failed tablet server's work must move to others quickly and without losing committed writes",
+    "A simple data model: the paper says Bigtable does not support general transactions across row keys"
+  ],
+  "firstAttempt": {
+    "text": "This study's starting point, not something the paper says about Google's history: each product keeps its data in its own relational database, split by hand across a few servers, with a copy of each for failover. A query goes to the server the application picks.",
+    "limits": [
+      "The paper notes that parallel databases offer a lot of what Bigtable does, but Bigtable chose a different interface, a simple data model that gives clients dynamic control over layout and format",
+      "Splitting a database by hand means the application must know which server holds which rows, and growing means moving data by hand",
+      "Rows with different sets of columns, such as the many different incoming links of a web page, fit poorly in a fixed relational schema",
+      "Each team would run its own storage, instead of sharing one system for more than sixty products"
+    ]
+  },
+  "nodes": [
+    {
+      "id": "client",
+      "label": "Application",
+      "kind": "client",
+      "x": 8,
+      "y": 50
+    },
+    {
+      "id": "db",
+      "label": "Hand-sharded relational databases",
+      "kind": "data",
+      "x": 80,
+      "y": 50,
+      "until": 1
+    },
+    {
+      "id": "ts1",
+      "label": "Tablet server 1",
+      "kind": "compute",
+      "x": 72,
+      "y": 16,
+      "at": 1
+    },
+    {
+      "id": "ts2",
+      "label": "Tablet server 2",
+      "kind": "compute",
+      "x": 72,
+      "y": 84,
+      "at": 1
+    },
+    {
+      "id": "gfs",
+      "label": "GFS (log and SSTable files)",
+      "kind": "data",
+      "x": 92,
+      "y": 50,
+      "at": 1
+    },
+    {
+      "id": "master",
+      "label": "Master",
+      "kind": "compute",
+      "x": 34,
+      "y": 84,
+      "at": 2
+    },
+    {
+      "id": "meta",
+      "label": "Chubby and METADATA tablets",
+      "kind": "data",
+      "x": 34,
+      "y": 16,
+      "at": 3
+    },
+    {
+      "id": "log",
+      "label": "Commit log and memtable",
+      "kind": "async",
+      "x": 50,
+      "y": 50,
+      "at": 4
+    }
+  ],
+  "edges": [
+    {
+      "from": "client",
+      "to": "db",
+      "until": 1
+    },
+    {
+      "from": "client",
+      "to": "ts1",
+      "at": 1
+    },
+    {
+      "from": "client",
+      "to": "ts2",
+      "at": 1
+    },
+    {
+      "from": "ts1",
+      "to": "gfs",
+      "at": 1
+    },
+    {
+      "from": "ts2",
+      "to": "gfs",
+      "at": 1
+    },
+    {
+      "from": "master",
+      "to": "ts1",
+      "at": 2
+    },
+    {
+      "from": "master",
+      "to": "ts2",
+      "at": 2
+    },
+    {
+      "from": "client",
+      "to": "meta",
+      "at": 3
+    },
+    {
+      "from": "master",
+      "to": "meta",
+      "at": 3
+    },
+    {
+      "from": "ts1",
+      "to": "log",
+      "at": 4
+    },
+    {
+      "from": "log",
+      "to": "gfs",
+      "at": 4
+    }
+  ],
+  "steps": [
+    {
+      "title": "Use a sorted, sparse table keyed by row",
+      "problem": "Different products need different shapes of data, and a fixed schema or a plain hash map does not fit all of them.",
+      "fix": "The paper describes Bigtable as a sparse, distributed, persistent, multi-dimensional sorted map. It maps a row key, a column key and a timestamp to a value that is an uninterpreted array of bytes. Row keys are arbitrary strings, up to 64 KB in size though 10 to 100 bytes is typical, and every read or write under one row key is atomic regardless of how many columns it touches. Data is kept in lexicographic order by row key, so applications choose keys to get locality: Webtable stores a page under the key with the host name reversed, so maps.google.com/index.html becomes com.google.maps/index.html and pages of one domain sit in neighbouring rows. Columns are grouped into column families, and each cell can hold several versions indexed by 64-bit timestamps, newest first.",
+      "tradeoff": "The model is simple and fast to distribute, but the atomic unit is a single row. The paper says Bigtable does not support general transactions across row keys, only single-row transactions and a way to batch writes across keys on the client side.",
+      "concepts": [
+        {
+          "slug": "sql-vs-nosql"
+        },
+        {
+          "slug": "database-sharding"
+        },
+        {
+          "slug": "ordering-and-partitioning"
+        }
+      ]
+    },
+    {
+      "title": "Split the table into tablets and give them to tablet servers",
+      "problem": "A table can grow past what any one machine holds, and adding machines should not need manual work.",
+      "fix": "A table is divided by row ranges into tablets, the unit of distribution and load balancing. A new table starts with one tablet and splits automatically as it grows, to about 100 to 200 MB each by default. A Bigtable cluster has a library linked into every client, one master and many tablet servers; the paper says each tablet server holds typically between ten and a thousand tablets. The tablet servers handle reads and writes and split tablets that grow too large. The master assigns tablets to servers, notices when servers join or die, balances load, collects garbage files and handles schema changes. Client data does not pass through the master, so it stays lightly loaded.",
+      "tradeoff": "A single master is simple to reason about but would be a risk if it sat in the data path. Keeping it out of reads and writes is what makes it safe to have only one.",
+      "concepts": [
+        {
+          "slug": "database-sharding"
+        },
+        {
+          "slug": "horizontal-vs-vertical-scaling"
+        },
+        {
+          "slug": "autoscaling"
+        }
+      ]
+    },
+    {
+      "title": "Find a tablet with a three-level lookup and a lock service",
+      "problem": "With thousands of tablets that move, clients need to find the right server without asking one central node every time.",
+      "fix": "Bigtable stores tablet locations in a special table called METADATA, using a three-level scheme like a B+ tree. A file in Chubby holds the location of the root tablet, the first METADATA tablet. The root tablet holds the locations of all other METADATA tablets, and each METADATA tablet holds the locations of a set of user tablets. A METADATA row's key encodes the table identifier and the tablet's end row. With 128 MB METADATA tablets the paper counts that this addresses 2^34 tablets. Clients cache locations, read ahead several entries at once, and go back up the hierarchy only when a cached location turns out to be wrong. Chubby is a distributed lock service with five replicas, and Bigtable uses it to elect the single master, to discover tablet servers, to store the root location and the schema information, and to hold access control lists.",
+      "tradeoff": "A cached location can be stale, which costs a retry. The bigger risk is Chubby: the paper says that if it is unavailable for long, Bigtable is unavailable. In 14 clusters the share of server hours during which some data was unavailable because of Chubby was 0.0047% on average and 0.0326% in the worst cluster.",
+      "concepts": [
+        {
+          "slug": "service-discovery"
+        },
+        {
+          "slug": "leader-election"
+        },
+        {
+          "slug": "leases-and-fencing-tokens"
+        },
+        {
+          "slug": "caching"
+        }
+      ]
+    },
+    {
+      "title": "Write to a log and a memtable, and read from a merged view",
+      "problem": "Random writes to a sorted file on disk would be slow, and a crash must not lose a write that was acknowledged.",
+      "fix": "A tablet's data is held in GFS. A write is checked, appended to a commit log that holds redo records (with group commit to speed up many small writes), and then put in an in-memory sorted buffer called the memtable. A read is executed on a merged view of the memtable and the SSTables, which are immutable sorted files; both are sorted, so the merge is cheap. When the memtable reaches a size threshold, it is frozen and written out as a new SSTable, which the paper calls a minor compaction. To keep the number of files bounded a merging compaction combines several, and a major compaction rewrites all SSTables into one with no deleted data. Deletions are written as special markers that hide older data until a major compaction removes both. To avoid a log file per tablet, a tablet server keeps a single commit log for all its tablets.",
+      "tradeoff": "Writes are fast because they are sequential, and reads may have to check several files. The paper's refinements reduce that: locality groups put column families read together in separate SSTables, and Bloom filters let a server ask whether an SSTable might hold a row and column, so most lookups for rows that do not exist need no disk read.",
+      "concepts": [
+        {
+          "slug": "lsm-trees-vs-b-trees"
+        },
+        {
+          "slug": "write-ahead-log"
+        },
+        {
+          "slug": "probabilistic-data-structures"
+        }
+      ]
+    },
+    {
+      "title": "Recover by moving tablets and replaying the log",
+      "problem": "With thousands of commodity servers, some fail every day. Their tablets must be served again quickly and without losing acknowledged writes.",
+      "fix": "Each tablet server takes an exclusive lock on a uniquely named file in a Chubby directory when it starts, and the master watches that directory. If a server loses its Chubby session, or its lock, the master checks the lock, and if the file can be locked by the master it knows the server is dead or cut off, so it deletes the file and moves the tablets to the pool of unassigned tablets for other servers. A server that takes over a tablet reads its metadata from METADATA, which lists the SSTables and redo points, loads the SSTable indexes and rebuilds the memtable by replaying the commit log from the redo point. Because the single log mixes many tablets, the log entries are sorted by table, row and sequence number first, so each new server reads only the entries it needs. If the master's own Chubby session expires, it kills itself, and a new master takes the master lock, scans the servers directory, asks each server what it serves, and scans METADATA for unassigned tablets.",
+      "tradeoff": "Recovery depends on Chubby and GFS, which are separate systems. The design pushes the hard problems of consensus and replicated files into them so Bigtable itself can stay simple.",
+      "concepts": [
+        {
+          "slug": "failure-detection"
+        },
+        {
+          "slug": "leader-election"
+        },
+        {
+          "slug": "write-ahead-log"
+        },
+        {
+          "slug": "leases-and-fencing-tokens"
+        }
+      ]
+    }
+  ],
+  "failures": [
+    {
+      "scenario": "A tablet server crashes with writes in its memtable",
+      "impact": "The memtable was only in memory, so acknowledged writes seem to be gone.",
+      "answer": "Every write went to the commit log in GFS before the memtable, so the tablet's new server rebuilds the memtable by replaying the log from the redo point.",
+      "concepts": [
+        {
+          "slug": "write-ahead-log"
+        }
+      ]
+    },
+    {
+      "scenario": "The master dies",
+      "impact": "Nobody is assigning tablets to servers.",
+      "answer": "Clients do not need the master for reads and writes, so serving continues. A new master takes the master lock in Chubby and rebuilds its view by asking tablet servers and scanning METADATA.",
+      "concepts": [
+        {
+          "slug": "leader-election"
+        },
+        {
+          "slug": "service-discovery"
+        }
+      ]
+    },
+    {
+      "scenario": "Chubby is unavailable for a long time",
+      "impact": "Bigtable cannot find tablets or elect masters, so it becomes unavailable.",
+      "answer": "The paper accepts this dependency and measured it as a small share of server hours, 0.0047% on average across 14 clusters.",
+      "concepts": [
+        {
+          "slug": "multi-region-failover"
+        },
+        {
+          "slug": "graceful-degradation"
+        }
+      ]
+    },
+    {
+      "scenario": "A client's cached tablet location is wrong because the tablet moved",
+      "impact": "The request goes to a server that no longer holds the row.",
+      "answer": "The client detects the miss and goes back up the lookup hierarchy to METADATA, and the stale entry is replaced.",
+      "concepts": [
+        {
+          "slug": "caching"
+        },
+        {
+          "slug": "retries-and-backoff"
+        }
+      ]
+    },
+    {
+      "scenario": "Reads for rows that do not exist keep hitting disk",
+      "impact": "Each SSTable in the tablet must be checked, so a missing row costs several disk reads.",
+      "answer": "Bloom filters on SSTables answer whether a row and column might be there, so most lookups for missing rows do not touch disk.",
+      "concepts": [
+        {
+          "slug": "probabilistic-data-structures"
+        }
+      ]
+    }
+  ],
+  "alternatives": [
+    {
+      "title": "How clients find a tablet",
+      "options": [
+        {
+          "name": "Ask the master every time",
+          "pro": "Simple and always current",
+          "con": "The master becomes a bottleneck and a single point of failure"
+        },
+        {
+          "name": "A table of locations that clients cache",
+          "pro": "The master is out of the read path, and stale entries are found when used",
+          "con": "A retry on a stale location, and a lookup hierarchy to run"
+        }
+      ],
+      "pick": "A three-level location table with client caches, as the paper does."
+    },
+    {
+      "title": "One log per tablet or one per server",
+      "options": [
+        {
+          "name": "A log per tablet",
+          "pro": "Recovery of one tablet reads only its own log",
+          "con": "Many files written at once cause many disk seeks, and smaller groups for group commit"
+        },
+        {
+          "name": "One log per tablet server",
+          "pro": "Better performance in normal operation",
+          "con": "Recovery must sort the log so each tablet reads only its own entries"
+        }
+      ],
+      "pick": "One log per tablet server, with a sorted log at recovery, as the paper does."
+    },
+    {
+      "title": "Where to keep the cluster's coordination state",
+      "options": [
+        {
+          "name": "Build it into the master",
+          "pro": "One less system",
+          "con": "The master has to solve consensus and failure of its own state"
+        },
+        {
+          "name": "Use a lock service (Chubby)",
+          "pro": "Locks, leases and small files with replication already solved",
+          "con": "If it is down for long, Bigtable is down"
+        }
+      ],
+      "pick": "A lock service, as the paper does."
+    }
+  ],
+  "roles": [
+    {
+      "id": "client",
+      "label": "Application",
+      "description": "Looks up a tablet's location, then talks directly to the tablet server for reads and writes."
+    },
+    {
+      "id": "compute",
+      "label": "Tablet servers and master",
+      "description": "Tablet servers serve and split tablets; the master assigns them and reacts to failures."
+    },
+    {
+      "id": "data",
+      "label": "Chubby, METADATA and GFS",
+      "description": "Chubby holds locks and the root location, METADATA holds tablet locations, GFS stores logs and SSTables."
+    },
+    {
+      "id": "async",
+      "label": "Log and memtable",
+      "description": "The commit log and sorted in-memory buffer that sit in front of the SSTables."
+    }
+  ],
+  "quiz": [
+    {
+      "question": "A tablet server crashes. Its memtable held writes that were not yet written to an SSTable. How are they recovered?",
+      "options": [
+        "They are lost, since the memtable was only in memory",
+        "The new server replays the commit log in GFS from the tablet's redo point",
+        "The master asks the client to send the writes again",
+        "The new server copies the memtable from the failed server's memory"
+      ],
+      "answer": 1,
+      "explanation": "Every write is appended to the commit log before it goes into the memtable, so the log holds everything the memtable held. The redo point marks where the SSTables already cover older writes. The writes were acknowledged, so losing them would break durability. Clients do not keep them. A dead server's memory cannot be copied."
+    },
+    {
+      "question": "How does a client find the tablet server for a row, without sending every request to the master?",
+      "options": [
+        "It broadcasts the row key to every tablet server",
+        "It asks the master, which keeps all locations in memory",
+        "It hashes the row key to a server number",
+        "It starts at a Chubby file with the root tablet's location, follows METADATA tablets to the user tablet, and caches the result"
+      ],
+      "answer": 3,
+      "explanation": "The three-level hierarchy keeps locations in a table that is itself split into tablets, and client caches mean most requests need no lookup at all. Broadcasting would not scale. Asking the master each time makes it a bottleneck. A hash would break range scans and the splitting of tablets by row range."
+    },
+    {
+      "question": "Why does Webtable store maps.google.com/index.html under the row key com.google.maps/index.html?",
+      "options": [
+        "So that pages of the same domain sort next to each other and a scan of a domain touches few tablets",
+        "So that the key is shorter, saving space in the SSTable index",
+        "Because Bigtable requires keys in reverse order",
+        "So that newer pages sort before older pages"
+      ],
+      "answer": 0,
+      "explanation": "Bigtable keeps rows sorted by key, so reversing the host name groups all pages of a domain together, which makes scans over a domain efficient. Shorter keys is not the effect. Bigtable has no reverse-order requirement. Page age is handled by timestamps within a cell, not by the row key."
+    }
+  ],
+  "sources": [
+    {
+      "title": "Bigtable: A Distributed Storage System for Structured Data",
+      "publisher": "Google Research (OSDI 2006)",
+      "year": 2006,
+      "url": "https://research.google/pubs/bigtable-a-distributed-storage-system-for-structured-data/"
+    }
+  ]
+}

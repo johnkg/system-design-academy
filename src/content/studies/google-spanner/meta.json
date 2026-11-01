@@ -1,0 +1,416 @@
+{
+  "name": "How Google Built Spanner",
+  "difficulty": "advanced",
+  "intent": "Follow the design Google describes in its Spanner paper for a database that is replicated around the world and still gives transactions a single global order, built on Paxos groups, two-phase commit and TrueTime, using only what the paper says.",
+  "codeTitle": "TrueTime intervals, commit wait and lock-free snapshot reads",
+  "finalIntro": "One write that spans two groups, the wait that makes its timestamp safe, and a read in the past that takes no locks.",
+  "prompt": "Google's advertising backend, called F1, ran on a MySQL database that was manually sharded many ways. The Spanner paper says the data was tens of terabytes, each customer and all of their data lived in a fixed shard, and the last resharding took over two years of intense effort and coordination across dozens of teams. Failover with MySQL master-slave replication was difficult and risked data loss and downtime, and some data had been moved to Bigtable, which gave up transactions across all data. How would you build a database that spreads data over many machines and data centers on several continents, fails over by itself, keeps full transactions, and still lets two clients in different places agree on which write came first? This study follows the paper 'Spanner: Google's Globally-Distributed Database', which is listed at the end. The simulation and the code samples are small models for learning, not Google's code or data.",
+  "functional": [
+    "Read and write rows in tables with a schema and run transactions that touch rows in different places",
+    "Replicate data synchronously across data centers and fail over automatically",
+    "Let the application choose how many replicas a piece of data has and where they are",
+    "Move data between machines to balance load without stopping clients",
+    "Read a consistent view of the database without blocking writers, and change the schema without taking the database offline"
+  ],
+  "nonFunctional": [
+    "Strong guarantees: the paper says Spanner provides externally consistent transactions, which means that if one transaction finishes before another starts, the order every reader sees matches that order",
+    "Scale described in the paper's design goals: millions of machines in hundreds of data centers and trillions of rows",
+    "Survive the loss of one or two data centers: the paper says most applications replicate across 3 to 5 data centers in a region, and F1 used five replicas across the United States",
+    "Reads should be cheap: most traffic reads, and the paper treats read-only work without locks as a main feature",
+    "No manual resharding, because the F1 team's experience with it was costly"
+  ],
+  "firstAttempt": {
+    "text": "This is the F1 team's starting point as the paper tells it. All of a customer's data lives in one MySQL shard, chosen by the application. Each shard has a master with a replica that copies it asynchronously. Queries and indexes work inside a customer. When a shard gets too big, a team reshards by hand, and data that does not fit is put in external Bigtables.",
+    "limits": [
+      "The paper says resharding the revenue-critical database took over two years of effort the last time and was too complex to do regularly",
+      "Application code needed to know how data was sharded",
+      "Failover with master-slave replication was difficult and risked data loss and downtime",
+      "Putting data in Bigtable to relieve MySQL meant giving up transactions and queries across all the data",
+      "Bigtable itself, the paper says, was hard to use for applications with complex, changing schemas or those that need strong consistency across data centers"
+    ]
+  },
+  "nodes": [
+    {
+      "id": "app",
+      "label": "Application (F1)",
+      "kind": "client",
+      "x": 8,
+      "y": 50
+    },
+    {
+      "id": "mysql",
+      "label": "Manually sharded MySQL",
+      "kind": "data",
+      "x": 80,
+      "y": 50,
+      "until": 1
+    },
+    {
+      "id": "leader",
+      "label": "Paxos leader, group 1",
+      "kind": "compute",
+      "x": 34,
+      "y": 50,
+      "at": 1
+    },
+    {
+      "id": "r1",
+      "label": "Replica in zone 2",
+      "kind": "data",
+      "x": 72,
+      "y": 16,
+      "at": 1
+    },
+    {
+      "id": "r2",
+      "label": "Replica in zone 3",
+      "kind": "data",
+      "x": 72,
+      "y": 84,
+      "at": 1
+    },
+    {
+      "id": "g2",
+      "label": "Paxos leader, group 2",
+      "kind": "compute",
+      "x": 92,
+      "y": 50,
+      "at": 2
+    },
+    {
+      "id": "tt",
+      "label": "TrueTime (GPS and atomic clocks)",
+      "kind": "edge",
+      "x": 34,
+      "y": 16,
+      "at": 3
+    },
+    {
+      "id": "snap",
+      "label": "Snapshot read",
+      "kind": "client",
+      "x": 8,
+      "y": 84,
+      "at": 5
+    }
+  ],
+  "edges": [
+    {
+      "from": "app",
+      "to": "mysql",
+      "until": 1
+    },
+    {
+      "from": "app",
+      "to": "leader",
+      "at": 1
+    },
+    {
+      "from": "leader",
+      "to": "r1",
+      "at": 1
+    },
+    {
+      "from": "leader",
+      "to": "r2",
+      "at": 1
+    },
+    {
+      "from": "leader",
+      "to": "g2",
+      "at": 2
+    },
+    {
+      "from": "leader",
+      "to": "tt",
+      "at": 3
+    },
+    {
+      "from": "snap",
+      "to": "r1",
+      "at": 5
+    },
+    {
+      "from": "snap",
+      "to": "r2",
+      "at": 5
+    }
+  ],
+  "steps": [
+    {
+      "title": "Split data into groups and replicate each group with Paxos",
+      "problem": "Manual shards need people to move data, and an asynchronous copy can lose writes when the master fails.",
+      "fix": "Spanner is organised as zones, and each zone has between one hundred and several thousand spanservers that serve data. Data is split into tablets, and each tablet is replicated by a Paxos state machine on spanservers in different zones. The replicas of one tablet make a Paxos group. A group has a long-lived leader that holds a time-based lease, 10 seconds by default. Writes start at the leader and are chosen by majority, while reads can be served by any replica that is up to date. Keys are bucketed into directories, sets of contiguous keys that share a prefix. A directory is the unit of data placement and of movement between groups, and the paper says it can be moved while client operations go on. The application chooses the replication of each directory, such as how many replicas and in which regions.",
+      "tradeoff": "Replication by majority vote means a write waits for a reply from replicas in other zones, so write latency depends on the distance to them. The paper says most applications therefore replicate within one region and choose lower latency over surviving more failures.",
+      "concepts": [
+        {
+          "slug": "consensus"
+        },
+        {
+          "slug": "database-replication"
+        },
+        {
+          "slug": "leader-election"
+        },
+        {
+          "slug": "leases-and-fencing-tokens"
+        }
+      ]
+    },
+    {
+      "title": "Run transactions across groups with two-phase locking and two-phase commit",
+      "problem": "A transaction can touch rows in several groups. Without coordination, one group could commit and another fail.",
+      "fix": "Each group leader keeps a lock table for two-phase locking, so a read-write transaction takes locks, does its work and holds them until it commits. If a transaction touches only one Paxos group, which the paper says is the case for most transactions, the leader commits it with Paxos alone. If it spans groups, the leaders run two-phase commit: one group's leader is the coordinator, the others are participants, they each log a prepare, and the coordinator logs the commit decision. The state of each transaction manager is stored in its Paxos group, so a leader failure does not leave a transaction stuck. The paper answers the claim that general two-phase commit is too expensive by saying it is better for programmers to deal with performance problems than to code around a lack of transactions, and that two-phase commit over Paxos mitigates its availability problems.",
+      "tradeoff": "A cross-group commit needs extra message rounds and holds locks longer. The paper's tests ran two-phase commit across 3 zones with 25 spanservers each and found it scales to about 50 participants in both the mean and the 99th percentile latency, and gets noticeably slower at 100.",
+      "concepts": [
+        {
+          "slug": "two-phase-commit"
+        },
+        {
+          "slug": "mvcc-and-isolation-levels"
+        },
+        {
+          "slug": "consensus"
+        }
+      ]
+    },
+    {
+      "title": "Make clock error a number that the database can see",
+      "problem": "To order transactions across the planet by time, every machine would need the same time, and real clocks drift. A timestamp from a clock that is a few milliseconds behind could place a later transaction before an earlier one.",
+      "fix": "Spanner's TrueTime API does not return a single time. TT.now() returns an interval, with an earliest and a latest end, and guarantees that the true time of the call is inside it. The paper adds TT.after(t) and TT.before(t). The time comes from GPS receivers and atomic clocks, which fail in different ways, so each data center has time master machines and each machine runs a daemon that polls several masters. The daemon advertises uncertainty that grows between polls: in production it varies as a sawtooth from about 1 to 7 ms, so it is about 4 ms most of the time, and the paper says it is generally under 10 ms. The poll interval is 30 seconds and the applied drift rate is 200 microseconds per second. Daemons use a variant of Marzullo's algorithm to detect and reject masters that report wrong times, and a machine whose own clock diverges too much evicts itself.",
+      "tradeoff": "Correctness depends on the interval always being right, so it is reported conservatively, and a wide interval makes Spanner slower, not wrong. This only works with hardware and time-master software that keep the bound small.",
+      "concepts": [
+        {
+          "slug": "logical-clocks"
+        },
+        {
+          "slug": "failure-detection"
+        },
+        {
+          "slug": "consistency-models"
+        }
+      ]
+    },
+    {
+      "title": "Choose commit timestamps with a start rule and a commit wait",
+      "problem": "Two transactions can start and finish on different servers whose clocks differ by a few milliseconds. If the second one finishes its timestamp choice earlier than the first, readers would see them in the wrong order.",
+      "fix": "The paper gives two rules. Start: the coordinator leader gives a write a commit timestamp no less than TT.now().latest, taken after the commit request arrives. Commit wait: the coordinator does not let clients see the data, or reply that it committed, until TT.after(timestamp) is true, which means the timestamp is certainly in the past everywhere. A later transaction on any server starts after that, so its own TT.now().latest is larger, and the timestamps follow real time. The paper says the expected wait is at least twice the uncertainty, and that it is typically overlapped with Paxos communication that has to happen anyway. Leaders use the same idea before giving up a lease: they wait until their highest timestamp is in the past.",
+      "tradeoff": "Every read-write commit pays a wait of a few milliseconds that grows with clock uncertainty. In exchange, clients get external consistency without a global lock or a central timestamp server.",
+      "concepts": [
+        {
+          "slug": "logical-clocks"
+        },
+        {
+          "slug": "consistency-models"
+        },
+        {
+          "slug": "cap-theorem"
+        }
+      ]
+    },
+    {
+      "title": "Serve reads in the past without locks, and change schemas the same way",
+      "problem": "Long reads, such as reports across a whole customer, would block writers if they took locks, or see half of a transaction if they did not.",
+      "fix": "Because every committed write has a timestamp, a read at timestamp t sees exactly the writes with timestamps up to t. A snapshot transaction, which must be declared as having no writes, picks a timestamp and reads without locking, so incoming writes are not blocked. It can run at any replica that has applied everything up to that timestamp, which the paper tracks as the replica's safe time. A client can also ask for a read at an exact timestamp or no older than a bound on staleness. Schema changes use the same idea. The paper describes a transaction, registered in the prepare phase, that is given a time in the future, so that reads and writes before that time carry on and those after it wait for the change.",
+      "tradeoff": "A snapshot read may be slightly behind the latest write, or wait if the chosen replica is not caught up. In return the readers cost writers nothing.",
+      "concepts": [
+        {
+          "slug": "mvcc-and-isolation-levels"
+        },
+        {
+          "slug": "online-schema-migrations"
+        },
+        {
+          "slug": "consistency-models"
+        }
+      ]
+    }
+  ],
+  "failures": [
+    {
+      "scenario": "A GPS time master fails or is spoofed",
+      "impact": "A machine could get a time from a broken source and give an interval that does not contain the true time, which would break timestamp order.",
+      "answer": "The paper says GPS and atomic clocks are used because they fail in different ways. Time masters are compared with each other, daemons reject masters that disagree with the rest, and a machine evicts itself if its own clock diverges too much. If every source gets worse, the uncertainty widens and Spanner slows down instead of giving wrong order.",
+      "concepts": [
+        {
+          "slug": "failure-detection"
+        },
+        {
+          "slug": "graceful-degradation"
+        }
+      ]
+    },
+    {
+      "scenario": "The leader of a Paxos group dies",
+      "impact": "Writes to that group cannot start until there is a leader again.",
+      "answer": "The leader's lease runs out, with a 10 second default, and the replicas elect a new leader. The disjointness rule in the paper means that two leaders never hold a lease for the same group at once.",
+      "concepts": [
+        {
+          "slug": "leader-election"
+        },
+        {
+          "slug": "leases-and-fencing-tokens"
+        }
+      ]
+    },
+    {
+      "scenario": "A whole data center is lost",
+      "impact": "One replica of every group in it disappears.",
+      "answer": "The other replicas still hold a majority if the group has enough copies, for example five. In the paper's test, with 5 zones and 1,250 Paxos groups, killing a zone without leaders did not affect read throughput, killing the leaders' zone after they handed over leadership cost about 3 to 4%, and killing it with no warning dropped throughput almost to zero until leaders were re-elected.",
+      "concepts": [
+        {
+          "slug": "multi-region-failover"
+        },
+        {
+          "slug": "consensus"
+        }
+      ]
+    },
+    {
+      "scenario": "The coordinator of a cross-group commit fails after participants prepared",
+      "impact": "With plain two-phase commit participants would hold locks and wait for the coordinator.",
+      "answer": "Each transaction manager's state is stored in its Paxos group, so a new leader of the coordinator group reads the prepared state and can finish the commit.",
+      "concepts": [
+        {
+          "slug": "two-phase-commit"
+        },
+        {
+          "slug": "consensus"
+        }
+      ]
+    },
+    {
+      "scenario": "Clock uncertainty grows to tens of milliseconds",
+      "impact": "Every commit wait becomes longer, so write latency and lock hold times rise.",
+      "answer": "Timestamps stay correct and the system gets slower. The paper reports that uncertainty was small in practice, and that bad CPUs were 6 times more likely than bad clocks, so it considers TrueTime as trustworthy as other software Spanner depends on.",
+      "concepts": [
+        {
+          "slug": "failure-detection"
+        },
+        {
+          "slug": "timeouts-and-deadlines"
+        }
+      ]
+    }
+  ],
+  "alternatives": [
+    {
+      "title": "How to order transactions across data centers",
+      "options": [
+        {
+          "name": "A central timestamp server",
+          "pro": "Simple and gives one global order",
+          "con": "Every transaction needs a trip to one place, which is slow across continents and a single point of failure"
+        },
+        {
+          "name": "Logical clocks only",
+          "pro": "No special hardware",
+          "con": "They order causally related events but not events that no message links, so they cannot promise that a later transaction in real time has a later timestamp"
+        },
+        {
+          "name": "Bounded clock uncertainty with commit wait (TrueTime)",
+          "pro": "Local timestamps with a global real-time order and lock-free snapshot reads",
+          "con": "Needs GPS and atomic clock hardware and a wait on each commit"
+        }
+      ],
+      "pick": "TrueTime with commit wait, as the paper does."
+    },
+    {
+      "title": "What to replicate with Paxos",
+      "options": [
+        {
+          "name": "Whole database in one group",
+          "pro": "Simple",
+          "con": "One leader would limit throughput"
+        },
+        {
+          "name": "A group per range of data",
+          "pro": "Many groups work in parallel and groups can be placed near their users",
+          "con": "Transactions across groups need two-phase commit"
+        }
+      ],
+      "pick": "Many groups, with two-phase commit over Paxos for the transactions that cross them."
+    },
+    {
+      "title": "What to do about read-only work",
+      "options": [
+        {
+          "name": "Take locks like a writer",
+          "pro": "Simple model",
+          "con": "Long reads block writes"
+        },
+        {
+          "name": "Read at a timestamp",
+          "pro": "No locks, any up-to-date replica can answer",
+          "con": "Reads are of the past, and the replica must be caught up to the chosen time"
+        }
+      ],
+      "pick": "Snapshot reads at a timestamp."
+    }
+  ],
+  "roles": [
+    {
+      "id": "client",
+      "label": "Application",
+      "description": "Starts transactions and reads, and can name a timestamp or a staleness bound for snapshot reads."
+    },
+    {
+      "id": "compute",
+      "label": "Paxos group leaders",
+      "description": "Hold the lock table, run Paxos for writes and coordinate two-phase commit across groups."
+    },
+    {
+      "id": "data",
+      "label": "Replicas",
+      "description": "Copies of a group's data in different zones, which can serve snapshot reads once caught up."
+    },
+    {
+      "id": "edge",
+      "label": "TrueTime",
+      "description": "Time masters with GPS and atomic clocks, and the daemon on every machine that reports an interval."
+    }
+  ],
+  "quiz": [
+    {
+      "question": "A write commits on server X at timestamp 107. Without commit wait, a client is told 'done' straight away and then starts a write on server Y whose clock is a little behind. What can go wrong?",
+      "options": [
+        "The second write may get an earlier timestamp than the first, so readers see them in the wrong order",
+        "The second write is rejected because the first still holds a lock",
+        "Both writes are lost because the Paxos group has two leaders",
+        "The first write is repeated, because the timestamps are equal"
+      ],
+      "answer": 0,
+      "explanation": "A timestamp comes from the local clock interval, and a server whose clock is behind can pick a smaller value even though the first write already finished. Commit wait removes that by holding the 'done' reply until the timestamp is surely in the past. A lock does not stop this, because the first transaction has already released it. Two leaders is prevented by leases. Equal timestamps are not the issue, since the second one is smaller."
+    },
+    {
+      "question": "What does TrueTime's TT.now() return, and why does it matter?",
+      "options": [
+        "A single time that has been synchronised across data centers with NTP",
+        "The number of milliseconds since the last atomic clock reading",
+        "A logical counter that is raised on every message",
+        "An interval guaranteed to contain the true time, so the database knows how long to wait out the uncertainty"
+      ],
+      "answer": 3,
+      "explanation": "Exposing the uncertainty lets Spanner wait exactly as long as needed, instead of trusting one number that may be a few milliseconds off. A synchronised single time would hide the error. A count since a reading and a logical counter do not bound the true time."
+    },
+    {
+      "question": "A report needs a consistent view of a customer's data across several groups while writes continue. How does Spanner do it?",
+      "options": [
+        "It locks every row in the report in all groups",
+        "It runs a snapshot read at a chosen timestamp, which takes no locks and can use any replica caught up to that time",
+        "It pauses writes in all groups until the report finishes",
+        "It reads from the leader of each group in turn and combines the results"
+      ],
+      "answer": 1,
+      "explanation": "Every committed write has a timestamp, so the view at one timestamp is the same on every replica that has caught up to it, and nobody has to wait. Locking all rows would stall writers for the length of the report. Pausing writes does the same in a worse way. Reading each leader in turn at different moments could mix versions."
+    }
+  ],
+  "sources": [
+    {
+      "title": "Spanner: Google's Globally-Distributed Database",
+      "publisher": "Google Research (OSDI 2012)",
+      "year": 2012,
+      "url": "https://research.google/pubs/spanner-googles-globally-distributed-database-2/"
+    }
+  ]
+}
