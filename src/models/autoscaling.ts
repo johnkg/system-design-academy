@@ -10,7 +10,7 @@ export interface Result { ready: number[]; total: number[]; util: number[]; drop
 export const REQUESTS_PER_INSTANCE = 100; // requests per second one ready instance serves
 export const SIMULATED_MINUTES = 120;
 export const TRAFFIC_SEED = 7;
-export const SECONDS_PER_MINUTE = 60;
+const SECONDS_PER_MINUTE = 60;
 export const FLAP_WINDOW_MIN = 12; // a reversal this soon counts as a flap
 
 const TRAFFIC = { quiet: 200, rampFrom: 24, peakFrom: 34, peak: 1200, declineFrom: 50, declineEnd: 300, nightFrom: 72, night: 80, noiseMin: 0.92, noiseSpan: 0.16 }; // req/s by minute; noise is +-8%

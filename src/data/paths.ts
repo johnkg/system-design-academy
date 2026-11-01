@@ -2,9 +2,9 @@
  * Curated learning paths. Every step is a slug that must exist: the Paths page throws at build time on a typo.
  * Order matters: earlier items are the ones later items lean on.
  */
-export interface PathStep { kind: 'concept' | 'pattern' | 'study'; slug: string; group?: string }
+interface PathStep { kind: 'concept' | 'pattern' | 'study'; slug: string; group?: string }
 // maxMinutes is a promise made in the title ("Thirty minutes"): the Paths page throws at build time if the estimated reading time goes over it.
-export interface LearningPath { id: string; title: string; audience: string; blurb: string; steps: PathStep[]; maxMinutes?: number }
+interface LearningPath { id: string; title: string; audience: string; blurb: string; steps: PathStep[]; maxMinutes?: number }
 
 const c = (slug: string): PathStep => ({ kind: 'concept', slug });
 const s = (slug: string): PathStep => ({ kind: 'study', slug });
