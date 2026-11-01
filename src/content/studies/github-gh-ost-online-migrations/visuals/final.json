@@ -1,0 +1,66 @@
+{
+  "actors": [
+    { "id": "app", "label": "Application", "role": "client", "x": 14, "y": 16 },
+    { "id": "primary", "label": "MySQL primary: original table", "role": "data", "x": 50, "y": 16 },
+    { "id": "replica", "label": "Replica (binary log)", "role": "data", "x": 86, "y": 16 },
+    { "id": "operator", "label": "Operator", "role": "client", "x": 14, "y": 84 },
+    { "id": "ghost", "label": "gh-ost", "role": "async", "x": 50, "y": 84 },
+    { "id": "ghosttable", "label": "Ghost table (new shape)", "role": "data", "x": 86, "y": 84 }
+  ],
+  "frames": [
+    {
+      "narration": "An engineer wants to add a column to a table that holds hundreds of gigabytes. They start gh-ost, which by default connects to a replica, finds the primary from there, and is told the change to make. Nothing has changed for the application yet.",
+      "messages": [{ "from": "operator", "to": "ghost", "label": "ALTER: add a column" }, { "from": "ghost", "to": "replica", "label": "connect, find the primary" }],
+      "states": { "ghost": "starting" },
+      "highlight": ["operator", "ghost"]
+    },
+    {
+      "narration": "gh-ost creates a ghost table next to the original. It has the same shape except for the change, and it starts empty. The application still reads and writes only the original table.",
+      "messages": [{ "from": "ghost", "to": "ghosttable", "label": "create ghost table with the change" }],
+      "states": { "ghosttable": "new shape, empty" },
+      "highlight": ["ghost", "ghosttable"]
+    },
+    {
+      "narration": "gh-ost copies rows from the original into the ghost table a chunk at a time. Copying in chunks lets it pace the work and pause between chunks.",
+      "messages": [{ "from": "primary", "to": "ghost", "label": "read a chunk of rows" }, { "from": "ghost", "to": "ghosttable", "label": "write the chunk" }],
+      "states": { "ghost": "copying chunks" },
+      "highlight": ["primary", "ghost", "ghosttable"]
+    },
+    {
+      "narration": "Meanwhile the application keeps writing to the original table. Every write goes into MySQL's binary log, and the log is sent on to the replica as usual. There are no triggers on the table, so the application's queries do no extra work.",
+      "messages": [{ "from": "app", "to": "primary", "label": "UPDATE a row" }, { "from": "primary", "to": "replica", "label": "binary log event" }],
+      "states": { "primary": "serving traffic as normal" },
+      "highlight": ["app", "primary", "replica"]
+    },
+    {
+      "narration": "gh-ost reads those events from the replica's binary log and applies them to the ghost table, so the copy keeps up with the changes. It does this asynchronously, a little after each write, and takes turns with the row copying so that the primary sees one connection writing in order.",
+      "messages": [{ "from": "replica", "to": "ghost", "label": "read the UPDATE event" }, { "from": "ghost", "to": "ghosttable", "label": "apply the change" }],
+      "states": { "ghosttable": "copy plus changes" },
+      "highlight": ["replica", "ghost", "ghosttable"]
+    },
+    {
+      "narration": "A traffic spike makes the replica fall behind. gh-ost measures replication lag with its own heartbeat, sees that it has passed the limit, and throttles: it stops all of its writes to the primary, apart from tiny heartbeat events. The operator can also throttle at any time by touching a flag file or sending a command to gh-ost's socket.",
+      "messages": [{ "from": "replica", "to": "ghost", "label": "heartbeat shows lag over the limit" }, { "from": "operator", "to": "ghost", "label": "throttle (or no-throttle)" }],
+      "states": { "ghost": "throttled, writes stopped", "replica": "catching up" },
+      "highlight": ["replica", "ghost", "operator"]
+    },
+    {
+      "narration": "The lag falls, gh-ost resumes, and the copy finishes. The two tables are in sync. gh-ost keeps applying changes but waits for the operator's go-ahead, because a flag file asks it to postpone the cut-over until a quiet moment.",
+      "messages": [{ "from": "operator", "to": "ghost", "label": "remove the flag file: go" }],
+      "states": { "ghost": "tables in sync, ready", "ghosttable": "matches the original" },
+      "highlight": ["operator", "ghost", "ghosttable"]
+    },
+    {
+      "narration": "The cut-over uses two connections. One holds a lock. The other tries an atomic RENAME that swaps the tables, but a sentry table blocks the RENAME until gh-ost has checked that everything is in order. Queries that arrive are held for a moment, not failed.",
+      "messages": [{ "from": "ghost", "to": "primary", "label": "lock, then atomic RENAME (sentry blocks it until ready)" }, { "from": "app", "to": "primary", "label": "queries wait a moment" }],
+      "states": { "primary": "swapping tables" },
+      "highlight": ["ghost", "primary", "app"]
+    },
+    {
+      "narration": "The swap succeeds and the held queries run against the new table, which now has the new column. At no point did a table with that name not exist. Had the attempt failed, the original table would still have been in place and gh-ost could have tried again.",
+      "messages": [{ "from": "primary", "to": "app", "label": "queries continue on the new table" }],
+      "states": { "primary": "new shape in place", "app": "never saw a missing table" },
+      "highlight": ["primary", "app"]
+    }
+  ]
+}
