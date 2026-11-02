@@ -1,0 +1,75 @@
+---
+import PlaygroundShell from '../../components/PlaygroundShell.astro';
+import RangeField from '../../components/RangeField.astro';
+---
+<PlaygroundShell title="A write, then a hot key" hint="A user writes in a secondary region and reloads, and a hot cached list is invalidated while many readers ask for it. Choose the design, replication lag and read rate, and see who sees stale data and how many reads hit MySQL. A simple model, not Facebook's code or data.">
+  <ol class="how">
+    <li>Press <b>Reset</b>. With <b>Cache beside MySQL, async replication, clients refill it</b>, <b>Replication lag to the secondary region (ms)</b> <b>500</b>, a reload after <b>100</b> ms and <b>200</b> thousand reads per second, the writer sees <b>the old value</b> and <b>10,000</b> reads hit MySQL during the refill.</li>
+    <li>Set <b>The writer reloads after (ms)</b> to <b>600</b>: the writer now sees <b>the new value</b>, because replication has caught up, but the <b>10,000</b> MySQL reads remain.</li>
+    <li>Set <b>Design</b> to <b>TAO: writes forwarded to the primary region, write-through caches, leaders</b> and the reload back to <b>100</b>: the writer sees <b>the new value</b> at once and MySQL gets <b>1</b> read (an assumption of this model).</li>
+    <li>Set <b>Design</b> back to the plain cache and <b>Reads per second for the hot list (thousands)</b> to <b>1,000</b>: MySQL gets <b>50,000</b> reads while the list is refilled.</li>
+  </ol>
+  <div class="pg brk" data-brk>
+    <div class="pg-row">
+      <label>Design <select class="pg-in" data-design><option value="plain">Cache beside MySQL, async replication, clients refill it</option><option value="tao">TAO: writes forwarded to the primary region, write-through caches, leaders</option></select></label>
+      <RangeField label="Replication lag to the secondary region (ms)" name="lag" min="50" max="2000" step="50" value="500" />
+      <RangeField label="The writer reloads after (ms)" name="reread" min="0" max="2000" step="50" value="100" />
+      <RangeField label="Reads per second for the hot list (thousands)" name="reads" min="10" max="1000" step="10" value="200" />
+      <button type="button" class="btn" data-reset>Reset</button>
+    </div>
+    <div class="pg-grid">
+      <div class="pg-box" data-b1><h3>The writer, reloading in the secondary region, sees</h3><span class="pg-mono" data-o1></span><span class="pg-note" data-n1></span></div>
+      <div class="pg-box" data-b2><h3>Other readers in the secondary region see the change after</h3><span class="pg-mono" data-o2></span><span class="pg-note" data-n2></span></div>
+      <div class="pg-box" data-b3><h3>MySQL reads while the hot list is refilled</h3><span class="pg-mono" data-o3></span><span class="pg-note" data-n3></span></div>
+    </div>
+    <p class="pg-out" data-verdict aria-live="polite"></p>
+    <p class="pg-note">Model, invented for teaching and not Facebook data. In the plain design the user writes through the primary region's MySQL and the secondary region learns about it by replication after the lag you set, so a reload sooner than that reads the old value. In the TAO design, as the 2013 post describes, a secondary region forwards the write to the primary region and the write-through cache updates as the reply comes back, which gives read-after-write consistency for that write. When a hot list is invalidated, the plain design lets every miss during the 50 ms fill go to MySQL. The post does not say how leaders handle simultaneous misses, so the TAO figure of one read is an assumption of this model, not a claim about Facebook's system.</p>
+  </div>
+</PlaygroundShell>
+<script>
+  import { query, formatWholeNumber, mulberry32 } from '../../playground';
+  document.querySelectorAll<HTMLElement>('[data-brk]').forEach((root) => {
+    const q = query(root);
+    const DEFAULTS: Record<string, string> = {"design": "plain", "lag": "500", "reread": "100", "reads": "200"};
+    const input = (k: string) => q<HTMLInputElement>(`[data-${k}]`);
+    const select = (k: string) => q<HTMLSelectElement>(`[data-${k}]`);
+    const whole = formatWholeNumber;
+    const one = (n: number) => (Math.round(n * 10) / 10).toLocaleString('en-US');
+
+    function draw() {
+      const design = select('design').value;
+      const lag = Number(input('lag').value);
+      const reread = Number(input('reread').value);
+      const reads = Number(input('reads').value);
+      q('[data-lagval]').textContent = String(lag);
+      q('[data-rereadval]').textContent = String(reread);
+      q('[data-readsval]').textContent = String(reads);
+      const boxes: { big: string; note: string; bad: boolean }[] = [];
+      let verdict = '';
+      let failed = false;
+      const FILL_MS = 50; // time to fetch the list from MySQL
+      const ownStale = design === 'plain' && reread < lag;
+      const dbReads = design === 'plain' ? Math.round(reads * 1000 * (FILL_MS / 1000)) : 1;
+      boxes.push({ big: ownStale ? 'the old value' : 'the new value', note: design === 'tao' ? 'the write was forwarded to the primary and the caches updated from its reply' : ownStale ? `the reload at ${reread} ms beats the ${lag} ms replication lag` : `the reload came ${reread - lag} ms after replication caught up`, bad: ownStale });
+      boxes.push({ big: `${whole(lag)} ms`, note: 'eventual consistency is the default in both designs', bad: false });
+      boxes.push({ big: whole(dbReads), note: design === 'plain' ? `every reader that misses in the ${FILL_MS} ms fill window goes to MySQL` : 'assumes followers send one miss to the leader, which reads MySQL once', bad: dbReads > 1000 });
+      failed = ownStale || dbReads > 1000;
+      if (ownStale) verdict = `The writer reloaded after ${reread} ms but the secondary region only caught up after ${lag} ms, so they saw their own change missing.`;
+      else if (dbReads > 1000) verdict = `${whole(dbReads)} reads reached MySQL at once while the list was refilled, because every miss went to the database.`;
+      else verdict = design === 'tao' ? 'The writer sees their own change straight away and the database sees almost no extra reads. Other readers see it after the lag.' : 'The writer saw the new value and the database load stayed small.';
+      boxes.forEach((b, i) => {
+        q(`[data-o${i + 1}]`).textContent = b.big;
+        q(`[data-n${i + 1}]`).textContent = b.note;
+        q<HTMLElement>(`[data-b${i + 1}]`).style.setProperty('--c', b.bad ? 'var(--bad)' : 'var(--good)');
+      });
+      const out = q('[data-verdict]'); out.classList.toggle('bad', failed); out.textContent = verdict;
+    }
+    root.addEventListener('input', draw);
+    root.addEventListener('change', draw);
+    q('[data-reset]').addEventListener('click', () => {
+      Object.entries(DEFAULTS).forEach(([k, v]) => { (root.querySelector<HTMLInputElement | HTMLSelectElement>(`[data-${k}]`)!).value = v; });
+      draw();
+    });
+    draw();
+  });
+</script>

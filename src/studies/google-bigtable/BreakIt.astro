@@ -1,0 +1,98 @@
+---
+import PlaygroundShell from '../../components/PlaygroundShell.astro';
+import RangeField from '../../components/RangeField.astro';
+---
+<PlaygroundShell title="Something fails" hint="Choose what fails (a tablet server, the master or Chubby), whether writes are logged before the memtable, and the timings, and see how many tablets are unavailable, for how long, and how many acknowledged writes are lost. A simple model, not Google's code or data.">
+  <ol class="how">
+    <li>Press <b>Reset</b>. When a server crashes with the log on, its data is back after <b>79</b> s and <b>0</b> MB are lost.</li>
+    <li>Turn the log off with <b>No (memory only)</b>: the server is back after only <b>15</b> s, but <b>6,400</b> MB of acknowledged writes are lost.</li>
+    <li>Choose <b>The master crashes</b>: nothing is unavailable (<b>0</b>), because clients talk to the servers, not the master.</li>
+    <li>Choose <b>Chubby is unavailable</b> with <b>Chubby outage (seconds)</b> at <b>120</b>: everything is unavailable for <b>120</b> s, and clients cannot read or write.</li>
+    <li>Choose <b>A tablet server crashes</b> and <b>Yes (commit log in GFS)</b> again, then slow <b>Log replay speed (MB per second)</b> to <b>50</b>: the server is back after <b>143</b> s, mostly reading the log.</li>
+  </ol>
+  <div class="pg brk" data-brk>
+    <div class="pg-row">
+      <label>What fails <select class="pg-in" data-fail><option value="tablet">A tablet server crashes</option><option value="master">The master crashes</option><option value="chubby">Chubby is unavailable</option></select></label>
+      <label>Writes are logged before the memtable <select class="pg-in" data-log><option value="on">Yes (commit log in GFS)</option><option value="off">No (memory only)</option></select></label>
+      <RangeField label="Memtable size (MB)" name="mem" min="8" max="256" step="8" value="64" />
+      <RangeField label="Tablets on one machine" name="per" min="10" max="1000" step="10" value="100" />
+      <RangeField label="Log replay speed (MB per second)" name="replay" min="10" max="500" step="10" value="100" />
+      <RangeField label="Seconds to notice the failure and reassign" name="detect" min="5" max="60" step="5" value="15" />
+      <RangeField label="Chubby outage (seconds)" name="outage" min="10" max="600" step="10" value="120" />
+      <button type="button" class="btn" data-reset>Reset</button>
+    </div>
+    <div class="pg-grid">
+      <div class="pg-box" data-b1><h3>Tablets unavailable</h3><span class="pg-mono" data-o1></span><span class="pg-note" data-n1></span></div>
+      <div class="pg-box" data-b2><h3>Seconds unavailable</h3><span class="pg-mono" data-o2></span><span class="pg-note" data-n2></span></div>
+      <div class="pg-box" data-b3><h3>Acknowledged writes lost (MB)</h3><span class="pg-mono" data-o3></span><span class="pg-note" data-n3></span></div>
+      <div class="pg-box" data-b4><h3>Can clients still read and write?</h3><span class="pg-mono" data-o4></span><span class="pg-note" data-n4></span></div>
+    </div>
+    <p class="pg-out" data-verdict aria-live="polite"></p>
+    <p class="pg-note">Model, invented for teaching and not Google data: a cluster of 10,000 tablets. When a tablet server crashes its tablets are unavailable until the master notices (the time you set) and other servers have loaded them and replayed the commit log from the redo point. In the worst case every tablet has a full memtable, so the log to replay is the memtable size times the tablets on the server. Without a commit log, the memtable contents are simply lost. If the master crashes, serving carries on but no tablets can be assigned until a new master takes the lock. If Chubby is unavailable for long, the paper says Bigtable is unavailable.</p>
+  </div>
+</PlaygroundShell>
+<script>
+  import { query, formatWholeNumber, mulberry32 } from '../../playground';
+  document.querySelectorAll<HTMLElement>('[data-brk]').forEach((root) => {
+    const q = query(root);
+    const DEFAULTS: Record<string, string> = {"fail": "tablet", "log": "on", "mem": "64", "per": "100", "replay": "100", "detect": "15", "outage": "120"};
+    const input = (k: string) => q<HTMLInputElement>(`[data-${k}]`);
+    const select = (k: string) => q<HTMLSelectElement>(`[data-${k}]`);
+    const whole = formatWholeNumber;
+    const one = (n: number) => (Math.round(n * 10) / 10).toLocaleString('en-US');
+
+    function draw() {
+      const fail = select('fail').value;
+      const log = select('log').value;
+      const mem = Number(input('mem').value);
+      const per = Number(input('per').value);
+      const replay = Number(input('replay').value);
+      const detect = Number(input('detect').value);
+      const outage = Number(input('outage').value);
+      q('[data-memval]').textContent = String(mem);
+      q('[data-perval]').textContent = String(per);
+      q('[data-replayval]').textContent = String(replay);
+      q('[data-detectval]').textContent = String(detect);
+      q('[data-outageval]').textContent = String(outage);
+      const boxes: { big: string; note: string; bad: boolean }[] = [];
+      let verdict = '';
+      let failed = false;
+      const CLUSTER_TABLETS = 10000;
+      let tablets = 0, secs = 0, lost = 0, can = '';
+      if (fail === 'tablet') {
+        tablets = per;
+        const logMb = mem * per; // worst case: every tablet's memtable is full
+        secs = detect + (log === 'on' ? logMb / replay : 0);
+        lost = log === 'on' ? 0 : logMb;
+        can = `Yes for the other ${whole(CLUSTER_TABLETS - per)} tablets`;
+      } else if (fail === 'master') {
+        can = 'Yes: clients talk to tablet servers, not the master';
+      } else {
+        tablets = CLUSTER_TABLETS; secs = outage;
+        can = 'No: without Chubby Bigtable is unavailable';
+      }
+      boxes.push({ big: whole(tablets), note: fail === 'master' ? 'the master is not in the read or write path' : `of ${whole(CLUSTER_TABLETS)} tablets in the cluster`, bad: tablets > 0 });
+      boxes.push({ big: whole(secs), note: fail === 'tablet' ? `${detect} s to notice, then ${log === 'on' ? `${one((mem * per) / replay)} s to replay the log` : 'nothing to replay'}` : fail === 'master' ? 'a new master takes the lock and rebuilds its view; no tablet is affected' : 'until Chubby is back', bad: secs > 0 });
+      boxes.push({ big: whole(lost), note: lost > 0 ? 'these writes were only in memory' : 'everything acknowledged is in the log or an SSTable', bad: lost > 0 });
+      boxes.push({ big: can.startsWith('No') ? 'no' : 'yes', note: can, bad: can.startsWith('No') });
+      failed = tablets > 0 || lost > 0;
+      if (lost > 0) verdict = `${whole(lost)} MB of acknowledged writes are gone. Appending to the commit log before the memtable is what makes them recoverable.`;
+      else if (fail === 'master') verdict = 'Nothing is unavailable: the master only assigns tablets, so reads and writes carry on while a new master takes over.';
+      else if (fail === 'chubby') verdict = `Every tablet is unavailable for ${whole(outage)} seconds. The paper accepts this dependency and measured it at a tiny share of server hours.`;
+      else verdict = `${whole(per)} tablets are unavailable for about ${whole(secs)} seconds while other servers take them over and replay the log.`;
+      boxes.forEach((b, i) => {
+        q(`[data-o${i + 1}]`).textContent = b.big;
+        q(`[data-n${i + 1}]`).textContent = b.note;
+        q<HTMLElement>(`[data-b${i + 1}]`).style.setProperty('--c', b.bad ? 'var(--bad)' : 'var(--good)');
+      });
+      const out = q('[data-verdict]'); out.classList.toggle('bad', failed); out.textContent = verdict;
+    }
+    root.addEventListener('input', draw);
+    root.addEventListener('change', draw);
+    q('[data-reset]').addEventListener('click', () => {
+      Object.entries(DEFAULTS).forEach(([k, v]) => { (root.querySelector<HTMLInputElement | HTMLSelectElement>(`[data-${k}]`)!).value = v; });
+      draw();
+    });
+    draw();
+  });
+</script>
