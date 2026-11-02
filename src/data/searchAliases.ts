@@ -69,6 +69,7 @@ export const aliasGroups: string[][] = [
   ['haystack', 'facebook', 'photo storage', 'needle', 'blob store', 'append-only', 'compaction', 'nfs', 'image storage', 'small files'],
   ['dapper', 'google', 'distributed tracing', 'trace', 'span', 'zipkin', 'jaeger', 'opentelemetry', 'sampling', 'trace id'],
   ['chubby', 'google', 'lock service', 'zookeeper', 'etcd', 'leader election', 'sequencer', 'session', 'keepalive', 'grace period', 'jeopardy'],
+  ['borg', 'google', 'kubernetes', 'cluster manager', 'cluster scheduler', 'borglet', 'borgmaster', 'preemption', 'bin packing', 'resource reclamation', 'priority'],
   ['unimog', 'cloudflare load balancer', 'layer 4 load balancer', 'xdp', 'ebpf', 'ecmp', 'connection draining'],
   ['estimation', 'capacity planning', 'back of the envelope', 'qps', 'napkin math', 'requests per second', 'how many servers', 'latency numbers'],
   ['inverted index', 'full-text search', 'full text', 'postings list', 'tf-idf', 'bm25', 'lucene', 'elasticsearch', 'tokenizer', 'stemming', 'relevance'],
