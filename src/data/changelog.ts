@@ -3,6 +3,13 @@ export interface Change { date: string; title: string; items: { text: string; hr
 
 export const changelog: Change[] = [
   {
+    date: '2026-11-03',
+    title: 'Three more famous systems from Google',
+    items: [
+      { text: 'How Google built Maglev (a load balancer made of ordinary servers, with a new kind of consistent hashing), Dremel (SQL over trillion-row nested data in seconds, with columns and a serving tree) and Percolator (updating the web index a little at a time with transactions on Bigtable). Each is built only from the original paper, listed at the end, with a diagram, animation, quiz, estimator, break-it simulation and code in three languages.', href: 'case-studies/' },
+    ],
+  },
+  {
     date: '2026-11-02',
     title: 'Six more famous systems, and a simulation for every new study',
     items: [

@@ -1,0 +1,391 @@
+{
+  "name": "How Google Built Dremel",
+  "difficulty": "advanced",
+  "intent": "Follow the design in Google's 2010 Dremel paper for interactive SQL-like queries over trillion-row nested datasets: the data left where it already lives, stored column by column with repetition and definition levels, and queried through a multi-level serving tree with a dispatcher that handles stragglers, using only what the paper says.",
+  "codeTitle": "nested columns with repetition and definition levels, and a serving tree",
+  "finalIntro": "One query over a huge nested table, from the root of the serving tree to the leaves that read the columns.",
+  "prompt": "The 2010 paper 'Dremel: Interactive Analysis of Web-Scale Datasets' says Google's web-scale data is mostly non-relational and nested, such as web documents with many repeated fields, and that analysing it with MapReduce jobs works but is slow: a job takes minutes to hours. The paper describes a system, in production since 2006, that runs aggregation queries over trillion-row tables in seconds, scaling to thousands of CPUs and petabytes of data, with thousands of users at Google. How would you let analysts ask ad-hoc questions of data that is nested, stored in a shared file system, and too large for any one machine, and get answers while they are still thinking about the question? This study follows the paper, which is listed at the end. The simulation and the code samples are small models for learning, not Google's code or data.",
+  "functional": [
+    "Run SQL-like queries (selection, projection, aggregation, top-k and others) over nested records",
+    "Query data in place in GFS or Bigtable, without first loading it into a database",
+    "Return results for large aggregations in seconds",
+    "Work on a data model with nested and repeated fields, without flattening it",
+    "Interoperate with MapReduce: read the same data from MapReduce jobs and combine the two"
+  ],
+  "nonFunctional": [
+    "Interactive latency on data that is petabytes in size and has trillions of rows",
+    "Scale to thousands of CPUs and share the cluster between many users and queries",
+    "Tolerate stragglers and failures, which the paper stresses as unavoidable at this scale",
+    "Read only the data a query needs: nested records can have hundreds of fields but a query touches a few",
+    "Read-only data, so no updates or transactions are needed"
+  ],
+  "firstAttempt": {
+    "text": "This is the situation the paper describes. Analysts write MapReduce jobs over record-oriented files in GFS. A job reads whole records, parses them into objects, runs the computation and writes its output, and any follow-up question needs another job. Alternatively, the data is flattened and loaded into a relational database.",
+    "limits": [
+      "The paper says MapReduce is a batch system, so even a simple query takes minutes or hours, which breaks the analyst's train of thought",
+      "Reading whole records means reading every field when a query needs one: in the paper's test, MapReduce on records read 87 TB for a query that needs about 0.5 TB of one column",
+      "Normalizing nested data into flat tables and joining it back at web scale is, in the paper's words, usually prohibitive",
+      "Loading data into a separate database adds a copy and a delay, while the paper wants to analyse the data where it already is"
+    ]
+  },
+  "nodes": [
+    {
+      "id": "analyst",
+      "label": "Analyst (SQL query)",
+      "kind": "client",
+      "x": 8,
+      "y": 50
+    },
+    {
+      "id": "mr",
+      "label": "MapReduce job over whole records",
+      "kind": "compute",
+      "x": 80,
+      "y": 50,
+      "until": 1
+    },
+    {
+      "id": "root",
+      "label": "Root server",
+      "kind": "compute",
+      "x": 34,
+      "y": 16,
+      "at": 1
+    },
+    {
+      "id": "mid",
+      "label": "Intermediate servers",
+      "kind": "compute",
+      "x": 58,
+      "y": 16,
+      "at": 3
+    },
+    {
+      "id": "leaf",
+      "label": "Leaf servers (slots)",
+      "kind": "compute",
+      "x": 80,
+      "y": 50,
+      "at": 1
+    },
+    {
+      "id": "gfs",
+      "label": "GFS / Bigtable (column stripes)",
+      "kind": "data",
+      "x": 92,
+      "y": 84,
+      "at": 1
+    },
+    {
+      "id": "disp",
+      "label": "Query dispatcher",
+      "kind": "async",
+      "x": 34,
+      "y": 84,
+      "at": 4
+    }
+  ],
+  "edges": [
+    {
+      "from": "analyst",
+      "to": "mr",
+      "until": 1
+    },
+    {
+      "from": "analyst",
+      "to": "root",
+      "at": 1
+    },
+    {
+      "from": "root",
+      "to": "leaf",
+      "at": 1,
+      "until": 3
+    },
+    {
+      "from": "root",
+      "to": "mid",
+      "at": 3
+    },
+    {
+      "from": "mid",
+      "to": "leaf",
+      "at": 3
+    },
+    {
+      "from": "leaf",
+      "to": "gfs",
+      "at": 1
+    },
+    {
+      "from": "disp",
+      "to": "leaf",
+      "at": 4
+    },
+    {
+      "from": "root",
+      "to": "disp",
+      "at": 4
+    }
+  ],
+  "steps": [
+    {
+      "title": "Query the data where it is, with a nested data model",
+      "problem": "Copying petabytes into a database is slow, and flattening nested data throws away its structure.",
+      "fix": "Dremel's data stays in a shared storage layer such as GFS or Bigtable, and Dremel reads it in place. The data model is strongly typed nested records: a record has fields that are required, optional or repeated, and fields can themselves contain records, written with dotted paths such as Name.Language.Code. The schema is described with protocol buffers, a platform-neutral format. A query takes nested tables and produces a nested table, and the paper's SQL-like language supports selection, projection, within-record aggregation, nested subqueries, top-k, joins and user-defined functions. The paper says this lets many queries that would be a chain of MapReduce jobs run in a fraction of the time.",
+      "tradeoff": "Reading in place means the data cannot be reorganised freely for the queries, and the paper treats data as read-only. In exchange there is no load step, and Dremel and MapReduce can share the same data.",
+      "concepts": [
+        {
+          "slug": "sql-vs-nosql"
+        },
+        {
+          "slug": "schema-evolution-and-compatibility"
+        },
+        {
+          "slug": "table-formats-and-the-lakehouse"
+        }
+      ]
+    },
+    {
+      "title": "Store each field in its own column, with repetition and definition levels",
+      "problem": "A query that needs one field out of hundreds should not read the rest. But nested, repeated data loses its structure if it is simply split by field.",
+      "fix": "Dremel stores all values of one field, such as Name.Language.Code, together as a column stripe. To keep the structure, each value carries two small numbers. The repetition level says at which repeated field in the path the value repeats, so it tells where a new record or a new list begins; 0 means a new record. The definition level says how many of the fields in the path that could be undefined are actually present, which lets the column say where a missing field stopped, and a NULL carries a definition level too. In the paper's example the Code column for its first record is en-us (r=0, d=2), en (r=2, d=2), NULL (r=1, d=1), en-gb (r=1, d=2). With these two numbers the nesting of the column can be rebuilt, without reading any other column. Levels are stored with only as many bits as needed, and values that are always defined need no definition level.",
+      "tradeoff": "Reading a few columns is far cheaper, and rebuilding whole records is costly. The paper reports that record assembly and parsing can each double the execution time, and that when few columns are read the columnar layout gains about an order of magnitude.",
+      "concepts": [
+        {
+          "slug": "columnar-formats-and-partitioning"
+        },
+        {
+          "slug": "database-indexing"
+        }
+      ]
+    },
+    {
+      "title": "Execute queries on a multi-level serving tree",
+      "problem": "Scanning a trillion rows needs thousands of machines, and the answer must come back through them quickly without a bottleneck at the end.",
+      "fix": "Dremel borrows the serving tree used in distributed web search. A root server receives the query, reads metadata, and rewrites the query for the next level. Intermediate servers rewrite it again, and the leaf servers scan the tablets, the horizontal partitions of the table, in parallel, from the storage layer or local disk. On the way up, each level combines the partial results of the level below. For example, SELECT A, COUNT(B) FROM T GROUP BY A becomes a COUNT on each leaf's tablets and a SUM of those counts at each higher level. The leaves read only the columns the query mentions, and the plan works on column stripes directly, emitting results with the right levels and skipping record assembly. The paper says this model suits aggregation queries with small or medium results.",
+      "tradeoff": "The tree is very good for one-pass aggregations. Large results and other query types may need the execution mechanisms of parallel databases or MapReduce, the paper says.",
+      "concepts": [
+        {
+          "slug": "mapreduce-and-shuffles"
+        },
+        {
+          "slug": "query-planning-and-joins"
+        },
+        {
+          "slug": "horizontal-vs-vertical-scaling"
+        }
+      ]
+    },
+    {
+      "title": "Dispatch work in slots and handle stragglers and failures",
+      "problem": "A table has far more tablets than there are processors, many users run queries at once, and a single slow machine can hold up a query.",
+      "fix": "A slot is an execution thread on a leaf server: with 3,000 leaf servers of 8 threads each there are 24,000 slots, and a table of 100,000 tablets gives about 5 tablets per slot. A query dispatcher schedules queries by priority and balances load. During a query it keeps a histogram of tablet processing times, and when a tablet takes much longer than the rest, it reschedules it on another server; a tablet may be redispatched more than once. Tablets are usually three-way replicated, and if a leaf cannot read one replica it falls over to another. Read-ahead caches typically reach a 95% hit rate. The dispatcher also takes a parameter for the minimum percentage of tablets that must be scanned before the result is returned: the paper says a value such as 98% instead of 100% can speed up execution a lot, especially with lower replication.",
+      "tradeoff": "Returning at 98% gives a quick, slightly incomplete answer, which suits interactive exploration but not accounting. The paper shows that with fewer replicas, stragglers matter more.",
+      "concepts": [
+        {
+          "slug": "hedged-requests-and-tail-latency"
+        },
+        {
+          "slug": "load-balancing"
+        },
+        {
+          "slug": "graceful-degradation"
+        },
+        {
+          "slug": "backpressure"
+        }
+      ]
+    },
+    {
+      "title": "Measure it against MapReduce",
+      "problem": "A design only matters if it delivers the interactivity it promises on real data.",
+      "fix": "The paper runs a query that finds the average number of terms in one text field of an 85-billion-record, 87 TB table, on 3,000 workers. MapReduce on the record-oriented data read about 87 TB. MapReduce on the columnar data and Dremel read about 0.5 TB of compressed columnar data. The paper reports an order of magnitude gained by switching MapReduce from records to columns, from hours to minutes, and another order of magnitude by using Dremel, from minutes to seconds. It also tested trillion-record tables of 105 TB and 20 TB, and found that the serving tree scales with the number of leaf servers.",
+      "tradeoff": "The gain is greatest when few columns are read. The paper says the point where record-wise storage becomes better is often at dozens of fields, but it depends on the dataset and on whether record assembly is needed.",
+      "concepts": [
+        {
+          "slug": "batch-vs-stream-processing"
+        },
+        {
+          "slug": "back-of-the-envelope-estimation"
+        },
+        {
+          "slug": "table-formats-and-the-lakehouse"
+        }
+      ]
+    }
+  ],
+  "failures": [
+    {
+      "scenario": "One leaf server is much slower than the others",
+      "impact": "The query waits for its tablets, since the answer needs every tablet.",
+      "answer": "The dispatcher's histogram of tablet times shows the slow tablets, and it reschedules them on another server. It can also return once a minimum share of tablets, for example 98%, has been scanned.",
+      "concepts": [
+        {
+          "slug": "hedged-requests-and-tail-latency"
+        }
+      ]
+    },
+    {
+      "scenario": "A tablet replica cannot be read",
+      "impact": "The leaf cannot scan that tablet.",
+      "answer": "Tablets are usually replicated three ways, and the leaf falls over to another replica.",
+      "concepts": [
+        {
+          "slug": "database-replication"
+        }
+      ]
+    },
+    {
+      "scenario": "A query touches two columns out of hundreds",
+      "impact": "Reading whole records would pull in every field.",
+      "answer": "Only the column stripes named in the query are read, so the I/O is proportional to the columns used.",
+      "concepts": [
+        {
+          "slug": "columnar-formats-and-partitioning"
+        }
+      ]
+    },
+    {
+      "scenario": "An analyst needs a large result or a join that does not fit the tree",
+      "impact": "Aggregation up a tree suits small and medium results, and a big shuffle would overload the upper levels.",
+      "answer": "The paper says such queries may need the mechanisms of parallel databases and MapReduce, and it defers joins and other classes to future work.",
+      "concepts": [
+        {
+          "slug": "mapreduce-and-shuffles"
+        },
+        {
+          "slug": "query-planning-and-joins"
+        }
+      ]
+    },
+    {
+      "scenario": "Many users query at the same time",
+      "impact": "The data processed by queries exceeds the number of slots.",
+      "answer": "The dispatcher assigns tablets to slots by query priority and balances the load.",
+      "concepts": [
+        {
+          "slug": "load-balancing"
+        },
+        {
+          "slug": "queueing-theory-and-littles-law"
+        }
+      ]
+    }
+  ],
+  "alternatives": [
+    {
+      "title": "Record-oriented or column-oriented storage",
+      "options": [
+        {
+          "name": "Records",
+          "pro": "Whole records are cheap to read and write",
+          "con": "Every field is read for every query: 87 TB in the paper's test"
+        },
+        {
+          "name": "Column stripes with levels",
+          "pro": "Reads only the columns used, an order of magnitude less I/O for few columns",
+          "con": "Rebuilding records is expensive, and levels add some complexity"
+        }
+      ],
+      "pick": "Column stripes, with record assembly only when needed."
+    },
+    {
+      "title": "How to run the query",
+      "options": [
+        {
+          "name": "A MapReduce job",
+          "pro": "General, handles huge outputs",
+          "con": "Batch latency of minutes to hours"
+        },
+        {
+          "name": "A serving tree",
+          "pro": "Seconds on trillion-row tables for aggregations",
+          "con": "Best for small and medium results"
+        }
+      ],
+      "pick": "A serving tree for interactive aggregation, with MapReduce still available for the rest."
+    },
+    {
+      "title": "Wait for every tablet or return early",
+      "options": [
+        {
+          "name": "100% of tablets",
+          "pro": "Exact answer",
+          "con": "One straggler sets the latency"
+        },
+        {
+          "name": "A minimum share such as 98%",
+          "pro": "Much faster in the paper's tests",
+          "con": "Slightly incomplete result"
+        }
+      ],
+      "pick": "Let the user choose with the minimum-percentage parameter."
+    }
+  ],
+  "roles": [
+    {
+      "id": "client",
+      "label": "Analyst",
+      "description": "Writes SQL-like queries over nested tables."
+    },
+    {
+      "id": "compute",
+      "label": "Root, intermediate and leaf servers",
+      "description": "The serving tree: the root rewrites and routes the query, intermediates combine partial results, and leaves scan column stripes."
+    },
+    {
+      "id": "data",
+      "label": "GFS / Bigtable",
+      "description": "Holds the column stripes of tablets, usually three-way replicated."
+    },
+    {
+      "id": "async",
+      "label": "Query dispatcher",
+      "description": "Assigns tablets to slots, tracks their times and re-dispatches slow ones."
+    }
+  ],
+  "quiz": [
+    {
+      "question": "In Dremel's column for Name.Language.Code, what does a repetition level of 0 mean?",
+      "options": [
+        "The value is NULL",
+        "The value starts a new record",
+        "The value is repeated from the previous record",
+        "The field is required"
+      ],
+      "answer": 1,
+      "explanation": "The repetition level says at which repeated field in the path the value repeats, and 0 means that no field repeats, so the value begins a new record. NULL is shown by the definition level being below the maximum. A required field is a schema property, not a level."
+    },
+    {
+      "question": "A query needs two fields out of a table with hundreds. Why is Dremel's storage faster than MapReduce on records for it?",
+      "options": [
+        "It compresses each record into a single block",
+        "It reads only the column stripes the query names, about 0.5 TB instead of 87 TB in the paper's test",
+        "It keeps the whole table in memory",
+        "It runs the query on a single machine"
+      ],
+      "answer": 1,
+      "explanation": "Each field is stored in its own stripe, so I/O is proportional to the columns used. The table is far too large for memory or one machine, and record blocks would still need every field to be read."
+    },
+    {
+      "question": "One tablet in a Dremel query is much slower than the others. What can the query dispatcher do?",
+      "options": [
+        "Nothing; the query must wait",
+        "Reschedule that tablet on another server, or return once a minimum percentage of tablets has been scanned",
+        "Cancel the query",
+        "Restart the whole query from scratch"
+      ],
+      "answer": 1,
+      "explanation": "The dispatcher tracks a histogram of tablet times and reschedules a straggler, and a parameter for the minimum share of tablets lets the result come back early, for example at 98%. Waiting would let one slow machine set the latency, and restarting would repeat all the work."
+    }
+  ],
+  "sources": [
+    {
+      "title": "Dremel: Interactive Analysis of Web-Scale Datasets",
+      "publisher": "Google Research (VLDB 2010)",
+      "year": 2010,
+      "url": "https://research.google/pubs/dremel-interactive-analysis-of-web-scale-datasets-2/"
+    }
+  ]
+}
