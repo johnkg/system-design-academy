@@ -1,0 +1,91 @@
+---
+import PlaygroundShell from '../../components/PlaygroundShell.astro';
+import RangeField from '../../components/RangeField.astro';
+---
+<PlaygroundShell title="A transaction dies halfway" hint="Ten accounts hold $100 each. Some money transfers stop partway through, and a reader then reads every account. Choose where the transfers stop, what the reader does when it meets a leftover lock, and how many stopped, and see what the reader can read and whether the total is still $1,000. A simple model, not Google's code or data.">
+  <ol class="how">
+    <li>Press <b>Reset</b>. With a few unfinished transfers left after the prewrite and a reader that waits, <b>6</b> accounts cannot be read, and the readable ones add up to only <b>$400</b>.</li>
+    <li>Choose <b>Ignores it and reads the last committed value</b>: the money adds up to <b>$1,000</b>, because nothing had been committed.</li>
+    <li>Choose <b>After the primary commit: half is committed</b>: now the reader that ignores locks sees only <b>$940</b>, and <b>3</b> half-done transfers.</li>
+    <li>Choose <b>Checks the primary and cleans up</b>: the reader rolls the locks forward and the money adds up to <b>$1,000</b> again.</li>
+  </ol>
+  <div class="pg brk" data-brk>
+    <div class="pg-row">
+      <label>Where they stop <select class="pg-in" data-crash><option value="pre">After the prewrite: nothing is committed</option><option value="prim">After the primary commit: half is committed</option></select></label>
+      <label>Reader meets a lock <select class="pg-in" data-policy><option value="wait">Waits for it</option><option value="ignore">Ignores it and reads the last committed value</option><option value="resolve">Checks the primary and cleans up</option></select></label>
+      <RangeField label="Stopped transfers (of 5 pairs)" name="dead" min="0" max="5" value="3" />
+      <button type="button" class="btn" data-reset>Reset</button>
+    </div>
+    <div class="pg-grid">
+      <div class="pg-box" data-b1><h3>Accounts the reader cannot read</h3><span class="pg-mono" data-o1></span><span class="pg-note" data-n1></span></div>
+      <div class="pg-box" data-b2><h3>Money the reader sees (of $1,000)</h3><span class="pg-mono" data-o2></span><span class="pg-note" data-n2></span></div>
+      <div class="pg-box" data-b3><h3>Locks the reader cleaned up</h3><span class="pg-mono" data-o3></span><span class="pg-note" data-n3></span></div>
+      <div class="pg-box" data-b4><h3>Half-done transfers the reader saw</h3><span class="pg-mono" data-o4></span><span class="pg-note" data-n4></span></div>
+    </div>
+    <p class="pg-out" data-verdict aria-live="polite"></p>
+    <p class="pg-note">Model, invented for teaching and not Google data: ten accounts start with $100 and 30 ordinary transfers of $5 have already finished. Then up to five transfers of $20 stop partway, each between two accounts that no other transfer uses. If a transfer stops after the prewrite, both of its accounts hold a lock and nothing is committed. If it stops after committing its primary, the first account has the new balance and the second still holds a lock that points to the primary. A reader that waits can read neither locked account. One that ignores locks reads the last committed value, which for a committed primary is only half the transfer. One that checks the primary, as the Percolator paper describes, rolls forward when the primary has a write record and back when it still has its lock. The paper only cleans up locks of workers it suspects are dead.</p>
+  </div>
+</PlaygroundShell>
+<script>
+  import { query, formatWholeNumber, mulberry32 } from '../../playground';
+  document.querySelectorAll<HTMLElement>('[data-brk]').forEach((root) => {
+    const q = query(root);
+    const DEFAULTS: Record<string, string> = {"crash": "pre", "policy": "wait", "dead": "3"};
+    const input = (k: string) => q<HTMLInputElement>(`[data-${k}]`);
+    const select = (k: string) => q<HTMLSelectElement>(`[data-${k}]`);
+    const whole = formatWholeNumber;
+    const one = (n: number) => (Math.round(n * 10) / 10).toLocaleString('en-US');
+
+    function draw() {
+      const crash = select('crash').value;
+      const policy = select('policy').value;
+      const dead = Number(input('dead').value);
+      q('[data-deadval]').textContent = String(dead);
+      const boxes: { big: string; note: string; bad: boolean }[] = [];
+      let verdict = '';
+      let failed = false;
+      const ACCOUNTS = 10, EXPECTED = 1000, STOPPED_AMOUNT = 20;
+      const committed = new Array(ACCOUNTS).fill(100);
+      for (let i = 0; i < 30; i++) { committed[i % ACCOUNTS] -= 5; committed[(3 * i + 1) % ACCOUNTS] += 5; } // 30 ordinary transfers of $5 that finished
+      type Lock = 'none' | 'primary-open' | 'secondary-open' | 'secondary-after-commit';
+      const locks: Lock[] = new Array(ACCOUNTS).fill('none');
+      for (let j = 0; j < dead; j++) {
+        const from = 2 * j, to = 2 * j + 1;
+        if (crash === 'pre') { locks[from] = 'primary-open'; locks[to] = 'secondary-open'; }
+        else { committed[from] -= STOPPED_AMOUNT; locks[to] = 'secondary-after-commit'; } // the primary committed; the secondary still has a lock
+      }
+      let blocked = 0, total = 0, cleaned = 0, torn = 0;
+      committed.forEach((value, a) => {
+        const lock = locks[a];
+        if (lock === 'none') { total += value; return; }
+        if (policy === 'wait') { blocked++; return; }
+        if (policy === 'ignore') { total += value; if (lock === 'secondary-after-commit') torn++; return; } // the committed half is visible, the other half is not
+        cleaned++;
+        total += lock === 'secondary-after-commit' ? value + STOPPED_AMOUNT : value; // rolled forward, or rolled back
+      });
+      const sum = total;
+      boxes.push({ big: whole(blocked), note: blocked > 0 ? 'the lock may still commit below the reader\'s timestamp, so it cannot read past it' : 'no reader was held up', bad: blocked > 0 });
+      boxes.push({ big: blocked > 0 ? `$${whole(sum)} (of the readable ones)` : `$${whole(sum)}`, note: sum === EXPECTED ? 'the money adds up' : blocked > 0 ? 'some accounts are missing from the total' : 'money has disappeared', bad: sum !== EXPECTED });
+      boxes.push({ big: whole(cleaned), note: cleaned > 0 ? 'each was rolled back or forward by looking at the primary' : 'no cleanup was done', bad: false });
+      boxes.push({ big: whole(torn), note: torn > 0 ? 'the reader saw one side of a committed transfer and not the other' : 'every transfer was seen whole or not at all', bad: torn > 0 });
+      failed = blocked > 0 || sum !== EXPECTED;
+      if (dead === 0) verdict = 'Nothing stopped partway, so the reader sees the $1,000 in full.';
+      else if (blocked > 0) verdict = `${whole(blocked)} accounts hold locks that nobody cleans up, so a reader waits on them. Percolator readers clean up locks of dead workers.`;
+      else if (sum !== EXPECTED) verdict = `The reader ignored the locks and saw ${whole(torn)} transfers half done: $${whole(EXPECTED - sum)} seems to have vanished. Looking at the primary shows whether each transfer committed.`;
+      else verdict = crash === 'pre' ? 'The unfinished transfers never committed, so the reader rolled them back and the money adds up.' : 'The primaries had committed, so the reader rolled the transfers forward and the money adds up.';
+      boxes.forEach((b, i) => {
+        q(`[data-o${i + 1}]`).textContent = b.big;
+        q(`[data-n${i + 1}]`).textContent = b.note;
+        q<HTMLElement>(`[data-b${i + 1}]`).style.setProperty('--c', b.bad ? 'var(--bad)' : 'var(--good)');
+      });
+      const out = q('[data-verdict]'); out.classList.toggle('bad', failed); out.textContent = verdict;
+    }
+    root.addEventListener('input', draw);
+    root.addEventListener('change', draw);
+    q('[data-reset]').addEventListener('click', () => {
+      Object.entries(DEFAULTS).forEach(([k, v]) => { (root.querySelector<HTMLInputElement | HTMLSelectElement>(`[data-${k}]`)!).value = v; });
+      draw();
+    });
+    draw();
+  });
+</script>

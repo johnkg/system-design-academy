@@ -72,6 +72,7 @@ export const aliasGroups: string[][] = [
   ['borg', 'google', 'kubernetes', 'cluster manager', 'cluster scheduler', 'borglet', 'borgmaster', 'preemption', 'bin packing', 'resource reclamation', 'priority'],
   ['maglev', 'google', 'software load balancer', 'maglev hashing', 'consistent hashing', 'ecmp', 'vip', 'dsr', 'direct server return', 'kernel bypass', 'connection tracking', 'gre'],
   ['dremel', 'google', 'bigquery', 'columnar', 'nested data', 'repetition level', 'definition level', 'parquet', 'serving tree', 'interactive analytics', 'ad hoc sql'],
+  ['percolator', 'google', 'caffeine', 'snapshot isolation', 'timestamp oracle', 'incremental processing', 'observers', 'distributed transactions on bigtable', 'primary lock', 'write skew'],
   ['unimog', 'cloudflare load balancer', 'layer 4 load balancer', 'xdp', 'ebpf', 'ecmp', 'connection draining'],
   ['estimation', 'capacity planning', 'back of the envelope', 'qps', 'napkin math', 'requests per second', 'how many servers', 'latency numbers'],
   ['inverted index', 'full-text search', 'full text', 'postings list', 'tf-idf', 'bm25', 'lucene', 'elasticsearch', 'tokenizer', 'stemming', 'relevance'],
