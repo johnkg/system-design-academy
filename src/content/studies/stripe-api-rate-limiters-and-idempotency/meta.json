@@ -1,0 +1,251 @@
+{
+  "name": "How Stripe Protects Its API",
+  "difficulty": "intermediate",
+  "intent": "Follow the four rate limiters and the idempotency keys that Stripe describes in two engineering posts, and see what each one protects against, using only what Stripe has published.",
+  "codeTitle": "a token bucket, a load shedder and idempotency keys, side by side",
+  "finalIntro": "One charge request through the finished design, including a lost response and a retry.",
+  "prompt": "Stripe's API takes money, so two things have to go right. It must stay up when too many requests arrive, and it must never charge a customer twice because a client was unsure whether a request worked. In two 2017 engineering posts, 'Scaling your API with rate limiters' and 'Designing robust and predictable APIs with idempotency', Stripe describes how it handles both. How would you protect an API like this? This study follows those two posts, which are listed at the end. Stripe's posts give no production limits for its limiters, so this study does not either: the numbers in the estimator, the simulation and the code samples are round teaching figures, not Stripe's data or code.",
+  "functional": [
+    "Accept a request and process it at most once, even when the client sends it more than once",
+    "Stop one user, such as a buggy script, from using up the capacity that everyone shares",
+    "Limit how many heavy requests one user can have running at the same time",
+    "Keep the most important requests, such as creating a charge, working when the whole system is short of capacity",
+    "Tell a turned-away client clearly that it was limited, so it can back off"
+  ],
+  "nonFunctional": [
+    "Fail open: a bug in a limiter, or an outage of the store it uses, must not take the API down. This is Stripe's own advice",
+    "The request rate limiter behaves the same in test mode and live mode, so a script does not meet different limits when it goes to production",
+    "Allow brief bursts above the steady limit, such as a flash sale",
+    "Roll limiters out gradually, with a way to turn each off at once and metrics on how often each one triggers, because a wrong limiter blocks real customers",
+    "A retry must never create a second charge"
+  ],
+  "firstAttempt": {
+    "text": "The simplest design is an API that accepts every request as it arrives and hands it to a worker. Clients that get an error or a timeout simply send the request again. Every user shares the same pool of workers, and nothing distinguishes a payment from a request to list old payments.",
+    "limits": [
+      "One user's script that has run out of control can use up the workers for everyone. Stripe says its request rate limiter rejected 'millions of requests this month alone', largely from test-mode scripts that had gone wrong",
+      "Some endpoints are expensive. Stripe describes CPU-heavy endpoints where retries from frustrated users make the contention worse",
+      "When the whole fleet is short of capacity, every request suffers equally, including the ones that move money",
+      "A client whose connection drops cannot tell whether the request worked. Retrying risks a second charge, and giving up risks no charge at all"
+    ]
+  },
+  "nodes": [
+    { "id": "client", "label": "API client", "kind": "client", "x": 8, "y": 50 },
+    { "id": "workers", "label": "API workers", "kind": "compute", "x": 92, "y": 50 },
+    { "id": "ratelimit", "label": "Request rate limiter", "kind": "edge", "x": 29, "y": 50, "at": 1 },
+    { "id": "redis", "label": "Redis (limiter state)", "kind": "data", "x": 50, "y": 16, "at": 1 },
+    { "id": "conclimit", "label": "Concurrent requests limiter", "kind": "edge", "x": 50, "y": 50, "at": 2 },
+    { "id": "fleetshed", "label": "Fleet usage load shedder", "kind": "edge", "x": 71, "y": 50, "at": 3 },
+    { "id": "hostshed", "label": "Worker utilization load shedder", "kind": "edge", "x": 92, "y": 16, "at": 4 },
+    { "id": "store", "label": "Saved results by key", "kind": "data", "x": 92, "y": 84, "at": 5 }
+  ],
+  "edges": [
+    { "from": "client", "to": "workers", "until": 1 },
+    { "from": "client", "to": "ratelimit", "at": 1 },
+    { "from": "ratelimit", "to": "workers", "at": 1, "until": 2 },
+    { "from": "ratelimit", "to": "redis", "at": 1 },
+    { "from": "ratelimit", "to": "conclimit", "at": 2 },
+    { "from": "conclimit", "to": "workers", "at": 2, "until": 3 },
+    { "from": "conclimit", "to": "fleetshed", "at": 3 },
+    { "from": "fleetshed", "to": "workers", "at": 3 },
+    { "from": "fleetshed", "to": "redis", "at": 3 },
+    { "from": "hostshed", "to": "workers", "at": 4 },
+    { "from": "workers", "to": "store", "at": 5 }
+  ],
+  "steps": [
+    {
+      "title": "Limit each user's request rate with a token bucket",
+      "problem": "A single user, usually by accident, can send requests fast enough to starve everyone else of workers. A limit that is too strict would also punish normal behaviour, such as a sudden sale that makes a shop send a burst of requests.",
+      "fix": "Stripe's request rate limiter restricts each user to a number of requests per second (the post does not say how many). It allows brief bursts above that cap after Stripe analysed its traffic. It uses the token bucket algorithm: each user has a bucket held in a central place, every request takes a token out, tokens drip back in over time, and a request that finds the bucket empty is rejected. The limiter behaves the same in test mode and live mode, so scripts do not meet different limits when they move to production. Stripe builds its limiters on Redis, either self-hosted or a managed service such as AWS ElastiCache, and the post says the limiter rejected millions of requests in the month it describes, largely from test-mode scripts that had run out of control.",
+      "tradeoff": "A token bucket is easy to reason about and tolerates bursts, but the burst size is a second number to choose, and for a moment a user may send more than the steady limit. The bucket state lives in a shared store that every request touches, so that store becomes a dependency of the API, which is why Stripe's next piece of advice is to fail open. The post gives no values for the limit or the bucket size, so any figure you see in the estimator here is invented.",
+      "concepts": [
+        { "slug": "rate-limiting" },
+        { "slug": "api-gateway" },
+        { "slug": "backpressure" }
+      ]
+    },
+    {
+      "title": "Cap how many heavy requests one user can run at once",
+      "problem": "A rate limit counts requests per second, but an expensive request can hold a worker for a long time. A user who stays under the rate limit can still tie up many workers with slow, CPU-heavy calls, and impatient retries make the contention worse.",
+      "fix": "Stripe's concurrent requests limiter caps how many requests are in progress at once instead of how many arrive per second. The post's illustration is 20 API requests in progress at the same time, and it says this is an example, not Stripe's production value. It is aimed at resource-intensive endpoints. The post says it triggered about 12,000 times in the month it describes, and that it can reasonably be tuned to reject more often than the request rate limiter.",
+      "tradeoff": "Limiting concurrency matches the real cost of slow requests better than a rate does, but it needs a live count of requests in progress, and a request that never finishes must not hold its slot forever. The post does not describe how Stripe counts them. This study's reading: the count has to be kept somewhere shared, just like the token buckets, so the same fail-open advice applies.",
+      "concepts": [
+        { "slug": "bulkhead" },
+        { "slug": "queueing-theory-and-littles-law" },
+        { "slug": "timeouts-and-deadlines" }
+      ]
+    },
+    {
+      "title": "When the whole fleet is short of capacity, protect the important requests",
+      "problem": "Per-user limits do nothing when the total load is simply too high, for example after a bad deploy or a partial outage. If all requests are treated alike, creating a charge fails as often as listing old charges, though one matters far more.",
+      "fix": "Stripe's fleet usage load shedder splits traffic into critical methods, for example creating a charge, and non-critical methods, for example listing charges. A Redis cluster counts the current requests of each kind. The shedder reserves a fraction of capacity for critical requests, and non-critical requests beyond what is left are rejected with HTTP 503. The post's example reserves 20% and says it is illustrative, not a production figure. It says the shedder triggered for a very small fraction of requests in the month it describes.",
+      "tradeoff": "Someone has to decide, endpoint by endpoint, what counts as critical, and the post does not publish that list. A larger reserve protects payments better and sheds more of everything else. A 503 tells the client the service is short of capacity, which is a different message from the 429 a limited user receives.",
+      "concepts": [
+        { "slug": "load-shedding" },
+        { "slug": "graceful-degradation" },
+        { "slug": "backpressure" }
+      ]
+    },
+    {
+      "title": "Add a last line of defence on each worker host",
+      "problem": "The fleet-wide shedder works from request counts, but what finally breaks is a host that has run out of workers. During a major incident something local has to keep each host alive even if every other layer has been overrun.",
+      "fix": "Stripe's worker utilization load shedder watches how many workers on a host still have spare capacity. It divides traffic into four categories: critical methods, POST requests, GET requests and test-mode traffic. When a host is overloaded it sheds the lowest-priority traffic first, starting with test-mode traffic, and escalates up the list if that is not enough. Stripe made shedding and restoring deliberately slow so that it does not flap on and off, and tuned it to shed a substantial amount of traffic within a few minutes. The post describes it as the last line of defence in major incidents and says it rejected only 100 requests in the month it covers.",
+      "tradeoff": "A slow shedder reacts later but does not oscillate, and a host that sheds too eagerly makes things worse for its neighbours, who then receive the traffic. Ranking test-mode traffic last means a developer's experiments are the first thing to go, which is the right call when real payments are at stake.",
+      "concepts": [
+        { "slug": "load-shedding" },
+        { "slug": "health-checks" },
+        { "slug": "autoscaling" }
+      ]
+    },
+    {
+      "title": "Make retries safe with idempotency keys",
+      "problem": "Networks fail in the middle of a request. If the client does not hear back, it cannot know whether the server did the work. Retrying a charge without protection can charge a customer twice, and retrying without any care makes a busy server busier.",
+      "fix": "Stripe's clients send a unique value in an Idempotency-Key header, and the post says keys apply to anything under POST. The server correlates the key with the state of the request, so a retry that reuses the key is recognised. The post walks through the cases. If the connection failed before the server saw the request, the retry is the first time the server sees the key, so it is processed normally. If the server failed part-way through, it picks the work up and carries it through, though the post says the exact behaviour depends heavily on the implementation. If the work finished but the response was lost, the server replies with the saved result of the first attempt. The post also advises clients to retry with exponential backoff, waiting a time proportional to 2 to the power n after n failures, plus random jitter so that clients do not all retry at the same instant. Stripe's Ruby library retries automatically with a key.",
+      "tradeoff": "The post does not say where keys are stored, how long they are kept, or what happens when a retry reuses a key with different parameters. This study's reading: the server has to keep a record per key, so storage and expiry are real decisions, and a key that is reused for a different request needs a clear rule. Idempotency keys make retrying safe, but they do not make an overloaded server less loaded, which is why backoff and jitter matter too.",
+      "concepts": [
+        { "slug": "idempotency" },
+        { "slug": "retries-and-backoff" },
+        { "slug": "delivery-guarantees" }
+      ]
+    },
+    {
+      "title": "Roll limiters out slowly, and make them fail open",
+      "problem": "A limiter that is wrong blocks real customers, and a limiter that depends on a shared store can bring the API down with it.",
+      "fix": "Stripe's advice is to introduce limiters gradually, starting with the request rate limiter and adding the others as scaling needs appear. Make them fail open, catching exceptions at every level so a bug or a Redis outage does not break the API. Put each limiter behind a feature flag or kill switch. Set up alerts and metrics on how often each one triggers. Dark launch each one, which means running it without enforcing it to see what it would have blocked, and tune the thresholds from that. Clients may need to change their code to fit new limits, and error messages should be actionable.",
+      "tradeoff": "Failing open means that during a limiter outage the protection is gone just when it might be needed, and Stripe accepts that rather than risk an outage caused by the protection itself. Dark launches take time and delay the benefit, but they turn a guess about thresholds into a measurement.",
+      "concepts": [
+        { "slug": "feature-flags" },
+        { "slug": "canary-deployments" },
+        { "slug": "metrics" },
+        { "slug": "alerting" }
+      ]
+    }
+  ],
+  "failures": [
+    {
+      "scenario": "A user's script runs out of control and floods the API",
+      "impact": "Without a limit it would take workers away from every other customer.",
+      "answer": "The request rate limiter empties that user's token bucket and rejects the excess, while everyone else's buckets are untouched. Stripe says this is what happened to millions of requests in the month it describes, mostly from test-mode scripts.",
+      "concepts": [
+        { "slug": "rate-limiting" }
+      ]
+    },
+    {
+      "scenario": "The Redis store behind the limiters stops responding",
+      "impact": "If every request had to wait for the limiter, the API would be down because of its own protection.",
+      "answer": "Stripe's advice is to fail open: exceptions are caught at all levels, so a bug or a Redis outage lets requests through unlimited instead of breaking the API. Kill switches let the team turn a limiter off at once.",
+      "concepts": [
+        { "slug": "graceful-degradation" },
+        { "slug": "feature-flags" }
+      ]
+    },
+    {
+      "scenario": "The whole fleet runs short of capacity",
+      "impact": "Every request would slow down or fail alike, including the ones that create charges.",
+      "answer": "The fleet usage load shedder keeps a share of capacity for critical requests and rejects non-critical requests beyond the rest with HTTP 503. If a host is still overloaded, the worker utilization shedder drops test-mode traffic first and then climbs the list.",
+      "concepts": [
+        { "slug": "load-shedding" },
+        { "slug": "backpressure" }
+      ]
+    },
+    {
+      "scenario": "A charge succeeds but the response never reaches the client",
+      "impact": "The client believes the charge failed, and a plain retry would charge the customer again.",
+      "answer": "The client retries with the same idempotency key. The server recognises the key and replies with the saved result of the first attempt instead of doing the work again. Per Stripe's advice the retry waits with exponential backoff and jitter.",
+      "concepts": [
+        { "slug": "idempotency" },
+        { "slug": "retries-and-backoff" }
+      ]
+    },
+    {
+      "scenario": "A new limiter is set too tight and would block real customers",
+      "impact": "Customers would see errors from a protection meant to keep the API healthy.",
+      "answer": "Stripe suggests dark launching each limiter, which shows what it would block before it blocks anything, with alerts on how often it triggers and a kill switch to turn it off. Thresholds are tuned from what the dark launch shows.",
+      "concepts": [
+        { "slug": "canary-deployments" },
+        { "slug": "metrics" }
+      ]
+    }
+  ],
+  "alternatives": [
+    {
+      "title": "How to count one user's requests",
+      "options": [
+        { "name": "Token bucket", "pro": "Allows a short burst and then a steady rate, which fits traffic such as a flash sale. This is the algorithm Stripe says its request rate limiter uses", "con": "Two numbers to choose, the refill rate and the bucket size, and a shared store to keep each bucket" },
+        { "name": "Fixed window counter", "pro": "Very simple: count requests in each second or minute and reject past a number", "con": "This study's reading: a user can send the full limit at the end of one window and again at the start of the next, so the real burst is double the limit" },
+        { "name": "No per-user limit", "pro": "Nothing to run or tune", "con": "One runaway script can take the capacity everyone shares" }
+      ],
+      "pick": "A token bucket per user, as Stripe describes."
+    },
+    {
+      "title": "What to tell a client that is turned away",
+      "options": [
+        { "name": "HTTP 429, Too Many Requests", "pro": "Says the problem is this client's own request rate, so it knows to slow down", "con": "Says nothing about the health of the service" },
+        { "name": "HTTP 503, Service Unavailable", "pro": "Says the service is short of capacity. Stripe's post uses it for the fleet usage load shedder", "con": "A client may not know whether it caused the problem" }
+      ],
+      "pick": "Both, chosen by the situation. The post names 429 and 503 as candidates and uses 503 for fleet-wide shedding."
+    },
+    {
+      "title": "How to switch a limiter on",
+      "options": [
+        { "name": "Enforce it straight away", "pro": "Protection starts at once", "con": "A threshold that is too low blocks real customers before anyone notices" },
+        { "name": "Dark launch first, then enforce behind a kill switch", "pro": "Shows what would have been blocked and lets thresholds be tuned from real traffic", "con": "Slower to protect, and extra work to build the reporting" }
+      ],
+      "pick": "A dark launch behind a feature flag, as Stripe advises."
+    }
+  ],
+  "roles": [
+    { "id": "client", "label": "API client", "description": "Sends requests with an Idempotency-Key and retries with backoff and jitter when it does not hear back." },
+    { "id": "edge", "label": "Limiters and shedders", "description": "Reject requests that would use too much: per user (rate, concurrency), for the whole fleet (usage) and per host (worker utilization)." },
+    { "id": "data", "label": "Redis and saved results", "description": "Where limiter counts live (Redis) and where the results of finished requests are kept by their key." },
+    { "id": "compute", "label": "API workers", "description": "Do the real work, such as creating a charge." }
+  ],
+  "quiz": [
+    {
+      "question": "One user's script, still under the request rate limit, sends a stream of very slow, CPU-heavy calls and ties up many workers. Which of Stripe's limiters is aimed at this?",
+      "options": [
+        "The concurrent requests limiter, which caps how many requests one user has in progress",
+        "The request rate limiter, because a lower token refill rate would solve it",
+        "The fleet usage load shedder, which reserves capacity for charges",
+        "The idempotency key, which stops the same call from running twice"
+      ],
+      "answer": 0,
+      "explanation": "Stripe describes the concurrent requests limiter as capping requests in progress, aimed at resource-intensive endpoints where retries make contention worse. A rate limit counts requests per second, so a user can stay under it while holding many workers with slow calls. The fleet shedder reacts to total load, not to one user. An idempotency key makes a repeated request safe but does nothing about calls that are all different."
+    },
+    {
+      "question": "A charge request finishes on the server, but the response is lost on the way back. The client retries with the same Idempotency-Key. What does Stripe's post say the server does?",
+      "options": [
+        "It processes the charge again, because the first response was never delivered",
+        "It replies with the saved result of the first, successful attempt",
+        "It rejects the retry with a 429, because the same request was sent twice",
+        "It waits for the client to send a new key and then charges once"
+      ],
+      "answer": 1,
+      "explanation": "The post lists three cases, and for a request that finished but whose response was lost, the server replies with the cached result of the successful operation. Processing again is exactly the double charge the key exists to prevent. A 429 is the answer to a user over a rate limit, not to a repeat of a request. Asking for a new key would defeat the point, because a new key looks like a new request."
+    },
+    {
+      "question": "Stripe's worker utilization load shedder must drop some traffic on an overloaded host. Which traffic does the post say it drops first, and how quickly?",
+      "options": [
+        "Critical methods first, then everything else, as fast as the host can react",
+        "GET requests first, because reading is less important than writing, as fast as possible",
+        "Test-mode traffic first, escalating only if needed, and deliberately slowly so it does not flap",
+        "Whichever users sent the most requests, immediately, until the host recovers"
+      ],
+      "answer": 2,
+      "explanation": "The post gives four categories, critical methods, POSTs, GETs and test-mode traffic, and says the shedder starts with test-mode traffic and escalates if that is not enough. Stripe made shedding and restoring slow on purpose to avoid flapping. Dropping critical methods first would shed the most important requests. The post ranks test-mode traffic below GETs, and it does not describe shedding by which user sent the most."
+    }
+  ],
+  "sources": [
+    {
+      "title": "Scaling your API with rate limiters",
+      "publisher": "Stripe, Paul Tarjan",
+      "year": 2017,
+      "url": "https://stripe.com/blog/rate-limiters"
+    },
+    {
+      "title": "Designing robust and predictable APIs with idempotency",
+      "publisher": "Stripe, Brandur Leach",
+      "year": 2017,
+      "url": "https://stripe.com/blog/idempotency"
+    }
+  ]
+}
