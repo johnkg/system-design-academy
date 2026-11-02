@@ -1,0 +1,411 @@
+{
+  "name": "How Google Built Maglev",
+  "difficulty": "advanced",
+  "intent": "Follow the design in Google's 2016 Maglev paper for a software network load balancer built from ordinary servers: ECMP to spread packets, kernel-bypass forwarding at line rate, connection tracking, and a new consistent hashing table that spreads load almost perfectly and moves few connections when backends change, using only what the paper says.",
+  "codeTitle": "Maglev hashing, a lookup table and connection tracking",
+  "finalIntro": "One packet from a user to a Google service, then what happens when a backend disappears and the router sends the connection to a different Maglev machine.",
+  "prompt": "The 2016 paper 'Maglev: A Fast and Reliable Software Network Load Balancer' says Google services such as Search and Gmail receive millions of queries per second, so each service runs on many servers in clusters around the world, and inside a cluster a network load balancer matches each packet to a service and forwards it to one of that service's endpoints. The paper says such load balancers were traditionally dedicated hardware, which has four limits: capacity limited to one unit, only 1+1 redundancy, little flexibility and costly upgrades. Maglev has served Google's traffic since 2008. How would you build the load balancer as a distributed software system on ordinary servers, so that capacity grows by adding machines, a machine can fail or be upgraded without breaking connections, and traffic is spread evenly over the backends? This study follows the paper, which is listed at the end. The simulation and the code samples are small models for learning, not Google's code or data.",
+  "functional": [
+    "Match each incoming packet to a service by its virtual IP address (VIP)",
+    "Choose one of the service's backends and forward the packet to it",
+    "Send every packet of one connection to the same backend",
+    "Stop sending to backends that fail their health checks, and add new backends",
+    "Announce each VIP to the router, and withdraw it when a Maglev machine is unhealthy"
+  ],
+  "nonFunctional": [
+    "Scale out: add Maglev machines to add capacity, with traffic spread over them by the router",
+    "Forward packets at line rate, even small ones: the paper says 10 Gbps is typical, which is about 813 thousand packets a second for 1,500-byte packets and about 9.06 million for 100-byte packets",
+    "Add little latency: the paper reports about 350 ns of processing per packet",
+    "Keep connections alive through changes of the Maglev set, such as a rolling upgrade that can last over an hour",
+    "Spread load evenly: backends should not need large over-provisioning to absorb imbalance"
+  ],
+  "firstAttempt": {
+    "text": "This is the situation the paper describes. Dedicated hardware load balancers sit between the routers and the service endpoints. They are usually deployed in pairs, and each pair handles the traffic of the services assigned to it.",
+    "limits": [
+      "The paper says their scalability is limited by the maximum capacity of a single unit, which could not keep up with Google's traffic growth",
+      "They are often deployed in pairs, giving only 1+1 redundancy, which does not meet Google's availability needs",
+      "They are hard or impossible to modify, which slows down new features",
+      "Adding capacity usually means buying and physically installing new hardware"
+    ]
+  },
+  "nodes": [
+    {
+      "id": "user",
+      "label": "Users",
+      "kind": "client",
+      "x": 8,
+      "y": 50
+    },
+    {
+      "id": "router",
+      "label": "Router (ECMP)",
+      "kind": "edge",
+      "x": 30,
+      "y": 50
+    },
+    {
+      "id": "hw",
+      "label": "Hardware load balancer pair",
+      "kind": "compute",
+      "x": 60,
+      "y": 50,
+      "until": 1
+    },
+    {
+      "id": "maglev",
+      "label": "Maglev machines",
+      "kind": "compute",
+      "x": 60,
+      "y": 50,
+      "at": 1
+    },
+    {
+      "id": "backends",
+      "label": "Service backends",
+      "kind": "data",
+      "x": 92,
+      "y": 50
+    },
+    {
+      "id": "table",
+      "label": "Lookup table (Maglev hashing)",
+      "kind": "async",
+      "x": 60,
+      "y": 16,
+      "at": 3
+    },
+    {
+      "id": "conn",
+      "label": "Connection table",
+      "kind": "data",
+      "x": 60,
+      "y": 84,
+      "at": 4
+    },
+    {
+      "id": "ctrl",
+      "label": "Controller (BGP, health checks)",
+      "kind": "async",
+      "x": 30,
+      "y": 16,
+      "at": 5
+    }
+  ],
+  "edges": [
+    {
+      "from": "user",
+      "to": "router"
+    },
+    {
+      "from": "router",
+      "to": "hw",
+      "until": 1
+    },
+    {
+      "from": "hw",
+      "to": "backends",
+      "until": 1
+    },
+    {
+      "from": "router",
+      "to": "maglev",
+      "at": 1
+    },
+    {
+      "from": "maglev",
+      "to": "backends",
+      "at": 1
+    },
+    {
+      "from": "maglev",
+      "to": "table",
+      "at": 3
+    },
+    {
+      "from": "maglev",
+      "to": "conn",
+      "at": 4
+    },
+    {
+      "from": "ctrl",
+      "to": "router",
+      "at": 5
+    },
+    {
+      "from": "ctrl",
+      "to": "maglev",
+      "at": 5
+    }
+  ],
+  "steps": [
+    {
+      "title": "Replace the hardware box with a pool of ordinary servers",
+      "problem": "One hardware unit caps capacity, and a pair gives only 1+1 redundancy.",
+      "fix": "Every Google service has one or more virtual IP addresses (VIPs), which belong to a service, not a machine. Maglev associates each VIP with a set of service endpoints and announces the VIP to the router. All Maglev machines in the cluster announce the same VIP at the same cost, so the router uses equal-cost multipath (ECMP) to spread packets evenly across them. A Maglev machine matches the packet to a VIP, picks an endpoint, and sends the packet on wrapped in a GRE tunnel header addressed to the endpoint. The endpoint unwraps it and answers with a packet that has the VIP as its source, sent straight to the router: the paper says Direct Server Return keeps the larger response traffic away from Maglev. The result is N+1 redundancy on commodity machines, and capacity that grows by adding machines.",
+      "tradeoff": "ECMP knows nothing about connections, so it can change which Maglev machine a connection goes to when the set of machines changes. The rest of the design deals with that.",
+      "concepts": [
+        {
+          "slug": "load-balancing"
+        },
+        {
+          "slug": "anycast-and-bgp-routing"
+        },
+        {
+          "slug": "proxies"
+        }
+      ]
+    },
+    {
+      "title": "Process packets in user space at line rate",
+      "problem": "The load balancer must handle small packets at 10 Gbps. The Linux kernel network stack is too slow for that.",
+      "fix": "The Maglev forwarder is a user-space program that bypasses the kernel. It shares a packet pool with the network card, with rings of pointers so that packets are never copied. A steering module computes a 5-tuple hash (source and destination address and port, and protocol) and spreads packets over receive queues, each served by a packet thread pinned to its own CPU core. The threads do not share data, so they never contend. Packets are processed in batches to cut the cost of crossing between the program and the card. The paper reports that a packet takes about 350 ns to process, that a batch timer of 50 microseconds adds at most that much to each packet when the machine is nearly idle, and that an overloaded machine adds at most about 300 microseconds, assuming a packet pool of 3,000 packets that is processed at 10 million packets a second.",
+      "tradeoff": "Bypassing the kernel gives speed and takes on the work the kernel did, and the machine can only do load balancing. The paper says this loses no functionality it needed, and each machine's throughput improved greatly.",
+      "concepts": [
+        {
+          "slug": "latency-and-round-trips"
+        },
+        {
+          "slug": "tcp-vs-udp"
+        },
+        {
+          "slug": "back-of-the-envelope-estimation"
+        }
+      ]
+    },
+    {
+      "title": "Pick the backend with Maglev hashing, a lookup table",
+      "problem": "Backends are added, removed and fail. A hash like hash mod N would move almost every connection when N changes, and plain consistent hashing spreads load unevenly.",
+      "fix": "Maglev hashing builds a lookup table of M slots, where M is a prime much larger than the number of backends N. Each backend gets a permutation of the slots, from an offset and a skip derived from two hashes of its name: slot j in the permutation is (offset + j x skip) mod M. The backends then take turns, in order, and each claims the next slot in its permutation that is still free, until the table is full. Every backend ends up with either the floor or the ceiling of M divided by N slots, so the counts differ by at most one. A packet's 5-tuple hash selects a slot and so a backend. In the paper's example with 3 backends and 7 slots, removing one backend changes its slots plus only one other. In practice M is larger than 100 times N to keep the imbalance under 1%, and the default is 65,537.",
+      "tradeoff": "Load is almost perfectly even, while minimal disruption is only approximate: a few connections that were on other backends can move. The paper says it was willing to trade a little of that, because connection tracking is the main protection.",
+      "concepts": [
+        {
+          "slug": "consistent-hashing"
+        },
+        {
+          "slug": "load-balancing"
+        },
+        {
+          "slug": "probabilistic-data-structures"
+        }
+      ]
+    },
+    {
+      "title": "Remember each connection in a connection table",
+      "problem": "Even a good hash can send an existing connection to a new backend after a change in the backends, and that breaks it.",
+      "fix": "Each packet thread keeps a fixed-size connection table that maps the 5-tuple hash to a backend. For a packet of an unknown connection the thread chooses a backend with the lookup table and records the choice. Later packets of that connection use the recorded backend for as long as it can serve them, so backend changes do not affect established connections. Each thread has its own table, to avoid contention.",
+      "tradeoff": "The table has finite space and can fill under heavy load or a SYN flood, and it does not survive a change of Maglev machine. That is why the lookup table has to be consistent as well.",
+      "concepts": [
+        {
+          "slug": "load-balancing"
+        },
+        {
+          "slug": "caching"
+        },
+        {
+          "slug": "tcp-congestion-control"
+        }
+      ]
+    },
+    {
+      "title": "Survive router changes, health, and upgrades with consistent hashing and a controller",
+      "problem": "When Maglev machines are added, removed, or upgraded in a rolling restart that can last over an hour, ECMP reshuffles flows, so packets arrive at a machine that has no entry for the connection.",
+      "fix": "The new machine falls back to the lookup table. Because the table is built consistently, every Maglev machine with the same backend pool computes the same answer for the same packet, so the connection goes to the same backend as before in nearly all cases, and the disruption is limited to the few connections for which the table changed. Each machine runs a controller next to the forwarder. The controller health-checks the forwarder, and if it is unhealthy it withdraws all the VIPs through BGP so the router stops sending traffic to it. It also health-checks the backends and updates the pools. The paper adds that several shards of Maglev can serve different sets of VIPs in one cluster for isolation.",
+      "tradeoff": "The table only helps while machines agree on the backend pool, and the paper says the pools on different machines may be briefly out of sync. Together, the table and the connection table give two lines of defence.",
+      "concepts": [
+        {
+          "slug": "health-checks"
+        },
+        {
+          "slug": "consistent-hashing"
+        },
+        {
+          "slug": "blue-green-and-rolling-deployments"
+        },
+        {
+          "slug": "anycast-and-bgp-routing"
+        }
+      ]
+    }
+  ],
+  "failures": [
+    {
+      "scenario": "A backend fails its health check",
+      "impact": "Connections to it will break, and new connections must not be sent to it.",
+      "answer": "The controller removes it from the pool and the lookup table is rebuilt. Connections on other backends keep using the connection table, and only those on the failed backend have to move.",
+      "concepts": [
+        {
+          "slug": "health-checks"
+        }
+      ]
+    },
+    {
+      "scenario": "A Maglev machine is restarted for an upgrade",
+      "impact": "ECMP sends some of its connections to other Maglev machines that have no table entry for them.",
+      "answer": "The new machines use the lookup table, which gives the same backend as before for nearly every connection.",
+      "concepts": [
+        {
+          "slug": "consistent-hashing"
+        },
+        {
+          "slug": "blue-green-and-rolling-deployments"
+        }
+      ]
+    },
+    {
+      "scenario": "A SYN flood fills the connection table",
+      "impact": "New entries cannot be stored, and per-machine tracking stops working.",
+      "answer": "Maglev still picks a backend for every packet from the lookup table, so traffic is delivered consistently without tracking. The paper reports that Maglev needs a sixth packet thread to saturate the card under SYN traffic.",
+      "concepts": [
+        {
+          "slug": "rate-limiting"
+        },
+        {
+          "slug": "load-shedding"
+        }
+      ]
+    },
+    {
+      "scenario": "The forwarder on one machine stops working",
+      "impact": "The router would keep sending it its share of traffic.",
+      "answer": "The controller on the machine notices, withdraws the VIPs over BGP, and the router stops sending packets to it.",
+      "concepts": [
+        {
+          "slug": "anycast-and-bgp-routing"
+        },
+        {
+          "slug": "failure-detection"
+        }
+      ]
+    },
+    {
+      "scenario": "Several backends fail at once",
+      "impact": "A larger share of the table's slots must change, so more connections move if they are not tracked.",
+      "answer": "The paper measured with 1,000 backends that the share of changed slots grows with the number of concurrent failures and shrinks with a bigger table. It kept 65,537 slots because it expects concurrent failures to be rare, and relies on connection tracking as its main protection.",
+      "concepts": [
+        {
+          "slug": "consistent-hashing"
+        }
+      ]
+    }
+  ],
+  "alternatives": [
+    {
+      "title": "Hardware or software load balancers",
+      "options": [
+        {
+          "name": "Dedicated hardware",
+          "pro": "Purpose-built",
+          "con": "Capped by one unit, 1+1 redundancy, hard to change, costly to upgrade"
+        },
+        {
+          "name": "Software on commodity servers behind ECMP",
+          "pro": "Scale out, N+1 redundancy, fast iteration",
+          "con": "Needs a very fast packet path, and connections must survive ECMP changes"
+        }
+      ],
+      "pick": "Software on commodity servers, as Maglev does."
+    },
+    {
+      "title": "Which consistent hashing",
+      "options": [
+        {
+          "name": "Karger ring hashing or Rendezvous hashing",
+          "pro": "Remaining entries are not disturbed when a backend leaves",
+          "con": "With a table of 65,537 slots the paper says they need backends over-provisioned by 29.7% and 49.5% for imbalance"
+        },
+        {
+          "name": "Maglev hashing",
+          "pro": "Almost perfect balance at any table size, with small disturbance",
+          "con": "Some entries of other backends can change when a backend leaves"
+        }
+      ],
+      "pick": "Maglev hashing, with connection tracking to cover the rest."
+    },
+    {
+      "title": "Where connection state lives",
+      "options": [
+        {
+          "name": "Shared between all Maglev machines",
+          "pro": "Any machine knows every connection",
+          "con": "Expensive to keep consistent at this packet rate"
+        },
+        {
+          "name": "Per machine, with consistent hashing as a fallback",
+          "pro": "No coordination between machines",
+          "con": "A change of machine loses the tracking, so the table must pick the same backend"
+        }
+      ],
+      "pick": "Per machine plus consistent hashing."
+    }
+  ],
+  "roles": [
+    {
+      "id": "client",
+      "label": "Users",
+      "description": "Send packets to a service's virtual IP."
+    },
+    {
+      "id": "edge",
+      "label": "Router",
+      "description": "Spreads packets over the Maglev machines with ECMP."
+    },
+    {
+      "id": "compute",
+      "label": "Maglev machines",
+      "description": "Forwarder threads that pick a backend and encapsulate the packet."
+    },
+    {
+      "id": "data",
+      "label": "Backends and connection tables",
+      "description": "The service endpoints, and each thread's table of established connections."
+    },
+    {
+      "id": "async",
+      "label": "Lookup table and controller",
+      "description": "The consistent hash table, and the controller that announces VIPs and checks health."
+    }
+  ],
+  "quiz": [
+    {
+      "question": "The router starts sending a connection's packets to a different Maglev machine, which has no connection table entry for it. Why does the connection usually survive?",
+      "options": [
+        "Maglev machines share a single connection table",
+        "The new machine asks the old one where the connection was",
+        "The new machine picks the backend from the same consistent lookup table, which gives the same answer as before for nearly all connections",
+        "The backend reconnects to the user"
+      ],
+      "answer": 2,
+      "explanation": "All Maglev machines with the same backend pool build the same lookup table, so the same packet hash leads to the same backend, apart from the few slots that changed. Sharing state or asking the old machine would cost too much at this packet rate, and a backend cannot reconnect to the user."
+    },
+    {
+      "question": "How does Maglev hashing build its lookup table?",
+      "options": [
+        "Each backend takes turns claiming the next free slot in its own permutation of the slots, until all slots are taken",
+        "Each backend is placed at several random points on a ring",
+        "The slots are divided into equal ranges, one for each backend",
+        "Each backend hashes its name and takes the slot with that number"
+      ],
+      "answer": 0,
+      "explanation": "Taking turns guarantees each backend gets the floor or ceiling of M divided by N slots, so the load is almost perfectly even. A ring is Karger hashing, which balances worse. Equal ranges would reshuffle everything when a backend leaves. A single hash per backend would give collisions and uneven counts."
+    },
+    {
+      "question": "Why does Maglev forward packets from user space and bypass the Linux kernel?",
+      "options": [
+        "To make the packets bigger",
+        "The kernel network stack cannot keep up with small packets at line rate, so Maglev shares a packet pool with the network card",
+        "Because the kernel cannot do GRE",
+        "To avoid using CPU cores"
+      ],
+      "answer": 1,
+      "explanation": "Handling about 9 million small packets a second needs every cost removed: Maglev shares a packet pool with the card, copies nothing, batches work and pins threads to cores. Packet size is not the goal. The paper does not say the kernel cannot do GRE, and Maglev uses several cores."
+    }
+  ],
+  "sources": [
+    {
+      "title": "Maglev: A Fast and Reliable Software Network Load Balancer",
+      "publisher": "Google Research (NSDI 2016)",
+      "year": 2016,
+      "url": "https://research.google/pubs/maglev-a-fast-and-reliable-software-network-load-balancer/"
+    }
+  ]
+}
