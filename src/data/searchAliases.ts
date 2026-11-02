@@ -66,6 +66,7 @@ export const aliasGroups: string[][] = [
   ['tao', 'facebook', 'social graph', 'objects and associations', 'follower cache', 'leader cache', 'memcache', 'read-after-write', 'graph store', 'inverse edge'],
   ['gfs', 'google file system', 'chunkserver', 'chunk', 'record append', 'hdfs', 'distributed file system', 'master', 'lease', 'commodity hardware'],
   ['mapreduce', 'map reduce', 'google', 'hadoop', 'shuffle', 'combiner', 'straggler', 'backup task', 'batch processing', 'word count'],
+  ['haystack', 'facebook', 'photo storage', 'needle', 'blob store', 'append-only', 'compaction', 'nfs', 'image storage', 'small files'],
   ['unimog', 'cloudflare load balancer', 'layer 4 load balancer', 'xdp', 'ebpf', 'ecmp', 'connection draining'],
   ['estimation', 'capacity planning', 'back of the envelope', 'qps', 'napkin math', 'requests per second', 'how many servers', 'latency numbers'],
   ['inverted index', 'full-text search', 'full text', 'postings list', 'tf-idf', 'bm25', 'lucene', 'elasticsearch', 'tokenizer', 'stemming', 'relevance'],

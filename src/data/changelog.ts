@@ -3,6 +3,14 @@ export interface Change { date: string; title: string; items: { text: string; hr
 
 export const changelog: Change[] = [
   {
+    date: '2026-11-02',
+    title: 'Three more famous systems, and a simulation for every new study',
+    items: [
+      { text: 'How Google built the Google File System (one master, 64 MB chunks, leases, record append) and MapReduce (map, shuffle, reduce, re-running lost work, backup tasks), and how Facebook built Haystack for photos. Each is built only from the original paper or post, which is listed at the end.', href: 'case-studies/' },
+      { text: 'The five studies added yesterday (Dynamo, Spanner, Bigtable, Stripe rate limiters and TAO) now also have a back-of-the-envelope estimator and a break-it simulation, like the older company studies.', href: 'case-studies/' },
+    ],
+  },
+  {
     date: '2026-11-01',
     title: 'Five more case studies from famous systems',
     items: [
