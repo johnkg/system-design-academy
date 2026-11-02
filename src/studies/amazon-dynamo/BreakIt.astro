@@ -1,0 +1,85 @@
+---
+import PlaygroundShell from '../../components/PlaygroundShell.astro';
+import RangeField from '../../components/RangeField.astro';
+---
+<PlaygroundShell title="Nodes fail during writes" hint="Choose a strict or a sloppy quorum, how many acknowledgements a write needs, and how many nodes are down, then see which of 1,000 cart writes are refused and how many copies are waiting on stand-in nodes. A simple model, not Amazon's code or data.">
+  <ol class="how">
+    <li>Press <b>Reset</b>. With <b>Strict quorum (only the 3 owners)</b>, <b>Acknowledgements a write needs (W)</b> at <b>2</b> and <b>Nodes down (of 8)</b> at <b>2</b>, <b>0</b> writes are refused, but <b>750</b> owner copies are missing, because a strict quorum does not write the copy for an owner that is down.</li>
+    <li>Set <b>Acknowledgements a write needs (W)</b> to <b>3</b> and <b>Nodes down (of 8)</b> to <b>1</b>: <b>375</b> writes are refused, because every write whose three owners include the down node cannot collect three acknowledgements.</li>
+    <li>Set <b>Design</b> to <b>Sloppy quorum with hinted handoff</b>: <b>0</b> writes are refused, <b>375</b> hinted copies wait on stand-in nodes, and <b>0</b> owner copies are missing once the owners return.</li>
+    <li>Set <b>Acknowledgements a write needs (W)</b> to <b>2</b>, <b>Nodes down (of 8)</b> to <b>2</b> and <b>Stand-in nodes</b> to <b>die before handing the copies back</b>: <b>750</b> hinted copies are lost with them and <b>750</b> owner copies stay missing until Merkle-tree repair.</li>
+  </ol>
+  <div class="pg brk" data-brk>
+    <div class="pg-row">
+      <label>Design <select class="pg-in" data-design><option value="strict">Strict quorum (only the 3 owners)</option><option value="sloppy">Sloppy quorum with hinted handoff</option></select></label>
+      <RangeField label="Acknowledgements a write needs (W)" name="w" min="1" max="3" value="2" />
+      <RangeField label="Nodes down (of 8)" name="down" min="0" max="4" value="2" />
+      <label>Stand-in nodes <select class="pg-in" data-lost><option value="keep">keep their hinted copies until the owner returns</option><option value="die">die before handing the copies back</option></select></label>
+      <button type="button" class="btn" data-reset>Reset</button>
+    </div>
+    <div class="pg-grid">
+      <div class="pg-box" data-b1><h3>Writes refused (of 1,000)</h3><span class="pg-mono" data-o1></span><span class="pg-note" data-n1></span></div>
+      <div class="pg-box" data-b2><h3>Hinted copies on stand-in nodes</h3><span class="pg-mono" data-o2></span><span class="pg-note" data-n2></span></div>
+      <div class="pg-box" data-b3><h3>Owner copies missing after the nodes return</h3><span class="pg-mono" data-o3></span><span class="pg-note" data-n3></span></div>
+      <div class="pg-box" data-b4><h3>Writes accepted with all 3 owners up</h3><span class="pg-mono" data-o4></span><span class="pg-note" data-n4></span></div>
+    </div>
+    <p class="pg-out" data-verdict aria-live="polite"></p>
+    <p class="pg-note">Model, invented for teaching and not Amazon data: 8 nodes on a ring, 1,000 keys spread evenly, and every key kept on 3 owners (N = 3), the owner and the next two nodes. Nodes fail in a fixed order: 2, 5, 8, then 3. A strict quorum accepts a write only if at least W of its 3 owners are up and does not write the copy for an owner that is down. A sloppy quorum accepts it if at least W nodes are healthy anywhere and sends the missing copy to a stand-in with a hint. When the owners return, stand-ins that kept their hinted copies hand them back. If the stand-ins die first, those copies are lost until repair. Real failures are often correlated and stand-ins are chosen by position on the ring.</p>
+  </div>
+</PlaygroundShell>
+<script>
+  import { query, formatWholeNumber, mulberry32 } from '../../playground';
+  document.querySelectorAll<HTMLElement>('[data-brk]').forEach((root) => {
+    const q = query(root);
+    const DEFAULTS: Record<string, string> = {"design": "strict", "w": "2", "down": "2", "lost": "keep"};
+    const input = (k: string) => q<HTMLInputElement>(`[data-${k}]`);
+    const select = (k: string) => q<HTMLSelectElement>(`[data-${k}]`);
+    const whole = formatWholeNumber;
+    const one = (n: number) => (Math.round(n * 10) / 10).toLocaleString('en-US');
+
+    function draw() {
+      const design = select('design').value;
+      const lost = select('lost').value;
+      const w = Number(input('w').value);
+      const down = Number(input('down').value);
+      q('[data-wval]').textContent = String(w);
+      q('[data-downval]').textContent = String(down);
+      const boxes: { big: string; note: string; bad: boolean }[] = [];
+      let verdict = '';
+      let failed = false;
+      const NODES = 8, KEYS = 1000, COPIES = 3, ORDER = [1, 4, 7, 2];
+      const downSet = new Set(ORDER.slice(0, down));
+      let refused = 0, hinted = 0, missing = 0, full = 0;
+      for (let k = 0; k < KEYS; k++) {
+        const owners = [0, 1, 2].map((i) => (k + i) % NODES);
+        const downOwners = owners.filter((o) => downSet.has(o)).length;
+        const ok = design === 'strict' ? COPIES - downOwners >= w : NODES - down >= w;
+        if (!ok) { refused++; continue; }
+        if (downOwners === 0) full++;
+        if (design === 'sloppy') { hinted += downOwners; if (lost === 'die') missing += downOwners; }
+        else missing += downOwners;
+      }
+      boxes.push({ big: whole(refused), note: refused > 0 ? `${one(refused / 10)}% of writes failed while ${down} node${down === 1 ? ' was' : 's were'} down` : 'every write was accepted', bad: refused > 0 });
+      boxes.push({ big: whole(hinted), note: design === 'strict' ? 'a strict quorum has no stand-ins' : 'each carries a hint naming its owner', bad: false });
+      boxes.push({ big: whole(missing), note: missing > 0 ? 'these stay missing until Merkle-tree repair compares the replicas' : 'every owner has its copies again', bad: missing > 0 });
+      boxes.push({ big: whole(full), note: 'the rest were accepted with an owner down', bad: false });
+      failed = refused > 0 || missing > 0;
+      if (refused > 0) verdict = `${whole(refused)} cart writes were refused, so customers could not add items. A sloppy quorum would use stand-in nodes and accept them.`;
+      else if (missing > 0) verdict = `Writes succeeded, but ${whole(missing)} owner copies are missing. Anti-entropy with Merkle trees finds and copies them.`;
+      else verdict = `Nothing broke: every write was accepted${hinted > 0 ? ` and ${whole(hinted)} hinted copies will be handed back` : ''}.`;
+      boxes.forEach((b, i) => {
+        q(`[data-o${i + 1}]`).textContent = b.big;
+        q(`[data-n${i + 1}]`).textContent = b.note;
+        q<HTMLElement>(`[data-b${i + 1}]`).style.setProperty('--c', b.bad ? 'var(--bad)' : 'var(--good)');
+      });
+      const out = q('[data-verdict]'); out.classList.toggle('bad', failed); out.textContent = verdict;
+    }
+    root.addEventListener('input', draw);
+    root.addEventListener('change', draw);
+    q('[data-reset]').addEventListener('click', () => {
+      Object.entries(DEFAULTS).forEach(([k, v]) => { (root.querySelector<HTMLInputElement | HTMLSelectElement>(`[data-${k}]`)!).value = v; });
+      draw();
+    });
+    draw();
+  });
+</script>

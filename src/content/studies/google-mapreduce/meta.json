@@ -1,0 +1,403 @@
+{
+  "name": "How Google Built MapReduce",
+  "difficulty": "intermediate",
+  "intent": "Follow the design in Google's 2004 MapReduce paper for running a computation over terabytes on thousands of failure-prone machines: map and reduce functions, a master and workers, a shuffle through local disks, re-execution after failures, data locality and backup tasks, using only what the paper says.",
+  "codeTitle": "a word count with a combiner, re-execution and a backup task",
+  "finalIntro": "One word count going through map, shuffle and reduce while a worker dies and a straggler is backed up.",
+  "prompt": "The 2004 paper 'MapReduce: Simplified Data Processing on Large Clusters' says Google had implemented hundreds of special-purpose computations, such as building inverted indexes and processing web logs, and each was simple in itself. But the input was large and the computation had to be spread over hundreds or thousands of machines, which made the code for parallelizing, distributing data and handling failures bigger than the computation. How would you let a programmer write only the simple part, and have a library run it over a large cluster of unreliable commodity machines, where the paper says machine failures are common? This study follows the paper, which is listed at the end. The simulation and the code samples are small models for learning, not Google's code or data.",
+  "functional": [
+    "Let a programmer express a computation as a map function and a reduce function",
+    "Split the input, run the maps in parallel, group the intermediate results by key and run the reduces in parallel",
+    "Handle machine failures during a run without the programmer doing anything",
+    "Allow common extras: a combiner, a custom partitioning function, sorted output and skipping records that crash the code",
+    "Write the final result as files in the cluster file system"
+  ],
+  "nonFunctional": [
+    "Scale: the paper says a typical computation processes many terabytes on thousands of machines",
+    "Tolerate failures: the paper says clusters have hundreds or thousands of machines, so failures are common, and one run can see many",
+    "Use the network sparingly: bandwidth is scarce, so reading input should be local where possible",
+    "Finish a run in a time close to the slowest necessary work, so a few slow machines must not hold up the whole run",
+    "Simple enough that programmers with no parallel systems experience can use it"
+  ],
+  "firstAttempt": {
+    "text": "This is the situation the paper describes. Each team writes its own distributed program for each computation: code that splits the input, starts processes on many machines, moves intermediate data between them, and copes with failures, mixed in with the code of the computation itself.",
+    "limits": [
+      "The paper says the parallelizing, data distribution and failure handling code obscured the simple computation",
+      "Every team repeats the same hard work, and mistakes in it are costly because runs are long",
+      "A run on thousands of machines almost always meets a failed machine, which an ad-hoc program often handles by starting again",
+      "Changing the computation means changing the distributed code, which the paper says was hard in the old indexing system"
+    ]
+  },
+  "nodes": [
+    {
+      "id": "user",
+      "label": "User program",
+      "kind": "client",
+      "x": 8,
+      "y": 50
+    },
+    {
+      "id": "job",
+      "label": "Hand-written distributed program",
+      "kind": "compute",
+      "x": 80,
+      "y": 50,
+      "until": 1
+    },
+    {
+      "id": "master",
+      "label": "Master",
+      "kind": "compute",
+      "x": 34,
+      "y": 16,
+      "at": 1
+    },
+    {
+      "id": "mapw",
+      "label": "Map workers",
+      "kind": "compute",
+      "x": 72,
+      "y": 16,
+      "at": 1
+    },
+    {
+      "id": "gfs",
+      "label": "GFS (input and output)",
+      "kind": "data",
+      "x": 92,
+      "y": 50,
+      "at": 1
+    },
+    {
+      "id": "disks",
+      "label": "Local disks (map output)",
+      "kind": "data",
+      "x": 50,
+      "y": 50,
+      "at": 2
+    },
+    {
+      "id": "redw",
+      "label": "Reduce workers",
+      "kind": "compute",
+      "x": 72,
+      "y": 84,
+      "at": 2
+    },
+    {
+      "id": "backup",
+      "label": "Backup task",
+      "kind": "compute",
+      "x": 34,
+      "y": 84,
+      "at": 5
+    }
+  ],
+  "edges": [
+    {
+      "from": "user",
+      "to": "job",
+      "until": 1
+    },
+    {
+      "from": "user",
+      "to": "master",
+      "at": 1
+    },
+    {
+      "from": "master",
+      "to": "mapw",
+      "at": 1
+    },
+    {
+      "from": "mapw",
+      "to": "disks",
+      "at": 2
+    },
+    {
+      "from": "disks",
+      "to": "redw",
+      "at": 2
+    },
+    {
+      "from": "redw",
+      "to": "gfs",
+      "at": 2
+    },
+    {
+      "from": "master",
+      "to": "redw",
+      "at": 3
+    },
+    {
+      "from": "gfs",
+      "to": "mapw",
+      "at": 4
+    },
+    {
+      "from": "master",
+      "to": "backup",
+      "at": 5
+    },
+    {
+      "from": "backup",
+      "to": "gfs",
+      "at": 5
+    }
+  ],
+  "steps": [
+    {
+      "title": "Split the work into map and reduce functions run by a master and workers",
+      "problem": "Programmers want to write the computation, not the parallel machinery around it.",
+      "fix": "The user writes a map function, which takes an input key and value and produces intermediate key and value pairs, and a reduce function, which receives one intermediate key with all its values and merges them. The paper's examples are distributed grep, counting URL access frequency, reversing a web-link graph, building inverted indexes and distributed sort. The library splits the input into M pieces and starts many copies of the program on a cluster. One copy is the master, and the others are workers. The master picks idle workers and gives each a map task or a reduce task, and it keeps the state of every task (idle, in progress or completed) and which worker has it.",
+      "tradeoff": "The model limits what can be expressed, which is what lets the library parallelize everything automatically. Computations that do not fit map then reduce, such as iterative ones, are awkward.",
+      "concepts": [
+        {
+          "slug": "mapreduce-and-shuffles"
+        },
+        {
+          "slug": "batch-vs-stream-processing"
+        }
+      ]
+    },
+    {
+      "title": "Partition by key and move intermediate data through local disks",
+      "problem": "All values for one key must meet in one reduce call, but they come from many map tasks on many machines.",
+      "fix": "The intermediate keys are divided into R pieces by a partitioning function, by default hash(key) mod R. A map worker buffers its output in memory and periodically writes it to its local disk, divided into R regions, then reports the locations to the master. The master tells a reduce worker where its regions are, and the reduce worker reads them with remote procedure calls from the map workers' disks. It then sorts the data by key, an external sort if it is too large, so that all occurrences of a key are together, and calls the reduce function once per key. The output goes to one file per reduce task. An optional combiner function merges repeated keys on the map side, for example adding the counts of a word, to cut the data sent over the network.",
+      "tradeoff": "Keeping map output on local disks avoids writing it to the replicated file system, which would be slower, but it makes that output vulnerable to a machine failure, which the next step handles.",
+      "concepts": [
+        {
+          "slug": "mapreduce-and-shuffles"
+        },
+        {
+          "slug": "ordering-and-partitioning"
+        },
+        {
+          "slug": "consistent-hashing"
+        }
+      ]
+    },
+    {
+      "title": "Recover from failures by running tasks again",
+      "problem": "With thousands of machines, workers die during a run, and the master cannot restart the whole computation each time.",
+      "fix": "The master pings every worker from time to time. A worker that does not answer in a certain time is marked failed. Its in-progress map and reduce tasks go back to idle and are given to other workers. Its completed map tasks must also be done again, because their output was on the failed machine's local disk and cannot be read now. Completed reduce tasks need no repeat because their output is in the global file system. Each map task commits by sending the master the names of its R files, and the master ignores a second completion of the same task. Each reduce task writes to a temporary file and atomically renames it to the final name, so running it twice leaves one complete output file. The paper describes a run in which network maintenance made groups of 80 machines unreachable for several minutes, and the master simply re-executed the work and the computation finished.",
+      "tradeoff": "This is simple, and it is correct when map and reduce are deterministic: the output is then the same as a sequential run. With non-deterministic functions the guarantees are weaker. The paper's implementation aborts the computation if the single master fails.",
+      "concepts": [
+        {
+          "slug": "idempotency"
+        },
+        {
+          "slug": "failure-detection"
+        },
+        {
+          "slug": "retries-and-backoff"
+        },
+        {
+          "slug": "delivery-guarantees"
+        }
+      ]
+    },
+    {
+      "title": "Move computation to the data",
+      "problem": "Network bandwidth is scarce, and terabytes of input cannot be moved across it for every run.",
+      "fix": "The input is stored in GFS, which cuts files into 64 MB blocks and keeps typically three copies on different machines. The master knows where the blocks are, and tries to schedule a map task on a machine that holds a replica of its input split. If it cannot, it schedules the task near a replica, for example on a machine on the same network switch. The paper says that when running large operations on a significant fraction of the cluster's workers, most input data is read locally and consumes no network bandwidth. Map tasks are sized to match: each split is about 16 MB to 64 MB, and R is a small multiple of the number of workers. The paper often used M = 200,000 and R = 5,000 with 2,000 workers.",
+      "tradeoff": "More and smaller tasks balance the load and speed up recovery from a failure, but the master must make O(M + R) scheduling decisions and keep O(M x R) state, so there is a practical limit.",
+      "concepts": [
+        {
+          "slug": "caching"
+        },
+        {
+          "slug": "load-balancing"
+        },
+        {
+          "slug": "horizontal-vs-vertical-scaling"
+        }
+      ]
+    },
+    {
+      "title": "Run backup copies of the last tasks",
+      "problem": "A run ends only when its slowest task ends. A machine with a bad disk or a busy CPU can make one of the last tasks take far longer than the rest.",
+      "fix": "When a MapReduce operation is close to completion, the master starts backup executions of the tasks still in progress. A task is marked complete when either the original or the backup finishes. The paper says the cost is a few percent more computing resources, and that the gain is large: its sort program took 44% longer, 1,283 seconds instead of 891, when backup tasks were turned off. The paper also describes how a machine with a bug that disabled its processor caches ran more than a hundred times slower. A related refinement lets the library skip records that make the user code crash every time: a signal handler sends the record's sequence number to the master, and after more than one failure on a record the master tells the next attempt to skip it.",
+      "tradeoff": "Backups use spare capacity to buy shorter runs. Skipping records changes the result, so it is an option, to be used when losing a few records is acceptable.",
+      "concepts": [
+        {
+          "slug": "hedged-requests-and-tail-latency"
+        },
+        {
+          "slug": "dead-letter-queues-and-poison-messages"
+        },
+        {
+          "slug": "graceful-degradation"
+        }
+      ]
+    }
+  ],
+  "failures": [
+    {
+      "scenario": "A worker dies after finishing its map tasks",
+      "impact": "The intermediate data for several reduce tasks was on its local disk and is gone.",
+      "answer": "The master marks the worker failed, resets those map tasks to idle and runs them elsewhere. Reduce workers that have not yet read the data read it from the new location.",
+      "concepts": [
+        {
+          "slug": "failure-detection"
+        },
+        {
+          "slug": "retries-and-backoff"
+        }
+      ]
+    },
+    {
+      "scenario": "Two copies of the same reduce task finish",
+      "impact": "Both want to write the final output file.",
+      "answer": "Each writes to a temporary file and atomically renames it, so the file system keeps one complete output, and the master ignores the second completion of the same task.",
+      "concepts": [
+        {
+          "slug": "idempotency"
+        }
+      ]
+    },
+    {
+      "scenario": "One machine is very slow and holds up the last tasks",
+      "impact": "The whole run waits for a straggler even though everything else is done.",
+      "answer": "The master runs a backup copy of each remaining task on another worker. Whichever copy finishes first completes the task.",
+      "concepts": [
+        {
+          "slug": "hedged-requests-and-tail-latency"
+        }
+      ]
+    },
+    {
+      "scenario": "The code crashes deterministically on one bad record",
+      "impact": "The task fails again every time it is retried, and the run never finishes.",
+      "answer": "In skip mode the library notes the record that was being processed when the code crashed, and after more than one failure the master tells the next execution to skip it.",
+      "concepts": [
+        {
+          "slug": "dead-letter-queues-and-poison-messages"
+        }
+      ]
+    },
+    {
+      "scenario": "The master dies",
+      "impact": "No one is tracking the tasks.",
+      "answer": "The paper says it is easy to checkpoint the master's data structures and restart it, but with a single master failure is unlikely, so its implementation aborts the computation and clients can retry it.",
+      "concepts": [
+        {
+          "slug": "leader-election"
+        },
+        {
+          "slug": "write-ahead-log"
+        }
+      ]
+    }
+  ],
+  "alternatives": [
+    {
+      "title": "Where to keep map output",
+      "options": [
+        {
+          "name": "On the map worker's local disk",
+          "pro": "Fast, and the replicated file system is not loaded with temporary data",
+          "con": "Lost with the machine, so finished map tasks must be run again after a failure"
+        },
+        {
+          "name": "In the replicated file system",
+          "pro": "Survives a machine failure",
+          "con": "Slower and uses far more network and disk"
+        }
+      ],
+      "pick": "Local disks with re-execution, as the paper does."
+    },
+    {
+      "title": "How to handle stragglers",
+      "options": [
+        {
+          "name": "Wait for them",
+          "pro": "No extra work",
+          "con": "The run takes as long as the slowest machine; the paper's sort took 44% longer"
+        },
+        {
+          "name": "Run backup copies near the end",
+          "pro": "Cuts the tail for a few percent more resources",
+          "con": "Needs tasks to be safe to run twice"
+        }
+      ],
+      "pick": "Backup tasks, which is why the tasks are made idempotent."
+    },
+    {
+      "title": "How many tasks",
+      "options": [
+        {
+          "name": "Few large tasks",
+          "pro": "Less scheduling and less state in the master",
+          "con": "Uneven load and slow recovery"
+        },
+        {
+          "name": "Many small tasks (16 to 64 MB per map)",
+          "pro": "Even load, fast recovery, good locality",
+          "con": "More scheduling decisions and more state in the master"
+        }
+      ],
+      "pick": "Many small tasks, with the master's O(M x R) state as the limit."
+    }
+  ],
+  "roles": [
+    {
+      "id": "client",
+      "label": "User program",
+      "description": "Provides the map and reduce functions and waits for the result."
+    },
+    {
+      "id": "compute",
+      "label": "Master and workers",
+      "description": "The master tracks tasks and workers; map and reduce workers do the computing."
+    },
+    {
+      "id": "data",
+      "label": "GFS and local disks",
+      "description": "GFS holds input and final output; map output stays on the workers' local disks."
+    }
+  ],
+  "quiz": [
+    {
+      "question": "A worker dies after it has finished three map tasks and one reduce task. Which of its completed tasks must be run again?",
+      "options": [
+        "None of them, since they are completed",
+        "All four",
+        "The three map tasks, because their output was on its local disk",
+        "Only the reduce task"
+      ],
+      "answer": 2,
+      "explanation": "Map output lives on the local disk of the worker that made it, so when the worker dies the data cannot be read and the maps must be redone. A completed reduce task wrote its output to the global file system, so it is safe. 'None' would leave reduce workers without input. 'All four' repeats a reduce task for no reason."
+    },
+    {
+      "question": "Why does the master start backup copies of the last tasks, according to the paper?",
+      "options": [
+        "Because some tasks are certain to have failed",
+        "To check that the workers compute the same answer",
+        "To balance the number of tasks on each worker",
+        "Because a few slow machines (stragglers) can hold up the whole run, and the first copy to finish completes the task"
+      ],
+      "answer": 3,
+      "explanation": "A run finishes only when its last task does, and one machine with a bad disk can slow a task a lot. The paper's sort took 44% longer with backup tasks off. Failed tasks are handled by re-execution instead. Checking answers is not the purpose. Balancing is done by scheduling many small tasks."
+    },
+    {
+      "question": "A combiner function is used in a word count. What does it do?",
+      "options": [
+        "It sorts the final output by word",
+        "It adds up repeated words inside each map task before the data is sent, so less data crosses the network",
+        "It decides which reduce task gets each word",
+        "It merges the output files of all reduce tasks into one"
+      ],
+      "answer": 1,
+      "explanation": "The combiner runs on the map side, doing the same kind of merging as the reduce function on a partial basis, so ('the', 1) repeated many times becomes ('the', n). The partitioning function chooses the reduce task. Sorting is done by the reduce worker. Output files stay one per reduce task."
+    }
+  ],
+  "sources": [
+    {
+      "title": "MapReduce: Simplified Data Processing on Large Clusters",
+      "publisher": "Google Research (OSDI 2004)",
+      "year": 2004,
+      "url": "https://research.google/pubs/mapreduce-simplified-data-processing-on-large-clusters/"
+    }
+  ]
+}

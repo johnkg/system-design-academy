@@ -1,0 +1,403 @@
+{
+  "name": "How Facebook Built TAO",
+  "difficulty": "intermediate",
+  "intent": "Follow what Facebook says in its 2013 engineering post about TAO, its social graph store: why memcache in front of MySQL was not enough, a small objects-and-associations API, leader and follower cache tiers over sharded MySQL, and eventual consistency across regions, using only what the post says.",
+  "codeTitle": "objects, associations and a follower-leader-database read path",
+  "finalIntro": "One read of a friend list through the caches, then a write that updates every tier on its way back.",
+  "prompt": "In its 2013 post 'TAO: The power of the graph', Facebook says each page view shows hundreds of pieces of information from the social graph, and that all of it has to be assembled in a few hundred milliseconds. The post gives TAO's scale at that time as over a billion read requests and millions of write requests every second, from over a billion active users, with the data split into hundreds of thousands of shards. Before TAO, product engineers had to use memcache in front of MySQL themselves and keep the two in step. How would you give product code a single, simple way to read and write the social graph, that serves almost every read from memory, and keeps working across several data centers? This study follows what Facebook says in that post, which is listed at the end. The simulation and the code samples are small models for learning, not Facebook's code or data.",
+  "functional": [
+    "Store typed objects (users, photos, pages) with named fields, and typed, directed associations between them (friends, likes)",
+    "Create an inverse edge automatically when an association has one, for example friend-of in both directions or likes and liked-by",
+    "Answer point queries (is there this edge), range queries (the newest edges of a type, with a limit) and count queries",
+    "Accept writes and make them visible to the person who made them",
+    "Let product engineers add new object and association types without coordinating with database operators"
+  ],
+  "nonFunctional": [
+    "Scale in the post: over a billion read requests and millions of write requests per second, thousands of data types, hundreds of thousands of shards",
+    "Low latency: pages are assembled in a few hundred milliseconds from hundreds of pieces of data",
+    "Reads are far more common than writes, so a cache hit should be the normal case",
+    "Eventual consistency by default, with a high probability that a user sees their own updates, and an option for stronger consistency on request at a higher cost",
+    "Survive the loss of a database server or a region, with the primary region of a shard able to move"
+  ],
+  "firstAttempt": {
+    "text": "This is the situation the post describes. Web servers use memcache as a large distributed cache in front of MySQL. The product code reads from memcache, and on a miss it reads MySQL and fills memcache itself. On a write it changes MySQL and then deletes or updates the cache entries it knows about. In 2007 Facebook added a client-side Objects and Associations API on top of this.",
+    "limits": [
+      "The post says memcache does not fill itself on a miss and does not keep itself consistent, so every product engineer had to manage two data stores with different data models, and mistakes caused bugs, inconsistencies and performance problems",
+      "Schema changes needed coordination with MySQL operators, which slowed development",
+      "The client-side API invalidated a whole list when a small update happened, and moved entire edge lists across the network",
+      "With the logic in each client, there was no distributed coordination to avoid a thundering herd of requests for the same key",
+      "MySQL's InnoDB buffer pool assumes spatial locality, but Facebook's workload showed locality by creation time, and many requests checked for relations that did not exist"
+    ]
+  },
+  "nodes": [
+    {
+      "id": "web",
+      "label": "Web servers",
+      "kind": "client",
+      "x": 8,
+      "y": 50
+    },
+    {
+      "id": "memcache",
+      "label": "Memcache (managed by product code)",
+      "kind": "edge",
+      "x": 50,
+      "y": 50,
+      "until": 1
+    },
+    {
+      "id": "mysql",
+      "label": "MySQL shards",
+      "kind": "data",
+      "x": 92,
+      "y": 50
+    },
+    {
+      "id": "tao",
+      "label": "TAO API (objects and associations)",
+      "kind": "compute",
+      "x": 32,
+      "y": 50,
+      "at": 1
+    },
+    {
+      "id": "follower",
+      "label": "Follower caches",
+      "kind": "edge",
+      "x": 56,
+      "y": 16,
+      "at": 3
+    },
+    {
+      "id": "leader",
+      "label": "Leader caches",
+      "kind": "edge",
+      "x": 56,
+      "y": 84,
+      "at": 3
+    },
+    {
+      "id": "replica",
+      "label": "MySQL in a secondary region",
+      "kind": "data",
+      "x": 92,
+      "y": 84,
+      "at": 5
+    }
+  ],
+  "edges": [
+    {
+      "from": "web",
+      "to": "memcache",
+      "until": 1
+    },
+    {
+      "from": "memcache",
+      "to": "mysql",
+      "until": 1
+    },
+    {
+      "from": "web",
+      "to": "tao",
+      "at": 1
+    },
+    {
+      "from": "tao",
+      "to": "mysql",
+      "at": 1,
+      "until": 3
+    },
+    {
+      "from": "tao",
+      "to": "follower",
+      "at": 3
+    },
+    {
+      "from": "follower",
+      "to": "leader",
+      "at": 3
+    },
+    {
+      "from": "leader",
+      "to": "mysql",
+      "at": 3
+    },
+    {
+      "from": "mysql",
+      "to": "replica",
+      "at": 5
+    }
+  ],
+  "steps": [
+    {
+      "title": "Model the data as objects and associations",
+      "problem": "Product code that manages cache keys and tables by hand repeats the same work and the same mistakes for each feature.",
+      "fix": "TAO stores a labelled graph. Objects are typed nodes, each with a dictionary of named fields, and all objects of one type share the same fields, which can be added or marked deprecated at any time. Associations are typed, directed edges, grouped into association lists by their origin. Several associations can join the same two objects if their types differ. An association type can have an inverse: creating or deleting the edge also creates or deletes the inverse edge in the other direction, as with friendship and likes and liked-by. Each association carries a time, which TAO uses to improve the cache hit rate.",
+      "tradeoff": "A fixed shape of data is less flexible than arbitrary queries, but it lets one service cache and shard every kind of data in the same way. The post says engineers can add types without waiting for database changes.",
+      "concepts": [
+        {
+          "slug": "sql-vs-nosql"
+        },
+        {
+          "slug": "schema-evolution-and-compatibility"
+        }
+      ]
+    },
+    {
+      "title": "Offer a small API and leave complex queries to the client",
+      "problem": "An expressive query language would be hard to cache and hard to make fast at this scale.",
+      "fix": "Object operations are create, set-fields, get and delete. Association operations create and delete single edges, with the inverse made automatically. Reads come in three kinds: a point query checks for a specific edge from one object to another of a given type; a range query returns the outgoing edges of one type from an object, ordered by time, with a limit and a way to continue from a cursor; and a count query returns how many outgoing edges there are, which can be answered in constant time. The post says TAO deliberately leaves out complex traversals, pattern matching and server-side set intersection, and clients combine results with point and range queries.",
+      "tradeoff": "A simple, regular API makes each request cheap and predictable. The cost moves to the client, which has to do its own joins.",
+      "concepts": [
+        {
+          "slug": "api-styles"
+        },
+        {
+          "slug": "pagination"
+        },
+        {
+          "slug": "graphql-n-plus-one-and-dataloader"
+        }
+      ]
+    },
+    {
+      "title": "Split caching from storage, shard everything, and use two cache tiers",
+      "problem": "The database cannot serve billions of reads per second, and a cache that only a client fills lets many clients fetch the same missing key at once.",
+      "fix": "Persistent storage (MySQL) and caching (RAM and flash) run in separate clusters so that each can be scaled on its own. Clients always talk to caching servers running TAO. Everything in one shard, objects and their association lists, lives in the same MySQL database and on the same cache servers, and an object can be assigned to a shard when it is created to reduce communication and hot spots. Within a region there are two tiers: followers, which clients connect to and which ask leaders when they miss, and leaders, which connect to the regional MySQL, keep the region's caches consistent, and protect the database during outages. The post says shards can be moved or cloned within a cluster to handle a spike in load, such as popular content appearing in many News Feeds at once.",
+      "tradeoff": "Another tier adds a hop on a miss and more servers to run. In return, only the leaders touch the database, which is how the post says they protect it. This study's reading, which the post does not detail, is that a leader sees every miss for its shards and so is the natural place to avoid duplicate database reads.",
+      "concepts": [
+        {
+          "slug": "caching"
+        },
+        {
+          "slug": "database-sharding"
+        },
+        {
+          "slug": "consistent-hashing"
+        },
+        {
+          "slug": "cache-eviction-stampedes-and-write-policies"
+        }
+      ]
+    },
+    {
+      "title": "Send writes through the leader and update caches from the reply",
+      "problem": "If a write goes to the database and the caches are cleared by the code that wrote it, any step that fails leaves the caches wrong.",
+      "fix": "A write goes from a follower to its leader and then to the database. The post says the caches are updated as the reply to the successful write travels back along the same path. The write is therefore a write-through, and the person who made it sees their own change straight away. Because the leader handles all writes and misses for a shard in its region, it is the one place where the region's caches are kept consistent.",
+      "tradeoff": "Routing every write through one place makes consistency manageable and adds latency to writes, which are far fewer than reads.",
+      "concepts": [
+        {
+          "slug": "cache-eviction-stampedes-and-write-policies"
+        },
+        {
+          "slug": "optimistic-concurrency-and-etags"
+        },
+        {
+          "slug": "consistency-models"
+        }
+      ]
+    },
+    {
+      "title": "Replicate across regions and accept eventual consistency",
+      "problem": "Users around the world need low-latency reads, and a whole region or database server can fail.",
+      "fix": "Each shard has a single primary region, and MySQL replication carries its updates to the secondary regions. A secondary region forwards writes to the primary region, and a write-through cache gives read-after-write consistency for those writes. The default is eventual consistency, chosen for performance and because of the trade-offs described by the CAP theorem, with the aim that users see their own updates with high probability. Clients can override this and ask for strong consistency for specific uses, at a higher cost and with possible loss of availability. The primary region of a shard can be changed automatically, for example after a hardware failure takes down a MySQL instance.",
+      "tradeoff": "Readers in other regions can see slightly stale data. The post accepts that for most of the social graph, and gives a stronger mode for the cases that need it.",
+      "concepts": [
+        {
+          "slug": "cap-theorem"
+        },
+        {
+          "slug": "database-replication"
+        },
+        {
+          "slug": "multi-region-failover"
+        },
+        {
+          "slug": "consistency-models"
+        }
+      ]
+    }
+  ],
+  "failures": [
+    {
+      "scenario": "Popular content appears in the News Feeds of millions of people at once",
+      "impact": "A few shards get a very large number of reads and could overload their cache servers.",
+      "answer": "Shards can be moved or cloned within a cluster to spread the load, and followers serve repeated reads from memory so only misses reach the leader.",
+      "concepts": [
+        {
+          "slug": "caching"
+        },
+        {
+          "slug": "hedged-requests-and-tail-latency"
+        }
+      ]
+    },
+    {
+      "scenario": "Many followers miss on the same association list at the same moment",
+      "impact": "With client-managed memcache each of them would query MySQL.",
+      "answer": "Followers send their misses to the leader of the shard, and only leaders connect to the database. The post lists the lack of distributed coordination against thundering herds as a weakness of the client-side design, and says leaders protect the persistent store, though it does not detail how.",
+      "concepts": [
+        {
+          "slug": "cache-eviction-stampedes-and-write-policies"
+        },
+        {
+          "slug": "backpressure"
+        }
+      ]
+    },
+    {
+      "scenario": "A MySQL instance fails",
+      "impact": "Writes and cache misses for its shards cannot be served.",
+      "answer": "The primary region for the shard can be switched automatically, as the post describes for a hardware failure that takes down a MySQL instance.",
+      "concepts": [
+        {
+          "slug": "multi-region-failover"
+        },
+        {
+          "slug": "failure-detection"
+        }
+      ]
+    },
+    {
+      "scenario": "A user changes something in a secondary region and reads it straight back",
+      "impact": "With plain asynchronous replication the secondary region could still hold the old value.",
+      "answer": "The secondary region forwards the write to the primary region, and the write-through cache updates as the reply returns, which gives read-after-write consistency for that write.",
+      "concepts": [
+        {
+          "slug": "consistency-models"
+        },
+        {
+          "slug": "database-replication"
+        }
+      ]
+    },
+    {
+      "scenario": "The database's page cache does not fit the access pattern",
+      "impact": "The post says InnoDB's buffer pool assumes spatial locality, but Facebook's workload shows locality by creation time, and many requests ask about relations that do not exist, so the database's own cache works poorly.",
+      "answer": "TAO serves reads from its own caches, built around association lists, and uses the time attribute on each association to keep the working set small and the hit rate high.",
+      "concepts": [
+        {
+          "slug": "caching"
+        },
+        {
+          "slug": "database-indexing"
+        }
+      ]
+    }
+  ],
+  "alternatives": [
+    {
+      "title": "Where the caching logic lives",
+      "options": [
+        {
+          "name": "In each client (memcache plus MySQL)",
+          "pro": "No new service",
+          "con": "Every engineer repeats the work, and there is no coordination against thundering herds"
+        },
+        {
+          "name": "In a dedicated service (TAO)",
+          "pro": "One place for consistency, sharding and fill logic",
+          "con": "A new system to run, and a restricted API"
+        }
+      ],
+      "pick": "A dedicated service, as Facebook did."
+    },
+    {
+      "title": "How to handle consistency",
+      "options": [
+        {
+          "name": "Strong consistency everywhere",
+          "pro": "One current value",
+          "con": "Higher latency, and possible loss of availability"
+        },
+        {
+          "name": "Eventual consistency, with a strong option on request",
+          "pro": "Fast reads in every region, with read-after-write for the writer",
+          "con": "Other readers may briefly see old data"
+        }
+      ],
+      "pick": "Eventual by default with an opt-in for strong, as the post describes."
+    },
+    {
+      "title": "How rich the query interface should be",
+      "options": [
+        {
+          "name": "Graph traversals and joins in the service",
+          "pro": "Less work for clients",
+          "con": "Hard to cache and to keep fast at this scale"
+        },
+        {
+          "name": "Point, range and count queries only",
+          "pro": "Cheap, predictable and cacheable",
+          "con": "Clients join results themselves"
+        }
+      ],
+      "pick": "Point, range and count only, as the post says TAO deliberately does."
+    }
+  ],
+  "roles": [
+    {
+      "id": "client",
+      "label": "Web servers",
+      "description": "Product code that reads and writes objects and associations through TAO."
+    },
+    {
+      "id": "compute",
+      "label": "TAO API",
+      "description": "The objects-and-associations interface that hides the caches and the database."
+    },
+    {
+      "id": "edge",
+      "label": "Follower and leader caches",
+      "description": "Followers answer clients; leaders sit between followers and MySQL and keep the region consistent."
+    },
+    {
+      "id": "data",
+      "label": "MySQL",
+      "description": "The persistent store, sharded, with replication to other regions."
+    }
+  ],
+  "quiz": [
+    {
+      "question": "A follower cache does not have a user's friend list. What happens next, according to the post?",
+      "options": [
+        "The follower reads MySQL directly and fills its own cache",
+        "The follower asks a leader, which reads MySQL if it also misses",
+        "The client reads MySQL and then writes the result into the cache",
+        "The request fails and the page is shown without the list"
+      ],
+      "answer": 1,
+      "explanation": "Followers fetch from leaders on a miss, and the leaders are the only tier that talks to the regional MySQL, which lets them protect the database. If every follower read MySQL, a popular missing key would reach the database many times. Having the client fill the cache is the pattern the post describes as error-prone. Failing the request is not how TAO behaves."
+    },
+    {
+      "question": "A user in a secondary region adds a friend and immediately reloads their friend list. How does TAO make sure they see the new friend?",
+      "options": [
+        "It waits until MySQL replication reaches the secondary region",
+        "It reads from the primary region for all requests",
+        "It forwards the write to the primary region, and the caches update from the write's reply as it comes back",
+        "It tells the user to refresh again later"
+      ],
+      "answer": 2,
+      "explanation": "The secondary region forwards the write to the primary region and the write-through cache gives read-after-write consistency for that write. Waiting for replication would add delay to every write. Reading everything from the primary region would remove the point of having regions. Asking the user to refresh is not a design."
+    },
+    {
+      "question": "What does TAO do when you create a 'likes' association from a user to a photo?",
+      "options": [
+        "Nothing else; the photo's likes must be written separately",
+        "It deletes the user's other likes",
+        "It stores the edge only on the user's shard and computes likes by scanning every shard",
+        "It also creates the inverse 'liked by' edge from the photo to the user"
+      ],
+      "answer": 3,
+      "explanation": "An association type can have an inverse type, and creating the edge also creates the inverse edge in the opposite direction, so the photo's list of likers is ready to read. Writing it separately is the manual work TAO removes. Deleting other likes would be wrong. Scanning all shards for likers would be very slow, which is why the inverse edge exists."
+    }
+  ],
+  "sources": [
+    {
+      "title": "TAO: The power of the graph",
+      "publisher": "Meta Engineering (Facebook)",
+      "year": 2013,
+      "url": "https://engineering.fb.com/2013/06/25/core-infra/tao-the-power-of-the-graph/"
+    }
+  ]
+}

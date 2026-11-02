@@ -1,0 +1,370 @@
+{
+  "name": "How Google Built Dapper",
+  "difficulty": "intermediate",
+  "intent": "Follow the design in Google's 2010 Dapper report for tracing requests across thousands of services with almost no overhead: spans and trace ids carried through RPCs, instrumentation in shared libraries, sampling, and out-of-band collection into Bigtable, using only what the report says.",
+  "codeTitle": "trace ids, sampling at the root, local span logs and a rebuilt trace tree",
+  "finalIntro": "One request going through five services, and then its trace being collected and rebuilt.",
+  "prompt": "The 2010 report 'Dapper, a Large-Scale Distributed Systems Tracing Infrastructure' says modern Internet services are built from many software modules, written by different teams in different languages, that can span thousands of machines in several facilities. An engineer who sees only that a request was slow cannot tell which of these modules is to blame. The report gives three design goals: low overhead, so that teams never turn the tracing off; application-level transparency, so that programmers need not do anything; and scalability. How would you build a tracing system for a company like that, that is always on, whose cost is negligible, and that works without every team changing their code? This study follows the report, which is listed at the end. The simulation and the code samples are small models for learning, not Google's code or data.",
+  "functional": [
+    "Follow one request across every service and machine it touches, and record how long each step took",
+    "Show a trace as a tree of the calls it made, with timing, so the slow part is visible",
+    "Let programmers add their own notes to a trace (annotations)",
+    "Keep trace data available for analysis tools and a lookup by trace",
+    "Work across services written in different languages"
+  ],
+  "nonFunctional": [
+    "Low overhead: the report says even small monitoring overhead is noticeable in highly optimized services and may lead teams to turn tracing off",
+    "Application-level transparency: the report wants instrumentation to live in a few common libraries, not in application code",
+    "Scale to all of Google's production processes and machines, and always on, since unusual behaviour is hard to reproduce",
+    "Data available soon enough to be useful: the report's median time from a process to the central repository is under 15 seconds",
+    "Must not change the behaviour of the requests being traced"
+  ],
+  "firstAttempt": {
+    "text": "This is the situation the report describes. Each service writes its own logs, and an engineer with a slow request opens the logs of the services they think are involved, matching entries by time or by an id that the teams agreed on, if any. Black-box approaches try to infer the links between calls from log data and statistics instead.",
+    "limits": [
+      "The report says an engineer looking only at the overall latency may know there is a problem but not which service causes it, because the request touches many services they may not know about",
+      "Per-service logs have no shared id, so linking the entries of one request is manual, and it changes when a new service joins the path",
+      "The report notes that black-box schemes need more data and rely on statistical inference to guess the links between calls",
+      "Instrumentation that application developers must add themselves is fragile and is often broken by bugs or omissions"
+    ]
+  },
+  "nodes": [
+    {
+      "id": "request",
+      "label": "User request",
+      "kind": "client",
+      "x": 8,
+      "y": 50
+    },
+    {
+      "id": "logs",
+      "label": "Separate service logs",
+      "kind": "data",
+      "x": 80,
+      "y": 50,
+      "until": 1
+    },
+    {
+      "id": "fe",
+      "label": "Frontend",
+      "kind": "compute",
+      "x": 34,
+      "y": 16,
+      "at": 1
+    },
+    {
+      "id": "svc",
+      "label": "Backend services",
+      "kind": "compute",
+      "x": 72,
+      "y": 16,
+      "at": 1
+    },
+    {
+      "id": "locallog",
+      "label": "Local span logs",
+      "kind": "data",
+      "x": 92,
+      "y": 50,
+      "at": 2
+    },
+    {
+      "id": "daemon",
+      "label": "Dapper daemon",
+      "kind": "async",
+      "x": 72,
+      "y": 84,
+      "at": 4
+    },
+    {
+      "id": "repo",
+      "label": "Dapper Bigtable repository",
+      "kind": "data",
+      "x": 34,
+      "y": 84,
+      "at": 4
+    }
+  ],
+  "edges": [
+    {
+      "from": "request",
+      "to": "logs",
+      "until": 1
+    },
+    {
+      "from": "request",
+      "to": "fe",
+      "at": 1
+    },
+    {
+      "from": "fe",
+      "to": "svc",
+      "at": 1
+    },
+    {
+      "from": "svc",
+      "to": "locallog",
+      "at": 2
+    },
+    {
+      "from": "fe",
+      "to": "locallog",
+      "at": 2
+    },
+    {
+      "from": "locallog",
+      "to": "daemon",
+      "at": 4
+    },
+    {
+      "from": "daemon",
+      "to": "repo",
+      "at": 4
+    }
+  ],
+  "steps": [
+    {
+      "title": "Give every call a trace id, a span id and a parent id",
+      "problem": "To rebuild one request out of the logs of many services, every log entry must say which request and which call it belongs to.",
+      "fix": "Dapper's model is a tree of spans. A span is the work of one call, such as an RPC, with a name, a start time and an end time. Each span has a span id and the id of its parent span, and all the spans of one request share a trace id. A span without a parent is the root. The report says the ids are probabilistically unique 64-bit integers. In a typical trace there is one span for each RPC, and each extra tier of infrastructure adds one level to the tree. An RPC span has annotations from both the client and the server, so a gap between them shows time spent in the network or in queues.",
+      "tradeoff": "Ids are cheap to carry, and a tree is easy to read. The model assumes calls nest, which, as the report says, does not hold for every system, for example when a middle tier answers before its own downstream work is done.",
+      "concepts": [
+        {
+          "slug": "distributed-tracing"
+        },
+        {
+          "slug": "structured-logging"
+        }
+      ]
+    },
+    {
+      "title": "Put the instrumentation in the shared libraries",
+      "problem": "If every team must add tracing code, some will forget or get it wrong, and the picture will have holes.",
+      "fix": "Dapper puts its instrumentation in a small number of widely used libraries, so applications need no changes. Nearly all of Google's inter-process communication goes through one RPC framework with C++ and Java bindings, and Dapper defines spans around all its RPCs and sends the trace and span ids from client to server for traced calls. The trace context is also kept in thread-local storage and copied by the common threading and callback libraries, so that work started in a callback or another thread stays in the same trace. Applications that want to add detail can attach annotations, text or key-value pairs, through a simple API, and each span has a limit on annotation volume to prevent over-logging.",
+      "tradeoff": "Transparency requires a homogeneous base: the report says non-RPC communication frameworks would need their own instrumentation. In exchange, the report says almost every production process can generate traces without the developers' help.",
+      "concepts": [
+        {
+          "slug": "distributed-tracing"
+        },
+        {
+          "slug": "api-gateway"
+        }
+      ]
+    },
+    {
+      "title": "Decide on sampling once, at the root",
+      "problem": "Writing spans for every request would slow down the busiest, most latency-sensitive services, and teams would switch tracing off.",
+      "fix": "Dapper records only a fraction of requests. The decision is taken once, when the trace starts, and the sampled flag travels with the trace context, so every service on the path makes the same choice and a sampled trace is complete. The report measured a web search cluster: tracing every request raised average latency by 16.3% and cut throughput by 1.48%; at one in 16 the latency cost was 2.12% and the throughput cost 0.08%, and the report says penalties below one in 16 were within experimental error; at one in 1,024 the change was within the noise. It says a rate as low as 1 in 1,024 still gave enough data for high-volume services, and uses 0.01% as an example for the busiest ones.",
+      "tradeoff": "Rare events can be missed in the sample. The report argues that in a high-throughput service a notable pattern that appears once will appear thousands of times, but services with only dozens of requests per second can afford to trace all, which motivated its move to an adaptive rate set as a desired number of traces per unit of time.",
+      "concepts": [
+        {
+          "slug": "cardinality-and-sampling"
+        },
+        {
+          "slug": "distributed-tracing"
+        },
+        {
+          "slug": "metrics"
+        }
+      ]
+    },
+    {
+      "title": "Log locally and collect out of band",
+      "problem": "Sending trace data back with the request would cost network capacity and could distort the very behaviour being measured.",
+      "fix": "Each process writes its spans to local log files. Dapper daemons on every host read those files and send them to regional Dapper Bigtable repositories, where a trace is a single row and each span is a column, which suits Bigtable's sparse tables because traces have any number of spans. This is out of band from the request tree for two reasons given in the report: in-band collection, where trace data would come back in RPC response headers, could dwarf responses that are often under ten kilobytes and bias the analysis; and in-band collection assumes every RPC nests perfectly, which many middleware systems break. The report measures the cost: each span averages 426 bytes, trace collection is under 0.01% of network traffic, and the daemon never uses more than 0.3% of one core in the worst case, running at the lowest scheduler priority.",
+      "tradeoff": "Collection is not instant, so a trace may be incomplete for a while: the median delay from process to repository is under 15 seconds, but the 98th percentile is bimodal, under two minutes about 75% of the time and up to many hours the rest of the time.",
+      "concepts": [
+        {
+          "slug": "structured-logging"
+        },
+        {
+          "slug": "lsm-trees-vs-b-trees"
+        }
+      ]
+    },
+    {
+      "title": "Offer an API and tools on top of the repository",
+      "problem": "A pile of traces is useless unless engineers and other systems can query and understand it.",
+      "fix": "Dapper provides an API to the repository, and Google's developers build both general-purpose and application-specific tools on it. The report gives uses such as finding which services are involved in a request, finding the cause of a slow step, and checking for policy violations, for example that applications with sensitive data only talk to systems they should. It notes that 70% of all spans and 90% of all traces have at least one application-specified annotation, such as the table name on every Bigtable request.",
+      "tradeoff": "Traces carry data from every service, so they raise security and privacy questions; the report says Dapper stores only the names of RPC methods and not their payloads, with annotations as an opt-in.",
+      "concepts": [
+        {
+          "slug": "distributed-tracing"
+        },
+        {
+          "slug": "metrics"
+        },
+        {
+          "slug": "red-use-and-golden-signals"
+        }
+      ]
+    }
+  ],
+  "failures": [
+    {
+      "scenario": "Tracing every request slows the busiest service",
+      "impact": "Latency rises and the team turns Dapper off in that service, leaving a hole in every trace.",
+      "answer": "Sampling keeps the cost low: at 1 in 16 the report measured a latency and throughput cost within experimental error, and at 1 in 1,024 even less.",
+      "concepts": [
+        {
+          "slug": "cardinality-and-sampling"
+        }
+      ]
+    },
+    {
+      "scenario": "The host that holds some of a trace's spans has not been collected yet",
+      "impact": "The trace looks incomplete, with a missing branch.",
+      "answer": "The trace is rebuilt from ids and shown as it is, and the missing spans appear when their host's log reaches the repository. The report says the 98th percentile collection delay can be many hours.",
+      "concepts": [
+        {
+          "slug": "structured-logging"
+        }
+      ]
+    },
+    {
+      "scenario": "A callback or thread pool does part of the work",
+      "impact": "Spans created there would not know which trace they belong to.",
+      "answer": "The common threading and callback libraries copy the trace context to the new thread, so the work stays in the trace.",
+      "concepts": [
+        {
+          "slug": "distributed-tracing"
+        }
+      ]
+    },
+    {
+      "scenario": "A middle tier answers before its own downstream calls finish",
+      "impact": "A scheme that sends trace data back in responses would lose the late spans.",
+      "answer": "Dapper collects out of band from local logs, so late spans are still written and collected later.",
+      "concepts": [
+        {
+          "slug": "async-apis-and-long-running-operations"
+        }
+      ]
+    },
+    {
+      "scenario": "The collection daemon competes with the application for CPU",
+      "impact": "Tracing could slow the service it observes.",
+      "answer": "The daemon uses at most 0.3% of one core in the report's worst case and runs at the lowest scheduler priority.",
+      "concepts": [
+        {
+          "slug": "profiling-and-flame-graphs"
+        }
+      ]
+    }
+  ],
+  "alternatives": [
+    {
+      "title": "How to learn which calls belong together",
+      "options": [
+        {
+          "name": "Annotation-based: carry an id through the calls",
+          "pro": "Exact links between calls",
+          "con": "Needs instrumentation in the code path"
+        },
+        {
+          "name": "Black-box: infer links from logs statistically",
+          "pro": "No instrumentation",
+          "con": "The report says it needs more data and is less exact"
+        }
+      ],
+      "pick": "Carry ids, with the instrumentation in shared libraries so applications need no changes."
+    },
+    {
+      "title": "What to trace",
+      "options": [
+        {
+          "name": "Every request",
+          "pro": "Nothing is missed",
+          "con": "The report measured +16.3% average latency in a search cluster"
+        },
+        {
+          "name": "A sample decided at the root",
+          "pro": "Low cost and complete traces",
+          "con": "Rare patterns can be missed in low-traffic services"
+        }
+      ],
+      "pick": "Sample, and move toward adaptive rates, as the report describes."
+    },
+    {
+      "title": "How trace data travels",
+      "options": [
+        {
+          "name": "In band, in the RPC responses",
+          "pro": "No separate collection path",
+          "con": "Can dwarf small responses, and assumes perfectly nested calls"
+        },
+        {
+          "name": "Out of band, from local logs",
+          "pro": "No effect on the request, and handles late spans",
+          "con": "Data arrives with a delay and traces can be incomplete for a while"
+        }
+      ],
+      "pick": "Out of band, as the report does."
+    }
+  ],
+  "roles": [
+    {
+      "id": "client",
+      "label": "Request",
+      "description": "Starts a trace, with the sampling decision taken at the root."
+    },
+    {
+      "id": "compute",
+      "label": "Instrumented services",
+      "description": "Create spans around their RPCs using the shared libraries."
+    },
+    {
+      "id": "data",
+      "label": "Local logs and repository",
+      "description": "Spans are written locally, then collected into Bigtable, one trace per row."
+    },
+    {
+      "id": "async",
+      "label": "Dapper daemon",
+      "description": "Reads local span logs and ships them to the repository at low priority."
+    }
+  ],
+  "quiz": [
+    {
+      "question": "A request enters the frontend and the sampling coin says 'trace'. What happens to the five services it calls?",
+      "options": [
+        "Each one flips its own coin",
+        "They all follow the same decision, which travels in the trace context, so the trace is complete",
+        "Only the first service writes spans",
+        "They trace only if their load is low"
+      ],
+      "answer": 1,
+      "explanation": "The decision is made once at the root and passed along, so a sampled trace includes every span, and an unsampled one costs nothing downstream. Independent coins would produce traces with random missing branches. The other options are not how Dapper works."
+    },
+    {
+      "question": "Why does Dapper collect spans out of band instead of returning them in RPC responses?",
+      "options": [
+        "Because RPC responses cannot carry extra data",
+        "Because response headers are encrypted",
+        "Trace data could dwarf small responses and bias analysis, and it assumes calls nest perfectly, which many systems break",
+        "Because it needs less disk space"
+      ],
+      "answer": 2,
+      "explanation": "The report gives these two reasons: responses are often under ten kilobytes, and some middleware replies to the caller before its own work is finished. Responses can carry extra data, which is why in-band is possible but unwise. Encryption and disk space are not reasons it gives."
+    },
+    {
+      "question": "The report measured the cost of sampling in a web search cluster. What did it find?",
+      "options": [
+        "Sampling had no effect at any rate",
+        "Tracing every request added about 16% to the average latency, while at 1 in 16 or lower the effect was within experimental error",
+        "Latency fell as the sampling rate rose",
+        "Throughput dropped by half at every rate"
+      ],
+      "answer": 1,
+      "explanation": "At full sampling the average latency rose by 16.3%, and the penalties at 1 in 16 and lower were within the experimental error, with 1 in 1,024 well inside the noise. 'No effect at any rate' ignores the 16.3%. Latency did not fall as the rate rose, and throughput changed by only about 1.5% at most."
+    }
+  ],
+  "sources": [
+    {
+      "title": "Dapper, a Large-Scale Distributed Systems Tracing Infrastructure",
+      "publisher": "Google Technical Report dapper-2010-1",
+      "year": 2010,
+      "url": "https://research.google/pubs/dapper-a-large-scale-distributed-systems-tracing-infrastructure/"
+    }
+  ]
+}

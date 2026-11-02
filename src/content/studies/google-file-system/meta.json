@@ -1,0 +1,425 @@
+{
+  "name": "How Google Built the Google File System",
+  "difficulty": "advanced",
+  "intent": "Follow the choices Google describes in its 2003 GFS paper for a file system on thousands of cheap machines that fail all the time: one master, 64 MB chunks on three replicas, leases, record append and a relaxed consistency model, using only what the paper says.",
+  "codeTitle": "a master, chunkservers, record append and re-replication",
+  "finalIntro": "One record appended to a file, then a chunkserver that dies and a master that restarts.",
+  "prompt": "The 2003 paper 'The Google File System' says Google needed a file system for its own workloads: it runs on thousands of inexpensive commodity machines that fail often, stores many huge files of multiple gigabytes, is mostly read in large streams and written by appending, and is used by applications Google could change along with the file system. The paper reports clusters with over a thousand storage nodes and over 300 TB of disk (the abstract says hundreds of terabytes across thousands of disks), used by hundreds of clients at once. How would you build a file system that survives constant failures, serves very large files at high total throughput, and lets many machines append to one file at the same time? This study follows the paper, which is listed at the end. The simulation and the code samples are small models for learning, not Google's code or data.",
+  "functional": [
+    "Store huge files, usually many gigabytes, made of large sequential reads and appends",
+    "Let many clients append to the same file at once, with each append stored atomically",
+    "Create a cheap copy of a file or directory tree (a snapshot)",
+    "Keep data safe when machines or disks fail, which the paper says happens all the time",
+    "Provide a familiar interface (create, delete, open, close, read, write) without strict POSIX behaviour"
+  ],
+  "nonFunctional": [
+    "Treat failure as normal: the paper says component failures are the norm, not the exception, so monitoring, error detection and automatic recovery must be built in",
+    "High total throughput for many clients, more than low latency for one request",
+    "Scale to over a thousand storage nodes and hundreds of clients",
+    "Simple enough to run: a single master that does not become a bottleneck",
+    "Applications adapt to the file system, so the consistency model can be relaxed"
+  ],
+  "firstAttempt": {
+    "text": "This study's starting point, not something the paper says about Google's history: a conventional network file system. One file server holds the files and their metadata and serves reads and writes, perhaps with a standby machine.",
+    "limits": [
+      "The paper's workload has files of many gigabytes, so the usual small block sizes make for huge numbers of blocks and a lot of metadata",
+      "One server's disks and network link cap the total throughput, while the paper wants hundreds of clients reading at once",
+      "On thousands of cheap machines something is always broken, so a design that treats failure as rare would be down all the time",
+      "Strict POSIX semantics are costly with many concurrent appenders, and the paper's applications do not need them"
+    ]
+  },
+  "nodes": [
+    {
+      "id": "client",
+      "label": "Clients (applications)",
+      "kind": "client",
+      "x": 8,
+      "y": 50
+    },
+    {
+      "id": "fs",
+      "label": "One file server",
+      "kind": "data",
+      "x": 80,
+      "y": 50,
+      "until": 1
+    },
+    {
+      "id": "master",
+      "label": "Master (metadata in memory)",
+      "kind": "compute",
+      "x": 34,
+      "y": 16,
+      "at": 1
+    },
+    {
+      "id": "cs1",
+      "label": "Chunkserver 1",
+      "kind": "data",
+      "x": 72,
+      "y": 16,
+      "at": 1
+    },
+    {
+      "id": "cs2",
+      "label": "Chunkserver 2",
+      "kind": "data",
+      "x": 92,
+      "y": 50,
+      "at": 1
+    },
+    {
+      "id": "cs3",
+      "label": "Chunkserver 3",
+      "kind": "data",
+      "x": 72,
+      "y": 84,
+      "at": 1
+    },
+    {
+      "id": "producers",
+      "label": "Many appending producers",
+      "kind": "client",
+      "x": 8,
+      "y": 84,
+      "at": 4
+    },
+    {
+      "id": "log",
+      "label": "Operation log and checkpoints",
+      "kind": "async",
+      "x": 34,
+      "y": 84,
+      "at": 5
+    }
+  ],
+  "edges": [
+    {
+      "from": "client",
+      "to": "fs",
+      "until": 1
+    },
+    {
+      "from": "client",
+      "to": "master",
+      "at": 1
+    },
+    {
+      "from": "client",
+      "to": "cs1",
+      "at": 1
+    },
+    {
+      "from": "master",
+      "to": "cs1",
+      "at": 1
+    },
+    {
+      "from": "master",
+      "to": "cs2",
+      "at": 1
+    },
+    {
+      "from": "master",
+      "to": "cs3",
+      "at": 1
+    },
+    {
+      "from": "cs1",
+      "to": "cs2",
+      "at": 2
+    },
+    {
+      "from": "cs2",
+      "to": "cs3",
+      "at": 2
+    },
+    {
+      "from": "producers",
+      "to": "cs1",
+      "at": 4
+    },
+    {
+      "from": "producers",
+      "to": "master",
+      "at": 4
+    },
+    {
+      "from": "master",
+      "to": "log",
+      "at": 5
+    }
+  ],
+  "steps": [
+    {
+      "title": "Keep metadata on one master and data on chunkservers, in large chunks",
+      "problem": "A file system for huge files needs a place that knows where everything is, without that place carrying the data.",
+      "fix": "A GFS cluster has a single master and many chunkservers. Files are divided into fixed-size chunks of 64 MB, much larger than usual file system blocks, and each chunk is stored on chunkservers as an ordinary Linux file with a unique 64-bit handle. The master keeps all metadata in memory: the namespace, the mapping from files to chunks, and where each chunk's replicas are. Clients ask the master only for metadata, such as which chunkservers hold a chunk, cache the answer, and then read and write data directly with the chunkservers. The paper says the master keeps less than 64 bytes of metadata for each 64 MB chunk, so even a very large file system fits in its memory. Large chunks mean fewer requests to the master, a client keeps one connection to a chunkserver open for many operations, and the metadata is small.",
+      "tradeoff": "A small file lives in a single chunk, so many clients reading it at once can overload the few chunkservers that hold it. The paper met this with an executable that hundreds of machines started together, and fixed it by storing such files with a higher replication factor.",
+      "concepts": [
+        {
+          "slug": "database-sharding"
+        },
+        {
+          "slug": "caching"
+        },
+        {
+          "slug": "service-discovery"
+        }
+      ]
+    },
+    {
+      "title": "Replicate every chunk and let the master find the copies",
+      "problem": "Disks and machines fail all the time, and a chunk with a single copy would be lost with its machine.",
+      "fix": "Each chunk is stored on several chunkservers, three by default. The master does not store chunk locations on disk. It asks each chunkserver what it holds when it starts and whenever a chunkserver joins, and it keeps up to date with regular HeartBeat messages. The paper gives the reason: a chunkserver has the final say on what chunks it has, so there is nothing for the master to keep in step. The master also places new chunks, balancing disk use and spreading replicas across racks, and starts new copies when a chunk has too few replicas. Chunks with fewer replicas get higher priority; the master clones from a surviving replica, with limits so that cloning does not slow applications. In the paper's test, a chunkserver with 15,000 chunks and 600 GB was killed and all chunks were restored in 23.2 minutes.",
+      "tradeoff": "Three copies cost three times the disk, and the master must limit how fast it re-replicates. In the paper's test of a double failure, the 266 chunks left with one replica were restored to at least two within 2 minutes, because they were cloned first.",
+      "concepts": [
+        {
+          "slug": "database-replication"
+        },
+        {
+          "slug": "failure-detection"
+        },
+        {
+          "slug": "consistent-hashing"
+        }
+      ]
+    },
+    {
+      "title": "Order writes with leases and separate the data flow",
+      "problem": "Several replicas must apply the same changes in the same order, without the master touching every write.",
+      "fix": "The master grants a chunk lease to one replica, the primary. The lease starts at 60 seconds and the primary can ask for extensions, which ride on the HeartBeat messages. The primary assigns serial numbers to all changes it receives, and applies them in that order, and the other replicas follow. The client gets the primary's identity from the master, caches it, and pushes the data to all replicas, which hold it in a buffer. The data goes along a chain from chunkserver to chunkserver, each forwarding to the closest one that has not received it, and is pipelined, so each starts forwarding as soon as it receives data. Then the client sends the write to the primary, which orders it and tells the secondaries to apply it. If the master loses contact with a primary, it waits for the lease to expire before it grants a new one.",
+      "tradeoff": "Separating control and data flow uses every machine's network link fully. If a write fails at a replica, the client's write is reported as failed and the region is left inconsistent until the client retries.",
+      "concepts": [
+        {
+          "slug": "leases-and-fencing-tokens"
+        },
+        {
+          "slug": "ordering-and-partitioning"
+        },
+        {
+          "slug": "consensus"
+        }
+      ]
+    },
+    {
+      "title": "Offer record append and a relaxed consistency model",
+      "problem": "Many producers appending to one file would need heavy locking if each had to know the file's end. POSIX-style consistency is costly and the applications do not need it.",
+      "fix": "With record append the client gives only the data, and GFS appends it at least once at an offset that GFS chooses and returns, even if many clients append at the same time. If the record would pass the end of the chunk, the primary pads the chunk to its full size and tells the client to retry on the next chunk. If an append fails on some replicas, the client retries, so replicas can hold duplicate records or padding. The paper states the resulting model: a region is consistent if all clients see the same data, and defined if they also see what the mutation wrote. Concurrent successful writes leave a region consistent but undefined, and a failed mutation leaves it inconsistent. Applications cope by writing self-describing records with checksums or unique ids, so readers can skip padding and drop duplicates.",
+      "tradeoff": "The file system gets simpler and faster, and every application must handle duplicates and padding. The paper says this was acceptable because Google controlled the applications.",
+      "concepts": [
+        {
+          "slug": "idempotency"
+        },
+        {
+          "slug": "consistency-models"
+        },
+        {
+          "slug": "delivery-guarantees"
+        },
+        {
+          "slug": "message-queues"
+        }
+      ]
+    },
+    {
+      "title": "Make the master recoverable and detect corrupt data",
+      "problem": "The master is a single machine holding everything in memory, and with thousands of disks, data on disk will go bad.",
+      "fix": "The master logs every change to the namespace and the file-to-chunk map in an operation log, stored on its local disk and replicated on remote machines. A change is not shown to clients until the log record is on disk both locally and remotely. The master checkpoints its state when the log grows past a limit, so recovery loads the latest checkpoint and replays only the later log records. Chunk locations are not logged because the chunkservers report them. External monitoring restarts a failed master elsewhere, and read-only shadow masters can serve reads, possibly slightly behind. Each chunkserver checks its data with checksums: every 64 KB block of a chunk has a 32-bit checksum, verified on every read, and a corrupt replica is replaced by cloning another. Deleted files are removed lazily, by renaming them to a hidden name and removing it after three days by default.",
+      "tradeoff": "A single master is simple and keeps global knowledge for good placement, and it also means a restart pauses metadata operations. The paper keeps the master out of the data path so most clients do not notice.",
+      "concepts": [
+        {
+          "slug": "write-ahead-log"
+        },
+        {
+          "slug": "backups-and-point-in-time-recovery"
+        },
+        {
+          "slug": "failure-detection"
+        }
+      ]
+    }
+  ],
+  "failures": [
+    {
+      "scenario": "A chunkserver dies",
+      "impact": "All the chunks it held now have one fewer replica, and a second failure could lose data.",
+      "answer": "Heartbeats stop, the master finds the chunks that fell below three replicas and clones them from surviving replicas, most endangered first, within limits that protect running applications.",
+      "concepts": [
+        {
+          "slug": "failure-detection"
+        },
+        {
+          "slug": "database-replication"
+        }
+      ]
+    },
+    {
+      "scenario": "The master crashes and restarts",
+      "impact": "All metadata was in memory.",
+      "answer": "It loads the latest checkpoint, replays the operation log, and asks the chunkservers which chunks they hold. The paper says it takes only a few seconds to read the metadata from disk, and typically 30 to 60 seconds more until it has fetched chunk locations from all chunkservers.",
+      "concepts": [
+        {
+          "slug": "write-ahead-log"
+        },
+        {
+          "slug": "service-discovery"
+        }
+      ]
+    },
+    {
+      "scenario": "A client cannot reach the primary replica of a chunk",
+      "impact": "Writes to the chunk cannot be ordered.",
+      "answer": "The master waits for the primary's lease to expire (the initial timeout is 60 seconds) and then grants a lease to another replica, so there are never two primaries.",
+      "concepts": [
+        {
+          "slug": "leases-and-fencing-tokens"
+        },
+        {
+          "slug": "leader-election"
+        }
+      ]
+    },
+    {
+      "scenario": "A record append fails on one replica",
+      "impact": "The replicas hold different bytes at that offset.",
+      "answer": "The client retries the append, so the record may appear twice on some replicas. Readers use unique ids and checksums to skip duplicates and padding.",
+      "concepts": [
+        {
+          "slug": "idempotency"
+        },
+        {
+          "slug": "retries-and-backoff"
+        }
+      ]
+    },
+    {
+      "scenario": "A disk silently corrupts a block",
+      "impact": "A client could read bad data without knowing.",
+      "answer": "Each 64 KB block has a 32-bit checksum that the chunkserver verifies before returning data. On a mismatch it reports to the master, and the chunk is cloned from a good replica.",
+      "concepts": [
+        {
+          "slug": "merkle-trees-and-anti-entropy"
+        },
+        {
+          "slug": "database-replication"
+        }
+      ]
+    }
+  ],
+  "alternatives": [
+    {
+      "title": "One master or several",
+      "options": [
+        {
+          "name": "A single master",
+          "pro": "Simple, with global knowledge for placement and replication decisions",
+          "con": "A limit to how far one machine's memory and request rate can go"
+        },
+        {
+          "name": "A distributed metadata service",
+          "pro": "Scales further",
+          "con": "Much more complex to build and keep consistent"
+        }
+      ],
+      "pick": "A single master kept out of the data path, as the paper does."
+    },
+    {
+      "title": "How big a chunk should be",
+      "options": [
+        {
+          "name": "Small blocks (a few KB)",
+          "pro": "Little wasted space for small files",
+          "con": "Huge metadata for multi-gigabyte files, and many master requests"
+        },
+        {
+          "name": "64 MB chunks",
+          "pro": "Few master requests, small metadata, long-lived connections",
+          "con": "Small files can create hot spots on the few chunkservers that hold them"
+        }
+      ],
+      "pick": "64 MB chunks, with a higher replication factor for hot small files."
+    },
+    {
+      "title": "How strict the file semantics should be",
+      "options": [
+        {
+          "name": "POSIX-like consistency",
+          "pro": "Familiar to applications",
+          "con": "Costly with many concurrent writers and across replicas"
+        },
+        {
+          "name": "A relaxed model with record append",
+          "pro": "Fast concurrent appends with no coordination between clients",
+          "con": "Applications must tolerate duplicates and padding"
+        }
+      ],
+      "pick": "A relaxed model, since the applications are written for it."
+    }
+  ],
+  "roles": [
+    {
+      "id": "client",
+      "label": "Clients",
+      "description": "Applications using the GFS client library: ask the master for metadata, then talk to chunkservers directly."
+    },
+    {
+      "id": "compute",
+      "label": "Master",
+      "description": "Holds the namespace and chunk map in memory, grants leases, places and re-replicates chunks."
+    },
+    {
+      "id": "data",
+      "label": "Chunkservers",
+      "description": "Store 64 MB chunks as plain files, apply writes in the primary's order and verify checksums."
+    },
+    {
+      "id": "async",
+      "label": "Operation log",
+      "description": "The replicated record of metadata changes and its checkpoints, used to recover the master."
+    }
+  ],
+  "quiz": [
+    {
+      "question": "Why does the GFS master not store chunk locations on disk?",
+      "options": [
+        "The locations change too fast to store",
+        "The chunkservers report what they hold at startup and in heartbeats, and they have the final word on it, so there is nothing to keep in step",
+        "Disk space on the master is too small",
+        "Chunk locations are secret and must not be saved"
+      ],
+      "answer": 1,
+      "explanation": "The paper says polling the chunkservers is simpler than keeping master and chunkservers in sync as servers join, fail and are renamed. The master's disk is not the limit, and locations are not secret. 'Change too fast' is partly true but the stated reason is that the chunkserver is the authority on what it holds."
+    },
+    {
+      "question": "Three clients append records to the same GFS file at the same time. What does record append guarantee?",
+      "options": [
+        "Records are stored in the order the clients sent them",
+        "Each record is stored atomically at least once, at an offset GFS chooses, though duplicates and padding may appear",
+        "Exactly one record is stored and the rest are rejected",
+        "Each client writes to its own copy of the file"
+      ],
+      "answer": 1,
+      "explanation": "GFS chooses the offset and appends the record at least once, so a retry after a partial failure may leave duplicates, and a record that does not fit pads the chunk. It does not order records by send time, or reject any. Applications deal with duplicates using unique ids and checksums."
+    },
+    {
+      "question": "The primary replica of a chunk becomes unreachable from the master. When may the master grant a new lease to another replica?",
+      "options": [
+        "At once, since the old primary is probably dead",
+        "After the old lease expires, so two primaries are never active together",
+        "Only after an operator confirms",
+        "After the next checkpoint of the operation log"
+      ],
+      "answer": 1,
+      "explanation": "Waiting for the lease to expire is what makes it safe: the old primary stops acting as primary at that time even if it is alive but cut off. Granting a new lease at once could give a chunk two primaries ordering writes differently. Operators and checkpoints are not part of this."
+    }
+  ],
+  "sources": [
+    {
+      "title": "The Google File System",
+      "publisher": "Google Research (SOSP 2003)",
+      "year": 2003,
+      "url": "https://research.google/pubs/the-google-file-system/"
+    }
+  ]
+}

@@ -1,0 +1,85 @@
+---
+import PlaygroundShell from '../../components/PlaygroundShell.astro';
+import RangeField from '../../components/RangeField.astro';
+---
+<PlaygroundShell title="Slow and dead workers" hint="A job runs 2,000 map tasks and then 500 reduce tasks on 500 workers. Choose whether backup tasks run, what happens when workers die, and how many are slow, and see how the run time changes. A simple model, not Google's code or data.">
+  <ol class="how">
+    <li>Press <b>Reset</b>. With the defaults the run takes <b>750</b> s: late tasks add <b>540</b> s and failures add <b>30</b> s.</li>
+    <li>Choose <b>On: copy the last tasks to idle workers</b>: the run drops to <b>270</b> s, late tasks add only <b>60</b> s, and the extra computing is <b>0.3%</b>.</li>
+    <li>Set <b>When a worker dies</b> to <b>Start the whole job again</b>: failures now add <b>120</b> s instead of <b>30</b>.</li>
+    <li>Set <b>Crashed hosts (of 500)</b> to <b>400</b>, with <b>Re-run only its finished map tasks</b>: <b>1,600</b> finished map tasks are run again and failures add <b>480</b> s.</li>
+    <li>Set <b>Crashed hosts (of 500)</b> back to <b>20</b>, <b>Straggler slowdown (times)</b> to <b>100</b> and backups to <b>Off: wait for the slow ones</b>: late tasks add <b>5,940</b> s and the run takes <b>6,150</b> s.</li>
+  </ol>
+  <div class="pg brk" data-brk>
+    <div class="pg-row">
+      <label>Backup tasks <select class="pg-in" data-backup><option value="off">Off: wait for the slow ones</option><option value="on">On: copy the last tasks to idle workers</option></select></label>
+      <RangeField label="Stragglers (of 500)" name="slow" min="0" max="50" value="5" />
+      <RangeField label="Straggler slowdown (times)" name="factor" min="2" max="100" value="10" />
+      <RangeField label="Crashed hosts (of 500)" name="dead" min="0" max="400" step="10" value="20" />
+      <label>When a worker dies <select class="pg-in" data-policy><option value="rerun">Re-run only its finished map tasks</option><option value="restart">Start the whole job again</option></select></label>
+      <button type="button" class="btn" data-reset>Reset</button>
+    </div>
+    <div class="pg-grid">
+      <div class="pg-box" data-b1><h3>Total run time (seconds)</h3><span class="pg-mono" data-o1></span><span class="pg-note" data-n1></span></div>
+      <div class="pg-box" data-b2><h3>Extra time from slow machines (seconds)</h3><span class="pg-mono" data-o2></span><span class="pg-note" data-n2></span></div>
+      <div class="pg-box" data-b3><h3>Extra time from dead workers (seconds)</h3><span class="pg-mono" data-o3></span><span class="pg-note" data-n3></span></div>
+      <div class="pg-box" data-b4><h3>Extra computing used by backup tasks</h3><span class="pg-mono" data-o4></span><span class="pg-note" data-n4></span></div>
+    </div>
+    <p class="pg-out" data-verdict aria-live="polite"></p>
+    <p class="pg-note">Model, invented for teaching and not Google data: 500 workers run 2,000 map tasks of 30 seconds (4 rounds), then 500 reduce tasks of 60 seconds, so a run with no problems takes 180 seconds. Slow machines run a reduce task the number of times slower that you set. With backup tasks, the master starts a copy on an idle worker when the other tasks are done, which takes 60 seconds, so a late task ends after 120 seconds at most. Workers die just before the reduce phase starts. Their finished map output is on their local disks, so those map tasks must be run again on the remaining workers (rerun) or the job starts from the beginning (restart). The paper's sort took 44% longer without backup tasks, and a run with 200 of 1,746 workers killed took only 5% longer.</p>
+  </div>
+</PlaygroundShell>
+<script>
+  import { query, formatWholeNumber, mulberry32 } from '../../playground';
+  document.querySelectorAll<HTMLElement>('[data-brk]').forEach((root) => {
+    const q = query(root);
+    const DEFAULTS: Record<string, string> = {"backup": "off", "slow": "5", "factor": "10", "dead": "20", "policy": "rerun"};
+    const input = (k: string) => q<HTMLInputElement>(`[data-${k}]`);
+    const select = (k: string) => q<HTMLSelectElement>(`[data-${k}]`);
+    const whole = formatWholeNumber;
+    const one = (n: number) => (Math.round(n * 10) / 10).toLocaleString('en-US');
+
+    function draw() {
+      const backup = select('backup').value;
+      const policy = select('policy').value;
+      const slow = Number(input('slow').value);
+      const factor = Number(input('factor').value);
+      const dead = Number(input('dead').value);
+      q('[data-slowval]').textContent = String(slow);
+      q('[data-factorval]').textContent = String(factor);
+      q('[data-deadval]').textContent = String(dead);
+      const boxes: { big: string; note: string; bad: boolean }[] = [];
+      let verdict = '';
+      let failed = false;
+      const WORKERS = 500, MAPS = 2000, MAP_S = 30, REDUCES = 500, RED_S = 60;
+      const mapPhase = Math.ceil(MAPS / WORKERS) * MAP_S; // 4 waves of 30 s
+      const normalReduce = RED_S;
+      const slowReduce = slow === 0 ? RED_S : backup === 'on' ? Math.min(RED_S * factor, RED_S + RED_S) : RED_S * factor; // a backup starts when the rest are done and runs the task again
+      const lostMaps = Math.ceil(MAPS / WORKERS) * dead; // finished map tasks held on the dead workers' local disks
+      const failExtra = dead === 0 ? 0 : policy === 'restart' ? mapPhase : Math.ceil(lostMaps / (WORKERS - dead)) * MAP_S;
+      const total = mapPhase + slowReduce + failExtra;
+      const backupCost = backup === 'on' ? (slow * RED_S) / (MAPS * MAP_S + REDUCES * RED_S) * 100 : 0;
+      boxes.push({ big: whole(total), note: `with no problems: ${whole(mapPhase + normalReduce)} s`, bad: total > 1.5 * (mapPhase + normalReduce) });
+      boxes.push({ big: whole(slowReduce - normalReduce), note: slow === 0 ? 'no stragglers' : backup === 'on' ? 'a copy of each late task finishes first' : 'the whole job waits for the slowest task', bad: slowReduce - normalReduce > 60 });
+      boxes.push({ big: whole(failExtra), note: dead === 0 ? 'no worker died' : policy === 'restart' ? 'the work done so far is thrown away' : `finished map tasks run again: ${whole(lostMaps)}`, bad: failExtra > 60 });
+      boxes.push({ big: `${one(backupCost)}%`, note: backup === 'on' ? 'a few percent at most, as the paper says' : 'no backups are run', bad: false });
+      failed = total > 1.5 * (mapPhase + normalReduce);
+      if (!failed) verdict = `The run took ${whole(total)} seconds, close to the ${whole(mapPhase + normalReduce)} it takes with no problems.`;
+      else if (slowReduce - normalReduce > failExtra) verdict = `The stragglers added ${whole(slowReduce - normalReduce)} seconds because the job cannot finish until its last task does. Backup tasks cut that.`;
+      else verdict = `Crashed hosts added ${whole(failExtra)} seconds. ${policy === 'restart' ? 'Re-running only the lost map tasks costs much less than starting again.' : 'Their finished map output was on local disks, so it had to be made again.'}`;
+      boxes.forEach((b, i) => {
+        q(`[data-o${i + 1}]`).textContent = b.big;
+        q(`[data-n${i + 1}]`).textContent = b.note;
+        q<HTMLElement>(`[data-b${i + 1}]`).style.setProperty('--c', b.bad ? 'var(--bad)' : 'var(--good)');
+      });
+      const out = q('[data-verdict]'); out.classList.toggle('bad', failed); out.textContent = verdict;
+    }
+    root.addEventListener('input', draw);
+    root.addEventListener('change', draw);
+    q('[data-reset]').addEventListener('click', () => {
+      Object.entries(DEFAULTS).forEach(([k, v]) => { (root.querySelector<HTMLInputElement | HTMLSelectElement>(`[data-${k}]`)!).value = v; });
+      draw();
+    });
+    draw();
+  });
+</script>

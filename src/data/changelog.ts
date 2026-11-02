@@ -3,9 +3,18 @@ export interface Change { date: string; title: string; items: { text: string; hr
 
 export const changelog: Change[] = [
   {
-    date: '2026-11-01',
-    title: 'Three more case studies from real companies',
+    date: '2026-11-02',
+    title: 'Six more famous systems, and a simulation for every new study',
     items: [
+      { text: 'How Google built the Google File System (one master, 64 MB chunks, leases, record append) and MapReduce (map, shuffle, reduce, re-running lost work, backup tasks), how Facebook built Haystack for photos, how Google built Dapper (tracing), Chubby (locks and leader election) and Borg (cluster scheduling). Each is built only from the original paper or post, which is listed at the end.', href: 'case-studies/' },
+      { text: 'The five studies added yesterday (Dynamo, Spanner, Bigtable, Stripe rate limiters and TAO) now also have a back-of-the-envelope estimator and a break-it simulation, like the older company studies.', href: 'case-studies/' },
+    ],
+  },
+  {
+    date: '2026-11-01',
+    title: 'Eight more case studies from famous systems and real companies',
+    items: [
+      { text: 'How Amazon built Dynamo (always-writable shopping carts, sloppy quorums, hinted handoff, vector clocks), how Google built Spanner (TrueTime and commit wait) and Bigtable (tablets, memtables and SSTables), how Stripe scales its API with four kinds of rate limiter, and how Facebook built TAO. Each is built only from the original paper or post, which is listed at the end, and has a diagram that grows step by step, an animation and code in three languages.', href: 'case-studies/' },
       { text: 'How Stripe protects its API with four kinds of rate limiter and idempotency keys, how GitHub changes huge MySQL tables without stopping with gh-ost, and how Notion split one Postgres database into 480 logical shards. Each is built only from the company\'s own public posts and documentation, listed at the end of the page, and says plainly when a post does not give a number. The simulations and code are small teaching models, not the companies\' own.', href: 'case-studies/' },
     ],
   },

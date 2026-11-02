@@ -1,0 +1,421 @@
+{
+  "name": "How Stripe Scales Its API with Rate Limiters",
+  "difficulty": "intermediate",
+  "intent": "Follow the four rate limiters Stripe describes in a 2017 engineering post (request rate, concurrent requests, fleet usage and worker utilization) and the way it says to roll them out safely, using only what the post says.",
+  "codeTitle": "a token bucket, a concurrency cap, a load shedder and failing open",
+  "finalIntro": "One user's burst of requests going through the limiters, and what happens when the fleet or the limiter itself is in trouble.",
+  "prompt": "Stripe's public API takes payments for many businesses. In its 2017 post 'Scaling your API with rate limiters', Stripe says rate limiting is how it stays up for everyone when one user causes a traffic spike, when a script sends far more requests than its author meant, when low-priority work such as analytics could crowd out critical transactions, and when an internal failure leaves too little capacity for all the regular traffic. How would you protect a shared API from all of these, without blocking honest customers, and how would you add the protection without risking an outage of the API itself? This study follows what Stripe says in that post, which is listed at the end. The post does not give Stripe's real limits or its code, so the numbers in the simulation and the samples are made up for teaching.",
+  "functional": [
+    "Limit how many requests each user can send per second, while allowing short bursts",
+    "Limit how many of a user's requests can be in progress at the same time, for expensive endpoints",
+    "Keep room for critical requests such as creating a charge when the fleet is busy, by turning away less important ones such as listing charges",
+    "Under severe overload, drop traffic in a fixed order, starting with test mode requests",
+    "Tell rejected clients clearly why, so they can slow down"
+  ],
+  "nonFunctional": [
+    "A bug or an outage in the limiter must never take the API down: the post says to fail open",
+    "The limiters must be cheap to check, because they run on every request",
+    "New limits must be tried without risk: the post says to dark launch each limiter first and keep a way to turn it off",
+    "Operators must see how often each limiter fires, with alerts and metrics",
+    "Behaviour must be the same in test mode and live mode so developers see in testing what will happen in production"
+  ],
+  "firstAttempt": {
+    "text": "This is the situation before limiters, in the terms of the post. Every request goes straight to the API servers. If a user's script goes wrong, or a slow endpoint makes many clients retry, all of that load lands on the servers, and the servers have no way to prefer one kind of request to another.",
+    "limits": [
+      "One user with a runaway script can use enough capacity to slow down everyone else. The post says this happens in test mode, where a user runs a script that has got out of hand",
+      "Slow endpoints cause users to retry, which the post says adds more demand to the resource that is already overloaded",
+      "Low-priority traffic such as analytics and critical traffic such as charges compete for the same servers",
+      "When the fleet loses capacity in an incident, there is no way to drop the least important traffic first"
+    ]
+  },
+  "nodes": [
+    {
+      "id": "client",
+      "label": "API clients",
+      "kind": "client",
+      "x": 8,
+      "y": 50
+    },
+    {
+      "id": "api",
+      "label": "API servers",
+      "kind": "compute",
+      "x": 82,
+      "y": 50
+    },
+    {
+      "id": "rate",
+      "label": "Request rate limiter",
+      "kind": "edge",
+      "x": 32,
+      "y": 50,
+      "at": 1
+    },
+    {
+      "id": "store",
+      "label": "Redis (counters and buckets)",
+      "kind": "data",
+      "x": 32,
+      "y": 16,
+      "at": 1
+    },
+    {
+      "id": "conc",
+      "label": "Concurrent requests limiter",
+      "kind": "edge",
+      "x": 57,
+      "y": 50,
+      "at": 2
+    },
+    {
+      "id": "fleet",
+      "label": "Fleet usage load shedder",
+      "kind": "edge",
+      "x": 57,
+      "y": 84,
+      "at": 3
+    },
+    {
+      "id": "worker",
+      "label": "Worker utilization load shedder",
+      "kind": "edge",
+      "x": 82,
+      "y": 84,
+      "at": 4
+    },
+    {
+      "id": "flags",
+      "label": "Dark launch and kill switch",
+      "kind": "async",
+      "x": 8,
+      "y": 84,
+      "at": 5
+    }
+  ],
+  "edges": [
+    {
+      "from": "client",
+      "to": "api",
+      "until": 1
+    },
+    {
+      "from": "client",
+      "to": "rate",
+      "at": 1
+    },
+    {
+      "from": "rate",
+      "to": "store",
+      "at": 1
+    },
+    {
+      "from": "rate",
+      "to": "conc",
+      "at": 2
+    },
+    {
+      "from": "conc",
+      "to": "api",
+      "at": 2
+    },
+    {
+      "from": "conc",
+      "to": "fleet",
+      "at": 3
+    },
+    {
+      "from": "fleet",
+      "to": "store",
+      "at": 3
+    },
+    {
+      "from": "fleet",
+      "to": "worker",
+      "at": 4
+    },
+    {
+      "from": "worker",
+      "to": "api",
+      "at": 4
+    },
+    {
+      "from": "flags",
+      "to": "rate",
+      "at": 5
+    }
+  ],
+  "steps": [
+    {
+      "title": "Start with a request rate limiter for each user",
+      "problem": "A user whose script goes wrong, or who is attacking, can send far more requests than the API can serve, and the others suffer.",
+      "fix": "The post calls the request rate limiter by far the most important and the one to start with. It restricts each user to N requests per second. Stripe says it uses the token bucket algorithm: each user has a bucket that holds tokens, every request takes one token, and tokens are added back at a steady rate. A request that finds the bucket empty is rejected. The bucket allows a short burst of requests above the steady rate, and the post says Stripe added a brief burst allowance for spikes such as a flash sale. The buckets live in Redis, which the post says can be run yourself or as a managed service. The post says this limiter has rejected millions of requests in a month, many from test mode scripts, and that it applies the same behaviour in test mode and live mode.",
+      "tradeoff": "A bucket gives smooth limits with bursts, at the cost of a Redis call on every request. The post does not give Stripe's rate, so the right value for N is something each team must find by watching its own traffic.",
+      "concepts": [
+        {
+          "slug": "rate-limiting"
+        },
+        {
+          "slug": "caching"
+        },
+        {
+          "slug": "idempotency"
+        }
+      ]
+    },
+    {
+      "title": "Cap requests in progress on expensive endpoints",
+      "problem": "Some endpoints use a lot of CPU. A user can stay under a requests-per-second limit and still tie up many workers if each request is slow, and slow responses make clients retry, which adds demand to a resource that is already overloaded.",
+      "fix": "The concurrent requests limiter caps how many of one user's requests can be in progress at the same time. The post's example is 20 requests at once. It is meant for CPU-intensive endpoints and the post says it totally solved resource contention on the most expensive ones. It rejects far less often than the rate limiter, and the post says it was triggered 12,000 requests in the month it describes.",
+      "tradeoff": "It protects the slowest paths without limiting cheap ones. It needs a counter that goes up when a request starts and down when it ends, so a request that dies without cleaning up must not leave the counter stuck.",
+      "concepts": [
+        {
+          "slug": "rate-limiting"
+        },
+        {
+          "slug": "backpressure"
+        },
+        {
+          "slug": "bulkhead"
+        }
+      ]
+    },
+    {
+      "title": "Reserve capacity for critical traffic with a fleet usage load shedder",
+      "problem": "Even when each user is within their limits, the fleet as a whole can be too busy, and then a request that creates a charge is just as likely to be slowed as one that lists old charges.",
+      "fix": "The fleet usage load shedder sorts traffic into critical methods, for example creating a charge, and non-critical methods, for example listing charges. A Redis cluster counts how many requests of each kind are in use. Stripe reserves a share of the fleet's capacity for critical requests. In the post's example the reservation is 20%, so non-critical requests are rejected once they would use more than the other 80%, with status 503, while critical requests can still use all of the capacity.",
+      "tradeoff": "Someone has to decide which methods are critical, and non-critical users get errors while capacity is free in the reserved share. The post says this shedder fired for a very small fraction of requests.",
+      "concepts": [
+        {
+          "slug": "load-shedding"
+        },
+        {
+          "slug": "graceful-degradation"
+        },
+        {
+          "slug": "slos-and-error-budgets"
+        }
+      ]
+    },
+    {
+      "title": "Keep a last line of defence based on how busy the workers are",
+      "problem": "During an incident, for example when some servers fail, the fleet cannot serve even its normal traffic. Counting requests by type is not enough, because the real limit is how busy the workers are.",
+      "fix": "The worker utilization load shedder is described in the post as the final line of defence. It looks at how many workers are busy and sheds traffic in four categories: critical methods, POSTs, GETs and test mode traffic. The post says test mode traffic is shed first. The post gives it as damage control during incidents rather than prevention, and says it rejected only 100 requests in the month it describes.",
+      "tradeoff": "It trades some failed requests for keeping the critical ones alive. The ordering is a business choice, and shedding test mode first protects live payments.",
+      "concepts": [
+        {
+          "slug": "load-shedding"
+        },
+        {
+          "slug": "backpressure"
+        },
+        {
+          "slug": "graceful-degradation"
+        }
+      ]
+    },
+    {
+      "title": "Roll the limiters out safely",
+      "problem": "A rate limiter that is wrong can reject honest customers, and one that crashes can take down the API it was meant to protect.",
+      "fix": "The post's advice is to hook the limiters into the middleware stack safely. Dark launch each limiter first, so it records the traffic it would block without blocking it, and use that to tune thresholds. Keep feature flags or a kill switch so a person can turn limiters off. Catch exceptions at every level so that a bug in the limiter or an outage of Redis fails open, which means the request is allowed and the API stays up. Choose between 429 and 503 by what is most accurate for the situation, and write messages that tell the client what to do. In this study 429 means a user is sending too much and 503 means the service is short of capacity; the post's fleet shedder example returns 503. Alert on how often each limiter triggers.",
+      "tradeoff": "Failing open means that during a limiter failure the protection is gone. Stripe's choice is that a degraded limiter is better than an unavailable API. The post's own lesson list says to start with the request rate limiter and add the others as scale needs them.",
+      "concepts": [
+        {
+          "slug": "feature-flags"
+        },
+        {
+          "slug": "canary-deployments"
+        },
+        {
+          "slug": "graceful-degradation"
+        },
+        {
+          "slug": "metrics"
+        }
+      ]
+    }
+  ],
+  "failures": [
+    {
+      "scenario": "A customer's script goes into a loop and sends thousands of requests a second",
+      "impact": "Without a limit it would use capacity needed by other customers.",
+      "answer": "The token bucket empties after the burst allowance, so most of the requests are rejected with 429 and the rest of the fleet is untouched. The rejection message tells the client to slow down.",
+      "concepts": [
+        {
+          "slug": "rate-limiting"
+        }
+      ]
+    },
+    {
+      "scenario": "An expensive endpoint gets slow, and clients start retrying",
+      "impact": "Retries add demand to the resource that is already overloaded, which makes it slower and causes more retries.",
+      "answer": "The concurrent requests limiter rejects a user's extra in-progress requests, so a slow endpoint cannot be flooded by one user's retries. The clients should also back off.",
+      "concepts": [
+        {
+          "slug": "retries-and-backoff"
+        },
+        {
+          "slug": "backpressure"
+        }
+      ]
+    },
+    {
+      "scenario": "Part of the fleet fails and capacity drops",
+      "impact": "There is not enough capacity for the normal traffic.",
+      "answer": "The fleet usage shedder keeps the reserved share for critical requests and turns away non-critical ones with 503. If workers are still saturated, the worker utilization shedder drops test mode traffic first.",
+      "concepts": [
+        {
+          "slug": "load-shedding"
+        },
+        {
+          "slug": "graceful-degradation"
+        }
+      ]
+    },
+    {
+      "scenario": "The Redis cluster that holds the buckets becomes unreachable",
+      "impact": "If the limiter treated a failed check as a rejection, every request would fail and the limiter would cause the outage.",
+      "answer": "The limiter code catches the error and lets the request through, which is failing open. Operators are alerted through the limiter's own metrics.",
+      "concepts": [
+        {
+          "slug": "graceful-degradation"
+        },
+        {
+          "slug": "circuit-breaker"
+        }
+      ]
+    },
+    {
+      "scenario": "A new limit is set too low",
+      "impact": "Honest customers would get 429 responses on the day it is enabled.",
+      "answer": "The limiter was dark launched, so its would-be rejections were measured against real traffic beforehand and the limit adjusted. A feature flag lets a person switch it off at once if something was missed.",
+      "concepts": [
+        {
+          "slug": "feature-flags"
+        },
+        {
+          "slug": "canary-deployments"
+        }
+      ]
+    }
+  ],
+  "alternatives": [
+    {
+      "title": "Where to start",
+      "options": [
+        {
+          "name": "All four limiters at once",
+          "pro": "Complete protection",
+          "con": "Much to tune and monitor; the post says to add the others over time as scale requires"
+        },
+        {
+          "name": "A request rate limiter first",
+          "pro": "The post calls it by far the most important one, and it is simple",
+          "con": "Does not protect against slow endpoints or fleet-wide overload"
+        }
+      ],
+      "pick": "The request rate limiter first, then the others as the traffic and the incidents call for them, as the post advises."
+    },
+    {
+      "title": "What to do when the limiter itself fails",
+      "options": [
+        {
+          "name": "Fail closed (reject everything)",
+          "pro": "Never lets abuse through",
+          "con": "A limiter bug becomes an outage for every user"
+        },
+        {
+          "name": "Fail open (allow everything)",
+          "pro": "The API stays up",
+          "con": "No protection while the limiter is down"
+        }
+      ],
+      "pick": "Fail open, as the post recommends."
+    },
+    {
+      "title": "Which status code to return",
+      "options": [
+        {
+          "name": "429 Too Many Requests",
+          "pro": "Tells one client it is sending too much",
+          "con": "Misleading when the whole fleet is short of capacity"
+        },
+        {
+          "name": "503 Service Unavailable",
+          "pro": "Fits a shortage of capacity that is not the client's fault",
+          "con": "Does not tell the client that it should slow down"
+        }
+      ],
+      "pick": "429 for per-user limits and 503 for fleet shedding, following the post's advice to choose what is most accurate for the situation."
+    }
+  ],
+  "roles": [
+    {
+      "id": "client",
+      "label": "API clients",
+      "description": "Send requests and should slow down when they see 429 or 503."
+    },
+    {
+      "id": "edge",
+      "label": "Limiters",
+      "description": "Four checks in the middleware: request rate, concurrent requests, fleet usage and worker utilization."
+    },
+    {
+      "id": "data",
+      "label": "Redis",
+      "description": "Holds the buckets and the counters the limiters read and update."
+    },
+    {
+      "id": "compute",
+      "label": "API servers",
+      "description": "Do the work for requests that pass every limiter."
+    },
+    {
+      "id": "async",
+      "label": "Rollout controls",
+      "description": "Dark launch, feature flags and metrics that make the limiters safe to change."
+    }
+  ],
+  "quiz": [
+    {
+      "question": "A user keeps sending short bursts of requests above the steady rate. With a token bucket per user, what happens?",
+      "options": [
+        "Every request over the steady rate is rejected immediately",
+        "The bucket lets a burst through while it has tokens, then rejects until tokens are added back at the steady rate",
+        "All requests are delayed until the bucket is full",
+        "The user's bucket is deleted and a new one is made"
+      ],
+      "answer": 1,
+      "explanation": "A bucket holds tokens that build up while the user is quiet, so a burst up to its size is allowed, and after that requests pass only as fast as tokens are added. A strict per-second limit would reject all the extra requests. Delaying until the bucket is full is not how a bucket works, and deleting buckets would give no limit at all."
+    },
+    {
+      "question": "The Redis cluster holding the limiter's counters goes down. What does the post recommend the limiter does?",
+      "options": [
+        "Reject all requests until Redis is back",
+        "Allow requests through (fail open), so that an error in the limiter does not make the API unavailable",
+        "Use only the worker utilization shedder from then on",
+        "Switch to the strictest limits it has seen"
+      ],
+      "answer": 1,
+      "explanation": "The post says to catch errors at all levels so that coding or operational problems fail open and the API stays functional. Rejecting everything would make the limiter the cause of an outage. The other limiters would depend on the same store here. Using the strictest limits would reject honest customers during a failure that is not theirs."
+    },
+    {
+      "question": "Before turning on a new limiter for real, what does the post advise?",
+      "options": [
+        "Enable it for all users and watch for complaints",
+        "Run it in test mode only, since test mode is never used by real customers",
+        "Dark launch it, so it records the requests it would have blocked without blocking them",
+        "Copy the limits of another company's API"
+      ],
+      "answer": 2,
+      "explanation": "A dark launch shows what the limiter would do with real traffic, so thresholds can be tuned first. Watching for complaints means honest customers are already affected. Test mode traffic is not typical of live traffic, and the post notes test mode is where many runaway scripts are. Another company's limits do not fit your traffic."
+    }
+  ],
+  "sources": [
+    {
+      "title": "Scaling your API with rate limiters",
+      "publisher": "Stripe Engineering Blog",
+      "year": 2017,
+      "url": "https://stripe.com/blog/rate-limiters"
+    }
+  ]
+}

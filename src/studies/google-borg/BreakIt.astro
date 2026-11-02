@@ -1,0 +1,83 @@
+---
+import PlaygroundShell from '../../components/PlaygroundShell.astro';
+import RangeField from '../../components/RangeField.astro';
+---
+<PlaygroundShell title="Reclaiming reserved resources" hint="Production jobs reserve room for peaks and mostly use less. Choose whether Borg lends the unused part to batch work, how much production really uses, how much batch work wants to run, and whether production spikes to its limits, and see what runs, what waits and what is evicted. A simple model, not Google's code or data.">
+  <ol class="how">
+    <li>Press <b>Reset</b>. With the defaults, low-priority work gets only the room outside the main services' reservations: <b>30%</b> of the cluster runs and <b>10%</b> waits.</li>
+    <li>Set <b>Reclamation</b> to <b>On: unused reservations are lent out</b>: all <b>40%</b> runs, nothing waits, and the same work fits in <b>82%</b> of the cluster.</li>
+    <li>Set <b>Production spike</b> to <b>Usage jumps to the limits</b>: <b>10%</b> of the low-priority work is evicted, and none of the main services is touched.</li>
+    <li>Set <b>Batch want (% of cell)</b> to <b>70</b>: <b>58%</b> runs, <b>12%</b> waits, and the work needs <b>112%</b> of the cluster.</li>
+  </ol>
+  <div class="pg brk" data-brk>
+    <div class="pg-row">
+      <label>Reclamation <select class="pg-in" data-recl><option value="off">Off: production limits stay reserved</option><option value="on">On: unused reservations are lent out</option></select></label>
+      <RangeField label="Prod use (% of limits)" name="use" min="20" max="100" step="5" value="50" />
+      <RangeField label="Batch want (% of cell)" name="want" min="0" max="70" step="5" value="40" />
+      <label>Production spike <select class="pg-in" data-spike><option value="no">No spike</option><option value="yes">Usage jumps to the limits</option></select></label>
+      <button type="button" class="btn" data-reset>Reset</button>
+    </div>
+    <div class="pg-grid">
+      <div class="pg-box" data-b1><h3>Low-priority work running (% of the cell)</h3><span class="pg-mono" data-o1></span><span class="pg-note" data-n1></span></div>
+      <div class="pg-box" data-b2><h3>Low-priority work waiting (% of the cell)</h3><span class="pg-mono" data-o2></span><span class="pg-note" data-n2></span></div>
+      <div class="pg-box" data-b3><h3>Low-priority work evicted by the spike (% of the cell)</h3><span class="pg-mono" data-o3></span><span class="pg-note" data-n3></span></div>
+      <div class="pg-box" data-b4><h3>Cell size needed for all of this (% of the cell)</h3><span class="pg-mono" data-o4></span><span class="pg-note" data-n4></span></div>
+    </div>
+    <p class="pg-out" data-verdict aria-live="polite"></p>
+    <p class="pg-note">Model, invented for teaching and not Google data. Production jobs have limits that add up to 70% of the cell (the paper says prod jobs are allocated about 70% of the CPU in a representative cell) and really use the share of their limits that you set. With reclamation, the Borgmaster computes each task's reservation as its usage plus a safety margin of 10% of the limit, and the rest is lent to low-priority work. The scheduler places production tasks by their limits, so they never rely on reclaimed resources. If production usage jumps to its limits, the reclaimed room is taken back and low-priority tasks there are killed or throttled. The paper reports that about 20% of the workload in a median cell runs in reclaimed resources, and that separate cells for prod and non-prod work need 20 to 30% more machines in the median cell.</p>
+  </div>
+</PlaygroundShell>
+<script>
+  import { query, formatWholeNumber, mulberry32 } from '../../playground';
+  document.querySelectorAll<HTMLElement>('[data-brk]').forEach((root) => {
+    const q = query(root);
+    const DEFAULTS: Record<string, string> = {"recl": "off", "use": "50", "want": "40", "spike": "no"};
+    const input = (k: string) => q<HTMLInputElement>(`[data-${k}]`);
+    const select = (k: string) => q<HTMLSelectElement>(`[data-${k}]`);
+    const whole = formatWholeNumber;
+    const one = (n: number) => (Math.round(n * 10) / 10).toLocaleString('en-US');
+
+    function draw() {
+      const recl = select('recl').value;
+      const spike = select('spike').value;
+      const use = Number(input('use').value);
+      const want = Number(input('want').value);
+      q('[data-useval]').textContent = String(use);
+      q('[data-wantval]').textContent = String(want);
+      const boxes: { big: string; note: string; bad: boolean }[] = [];
+      let verdict = '';
+      let failed = false;
+      const LIMIT = 70, MARGIN = 7; // production limits are 70% of the cell; the safety margin is 10% of them
+      const usage = (LIMIT * use) / 100;
+      const reservation = Math.min(LIMIT, usage + MARGIN);
+      const capacity = recl === 'on' ? 100 - reservation : 100 - LIMIT; // room open to low-priority work
+      const running = Math.min(want, capacity);
+      const waiting = want - running;
+      const afterSpike = recl === 'on' && spike === 'yes' ? 100 - LIMIT : capacity; // production claims its full limits again
+      const evicted = Math.max(0, running - afterSpike);
+      const needed = (recl === 'on' ? reservation : LIMIT) + want;
+      boxes.push({ big: `${one(running)}%`, note: recl === 'on' ? 'the cell also uses room that production reserved but does not use' : 'only the room outside the production limits', bad: false });
+      boxes.push({ big: `${one(waiting)}%`, note: waiting > 0 ? 'there is no room for it, so it stays pending' : 'everything that wanted to run is running', bad: waiting > 0 });
+      boxes.push({ big: `${one(evicted)}%`, note: evicted > 0 ? 'low-priority tasks are killed or throttled, never production ones' : spike === 'yes' ? 'nothing was in reclaimed room' : 'no spike', bad: evicted > 0 });
+      boxes.push({ big: `${one(needed)}%`, note: needed > 100 ? 'this does not fit in one cell' : 'fits in the cell', bad: needed > 100 });
+      failed = waiting > 0 || evicted > 0;
+      if (waiting > 0 && recl === 'off') verdict = `${one(waiting)}% of the cell's worth of low-priority work cannot run, even though production uses only ${one(usage)}% of the cell. Reclamation would lend the unused part of the production reservations.`;
+      else if (waiting > 0) verdict = `${one(waiting)}% of the cell's worth of low-priority work still cannot run: even with reclamation, the production reservations (${one(reservation)}%) leave only ${one(capacity)}% of the cell open.`;
+      else if (evicted > 0) verdict = `The spike took back the reclaimed room, so ${one(evicted)}% of low-priority work was evicted. Production tasks were not touched.`;
+      else verdict = recl === 'on' ? 'Everything runs, and the same work needs a smaller cell than it would with production limits reserved.' : 'Everything fits inside the room outside the production limits.';
+      boxes.forEach((b, i) => {
+        q(`[data-o${i + 1}]`).textContent = b.big;
+        q(`[data-n${i + 1}]`).textContent = b.note;
+        q<HTMLElement>(`[data-b${i + 1}]`).style.setProperty('--c', b.bad ? 'var(--bad)' : 'var(--good)');
+      });
+      const out = q('[data-verdict]'); out.classList.toggle('bad', failed); out.textContent = verdict;
+    }
+    root.addEventListener('input', draw);
+    root.addEventListener('change', draw);
+    q('[data-reset]').addEventListener('click', () => {
+      Object.entries(DEFAULTS).forEach(([k, v]) => { (root.querySelector<HTMLInputElement | HTMLSelectElement>(`[data-${k}]`)!).value = v; });
+      draw();
+    });
+    draw();
+  });
+</script>

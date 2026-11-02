@@ -1,0 +1,85 @@
+---
+import PlaygroundShell from '../../components/PlaygroundShell.astro';
+import RangeField from '../../components/RangeField.astro';
+---
+<PlaygroundShell title="Photos at the peak" hint="Choose a file per photo or Haystack, how much file system metadata is cached, the request rate, how many photos are deleted, and whether compaction and the index file are there, and see disk reads, disks needed, wasted space and restart time. A simple model, not Facebook's code or data.">
+  <ol class="how">
+    <li>Press <b>Reset</b>. With a file per photo on NFS, an image costs <b>2.6</b> disk reads and <b>14,300</b> disks are busy.</li>
+    <li>Set <b>Layout</b> to <b>Haystack: needles in big files</b>: an image costs <b>1</b> disk read, <b>5,500</b> disks are busy, <b>2</b> TB are wasted on dead needles, and the index reloads in <b>11.1</b> minutes.</li>
+    <li>Set <b>Compaction</b> to <b>On: live needles are copied to a new file</b>: the wasted space falls to <b>0</b> TB.</li>
+    <li>Set <b>Index file</b> to <b>Lost: scan the whole store file</b>: the reload takes <b>1,111.1</b> minutes.</li>
+    <li>Set <b>Layout</b> back to <b>A file per photo on NFS</b> and <b>Metadata found in cache (%)</b> to <b>100</b>: an image costs <b>1</b> disk read, but at this scale the metadata is far too big to cache.</li>
+  </ol>
+  <div class="pg brk" data-brk>
+    <div class="pg-row">
+      <label>Layout <select class="pg-in" data-layout><option value="nfs">A file per photo on NFS</option><option value="hay">Haystack: needles in big files</option></select></label>
+      <RangeField label="Metadata found in cache (%)" name="hit" min="0" max="100" step="10" value="20" />
+      <RangeField label="Requests per second (thousands)" name="req" min="50" max="1000" step="50" value="550" />
+      <RangeField label="Photos deleted (%)" name="del" min="0" max="50" step="10" value="20" />
+      <label>Compaction <select class="pg-in" data-compact><option value="off">Off: deleted needles stay</option><option value="on">On: live needles are copied to a new file</option></select></label>
+      <label>Index file <select class="pg-in" data-indexfile><option value="kept">Kept beside the store file</option><option value="lost">Lost: scan the whole store file</option></select></label>
+      <button type="button" class="btn" data-reset>Reset</button>
+    </div>
+    <div class="pg-grid">
+      <div class="pg-box" data-b1><h3>Disk reads for one image</h3><span class="pg-mono" data-o1></span><span class="pg-note" data-n1></span></div>
+      <div class="pg-box" data-b2><h3>Disks busy at this request rate</h3><span class="pg-mono" data-o2></span><span class="pg-note" data-n2></span></div>
+      <div class="pg-box" data-b3><h3>Disk space wasted by deleted photos (TB of 10 TB)</h3><span class="pg-mono" data-o3></span><span class="pg-note" data-n3></span></div>
+      <div class="pg-box" data-b4><h3>Minutes to reload the index after a restart</h3><span class="pg-mono" data-o4></span><span class="pg-note" data-n4></span></div>
+    </div>
+    <p class="pg-out" data-verdict aria-live="polite"></p>
+    <p class="pg-note">Model, invented for teaching and not Facebook data. In the file-per-photo layout, a read costs one read for the data plus two (the directory and the inode) for each lookup whose metadata is not cached. In Haystack the offset is found in memory, so a read costs one. A disk does 100 reads per second and 150 MB per second, a storage machine holds 10 TB (the post says about 10 TB usable per blade), and the index file is 1% of the store file (the post says usually under 1%). Deleted photos in Haystack stay in the store file as flagged needles until compaction.</p>
+  </div>
+</PlaygroundShell>
+<script>
+  import { query, formatWholeNumber, mulberry32 } from '../../playground';
+  document.querySelectorAll<HTMLElement>('[data-brk]').forEach((root) => {
+    const q = query(root);
+    const DEFAULTS: Record<string, string> = {"layout": "nfs", "hit": "20", "req": "550", "del": "20", "compact": "off", "indexfile": "kept"};
+    const input = (k: string) => q<HTMLInputElement>(`[data-${k}]`);
+    const select = (k: string) => q<HTMLSelectElement>(`[data-${k}]`);
+    const whole = formatWholeNumber;
+    const one = (n: number) => (Math.round(n * 10) / 10).toLocaleString('en-US');
+
+    function draw() {
+      const layout = select('layout').value;
+      const compact = select('compact').value;
+      const indexfile = select('indexfile').value;
+      const hit = Number(input('hit').value);
+      const req = Number(input('req').value);
+      const del = Number(input('del').value);
+      q('[data-hitval]').textContent = String(hit);
+      q('[data-reqval]').textContent = String(req);
+      q('[data-delval]').textContent = String(del);
+      const boxes: { big: string; note: string; bad: boolean }[] = [];
+      let verdict = '';
+      let failed = false;
+      const DISK_IOPS = 100, MACHINE_TB = 10, DISK_MBS = 150, MACHINE_MB = MACHINE_TB * 1e6;
+      const reads = layout === 'nfs' ? 1 + 2 * (1 - hit / 100) : 1; // directory and inode reads when the metadata is not cached, then the data
+      const disks = Math.ceil((req * 1000 * reads) / DISK_IOPS);
+      const waste = layout === 'hay' && compact === 'off' ? (MACHINE_TB * del) / 100 : 0;
+      const restart = layout === 'hay' ? (indexfile === 'kept' ? MACHINE_MB * 0.01 : MACHINE_MB) / DISK_MBS / 60 : 0;
+      boxes.push({ big: one(reads), note: layout === 'nfs' ? `metadata misses add reads before the data` : 'the offset is in memory, so one read fetches the data', bad: reads > 1.5 });
+      boxes.push({ big: whole(disks), note: `at ${DISK_IOPS} reads per second per disk`, bad: disks > 10000 });
+      boxes.push({ big: one(waste), note: layout === 'nfs' ? 'a deleted file frees its space at once' : compact === 'on' ? 'compaction copies only live needles' : 'flagged needles stay in the file until compaction', bad: waste >= 1 });
+      boxes.push({ big: layout === 'hay' ? one(restart) : 'no index', note: layout === 'hay' ? (indexfile === 'kept' ? 'reading the index file, about 1% of the store file' : 'reading the whole store file at 150 MB per second') : 'nothing to reload, but every read pays for metadata', bad: restart > 60 });
+      failed = reads > 1.5 || waste >= 1 || restart > 60;
+      if (layout === 'nfs') verdict = reads > 1.5 ? `Each image costs ${one(reads)} disk reads because ${whole(100 - hit)}% of the metadata lookups miss the cache, so ${whole(disks)} disks are busy. Haystack keeps the offset in memory.` : 'With all the metadata cached a file per photo needs one read too, but at this scale the metadata is far too big to cache.';
+      else if (restart > 60) verdict = `Without the index file the machine must scan its whole store file: ${whole(restart)} minutes before it can serve. The index file is under 1% of the store file's size.`;
+      else if (waste >= 1) verdict = `${one(waste)} TB of each 10 TB machine holds deleted photos, because compaction is off. Compaction copies only the live needles.`;
+      else verdict = 'One disk read per image, no wasted space and a quick restart.';
+      boxes.forEach((b, i) => {
+        q(`[data-o${i + 1}]`).textContent = b.big;
+        q(`[data-n${i + 1}]`).textContent = b.note;
+        q<HTMLElement>(`[data-b${i + 1}]`).style.setProperty('--c', b.bad ? 'var(--bad)' : 'var(--good)');
+      });
+      const out = q('[data-verdict]'); out.classList.toggle('bad', failed); out.textContent = verdict;
+    }
+    root.addEventListener('input', draw);
+    root.addEventListener('change', draw);
+    q('[data-reset]').addEventListener('click', () => {
+      Object.entries(DEFAULTS).forEach(([k, v]) => { (root.querySelector<HTMLInputElement | HTMLSelectElement>(`[data-${k}]`)!).value = v; });
+      draw();
+    });
+    draw();
+  });
+</script>
