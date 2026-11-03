@@ -1,0 +1,270 @@
+{
+  "name": "How Amazon's Dynamo Stays Always Writable",
+  "difficulty": "advanced",
+  "intent": "Follow how Amazon's Dynamo spreads a key-value store across many machines so that a shopping cart can always be written to, using only what the 2007 paper says.",
+  "codeTitle": "a replica set, quorums, a hinted stand-in and a merge on read",
+  "finalIntro": "One shopping-cart update through the finished design, including a replica that is down and two versions that must be merged.",
+  "prompt": "Amazon's e-commerce platform runs on tens of thousands of servers in many data centers, where, as the Dynamo paper puts it, small and large components fail continuously. A customer must be able to add an item to a shopping cart even if disks are failing, network routes are flapping or a data center is destroyed. In its 2007 paper 'Dynamo: Amazon's Highly Available Key-value Store', Amazon describes a storage system built for that: it accepts writes when parts of it are unreachable and sorts out the differences later. How would you build a store that never refuses a write, and what do you give up for it? This study follows that paper, which is listed at the end. The paper says that protecting Amazon's business interests required it to give some figures only as aggregates, so where it gives no number this study says so, and the numbers in the estimator, the simulation and the code samples are round teaching figures, not Amazon's data or code.",
+  "functional": [
+    "Store and fetch a small object, usually under 1 MB, by its key with get and put, with no relational queries and no operations across several keys",
+    "Accept a write even when some of the machines that should hold the data cannot be reached",
+    "Notice when two copies of an object have diverged and bring them back together",
+    "Add or remove one machine at a time without manually moving data around",
+    "Let each service choose its own trade-off between availability, consistency, durability and cost"
+  ],
+  "nonFunctional": [
+    "Latency measured at the 99.9th percentile, not the mean: the paper's example SLA is a response within 300 ms for 99.9% of requests at a peak client load of 500 requests per second",
+    "Always writable: rejecting a customer's update, such as an item added to a cart, is treated as a bad outcome",
+    "No central point of control: every node does the same job, because the paper says centralised control has caused outages",
+    "Runs on commodity hardware inside Amazon's own trusted network, so there is no authentication or authorisation in the design",
+    "Production figures the paper gives: the shopping cart service served tens of millions of requests resulting in well over 3 million checkouts in a day, and 99.9995% of requests over two years got a successful response, with no data loss event"
+  ],
+  "firstAttempt": {
+    "text": "The design this study starts from is the one the paper says Amazon's services traditionally used: state kept in a relational database, replicated so that every copy agrees before an answer is given. The paper notes that most of these services only store and retrieve data by primary key, so most of what a relational database offers goes unused.",
+    "limits": [
+      "The paper says Amazon's experience is that data stores that provide ACID guarantees tend to have poor availability",
+      "Replication of this kind coordinates the replicas synchronously, so when it cannot be sure an answer is correct it makes the data unavailable instead. For a shopping cart, refusing the customer's update means a poor customer experience",
+      "The extra functionality needs expensive hardware and highly skilled operators, which the paper calls a very inefficient solution for a service that only looks things up by key",
+      "It is not easy to scale out a database or to use smart partitioning schemes for load balancing"
+    ]
+  },
+  "nodes": [
+    { "id": "client", "label": "Application", "kind": "client", "x": 8, "y": 50 },
+    { "id": "database", "label": "Relational database", "kind": "data", "x": 50, "y": 50, "until": 1 },
+    { "id": "coordinator", "label": "Coordinator (first node in the preference list)", "kind": "edge", "x": 29, "y": 50, "at": 1 },
+    { "id": "replicaB", "label": "Replica B", "kind": "data", "x": 71, "y": 16, "at": 1 },
+    { "id": "replicaC", "label": "Replica C", "kind": "data", "x": 92, "y": 50, "at": 1 },
+    { "id": "replicaD", "label": "Replica D", "kind": "data", "x": 71, "y": 84, "at": 1 },
+    { "id": "standin", "label": "Stand-in node E (holds a hint)", "kind": "data", "x": 50, "y": 84, "at": 4 },
+    { "id": "merkle", "label": "Merkle trees (anti-entropy)", "kind": "async", "x": 50, "y": 16, "at": 5 },
+    { "id": "gossip", "label": "Gossip: membership and tokens", "kind": "async", "x": 29, "y": 16, "at": 6 },
+    { "id": "buffer", "label": "Write buffer in memory", "kind": "data", "x": 92, "y": 84, "at": 7 }
+  ],
+  "edges": [
+    { "from": "client", "to": "database", "until": 1 },
+    { "from": "client", "to": "coordinator", "at": 1 },
+    { "from": "coordinator", "to": "replicaB", "at": 1 },
+    { "from": "coordinator", "to": "replicaC", "at": 2 },
+    { "from": "coordinator", "to": "replicaD", "at": 2 },
+    { "from": "replicaB", "to": "client", "at": 3 },
+    { "from": "coordinator", "to": "standin", "at": 4 },
+    { "from": "standin", "to": "replicaD", "at": 4 },
+    { "from": "merkle", "to": "replicaB", "at": 5 },
+    { "from": "merkle", "to": "replicaC", "at": 5 },
+    { "from": "gossip", "to": "coordinator", "at": 6 },
+    { "from": "gossip", "to": "replicaB", "at": 6 },
+    { "from": "replicaB", "to": "buffer", "at": 7 }
+  ],
+  "steps": [
+    {
+      "title": "Choose availability over consistency, and spread keys with consistent hashing",
+      "problem": "A store that must always accept writes cannot wait for every copy to agree. It also has to grow one machine at a time, with no machine in charge, and without moving most of the data every time it does.",
+      "fix": "Dynamo is designed as an eventually consistent store, where all updates reach all replicas eventually, and it targets an always-writeable data store. It offers only get and put on an opaque value found by key, with an MD5 hash of the key giving a 128-bit identifier. It partitions with consistent hashing. The hash range is a ring, each node is given a random position on it, and a key belongs to the first node clockwise from the key's position. A node's arrival or departure then affects only its neighbours. To even out load and account for machines of different power, each physical node takes many positions, called virtual nodes or tokens. Every node can work out where any key lives, so a request goes straight to the right node instead of being routed through several, which the paper calls a zero-hop design and adopts because multi-hop routing increases variability at high percentiles.",
+      "tradeoff": "Choosing to accept every write means that conflicting versions can arise, and the paper pushes the work of resolving them to the reads. With the basic ring, random positions give uneven load, which is what virtual nodes fix. The design assumes a trusted network and, as the paper says, targets instances of up to a couple of hundred nodes, because every node knows the whole routing table.",
+      "concepts": [
+        { "slug": "consistent-hashing" },
+        { "slug": "cap-theorem" },
+        { "slug": "consistency-models" },
+        { "slug": "sql-vs-nosql" }
+      ]
+    },
+    {
+      "title": "Replicate to N nodes and tune R and W",
+      "problem": "One copy is not durable, and waiting for every copy makes every write as slow and as fragile as the slowest, least reachable machine.",
+      "fix": "Each key is stored by a coordinator and copied to the N minus 1 nodes that follow it clockwise on the ring, and this list of nodes is the key's preference list. It contains more than N nodes so that there are spares when some fail, and it skips positions so that it names only distinct physical nodes. A read waits for R replies and a write for W acknowledgements. Setting R plus W above N gives a quorum-like system, and because latency is set by the slowest of the R or W replicas, they are usually set below N. The paper's usual configuration is N=3, R=2, W=2. A service can set W to 1 to accept a write as long as one node can store it, or R to 1 and W to N to make a fast read engine. The paper says most production services set a higher W for durability.",
+      "tradeoff": "N sets durability, and R and W trade latency against consistency and durability. Low W means a write can be acknowledged after reaching only a few nodes, which the paper calls a vulnerability window for durability, and raising W shrinks it but makes writes fail more often when nodes are down. The paper presents a typical SLA of 99.9% of reads and writes within 300 ms but gives no per-service settings beyond the usual (3,2,2).",
+      "concepts": [
+        { "slug": "quorums" },
+        { "slug": "database-replication" },
+        { "slug": "slos-and-error-budgets" }
+      ]
+    },
+    {
+      "title": "Keep every version, and merge conflicts when the data is read",
+      "problem": "If two clients update the same cart on different replicas at the same time, neither update should be lost, and the store cannot know which one is right.",
+      "fix": "Every update creates a new, immutable version of the object, and a vector clock, a list of (node, counter) pairs, records the causal history of each version. If one version's counters are all at most another's, it is an ancestor and can be discarded. Otherwise they are in conflict. A get returns all the conflicting versions with a context that holds their clocks, and a later put that passes this context collapses them into one. For the shopping cart, the application merges the versions, so an 'add to cart' is never lost. The paper notes that deleted items can resurface. The other option is for the store to apply a simple rule such as last write wins, which the paper says its session service uses. To keep clocks from growing, Dynamo stores a timestamp with each pair and, once a clock reaches a threshold (the paper says 10 as an example), drops the oldest pair. The paper says this has not caused problems in production, so it has not been studied closely.",
+      "tradeoff": "Pushing conflicts to the reader keeps writes always possible, but every application that uses application-level merging must write correct merge logic. In the paper's 24-hour sample of the shopping cart, 99.94% of requests saw exactly one version, 0.00057% saw two, 0.00047% saw three and 0.00009% saw four. The paper adds that the rise in divergent versions came from concurrent writers, usually automated programs and rarely people, and not from failures.",
+      "concepts": [
+        { "slug": "logical-clocks" },
+        { "slug": "crdts" },
+        { "slug": "optimistic-concurrency-and-etags" }
+      ]
+    },
+    {
+      "title": "Use a sloppy quorum and hinted handoff when nodes are down",
+      "problem": "A strict quorum fails or loses durability the moment some of the N nodes are unreachable, even for a moment, which would reject writes that Amazon wants to accept.",
+      "fix": "Dynamo does not insist on the first N nodes. All reads and writes use the first N healthy nodes in the preference list, which may be nodes further along the ring. If node A is down during a write, its replica goes to another node, D in the paper's example. That replica carries a hint naming the node it was meant for. The stand-in keeps hinted replicas in a separate local database that it scans periodically, and when A is back it tries to deliver the replica to A and then deletes its own copy. The preference list is also built so that its nodes are spread across several data centers, which lets Dynamo survive the loss of a whole data center.",
+      "tradeoff": "This keeps reads and writes from failing because of temporary failures, at the cost of a looser guarantee about which nodes hold the data. The paper says hinted handoff works best when membership churn is low and failures are transient, and that hinted replicas can become unavailable before they are returned.",
+      "concepts": [
+        { "slug": "quorums" },
+        { "slug": "multi-region-failover" },
+        { "slug": "graceful-degradation" }
+      ]
+    },
+    {
+      "title": "Repair permanent differences in the background with Merkle trees",
+      "problem": "Hints cover short failures. A node can also be lost for good, or miss updates in other ways, and replicas drift apart without anyone noticing. Comparing every key on every replica would be far too much data.",
+      "fix": "Dynamo runs an anti-entropy process to keep replicas in step. Each node keeps a Merkle tree, a hash tree whose leaves are hashes of individual keys, for each key range it hosts. Two nodes exchange the root of the tree for a range they share. If the roots match, the data matches. If not, they compare children and descend until they reach the keys that differ, so only those need to be transferred. Separately, read repair updates a stale replica when a read finds one, using the reply that arrives after the response has gone to the caller.",
+      "tradeoff": "Trees need recomputing when a node joins or leaves, because many key ranges change, which the paper says is costly on a production system, and its later partitioning scheme was designed in part to fix it. Background repair also competes with live traffic, which is why the paper adds an admission controller for background tasks.",
+      "concepts": [
+        { "slug": "merkle-trees-and-anti-entropy" },
+        { "slug": "database-replication" }
+      ]
+    },
+    {
+      "title": "Manage membership and failure detection without a central server",
+      "problem": "There is no master node. Every node must know which nodes exist and who owns which range, and must stop wasting time on nodes that do not answer.",
+      "fix": "Adding and removing nodes is an explicit act: an administrator tells one node to join or remove another, and the change and its time are written to that node's store. A gossip protocol spreads the changes: every second each node contacts a random peer and the two reconcile their histories of membership changes, which also carries the token ranges, so every node knows who owns what. Some nodes act as seeds, known to all, so that two nodes that were joined separately do not stay logically partitioned. Failure detection is local: a node considers a peer failed if the peer does not answer, uses other nodes for that peer's keys, and retries it from time to time. Early designs used a decentralised failure detector, and the paper says the explicit join and leave removed the need for a global view of failures. A node's outage is usually temporary, so it does not by itself trigger a rebalance.",
+      "tradeoff": "Full membership, with every node knowing every other, works for a couple of hundred nodes, but the paper says it would not be easy at tens of thousands because the routing table's upkeep grows with the system, and suggests hierarchical extensions. The partitioning scheme also changed: the first one, with random tokens, made new nodes slow to bootstrap, and the paper says bootstrapping took almost a day in the busy season. It moved to fixed, equal-sized partitions with Q divided by S tokens per node. That scheme, the paper says, gave better load balance and cut the size of the membership information by three orders of magnitude.",
+      "concepts": [
+        { "slug": "gossip-protocol" },
+        { "slug": "failure-detection" },
+        { "slug": "leader-election" },
+        { "slug": "consistent-hashing" }
+      ]
+    },
+    {
+      "title": "Tune for the slowest one in a thousand",
+      "problem": "Amazon measures at the 99.9th percentile, because a service that is fast on average can still be slow for the customers with the most data. The paper's own measurements show the 99.9th percentile around 200 ms, an order of magnitude above the average, and it is pushed up by load, object sizes and where data sits.",
+      "fix": "The paper describes several changes aimed at the tail. Any of the top N nodes may coordinate a write, and the coordinator is chosen as the node that answered a previous read fastest, which also makes read-your-writes consistency more likely. An in-memory write buffer, even one of only a thousand objects, lowered the 99.9th percentile latency by a factor of 5 at peak, at the price of durability, and to limit that risk the coordinator makes one of the N replicas perform a durable write. A partition-aware client library can coordinate requests itself, skipping the load balancer and a possible extra hop. In the paper's measurements this cut the 99.9th percentile read latency from 68.9 ms to 30.4 ms and the write from 68.5 ms to 30.4 ms. Background replica synchronisation and handoff are held back by an admission controller that watches the latency of foreground work.",
+      "tradeoff": "A buffer trades durability for latency, since a crash can lose writes that were still queued. The client library moves logic and membership state into every client, which has to refresh it, and the paper has clients poll a random node every 10 seconds, so a client may see stale membership for up to that long.",
+      "concepts": [
+        { "slug": "caching" },
+        { "slug": "load-balancing" },
+        { "slug": "queueing-theory-and-littles-law" },
+        { "slug": "hedged-requests-and-tail-latency" }
+      ]
+    }
+  ],
+  "failures": [
+    {
+      "scenario": "A replica is unreachable when a customer adds an item",
+      "impact": "A strict quorum would refuse the write, which for a shopping cart is a bad customer experience.",
+      "answer": "A sloppy quorum uses the first N healthy nodes in the preference list. The replica meant for the unreachable node goes to a stand-in with a hint, and the stand-in hands it back when the node recovers.",
+      "concepts": [
+        { "slug": "quorums" },
+        { "slug": "graceful-degradation" }
+      ]
+    },
+    {
+      "scenario": "Two clients update the same cart at the same time on different replicas",
+      "impact": "Neither update should be lost, and neither can be shown to be later.",
+      "answer": "Both are kept as versions with vector clocks. A read returns all the conflicting versions and the application merges them, so no 'add to cart' is lost, although deleted items can reappear.",
+      "concepts": [
+        { "slug": "logical-clocks" },
+        { "slug": "crdts" }
+      ]
+    },
+    {
+      "scenario": "A whole data center is lost",
+      "impact": "Every replica of a key could be in the lost building.",
+      "answer": "The preference list for a key is built so that its nodes are spread across several data centers, connected by fast links, so the loss of one does not take all the replicas.",
+      "concepts": [
+        { "slug": "multi-region-failover" },
+        { "slug": "database-replication" }
+      ]
+    },
+    {
+      "scenario": "A node is lost for good, or a stand-in loses its hints",
+      "impact": "Some replicas hold fewer updates than they should, and nobody is told.",
+      "answer": "Anti-entropy using Merkle trees finds the differences. Nodes compare the roots of the trees for the ranges they share and descend only into the branches that differ.",
+      "concepts": [
+        { "slug": "merkle-trees-and-anti-entropy" }
+      ]
+    },
+    {
+      "scenario": "Background repair and handoff slow down the live get and put requests",
+      "impact": "The 99.9th percentile latency rises and services miss their SLAs.",
+      "answer": "Background tasks reserve time slices through an admission controller. It watches the latency and failures of foreground operations over a trailing window and reduces the slices given to background work when the foreground suffers.",
+      "concepts": [
+        { "slug": "backpressure" },
+        { "slug": "load-shedding" }
+      ]
+    },
+    {
+      "scenario": "A new node joins during the busy shopping season",
+      "impact": "Other nodes must scan their stores to hand over key ranges, which is heavy work on a live node.",
+      "answer": "In the original scheme this ran at the lowest priority and took almost a day. The later scheme with fixed, equal-sized partitions lets a partition be moved as a unit by transferring its file, which the paper says gives faster bootstrapping and recovery.",
+      "concepts": [
+        { "slug": "database-sharding" },
+        { "slug": "consistent-hashing" }
+      ]
+    }
+  ],
+  "alternatives": [
+    {
+      "title": "Who resolves conflicting versions",
+      "options": [
+        { "name": "The application merges them", "pro": "The application knows its data, so a cart can be merged and an add is never lost. This is the shopping cart's choice", "con": "Developers must write the merge logic, and deleted items can come back" },
+        { "name": "The store applies last write wins", "pro": "Nothing to write. The paper's session service uses it", "con": "The paper says the store's choices are limited to simple policies like this, and an update that loses is discarded" }
+      ],
+      "pick": "Both, chosen per service. The shopping cart merges, and the session service uses last write wins."
+    },
+    {
+      "title": "How to place partitions on the ring",
+      "options": [
+        { "name": "Many random tokens per node", "pro": "The first scheme in production, and the simplest to describe", "con": "The paper reports slow bootstrapping, costly recomputation of Merkle trees, no easy way to snapshot the key space, and large membership information" },
+        { "name": "Random tokens with equal-sized partitions", "pro": "Separates partitioning from placement", "con": "The paper measured it as the worst of the three for load balance, and it served only as an interim step" },
+        { "name": "Q/S tokens per node with equal-sized partitions", "pro": "Best load balance of the three, much smaller membership information, and partitions that move as a file. This is what Dynamo moved to", "con": "Changing the membership needs coordination to keep the assignment's properties" }
+      ],
+      "pick": "Equal-sized partitions with Q/S tokens per node, as the paper describes."
+    },
+    {
+      "title": "Where requests are coordinated",
+      "options": [
+        { "name": "Server-driven, through a load balancer", "pro": "Clients need no Dynamo code", "con": "Adds the load balancer and a possible extra hop. The paper measured 99.9th percentile reads at 68.9 ms" },
+        { "name": "Client-driven, with a partition-aware library", "pro": "The paper measured 99.9th percentile reads at 30.4 ms, and no load balancer is needed", "con": "Clients must refresh membership, polling a random node every 10 seconds, and may briefly use stale information" }
+      ],
+      "pick": "Client-driven coordination where the lowest latency matters, as the paper's measurements show."
+    }
+  ],
+  "roles": [
+    { "id": "client", "label": "Application", "description": "Calls get and put, and reconciles conflicting versions when it reads them." },
+    { "id": "edge", "label": "Coordinator", "description": "The node that runs a request: it finds the preference list, sends the reads or writes and waits for R or W replies." },
+    { "id": "data", "label": "Replicas, stand-ins and buffer", "description": "The nodes that store each key, a stand-in that holds a hint for a replica that was unreachable, and an in-memory write buffer." },
+    { "id": "async", "label": "Background protocols", "description": "Gossip spreads membership and token ranges, and anti-entropy with Merkle trees repairs replicas that have drifted apart." }
+  ],
+  "quiz": [
+    {
+      "question": "Two versions of a shopping cart end up on different replicas, and a read finds that neither descends from the other. What does the Dynamo paper say happens next?",
+      "options": [
+        "Dynamo returns all the conflicting versions with their vector clocks, and the application merges them, so no add-to-cart is lost",
+        "The replica with the highest vector clock counter wins and the other version is deleted at once",
+        "The coordinator rejects the read until the replicas have agreed on a single version of the cart",
+        "Dynamo merges the two carts itself, because it understands what a shopping cart contains"
+      ],
+      "answer": 0,
+      "explanation": "The paper says that when the system cannot reconcile versions with the vector clocks alone, the client must do it, and that a typical example is merging the versions of a cart so an add is never lost, though deleted items can resurface. A higher counter on one node does not make a version win. Rejecting reads would give up the availability the design is for. Dynamo treats the object as opaque bytes, so it cannot know how to merge a cart."
+    },
+    {
+      "question": "Why does Dynamo use a sloppy quorum instead of a strict one?",
+      "options": [
+        "It makes every read return the latest write, whatever failures there are",
+        "It lets the system use fewer replicas than the configured N to save disk space",
+        "It lets reads and writes use the first N healthy nodes in the preference list, so temporary failures do not make them fail",
+        "It removes the need for vector clocks, because the stand-in nodes decide the order of writes"
+      ],
+      "answer": 2,
+      "explanation": "The paper says that a traditional quorum would be unavailable during server failures and network partitions, so Dynamo performs operations on the first N healthy nodes, which may not be the first N on the ring, and a stand-in keeps a hint for the node it replaced. It does not promise that reads return the latest write. It still keeps N copies and does not save space. Vector clocks are still needed, because stand-ins do not decide the order of writes."
+    },
+    {
+      "question": "Why does Amazon state Dynamo's latency requirements at the 99.9th percentile and not as a mean or median?",
+      "options": [
+        "A mean is hard to measure on a system with tens of thousands of servers",
+        "A percentile is cheaper to compute than a mean because it needs no history of past requests",
+        "Customers with the longest histories need the most processing, and a mean or median would hide how slow they are",
+        "A higher percentile such as the 99.99th was too costly, so the 99.9th was the cheapest choice"
+      ],
+      "answer": 2,
+      "explanation": "The paper says an SLA stated as a mean or median does not address customers with longer histories, who need more processing, and that Amazon wants all customers, not just most, to have a good experience. It chose 99.9 over a higher percentile for cost reasons, but that is not why it uses a percentile at all. It does not say the mean is hard to measure or that percentiles are cheaper to compute."
+    }
+  ],
+  "sources": [
+    {
+      "title": "Dynamo: Amazon's Highly Available Key-value Store",
+      "publisher": "Amazon, DeCandia et al., SOSP 2007",
+      "year": 2007,
+      "url": "https://www.allthingsdistributed.com/files/amazon-dynamo-sosp2007.pdf"
+    }
+  ]
+}

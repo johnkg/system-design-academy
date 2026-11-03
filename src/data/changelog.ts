@@ -7,6 +7,7 @@ export const changelog: Change[] = [
     title: 'Three more famous systems from Google',
     items: [
       { text: 'How Google built Maglev (a load balancer made of ordinary servers, with a new kind of consistent hashing), Dremel (SQL over trillion-row nested data in seconds, with columns and a serving tree) and Percolator (updating the web index a little at a time with transactions on Bigtable). Each is built only from the original paper, listed at the end, with a diagram, animation, quiz, estimator, break-it simulation and code in three languages.', href: 'case-studies/' },
+      { text: 'A second, deeper look at three papers already covered: Amazon\'s Dynamo, Google\'s Spanner and Google\'s Bigtable. Each deep dive follows the original paper through more steps, with a simulation that counts every possible read quorum (Dynamo), a commit-wait clock check (Spanner) and a read-path cost model (Bigtable). They are small teaching models, not Amazon\'s or Google\'s own.', href: 'case-studies/' },
     ],
   },
   {
