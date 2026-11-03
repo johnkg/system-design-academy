@@ -1,0 +1,97 @@
+---
+import PlaygroundShell from '../../components/PlaygroundShell.astro';
+import RangeField from '../../components/RangeField.astro';
+---
+<PlaygroundShell title="A backend leaves" hint="Choose how a backend is picked for each connection, whether the connections are seen by the same Maglev machine or by a different one after a router change, and how many of 50 backends are removed, and see how many connections change backend. A simple model, not Google's code or data.">
+  <ol class="how">
+    <li>Press <b>Reset</b>. With hash mod and the same machine, <b>130</b> connections have to move because their server is gone, and none of the others do.</li>
+    <li>Choose <b>A different one with an empty table (router change)</b>: <b>1,829</b> healthy connections move as well, <b>1,959</b> in total, because changing the divisor reshuffles almost everything.</li>
+    <li>Choose <b>Maglev hashing (lookup table)</b>: the healthy connections that move fall to <b>136</b>, only <b>252</b> change in total, and each server gets <b>20</b> to <b>21</b> slots.</li>
+    <li>Choose <b>The same one, with its connection table</b>: only the <b>116</b> connections whose server is gone move.</li>
+  </ol>
+  <div class="pg brk" data-brk>
+    <div class="pg-row">
+      <label>Backend choice <select class="pg-in" data-scheme><option value="mod">Hash mod the number of backends</option><option value="maglev">Maglev hashing (lookup table)</option></select></label>
+      <label>Which Maglev machine <select class="pg-in" data-machine><option value="same">The same one, with its connection table</option><option value="other">A different one with an empty table (router change)</option></select></label>
+      <RangeField label="Backends removed (of 50)" name="gone" min="0" max="10" value="3" />
+      <button type="button" class="btn" data-reset>Reset</button>
+    </div>
+    <div class="pg-grid">
+      <div class="pg-box" data-b1><h3>Connections on the removed backends</h3><span class="pg-mono" data-o1></span><span class="pg-note" data-n1></span></div>
+      <div class="pg-box" data-b2><h3>Healthy connections that moved anyway</h3><span class="pg-mono" data-o2></span><span class="pg-note" data-n2></span></div>
+      <div class="pg-box" data-b3><h3>Slots per backend, smallest to largest</h3><span class="pg-mono" data-o3></span><span class="pg-note" data-n3></span></div>
+      <div class="pg-box" data-b4><h3>Connections that change backend in total</h3><span class="pg-mono" data-o4></span><span class="pg-note" data-n4></span></div>
+    </div>
+    <p class="pg-out" data-verdict aria-live="polite"></p>
+    <p class="pg-note">Model, invented for teaching and not Google data: 50 backends and 2,000 connections whose hashes are fixed. With hash mod, a connection goes to backend number (hash mod the number of backends). With Maglev hashing, a lookup table of 1,009 slots is filled as in the paper, with each backend taking turns to claim the next free slot of its own permutation, and the connection goes to the backend in the slot (hash mod 1,009). The paper uses 65,537 slots and says to use more than 100 times as many slots as backends; this model is smaller so that the page stays fast, so its imbalance and disruption are larger than in the paper. If the same Maglev machine still has its connection table, connections already seen stay where they were. If the router sends them to a different machine, which has no entries, each connection is placed again from the current table.</p>
+  </div>
+</PlaygroundShell>
+<script>
+  import { query, formatWholeNumber, mulberry32 } from '../../playground';
+  document.querySelectorAll<HTMLElement>('[data-brk]').forEach((root) => {
+    const q = query(root);
+    const DEFAULTS: Record<string, string> = {"scheme": "mod", "machine": "same", "gone": "3"};
+    const input = (k: string) => q<HTMLInputElement>(`[data-${k}]`);
+    const select = (k: string) => q<HTMLSelectElement>(`[data-${k}]`);
+    const whole = formatWholeNumber;
+    const one = (n: number) => (Math.round(n * 10) / 10).toLocaleString('en-US');
+
+    function draw() {
+      const scheme = select('scheme').value;
+      const machine = select('machine').value;
+      const gone = Number(input('gone').value);
+      q('[data-goneval]').textContent = String(gone);
+      const boxes: { big: string; note: string; bad: boolean }[] = [];
+      let verdict = '';
+      let failed = false;
+      const N = 50, FLOWS = 2000, M = 1009; // M is prime and more than 20 times N (the paper says more than 100 times)
+      const fnv = (text: string) => { let h = 0x811c9dc5; for (const ch of text) h = Math.imul(h ^ ch.charCodeAt(0), 0x01000193) >>> 0; return h; };
+      const names = Array.from({ length: N }, (_, i) => `backend-${i}`);
+      const REMOVE_ORDER = [7, 23, 41, 3, 15, 30, 48, 11, 36, 19];
+      const removed = new Set(REMOVE_ORDER.slice(0, gone).map((i) => names[i]));
+      const left = names.filter((n) => !removed.has(n));
+      const populate = (list: string[]) => {
+        const params = list.map((n) => [fnv(`a${n}`) % M, (fnv(`b${n}`) % (M - 1)) + 1]);
+        const next = list.map(() => 0); const entry = new Array(M).fill(-1); let filled = 0;
+        for (;;) for (let i = 0; i < list.length; i++) {
+          let c = (params[i][0] + next[i] * params[i][1]) % M;
+          while (entry[c] >= 0) { next[i]++; c = (params[i][0] + next[i] * params[i][1]) % M; }
+          entry[c] = i; next[i]++;
+          if (++filled === M) return entry.map((i: number) => list[i]);
+        }
+      };
+      const flows = Array.from({ length: FLOWS }, (_, i) => fnv(`flow-${i}`));
+      const pick = (list: string[]) => {
+        if (scheme === 'mod') return flows.map((h) => list[h % list.length]);
+        const table = populate(list); return flows.map((h) => table[h % M]);
+      };
+      const before = pick(names); const after = pick(left);
+      const forced = before.filter((b) => removed.has(b)).length;
+      const differ = before.filter((b, i) => b !== after[i]).length;
+      const total = machine === 'same' ? forced : differ;
+      const slotCounts = scheme === 'maglev' ? [...populate(names).reduce((m: Map<string, number>, n: string) => m.set(n, (m.get(n) ?? 0) + 1), new Map<string, number>()).values()] : [];
+      boxes.push({ big: whole(forced), note: 'these cannot stay, their backend is gone', bad: false });
+      boxes.push({ big: whole(total - forced), note: machine === 'same' ? 'the connection table keeps every healthy connection where it was' : 'the new machine has no entry and must choose again', bad: total - forced > 0 });
+      boxes.push({ big: scheme === 'maglev' ? `${Math.min(...slotCounts)} to ${Math.max(...slotCounts)}` : 'no table', note: scheme === 'maglev' ? 'slots per backend before the change: never more than one apart' : 'there is no lookup table, only a remainder', bad: false });
+      boxes.push({ big: whole(total), note: `out of ${whole(FLOWS)} connections`, bad: total - forced > 0 });
+      failed = total - forced > 0;
+      if (gone === 0) verdict = 'No backend was removed, so no connection has to move.';
+      else if (!failed) verdict = `Only the ${whole(forced)} connections on the removed backends moved. The connection table kept all the others where they were.`;
+      else if (scheme === 'mod') verdict = `${whole(total - forced)} healthy connections were also sent to another backend, because changing the divisor reshuffles almost every connection. Maglev hashing moves far fewer.`;
+      else verdict = `${whole(total - forced)} healthy connections moved because the new machine had no connection table. Maglev hashing keeps that number small, but not zero, so the paper uses connection tracking as well.`;
+      boxes.forEach((b, i) => {
+        q(`[data-o${i + 1}]`).textContent = b.big;
+        q(`[data-n${i + 1}]`).textContent = b.note;
+        q<HTMLElement>(`[data-b${i + 1}]`).style.setProperty('--c', b.bad ? 'var(--bad)' : 'var(--good)');
+      });
+      const out = q('[data-verdict]'); out.classList.toggle('bad', failed); out.textContent = verdict;
+    }
+    root.addEventListener('input', draw);
+    root.addEventListener('change', draw);
+    q('[data-reset]').addEventListener('click', () => {
+      Object.entries(DEFAULTS).forEach(([k, v]) => { (root.querySelector<HTMLInputElement | HTMLSelectElement>(`[data-${k}]`)!).value = v; });
+      draw();
+    });
+    draw();
+  });
+</script>

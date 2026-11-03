@@ -1,0 +1,398 @@
+{
+  "name": "How Google Built Chubby",
+  "difficulty": "advanced",
+  "intent": "Follow the design in Mike Burrows's 2006 Chubby paper for a lock service that Google systems use for leader election, small shared files and locks: five replicas with a master, sessions and leases, advisory locks with sequencers, and a grace period for master fail-over, using only what the paper says.",
+  "codeTitle": "sessions, leases, a stalled lock holder and a sequencer",
+  "finalIntro": "One client holding a lock through a stall, a master fail-over and a late write that is refused.",
+  "prompt": "The 2006 paper 'The Chubby lock service for loosely-coupled distributed systems' says Chubby provides coarse-grained locking and reliable, low-volume storage for a loosely coupled distributed system. Google's GFS uses it to appoint its master, and Bigtable uses it to elect a master, to let the master find the servers it controls, and to let clients find the master. The paper says developers often do not plan for the quorum logic of a consensus library, and that adding replication and master election to an existing service should not mean rewriting it. How would you give many services a shared way to elect leaders, hold locks and publish small pieces of data, that is highly available and that a programmer can use with a few lines of code? This study follows the paper, which is listed at the end. The simulation and the code samples are small models for learning, not Google's code or data.",
+  "functional": [
+    "Let a client acquire a lock, for example to become the master of a service, and release it",
+    "Store small files that clients can read and write whole, such as the address of the current master",
+    "Notify clients of events such as a file changing or a master fail-over",
+    "Let clients cache files and keep the cache consistent",
+    "Let a lock holder prove to other servers that it still holds the lock"
+  ],
+  "nonFunctional": [
+    "Availability over performance: the paper says the design emphasises availability and reliability, and does not aim for high throughput",
+    "Coarse-grained use: locks held for hours or days, not for fractions of a second, to keep the load on the service small",
+    "Serve many more clients than machines: the paper has seen 90,000 clients talking to one master",
+    "Survive a master fail-over without applications losing their locks, if the fail-over is quick",
+    "Simple for programmers: a familiar file-and-lock interface"
+  ],
+  "firstAttempt": {
+    "text": "This is the situation the paper describes. Each service that needs a master or shared state either runs its own consensus protocol (a library such as Paxos built into the service), or makes do with ad-hoc methods such as a name service whose cache timeouts are chosen by hand.",
+    "limits": [
+      "The paper says services are usually designed without consensus in mind, and adding replication and election afterwards means changing their structure and their communication patterns",
+      "A consensus library needs several replicas of the service itself, while with a lock service even a single client can obtain a lock and make progress",
+      "Programmers are familiar with locks, but many are not ready for the subtle rules of quorum protocols",
+      "Ad-hoc approaches such as polling with a cache timeout trade load against delay: the paper says a poorly chosen DNS-style time to live causes either high load or stale data"
+    ]
+  },
+  "nodes": [
+    {
+      "id": "app",
+      "label": "Client applications",
+      "kind": "client",
+      "x": 8,
+      "y": 50
+    },
+    {
+      "id": "adhoc",
+      "label": "Ad-hoc election and polling",
+      "kind": "data",
+      "x": 80,
+      "y": 50,
+      "until": 1
+    },
+    {
+      "id": "lib",
+      "label": "Chubby client library",
+      "kind": "edge",
+      "x": 34,
+      "y": 50,
+      "at": 1
+    },
+    {
+      "id": "master",
+      "label": "Master",
+      "kind": "compute",
+      "x": 72,
+      "y": 16,
+      "at": 1
+    },
+    {
+      "id": "rep",
+      "label": "Four other replicas",
+      "kind": "data",
+      "x": 92,
+      "y": 50,
+      "at": 1
+    },
+    {
+      "id": "fs",
+      "label": "File server using sequencers",
+      "kind": "compute",
+      "x": 72,
+      "y": 84,
+      "at": 4
+    },
+    {
+      "id": "dns",
+      "label": "DNS",
+      "kind": "edge",
+      "x": 34,
+      "y": 16,
+      "at": 2
+    }
+  ],
+  "edges": [
+    {
+      "from": "app",
+      "to": "adhoc",
+      "until": 1
+    },
+    {
+      "from": "app",
+      "to": "lib",
+      "at": 1
+    },
+    {
+      "from": "lib",
+      "to": "master",
+      "at": 1
+    },
+    {
+      "from": "master",
+      "to": "rep",
+      "at": 1
+    },
+    {
+      "from": "lib",
+      "to": "dns",
+      "at": 2
+    },
+    {
+      "from": "app",
+      "to": "fs",
+      "at": 4
+    }
+  ],
+  "steps": [
+    {
+      "title": "Run a small cell of replicas with one elected master",
+      "problem": "The lock service itself must not be a single point of failure, but it should be simple for clients.",
+      "fix": "A Chubby cell usually has five replicas, and the cell is up while three of them are running. The replicas use a consensus protocol to elect a master, who holds a master lease of a few seconds, renewed as long as the master keeps winning votes. The replicas keep a small database, and only the master reads and writes it; the others copy its updates through the consensus protocol. Reads are answered by the master alone, which is safe because no other master can exist while the lease has not expired. If the master fails, the others run an election when its lease runs out, and a new master is typically chosen in a few seconds; the paper gives 6 s and 4 s for two recent elections and up to 30 s as the highest. A failed replica is replaced from a pool and its address is changed in DNS.",
+      "tradeoff": "Five replicas serve many thousands of clients, but all requests go to one master, so it can be overwhelmed. Most of the effort in the scaling section goes to keeping traffic away from it.",
+      "concepts": [
+        {
+          "slug": "consensus"
+        },
+        {
+          "slug": "leader-election"
+        },
+        {
+          "slug": "leases-and-fencing-tokens"
+        },
+        {
+          "slug": "quorums"
+        }
+      ]
+    },
+    {
+      "title": "Offer files and locks through a client library and find the master with DNS",
+      "problem": "Programmers want a familiar interface, and clients must find the current master without being told.",
+      "fix": "Chubby looks like a small file system. Nodes are files or directories, files are read and written whole, and any node can act as an advisory reader/writer lock. A client library linked into the application talks to the cell. Clients find the cell's replicas through DNS and ask any of them where the master is, and non-master replicas answer with its identity. The paper says this makes locks and election easy to add to existing programs. To elect a master that writes to an existing file server, one acquires a lock, passes the lock acquisition count in the write, and has the file server reject writes with a lower count; the paper says this needs just two statements and one extra parameter. Small files also let a master publish its address for its clients.",
+      "tradeoff": "Locks are advisory, which means they do not stop a client that ignores them from touching the resource. The paper chose this because mandatory locks would need servers to know about Chubby, and because it lets administrators still reach a locked file.",
+      "concepts": [
+        {
+          "slug": "service-discovery"
+        },
+        {
+          "slug": "dns"
+        },
+        {
+          "slug": "leader-election"
+        }
+      ]
+    },
+    {
+      "title": "Keep clients alive with sessions, leases and cached files",
+      "problem": "A lock held by a dead client must be freed, but a live client must not lose its lock on a brief network glitch. Polling Chubby for every read would swamp the master.",
+      "fix": "A client keeps a session with the cell, kept alive by periodic KeepAlive calls and a lease. The master extends the lease with each KeepAlive reply, by 12 seconds by default, and may use longer times when it is overloaded, up to about 60 seconds. The master holds each KeepAlive call until the previous lease is nearly over, so there is almost always one call waiting. The reply also carries events and cache invalidations, so a client cannot keep a session without acknowledging invalidations. Clients cache file data and metadata, and the master invalidates cached copies before it changes a file. A lock is released when its holder releases it or when its session ends, so a stalled holder keeps the lock until its lease runs out.",
+      "tradeoff": "Long leases mean fewer KeepAlive calls but a dead client's lock stays held longer. The paper says KeepAlives are by far the most common request, so a longer lease is its main way to take load off the master.",
+      "concepts": [
+        {
+          "slug": "leases-and-fencing-tokens"
+        },
+        {
+          "slug": "caching"
+        },
+        {
+          "slug": "failure-detection"
+        },
+        {
+          "slug": "timeouts-and-deadlines"
+        }
+      ]
+    },
+    {
+      "title": "Protect resources from delayed requests with sequencers",
+      "problem": "A lock holder can stall, lose its lock, and then send an old request after a new holder has started working. The resource would apply a request from a client that no longer holds the lock.",
+      "fix": "A lock holder can ask for a sequencer, an opaque string that names the lock, the mode and the lock's generation number. It sends the sequencer along with its requests, and the receiving server checks it against Chubby, or against the newest one it has seen, and rejects requests whose sequencer is no longer valid. The paper says this needs only an extra string in the messages. For servers that do not yet check sequencers, Chubby offers a lock-delay: after a lock is lost because its holder failed or became unreachable, the lock server keeps others from taking it for a period the holder may choose up to a limit of one minute. The paper calls this imperfect but easy and helpful against everyday message delays and restarts.",
+      "tradeoff": "Servers must be changed to check sequencers, which is little work but not zero. The lock-delay protects unchanged servers only partly, since it bounds the problem by time.",
+      "concepts": [
+        {
+          "slug": "leases-and-fencing-tokens"
+        },
+        {
+          "slug": "optimistic-concurrency-and-etags"
+        },
+        {
+          "slug": "logical-clocks"
+        }
+      ]
+    },
+    {
+      "title": "Ride out a master fail-over with a grace period",
+      "problem": "When the master fails, every client's lease runs towards its end while a new master is chosen. If every client dropped its session at once, locks would be lost and services would fail over needlessly.",
+      "fix": "A client whose lease times out at its end does not know whether the session has ended. It empties and disables its cache, and its session is said to be in jeopardy. It then waits for a grace period, 45 seconds by default, and contacts the new master. If a KeepAlive succeeds within the grace period the session carries on, with its locks, and the library tells the application with a jeopardy event followed by a safe event. The new master rebuilds its state from the database and from the clients' KeepAlive messages. If the grace period ends first, the client treats the session as expired. The paper says this lets applications avoid outages that would follow from a brief Chubby problem.",
+      "tradeoff": "During jeopardy the client's cache is off and it cannot be sure of its locks, so it must be ready to pause work. The grace period must be longer than a typical election for this to help.",
+      "concepts": [
+        {
+          "slug": "failure-detection"
+        },
+        {
+          "slug": "leader-election"
+        },
+        {
+          "slug": "graceful-degradation"
+        },
+        {
+          "slug": "timeouts-and-deadlines"
+        }
+      ]
+    }
+  ],
+  "failures": [
+    {
+      "scenario": "The master fails",
+      "impact": "No one can reach the lock database, and every session lease is running down.",
+      "answer": "The other four replicas elect a new master when the old one's lease expires, typically in a few seconds. Clients in jeopardy wait out the 45 second grace period and keep their sessions if the new master answers in time.",
+      "concepts": [
+        {
+          "slug": "leader-election"
+        },
+        {
+          "slug": "consensus"
+        }
+      ]
+    },
+    {
+      "scenario": "A lock holder pauses for a long time and then sends an old request",
+      "impact": "The new holder's work could be overwritten by the old holder.",
+      "answer": "The old holder's session lease expired and its lock was released. The file server rejects the old holder's write because its sequencer generation is lower than the newest it has seen.",
+      "concepts": [
+        {
+          "slug": "leases-and-fencing-tokens"
+        }
+      ]
+    },
+    {
+      "scenario": "90,000 clients send KeepAlive calls to one master",
+      "impact": "The master can be overwhelmed, and failing to process KeepAlives in time is the typical failure of an overloaded master.",
+      "answer": "The master lengthens leases up to about 60 seconds, clients cache aggressively, proxies can pass requests on behalf of many clients, and the cluster uses one cell per data centre.",
+      "concepts": [
+        {
+          "slug": "caching"
+        },
+        {
+          "slug": "backpressure"
+        },
+        {
+          "slug": "load-shedding"
+        }
+      ]
+    },
+    {
+      "scenario": "A client that holds a lock crashes",
+      "impact": "Its lock must be freed so that others can proceed.",
+      "answer": "The master waits for its session lease to end and then releases the lock. The lock-delay can hold others back for up to a minute to protect servers that do not check sequencers.",
+      "concepts": [
+        {
+          "slug": "failure-detection"
+        },
+        {
+          "slug": "leases-and-fencing-tokens"
+        }
+      ]
+    },
+    {
+      "scenario": "A replica of the cell dies",
+      "impact": "The cell has one fewer replica, and a second failure in a three-replica quorum would stop it.",
+      "answer": "The cell stays up while three of five replicas are running. A replacement machine is started, its address replaces the old one in DNS, and the master notices.",
+      "concepts": [
+        {
+          "slug": "quorums"
+        },
+        {
+          "slug": "consensus"
+        }
+      ]
+    }
+  ],
+  "alternatives": [
+    {
+      "title": "A lock service or a consensus library",
+      "options": [
+        {
+          "name": "A consensus library inside each service",
+          "pro": "No extra system to depend on",
+          "con": "Every service needs several replicas, restructuring, and developers who understand quorums"
+        },
+        {
+          "name": "A lock service",
+          "pro": "Familiar interface, small changes to existing code, a single client can make progress, and one place to look after",
+          "con": "Another system to depend on, and its outage affects many services"
+        }
+      ],
+      "pick": "A lock service, as the paper argues."
+    },
+    {
+      "title": "Coarse-grained or fine-grained locks",
+      "options": [
+        {
+          "name": "Fine-grained (held for seconds)",
+          "pro": "Short waits for others",
+          "con": "Heavy load on the lock server, and a server outage could stall many clients"
+        },
+        {
+          "name": "Coarse-grained (held for hours or days)",
+          "pro": "Light load, and locks can survive lock server failures",
+          "con": "A failed holder keeps others waiting until its session ends"
+        }
+      ],
+      "pick": "Coarse-grained, with applications using their own locks for fine-grained needs."
+    },
+    {
+      "title": "Advisory or mandatory locks",
+      "options": [
+        {
+          "name": "Mandatory",
+          "pro": "Cannot be bypassed",
+          "con": "Every server would have to be integrated, and administrators could not reach a locked file"
+        },
+        {
+          "name": "Advisory, with sequencers",
+          "pro": "Existing servers need only a small change",
+          "con": "Relies on well-behaved clients and servers"
+        }
+      ],
+      "pick": "Advisory locks with sequencers, as the paper does."
+    }
+  ],
+  "roles": [
+    {
+      "id": "client",
+      "label": "Client applications",
+      "description": "Acquire locks, read and write small files, and keep a session alive."
+    },
+    {
+      "id": "edge",
+      "label": "Client library and DNS",
+      "description": "The library keeps the session, caches files and finds the master through DNS."
+    },
+    {
+      "id": "compute",
+      "label": "Master and file servers",
+      "description": "The master serves all requests; file servers can check sequencers from lock holders."
+    },
+    {
+      "id": "data",
+      "label": "Replicas",
+      "description": "Keep the small replicated database through consensus."
+    }
+  ],
+  "quiz": [
+    {
+      "question": "A lock holder stalls for a minute. Its session lease runs out and a second client takes the lock. When the first client wakes up and sends a write, how can the file server refuse it?",
+      "options": [
+        "By pinging the first client",
+        "By checking the sequencer sent with the write, which has an older generation than the newest the server has seen",
+        "By waiting for the first client to release the lock",
+        "By asking all five replicas to vote"
+      ],
+      "answer": 1,
+      "explanation": "A sequencer names the lock and its generation, so a request from an earlier holder carries a lower number and can be rejected locally, with no vote. Pinging does not tell whether the request is old. The first client cannot release a lock it no longer holds. A vote is not part of the check."
+    },
+    {
+      "question": "The master fails and a client's lease runs out before a new master is chosen. What does the client do?",
+      "options": [
+        "Drops its locks at once",
+        "Switches to another cell",
+        "Treats its session as in jeopardy, empties its cache, and waits for the grace period to reach the new master",
+        "Becomes the new master itself"
+      ],
+      "answer": 2,
+      "explanation": "The library waits a grace period, 45 seconds by default, in case the new master answers a KeepAlive and the session can carry on with its locks. Dropping locks at once would cause needless fail-overs. Cells are not swapped, and clients never become master."
+    },
+    {
+      "question": "Why does the Chubby paper say a lock service helps developers more than a consensus library?",
+      "options": [
+        "It is faster than any consensus protocol",
+        "It lets existing programs add election and replication with small changes, and even a single client can obtain a lock and progress",
+        "It does not need any replicas",
+        "It removes the need for clocks"
+      ],
+      "answer": 1,
+      "explanation": "The paper says electing a master that writes to an existing server needs just two statements and one extra parameter, and that a lock service needs fewer servers per client system. It is not claimed to be faster, and Chubby itself runs five replicas. Clocks are still used for leases."
+    }
+  ],
+  "sources": [
+    {
+      "title": "The Chubby lock service for loosely-coupled distributed systems",
+      "publisher": "Google Research (OSDI 2006)",
+      "year": 2006,
+      "url": "https://research.google/pubs/the-chubby-lock-service-for-loosely-coupled-distributed-systems/"
+    }
+  ]
+}

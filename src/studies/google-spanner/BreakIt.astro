@@ -1,0 +1,83 @@
+---
+import PlaygroundShell from '../../components/PlaygroundShell.astro';
+import RangeField from '../../components/RangeField.astro';
+---
+<PlaygroundShell title="Clocks and commit wait" hint="Two servers with slightly different clocks commit one write after the other. Turn commit wait on or off, change the clock uncertainty and how far the clocks really differ, and count how many pairs get timestamps in the wrong order. A simple model, not Google's code or data.">
+  <ol class="how">
+    <li>Press <b>Reset</b>. With <b>Commit wait</b> <b>Off</b>, <b>Clock uncertainty, epsilon (ms)</b> at <b>4</b> and <b>Real clock error of each server (ms, up to)</b> at <b>3</b>, <b>328</b> of 1,000 pairs get timestamps in the wrong order.</li>
+    <li>Set <b>Commit wait</b> to <b>On</b>: <b>0</b> pairs are wrong, the wait is <b>9</b> ms, the commit takes <b>10</b> ms because the wait overlaps the Paxos round, and one hot row allows <b>100</b> commits per second.</li>
+    <li>Set <b>Real clock error of each server (ms, up to)</b> to <b>12</b>: <b>161</b> pairs are wrong again, because the clocks are further apart than the <b>4</b> ms uncertainty the system assumed.</li>
+    <li>Set <b>Real clock error of each server (ms, up to)</b> back to <b>3</b> and <b>Clock uncertainty, epsilon (ms)</b> to <b>10</b>: no pair is wrong, but the wait grows to <b>21</b> ms, the commit takes <b>21</b> ms and one hot row drops to <b>48</b> commits per second.</li>
+  </ol>
+  <div class="pg brk" data-brk>
+    <div class="pg-row">
+      <label>Commit wait <select class="pg-in" data-wait><option value="on">On: reply after the timestamp is in the past</option><option value="off">Off: reply at once</option></select></label>
+      <RangeField label="Clock uncertainty, epsilon (ms)" name="eps" min="1" max="20" value="4" />
+      <RangeField label="Real clock error of each server (ms, up to)" name="skew" min="0" max="20" value="3" />
+      <button type="button" class="btn" data-reset>Reset</button>
+    </div>
+    <div class="pg-grid">
+      <div class="pg-box" data-b1><h3>Pairs with timestamps in the wrong order (of 1,000)</h3><span class="pg-mono" data-o1></span><span class="pg-note" data-n1></span></div>
+      <div class="pg-box" data-b2><h3>Commit wait added (ms)</h3><span class="pg-mono" data-o2></span><span class="pg-note" data-n2></span></div>
+      <div class="pg-box" data-b3><h3>Commit latency (ms)</h3><span class="pg-mono" data-o3></span><span class="pg-note" data-n3></span></div>
+      <div class="pg-box" data-b4><h3>Commits per second on one hot row</h3><span class="pg-mono" data-o4></span><span class="pg-note" data-n4></span></div>
+    </div>
+    <p class="pg-out" data-verdict aria-live="polite"></p>
+    <p class="pg-note">Model, invented for teaching and not Google data: 1,000 pairs of writes. In each pair the first write runs on server X at true time 0 and gets the latest end of its clock interval as its timestamp. It is acknowledged at once, or with commit wait after 2 x epsilon + 1 ms, when its timestamp is certainly in the past on X's clock. The second write then starts 1 ms later on server Y. Each server's clock is off by a random amount up to the real clock error you set. A pair is wrong if the second timestamp is not larger than the first. A Paxos round takes 10 ms and overlaps the wait. The Spanner paper says uncertainty is about 4 ms most of the time and generally under 10 ms.</p>
+  </div>
+</PlaygroundShell>
+<script>
+  import { query, formatWholeNumber, mulberry32 } from '../../playground';
+  document.querySelectorAll<HTMLElement>('[data-brk]').forEach((root) => {
+    const q = query(root);
+    const DEFAULTS: Record<string, string> = {"wait": "off", "eps": "4", "skew": "3"};
+    const input = (k: string) => q<HTMLInputElement>(`[data-${k}]`);
+    const select = (k: string) => q<HTMLSelectElement>(`[data-${k}]`);
+    const whole = formatWholeNumber;
+    const one = (n: number) => (Math.round(n * 10) / 10).toLocaleString('en-US');
+
+    function draw() {
+      const wait = select('wait').value;
+      const eps = Number(input('eps').value);
+      const skew = Number(input('skew').value);
+      q('[data-epsval]').textContent = String(eps);
+      q('[data-skewval]').textContent = String(skew);
+      const boxes: { big: string; note: string; bad: boolean }[] = [];
+      let verdict = '';
+      let failed = false;
+      const PAIRS = 1000, PAXOS = 10;
+      const rand = mulberry32(7);
+      let wrong = 0;
+      const ack = wait === 'on' ? 2 * eps + 1 : 0; // ms until the reply: the first timestamp must be in the past on the server's own clock
+      for (let i = 0; i < PAIRS; i++) {
+        const sx = (rand() * 2 - 1) * skew; const sy = (rand() * 2 - 1) * skew; // each server's clock error
+        const s1 = sx + eps; // T1: latest end of the interval, at true time 0
+        const s2 = ack + 1 + sy + eps; // T2 starts after T1 was acknowledged, on the other server
+        if (s2 <= s1) wrong++;
+      }
+      const latency = Math.max(PAXOS, ack);
+      const broken = skew > eps;
+      boxes.push({ big: whole(wrong), note: wrong > 0 ? 'T2 started after T1 finished but got the earlier timestamp' : 'timestamps follow real time', bad: wrong > 0 });
+      boxes.push({ big: wait === 'on' ? `${ack}` : '0', note: wait === 'on' ? 'about twice the uncertainty, plus 1 ms' : 'no waiting', bad: false });
+      boxes.push({ big: `${latency}`, note: `the wait overlaps the ${PAXOS} ms Paxos round`, bad: false });
+      boxes.push({ big: whole(1000 / latency), note: 'locks are held until the commit finishes', bad: false });
+      failed = wrong > 0;
+      if (wrong > 0 && wait === 'off') verdict = `${whole(wrong)} of 1,000 pairs are in the wrong order. Without commit wait a later transaction can get an earlier timestamp.`;
+      else if (wrong > 0) verdict = `${whole(wrong)} pairs are still in the wrong order because the servers' real clock error (${skew} ms) is larger than the uncertainty (${eps} ms) the system assumed. TrueTime's guarantee needs the bound to be right.`;
+      else verdict = `Timestamps follow real time${broken ? ' in this run' : ''}. ${wait === 'on' ? `The price is ${ack} ms of waiting per commit.` : 'This run was lucky: the clocks differ little enough that no pair was reversed.'}`;
+      boxes.forEach((b, i) => {
+        q(`[data-o${i + 1}]`).textContent = b.big;
+        q(`[data-n${i + 1}]`).textContent = b.note;
+        q<HTMLElement>(`[data-b${i + 1}]`).style.setProperty('--c', b.bad ? 'var(--bad)' : 'var(--good)');
+      });
+      const out = q('[data-verdict]'); out.classList.toggle('bad', failed); out.textContent = verdict;
+    }
+    root.addEventListener('input', draw);
+    root.addEventListener('change', draw);
+    q('[data-reset]').addEventListener('click', () => {
+      Object.entries(DEFAULTS).forEach(([k, v]) => { (root.querySelector<HTMLInputElement | HTMLSelectElement>(`[data-${k}]`)!).value = v; });
+      draw();
+    });
+    draw();
+  });
+</script>

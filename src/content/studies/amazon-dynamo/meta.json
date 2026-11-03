@@ -1,0 +1,430 @@
+{
+  "name": "How Amazon Built Dynamo",
+  "difficulty": "advanced",
+  "intent": "Follow the choices Amazon describes in its 2007 Dynamo paper for a shopping cart that must always accept writes: consistent hashing, N/R/W quorums, hinted handoff, vector clocks and Merkle-tree repair, using only what the paper says.",
+  "codeTitle": "a ring with sloppy quorums, hinted handoff and vector clocks",
+  "finalIntro": "One cart update going through the ring while a replica is down, and then two clients changing the same cart at once.",
+  "prompt": "Amazon's e-commerce platform is made of hundreds of services. The 2007 paper 'Dynamo: Amazon's Highly Available Key-value Store' says the shopping cart service served tens of millions of requests that resulted in well over 3 million checkouts in a single day, and the session service handled hundreds of thousands of concurrently active sessions. The paper says that for these services even a small amount of downtime has a large financial cost and hurts customer trust, and that most of them only need to get and put a value by its primary key, so they do not need a relational database with joins. How would you build a store where a customer can always add an item to the cart, even while servers fail or the network splits, and where adding a server needs no manual work? This study follows the paper, which is listed at the end. The simulation and the code samples are small models for learning, not Amazon's code or data.",
+  "functional": [
+    "Get and put values by a primary key, where the value is an opaque blob that is usually under 1 MB",
+    "Accept a write whenever possible, even if some replicas are down or unreachable",
+    "Spread keys over many machines and let operators add or remove machines without manual repartitioning",
+    "Detect updates that happened at the same time, and give the application what it needs to merge them",
+    "Bring replicas back in line after failures without copying everything"
+  ],
+  "nonFunctional": [
+    "Availability over strict consistency: the paper says Dynamo is 'always writable' and gives eventual consistency, so replicas can briefly disagree",
+    "A latency target stated at the 99.9th percentile, not the average: the paper gives an example service level of a response within 300 ms for 99.9% of requests at a peak of 500 requests per second",
+    "Scale to tens of thousands of servers in the platform, with each Dynamo instance holding up to hundreds of nodes",
+    "No single node that is special: the paper describes every node as having the same responsibilities, with no central master",
+    "The paper also assumes a trusted environment inside Amazon, so it has no authentication or authorization of its own"
+  ],
+  "firstAttempt": {
+    "text": "This is the starting point the paper describes. Services store their state in a relational database. A write goes to one primary database, a copy is kept for failover, and when the primary is unreachable the copy has to be promoted before writes can go on. To grow, the team buys a bigger machine or splits tables across several databases by hand.",
+    "limits": [
+      "The paper says the common pattern of using a relational database for this kind of data is a poor fit: the services only need a primary-key lookup, while relational databases bring complex query handling and cost, and they limit how far a design can scale out",
+      "Replicating a relational database usually favours strong consistency, and the paper says that choosing consistency means data can be unavailable during some failures, which it judged unacceptable for the cart",
+      "Splitting data by hand into shards needs manual repartitioning whenever machines are added, and the paper says the system should avoid that",
+      "A primary and a copy make the primary a special node: while the copy is promoted, customers cannot add items"
+    ]
+  },
+  "nodes": [
+    {
+      "id": "client",
+      "label": "Shopping cart service",
+      "kind": "client",
+      "x": 8,
+      "y": 50
+    },
+    {
+      "id": "db",
+      "label": "One relational database",
+      "kind": "data",
+      "x": 80,
+      "y": 50,
+      "until": 1
+    },
+    {
+      "id": "coord",
+      "label": "Coordinator (any node)",
+      "kind": "compute",
+      "x": 32,
+      "y": 50,
+      "at": 1
+    },
+    {
+      "id": "a",
+      "label": "Node A",
+      "kind": "data",
+      "x": 72,
+      "y": 16,
+      "at": 1
+    },
+    {
+      "id": "b",
+      "label": "Node B (down)",
+      "kind": "data",
+      "x": 92,
+      "y": 50,
+      "at": 1
+    },
+    {
+      "id": "c",
+      "label": "Node C",
+      "kind": "data",
+      "x": 72,
+      "y": 84,
+      "at": 1
+    },
+    {
+      "id": "d",
+      "label": "Node D (stand-in)",
+      "kind": "data",
+      "x": 50,
+      "y": 84,
+      "at": 3
+    },
+    {
+      "id": "merge",
+      "label": "Cart merge in the service",
+      "kind": "client",
+      "x": 8,
+      "y": 84,
+      "at": 4
+    },
+    {
+      "id": "tree",
+      "label": "Merkle tree repair",
+      "kind": "async",
+      "x": 50,
+      "y": 16,
+      "at": 5
+    }
+  ],
+  "edges": [
+    {
+      "from": "client",
+      "to": "db",
+      "until": 1
+    },
+    {
+      "from": "client",
+      "to": "coord",
+      "at": 1
+    },
+    {
+      "from": "coord",
+      "to": "a",
+      "at": 1
+    },
+    {
+      "from": "coord",
+      "to": "b",
+      "at": 2
+    },
+    {
+      "from": "coord",
+      "to": "c",
+      "at": 2
+    },
+    {
+      "from": "coord",
+      "to": "d",
+      "at": 3
+    },
+    {
+      "from": "d",
+      "to": "b",
+      "at": 3
+    },
+    {
+      "from": "merge",
+      "to": "coord",
+      "at": 4
+    },
+    {
+      "from": "tree",
+      "to": "a",
+      "at": 5
+    },
+    {
+      "from": "tree",
+      "to": "c",
+      "at": 5
+    }
+  ],
+  "steps": [
+    {
+      "title": "Spread keys over a ring of nodes with consistent hashing",
+      "problem": "One database cannot hold every cart, and splitting data by hand needs manual work each time machines change. The paper wants incremental scaling: add one machine at a time with little effect on the rest of the system.",
+      "fix": "Dynamo hashes each key with MD5 to a position on a ring, and each node owns a few positions (tokens) on the same ring. A key belongs to the first node found walking clockwise from its position. The paper first used virtual nodes, which means one physical machine takes many positions on the ring. It lists their advantages: if a node fails, its load is spread over many others; when a node is added it takes a roughly equal load from many nodes; and a stronger machine can take more positions than a weaker one. Any node can take a request for any key, because every node keeps enough routing information to send it on, which the paper calls a zero-hop design. The paper also says the first scheme, random tokens, made it slow to bootstrap a node and hard to archive data, and that production later moved to a scheme of equal-sized partitions with tokens assigned evenly.",
+      "tradeoff": "Consistent hashing moves only the keys next to a changed node, instead of reshuffling everything. The price is that the ring needs care to stay balanced: the paper reports that its first scheme had load balancing problems that the later scheme fixed.",
+      "concepts": [
+        {
+          "slug": "consistent-hashing"
+        },
+        {
+          "slug": "database-sharding"
+        },
+        {
+          "slug": "horizontal-vs-vertical-scaling"
+        }
+      ]
+    },
+    {
+      "title": "Copy each key to N nodes and choose R and W",
+      "problem": "A single copy of a cart is lost with its node. Copies on several nodes raise the question of how many must answer before a read or write counts.",
+      "fix": "The node that owns the key (the coordinator) stores it and also sends it to the next N-1 nodes clockwise. The list of nodes responsible for a key is its preference list, and it holds more than N nodes so a write can still go on when some are down; the paper adds that it skips positions on the same physical node so the copies are on different machines. A read waits for R replies and a write for W acknowledgements. If R + W is greater than N the read and write sets overlap, as in a quorum. The paper says the common setting is (N, R, W) = (3, 2, 2), and that a lower W or R lowers latency and raises the chance of reading stale data. Replicas are spread across several data centers.",
+      "tradeoff": "Choosing R, W and N tunes the system: a smaller W makes writes faster and more available, but a write may then sit on fewer nodes for a while, which the paper calls a longer window of vulnerability for durability. The paper says there is no setting that gives everything, and instances were tuned for each service.",
+      "concepts": [
+        {
+          "slug": "quorums"
+        },
+        {
+          "slug": "database-replication"
+        },
+        {
+          "slug": "consistency-models"
+        }
+      ]
+    },
+    {
+      "title": "Use a sloppy quorum and hinted handoff so writes keep working",
+      "problem": "With a strict quorum, a write fails when too many of the N chosen nodes are down or unreachable. For a cart, a failed 'add item' is the outcome the design is trying to avoid.",
+      "fix": "Dynamo does not require the first N nodes on the ring. Reads and writes go to the first N healthy nodes of the preference list, which the paper calls a sloppy quorum. If node B is down, its copy goes to the next node, D, along with a hint that names B as the intended owner. D keeps hinted copies in a separate local database that it scans from time to time. When D sees B is back, it sends the copy to B and then deletes its own. The paper says this keeps the desired availability and durability, and that hinted handoff works best when node failures are short.",
+      "tradeoff": "The write succeeds, but the copies are no longer on the nodes a later read expects, so a reader can see an older value until the handoff finishes. The paper accepts this: it chose to be always writable and to resolve disagreement later.",
+      "concepts": [
+        {
+          "slug": "quorums"
+        },
+        {
+          "slug": "failure-detection"
+        },
+        {
+          "slug": "graceful-degradation"
+        },
+        {
+          "slug": "cap-theorem"
+        }
+      ]
+    },
+    {
+      "title": "Track versions with vector clocks and let the application merge",
+      "problem": "If two clients change the same cart on different nodes while the network is split, both writes succeed, so the replicas end up with two different carts. Choosing a winner silently could drop an item a customer added.",
+      "fix": "Each version of a value carries a vector clock, a list of (node, counter) pairs. A coordinator increases its own counter when it handles a write. If one clock has every counter at least as large as another, the older version can be dropped. If neither does, the versions were made independently and both are kept. A read returns every version it cannot order, together with the clocks, and the application merges them. For the cart the paper's merge adds the items together, so 'Add to Cart' is never lost, and the paper notes that a deleted item can then come back. The merged write goes back with the combined clock. The paper also limits clock size: when a clock holds more than about 10 pairs, the oldest pair is removed, and it says this has not been a problem in production. Services that prefer simplicity can use last write wins, which picks the version with the largest timestamp.",
+      "tradeoff": "The application gets full control of merging, and also the job of writing a merge that makes sense. The paper reports that divergent versions are rare: in a 24-hour profile of the shopping cart service, 99.94% of requests saw exactly one version.",
+      "concepts": [
+        {
+          "slug": "logical-clocks"
+        },
+        {
+          "slug": "crdts"
+        },
+        {
+          "slug": "optimistic-concurrency-and-etags"
+        }
+      ]
+    },
+    {
+      "title": "Repair replicas with Merkle trees and keep membership with gossip",
+      "problem": "Hinted copies can be lost before they are delivered, and nodes that were apart can hold different data. Comparing every key between two nodes would be slow and would load the network.",
+      "fix": "Each node keeps a Merkle tree for each key range it hosts: a hash tree where each leaf is the hash of a key's value and each parent hashes its children. Two nodes swap the root of the tree for a range they share. If the roots match, the range is in sync. If they differ, they compare child hashes and walk down to the keys that differ, and only those are copied. Membership uses gossip: nodes tell a few other nodes about changes to the ring from time to time, so each node learns the whole ring eventually, and some nodes act as seeds so that new nodes do not form separate rings. Failure detection is local: a node simply treats another as failed when it does not answer.",
+      "tradeoff": "Repair costs little when replicas almost match. The paper notes a drawback: when a node joins or leaves, many key ranges change and the trees must be recomputed.",
+      "concepts": [
+        {
+          "slug": "merkle-trees-and-anti-entropy"
+        },
+        {
+          "slug": "gossip-protocol"
+        },
+        {
+          "slug": "failure-detection"
+        }
+      ]
+    }
+  ],
+  "failures": [
+    {
+      "scenario": "One of the three replica nodes for a cart is down when the customer adds an item",
+      "impact": "A strict quorum would reject or delay the write, and the customer would see an error while shopping.",
+      "answer": "The coordinator writes to the next healthy node with a hint. Two acknowledgements are enough with W = 2, so the write succeeds, and the stand-in node hands the copy back when the owner returns.",
+      "concepts": [
+        {
+          "slug": "quorums"
+        },
+        {
+          "slug": "failure-detection"
+        }
+      ]
+    },
+    {
+      "scenario": "A whole data center cannot be reached",
+      "impact": "If all copies of a key sat in one place, the cart would be unavailable or lost.",
+      "answer": "The paper says each object is replicated across several data centers and the preference list is built so that its nodes are in different ones, so the other data centers can still serve the key.",
+      "concepts": [
+        {
+          "slug": "multi-region-failover"
+        },
+        {
+          "slug": "database-replication"
+        }
+      ]
+    },
+    {
+      "scenario": "Two clients change the same cart at the same time on different coordinators",
+      "impact": "Both writes are accepted, so the replicas hold different carts, and taking only one would lose an item.",
+      "answer": "The vector clocks show that neither version descends from the other, so both are returned to the next reader, and the cart service merges them and writes the result back.",
+      "concepts": [
+        {
+          "slug": "logical-clocks"
+        },
+        {
+          "slug": "crdts"
+        }
+      ]
+    },
+    {
+      "scenario": "A node holding hinted copies fails before it can deliver them",
+      "impact": "The returning node misses writes made while it was away, and copies are fewer than N.",
+      "answer": "The Merkle-tree comparison between replicas of the same key range finds the missing keys, and the nodes copy only those.",
+      "concepts": [
+        {
+          "slug": "merkle-trees-and-anti-entropy"
+        }
+      ]
+    },
+    {
+      "scenario": "A few popular keys make some nodes much busier than others",
+      "impact": "A hot node slows down and the 99.9th percentile latency gets worse, even if the average looks fine.",
+      "answer": "Virtual nodes spread each machine's key ranges over the ring, and the paper's later partitioning scheme assigns equal-sized partitions evenly. The paper also reports a write buffer in memory that lowered 99.9th percentile latency by a factor of 5 at peak, at the cost of losing buffered writes if the server crashes.",
+      "concepts": [
+        {
+          "slug": "consistent-hashing"
+        },
+        {
+          "slug": "hedged-requests-and-tail-latency"
+        }
+      ]
+    }
+  ],
+  "alternatives": [
+    {
+      "title": "Strong consistency or always writable",
+      "options": [
+        {
+          "name": "Strong consistency (a relational database or a consensus-based store)",
+          "pro": "One current value, no merging",
+          "con": "The paper says it means data is unavailable during some failures, which the cart cannot accept"
+        },
+        {
+          "name": "Eventual consistency with merging in the application",
+          "pro": "Writes keep working during failures and network splits",
+          "con": "Applications must handle several versions, and some anomalies such as a deleted item coming back"
+        },
+        {
+          "name": "Last write wins on timestamps",
+          "pro": "Simplest for the application",
+          "con": "Silently drops one of two concurrent writes; the paper offers it as a choice but not for the cart"
+        }
+      ],
+      "pick": "Eventual consistency with application merging for the cart, as the paper does, and last write wins for services where losing an update is harmless."
+    },
+    {
+      "title": "Who picks the coordinator",
+      "options": [
+        {
+          "name": "Client uses a load balancer, any node forwards",
+          "pro": "The client stays simple",
+          "con": "One extra hop when the chosen node does not own the key"
+        },
+        {
+          "name": "Client library knows the ring and calls the owner",
+          "pro": "The paper says this gives lower latency by skipping that forwarding hop",
+          "con": "Clients must refresh their view of the ring regularly"
+        }
+      ],
+      "pick": "Either; the paper describes both, and reports that the client-driven way lowered the 99.9th percentile latency by about 30 ms and the average by 3 to 4 ms."
+    },
+    {
+      "title": "How to place partitions on the ring",
+      "options": [
+        {
+          "name": "Random tokens per node",
+          "pro": "Simple to start",
+          "con": "The paper reports uneven load, slow bootstrap, and data that is hard to archive"
+        },
+        {
+          "name": "Equal-sized partitions with an even number of tokens per node",
+          "pro": "The paper says it gave the best load balance for the memory it needs, and it is easier to move or archive a partition as one file",
+          "con": "Needs a fixed partition count chosen ahead of time"
+        }
+      ],
+      "pick": "Equal-sized partitions, which the paper says production moved to."
+    }
+  ],
+  "roles": [
+    {
+      "id": "client",
+      "label": "Shopping cart service",
+      "description": "Reads a cart with its clocks, merges any versions, and writes the result back with the combined clock."
+    },
+    {
+      "id": "compute",
+      "label": "Coordinator",
+      "description": "The node that takes a request, writes to the first N healthy nodes and waits for W or R replies."
+    },
+    {
+      "id": "data",
+      "label": "Storage nodes",
+      "description": "Hold the versions of each key, keep hinted copies for nodes that are down, and answer reads."
+    },
+    {
+      "id": "async",
+      "label": "Repair",
+      "description": "Background Merkle-tree comparison and gossip that bring replicas and membership back in line."
+    }
+  ],
+  "quiz": [
+    {
+      "question": "With N = 3, R = 2 and W = 2, one of the three nodes that own a key is down and a write arrives. What does the paper's design do?",
+      "options": [
+        "Rejects the write, because a strict quorum of the three owners is missing",
+        "Writes to the two owners that are up plus the next healthy node on the ring, with a hint for the node that is down",
+        "Writes only to the two nodes that are up and forgets the third copy",
+        "Stores the write on the coordinator alone until the owner returns"
+      ],
+      "answer": 1,
+      "explanation": "A sloppy quorum uses the first N healthy nodes, so the third copy goes to the next node with a hint naming the intended owner, which hands it back later. Rejecting the write is what a strict quorum would do, which the paper avoids to stay always writable. Dropping the third copy would lower durability for no gain. Keeping the write on only the coordinator would leave one copy until the owner returned."
+    },
+    {
+      "question": "Two clients read the same cart and each add a different item, through different coordinators. What does the next read return?",
+      "options": [
+        "Only the version with the later timestamp",
+        "Only the version with the larger clock counter on the first node",
+        "Both versions with their vector clocks, so the application can merge them",
+        "An error until an operator picks one version"
+      ],
+      "answer": 2,
+      "explanation": "Neither vector clock descends from the other, so Dynamo keeps both and returns both with their clocks and leaves the merge to the application. A timestamp choice is last write wins, which would lose one item and which the cart does not use. Comparing one counter would not show whether the writes were concurrent. Needing an operator would defeat the point of always being writable."
+    },
+    {
+      "question": "Two replicas of a key range may have drifted apart. How does Dynamo find which keys differ without comparing every key?",
+      "options": [
+        "It compares the replicas' vector clocks for every key",
+        "It sends every key's value from one node to the other",
+        "It asks the client library to read the key from all nodes",
+        "It compares the roots of their Merkle trees and walks down only the branches whose hashes differ"
+      ],
+      "answer": 3,
+      "explanation": "Each node keeps a hash tree per key range, so equal roots mean the range matches and different roots lead to the few keys that differ, which are the only ones copied. Comparing clocks for every key or sending every value would cost far more. Reading from all nodes through a client is not how background repair works."
+    }
+  ],
+  "sources": [
+    {
+      "title": "Dynamo: Amazon's Highly Available Key-value Store",
+      "publisher": "Amazon (SOSP 2007), hosted by Werner Vogels",
+      "year": 2007,
+      "url": "https://www.allthingsdistributed.com/files/amazon-dynamo-sosp2007.pdf"
+    }
+  ]
+}

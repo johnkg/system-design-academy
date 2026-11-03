@@ -1,0 +1,83 @@
+---
+import PlaygroundShell from '../../components/PlaygroundShell.astro';
+import RangeField from '../../components/RangeField.astro';
+---
+<PlaygroundShell title="A stall and a fail-over" hint="A lock holder stalls, then wakes up and writes. Later the master fails. Choose the stall length, the session lease, whether the file server checks sequencers, how long the election takes and the grace period, and see who holds the lock, whether the stale write lands and whether the session survives. A simple model, not Google's code or data.">
+  <ol class="how">
+    <li>Press <b>Reset</b>. With the defaults the lock goes to the standby after <b>12</b> s, the old owner's late write <b>overwrites</b> the new data, and the session survives the fail-over with the cache off for <b>8</b> s.</li>
+    <li>Set <b>File server</b> to <b>Checks sequencers</b>: the late write is <b>refused</b>, because its sequencer is older than the newest the server has seen.</li>
+    <li>Set <b>Election (s)</b> to <b>70</b>: the cache is off for <b>45</b> s and the session is <b>lost</b>, because the new master took longer than the grace period.</li>
+    <li>With <b>Election (s)</b> at <b>70</b>, set <b>Grace (s)</b> to <b>75</b>: the session is <b>kept</b>, with the cache off for <b>58</b> s.</li>
+    <li>Set <b>Holder pause (s)</b> to <b>5</b>: the lock <b>never</b> moves and there is <b>no write</b> from the old owner.</li>
+  </ol>
+  <div class="pg brk" data-brk>
+    <div class="pg-row">
+      <RangeField label="Holder pause (s)" name="pause" min="0" max="60" step="1" value="25" />
+      <RangeField label="Lease (s)" name="lease" min="6" max="60" step="1" value="12" />
+      <label>File server <select class="pg-in" data-seq><option value="no">Ignores sequencers</option><option value="yes">Checks sequencers</option></select></label>
+      <RangeField label="Election (s)" name="elect" min="2" max="90" step="1" value="20" />
+      <RangeField label="Grace (s)" name="grace" min="0" max="90" step="5" value="45" />
+      <button type="button" class="btn" data-reset>Reset</button>
+    </div>
+    <div class="pg-grid">
+      <div class="pg-box" data-b1><h3>The lock goes to the standby after (s)</h3><span class="pg-mono" data-o1></span><span class="pg-note" data-n1></span></div>
+      <div class="pg-box" data-b2><h3>The old holder writes after waking</h3><span class="pg-mono" data-o2></span><span class="pg-note" data-n2></span></div>
+      <div class="pg-box" data-b3><h3>The session through a master fail-over</h3><span class="pg-mono" data-o3></span><span class="pg-note" data-n3></span></div>
+      <div class="pg-box" data-b4><h3>Seconds the cache is off</h3><span class="pg-mono" data-o4></span><span class="pg-note" data-n4></span></div>
+    </div>
+    <p class="pg-out" data-verdict aria-live="polite"></p>
+    <p class="pg-note">Model, invented for teaching and not Google data. A lock holder sends its last KeepAlive and then pauses. The master frees the lock only when the lease runs out, which is a lease length after that KeepAlive (the paper's default is 12 seconds). If the pause is shorter than the lease, the holder keeps the lock. If it is longer, a standby takes the lock with a higher generation, and when the old holder wakes up it sends a write with its old sequencer: a file server that checks sequencers refuses it, and one that ignores them accepts it. Separately, the master fails just after a KeepAlive. The client's lease ends a lease length later, and if no new master is ready by then it is in jeopardy until one answers. The session survives if that wait is no longer than the grace period (45 seconds by default).</p>
+  </div>
+</PlaygroundShell>
+<script>
+  import { query, formatWholeNumber, mulberry32 } from '../../playground';
+  document.querySelectorAll<HTMLElement>('[data-brk]').forEach((root) => {
+    const q = query(root);
+    const DEFAULTS: Record<string, string> = {"pause": "25", "lease": "12", "seq": "no", "elect": "20", "grace": "45"};
+    const input = (k: string) => q<HTMLInputElement>(`[data-${k}]`);
+    const select = (k: string) => q<HTMLSelectElement>(`[data-${k}]`);
+    const whole = formatWholeNumber;
+    const one = (n: number) => (Math.round(n * 10) / 10).toLocaleString('en-US');
+
+    function draw() {
+      const seq = select('seq').value;
+      const pause = Number(input('pause').value);
+      const lease = Number(input('lease').value);
+      const elect = Number(input('elect').value);
+      const grace = Number(input('grace').value);
+      q('[data-pauseval]').textContent = String(pause);
+      q('[data-leaseval]').textContent = String(lease);
+      q('[data-electval]').textContent = String(elect);
+      q('[data-graceval]').textContent = String(grace);
+      const boxes: { big: string; note: string; bad: boolean }[] = [];
+      let verdict = '';
+      let failed = false;
+      const released = pause >= lease; // the master frees the lock only when the lease runs out
+      const stale = released ? (seq === 'yes' ? 'refused' : 'overwrites') : 'none';
+      const jeopardy = Math.max(0, elect - lease); // the master fails just after a KeepAlive, so the lease runs for its full length
+      const kept = jeopardy <= grace;
+      const cacheOff = Math.min(jeopardy, grace);
+      boxes.push({ big: released ? one(lease) : 'never', note: released ? 'the lock is not freed until the holder\'s lease ends' : 'the holder came back before its lease ended', bad: false });
+      boxes.push({ big: stale === 'refused' ? 'refused' : stale === 'overwrites' ? 'overwrites' : 'no write', note: stale === 'refused' ? 'its sequencer is older than the newest the server has seen' : stale === 'overwrites' ? 'the new holder\'s data is replaced by old data' : 'it still holds the lock, so its write is valid', bad: stale === 'overwrites' });
+      boxes.push({ big: kept ? 'kept' : 'lost', note: kept ? (jeopardy === 0 ? 'the new master was ready before the lease ended' : 'the new master answered within the grace period') : 'the grace period ended first, so the locks are gone', bad: !kept });
+      boxes.push({ big: one(cacheOff), note: jeopardy === 0 ? 'the client never lost contact' : 'the client is in jeopardy and has emptied its cache', bad: false });
+      failed = stale === 'overwrites' || !kept;
+      if (stale === 'overwrites') verdict = 'The old holder woke up after its lock had gone to the standby, and its late write replaced the new holder\'s data. A sequencer check would have refused it.';
+      else if (!kept) verdict = 'The new master took longer than the grace period, so the session and its locks were lost and the service has to start over. A longer grace period would have helped.';
+      else verdict = stale === 'refused' ? 'The late write was refused and the session survived the fail-over.' : 'Nothing was lost: the holder came back in time and the session survived the fail-over.';
+      boxes.forEach((b, i) => {
+        q(`[data-o${i + 1}]`).textContent = b.big;
+        q(`[data-n${i + 1}]`).textContent = b.note;
+        q<HTMLElement>(`[data-b${i + 1}]`).style.setProperty('--c', b.bad ? 'var(--bad)' : 'var(--good)');
+      });
+      const out = q('[data-verdict]'); out.classList.toggle('bad', failed); out.textContent = verdict;
+    }
+    root.addEventListener('input', draw);
+    root.addEventListener('change', draw);
+    q('[data-reset]').addEventListener('click', () => {
+      Object.entries(DEFAULTS).forEach(([k, v]) => { (root.querySelector<HTMLInputElement | HTMLSelectElement>(`[data-${k}]`)!).value = v; });
+      draw();
+    });
+    draw();
+  });
+</script>

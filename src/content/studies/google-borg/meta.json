@@ -1,0 +1,429 @@
+{
+  "name": "How Google Built Borg",
+  "difficulty": "advanced",
+  "intent": "Follow the design in Google's 2015 Borg paper for running hundreds of thousands of jobs across tens of thousands of machines: cells, a replicated Borgmaster, priorities and quota, a scheduler with feasibility and scoring, scalability tricks, failure handling and resource reclamation, using only what the paper says.",
+  "codeTitle": "a priority scheduler with scoring, preemption, failure and reclamation",
+  "finalIntro": "One production job being admitted, placed, and then kept running through a preemption and a machine failure.",
+  "prompt": "The 2015 paper 'Large-scale cluster management at Google with Borg' says Borg runs hundreds of thousands of jobs, from many thousands of different applications, across a number of clusters each with up to tens of thousands of machines. It runs two main kinds of work: long-running services that must almost never go down and handle short latency-sensitive requests, and batch jobs that take from a few seconds to a few days. The paper's three goals are to hide the details of resource management and failure handling, to operate with very high reliability and availability, and to run workloads effectively across tens of thousands of machines. How would you build a system that lets engineers just say what they want to run, places it well, keeps it running through constant failures, and uses the machines efficiently? This study follows the paper, which is listed at the end. The simulation and the code samples are small models for learning, not Google's code or data.",
+  "functional": [
+    "Accept a declarative specification of a job: how many tasks, what resources each needs, what priority it has, and its constraints",
+    "Place each task on a machine that has room, and start it with its program and data",
+    "Keep jobs running: restart and reschedule tasks when machines fail or tasks crash",
+    "Make room for important work by preempting less important tasks",
+    "Share machines between services and batch jobs, and report on what is happening"
+  ],
+  "nonFunctional": [
+    "Scale in the paper: tens of thousands of machines in a cell (the median cell is about 10,000), and several cells with more than 10,000 task arrivals a minute",
+    "Availability: the paper stresses that failures are the norm, and that tasks already running continue even if the Borgmaster or a Borglet goes down",
+    "Efficient use of machines: the paper measures this by how small a cell can be and still run a workload (cell compaction)",
+    "Fast decisions: an online scheduling pass over the pending queue should take under half a second",
+    "Fairness and isolation between users, through quota and priorities"
+  ],
+  "firstAttempt": {
+    "text": "This study's starting point, in the terms the paper uses when it compares with the alternative: each team or workload type gets its own pool of machines and its own simple scheduler. Production services run in one pool, batch jobs in another, and each team sizes its pool for its own peak.",
+    "limits": [
+      "The paper tested this by segregating prod and non-prod work into different cells: it needed 20 to 30 percent more machines in the median cell, because production jobs reserve room for rare spikes and do not use it most of the time",
+      "Segregating users in the same way also needed more machines, and the paper shows pooling resources reduces the cost significantly",
+      "Each pool has its own failure handling, and each team has to deal with machines failing",
+      "A pool sized for a peak sits idle between peaks, while another pool may be starved"
+    ]
+  },
+  "nodes": [
+    {
+      "id": "user",
+      "label": "Engineers (job specs)",
+      "kind": "client",
+      "x": 8,
+      "y": 50
+    },
+    {
+      "id": "pools",
+      "label": "Separate pools per team",
+      "kind": "data",
+      "x": 80,
+      "y": 50,
+      "until": 1
+    },
+    {
+      "id": "master",
+      "label": "Borgmaster (5 replicas, Paxos)",
+      "kind": "compute",
+      "x": 34,
+      "y": 16,
+      "at": 1
+    },
+    {
+      "id": "borglets",
+      "label": "Borglets on every machine",
+      "kind": "compute",
+      "x": 80,
+      "y": 50,
+      "at": 1
+    },
+    {
+      "id": "quota",
+      "label": "Quota and priorities",
+      "kind": "edge",
+      "x": 58,
+      "y": 16,
+      "at": 2
+    },
+    {
+      "id": "sched",
+      "label": "Scheduler",
+      "kind": "compute",
+      "x": 34,
+      "y": 84,
+      "at": 3
+    },
+    {
+      "id": "recl",
+      "label": "Resource reclamation",
+      "kind": "async",
+      "x": 58,
+      "y": 84,
+      "at": 6
+    }
+  ],
+  "edges": [
+    {
+      "from": "user",
+      "to": "pools",
+      "until": 1
+    },
+    {
+      "from": "user",
+      "to": "master",
+      "at": 1
+    },
+    {
+      "from": "master",
+      "to": "borglets",
+      "at": 1
+    },
+    {
+      "from": "master",
+      "to": "quota",
+      "at": 2
+    },
+    {
+      "from": "master",
+      "to": "sched",
+      "at": 3
+    },
+    {
+      "from": "sched",
+      "to": "borglets",
+      "at": 3
+    },
+    {
+      "from": "borglets",
+      "to": "recl",
+      "at": 6
+    },
+    {
+      "from": "recl",
+      "to": "master",
+      "at": 6
+    }
+  ],
+  "steps": [
+    {
+      "title": "Run each cluster as a cell with a replicated Borgmaster and a Borglet on every machine",
+      "problem": "Engineers should describe what they want and not manage individual machines, and the controller must not be a single point of failure.",
+      "fix": "A cell is a set of machines managed as a unit, with a median size of about 10,000 machines in the paper. Each cell has a logically centralized controller, the Borgmaster, and an agent, the Borglet, on every machine. The Borgmaster is replicated five times. Each replica keeps most of the cell's state in memory, and the state is also kept in a Paxos-based store on the replicas' disks. One elected master serves as the Paxos leader and handles all mutating requests. Users submit jobs, each made of one or more tasks, with a declarative specification of the resources, constraints and priority. The Borglet starts and stops tasks, restarts them if they fail, manages local resources and reports the machine's state. The master checkpoints its state, a periodic snapshot plus a change log, and a simulator called Fauxmaster can replay a checkpoint for debugging.",
+      "tradeoff": "A centralized controller gives one place to make good decisions, and it makes scalability the main engineering problem. The paper says it is not sure where the ultimate limit of the centralized design will be, but so far each limit approached has been removed.",
+      "concepts": [
+        {
+          "slug": "consensus"
+        },
+        {
+          "slug": "leader-election"
+        },
+        {
+          "slug": "containers-and-orchestration"
+        },
+        {
+          "slug": "write-ahead-log"
+        }
+      ]
+    },
+    {
+      "title": "Use priorities and quota to decide what runs",
+      "problem": "More work arrives than the cell can hold. Someone has to decide whose work waits, and users must not be able to claim unlimited resources.",
+      "fix": "Every job has a priority, a small positive integer. A higher-priority task can take resources from a lower-priority one, even if that means killing it. The paper defines non-overlapping priority bands: monitoring, production, batch and best effort (testing or free). To avoid preemption cascades, tasks in the production band are not allowed to preempt one another. Quota decides which jobs are admitted: it is a vector of resource quantities at a given priority for a period of time, typically months. Quota checking is part of admission control, not scheduling, so a job without enough quota is rejected at once. Higher-priority quota costs more, and production quota is limited to the actual resources of the cell. Quota is oversold at low priority: every user has infinite quota at priority zero, though such jobs may wait.",
+      "tradeoff": "Priorities make the important work reliable and push the cost of overload onto the cheap work. Users of low-priority work must accept being preempted, and the paper says applications must handle that.",
+      "concepts": [
+        {
+          "slug": "load-shedding"
+        },
+        {
+          "slug": "rate-limiting"
+        },
+        {
+          "slug": "access-control-models"
+        }
+      ]
+    },
+    {
+      "title": "Place tasks by feasibility checking and scoring",
+      "problem": "Among thousands of machines, a task should go where it fits, without stranding resources, and with minimal harm to others.",
+      "fix": "The scheduler scans the pending queue from high to low priority, with a round-robin within a priority for fairness across users. For each task it has two phases. Feasibility checking finds machines that meet the task's constraints and have enough available resources, counting resources used by lower-priority tasks that could be evicted. Scoring picks among them. The score reflects user preferences but is mostly built-in criteria: minimizing the number and priority of preempted tasks, preferring machines that already have the task's packages, spreading tasks across failure domains, and mixing high and low priority tasks on a machine. The paper compares scoring models: a variant of E-PVM spreads load and leaves room for spikes but fragments large tasks, best fit packs tightly and penalizes mis-estimated requirements, and the hybrid model Borg uses reduces stranded resources and packs about 3 to 5 percent better than best fit. If the chosen machine lacks room, Borg preempts lower-priority tasks from lowest to highest until the task fits, and puts them back in the pending queue. The median task startup latency is about 25 seconds, of which package installation takes about 80 percent.",
+      "tradeoff": "Spreading is safe against load spikes and fragments machines, while tight packing wastes less and punishes bad estimates. The hybrid is a compromise tuned on real workloads.",
+      "concepts": [
+        {
+          "slug": "load-balancing"
+        },
+        {
+          "slug": "autoscaling"
+        },
+        {
+          "slug": "back-of-the-envelope-estimation"
+        }
+      ]
+    },
+    {
+      "title": "Make the scheduler fast enough for tens of thousands of machines",
+      "problem": "Scoring every machine for every pending task would take far too long in a large cell with thousands of arrivals a minute.",
+      "fix": "Early Borgmasters had one loop that accepted requests, scheduled tasks and talked to Borglets. For larger cells the scheduler became a separate process that works on a cached copy of the cell state. It takes the changes from the elected master, runs a scheduling pass, and tells the master its assignments. The master accepts them unless they are inappropriate, for example because they rely on out-of-date state, and then they are considered again in the next pass. The paper says this is much in the spirit of the optimistic concurrency control used in Omega. Three techniques make it faster: score caching, where scores are kept until a machine or task changes; equivalence classes, where feasibility and scoring are done once for a group of tasks with identical requirements; and relaxed randomization, where machines are examined in random order only until enough feasible ones are found. The paper reports that scheduling a cell's whole workload from scratch took a few hundred seconds, but did not finish after more than three days without these techniques, and that an online pass normally completes in less than half a second.",
+      "tradeoff": "The scheduler may act on slightly old state and sometimes be wrong, and the master checks and rejects bad assignments. Sampling machines at random gives a good, not the best, placement.",
+      "concepts": [
+        {
+          "slug": "optimistic-concurrency-and-etags"
+        },
+        {
+          "slug": "caching"
+        },
+        {
+          "slug": "hedged-requests-and-tail-latency"
+        }
+      ]
+    },
+    {
+      "title": "Treat failure as normal and keep running tasks alive",
+      "problem": "In a cell this big, machines, racks and tasks fail all the time, and the controller itself can fail or lose contact.",
+      "fix": "The Borgmaster polls each Borglet every few seconds, which lets it control the rate of communication and avoid recovery storms. A Borglet that misses several polls is marked down and its tasks are rescheduled elsewhere; if contact is restored the master tells the Borglet to kill the tasks that were rescheduled so that no duplicates remain. The paper says that a Borglet continues normal operation without the master, so running tasks stay up even if all Borgmaster replicas fail. Borg also spreads the tasks of a job across machines, racks and power domains, limits the rate and number of task disruptions during maintenance, rate-limits rescheduling from unreachable machines because it cannot tell a large failure from a network partition, uses declarative desired state and idempotent operations so that a client can safely resubmit a request, and avoids repeating task and machine pairings that crash.",
+      "tradeoff": "Applications must still cope with being evicted, using replication and checkpoints. The paper says the master being up matters because new jobs cannot be submitted and tasks of failed machines cannot be rescheduled while it is down.",
+      "concepts": [
+        {
+          "slug": "failure-detection"
+        },
+        {
+          "slug": "graceful-degradation"
+        },
+        {
+          "slug": "idempotency"
+        },
+        {
+          "slug": "bulkhead"
+        }
+      ]
+    },
+    {
+      "title": "Reclaim resources that services reserve but do not use",
+      "problem": "Production jobs ask for enough to survive rare peaks and mostly use much less, so cells would look full while machines sit mostly idle.",
+      "fix": "A job states a resource limit for each task. Borg estimates how much a task will really use, called its reservation, which the Borgmaster recomputes every few seconds from usage data collected by the Borglet. The initial reservation equals the limit, and after a start-up period it decays towards actual usage plus a safety margin. The reclaimed difference is given to work that tolerates lower-quality resources, mainly batch jobs. The scheduler uses limits to place production tasks, so they never rely on reclaimed resources, and uses the reservations of existing tasks to place non-production tasks, which can therefore run in reclaimed resources. If a machine runs short, Borg kills or throttles non-production tasks, never production ones. The paper reports that about 20 percent of the workload in a median cell runs in reclaimed resources, and that putting production and non-production work in separate cells would need 20 to 30 percent more machines in the median cell.",
+      "tradeoff": "Reclamation raises utilization at the risk of evicting batch work during a spike. The paper says more aggressive estimates reclaim more with little effect on out-of-memory events, and that this is tuned.",
+      "concepts": [
+        {
+          "slug": "autoscaling"
+        },
+        {
+          "slug": "slos-and-error-budgets"
+        },
+        {
+          "slug": "load-shedding"
+        }
+      ]
+    }
+  ],
+  "failures": [
+    {
+      "scenario": "A machine stops answering polls",
+      "impact": "Its tasks may be down, or it may only be cut off, and both possibilities exist at once.",
+      "answer": "After several missed polls the Borgmaster marks the machine down and reschedules its tasks, rate-limited. If the machine comes back, the master tells its Borglet to kill the tasks that were rescheduled elsewhere, so there are no duplicates.",
+      "concepts": [
+        {
+          "slug": "failure-detection"
+        },
+        {
+          "slug": "idempotency"
+        }
+      ]
+    },
+    {
+      "scenario": "All Borgmaster replicas fail",
+      "impact": "No jobs can be submitted or changed, and tasks of failed machines cannot be rescheduled.",
+      "answer": "Tasks keep running, because each Borglet continues normal operation without the master. The paper still treats keeping the master up as important.",
+      "concepts": [
+        {
+          "slug": "graceful-degradation"
+        },
+        {
+          "slug": "consensus"
+        }
+      ]
+    },
+    {
+      "scenario": "A production task needs room and the cell is full of batch work",
+      "impact": "The task would wait even though it is more important.",
+      "answer": "The scheduler preempts lower-priority tasks on a chosen machine, from lowest to highest priority, and puts them back in the pending queue.",
+      "concepts": [
+        {
+          "slug": "load-shedding"
+        }
+      ]
+    },
+    {
+      "scenario": "A flood of pending tasks arrives",
+      "impact": "A scheduler that scored every machine for every task would fall behind.",
+      "answer": "Score caching, equivalence classes and relaxed randomization reduce the work. The paper reports that a full re-scheduling that takes a few hundred seconds with them did not finish in more than three days without.",
+      "concepts": [
+        {
+          "slug": "caching"
+        },
+        {
+          "slug": "back-of-the-envelope-estimation"
+        }
+      ]
+    },
+    {
+      "scenario": "Production usage rises suddenly towards its limit",
+      "impact": "The batch tasks using its reclaimed resources now compete with it for the machine.",
+      "answer": "Borg kills or throttles the non-production tasks, never the production ones, and the reservation grows back towards the limit.",
+      "concepts": [
+        {
+          "slug": "load-shedding"
+        },
+        {
+          "slug": "slos-and-error-budgets"
+        }
+      ]
+    }
+  ],
+  "alternatives": [
+    {
+      "title": "One shared cell or separate cells for prod and batch",
+      "options": [
+        {
+          "name": "Separate cells",
+          "pro": "Simple isolation",
+          "con": "The paper's experiment needed 20 to 30 percent more machines in the median cell"
+        },
+        {
+          "name": "Shared cells with priorities and reclamation",
+          "pro": "Spare room reserved by production jobs is used by batch work",
+          "con": "Needs preemption, isolation and careful resource estimation"
+        }
+      ],
+      "pick": "Shared cells, as Borg does."
+    },
+    {
+      "title": "How to score machines",
+      "options": [
+        {
+          "name": "Worst fit (spreading, E-PVM)",
+          "pro": "Headroom for spikes",
+          "con": "Fragments machines, hurting large tasks"
+        },
+        {
+          "name": "Best fit (tight packing)",
+          "pro": "Leaves whole machines free for large tasks",
+          "con": "Punishes wrong estimates and bursty loads"
+        },
+        {
+          "name": "Hybrid",
+          "pro": "Fewer stranded resources, about 3 to 5 percent better packing than best fit",
+          "con": "More tuning"
+        }
+      ],
+      "pick": "The hybrid, which the paper says is Borg's current model."
+    },
+    {
+      "title": "One scheduling loop or a separate scheduler",
+      "options": [
+        {
+          "name": "One synchronous loop in the Borgmaster",
+          "pro": "Simple",
+          "con": "Too slow for large cells"
+        },
+        {
+          "name": "A separate scheduler on cached state, with assignments checked by the master",
+          "pro": "Works in parallel with other master functions",
+          "con": "Some assignments are rejected for stale state and retried"
+        }
+      ],
+      "pick": "A separate scheduler, as the paper describes."
+    }
+  ],
+  "roles": [
+    {
+      "id": "client",
+      "label": "Engineers",
+      "description": "Submit declarative job specifications with resources, priority and constraints."
+    },
+    {
+      "id": "compute",
+      "label": "Borgmaster, scheduler and Borglets",
+      "description": "The replicated controller, the scheduler working on a cached copy of its state, and the agents that run tasks."
+    },
+    {
+      "id": "edge",
+      "label": "Admission control",
+      "description": "Checks quota and priority before a job reaches the scheduler."
+    },
+    {
+      "id": "async",
+      "label": "Reclamation",
+      "description": "Estimates what tasks really use and lends the rest to batch work."
+    },
+    {
+      "id": "data",
+      "label": "Paxos store",
+      "description": "Holds the cell's state and its checkpoints."
+    }
+  ],
+  "quiz": [
+    {
+      "question": "A Borglet stops answering the Borgmaster's polls for several rounds. What does the Borgmaster do?",
+      "options": [
+        "Waits forever, in case the machine returns",
+        "Marks the machine down and reschedules its tasks, and kills the old copies if the machine returns",
+        "Restarts every task in the cell",
+        "Moves the machine to another cell"
+      ],
+      "answer": 1,
+      "explanation": "The paper describes marking the machine down and rescheduling its tasks, and then telling the Borglet to kill the tasks that were rescheduled when contact returns, to avoid duplicates. Waiting forever would leave the tasks down. Restarting all tasks and moving machines between cells are not how it works."
+    },
+    {
+      "question": "Why does Borg keep running tasks alive when all Borgmaster replicas fail?",
+      "options": [
+        "The Borglet on each machine continues normal operation without the master",
+        "The tasks are copied to another cell",
+        "The scheduler runs the tasks itself",
+        "Tasks never fail"
+      ],
+      "answer": 0,
+      "explanation": "A Borglet starts, stops and restarts tasks on its machine and does not need the master for that, so running tasks and services stay up. The master is still needed for new jobs, updates and rescheduling failed machines' tasks. Tasks are not copied to another cell, the scheduler does not run them, and they can fail."
+    },
+    {
+      "question": "Why does Borg let batch tasks use resources that production tasks reserved but are not using?",
+      "options": [
+        "Production tasks never need their reservations",
+        "Because separating production and batch work into different cells needed 20 to 30 percent more machines in the median cell",
+        "To make batch tasks run faster than production tasks",
+        "Because quota is infinite for batch work"
+      ],
+      "answer": 1,
+      "explanation": "Production jobs reserve room for rare spikes and use it little, so Borg reclaims the unused part for batch work, which saves machines. Production tasks do sometimes need the whole limit, so the non-production tasks are killed or throttled when that happens. Batch tasks are not meant to be faster. Quota is infinite only at priority zero, which is not the reason."
+    }
+  ],
+  "sources": [
+    {
+      "title": "Large-scale cluster management at Google with Borg",
+      "publisher": "Google Research (EuroSys 2015)",
+      "year": 2015,
+      "url": "https://research.google/pubs/large-scale-cluster-management-at-google-with-borg/"
+    }
+  ]
+}

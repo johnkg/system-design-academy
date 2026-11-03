@@ -1,0 +1,422 @@
+{
+  "name": "How Google Built Percolator",
+  "difficulty": "advanced",
+  "intent": "Follow the design in Google's 2010 Percolator paper for updating a huge index incrementally instead of rebuilding it in batches: snapshot-isolation transactions on top of Bigtable, a timestamp oracle, locks stored in the table, lazy cleanup after crashes and observers triggered by notifications, using only what the paper says.",
+  "codeTitle": "snapshot-isolation transactions with primary and secondary locks",
+  "finalIntro": "One money transfer going through prewrite and commit, then two crashed transactions being cleaned up by readers.",
+  "prompt": "The 2010 paper 'Large-scale Incremental Processing Using Distributed Transactions and Notifications' says Google's web search index used to be rebuilt as a series of MapReduces over the whole repository, which holds tens of petabytes on thousands of machines and takes billions of updates a day. To add a few new pages, the MapReduces had to be run again over the entire repository, old pages and new, so the delay in indexing a page grew with the size of the repository, not with the size of the change. Databases could not store or process that much, and Bigtable alone could not keep the invariants of the index, because it has no transactions across rows. How would you update such a repository a little at a time, consistently, with many machines working in parallel? This study follows the paper, which is listed at the end. The simulation and the code samples are small models for learning, not Google's code or data.",
+  "functional": [
+    "Update one document at a time and keep the derived tables (links, duplicates, clusters) consistent with it",
+    "Run multi-row, multi-table transactions with a guaranteed isolation level",
+    "Run a piece of code automatically when a column changes (an observer), so work flows from one stage to the next",
+    "Let thousands of workers update the same repository in parallel",
+    "Recover from workers that crash in the middle of a transaction"
+  ],
+  "nonFunctional": [
+    "Scale to tens of petabytes and billions of updates a day on thousands of machines",
+    "Latency proportional to the size of the update, not of the repository",
+    "Efficient reads: reading should not need locks",
+    "No central transaction manager or lock server on the path of every access: the paper wants every worker to act on Bigtable directly",
+    "The paper accepts relaxed latency: delays of tens of seconds when a lock is left by a failed worker"
+  ],
+  "firstAttempt": {
+    "text": "This is the situation the paper describes. The index is built by a chain of MapReduces: one to cluster duplicates, one to invert links, and others. Each run processes the entire repository, and the next batch starts when the last one finishes.",
+    "limits": [
+      "To process new pages that link to old ones, the MapReduces must be run again over the whole repository, so the work discards what earlier runs did",
+      "Latency is proportional to the size of the repository: the paper measured an average delay of around 30 minutes between crawling a document and clustering it, at a low crawl rate",
+      "MapReduce and other batch systems cannot process small updates one at a time, because they rely on large batches for efficiency",
+      "Invariants are easy to keep in MapReduce because it limits parallelism, and are hard to keep when workers update shared state concurrently"
+    ]
+  },
+  "nodes": [
+    {
+      "id": "crawl",
+      "label": "Crawler (new pages)",
+      "kind": "client",
+      "x": 8,
+      "y": 50
+    },
+    {
+      "id": "batch",
+      "label": "Batch chain of MapReduces",
+      "kind": "compute",
+      "x": 80,
+      "y": 50,
+      "until": 1
+    },
+    {
+      "id": "worker",
+      "label": "Percolator workers (with observers)",
+      "kind": "compute",
+      "x": 34,
+      "y": 16,
+      "at": 1
+    },
+    {
+      "id": "bigtable",
+      "label": "Bigtable (data, lock, write columns)",
+      "kind": "data",
+      "x": 80,
+      "y": 50,
+      "at": 1
+    },
+    {
+      "id": "oracle",
+      "label": "Timestamp oracle",
+      "kind": "edge",
+      "x": 58,
+      "y": 16,
+      "at": 2
+    },
+    {
+      "id": "notify",
+      "label": "Notification (dirty) cells",
+      "kind": "async",
+      "x": 34,
+      "y": 84,
+      "at": 5
+    },
+    {
+      "id": "chubby",
+      "label": "Chubby (worker liveness)",
+      "kind": "data",
+      "x": 80,
+      "y": 84,
+      "at": 4
+    }
+  ],
+  "edges": [
+    {
+      "from": "crawl",
+      "to": "batch",
+      "until": 1
+    },
+    {
+      "from": "crawl",
+      "to": "worker",
+      "at": 1
+    },
+    {
+      "from": "worker",
+      "to": "bigtable",
+      "at": 1
+    },
+    {
+      "from": "worker",
+      "to": "oracle",
+      "at": 2
+    },
+    {
+      "from": "worker",
+      "to": "chubby",
+      "at": 4
+    },
+    {
+      "from": "bigtable",
+      "to": "notify",
+      "at": 5
+    },
+    {
+      "from": "notify",
+      "to": "worker",
+      "at": 5
+    }
+  ],
+  "steps": [
+    {
+      "title": "Build on Bigtable and add a transaction layer",
+      "problem": "The index must store tens of petabytes and be updated in parallel, and a single-row store cannot keep several tables consistent.",
+      "fix": "Percolator is built on Bigtable, which stores a multi-dimensional sorted map of (row, column, timestamp) cells, and which offers atomic operations on a single row. Percolator keeps Bigtable's interface and wraps its operations with a library that adds multi-row transactions and an observer framework. There is no central server for transactions: each worker runs the transaction protocol itself, reading and writing Bigtable directly. The paper says this is unlike a traditional database, where a database node controls access to the storage. The only central services are small ones: a timestamp oracle and a lightweight lock service that is used to tell whether a worker is alive.",
+      "tradeoff": "Reusing Bigtable gives scale, storage and replication at once. The cost is that Percolator must implement transactions out of what a single-row store provides, which shapes the whole protocol.",
+      "concepts": [
+        {
+          "slug": "sql-vs-nosql"
+        },
+        {
+          "slug": "mvcc-and-isolation-levels"
+        },
+        {
+          "slug": "two-phase-commit"
+        }
+      ]
+    },
+    {
+      "title": "Use snapshot isolation with a timestamp oracle",
+      "problem": "Concurrent updates and reads of a repository this big must see consistent data, and reads should not take locks.",
+      "fix": "Percolator gives snapshot isolation. A transaction gets a start timestamp from the timestamp oracle and reads the newest committed version of each cell at or below it, using Bigtable's timestamp dimension to keep several versions. At commit it gets a commit timestamp. Two transactions that write the same cell concurrently cannot both commit. Reads need no locks, because any timestamp names a consistent snapshot. The paper notes that snapshot isolation allows write skew. The oracle hands out strictly increasing timestamps and serves them from memory out of a range it has reserved in stable storage. Workers batch their requests, with one pending request to the oracle at a time. The paper reports that the oracle serves about 2 million timestamps a second from one machine.",
+      "tradeoff": "Snapshot isolation is cheaper to read than serializable protocols but lets a few anomalies through. A single oracle is simple and, with batching, fast enough, since it only gives out numbers.",
+      "concepts": [
+        {
+          "slug": "mvcc-and-isolation-levels"
+        },
+        {
+          "slug": "logical-clocks"
+        },
+        {
+          "slug": "consistency-models"
+        }
+      ]
+    },
+    {
+      "title": "Store locks in the table and commit with two-phase commit",
+      "problem": "A transaction touches rows on different machines. Without a central lock manager, the locks and commit decision must live in Bigtable itself.",
+      "fix": "Each Percolator column is stored as several Bigtable columns: the data, a lock column and a write column. In the prewrite phase the transaction picks one cell as the primary and the rest are secondaries. For each cell it checks that no one has committed a newer version since its start timestamp and that no lock exists, then writes the data at the start timestamp and a lock. The primary's lock is marked primary, and the secondary locks name the primary. If any check fails, the transaction aborts. To commit, it gets a commit timestamp and, in one Bigtable row transaction on the primary, checks that its lock is still there, adds a write record at the commit timestamp that points to the data, and erases the lock. That write record is the commit point. It then does the same for each secondary. The paper's example moves $7 from Bob to Joe, with Bob as the primary.",
+      "tradeoff": "Everything rides on single-row transactions that Bigtable already offers. The protocol is slower than a single-node database, since each commit has several rounds, and the paper accepts that: it measured roughly a factor of four overhead on a write in its benchmark.",
+      "concepts": [
+        {
+          "slug": "two-phase-commit"
+        },
+        {
+          "slug": "write-ahead-log"
+        },
+        {
+          "slug": "optimistic-concurrency-and-etags"
+        }
+      ]
+    },
+    {
+      "title": "Clean up after crashed transactions lazily",
+      "problem": "A worker can die between prewrite and commit, leaving locks on cells that other transactions need. With no central lock manager, no one else knows its state.",
+      "fix": "Cleanup is done by whichever transaction runs into the lock, and it is decided by looking at the primary. If the primary cell still has its lock, the transaction never committed, so the lock holder's work is rolled back: the primary lock and the data are erased, and so are the secondary ones. If the primary has a write record for that start timestamp, the transaction committed, so the cleaner rolls forward by writing the write record on the secondary and erasing its lock. Because both actions are synchronized on the primary, it is safe even if the owner is alive, though it makes the owner abort. A transaction does not clean up a lock unless it suspects that the owner is dead or stuck. Workers write a token into Chubby, which is deleted when the process exits, as a sign of life, and a lock also records the wall time, so a too-old lock is cleaned up even if its owner seems live.",
+      "tradeoff": "Lazy cleanup is simple and needs no global detector, and it can delay a conflicting transaction by tens of seconds, which the paper says is acceptable for its relaxed latency needs. It also has no global deadlock detector.",
+      "concepts": [
+        {
+          "slug": "failure-detection"
+        },
+        {
+          "slug": "saga"
+        },
+        {
+          "slug": "leases-and-fencing-tokens"
+        },
+        {
+          "slug": "idempotency"
+        }
+      ]
+    },
+    {
+      "title": "Trigger work with observers and notifications",
+      "problem": "An incremental system needs to run the next step for exactly the documents that changed, without scanning every row.",
+      "fix": "An observer is a piece of code that Percolator runs when a user-specified column changes. A Percolator application is a chain of observers: each completes a task and writes to the table, which triggers the downstream observers. Observers run inside the Percolator worker, which scans for changed columns, called notifications. To make that scan cheap, a special notify column marks dirty cells. A transaction that writes an observed cell also sets the notify cell, and the workers scan only the notify column, which has far fewer entries than the trillions of data cells. After the observer runs and commits, the notify cell is removed. To keep the scanner threads from clumping together on the same part of the table, the paper's threads jump to a random location when they get too close to the one ahead, which the paper compares to buses bunching on a route.",
+      "tradeoff": "The paper promises that at most one observer transaction commits for each change of an observed column, using an acknowledgment column that records the latest start timestamp at which the observer ran. The converse does not hold: many writes to a column may cause the observer to run only once, which the paper calls message collapsing, and which saves work. In return, only changed documents are processed.",
+      "concepts": [
+        {
+          "slug": "transactional-outbox"
+        },
+        {
+          "slug": "message-queues"
+        },
+        {
+          "slug": "idempotency"
+        },
+        {
+          "slug": "stateful-stream-processing"
+        }
+      ]
+    },
+    {
+      "title": "Measure it against the batch pipeline",
+      "problem": "The change is worth it only if latency and freshness improve enough to justify the extra cost.",
+      "fix": "Google converted its indexing system to Percolator, called Caffeine, which lets it process documents as they are crawled. The paper reports that this cut the average document processing latency by a factor of 100 and the average age of a document in a search result by nearly 50 percent. In a synthetic benchmark at a low crawl rate, MapReduce took about 20 minutes to cluster the documents and 30 minutes on average from crawl to clustering, while Percolator found a new document and processed it in about 2 seconds, which the paper calls roughly 1000 times faster. It also let the document collection grow to three times the size of the old system's. The cost is resources: the paper says Caffeine uses roughly twice as many resources as the old system to process the same crawl rate.",
+      "tradeoff": "Percolator is not meant to replace batch processing. The paper notes that a distributed transaction system needs far more resources for a fixed amount of data than a traditional database, which is the price of scalability, and that computations that must touch all of the data are better done with MapReduce.",
+      "concepts": [
+        {
+          "slug": "batch-vs-stream-processing"
+        },
+        {
+          "slug": "back-of-the-envelope-estimation"
+        },
+        {
+          "slug": "stateful-stream-processing"
+        }
+      ]
+    }
+  ],
+  "failures": [
+    {
+      "scenario": "A worker crashes after the prewrite phase",
+      "impact": "Locks are left on the cells, and no one has committed.",
+      "answer": "A later reader or writer that meets a lock sees the primary still locked, decides the transaction never committed, and rolls it back by erasing the locks and the data written at the start timestamp.",
+      "concepts": [
+        {
+          "slug": "failure-detection"
+        },
+        {
+          "slug": "saga"
+        }
+      ]
+    },
+    {
+      "scenario": "A worker crashes after committing the primary but before the secondaries",
+      "impact": "The transaction is committed, but some cells still hold locks and no write record.",
+      "answer": "A reader that meets a secondary lock finds the primary's write record, concludes it committed, and rolls forward by writing the secondary's write record and erasing its lock.",
+      "concepts": [
+        {
+          "slug": "idempotency"
+        },
+        {
+          "slug": "two-phase-commit"
+        }
+      ]
+    },
+    {
+      "scenario": "Two transactions write the same cell at the same time",
+      "impact": "Both cannot commit under snapshot isolation.",
+      "answer": "The second prewrite finds a lock, or a write record newer than its start timestamp, and aborts. The paper says it should retry after a backoff.",
+      "concepts": [
+        {
+          "slug": "optimistic-concurrency-and-etags"
+        },
+        {
+          "slug": "retries-and-backoff"
+        }
+      ]
+    },
+    {
+      "scenario": "A worker is alive but stuck holding a lock",
+      "impact": "Other transactions keep running into its lock.",
+      "answer": "The lock records the wall time, and a lock that is too old is cleaned up even if the worker's Chubby token is still there. The cleanup forces the stuck transaction to abort.",
+      "concepts": [
+        {
+          "slug": "leases-and-fencing-tokens"
+        },
+        {
+          "slug": "timeouts-and-deadlines"
+        }
+      ]
+    },
+    {
+      "scenario": "The timestamp oracle restarts",
+      "impact": "Timestamps might go backwards, which would break snapshot isolation.",
+      "answer": "The oracle writes the highest timestamp it has allocated to stable storage, and after a restart timestamps jump forward to that value and never go backwards.",
+      "concepts": [
+        {
+          "slug": "logical-clocks"
+        },
+        {
+          "slug": "write-ahead-log"
+        }
+      ]
+    }
+  ],
+  "alternatives": [
+    {
+      "title": "Batch rebuild or incremental updates",
+      "options": [
+        {
+          "name": "Rebuild with MapReduce",
+          "pro": "Simple invariants, efficient for large batches",
+          "con": "Latency proportional to the size of the repository"
+        },
+        {
+          "name": "Incremental transactions and observers",
+          "pro": "Latency proportional to the size of the change",
+          "con": "Roughly twice the resources in the paper's indexing system, and a more complex protocol"
+        }
+      ],
+      "pick": "Incremental processing for indexing, with MapReduce still used for work that touches all the data."
+    },
+    {
+      "title": "Where locks and transaction state live",
+      "options": [
+        {
+          "name": "A central lock server or transaction manager",
+          "pro": "Simple to reason about",
+          "con": "A bottleneck for every access, and another service to scale"
+        },
+        {
+          "name": "Columns in the same Bigtable row",
+          "pro": "Scales with Bigtable, and a row transaction updates data and lock together",
+          "con": "Lock handling is done by clients, with lazy cleanup"
+        }
+      ],
+      "pick": "Locks in Bigtable, as the paper does."
+    },
+    {
+      "title": "Isolation level",
+      "options": [
+        {
+          "name": "Serializable",
+          "pro": "No anomalies",
+          "con": "Reads would have to take locks"
+        },
+        {
+          "name": "Snapshot isolation",
+          "pro": "Reads are lock-free and consistent",
+          "con": "Write skew is possible"
+        }
+      ],
+      "pick": "Snapshot isolation."
+    }
+  ],
+  "roles": [
+    {
+      "id": "client",
+      "label": "Crawler",
+      "description": "Loads new documents into the repository by running transactions."
+    },
+    {
+      "id": "compute",
+      "label": "Workers and observers",
+      "description": "Run transactions and observer code directly against Bigtable."
+    },
+    {
+      "id": "data",
+      "label": "Bigtable and Chubby",
+      "description": "Bigtable stores data, locks and write records; Chubby tokens show which workers are alive."
+    },
+    {
+      "id": "edge",
+      "label": "Timestamp oracle",
+      "description": "Hands out strictly increasing timestamps."
+    },
+    {
+      "id": "async",
+      "label": "Notifications",
+      "description": "Mark the cells that changed, so observers are run only for them."
+    }
+  ],
+  "quiz": [
+    {
+      "question": "A reader finds a secondary lock left by a crashed transaction. How does it decide whether to roll back or roll forward?",
+      "options": [
+        "By checking the lock's age alone",
+        "By asking the timestamp oracle",
+        "By looking at the primary cell: a write record there means the transaction committed, a lock still there means it did not",
+        "By asking Chubby which transaction owns the lock"
+      ],
+      "answer": 2,
+      "explanation": "The commit point is the primary's write record, so the state of the primary decides the whole transaction's fate and cleanup is synchronized on it. Age alone cannot tell committed from uncommitted, and the oracle only gives out timestamps. Chubby tells only whether a worker is alive."
+    },
+    {
+      "question": "Why can Percolator reads avoid taking locks?",
+      "options": [
+        "Reads are always repeated until they succeed",
+        "Every timestamp names a consistent snapshot of the committed versions, so a read just looks up the newest write at or below its start timestamp",
+        "Reads go to a separate replica",
+        "Locks are never used"
+      ],
+      "answer": 1,
+      "explanation": "Snapshot isolation reads versions at the start timestamp, so concurrent writers do not change what the reader sees; the reader only has to deal with locks that might still commit below its timestamp. Reads are not repeated, there is no separate replica, and locks are used by writers."
+    },
+    {
+      "question": "The paper's indexing system moved from MapReduce to Percolator. What did it gain and what did it cost?",
+      "options": [
+        "Lower latency, by a factor of 100 per document, but roughly twice the resources for the same crawl rate",
+        "Lower resources and the same latency",
+        "Higher latency but fewer machines",
+        "Nothing changed except the code"
+      ],
+      "answer": 0,
+      "explanation": "The paper reports a factor of 100 reduction in document processing latency and nearly 50 percent younger documents in results, with about twice the resources for the same crawl rate. It also let the collection grow three times. It did not cut resources, and latency did not increase."
+    }
+  ],
+  "sources": [
+    {
+      "title": "Large-scale Incremental Processing Using Distributed Transactions and Notifications",
+      "publisher": "Google Research (OSDI 2010)",
+      "year": 2010,
+      "url": "https://research.google/pubs/large-scale-incremental-processing-using-distributed-transactions-and-notifications/"
+    }
+  ]
+}

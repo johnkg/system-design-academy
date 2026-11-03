@@ -1,0 +1,96 @@
+---
+import PlaygroundShell from '../../components/PlaygroundShell.astro';
+import RangeField from '../../components/RangeField.astro';
+---
+<PlaygroundShell title="One user floods the API" hint="One user sends a flood of requests while honest traffic continues. Choose which limiters are on and what happens when the limiter's store fails, and see how many honest and critical requests are served. A simple model, not Stripe's code or data.">
+  <ol class="how">
+    <li>Press <b>Reset</b>. With <b>No limiters</b>, a heavy attack and <b>No outage</b>, only <b>51.9%</b> of honest and of critical requests are served, <b>100%</b> of the attack gets in, and critical requests are under 90% served for <b>40</b> of the 60 seconds.</li>
+    <li>Set <b>Protection</b> to <b>Request rate limiter only</b>: <b>100%</b> of honest and critical requests are served, only <b>1.7%</b> of the flood gets in, and there are <b>0</b> bad seconds.</li>
+    <li>Set <b>Protection</b> to <b>Rate limiter, concurrency cap and fleet load shedder</b> and <b>Limiter store (Redis) outage</b> to <b>Outage for 20 s, limiters fail open</b>: the attack gets through during the outage (<b>50.8%</b> let in), only <b>75.9%</b> of critical traffic is served, and <b>20</b> bad seconds pass. The API stays up.</li>
+    <li>Set <b>Limiter store (Redis) outage</b> to <b>Outage for 20 s, limiters fail closed</b>: the limiter refuses everything during the outage, so only <b>66.7%</b> of critical traffic is served and <b>20</b> bad seconds pass, even though only <b>0.8%</b> of the attack got in.</li>
+  </ol>
+  <div class="pg brk" data-brk>
+    <div class="pg-row">
+      <label>Protection <select class="pg-in" data-design><option value="none">No limiters</option><option value="rate">Request rate limiter only</option><option value="full">Rate limiter, concurrency cap and fleet load shedder</option></select></label>
+      <RangeField label="Hostile volume (per s)" name="ab" min="0" max="5000" step="100" value="3000" />
+      <label>Limiter store (Redis) outage <select class="pg-in" data-store><option value="up">No outage</option><option value="open">Outage for 20 s, limiters fail open</option><option value="closed">Outage for 20 s, limiters fail closed</option></select></label>
+      <button type="button" class="btn" data-reset>Reset</button>
+    </div>
+    <div class="pg-grid">
+      <div class="pg-box" data-b1><h3>Honest requests served</h3><span class="pg-mono" data-o1></span><span class="pg-note" data-n1></span></div>
+      <div class="pg-box" data-b2><h3>Critical requests served</h3><span class="pg-mono" data-o2></span><span class="pg-note" data-n2></span></div>
+      <div class="pg-box" data-b3><h3>Flood requests let in</h3><span class="pg-mono" data-o3></span><span class="pg-note" data-n3></span></div>
+      <div class="pg-box" data-b4><h3>Seconds when under 90% of critical requests were served</h3><span class="pg-mono" data-o4></span><span class="pg-note" data-n4></span></div>
+    </div>
+    <p class="pg-out" data-verdict aria-live="polite"></p>
+    <p class="pg-note">Model, invented for teaching and not Stripe data (the post gives no real limits): the fleet can serve 1,000 requests per second. Honest users send 600 per second, of which 180 are critical (like creating a charge) and 420 are not (like listing charges). One user floods the API from second 10 to 50. With a rate limiter that user is held to a refill rate of 50 per second. When the fleet is overloaded and there is no load shedder, every request is served with the same chance. With the load shedder, critical requests are served first and the rest may use only 80% of the fleet. A Redis outage from second 20 to 40 turns off both limiters if they fail open, or refuses everything if they fail closed.</p>
+  </div>
+</PlaygroundShell>
+<script>
+  import { query, formatWholeNumber, mulberry32 } from '../../playground';
+  document.querySelectorAll<HTMLElement>('[data-brk]').forEach((root) => {
+    const q = query(root);
+    const DEFAULTS: Record<string, string> = {"design": "none", "ab": "3000", "store": "up"};
+    const input = (k: string) => q<HTMLInputElement>(`[data-${k}]`);
+    const select = (k: string) => q<HTMLSelectElement>(`[data-${k}]`);
+    const whole = formatWholeNumber;
+    const one = (n: number) => (Math.round(n * 10) / 10).toLocaleString('en-US');
+
+    function draw() {
+      const design = select('design').value;
+      const store = select('store').value;
+      const ab = Number(input('ab').value);
+      q('[data-abval]').textContent = String(ab);
+      const boxes: { big: string; note: string; bad: boolean }[] = [];
+      let verdict = '';
+      let failed = false;
+      const SECONDS = 60, CAP = 1000, CRIT = 180, NONCRIT = 420, REFILL = 50, FLOOD_FROM = 10, FLOOD_TO = 50, OUT_FROM = 20, OUT_TO = 40;
+      let honestServed = 0, critServed = 0, floodIn = 0, floodTotal = 0, bad = 0;
+      for (let t = 0; t < SECONDS; t++) {
+        const flood = t >= FLOOD_FROM && t < FLOOD_TO ? ab : 0;
+        floodTotal += flood;
+        const down = store !== 'up' && t >= OUT_FROM && t < OUT_TO;
+        const limiting = design !== 'none' && !down;
+        if (design !== 'none' && down && store === 'closed') { bad++; continue; } // every request is refused
+        const admitted = limiting ? Math.min(flood, REFILL) : flood;
+        floodIn += admitted;
+        let c: number, n: number;
+        if (design === 'full' && limiting) { // critical requests go first; others may use only 80% of the fleet
+          c = Math.min(CRIT, CAP);
+          const nonTotal = NONCRIT + admitted;
+          const nonServed = Math.min(nonTotal, CAP * 0.8, CAP - c);
+          n = (nonServed * NONCRIT) / nonTotal;
+        } else {
+          const frac = Math.min(1, CAP / (CRIT + NONCRIT + admitted));
+          c = CRIT * frac; n = NONCRIT * frac;
+        }
+        honestServed += c + n; critServed += c;
+        if (c < 0.9 * CRIT) bad++;
+      }
+      const honestPct = (100 * honestServed) / ((CRIT + NONCRIT) * SECONDS); const critPct = (100 * critServed) / (CRIT * SECONDS);
+      boxes.push({ big: `${one(honestPct)}%`, note: 'of the 600 honest requests per second', bad: honestPct < 99 });
+      boxes.push({ big: `${one(critPct)}%`, note: 'of the 180 critical requests per second', bad: critPct < 99 });
+      boxes.push({ big: floodTotal > 0 ? `${one((100 * floodIn) / floodTotal)}%` : 'none sent', note: floodTotal > 0 ? 'the flood runs from second 10 to 50' : 'set a flood to see the effect', bad: false });
+      boxes.push({ big: whole(bad), note: 'out of 60', bad: bad > 0 });
+      failed = honestPct < 99 || critPct < 99;
+      if (!failed) verdict = 'Nothing broke: honest traffic, critical traffic included, was served almost entirely.';
+      else if (store === 'closed' && design !== 'none') verdict = `Failing closed made the limiter itself cause an outage: for 20 seconds every request was refused, honest ones included. Stripe's post says to fail open.`;
+      else if (store === 'open' && design !== 'none') verdict = `While the store was down the limiters failed open, so the flood got through and ${one(100 - critPct)}% of critical requests were lost. The API stayed up, which the post prefers to being down.`;
+      else if (design === 'none') verdict = `With no limits the flood used capacity that honest users needed: only ${one(critPct)}% of critical requests were served.`;
+      else verdict = `Honest requests are suffering: ${one(100 - honestPct)}% were not served.`;
+      boxes.forEach((b, i) => {
+        q(`[data-o${i + 1}]`).textContent = b.big;
+        q(`[data-n${i + 1}]`).textContent = b.note;
+        q<HTMLElement>(`[data-b${i + 1}]`).style.setProperty('--c', b.bad ? 'var(--bad)' : 'var(--good)');
+      });
+      const out = q('[data-verdict]'); out.classList.toggle('bad', failed); out.textContent = verdict;
+    }
+    root.addEventListener('input', draw);
+    root.addEventListener('change', draw);
+    q('[data-reset]').addEventListener('click', () => {
+      Object.entries(DEFAULTS).forEach(([k, v]) => { (root.querySelector<HTMLInputElement | HTMLSelectElement>(`[data-${k}]`)!).value = v; });
+      draw();
+    });
+    draw();
+  });
+</script>

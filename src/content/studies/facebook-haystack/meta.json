@@ -1,0 +1,390 @@
+{
+  "name": "How Facebook Built Haystack for Photos",
+  "difficulty": "intermediate",
+  "intent": "Follow what Facebook says in its 2009 engineering post about Haystack, its photo store: why a file per photo on NFS needed several disk reads per photo, and how packing photos into large append-only files with an in-memory index aimed at a minimal number of disk operations per read, using only what the post says.",
+  "codeTitle": "needles in an append-only store file with an in-memory index",
+  "finalIntro": "One photo being uploaded, read, deleted and compacted.",
+  "prompt": "In its April 2009 post 'Needle in a haystack: efficient storage of billions of photos', Facebook says users had uploaded over 15 billion photos, which with four stored sizes of each came to 60 billion images and 1.5 petabytes. The site was adding 220 million photos a week, about 25 terabytes, and served a peak of 550,000 images per second. Photos were kept on NFS storage, one file for each image, and the post says the file system metadata alone, directories and inodes, was far larger than the storage tier could cache, so serving one photo needed several disk operations. How would you store and serve photos at this scale so that a read costs as few disk operations as possible? This study follows what Facebook says in that post, which is listed at the end. The simulation and the code samples are small models for learning, not Facebook's code or data.",
+  "functional": [
+    "Store an uploaded photo in several sizes and give it an id",
+    "Serve any stored photo by its id and size quickly",
+    "Delete a photo",
+    "Survive restarts and disk problems without losing track of where photos are",
+    "Reclaim the space used by deleted photos"
+  ],
+  "nonFunctional": [
+    "Scale in the post: more than 15 billion photos, 60 billion images, 1.5 PB, 220 million new photos a week and a peak of 550,000 images served per second",
+    "Each read should need a minimal number of disk operations, and each should fetch only photo data and no file system metadata",
+    "Cheap, high capacity storage: the post's storage machines use SATA disks in RAID-6",
+    "Photos are written once and rarely changed, so the store can be append-only",
+    "Make requests that miss the CDN cheaper to serve, because the post says the old design leaned heavily on CDNs"
+  ],
+  "firstAttempt": {
+    "text": "This is the design the post describes. Each photo size is a file on an NFS storage tier. A photo serving tier reads files over NFS and sends them to a CDN, which keeps popular photos in its cache. Facebook added a cache tier called Cachr for small profile images and a cache of NFS file handles on the serving machines.",
+    "limits": [
+      "The post says each file had its own metadata, in directories and inodes, and that this metadata far exceeded what the NFS storage tier could cache",
+      "As a result a read or an upload needed multiple disk operations, because metadata often missed the cache before the photo data could be read",
+      "The serving machines were limited by this metadata overhead, which the post says is why Facebook relied so heavily on CDNs",
+      "Adding caches such as Cachr and the file handle cache helped only part of the load, mostly the popular photos"
+    ]
+  },
+  "nodes": [
+    {
+      "id": "user",
+      "label": "Browser",
+      "kind": "client",
+      "x": 8,
+      "y": 50
+    },
+    {
+      "id": "cdn",
+      "label": "CDN",
+      "kind": "edge",
+      "x": 30,
+      "y": 50
+    },
+    {
+      "id": "nfs",
+      "label": "NFS tier (a file per photo)",
+      "kind": "data",
+      "x": 80,
+      "y": 50,
+      "until": 1
+    },
+    {
+      "id": "photostore",
+      "label": "Haystack photo store",
+      "kind": "compute",
+      "x": 72,
+      "y": 16,
+      "at": 1
+    },
+    {
+      "id": "store",
+      "label": "Store file (needles)",
+      "kind": "data",
+      "x": 92,
+      "y": 50,
+      "at": 1
+    },
+    {
+      "id": "index",
+      "label": "In-memory index",
+      "kind": "data",
+      "x": 50,
+      "y": 16,
+      "at": 2
+    },
+    {
+      "id": "compact",
+      "label": "Compaction",
+      "kind": "async",
+      "x": 50,
+      "y": 84,
+      "at": 3
+    },
+    {
+      "id": "idxfile",
+      "label": "Index file",
+      "kind": "data",
+      "x": 72,
+      "y": 84,
+      "at": 4
+    }
+  ],
+  "edges": [
+    {
+      "from": "user",
+      "to": "cdn"
+    },
+    {
+      "from": "cdn",
+      "to": "nfs",
+      "until": 1
+    },
+    {
+      "from": "cdn",
+      "to": "photostore",
+      "at": 1
+    },
+    {
+      "from": "photostore",
+      "to": "store",
+      "at": 1
+    },
+    {
+      "from": "photostore",
+      "to": "index",
+      "at": 2
+    },
+    {
+      "from": "compact",
+      "to": "store",
+      "at": 3
+    },
+    {
+      "from": "photostore",
+      "to": "idxfile",
+      "at": 4
+    }
+  ],
+  "steps": [
+    {
+      "title": "Pack many photos into one large file",
+      "problem": "With a file for each photo, the number of files makes the metadata too big to cache, and every read pays for metadata lookups.",
+      "fix": "Haystack stores many photos in one large file, called a store file. Each photo inside it is a needle. A needle has a header, the photo's data and a footer, and it is identified by a tuple of offset, key, alternate key and cookie. The key is a 64-bit photo id given on upload, and the four sizes of one photo share the key and cookie and differ in the alternate key, which holds the size. The first 8 KB of the file is a superblock. The post also says the photo serving and photo storage tiers were merged into one, with the layers HTTP server, photo store, Haystack object store and the file system (XFS, an extent-based file system) above the disks.",
+      "tradeoff": "Needles are packed tightly and the file system has very little metadata to hold, since there are few big files. A photo can no longer be changed in place or found by file name, so something else must record where each needle is.",
+      "concepts": [
+        {
+          "slug": "database-indexing"
+        },
+        {
+          "slug": "lsm-trees-vs-b-trees"
+        }
+      ]
+    },
+    {
+      "title": "Keep the location of every needle in memory",
+      "problem": "Even in one big file, finding a needle by scanning or by reading an on-disk index would add disk operations to every read.",
+      "fix": "The photo store keeps in memory a mapping from photo id and size to the offset of its needle in the store file. A read looks up the offset in memory and then reads the needle from disk, so the disk operation fetches only photo data and no file system metadata. The post says this index uses Google's sparse hash structure, with about 2 bits of overhead per entry, and that each storage machine holds hundreds of millions of photos. The post says the design aims for a minimal number of disk operations to read a photo; this study's model counts one.",
+      "tradeoff": "Memory size limits how many photos a machine can hold, which is why the index is made as compact as possible. The old design needed several disk reads, the new one usually needs one.",
+      "concepts": [
+        {
+          "slug": "caching"
+        },
+        {
+          "slug": "probabilistic-data-structures"
+        },
+        {
+          "slug": "back-of-the-envelope-estimation"
+        }
+      ]
+    },
+    {
+      "title": "Only append, mark deletions with a flag and compact later",
+      "problem": "Rewriting data in the middle of a big file is slow and risky, and photos are written once and rarely changed.",
+      "fix": "Each Haystack store file is append-only: an upload appends needles at the end. A delete only sets a flag on the needle, and the index forgets it. The space is reclaimed later by compaction, an online process that copies the live needles into a new Haystack, leaving the deleted ones behind. The post calls it an online process.",
+      "tradeoff": "Writes are sequential and cheap, and a delete does not free space until compaction. That means the store files carry some dead space in the meantime.",
+      "concepts": [
+        {
+          "slug": "write-ahead-log"
+        },
+        {
+          "slug": "lsm-trees-vs-b-trees"
+        },
+        {
+          "slug": "online-schema-migrations"
+        }
+      ]
+    },
+    {
+      "title": "Keep an index file so a restart is quick",
+      "problem": "If the in-memory index is lost in a crash or restart, rebuilding it by scanning the whole store file would take a long time.",
+      "fix": "Each Haystack has an index file next to its store file, with the offset of each needle. The post says the index is usually less than 1% of the size of the store file, and that it can be rebuilt from the store file if it is lost. This study's reading, which the post does not detail, is that the photo store loads the index file when it starts instead of scanning the store file.",
+      "tradeoff": "A second file to keep in step with the first, and rebuilding from the store file is a fallback that is slow, though safe.",
+      "concepts": [
+        {
+          "slug": "write-ahead-log"
+        },
+        {
+          "slug": "backups-and-point-in-time-recovery"
+        }
+      ]
+    },
+    {
+      "title": "Build the storage machines for capacity and cheap redundancy",
+      "problem": "At 220 million photos a week, the storage must grow steadily with low cost per terabyte.",
+      "fix": "The post describes the storage machine as a 2U blade with twelve or more 1 TB SATA drives, about 10 TB usable per blade in RAID-6, with 16 to 32 GB of memory and 256 to 512 MB of NVRAM. RAID-6 tolerates two disk failures in a group. The memory holds the index, so a blade can serve its photos with few disk operations per read. This study's reading is that requests that miss the CDN, such as rarely viewed photos, become cheaper to serve from the origin.",
+      "tradeoff": "Cheap disks and RAID cost less than a more fault-tolerant layout, and a machine that fails takes its photos off line until it is repaired. The post does not describe replication across machines or data centers, so this study does not either.",
+      "concepts": [
+        {
+          "slug": "horizontal-vs-vertical-scaling"
+        },
+        {
+          "slug": "cdn"
+        },
+        {
+          "slug": "back-of-the-envelope-estimation"
+        }
+      ]
+    }
+  ],
+  "failures": [
+    {
+      "scenario": "The photo store restarts and its memory is empty",
+      "impact": "Without the index it does not know where any needle is.",
+      "answer": "It reads the index file next to the store file. If that file is lost, it can be rebuilt by scanning the store file, which is slower.",
+      "concepts": [
+        {
+          "slug": "write-ahead-log"
+        }
+      ]
+    },
+    {
+      "scenario": "A photo is deleted",
+      "impact": "Its needle is in the middle of a file that is only ever appended to.",
+      "answer": "The needle is flagged as deleted and removed from the in-memory index, so reads no longer find it. The space comes back at the next compaction.",
+      "concepts": [
+        {
+          "slug": "lsm-trees-vs-b-trees"
+        }
+      ]
+    },
+    {
+      "scenario": "Deleted and duplicate needles pile up in a store file",
+      "impact": "The files use more disk than the live photos need.",
+      "answer": "Compaction copies the live needles into a new store file while the machine keeps serving, then the old file is replaced.",
+      "concepts": [
+        {
+          "slug": "online-schema-migrations"
+        }
+      ]
+    },
+    {
+      "scenario": "A disk in the storage machine fails",
+      "impact": "Its data must still be readable.",
+      "answer": "The machine uses RAID-6, which survives two failed disks in the group. The post does not say more about handling a whole machine failing.",
+      "concepts": [
+        {
+          "slug": "database-replication"
+        },
+        {
+          "slug": "backups-and-point-in-time-recovery"
+        }
+      ]
+    },
+    {
+      "scenario": "A photo nobody has viewed for a long time is requested",
+      "impact": "It is not in the CDN, so the request goes to the origin, which used to need several disk operations.",
+      "answer": "The origin finds the offset in memory and reads the needle with a minimal number of disk operations, so rarely viewed photos are cheaper to serve.",
+      "concepts": [
+        {
+          "slug": "cdn"
+        },
+        {
+          "slug": "caching"
+        }
+      ]
+    }
+  ],
+  "alternatives": [
+    {
+      "title": "How to store photos",
+      "options": [
+        {
+          "name": "A file per photo on NFS",
+          "pro": "Simple, with ordinary tools",
+          "con": "The post says its metadata far exceeded what the storage tier could cache, and reads needed multiple disk operations"
+        },
+        {
+          "name": "Many photos in large append-only files",
+          "pro": "Very little file system metadata and a minimal number of disk operations per read",
+          "con": "Needs its own index, delete and compaction logic"
+        }
+      ],
+      "pick": "Large append-only store files, as Facebook did."
+    },
+    {
+      "title": "Where to keep the index",
+      "options": [
+        {
+          "name": "On disk",
+          "pro": "Not limited by memory",
+          "con": "Each read pays at least one more disk operation"
+        },
+        {
+          "name": "In memory, with a file to reload it",
+          "pro": "Minimal disk operations to read, and a way to reload it",
+          "con": "Memory limits the photos per machine, so the index must be small"
+        }
+      ],
+      "pick": "In memory with an index file, as the post describes."
+    },
+    {
+      "title": "How to free space",
+      "options": [
+        {
+          "name": "Rewrite files in place",
+          "pro": "Space comes back at once",
+          "con": "Random writes into a big file, and risk to live data"
+        },
+        {
+          "name": "Flag deletes and compact online",
+          "pro": "Writes stay sequential and the machine keeps serving",
+          "con": "Dead space remains until compaction runs"
+        }
+      ],
+      "pick": "Flag, then compact."
+    }
+  ],
+  "roles": [
+    {
+      "id": "client",
+      "label": "Browser",
+      "description": "Asks for a photo by URL, which carries the photo id and the size."
+    },
+    {
+      "id": "edge",
+      "label": "CDN",
+      "description": "Caches popular photos and sends the rest to Haystack."
+    },
+    {
+      "id": "compute",
+      "label": "Photo store",
+      "description": "Looks up the offset in memory and reads the needle."
+    },
+    {
+      "id": "data",
+      "label": "Store and index files",
+      "description": "The append-only store file of needles and the small index file beside it."
+    },
+    {
+      "id": "async",
+      "label": "Compaction",
+      "description": "Online process that copies live needles into a fresh store file."
+    }
+  ],
+  "quiz": [
+    {
+      "question": "Why does a Haystack read need so few disk operations?",
+      "options": [
+        "The photo store keeps every photo in memory",
+        "The CDN always has the photo",
+        "The in-memory index gives the needle's offset, so the disk read fetches only photo data",
+        "The photo is split into pieces that are read in parallel"
+      ],
+      "answer": 2,
+      "explanation": "The index is small, about 2 bits of overhead per entry in Google's sparse hash, so it fits in memory, and the offset it returns means the disk read goes straight to the needle without file system metadata lookups. Keeping every photo in memory is impossible at 1.5 PB. A CDN does not always hold seldom-viewed photos. Reading in parallel is not what the post describes."
+    },
+    {
+      "question": "What happens when a photo is deleted in Haystack?",
+      "options": [
+        "The needle's bytes are erased in place",
+        "The store file is rewritten without it at once",
+        "The needle is flagged as deleted and dropped from the index; compaction later reclaims the space",
+        "The photo is moved to a trash file"
+      ],
+      "answer": 2,
+      "explanation": "Store files are append-only, so a delete sets a flag and the index forgets the needle. Online compaction later copies only the live needles into a new file. Erasing in place and immediate rewrites would break the append-only design and cost random writes. The post describes no trash file."
+    },
+    {
+      "question": "The photo store crashes and loses its in-memory index. How is it rebuilt quickly?",
+      "options": [
+        "By reading the index file kept beside the store file",
+        "By asking the CDN for all the photo ids",
+        "By scanning every file on the NFS tier",
+        "It cannot be rebuilt"
+      ],
+      "answer": 0,
+      "explanation": "The index file holds the offsets and is usually under 1% of the store file's size, so it loads fast. If it is lost it can be rebuilt by scanning the store file, which is slower but possible. A CDN does not know offsets. Haystack no longer uses the NFS tier. Saying it cannot be rebuilt is wrong, because the store file has all the data."
+    }
+  ],
+  "sources": [
+    {
+      "title": "Needle in a haystack: efficient storage of billions of photos",
+      "publisher": "Meta Engineering (Facebook)",
+      "year": 2009,
+      "url": "https://engineering.fb.com/2009/04/30/core-infra/needle-in-a-haystack-efficient-storage-of-billions-of-photos/"
+    }
+  ]
+}
