@@ -7,6 +7,7 @@
 // cannot reproduce: the list may be out of date, or the step may rely on a click the script does not make.
 //
 // When a step's numbers never show, the script follows the steps up to it on a fresh page and presses the buttons it names.
+// If a number is still missing, a last phase tries RANDOM_STATES random settings of every control, pressing buttons now and then.
 // Some claims still cannot be reproduced (a sequence of clicks, a unit conversion, a figure the author derived by hand).
 // Those are kept in scripts/walkthrough-baseline.json, so the check fails only for a NEW unverified number. Edit a how list so a
 // number changes and the check asks you to look at it: fix the text, or run with --update to accept it on purpose.
@@ -50,6 +51,9 @@ const APPROX_TOLERANCE = 0.05; // "about 300" may match 290 to 315
 const APPROX_WORDS = /(about|around|roughly|nearly|almost|over|under|above|below|up to|at least|at most|more than|less than|~)\s*$/i;
 const MIN_LABEL_WORD = 4; // a step names a control when it uses the label or any word of it this long
 const SEED = 20261024;
+const RANDOM_STATES = 150; // random settings of every control tried for a simulation whose numbers are still missing
+const RANDOM_PRESS_EVERY = 5; // after every this many random states, press the first buttons
+const RANDOM_BUTTONS = 6; // how many buttons that press covers
 const PRESSES = 6; // times each named button is pressed, with a look after each press ("press Send 3 times")
 
 const port = PORT_BASE + Math.floor(Math.random() * PORT_SPREAD);
@@ -82,7 +86,7 @@ const wanted = shard.pick(pages.filter((p) => p.includes(only)));
 // Runs inside the page: drives one simulation and returns its "how" steps and every number it showed.
 // mode 'explore' tries the controls; 'step' applies the settings of steps 0..step and then presses the buttons that step names
 // (Run, Send, Publish...); 'buttons' presses every button from the defaults. Each press is followed by a look at the numbers.
-async function drive({ index, settle, settleLooks, maxStates, minLabelWord, mode = 'explore', step = 0, presses = 0 }) {
+async function drive({ index, settle, settleLooks, maxStates, minLabelWord, mode = 'explore', step = 0, presses = 0, randomStates = 0, randomPressEvery = 1, randomButtons = 0 }) {
   const section = document.querySelectorAll('section.playground')[index];
   const steps = [...section.querySelectorAll('ol.how > li')].map((li) => li.textContent.replace(/\s+/g, ' ').trim());
   const wait = (ms) => new Promise((r) => setTimeout(r, ms));
@@ -149,6 +153,25 @@ async function drive({ index, settle, settleLooks, maxStates, minLabelWord, mode
   };
 
   snapshot();
+  if (mode === 'random') {
+    let r = 12345; // a small seeded generator, so every run tries the same settings
+    const rnd = () => { r = (r * 1664525 + 1013904223) >>> 0; return r / 4294967296; };
+    for (let n = 0; n < randomStates; n++) {
+      const settings = controls.map((c) => {
+        if (c.kind === 'select') return [c, c.el.options[Math.floor(rnd() * c.el.options.length)].value];
+        if (c.kind === 'range' || c.kind === 'number') {
+          const min = Number(c.el.min || 0), max = Number(c.el.max || 100), step = Number(c.el.step || 1) || 1;
+          return [c, min + Math.round((rnd() * (max - min)) / step) * step];
+        }
+        return [c, rnd() < 0.5];
+      });
+      settings.forEach(([c, v]) => put(c, v));
+      await stable();
+      snapshot();
+      if (n % randomPressEvery === 0) await press(buttons.slice(0, randomButtons));
+    }
+    return { steps, numbers: [...seen] };
+  }
   if (mode === 'buttons') {
     await press(buttons);
     return { steps, numbers: [...seen] };
@@ -235,7 +258,7 @@ async function check(path, context) {
   }, SEED);
   await page.goto(origin + base + path, { waitUntil: 'load' });
   const count = await page.$$eval('section.playground', (s) => s.map((x) => !!x.querySelector('ol.how')));
-  const opts = { settle: SETTLE_MS, settleLooks: SETTLE_LOOKS, maxStates: MAX_STATES, minLabelWord: MIN_LABEL_WORD, presses: PRESSES };
+  const opts = { settle: SETTLE_MS, settleLooks: SETTLE_LOOKS, maxStates: MAX_STATES, minLabelWord: MIN_LABEL_WORD, presses: PRESSES, randomStates: RANDOM_STATES, randomPressEvery: RANDOM_PRESS_EVERY, randomButtons: RANDOM_BUTTONS };
   const fresh = async () => page.goto(origin + base + path, { waitUntil: 'load' });
   let loaded = true;
   for (let i = 0; i < count.length; i++) {
@@ -254,6 +277,11 @@ async function check(path, context) {
     if (open().length) {
       await fresh();
       (await page.evaluate(drive, { ...opts, index: i, mode: 'buttons' })).numbers.forEach((n) => seen.add(n));
+    }
+    // Still missing: try random settings of every control, pressing buttons now and then.
+    if (open().length) {
+      await fresh();
+      (await page.evaluate(drive, { ...opts, index: i, mode: 'random', presses: 3 })).numbers.forEach((n) => seen.add(n));
     }
     results.push({ key: `${path}#${i}`, steps: out.steps, numbers: [...seen] });
   }
