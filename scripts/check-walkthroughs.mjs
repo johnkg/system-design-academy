@@ -106,7 +106,11 @@ async function drive({ index, settle, settleLooks, maxStates, minLabelWord, mode
     copy.querySelectorAll('ol.how, header, script, style').forEach((e) => e.remove());
     const live = [...section.querySelectorAll('input, select')].map((e) => (e.tagName === 'SELECT' ? e.selectedOptions[0]?.textContent : e.value)).join(' ');
     const aria = [...copy.querySelectorAll('[aria-label], [title]')].map((e) => `${e.getAttribute('aria-label') ?? ''} ${e.getAttribute('title') ?? ''}`).join(' ');
-    numbersIn(`${copy.textContent} ${live} ${aria}`).forEach((n) => seen.add(n));
+    // Neighbouring elements run together in textContent ("783 of 3,100" next to "25.3%" reads as "3,10025.3"), so read the text a second time with a space between text nodes.
+    const walker = document.createTreeWalker(copy, NodeFilter.SHOW_TEXT);
+    const pieces = [];
+    while (walker.nextNode()) pieces.push(walker.currentNode.textContent);
+    numbersIn(`${copy.textContent} ${pieces.join(' ')} ${live} ${aria}`).forEach((n) => seen.add(n));
   };
   const fire = (el) => { el.dispatchEvent(new Event('input', { bubbles: true })); el.dispatchEvent(new Event('change', { bubbles: true })); };
   const put = (c, value) => {
