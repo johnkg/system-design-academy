@@ -7,8 +7,14 @@
 // cannot reproduce: the list may be out of date, or the step may rely on a click the script does not make.
 //
 // When a step's numbers never show, the script follows the steps up to it on a fresh page and presses the buttons it names.
+// Then it reads the step as an ordered script, the way a reader follows it: "Press Reset, then set the rate to 400 thousand
+// and the lag to 500 ms" becomes press Reset, set one slider, set another, with a look at the numbers after each action.
+// Buttons are pressed by label, options chosen by their text, sliders and selects set to the number written after their label,
+// text boxes typed into, boxes ticked. Only the part of a sentence before its colon is read as instructions (what follows is the
+// result). A number the step tells the reader to type counts as shown once typed, since the control then displays it.
 // If a number is still missing, a last phase tries RANDOM_STATES random settings of every control, pressing buttons now and then.
-// Some claims still cannot be reproduced (a sequence of clicks, a unit conversion, a figure the author derived by hand).
+// Some claims still cannot be reproduced (a unit conversion, a figure the author derived by hand, a parameter inside the model).
+// --scripts prints each step as the script it is replayed as, and every claim that counts as shown because a script typed it.
 // Those are kept in scripts/walkthrough-baseline.json, so the check fails only for a NEW unverified number. Edit a how list so a
 // number changes and the check asks you to look at it: fix the text, or run with --update to accept it on purpose.
 //
@@ -121,7 +127,10 @@ async function drive({ index, settle, settleLooks, maxStates, minLabelWord, mode
     } catch { /* a control that throws is reported by check:pages, not here */ }
   };
   // Wait until the simulation has stopped redrawing: its text is the same on two looks in a row. A fixed pause is too short on a busy machine.
+  // Most simulations redraw in requestAnimationFrame, which a busy machine can hold back past the first look: wait for two frames first.
+  const frames = () => Promise.race([new Promise((r) => requestAnimationFrame(() => requestAnimationFrame(r))), wait(500)]); // a page whose frames never come still goes on
   const stable = async () => {
+    await frames();
     let last = '';
     for (let i = 0; i < settleLooks; i++) {
       await wait(settle);
@@ -166,6 +175,7 @@ async function drive({ index, settle, settleLooks, maxStates, minLabelWord, mode
   // a list of such actions from a fresh page and looks at the numbers after each one.
   const norm = (s) => (s || '').toLowerCase().replace(/[“”"]/g, '').replace(/[‘’]/g, "'").replace(/\s+/g, ' ').trim();
   const NUM = String.raw`\d[\d,]*(?:\.\d+)?`;
+  const UNIT = String.raw`(%|(?:ms|s|secs?|seconds?|mins?|minutes?|h|hours?|days?|km|kb|mb|gb|tb|gbps|mbps|x|thousands?|millions?)(?![a-z]))?`;
   const toNum = (s) => Number(s.replace(/,/g, ''));
   const STOP = new Set(['that', 'this', 'with', 'from', 'when', 'what', 'than', 'then', 'only', 'each', 'into', 'over', 'under', 'after', 'before', 'first', 'every', 'other', 'still', 'there', 'their', 'which', 'where', 'while', 'never', 'always', 'without', 'more', 'less', 'most', 'some', 'have', 'been', 'were', 'they', 'also', 'same', 'once', 'none', 'both', 'second', 'seconds', 'minute', 'minutes', 'hours', 'percent', 'times', 'million', 'thousand']);
   const edge = (s, at, len) => !/[a-z0-9]/.test(s[at - 1] ?? '') && !/[a-z0-9]/.test(s[at + len] ?? '');
@@ -294,7 +304,7 @@ async function drive({ index, settle, settleLooks, maxStates, minLabelWord, mode
           const o = c.options.filter(len).sort((x, y) => len(y) - len(x))[0];
           if (o) { take(vAt, vAt + len(o)); found.push({ at, end, act: { type: 'set', c: ci, value: o.value } }); continue; }
         }
-        const n = rest.match(new RegExp(`^\\$?(${NUM})(?![\\d])\\s*(%|[a-z]+)?`));
+        const n = rest.match(new RegExp(`^\\$?(${NUM})(?![\\d]|:\\d)\\s*${UNIT}`)); // not a clock time such as 14:00
         // Only with a word that sets it ("limit to 400", "batch every 1 minute"): "scores 66" quotes a result.
         if (n && free(vAt) && gap[1] && gap[1] !== 'on') {
           const v = toNum(n[1].replace(/,$/, ''));
@@ -304,13 +314,15 @@ async function drive({ index, settle, settleLooks, maxStates, minLabelWord, mode
         }
         // A number written just before the label: "12 agents", "a 10 s wait", "20 per second".
         // Not when the label is followed by what happens to them ("0 connections break", "40 healthy ones are dropped").
-        const before = s.slice(0, at).match(new RegExp(`\\$?(${NUM})\\s*(%|[a-z]{1,3})?\\s+(?:per\\s+)?$`));
+        // Nor after "from", "in", "of"...: "drops from 400 to 300 requests", "104 hits in 200 requests" quote results.
+        const before = s.slice(0, at).match(new RegExp(`(^|[^a-z0-9$.,]\\s*|\\b[a-z]+\\s+)\\$?(${NUM})\\s*${UNIT}\\s+(?:per\\s+)?$`));
+        if (before && /^(to|from|in|of|than|by|about|around|nearly|over|under|only|all|and)\s+$/.test(before[1])) continue;
         const next = s.slice(restAt).match(/^\s*(?:\([^)]*\)\s*)?([a-z']+)?/)[1] ?? '';
-        if (before && free(at - before[0].length) && !RESULT.test(next)) {
-          const v = toNum(before[1].replace(/,$/, ''));
-          const bAt = at - before[0].length;
+        if (before && free(at - before[0].length + before[1].length) && !RESULT.test(next)) {
+          const v = toNum(before[2].replace(/,$/, ''));
+          const bAt = at - before[0].length + before[1].length;
           if (numeric(c) && fits(c, v)) { take(bAt, at); found.push({ at: bAt, end, act: { type: 'set', c: ci, value: v } }); continue; }
-          const o = c.kind === 'select' && numberOption(c, v, before[2]);
+          const o = c.kind === 'select' && numberOption(c, v, before[3]);
           if (o) { take(bAt, at); found.push({ at: bAt, end, act: { type: 'set', c: ci, value: o.value } }); }
         }
       }
@@ -319,13 +331,14 @@ async function drive({ index, settle, settleLooks, maxStates, minLabelWord, mode
       // A number no label claimed: "to 500 ms" or "at 8 km" sets the one slider measured in that unit; "Lower the threshold
       // to 3" sets the slider the step last named, or the only slider there is; so does "At 75" at the start of a clause.
       const sliders = all.map((c, ci) => ({ c, ci })).filter(({ c }) => numeric(c));
-      for (const m of s.matchAll(new RegExp(`(?:^|\\b)(to|at) \\$?(${NUM})(?![\\d])\\s*(%|[a-z]+)?`, 'g'))) {
+      for (const m of s.matchAll(new RegExp(`(?:^|\\b)(to|at) \\$?(${NUM})(?![\\d]|:\\d)\\s*${UNIT}`, 'g'))) {
         const vAt = m.index + m[0].indexOf(m[2]);
         if (!free(vAt) || APPROX.test(s.slice(Math.max(0, m.index - 14), m.index + m[1].length))) continue;
         const v = toNum(m[2].replace(/,$/, ''));
         let pick = null;
         const byUnit = sliders.filter(({ c }) => unitMatch(m[3], c.units) && fits(c, v));
         if (byUnit.length === 1) pick = byUnit[0];
+        else if (m[3] && !sliders.some(({ c }) => unitMatch(m[3], c.units))) continue; // "At 25%" with no slider in % is a result
         else if ((m[1] === 'to' && VERB_TO.test(s.slice(0, m.index))) || (m[1] === 'at' && m.index === 0)) {
           const last = found.filter((f) => f.at < m.index && (f.act.type === 'mention' || f.act.type === 'set') && numeric(all[f.act.c]) && fits(all[f.act.c], v)).sort((x, y) => y.at - x.at)[0];
           const fitting = sliders.filter(({ c }) => fits(c, v));
@@ -373,7 +386,12 @@ async function drive({ index, settle, settleLooks, maxStates, minLabelWord, mode
       return sentences.map((acts) => acts.filter((a) => a.type !== 'mention').filter((a, i, list) => !(i && JSON.stringify(a) === JSON.stringify(list[i - 1]))));
     });
   };
-  if (mode === 'parse') return { steps, parsed: parseSteps() };
+  if (mode === 'parse') {
+    const parsed = parseSteps();
+    // Numbers the scripts type into a slider or box, so a claim of the same number counts as shown: listed by --scripts for review.
+    const typed = parsed.flatMap((sentences, k) => sentences.flat().filter((a) => a.type === 'set' && (numeric(all[a.c]) || all[a.c].kind === 'text')).map((a) => ({ step: k, value: a.value, label: all[a.c].label })));
+    return { steps, parsed, typed };
+  }
   if (mode === 'script') {
     const touched = new Set(script.filter((a) => a.type === 'set').map((a) => a.c));
     snapshot();
@@ -557,6 +575,11 @@ async function check(path, context) {
       (await page.evaluate(drive, { ...opts, index: i, mode: 'step', step: k })).numbers.forEach((n) => seen.add(n));
     }
     // Still missing: replay the steps as ordered scripts (see 'parse' in drive), each from a fresh page.
+    if (scripts) {
+      await fresh();
+      const { typed } = await page.evaluate(drive, { ...opts, index: i, mode: 'parse' });
+      for (const t of typed) for (const c of claims(out.steps[t.step])) if (c.value === Number(t.value)) console.log(`  typed claim: ${path}#${i} step ${t.step + 1}: ${c.raw} into "${t.label}"`);
+    }
     if (open().length) await replay(page, fresh, opts, i, seen, open);
     if (open().length) {
       await fresh();
