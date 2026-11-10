@@ -306,9 +306,12 @@ async function drive({ index, settle, settleLooks, maxStates, minLabelWord, mode
           continue;
         }
         if (c.kind === 'select') {
-          const len = (x) => (rest.startsWith(x.full) && edge(rest, 0, x.full.length) ? x.full.length : x.head.length >= 2 && rest.startsWith(x.head) && edge(rest, 0, x.head.length) ? x.head.length : 0);
-          const o = c.options.filter(len).sort((x, y) => len(y) - len(x))[0];
-          if (o) { take(vAt, vAt + len(o)); found.push({ at, end, act: { type: 'set', c: ci, value: o.value } }); continue; }
+          // The option right after the label and its "to", or right after the label when the option itself starts with "on".
+          const lenIn = (r) => (x) => (r.startsWith(x.full) && edge(r, 0, x.full.length) ? x.full.length : x.head.length >= 2 && r.startsWith(x.head) && edge(r, 0, x.head.length) ? x.head.length : 0);
+          const bare = s.slice(restAt).match(/^\s*/)[0].length + restAt;
+          let o = null, oAt = vAt, best = 0;
+          for (const [r, rAt] of [[rest, vAt], [s.slice(bare), bare]]) for (const x of c.options) if (lenIn(r)(x) > best) { best = lenIn(r)(x); o = x; oAt = rAt; }
+          if (o) { take(oAt, oAt + best); found.push({ at, end, act: { type: 'set', c: ci, value: o.value } }); continue; }
         }
         const n = rest.match(new RegExp(`^\\$?(${NUM})(?![\\d]|:\\d)\\s*${UNIT}`)); // not a clock time such as 14:00
         // Only with a word that sets it ("limit to 400", "batch every 1 minute"): "scores 66" quotes a result.
@@ -322,7 +325,7 @@ async function drive({ index, settle, settleLooks, maxStates, minLabelWord, mode
         // Not when the label is followed by what happens to them ("0 connections break", "40 healthy ones are dropped").
         // Nor after "from", "in", "of"...: "drops from 400 to 300 requests", "104 hits in 200 requests" quote results.
         const before = s.slice(0, at).match(new RegExp(`(^|[^a-z0-9$.,]\\s*|\\b[a-z]+\\s+)\\$?(${NUM})\\s*${UNIT}\\s+(?:per\\s+)?$`));
-        if (before && /^(to|from|in|of|than|by|about|around|nearly|over|under|only|all|and)\s+$/.test(before[1])) continue;
+        if (before && (/^(from|in|of|than|by|about|around|nearly|over|under|only|all|and)\s+$/.test(before[1]) || (/^to\s+$/.test(before[1]) && /\d%?\s*$/.test(s.slice(0, at - before[0].length))))) continue;
         const next = s.slice(restAt).match(/^\s*(?:\([^)]*\)\s*)?([a-z']+)?/)[1] ?? '';
         if (before && free(at - before[0].length + before[1].length) && !RESULT.test(next)) {
           const v = toNum(before[2].replace(/,$/, ''));
@@ -601,7 +604,8 @@ async function check(path, context) {
   await page.close();
 }
 
-const browser = await playwright.chromium.launch({ executablePath: process.env.CHROMIUM_PATH || undefined });
+// Pages checked side by side must all keep drawing: no throttling of timers or frames in a page that is not in front.
+const browser = await playwright.chromium.launch({ executablePath: process.env.CHROMIUM_PATH || undefined, args: ['--disable-background-timer-throttling', '--disable-renderer-backgrounding', '--disable-backgrounding-occluded-windows'] });
 const context = await browser.newContext({ reducedMotion: 'reduce', viewport: { width: 1280, height: 900 } });
 const queue = [...wanted];
 await Promise.all(Array.from({ length: PARALLEL }, async () => {
