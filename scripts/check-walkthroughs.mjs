@@ -22,6 +22,7 @@
 // Needs Playwright with a Chromium browser, like check:pages. Random numbers are seeded and animation is reduced, so a run is repeatable.
 import { createRequire } from 'node:module';
 import { spawn } from 'node:child_process';
+import { createServer } from 'node:net';
 import { existsSync, readdirSync, readFileSync, writeFileSync, statSync } from 'node:fs';
 import { join, relative } from 'node:path';
 import { parseShard } from './shard.mjs';
@@ -63,7 +64,11 @@ const RANDOM_PRESS_EVERY = 5; // after every this many random states, press the 
 const RANDOM_BUTTONS = 6; // how many buttons that press covers
 const PRESSES = 6; // times each named button is pressed, with a look after each press ("press Send 3 times")
 
-const port = PORT_BASE + Math.floor(Math.random() * PORT_SPREAD);
+// A port nobody listens on: another checkout's preview server on the same port would be checked in place of this build.
+const freePort = (p) => new Promise((resolve) => { const s = createServer().once('error', () => resolve(false)).listen(p, '127.0.0.1', () => s.close(() => resolve(true))); });
+let port = 0;
+for (let i = 0; i < PORT_SPREAD && !port; i++) { const p = PORT_BASE + Math.floor(Math.random() * PORT_SPREAD); if (await freePort(p)) port = p; }
+if (!port) { console.error('No free port for the preview server.'); process.exit(2); }
 const origin = `http://127.0.0.1:${port}`;
 const preview = spawn('npx', ['astro', 'preview', '--port', String(port), '--host', '127.0.0.1'], { cwd: root, stdio: 'ignore' });
 const stop = () => { try { preview.kill('SIGTERM'); } catch { /* already gone */ } };
@@ -73,6 +78,7 @@ const base = (() => { try { return new URL(process.env.BASE ? `http://x${process
 {
   let up = false;
   for (let i = 0; i < START_TRIES && !up; i++) {
+    if (preview.exitCode !== null) break; // it could not start (the port was taken after all): do not check someone else's server
     try { up = (await fetch(origin + base + '/')).status < 500; } catch { await new Promise((r) => setTimeout(r, START_POLL_MS)); }
   }
   if (!up) { console.error('The preview server did not start.'); stop(); process.exit(2); }
