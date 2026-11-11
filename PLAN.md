@@ -52,11 +52,13 @@ Simulation ideas: caching (hit/miss ratio with eviction policies), sharding and 
 
 ## Later
 - More areas: none queued; propose the next one
-- Lighthouse performance check; deploy
+- Lighthouse performance check (deploys already run from `main` through `.github/workflows/deploy.yml`)
+- Walkthrough check: a few steps still quote a rounded figure that the check accepts (the time-series database study says "45 GB" where the page shows 45.3 GB); find out why and decide whether to tighten it
 
 ## Status
 - Design patterns: all 23 built, with JS, Python and C# samples (verified by `npm run check:samples`)
 - Site generalised: area-based catalog with search and filters, concept pages, breadcrumbs, `/compare/` for patterns
 - Accessibility pass done (axe-core clean in light and dark, keyboard checks)
+- Walkthrough check: every number a "how to try it" step quotes is reproduced by `npm run check:walkthroughs` (298 lists; the baseline of known gaps is empty and its cap is 0, see `docs/walkthrough-hand-check.md`). The code that reads a step as a script is in `scripts/walkthrough-steps.mjs` and has unit tests
 - Concepts: 118 across thirteen areas (waves 1 to 6, including AI & ML systems: waves 3 and 4 added Cloud & deployment, Databases & storage, Data engineering, and 28 deeper concepts in Security, Observability, Networking, API design, Reliability, Distributed systems and Messaging), each with a diagram, an animation, a simulation, and JS, C# and Python samples where there is meaningful code
 - Case studies: 157 (every area has at least one; twenty-nine are named after real companies and cite their public write-ups), each with a build-up diagram, an estimator, a break-it simulation and JS, C# and Python samples
