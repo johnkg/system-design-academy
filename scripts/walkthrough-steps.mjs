@@ -37,6 +37,8 @@ export function claims(text) {
 export const shown = (c, numbers) => numbers.some((o) => c.decimals
   ? Math.abs(Math.round(o * 10 ** c.decimals) / 10 ** c.decimals - c.value) < 1e-9
   : o === c.value || (c.approx && Math.abs(o - c.value) <= APPROX_TOLERANCE * c.value));
+// The claims of a how-to list that the simulation never showed, each with its step (from 1) and the step's text.
+export const missingClaims = (steps, numbers) => steps.flatMap((text, i) => claims(text).filter((c) => !shown(c, numbers)).map((c) => ({ step: i + 1, c, text })));
 
 const norm = (s) => (s || '').toLowerCase().replace(/[“”"]/g, '').replace(/[‘’]/g, "'").replace(/\s+/g, ' ').trim();
 const NUM = String.raw`\d[\d,]*(?:\.\d+)?`;
