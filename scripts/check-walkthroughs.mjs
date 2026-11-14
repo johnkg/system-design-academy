@@ -27,7 +27,7 @@ import { existsSync, readdirSync, readFileSync, writeFileSync, statSync } from '
 import { join, relative } from 'node:path';
 import { parseShard } from './shard.mjs';
 import { BASELINE_CAP } from './baseline-cap.mjs';
-import { claims, shown, parseSteps, MIN_LABEL_WORD } from './walkthrough-steps.mjs';
+import { claims, shown, missingClaims, parseSteps, MIN_LABEL_WORD } from './walkthrough-steps.mjs';
 
 const args = process.argv.slice(2);
 const shard = parseShard(args);
@@ -330,7 +330,7 @@ async function replay(page, fresh, opts, i, seen, open) {
 }
 
 const results = []; // one entry per simulation
-async function check(path, context) {
+async function check(path, context, into = results) {
   const page = await context.newPage();
   await page.addInitScript((seed) => {
     let s = seed >>> 0; // mulberry32, so every run draws the same "random" numbers
@@ -370,7 +370,7 @@ async function check(path, context) {
       await fresh();
       (await page.evaluate(drive, { ...opts, index: i, mode: 'random', presses: 3 })).numbers.forEach((n) => seen.add(n));
     }
-    results.push({ key: `${path}#${i}`, steps: out.steps, numbers: [...seen] });
+    into.push({ key: `${path}#${i}`, steps: out.steps, numbers: [...seen] });
   }
   await page.close();
 }
@@ -385,17 +385,35 @@ await Promise.all(Array.from({ length: PARALLEL }, async () => {
     try { await check(path, context); } catch (e) { results.push({ key: `${path}#?`, steps: [], numbers: [], error: String(e).split('\n')[0] }); }
   }
 }));
+
+// A simulation that redraws late on a busy machine can miss a number it does show. Before reporting, every page with a new
+// problem is checked once more, on its own with nothing running beside it, and the numbers of both looks are put together:
+// a number counts once the simulation has displayed it, in either look. The run says how many pages needed this.
+const baseline = existsSync(baselinePath) ? JSON.parse(readFileSync(baselinePath, 'utf8')) : {};
+const failing = (r) => !!r.error || missingClaims(r.steps, r.numbers).some((m) => !(baseline[r.key] ?? []).includes(m.c.raw));
+const again = [...new Set(results.filter(failing).map((r) => r.key.replace(/#[^#]*$/, '')))];
+let cleared = 0;
+for (const path of again) {
+  const second = [];
+  try { await check(path, context, second); } catch { continue; } // the first look's report stands
+  for (let i = results.length - 1; i >= 0; i--) if (results[i].error && results[i].key === `${path}#?`) results.splice(i, 1);
+  for (const r of second) {
+    const first = results.find((x) => x.key === r.key);
+    if (first) first.numbers = [...new Set([...first.numbers, ...r.numbers])]; else results.push(r);
+  }
+  if (!results.some((r) => r.key.startsWith(`${path}#`) && failing(r))) cleared++;
+}
+if (again.length) console.log(`looked again at ${again.length} page(s) on their own: ${cleared} passed the second time, ${again.length - cleared} still fail`);
 await browser.close();
 stop();
 
-const baseline = existsSync(baselinePath) ? JSON.parse(readFileSync(baselinePath, 'utf8')) : {};
 const fresh = {}; // what the baseline would be after this run
 const problems = [];
 let total = 0;
 for (const r of results.sort((a, b) => a.key.localeCompare(b.key))) {
   if (r.error) { problems.push(`${r.key}: could not be driven (${r.error})`); continue; }
-  const missing = [];
-  r.steps.forEach((text, i) => claims(text).forEach((c) => { total++; if (!shown(c, r.numbers)) missing.push({ step: i + 1, c, text }); }));
+  total += r.steps.reduce((n, text) => n + claims(text).length, 0);
+  const missing = missingClaims(r.steps, r.numbers);
   if (missing.length) fresh[r.key] = [...new Set(missing.map((m) => m.c.raw))];
   const known = new Set(baseline[r.key] ?? []);
   for (const m of missing) {

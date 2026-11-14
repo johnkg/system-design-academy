@@ -1,6 +1,6 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { claims, shown, parseSteps } from '../scripts/walkthrough-steps.mjs';
+import { claims, shown, missingClaims, parseSteps } from '../scripts/walkthrough-steps.mjs';
 
 // A small simulation: the controls and buttons as the page describes them to the walkthrough check.
 const slider = (label: string, min: number, max: number, step = 1) => ({ kind: 'range', label, min: String(min), max: String(max), step: String(step) });
@@ -39,6 +39,14 @@ test('shown: exact for plain numbers, rounded to the quoted decimals, 5% either 
   assert.ok(!shown(decimal, [68.66, 69]));
   assert.ok(shown(about, [288]) && shown(about, [315]));
   assert.ok(!shown(about, [284]) && !shown(about, [316]));
+});
+
+test('missingClaims: what a list quotes that the simulation never showed', () => {
+  const steps = ['Press Run: 120 requests fail.', 'Raise the limit and about 300 ms becomes 68.6 %.'];
+  assert.deepEqual(missingClaims(steps, [120, 310, 68.57]), []);
+  const missing = missingClaims(steps, [121, 310]);
+  assert.deepEqual(missing.map((m: { step: number; c: { raw: string } }) => [m.step, m.c.raw]), [[1, '120'], [2, '68.6']]);
+  assert.equal(missing[0].text, steps[0]);
 });
 
 test('buttons are pressed in the order the step names them', () => {
