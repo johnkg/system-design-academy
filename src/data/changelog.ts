@@ -3,6 +3,13 @@ export interface Change { date: string; title: string; items: { text: string; hr
 
 export const changelog: Change[] = [
   {
+    date: '2026-11-15',
+    title: 'Plan an idea: describe what you want to build, see what it needs',
+    items: [
+      { text: 'A new page where you describe an app or a page in your own words. It ticks the needs it can read in your description (payments, live updates, search, limited stock and twenty more), and for each one lists what to use and why, the closest worked case studies, and an order to read them in. It matches words in your browser, it is not an AI, so you can tick or untick needs to correct it.', href: 'advisor/' },
+    ],
+  },
+  {
     date: '2026-11-03',
     title: 'Three more famous systems from Google',
     items: [
