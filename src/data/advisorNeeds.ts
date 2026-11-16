@@ -115,6 +115,7 @@ export const advisorNeeds: Need[] = [
       { kind: 'study', slug: 'object-storage', because: 'where the files actually live' },
       { kind: 'study', slug: 'photo-sharing', because: 'upload, resize, serve' },
       { kind: 'study', slug: 'video-streaming', because: 'video cut into pieces at several qualities' },
+      { kind: 'study', slug: 'image-processing-pipeline', because: 'resizing every upload, even during a bulk import' },
     ],
   },
   {
@@ -150,6 +151,7 @@ export const advisorNeeds: Need[] = [
       { kind: 'concept', slug: 'message-queues', because: 'hand the work to a worker' },
       { kind: 'concept', slug: 'async-apis-and-long-running-operations', because: 'how an API says "started, ask me later"' },
       { kind: 'concept', slug: 'dead-letter-queues-and-poison-messages', because: 'what to do with the job that always fails' },
+      { kind: 'study', slug: 'image-processing-pipeline', because: 'lanes, retries and autoscaling for a big backlog' },
       { kind: 'study', slug: 'job-scheduler', because: 'run millions of jobs at the right time, once' },
     ],
   },
@@ -176,6 +178,7 @@ export const advisorNeeds: Need[] = [
       { kind: 'concept', slug: 'autoscaling', because: 'add servers when the load rises' },
       { kind: 'concept', slug: 'rate-limiting', because: 'stop one client from taking everything' },
       { kind: 'concept', slug: 'back-of-the-envelope-estimation', because: 'work out how big it really is before you build' },
+      { kind: 'concept', slug: 'cloud-cost-management', because: 'more servers means a bigger bill, unless they follow the load' },
     ],
   },
   {
@@ -302,6 +305,7 @@ export const advisorNeeds: Need[] = [
     words: ['deploy', 'release', 'rollout', 'beta', 'a b test', 'experiment', 'feature flag', 'staging', 'ci cd', 'continuous delivery', 'mvp'],
     use: [
       { kind: 'concept', slug: 'feature-flags', because: 'ship the code, switch the feature on later' },
+      { kind: 'concept', slug: 'gitops', because: 'every release is a reviewed commit, every rollback a revert' },
       { kind: 'concept', slug: 'canary-deployments', because: 'try a release on a few users first' },
       { kind: 'concept', slug: 'online-schema-migrations', because: 'change the database without downtime' },
       { kind: 'concept', slug: 'metrics', because: 'know whether the release made things worse' },

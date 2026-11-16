@@ -3,6 +3,15 @@ export interface Change { date: string; title: string; items: { text: string; hr
 
 export const changelog: Change[] = [
   {
+    date: '2026-11-16',
+    title: 'GitOps, cloud costs, and an image pipeline',
+    items: [
+      { text: 'GitOps: keep what should run in Git and let a controller in the cluster make it so. Simulate a hand-made change that the next deploy silently erases, a deleted job left running, and how long a broken version stays live on a slow poll.', href: 'concepts/gitops/' },
+      { text: 'Cloud cost management: the same traffic for $7,488 or $1,179 a month. Right-size, autoscale, commit to the base load, burst on spot, switch the test environment off at night, and see what over-committing costs.', href: 'concepts/cloud-cost-management/' },
+      { text: 'Design an image-processing pipeline: a marketplace where one seller imports 100,000 photos while others wait for theirs. Break it with a single queue, broken files retried for ever, and an autoscaler that hides the problem instead of fixing it.', href: 'case-studies/image-processing-pipeline/' },
+    ],
+  },
+  {
     date: '2026-11-15',
     title: 'Plan an idea: describe what you want to build, see what it needs',
     items: [
