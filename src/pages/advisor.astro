@@ -1,0 +1,215 @@
+---
+import { getCollection } from 'astro:content';
+import Layout from '../layouts/Layout.astro';
+import PageHead from '../components/PageHead.astro';
+import { url } from '../lib';
+import { tokens } from '../advisor';
+import { advisorNeeds } from '../data/advisorNeeds';
+
+// "Describe your idea, see what it needs": the reader types what they want to build, the page ticks the needs it can read
+// in the description (src/advisor.ts matches words; there is no AI and nothing leaves the browser), and for every ticked
+// need it lists what to use and why, the closest worked case studies, and an order to read it all in.
+const concepts = await getCollection('concepts');
+const patterns = await getCollection('patterns');
+const studies = await getCollection('studies');
+
+// Resolve every recommendation; a typo in src/data/advisorNeeds.ts fails the build.
+const needs = advisorNeeds.map((n) => ({
+  id: n.id, label: n.label, why: n.why, words: n.words,
+  use: n.use.map((u) => {
+    const hit = u.kind === 'concept' ? concepts.find((c) => c.id === u.slug) : u.kind === 'pattern' ? patterns.find((p) => p.id === u.slug) : studies.find((s) => s.id === u.slug);
+    if (!hit) throw new Error(`Advisor need "${n.id}" references unknown ${u.kind} "${u.slug}"`);
+    const folder = u.kind === 'concept' ? 'concepts' : u.kind === 'pattern' ? 'patterns' : 'case-studies';
+    return { kind: u.kind, key: `${u.kind}/${u.slug}`, name: hit.data.name, level: hit.data.difficulty, href: url(`${folder}/${u.slug}/`), because: u.because };
+  }),
+}));
+// Every case study, as words to compare a description with.
+const docs = studies.map((s) => ({
+  key: `study/${s.id}`, name: s.data.name, intent: s.data.intent, level: s.data.difficulty, href: url(`case-studies/${s.id}/`),
+  n: [...new Set(tokens(s.data.name))], b: [...new Set(tokens(`${s.data.intent} ${s.data.prompt}`))],
+}));
+const data = JSON.stringify({ needs, docs }).replace(/</g, '\\u003c');
+const examples = [
+  'A food delivery app: customers order from restaurants, pay in the app, and track the courier on a map',
+  'A page where a team edits the same document together and sees each other typing',
+  'An online shop for concert tickets that sells out in minutes',
+  'A contact form that emails me what people submit',
+  'A chatbot that answers questions about our company documents',
+];
+---
+<Layout title="Plan an idea | System Design Academy" description="Describe an app or a page you want to build and see which system design ideas it needs, with the lessons and case studies to read.">
+  <PageHead eyebrow={`Plan an idea · ${needs.length} needs it can spot`} title="Describe your idea, see what it needs" lede="Say what you want to build, in your own words. You get the design questions it raises, what to use for each, and the closest worked examples on this site." />
+
+  <form class="idea" data-advisor onsubmit="return false">
+    <label class="idea-label" for="idea">Your app or page</label>
+    <textarea id="idea" rows="4" data-idea placeholder="For example: a food delivery app where customers pay in the app and track the courier on a map"></textarea>
+    <p class="try" data-try-row><span class="chips-label">Try</span>
+      {examples.map((t) => <button type="button" class="chip-btn" data-try={t}>{t.split(/[:,]| that | where /)[0]}</button>)}
+    </p>
+    <p class="how-note">This page matches the words you type against the lessons. It is not an AI, nothing you type leaves your browser, and it will miss things: tick or untick the needs below to correct it.</p>
+
+    <fieldset class="needs">
+      <legend>What your idea needs <span class="status" data-count aria-live="polite"></span></legend>
+      <ul>
+        {needs.map((n) => (
+          <li>
+            <label><input type="checkbox" data-need={n.id} /> <span>{n.label}</span></label>
+            <span class="seen" data-seen={n.id} hidden></span>
+          </li>
+        ))}
+      </ul>
+      <p><button type="button" class="btn" data-clear hidden>Start again</button></p>
+    </fieldset>
+  </form>
+
+  <section class="out" data-out aria-live="polite" aria-label="What to use">
+    <p class="empty" data-empty>Describe your idea above, or tick a need, and what to use appears here.</p>
+  </section>
+  <script type="application/json" id="advisor-data" set:html={data}></script>
+</Layout>
+<script>
+  import { detect, closest } from '../advisor';
+
+  interface Use { kind: 'concept' | 'pattern' | 'study'; key: string; name: string; level: string; href: string; because: string }
+  interface NeedView { id: string; label: string; why: string; words: string[]; use: Use[] }
+  interface DocView { key: string; name: string; intent: string; level: string; href: string; n: string[]; b: string[] }
+  const { needs, docs }: { needs: NeedView[]; docs: DocView[] } = JSON.parse(document.getElementById('advisor-data')!.textContent!);
+
+  const root = document.querySelector<HTMLElement>('[data-advisor]')!;
+  const idea = root.querySelector<HTMLTextAreaElement>('[data-idea]')!;
+  const out = document.querySelector<HTMLElement>('[data-out]')!;
+  const count = root.querySelector<HTMLElement>('[data-count]')!;
+  const clear = root.querySelector<HTMLButtonElement>('[data-clear]')!;
+  const tryRow = root.querySelector<HTMLElement>('[data-try-row]')!;
+  const boxes = new Map([...root.querySelectorAll<HTMLInputElement>('[data-need]')].map((b) => [b.dataset.need!, b]));
+  const seen = new Map([...root.querySelectorAll<HTMLElement>('[data-seen]')].map((s) => [s.dataset.seen!, s]));
+
+  const KIND: Record<Use['kind'], string> = { concept: 'Concept', pattern: 'Pattern', study: 'Case study' };
+  const LEVELS = ['beginner', 'intermediate', 'advanced'];
+  const CLOSEST = 5; // case studies shown as "closest to your idea"
+  const MAX_IDEA = 600; // characters of the description kept in the link
+
+  // What the reader ticked or unticked by hand wins over what the words say.
+  const params = new URLSearchParams(location.search);
+  const manual = new Map<string, boolean>();
+  for (const id of (params.get('with') ?? '').split(',').filter((x) => boxes.has(x))) manual.set(id, true);
+  for (const id of (params.get('without') ?? '').split(',').filter((x) => boxes.has(x))) manual.set(id, false);
+  idea.value = params.get('idea') ?? '';
+
+  const el = <K extends keyof HTMLElementTagNameMap>(tag: K, cls = '', text = '') => { const e = document.createElement(tag); if (cls) e.className = cls; if (text) e.textContent = text; return e; };
+  function card(u: { kind: Use['kind']; name: string; level: string; href: string }, note: string) {
+    const li = el('li'); li.dataset.kind = u.kind;
+    const a = el('a'); a.href = u.href;
+    const top = el('span', 'top');
+    top.append(el('span', 'kind', KIND[u.kind]));
+    const badge = el('span', 'badge', u.level); badge.dataset.level = u.level; top.append(badge);
+    a.append(top, el('strong', 'name', u.name), el('span', 'because', note));
+    li.append(a);
+    return li;
+  }
+
+  function apply() {
+    const found = detect(idea.value, needs);
+    const active = needs.filter((n) => manual.get(n.id) ?? found.has(n.id));
+    for (const n of needs) {
+      boxes.get(n.id)!.checked = active.includes(n);
+      const note = seen.get(n.id)!, words = found.get(n.id);
+      note.hidden = !words;
+      note.textContent = words ? `${manual.get(n.id) === false ? 'you unticked this; ' : ''}from "${words.join('", "')}"` : '';
+    }
+    count.textContent = active.length ? `${active.length} ticked` : '';
+    clear.hidden = !idea.value && !manual.size;
+    tryRow.hidden = !!idea.value;
+
+    out.replaceChildren();
+    const near = closest(idea.value, docs.map((d) => ({ key: d.key, name: d.n, body: d.b })), CLOSEST);
+    if (!active.length && !near.length) {
+      out.append(el('p', 'empty', idea.value.trim() ? 'No need recognised in those words yet. Say what people do in it (pay, chat, upload, search, book), or tick the needs yourself.' : 'Describe your idea above, or tick a need, and what to use appears here.'));
+    }
+    for (const n of active) {
+      const sec = el('section', 'need');
+      sec.append(el('h2', '', n.label), el('p', 'why', n.why));
+      const list = el('ul', 'cards');
+      for (const u of n.use) list.append(card(u, u.because));
+      sec.append(list);
+      out.append(sec);
+    }
+    if (near.length) {
+      const sec = el('section', 'need');
+      sec.append(el('h2', '', 'Closest worked examples'), el('p', 'why', 'Case studies whose description shares the most telling words with yours. Each one designs a whole system step by step.'));
+      const list = el('ul', 'cards');
+      for (const m of near) { const d = docs.find((x) => x.key === m.key)!; list.append(card({ kind: 'study', name: d.name, level: d.level, href: d.href }, d.intent)); }
+      sec.append(list);
+      out.append(sec);
+    }
+    // One reading order for everything above: each page once, easiest first, concepts before the case studies that use them.
+    const all = new Map<string, Use>();
+    for (const n of active) for (const u of n.use) if (!all.has(u.key)) all.set(u.key, u);
+    if (all.size > 1) {
+      const rank = (u: Use) => LEVELS.indexOf(u.level) * 2 + (u.kind === 'study' ? 1 : 0);
+      const ordered = [...all.values()].sort((a, b) => rank(a) - rank(b));
+      const sec = el('section', 'need');
+      sec.append(el('h2', '', `A reading order (${ordered.length} pages)`), el('p', 'why', 'Everything recommended above, once each, easiest first.'));
+      const ol = el('ol', 'order');
+      for (const u of ordered) { const li = el('li'); const a = el('a', '', u.name); a.href = u.href; li.append(a, el('span', 'meta', ` ${KIND[u.kind].toLowerCase()}, ${u.level}`)); ol.append(li); }
+      sec.append(ol);
+      out.append(sec);
+    }
+
+    const next = new URLSearchParams();
+    if (idea.value.trim()) next.set('idea', idea.value.slice(0, MAX_IDEA));
+    const on = [...manual].filter(([, v]) => v).map(([k]) => k), off = [...manual].filter(([, v]) => !v).map(([k]) => k);
+    if (on.length) next.set('with', on.join(','));
+    if (off.length) next.set('without', off.join(','));
+    history.replaceState(null, '', next.size ? `?${next}` : location.pathname);
+  }
+
+  idea.addEventListener('input', apply);
+  root.addEventListener('change', (e) => {
+    const b = (e.target as Element).closest<HTMLInputElement>('[data-need]');
+    if (!b) return;
+    // Back to what the words say when the tick agrees with them again.
+    const byWords = detect(idea.value, needs).has(b.dataset.need!);
+    if (b.checked === byWords) manual.delete(b.dataset.need!); else manual.set(b.dataset.need!, b.checked);
+    apply();
+  });
+  root.addEventListener('click', (e) => {
+    const b = (e.target as Element).closest<HTMLElement>('button');
+    if (b?.dataset.try) { idea.value = b.dataset.try; manual.clear(); apply(); idea.focus(); }
+    if (b?.hasAttribute('data-clear')) { idea.value = ''; manual.clear(); apply(); idea.focus(); }
+  });
+  apply();
+</script>
+<style>
+  .idea { display: grid; gap: 12px; margin-bottom: 2rem; }
+  .idea-label { font-weight: 600; }
+  .idea textarea { font: inherit; width: 100%; min-height: 6.5rem; padding: 12px 14px; border: 1px solid var(--border); border-radius: 12px; background: var(--surface); color: var(--text); resize: vertical; }
+  .try { display: flex; flex-wrap: wrap; gap: 6px 8px; align-items: center; margin: 0; }
+  .how-note { margin: 0; color: var(--muted); font-size: .92rem; max-width: 70ch; }
+  .needs { border: 1px solid var(--border); border-radius: 12px; padding: 12px 16px 14px; margin: 0; min-width: 0; }
+  .needs legend { font-weight: 600; padding: 0 6px; }
+  .needs .status { color: var(--muted); font: .78rem var(--font-mono); margin-left: 6px; }
+  .needs ul { list-style: none; margin: 0; padding: 0; display: grid; grid-template-columns: repeat(auto-fill, minmax(min(100%, 290px), 1fr)); gap: 4px 18px; }
+  .needs li { display: grid; gap: 0; padding: 2px 0; }
+  .needs label { display: flex; gap: 10px; align-items: flex-start; min-height: 36px; padding: 6px 0; cursor: pointer; }
+  .needs input { flex: none; width: 18px; height: 18px; margin-top: 3px; accent-color: var(--accent); }
+  .needs .seen { color: var(--muted); font-size: .82rem; padding-left: 28px; overflow-wrap: anywhere; }
+  .needs p { margin: 12px 0 0; }
+  .out { display: grid; gap: 2rem; margin-bottom: 3rem; }
+  .empty { margin: 2rem 0; text-align: center; color: var(--muted); }
+  .out :global(.need) { display: grid; gap: 10px; }
+  .out :global(.need > *) { margin: 0; }
+  .out :global(h2) { font-size: 1.3rem; line-height: 1.25; }
+  .out :global(.why) { color: var(--muted); max-width: 70ch; }
+  .out :global(.cards) { list-style: none; padding: 0; display: grid; grid-template-columns: repeat(auto-fill, minmax(min(100%, 300px), 1fr)); gap: 10px; }
+  .out :global(.cards a) { --k: var(--accent); display: grid; gap: 4px; height: 100%; padding: 12px 14px 12px 16px; border: 1px solid var(--border); border-left: 4px solid var(--k); border-radius: 12px; background: var(--surface); text-decoration: none; color: var(--text); overflow-wrap: anywhere; }
+  .out :global(.cards li[data-kind='pattern'] a) { --k: var(--role-2); }
+  .out :global(.cards li[data-kind='study'] a) { --k: var(--signal); }
+  .out :global(.cards a:hover) { border-color: var(--k); box-shadow: 0 0 0 3px color-mix(in srgb, var(--k) 14%, transparent); }
+  .out :global(.top) { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; }
+  .out :global(.kind) { font: 600 .74rem var(--font-mono); letter-spacing: .04em; text-transform: uppercase; color: var(--k); }
+  .out :global(.name) { font-size: 1.05rem; line-height: 1.3; }
+  .out :global(.because) { color: var(--muted); font-size: .93rem; }
+  .out :global(.order) { padding-left: 1.4rem; display: grid; gap: 6px; }
+  .out :global(.order .meta) { color: var(--muted); font: .78rem var(--font-mono); }
+</style>
