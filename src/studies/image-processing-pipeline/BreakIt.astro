@@ -1,0 +1,141 @@
+---
+import PlaygroundShell from '../../components/PlaygroundShell.astro';
+---
+<PlaygroundShell title="An import, some broken files, and the seller who is waiting" hint="Twenty minutes of the pipeline, second by second. Sellers upload 10 photos a second while editing listings, and each photo takes a worker 2 seconds. At 60 s a big seller starts a bulk import. Broken images, if any, arrive at 120 s and make a worker run 30 seconds before it gives up.">
+  <ol class="how">
+    <li>Start with the defaults: <b>one queue</b>, a fixed fleet of <b>30 workers</b>, an import of <b>100,000</b> photos and no broken images. Every seller who uploads after the import waits behind it: only <b>5%</b> of their photos are ready within 10 s, and the 95th percentile is over 20 minutes. The import itself gets <b>17,090</b> photos done.</li>
+    <li>Set <b>Queues</b> to <b>Separate lanes</b>: live photos are ready in <b>2 s</b> at the 95th percentile and <b>100%</b> within 10 s, but the import only gets the spare capacity, <b>5,700</b> photos. Set <b>Workers</b> to <b>Autoscale on backlog</b>: the import is done at <b>901 s</b>, for <b>63</b> worker-hours instead of 10.</li>
+    <li>Set <b>Workers</b> back to <b>Fixed at 30</b> and <b>Broken images</b> to <b>5</b>. Retried at once, they keep coming back: live photos slow to <b>17 s</b> at the 95th percentile and only <b>10%</b> are ready within 10 s, while <b>10,920</b> worker-seconds are burned on files that will never work. Set <b>Failed jobs</b> to <b>Back off, then dead-letter</b>: the 5 files cost <b>450</b> worker-seconds and land in the dead-letter queue, and live photos are back to 2 s.</li>
+    <li>Now autoscale with failed jobs <b>Retried at once</b>: live photos look fine, because the autoscaler mistakes the retry loop for backlog and grows the fleet to <b>400</b> workers. The broken files burn <b>388,800</b> worker-seconds and the bill is <b>121</b> worker-hours. Autoscaling hides a poison loop; it does not fix it.</li>
+  </ol>
+  <div class="pg ipb" data-ipb>
+    <div class="pg-row">
+      <label>Queues <select class="pg-in" data-lanes><option value="one" selected>One queue, first in first out</option><option value="lanes">Separate lanes</option></select></label>
+      <label>Workers <select class="pg-in" data-scale><option value="fixed" selected>Fixed at 30</option><option value="auto">Autoscale on backlog (30 to 400)</option></select></label>
+      <label>Bulk import <select class="pg-in" data-bulk><option value="0">None</option><option value="20000">20,000 photos</option><option value="100000" selected>100,000 photos</option><option value="300000">300,000 photos</option></select></label>
+      <label>Broken images <select class="pg-in" data-poison><option value="0" selected>None</option><option value="5">5</option><option value="20">20</option></select></label>
+      <label>Failed jobs <select class="pg-in" data-retry><option value="now" selected>Retried at once</option><option value="backoff">Back off, then dead-letter</option></select></label>
+    </div>
+    <div class="pg-grid">
+      <div class="pg-box" data-b1><h3>Seller waiting for their photo</h3><span class="pg-mono" data-o1></span><span class="pg-note" data-n1></span></div>
+      <div class="pg-box" data-b2><h3>Bulk import</h3><span class="pg-mono" data-o2></span><span class="pg-note" data-n2></span></div>
+      <div class="pg-box" data-b3><h3>Broken images</h3><span class="pg-mono" data-o3></span><span class="pg-note" data-n3></span></div>
+      <div class="pg-box" data-b4><h3>Workers and cost</h3><span class="pg-mono" data-o4></span><span class="pg-note" data-n4></span></div>
+    </div>
+    <div class="pg-box" style="--c: var(--border)">
+      <h3>Every 30 seconds: how long a live photo waited, and how many workers ran</h3>
+      <div class="ipb-chart" data-chart role="img" aria-label="Wait of live photos and the number of workers, in 30 second steps"></div>
+      <span class="pg-note">Columns: the longest wait of a live photo finished in those 30 s (a full column is 60 s or more, red if none finished). Line of dots: workers running, out of 400.</span>
+    </div>
+    <p class="pg-out" data-verdict aria-live="polite"></p>
+  </div>
+</PlaygroundShell>
+<script>
+  import { query, formatThousands } from '../../playground';
+  // The same model as the code samples, plus a record every 30 s for the chart.
+  const END = 1200, LIVE_PER_S = 10, COST = 2, POISON_COST = 30, BULK_AT = 60, POISON_AT = 120, MAX_TRIES = 3, BACKOFF = 10;
+  const MIN_W = 30, MAX_W = 400, BOOT = 60, SCALE_EVERY = 30, DRAIN = 120;
+  const STEP = 30, FULL_WAIT = 60;
+  type Kind = 'live' | 'bulk' | 'poison';
+  interface Batch { t: number; kind: Kind; n: number; tries: number }
+  const cost = (b: Batch) => (b.kind === 'poison' ? POISON_COST : COST);
+
+  function simulate(lanes: boolean, autoscale: boolean, bulk: number, poison: number, backoff: boolean) {
+    const live: Batch[] = [], batch: Batch[] = [], waiting: { ready: number; b: Batch }[] = [], pending: [number, number][] = [];
+    const lat = new Map<number, number>();
+    let w = MIN_W, budget = 0, bulkDone = 0, bulkEnd = -1, burned = 0, dlq = 0, workerSeconds = 0, peakW = MIN_W;
+    const chart: { wait: number; w: number }[] = [];
+    let stepWait = -1;
+    const laneOf = (kind: Kind) => (lanes && kind === 'bulk' ? batch : live);
+    for (let t = 0; t < END; t++) {
+      live.push({ t, kind: 'live', n: LIVE_PER_S, tries: 0 });
+      if (t === BULK_AT && bulk) laneOf('bulk').push({ t, kind: 'bulk', n: bulk, tries: 0 });
+      if (t === POISON_AT) for (let i = 0; i < poison; i++) live.push({ t, kind: 'poison', n: 1, tries: 0 });
+      for (let i = waiting.length - 1; i >= 0; i--) if (waiting[i].ready <= t) { live.push(waiting[i].b); waiting.splice(i, 1); }
+      for (let i = pending.length - 1; i >= 0; i--) if (pending[i][0] <= t) { w += pending[i][1]; pending.splice(i, 1); }
+      if (autoscale && t % SCALE_EVERY === 0) {
+        let backlog = 0;
+        for (const b of [...live, ...batch]) backlog += b.n * cost(b);
+        const target = Math.min(MAX_W, MIN_W + Math.floor((backlog + DRAIN - 1) / DRAIN));
+        const planned = w + pending.reduce((s, p) => s + p[1], 0);
+        if (target > planned) pending.push([t + BOOT, target - planned]);
+        else if (target < w && pending.length === 0) w = target;
+      }
+      peakW = Math.max(peakW, w);
+      workerSeconds += w;
+      budget += w;
+      for (const q of [live, batch]) {
+        while (q.length && budget >= cost(q[0])) {
+          const b = q[0], c = cost(b), k = Math.min(b.n, Math.floor(budget / c));
+          budget -= k * c; b.n -= k;
+          if (b.kind === 'live') { const d = t - b.t + COST; lat.set(d, (lat.get(d) ?? 0) + k); stepWait = Math.max(stepWait, d); }
+          if (b.kind === 'bulk') { bulkDone += k; if (bulkDone === bulk) bulkEnd = t; }
+          if (b.kind === 'poison') {
+            burned += c; b.tries++;
+            if (!backoff) q.push({ ...b, n: 1 });
+            else if (b.tries >= MAX_TRIES) dlq++;
+            else waiting.push({ ready: t + BACKOFF * 2 ** (b.tries - 1), b: { ...b, n: 1 } });
+          }
+          if (b.n === 0) q.shift();
+        }
+      }
+      if (!live.length && !batch.length) budget = 0;
+      if ((t + 1) % STEP === 0) { chart.push({ wait: stepWait, w }); stepWait = -1; }
+    }
+    const total = LIVE_PER_S * END;
+    let seen = 0, p95 = -1, fast = 0;
+    for (const s of [...lat.keys()].sort((a, b) => a - b)) { seen += lat.get(s)!; if (s <= 10) fast = seen; if (p95 < 0 && seen * 100 >= total * 95) p95 = s; }
+    return { p95, fastPct: Math.floor((fast * 100) / total), bulkDone, bulkEnd, burned, dlq, endW: w, peakW, hours: Math.floor(workerSeconds / 3600), chart };
+  }
+
+  document.querySelectorAll<HTMLElement>('[data-ipb]').forEach((root) => {
+    const q = query(root);
+    const chartEl = q('[data-chart]');
+    const cols = Array.from({ length: END / STEP }, () => {
+      const c = document.createElement('span'); c.className = 'ipb-col';
+      const bar = document.createElement('span'); bar.className = 'ipb-bar';
+      const dot = document.createElement('span'); dot.className = 'ipb-dot';
+      c.append(bar, dot); chartEl.appendChild(c); return { c, bar, dot };
+    });
+    const box = (n: number, colour: string) => q<HTMLElement>(`[data-b${n}]`).style.setProperty('--c', colour);
+    const sel = (s: string) => q<HTMLSelectElement>(s).value;
+    function draw() {
+      const bulk = Number(sel('[data-bulk]')), poison = Number(sel('[data-poison]'));
+      const r = simulate(sel('[data-lanes]') === 'lanes', sel('[data-scale]') === 'auto', bulk, poison, sel('[data-retry]') === 'backoff');
+      q('[data-o1]').textContent = r.p95 < 0 ? 'p95 over 20 min' : `p95 ${r.p95} s`;
+      q('[data-n1]').textContent = `${r.fastPct}% of live photos ready within 10 s (the target is 95%)`;
+      box(1, r.fastPct >= 95 ? 'var(--good)' : r.fastPct >= 50 ? 'var(--role-3)' : 'var(--bad)');
+      q('[data-o2]').textContent = !bulk ? 'none' : r.bulkEnd >= 0 ? `done at ${r.bulkEnd} s` : `${formatThousands(r.bulkDone)} of ${formatThousands(bulk)}`;
+      q('[data-n2]').textContent = !bulk ? 'no import in this run' : r.bulkEnd >= 0 ? `started at ${BULK_AT} s` : 'photos done when the 20 minutes end';
+      box(2, !bulk || r.bulkEnd >= 0 ? 'var(--good)' : 'var(--role-3)');
+      q('[data-o3]').textContent = poison ? `${formatThousands(r.burned)} worker-seconds burned` : 'none';
+      q('[data-n3]').textContent = !poison ? 'no broken images in this run' : r.dlq ? `${r.dlq} in the dead-letter queue after ${MAX_TRIES} tries each, for a person to look at` : 'still being retried at the end, and never going to work';
+      box(3, !poison || r.dlq === poison ? 'var(--good)' : 'var(--bad)');
+      q('[data-o4]').textContent = `${r.hours} worker-hours`;
+      q('[data-n4]').textContent = r.peakW === MIN_W ? `${MIN_W} workers all the time` : `up to ${r.peakW} workers, ${r.endW} at the end`;
+      box(4, r.hours <= 70 ? 'var(--good)' : 'var(--bad)');
+      r.chart.forEach((s, i) => {
+        const done = s.wait >= 0;
+        cols[i].bar.style.height = `${done ? Math.min(100, (s.wait * 100) / FULL_WAIT) : 100}%`;
+        cols[i].bar.style.setProperty('--c', !done || s.wait > 10 ? 'var(--bad)' : 'var(--good)');
+        cols[i].dot.style.bottom = `${(s.w * 100) / MAX_W}%`;
+        cols[i].c.title = `${i * STEP} to ${(i + 1) * STEP} s: ${done ? `longest wait ${s.wait} s` : 'no live photo finished'}, ${s.w} workers`;
+      });
+      const v = q('[data-verdict]');
+      const bad = r.fastPct < 95 || (poison > 0 && r.dlq < poison);
+      v.classList.toggle('bad', bad);
+      v.textContent = r.fastPct < 50 ? 'Sellers are waiting behind work that is not theirs.'
+        : poison && r.dlq < poison ? (r.fastPct >= 95 ? 'Live photos are fine, but only because the fleet keeps growing to feed a loop of broken files.' : 'Broken files keep coming back and take the workers live photos need.')
+        : r.fastPct < 95 ? 'Live photos are slower than the 10 s target.'
+        : bulk && r.bulkEnd < 0 ? 'Live photos are fast; the import only gets what is left over.' : 'Live photos are fast and every job ended where it should.';
+    }
+    root.addEventListener('change', draw);
+    draw();
+  });
+</script>
+<style is:global>
+  .playground .ipb-chart { display: grid; grid-template-columns: repeat(40, 1fr); gap: 2px; height: 120px; align-items: end; }
+  .playground .ipb-col { position: relative; height: 100%; }
+  .playground .ipb-bar { position: absolute; left: 0; right: 0; bottom: 0; background: var(--c); border-radius: 2px 2px 0 0; opacity: .8; }
+  .playground .ipb-dot { position: absolute; left: 50%; width: 6px; height: 6px; margin: 0 0 -3px -3px; border-radius: 50%; background: var(--text); }
+</style>

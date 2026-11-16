@@ -1,0 +1,112 @@
+---
+import PlaygroundShell from '../components/PlaygroundShell.astro';
+---
+<PlaygroundShell title="Simulate it" hint="Fifteen minutes of a checkout service run by a GitOps controller. The same things happen every time: v2 is committed at 20 s, someone scales to 10 replicas by hand at 200 s, a broken v3 is committed at 430 s and reverted 60 s after it goes live, and the cleanup job is deleted from Git at 640 s.">
+  <ol class="how">
+    <li>Start with the defaults: the controller polls Git every 3 minutes, with self-heal and prune off. v2 goes live <b>160 s</b> after its commit, and the broken v3 stays live for <b>180 s</b> because the revert waits for the next poll. The hand-made scale-up lasts <b>340 s</b> and then vanishes when v3 is deployed, and the deleted cleanup job is still running at the end. Live state differs from Git for <b>801 s of 900</b>.</li>
+    <li>Tick <b>Self-heal</b>: the controller watches the cluster and puts 3 replicas back <b>5 s</b> after the hand edit, so nobody relies on a change that the next deploy would erase. Then tick <b>Prune</b>: the cleanup job is deleted at the next poll, and the time out of sync falls to <b>395 s</b>.</li>
+    <li>Set <b>Controller hears about commits</b> to <b>Webhook on every push</b>: every commit is applied 5 s later, so the broken v3 is live for only <b>65 s</b> and the time out of sync falls to <b>25 s</b>. Polling every minute is in between: the broken v3 is served for <b>60 s</b>, but v2 waits <b>40 s</b>.</li>
+  </ol>
+  <div class="pg go" data-go>
+    <div class="pg-row">
+      <label>Controller hears about commits <select class="pg-in" data-mode><option value="180" selected>Poll Git every 3 min</option><option value="60">Poll Git every 1 min</option><option value="0">Webhook on every push</option></select></label>
+      <label><input type="checkbox" data-heal /> Self-heal</label>
+      <label><input type="checkbox" data-prune /> Prune</label>
+    </div>
+    <div class="pg-grid">
+      <div class="pg-box" data-b1><h3>Commit to live (v2)</h3><span class="pg-mono" data-o1></span><span class="pg-note" data-n1></span></div>
+      <div class="pg-box" data-b2><h3>Broken v3 served for</h3><span class="pg-mono" data-o2></span><span class="pg-note" data-n2></span></div>
+      <div class="pg-box" data-b3><h3>Hand-made scale to 10</h3><span class="pg-mono" data-o3></span><span class="pg-note" data-n3></span></div>
+      <div class="pg-box" data-b4><h3>Deleted cleanup job</h3><span class="pg-mono" data-o4></span><span class="pg-note" data-n4></span></div>
+    </div>
+    <div class="pg-box" style="--c: var(--border)">
+      <h3>Live state against Git, one cell per 30 s</h3>
+      <div class="go-strip" data-strip></div>
+      <span class="pg-note" data-n5></span>
+    </div>
+    <ol class="pg-log" data-log tabindex="0" aria-label="What happened, in order"></ol>
+  </div>
+</PlaygroundShell>
+<script>
+  import { query } from '../playground';
+  const END = 900; const REACT = 5; const ALERT_AFTER = 60; const HAND_EDIT_AT = 200; const CELL = 30;
+  interface Commit { at: number; image?: string; removeJob?: boolean; revert?: boolean }
+  const COMMITS: Commit[] = [{ at: 20, image: 'v2' }, { at: 430, image: 'v3' }, { at: 640, removeJob: true }];
+  interface Result { log: string[]; v2Delay: number; badFor: number; handLasted: number; handBy: string; jobLeft: boolean; jobDeletedAt: number; outOfSync: number; cells: boolean[] }
+
+  // The same model as the code samples: a sync applies everything in Git (undoing hand edits); self-heal reverts drift
+  // REACT seconds after it happens; pruning deletes what Git no longer lists.
+  function simulate(poll: number, selfHeal: boolean, prune: boolean): Result {
+    const webhook = poll === 0;
+    const git = { image: 'v1', replicas: 3, job: true }; const live = { ...git }; const applied = { ...git };
+    const todo: [number, string][] = []; const log: string[] = [];
+    let handAt = -1, handLasted = -1, handBy = '', v2LiveAt = -1, v3LiveAt = -1, badFor = -1, revertAt = -1, outOfSync = 0, jobDeletedAt = -1;
+    const cells: boolean[] = [];
+    let cellBad = false;
+    const sync = (t: number, why: string) => {
+      const gitChanged = git.image !== applied.image || git.job !== applied.job;
+      const drifted = live.replicas !== git.replicas;
+      if (!gitChanged && !(drifted && why === 'self-heal')) return;
+      if (drifted && handLasted < 0) { handLasted = t - handAt; handBy = why === 'self-heal' ? 'self-heal' : `the ${live.image !== git.image ? `${git.image} deploy` : 'next sync'}`; log.push(`${t} s, ${why}: replicas 10 -> 3, the hand edit is gone`); }
+      if (live.image !== git.image) log.push(`${t} s, ${why}: image ${live.image} -> ${git.image}`);
+      live.image = git.image; live.replicas = git.replicas;
+      if (live.job && !git.job && prune) { live.job = false; jobDeletedAt = t; log.push(`${t} s, ${why}: cleanup job deleted`); }
+      Object.assign(applied, git);
+      if (live.image === 'v2' && v2LiveAt < 0) v2LiveAt = t;
+      if (live.image === 'v3' && v3LiveAt < 0) v3LiveAt = t;
+      if (v3LiveAt >= 0 && badFor < 0 && live.image !== 'v3') badFor = t - v3LiveAt;
+    };
+    const commit = (t: number, c: Commit) => {
+      if (c.image) git.image = c.image;
+      if (c.removeJob) git.job = false;
+      log.push(`${t} s, commit: ${c.revert ? 'revert to image v2' : c.image ? `image ${c.image}` : 'delete the cleanup job'}`);
+      if (webhook) todo.push([t + REACT, 'webhook']);
+    };
+    for (let t = 1; t <= END; t++) {
+      for (const c of COMMITS) if (c.at === t) commit(t, c);
+      if (v3LiveAt >= 0 && revertAt < 0 && t === v3LiveAt + ALERT_AFTER) { revertAt = t; commit(t, { at: t, image: 'v2', revert: true }); }
+      if (t === HAND_EDIT_AT) { live.replicas = 10; handAt = t; log.push(`${t} s, hand edit: replicas 3 -> 10`); if (selfHeal) todo.push([t + REACT, 'self-heal']); }
+      for (const [at, why] of todo) if (at === t) sync(t, why);
+      if (!webhook && t % poll === 0) sync(t, 'poll');
+      if (webhook && t % 180 === 0) sync(t, 'poll'); // a webhook setup still polls now and then, in case a push was missed
+      const off = live.image !== git.image || live.replicas !== git.replicas || live.job !== git.job;
+      if (off) { outOfSync++; cellBad = true; }
+      if (t % CELL === 0) { cells.push(cellBad); cellBad = false; }
+    }
+    return { log, v2Delay: v2LiveAt - COMMITS[0].at, badFor, handLasted, handBy, jobLeft: live.job, jobDeletedAt, outOfSync, cells };
+  }
+
+  document.querySelectorAll<HTMLElement>('[data-go]').forEach((root) => {
+    const q = query(root);
+    const strip = q('[data-strip]');
+    const cells = Array.from({ length: END / CELL }, () => { const c = document.createElement('span'); c.className = 'go-cell'; strip.appendChild(c); return c; });
+    const box = (n: number, good: boolean) => q<HTMLElement>(`[data-b${n}]`).style.setProperty('--c', good ? 'var(--good)' : 'var(--bad)');
+    function draw() {
+      const poll = Number(q<HTMLSelectElement>('[data-mode]').value);
+      const r = simulate(poll, q<HTMLInputElement>('[data-heal]').checked, q<HTMLInputElement>('[data-prune]').checked);
+      const how = poll === 0 ? 'a webhook from Git starts a sync 5 s after each push' : `the controller looks at Git every ${poll / 60} min`;
+      q('[data-o1]').textContent = `${r.v2Delay} s`;
+      q('[data-n1]').textContent = how;
+      box(1, r.v2Delay <= 60);
+      q('[data-o2]').textContent = `${r.badFor} s`;
+      q('[data-n2]').textContent = `the revert is pushed ${ALERT_AFTER} s after v3 goes live, then waits for the controller`;
+      box(2, r.badFor <= 65);
+      q('[data-o3]').textContent = `lasted ${r.handLasted} s`;
+      q('[data-n3]').textContent = r.handBy === 'self-heal' ? 'self-heal saw the change in the cluster and put 3 replicas back' : `nothing reverted it until ${r.handBy} applied Git's 3 replicas, without warning`;
+      box(3, r.handBy === 'self-heal');
+      q('[data-o4]').textContent = r.jobLeft ? 'still running' : `deleted at ${r.jobDeletedAt} s`;
+      q('[data-n4]').textContent = r.jobLeft ? 'an orphan: Git no longer lists it, and without prune the controller leaves it alone' : 'prune deletes what the controller created and Git no longer lists';
+      box(4, !r.jobLeft);
+      r.cells.forEach((bad, i) => { cells[i].style.setProperty('--c', bad ? 'var(--bad)' : 'var(--good)'); cells[i].title = `${i * CELL} to ${(i + 1) * CELL} s: ${bad ? 'out of sync' : 'synced'}`; });
+      q('[data-n5]').textContent = `Live state differed from Git for ${r.outOfSync} s of ${END}. Red: out of sync at some point in those 30 s.`;
+      const log = q('[data-log]'); log.textContent = '';
+      for (const line of r.log) { const li = document.createElement('li'); li.textContent = line; log.appendChild(li); }
+    }
+    root.addEventListener('change', draw);
+    draw();
+  });
+</script>
+<style is:global>
+  .playground .go-strip { display: flex; flex-wrap: wrap; gap: 3px; }
+  .playground .go-cell { width: 14px; height: 18px; border-radius: 3px; background: var(--c); }
+</style>

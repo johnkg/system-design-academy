@@ -1,0 +1,209 @@
+{
+  "name": "Design an Image-Processing Pipeline",
+  "difficulty": "intermediate",
+  "intent": "Turn every uploaded photo into the sizes and formats a store needs, quickly for the person waiting and cheaply for the rest, even when a big seller imports 100,000 photos at once or a broken file arrives.",
+  "prompt": "Design the image pipeline of an online marketplace. Sellers upload about 2 million product photos a day, mostly one at a time while editing a listing, but a big seller can bulk-import 100,000 or more at once. Every photo needs 6 variants (3 sizes in WebP and AVIF) and a moderation check. A seller must see their new photo on the listing within about 10 seconds, even during someone else's import. Twice a year the design team adds a new size, which means reprocessing about 400 million existing photos. Design the processing pipeline, not the storefront.",
+  "codeTitle": "lanes, retries with backoff, and an autoscaler on one queue model",
+  "finalIntro": "One photo from a seller's phone to a buyer's screen, while a bulk import runs.",
+  "functional": [
+    "Accept photo uploads and produce a fixed set of variants for each one",
+    "Show a seller's new photo on their listing within seconds",
+    "Take bulk imports of hundreds of thousands of photos from one seller",
+    "Reprocess every stored photo when a new variant is added",
+    "Reject or quarantine broken, oversized and unsafe images"
+  ],
+  "nonFunctional": [
+    "Interactive uploads reach the listing within 10 s at the 95th percentile, even during a bulk import",
+    "No photo is lost or left half-processed: every job ends done, or somewhere a person can see it",
+    "A malformed or malicious file cannot crash or stall the workers",
+    "Cost follows the work done, not the busiest hour of the year",
+    "A backfill of 400 million photos finishes within days without slowing live uploads"
+  ],
+  "firstAttempt": {
+    "text": "The upload API saves the original and puts a job on one queue. A fixed pool of 30 workers takes jobs in arrival order, resizes the photo into 6 variants and writes them back under the photo's id. If a job fails, it goes straight back on the queue.",
+    "limits": [
+      "A bulk import of 100,000 photos sits in front of every seller who uploads after it, so their photos take hours instead of seconds",
+      "A broken image that makes a worker time out is retried at once, for ever, and keeps burning workers",
+      "30 workers are too few during an import and mostly idle at night",
+      "A job that runs twice, or stops halfway, can overwrite good variants with partial ones",
+      "Adding a size means pushing 400 million jobs into the same queue as live uploads"
+    ]
+  },
+  "nodes": [
+    { "id": "seller", "label": "Seller's app", "kind": "client", "x": 12, "y": 63 },
+    { "id": "mono", "label": "Upload API, one queue", "kind": "compute", "x": 37, "y": 63, "at": 0, "until": 1 },
+    { "id": "api", "label": "Upload API", "kind": "edge", "x": 37, "y": 88, "at": 1 },
+    { "id": "store", "label": "Object storage", "kind": "data", "x": 62, "y": 63 },
+    { "id": "queue", "label": "Job queue", "kind": "async", "x": 62, "y": 37, "until": 3 },
+    { "id": "workers", "label": "Image workers", "kind": "compute", "x": 62, "y": 12 },
+    { "id": "db", "label": "Photo records", "kind": "data", "x": 87, "y": 88, "at": 1 },
+    { "id": "live", "label": "Interactive lane", "kind": "async", "x": 37, "y": 37, "at": 3 },
+    { "id": "bulk", "label": "Bulk and backfill lane", "kind": "async", "x": 87, "y": 37, "at": 3 },
+    { "id": "dlq", "label": "Dead-letter queue", "kind": "async", "x": 87, "y": 12, "at": 4 },
+    { "id": "scaler", "label": "Autoscaler", "kind": "compute", "x": 37, "y": 12, "at": 5 },
+    { "id": "buyer", "label": "Buyer's browser", "kind": "client", "x": 12, "y": 37, "at": 6 },
+    { "id": "cdn", "label": "CDN and on-demand resizer", "kind": "edge", "x": 12, "y": 12, "at": 6 }
+  ],
+  "edges": [
+    { "from": "seller", "to": "mono", "at": 0, "until": 1 },
+    { "from": "mono", "to": "store", "at": 0, "until": 1 },
+    { "from": "mono", "to": "queue", "at": 0, "until": 1 },
+    { "from": "queue", "to": "workers", "at": 0, "until": 3 },
+    { "from": "workers", "to": "store", "at": 0 },
+    { "from": "seller", "to": "api", "at": 1 },
+    { "from": "seller", "to": "store", "at": 1 },
+    { "from": "store", "to": "queue", "at": 1, "until": 3 },
+    { "from": "api", "to": "db", "at": 1 },
+    { "from": "workers", "to": "db", "at": 2 },
+    { "from": "store", "to": "live", "at": 3 },
+    { "from": "api", "to": "bulk", "at": 3 },
+    { "from": "live", "to": "workers", "at": 3 },
+    { "from": "bulk", "to": "workers", "at": 3 },
+    { "from": "workers", "to": "dlq", "at": 4 },
+    { "from": "scaler", "to": "workers", "at": 5 },
+    { "from": "live", "to": "scaler", "at": 5 },
+    { "from": "buyer", "to": "cdn", "at": 6 },
+    { "from": "cdn", "to": "store", "at": 6 }
+  ],
+  "steps": [
+    {
+      "title": "Upload straight to storage, then process from an event",
+      "problem": "Original photos are several megabytes each. Passing them through the API servers ties those servers up on slow phone connections, and resizing inside the request makes the seller wait.",
+      "fix": "The API returns a signed URL that lets the app put one photo, of limited size, straight into object storage. Storage emits an 'object created' event, which becomes a job on a queue. The API records the photo as pending and answers at once; the app shows the local copy until the variants are ready.",
+      "tradeoff": "The seller is not kept waiting, and processing can fall behind without failing uploads. The listing now has a short 'processing' state that the app must show honestly.",
+      "concepts": [{ "slug": "message-queues" }, { "slug": "async-apis-and-long-running-operations" }]
+    },
+    {
+      "title": "Make every job safe to run twice",
+      "problem": "Queues deliver at least once: a worker that crashes or times out has its job handed to another worker, and the first one may still be writing. Writing variants under the photo's id lets a late or partial run overwrite good files.",
+      "fix": "Name each output by what it is made from: a hash of the original's bytes, the variant spec (size, format, quality) and the pipeline version. Write to a temporary key and rename only when the file is complete. A second run of the same job produces the same names with the same bytes, and the photo record is updated with a conditional write that only moves forward. Duplicate uploads of the same file are found by the hash and processed once.",
+      "tradeoff": "Retries and duplicate deliveries become harmless, and a pipeline change produces new names instead of silently replacing files. Old versions take storage until a cleanup removes them.",
+      "concepts": [{ "slug": "idempotency" }, { "slug": "delivery-guarantees" }, { "slug": "optimistic-concurrency-and-etags" }]
+    },
+    {
+      "title": "Give interactive uploads their own lane",
+      "problem": "In one first-in, first-out queue, a bulk import of 100,000 photos is ahead of every seller who uploads after it. With 30 workers, the photo of a seller who uploads a minute later waits for most of the import: hours, not seconds.",
+      "fix": "Split the work into lanes: an interactive lane for photos a person is waiting for, and a bulk lane for imports and backfills. Workers always take interactive jobs first and spend what is left on bulk work. Each bulk import is also capped per seller, so one seller's 100,000 photos cannot starve another seller's import.",
+      "tradeoff": "Sellers editing a listing see their photo within seconds whatever else is running. Bulk work slows down when interactive load is high, which is the right priority but needs its own capacity, or it may never finish.",
+      "concepts": [{ "slug": "bulkhead" }, { "slug": "ordering-and-partitioning" }, { "slug": "queueing-theory-and-littles-law" }]
+    },
+    {
+      "title": "Contain broken images: limits, backoff and a dead-letter queue",
+      "problem": "Some files are broken or hostile: a corrupt header, a 50,000 by 50,000 pixel image that expands to gigabytes when decoded, a format the decoder chokes on. Such a job makes a worker run until it times out. Retried at once, it comes straight back, and five of them can keep a whole small fleet busy for ever.",
+      "fix": "Check before decoding: the declared dimensions, the pixel count and the file type. Decode in a sandbox with a memory limit and a time limit. When a job fails, retry it after a growing delay (10 s, then 20 s), and after 3 attempts move it to a dead-letter queue, mark the photo failed and alert. Moderation runs as a separate step with its own retry, so a slow moderation service never blocks resizing.",
+      "tradeoff": "A poison image costs a bounded amount of work and lands where a person can look at it. Some genuine photos will be refused by the limits, so the seller needs a clear message.",
+      "concepts": [{ "slug": "retries-and-backoff" }, { "slug": "dead-letter-queues-and-poison-messages" }, { "slug": "timeouts-and-deadlines" }, { "slug": "injection-and-xss" }]
+    },
+    {
+      "title": "Scale workers on queue backlog, not on CPU",
+      "problem": "A fixed fleet is wrong both ways: too small when an import arrives and paid for while idle at night. Scaling on CPU reacts late, because a worker waiting for its next job and a full queue can look the same from inside the worker.",
+      "fix": "An autoscaler looks at the work waiting in each lane, in worker-seconds, and runs enough workers to clear it in about two minutes, between a floor of 30 and a ceiling of 400. New workers take about a minute to start, so the floor covers the interactive lane on its own. The ceiling also caps the bill when something goes wrong.",
+      "tradeoff": "An import of 100,000 photos finishes in about 15 minutes instead of hours, and the fleet shrinks back when the queue is empty. A ceiling that is too high lets a retry storm burn hundreds of workers before anyone notices, so the dead-letter queue still matters.",
+      "concepts": [{ "slug": "autoscaling" }, { "slug": "cloud-cost-management" }, { "slug": "backpressure" }]
+    },
+    {
+      "title": "Add new sizes on demand, and backfill slowly",
+      "problem": "A new size for 400 million photos is 400 million jobs. Queued all at once they flood the bulk lane for weeks, and most of those photos belong to listings nobody views.",
+      "fix": "Serve images through a CDN with a resizer behind it. When a buyer asks for a size that does not exist yet, the resizer makes it from the original, stores it under its content-based name and the CDN caches it, so the first view is slower and every later view is cached. A background backfill then fills in the remaining photos through the bulk lane at a set rate, most-viewed listings first, so it never competes with live uploads. Only sizes on an allowed list can be requested, so nobody can make the resizer produce millions of variants.",
+      "tradeoff": "A new size is live everywhere at once, and the backfill runs at whatever pace the budget allows. The first view of each photo in a new size takes a few hundred milliseconds longer.",
+      "concepts": [{ "slug": "cdn" }, { "slug": "caching" }, { "slug": "rate-limiting" }]
+    }
+  ],
+  "failures": [
+    {
+      "scenario": "A worker crashes halfway through writing a photo's variants",
+      "impact": "The photo is stuck in 'processing', and some variant files may be half written.",
+      "answer": "The queue hands the job to another worker after its visibility timeout (the time a taken job stays hidden from others). Outputs are written to temporary keys and renamed only when complete, under names that come from the content, so the second run writes the same files again and nothing half-written is ever served. The photo record moves to 'ready' with a conditional write.",
+      "concepts": [{ "slug": "idempotency" }, { "slug": "message-queues" }]
+    },
+    {
+      "scenario": "A seller uploads a 50,000 by 50,000 pixel PNG, small on disk but huge when decoded",
+      "impact": "Decoding it would need about 10 GB of memory and could take a worker, or the whole machine, down.",
+      "answer": "The worker reads only the header first and refuses images above a pixel limit, such as 100 megapixels, before decoding anything. Decoding happens in a sandboxed process with memory and time limits, so a file that slips past still only kills its own sandbox. After 3 attempts the job goes to the dead-letter queue and the seller is told the image is too large.",
+      "concepts": [{ "slug": "dead-letter-queues-and-poison-messages" }, { "slug": "timeouts-and-deadlines" }]
+    },
+    {
+      "scenario": "A seller starts an import of 300,000 photos while thousands of other sellers are editing listings",
+      "impact": "Without lanes, every other seller's photo waits behind the import for hours.",
+      "answer": "The import goes to the bulk lane, with a per-seller cap so it shares that lane fairly with other imports. Interactive uploads keep their own lane and are always served first. The autoscaler sees the bulk backlog and adds workers up to its ceiling, so the import finishes in minutes to hours, and the import's progress is shown to the seller.",
+      "concepts": [{ "slug": "bulkhead" }, { "slug": "autoscaling" }]
+    },
+    {
+      "scenario": "The moderation service is slow or down",
+      "impact": "If moderation sits in the same job as resizing, every photo waits for it, and timeouts pile up retries.",
+      "answer": "Moderation is its own step with its own queue, timeout and circuit breaker. Variants are made regardless, and the photo stays hidden from buyers as 'pending review' until moderation passes; the seller still sees it on their own listing. When the service recovers, the backlog drains with backoff, so it is not flooded.",
+      "concepts": [{ "slug": "circuit-breaker" }, { "slug": "graceful-degradation" }]
+    }
+  ],
+  "alternatives": [
+    {
+      "title": "When to make the variants",
+      "options": [
+        { "name": "All variants at upload", "pro": "Every view is fast and costs predictable", "con": "CPU and storage for variants nobody requests, and every new size is a 400 million photo backfill" },
+        { "name": "Only on demand, at the CDN", "pro": "Nothing wasted, and a new size is live at once", "con": "Every first view is slow, and a traffic spike on cold photos becomes a spike of resizing" },
+        { "name": "Common variants at upload, the rest on demand", "pro": "The usual views are fast; new and rare sizes cost nothing until used", "con": "Two paths to build and watch" }
+      ],
+      "pick": "Make the variants the listing page needs at upload, and everything else on demand with a slow background backfill."
+    },
+    {
+      "title": "How to keep imports from blocking sellers",
+      "options": [
+        { "name": "One queue with job priorities", "pro": "One system to run", "con": "Many queues only approximate priority, and a flood of low-priority jobs still slows dequeuing" },
+        { "name": "Separate lanes with their own workers", "pro": "Complete isolation", "con": "Idle capacity in one lane cannot help the other" },
+        { "name": "Separate lanes, shared workers that drain interactive first", "pro": "Isolation for interactive work, and spare capacity goes to bulk", "con": "Bulk can starve if interactive load stays high, so it needs a minimum share" }
+      ],
+      "pick": "Separate lanes, with shared workers that serve the interactive lane first and keep a minimum share for bulk."
+    },
+    {
+      "title": "What the autoscaler watches",
+      "options": [
+        { "name": "Worker CPU", "pro": "Available everywhere, no extra metrics", "con": "Reacts late, and cannot tell a full queue from a busy worker" },
+        { "name": "Queue backlog or age of the oldest job", "pro": "Measures exactly the work waiting and how late it is", "con": "Needs the queue to expose those numbers, and a poison loop also looks like backlog" },
+        { "name": "A fixed schedule", "pro": "Simple and predictable for daily patterns", "con": "Blind to imports and backfills, which do not follow the clock" }
+      ],
+      "pick": "Scale on backlog per lane, with a floor for the interactive lane and a ceiling that caps the bill."
+    }
+  ],
+  "roles": [
+    { "id": "client", "label": "Apps", "description": "The seller's app that uploads and the buyer's browser that views." },
+    { "id": "edge", "label": "Entry points and CDN", "description": "The upload API, and the CDN with its on-demand resizer." },
+    { "id": "async", "label": "Queues", "description": "The interactive and bulk lanes and the dead-letter queue." },
+    { "id": "compute", "label": "Workers", "description": "Image workers and the autoscaler that sizes them." },
+    { "id": "data", "label": "Storage", "description": "Object storage for originals and variants, and the photo records." }
+  ],
+  "quiz": [
+    {
+      "question": "A seller starts an import of 100,000 photos. A minute later another seller uploads one photo and waits over an hour to see it. The pipeline has one queue and 30 workers. What is the best fix?",
+      "options": [
+        "Add more workers whenever the CPU of the current ones goes above 80%.",
+        "Give interactive uploads their own lane that workers always serve first.",
+        "Make each worker faster by producing fewer variants for every photo.",
+        "Ask big sellers to split imports into batches of 1,000 photos at a time."
+      ],
+      "answer": 1,
+      "explanation": "The seller is waiting behind the import, not behind slow workers. A separate interactive lane takes the import out of their way whatever its size. More workers or faster jobs only shorten the line, and sellers splitting imports still put every batch ahead of whoever comes next."
+    },
+    {
+      "question": "Five corrupt images each make a worker run for 30 seconds before timing out, and failed jobs are retried at once. With 30 workers, what happens?",
+      "options": [
+        "Nothing much: 5 failing jobs out of thousands are a rounding error.",
+        "The queue drops them after the first timeout, as all queues do by default.",
+        "They come back at once and keep taking workers, so live uploads slow down.",
+        "The workers learn to skip them, because they fail in the same way every time."
+      ],
+      "answer": 2,
+      "explanation": "A job retried at once is back in seconds, so five of them can keep a large part of a small fleet busy for ever. Backoff spreads the retries out and a dead-letter queue stops them after a few attempts. Queues do not drop jobs by default, and workers do not remember which ones failed."
+    },
+    {
+      "question": "Why name each variant by a hash of the original, the variant spec and the pipeline version instead of by the photo's id?",
+      "options": [
+        "Two runs of the same job write the same names and bytes, so retries cannot corrupt files.",
+        "Hashed names are shorter, so object storage can look them up faster than ids.",
+        "It hides which seller uploaded the photo, so the files are private by default.",
+        "It lets the CDN skip its cache, so every buyer always sees the newest version."
+      ],
+      "answer": 0,
+      "explanation": "Content-based names make the job idempotent: a retry or a duplicate delivery rewrites identical files, and a pipeline change produces new names instead of overwriting old ones. Names do not make lookups faster or files private, and because a name never changes meaning the CDN can cache it for a long time."
+    }
+  ]
+}

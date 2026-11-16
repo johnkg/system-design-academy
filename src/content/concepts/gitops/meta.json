@@ -1,0 +1,95 @@
+{
+  "name": "GitOps",
+  "area": "deployment",
+  "difficulty": "intermediate",
+  "intent": "Keep the desired state of every environment in Git, and let a controller inside the cluster pull it and keep the live state matching, so a deploy is a commit and a rollback is a revert.",
+  "scenario": "A checkout service runs 3 replicas of image v1 on Kubernetes, plus an old cleanup job. In 15 minutes the team commits v2, someone scales the service to 10 replicas by hand, a broken v3 is committed and then reverted, and the cleanup job is deleted from Git. A controller (Argo CD or Flux) syncs the cluster from Git.",
+  "problem": "When people deploy by running commands against the cluster, nobody can say for sure what is running or why. Each hand-made change (a quick scale-up, a hot-fixed config) is real but recorded nowhere, so the next deploy silently overwrites it, or a rebuilt cluster comes back without it. Rollback means remembering what was there before. The CI system also needs credentials to change production, which makes it a target.",
+  "howItWorks": [
+    { "title": "Git is the single source of truth", "text": "Every resource of an environment (deployments, services, config, jobs) is described declaratively in a Git repository: what should exist, not the steps to create it. A change to production is a commit or a merged pull request, so it is reviewed, recorded with an author and a reason, and can be reverted like any other commit." },
+    { "title": "A controller pulls and applies", "text": "A controller running inside the cluster (Argo CD, Flux) watches the repository: it polls every few minutes, or a webhook from Git tells it at once that something was pushed. It compares what Git says with what is running and applies the difference. Because it pulls, the CI system never needs credentials for the cluster: it only builds images and commits." },
+    { "title": "Reconcile continuously, not once", "text": "Applying is not a one-off step. The controller keeps comparing desired and live state, and reports the application as Synced or OutOfSync. With self-heal on, it also watches the cluster and reverts a hand-made change within seconds. Without it, the change stays until the next sync, which may be an unrelated deploy that wipes it without warning." },
+    { "title": "Prune what Git no longer lists", "text": "Deleting a file from Git does not delete the resource by default: the controller only knows what Git lists, so a removed job keeps running as an orphan. With pruning on, resources that the controller created and Git no longer lists are deleted. Pruning is powerful, so it is usually limited to resources the controller owns." },
+    { "title": "Roll back with git revert", "text": "A bad release is undone by reverting its commit. The controller applies the old state like any other change, and the history shows what happened. How fast that takes depends on how the controller hears about commits: on a 3-minute poll the broken version can stay live for several minutes after the revert is pushed." }
+  ],
+  "pros": [
+    "Every change to production is reviewed and recorded, with an author and a reason",
+    "Rollback is a git revert, and an environment can be rebuilt from the repository",
+    "Drift (hand-made changes) is detected, reported and, with self-heal, undone",
+    "The cluster pulls, so CI never holds credentials that can change production"
+  ],
+  "cons": [
+    "Changes take effect at the next sync: a slow poll adds minutes to every deploy and every rollback",
+    "Emergency fixes by hand are reverted by self-heal, so the on-call engineer must know to commit instead",
+    "Secrets cannot sit in Git in plain text, so they need sealing or an external store",
+    "Steps that are not declarative (a database migration, a one-off script) do not fit the model well"
+  ],
+  "whenToUse": [
+    "Kubernetes or other platforms whose resources are declared in files",
+    "Several environments or clusters that must stay identical, or be rebuilt quickly",
+    "Teams that want every production change reviewed and auditable"
+  ],
+  "whenNotToUse": [
+    "A single server set up by hand, where the controller and repository add more than they save",
+    "Systems configured mostly by imperative steps or by clicking through a console that has no declarative format",
+    "Changes that must happen in a strict order across systems (a migration before a deploy), unless you add sync waves or hooks for them"
+  ],
+  "pitfalls": [
+    "Leaving self-heal off and assuming a hand-made fix will last: the next deploy overwrites it without warning",
+    "Deleting a manifest and expecting the resource to go away, with pruning off",
+    "Relying on a slow poll, so deploys and reverts take minutes to land; add a webhook from Git",
+    "Committing secrets in plain text because everything else lives in Git",
+    "Letting CI or people keep write access to the cluster, so changes bypass Git anyway",
+    "Pointing the controller at a branch everyone pushes to, so an unreviewed commit is a production deploy"
+  ],
+  "related": [
+    { "kind": "concept", "slug": "infrastructure-as-code" },
+    { "kind": "concept", "slug": "containers-and-orchestration" },
+    { "kind": "concept", "slug": "canary-deployments" },
+    { "kind": "concept", "slug": "blue-green-and-rolling-deployments" },
+    { "kind": "concept", "slug": "secrets-management" },
+    { "kind": "concept", "slug": "feature-flags" }
+  ],
+  "roles": [
+    { "id": "dev", "label": "Developer", "description": "Changes production only by committing to the repository." },
+    { "id": "git", "label": "Git repository", "description": "Holds the desired state of the environment, with its full history." },
+    { "id": "controller", "label": "GitOps controller", "description": "Runs in the cluster, pulls from Git, compares and applies." },
+    { "id": "cluster", "label": "Cluster", "description": "Where the service actually runs: the live state." },
+    { "id": "oncall", "label": "On-call engineer", "description": "Has cluster access and makes a change by hand." }
+  ],
+  "quiz": [
+    {
+      "question": "During an incident an engineer scales a service from 3 to 10 replicas with kubectl. Self-heal is off. Two hours later a teammate merges an unrelated config change, and traffic problems return. What happened?",
+      "options": [
+        "The config change used more memory per replica, so 10 replicas were no longer enough.",
+        "Self-heal reverted the scale-up a few seconds after the merge, as it always does.",
+        "The sync applied Git's 3 replicas, quietly undoing the hand change Git never knew about.",
+        "The controller lost track of the deployment because its replica count no longer matched."
+      ],
+      "answer": 2,
+      "explanation": "A sync applies everything in Git, so an unrelated deploy wipes any hand-made change. With self-heal off the change survived only until that sync. The fix is to commit the new replica count, not to make the change by hand. Self-heal would have reverted it within seconds of the scale-up, not at the merge."
+    },
+    {
+      "question": "A team removes an old cron job's manifest from the repository. A week later the job is still running in the cluster. Why?",
+      "options": [
+        "The controller cannot delete jobs, only deployments and services.",
+        "Pruning is off, so the controller does not delete what Git no longer lists.",
+        "Git keeps the old file in its history, so the controller still applies it.",
+        "The cluster restarts cron jobs on its own until an admin deletes them."
+      ],
+      "answer": 1,
+      "explanation": "Removing a file tells the controller to stop managing the resource, not to delete it, unless pruning is on. The old job is now an orphan. The controller only applies the current commit, not the history."
+    },
+    {
+      "question": "A broken release is reverted in Git one minute after it went live. The controller polls Git every 3 minutes and has no webhook. How long can users keep seeing the broken version after the revert is pushed?",
+      "options": [
+        "About 5 seconds, because the controller watches the repository continuously.",
+        "Up to 3 minutes, until the controller's next poll picks up the revert.",
+        "No time at all, because a revert is applied by Git directly to the cluster.",
+        "Until someone presses Sync, because reverts are never applied automatically."
+      ],
+      "answer": 1,
+      "explanation": "Git cannot push to the cluster: the controller pulls, so the revert waits for the next poll. A webhook from Git cuts that to seconds. Reverts are applied automatically like any commit when auto-sync is on."
+    }
+  ]
+}
