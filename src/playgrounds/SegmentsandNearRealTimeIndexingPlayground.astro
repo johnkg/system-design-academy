@@ -1,0 +1,108 @@
+---
+import PlaygroundShell from '../components/PlaygroundShell.astro';
+---
+<PlaygroundShell title="Simulate it" hint="Two minutes of a search index taking writes, in 100 ms steps. Every 10th new document replaces an older one, so the old copy is only marked deleted. Change how often the buffer is refreshed into a segment and when segments are merged.">
+  <ol class="how">
+    <li>Start with the defaults: <b>500</b> documents a second, a refresh every second and merging at 10 similar segments. A new document is searchable after <b>500 ms</b> on average and <b>950 ms</b> at worst. Segments peak at <b>18</b> and end at 3, and merging rewrites the data: <b>164,600</b> documents written to disk for 60,000 that arrived, a write amplification of <b>2.74</b>.</li>
+    <li>Set <b>Refresh interval</b> to <b>30 s</b>: writes get cheaper (a write amplification of <b>1.00</b>, only 4 segments) but a new document waits <b>15,000 ms</b> on average and <b>29,950 ms</b> at worst before a search can find it.</li>
+    <li>Break it: set <b>Refresh interval</b> to <b>100 ms</b> and <b>Merge policy</b> to <b>No merging</b>. Documents are searchable after <b>50 ms</b>, but the index ends with <b>1,200</b> segments and every query must visit all of them. Now set <b>Merge policy</b> to <b>Merge at 10 similar segments</b>: the peak falls to <b>27</b> segments, at the cost of a write amplification of <b>3.74</b>.</li>
+    <li>Set <b>Refresh interval</b> to <b>1 s</b> and <b>Merge policy</b> to <b>Merge at 4 similar segments</b>: a query visits at most <b>9</b> segments, and the write amplification is <b>3.39</b>. Fewer segments cost more rewriting.</li>
+  </ol>
+  <div class="pg sg" data-sg>
+    <div class="pg-row">
+      <label>Documents per second <select class="pg-in" data-rate><option value="100">100</option><option value="500" selected>500</option><option value="2000">2000</option></select></label>
+      <label>Refresh interval <select class="pg-in" data-refresh><option value="100">100 ms</option><option value="1000" selected>1 s</option><option value="5000">5 s</option><option value="30000">30 s</option></select></label>
+      <label>Merge policy <select class="pg-in" data-merge><option value="0">No merging</option><option value="10" selected>Merge at 10 similar segments</option><option value="4">Merge at 4 similar segments</option></select></label>
+    </div>
+    <div class="pg-grid">
+      <div class="pg-box" data-b1><h3>New document searchable after</h3><span class="pg-mono" data-o1></span><span class="pg-note" data-n1></span></div>
+      <div class="pg-box" data-b2><h3>Segments a query must visit</h3><span class="pg-mono" data-o2></span><span class="pg-note" data-n2></span></div>
+      <div class="pg-box" data-b3><h3>Write amplification</h3><span class="pg-mono" data-o3></span><span class="pg-note" data-n3></span></div>
+      <div class="pg-box" data-b4><h3>Deleted copies still on disk</h3><span class="pg-mono" data-o4></span><span class="pg-note" data-n4></span></div>
+    </div>
+    <div class="pg-box" style="--c: var(--border)">
+      <h3>Segments in the index, second by second</h3>
+      <div class="sg-bars" data-bars role="img" aria-label="Segment count at the end of each second of the two minutes"></div>
+      <span class="pg-note" data-n5></span>
+    </div>
+  </div>
+</PlaygroundShell>
+<script>
+  import { query, formatThousands } from '../playground';
+  const TICK_MS = 100, END_MS = 120000, UPDATE_EVERY = 10;
+  interface Seg { level: number; docs: number; dead: number }
+
+  // The same model as the code samples: a refresh flushes the buffer into a new segment, a merge rewrites the live
+  // documents of N similar segments into one, and a delete only marks a copy until its segment is merged.
+  function simulate(docsPerSec: number, refreshMs: number, mergeAt: number) {
+    const perTick = docsPerSec * TICK_MS / 1000;
+    const segments: Seg[] = [];
+    let buffer = 0, arrived = 0, flushed = 0, mergeWritten = 0, merges = 0, created = 0, delaySum = 0, delayMax = 0, peak = 0;
+    const pending: number[] = [];
+    const series: number[] = [];
+    for (let t = TICK_MS; t <= END_MS; t += TICK_MS) {
+      buffer += perTick;
+      pending.push(t - TICK_MS / 2);
+      for (let i = 0; i < perTick; i++) {
+        arrived++;
+        if (arrived % UPDATE_EVERY === 0) { const old = segments.find((s) => s.docs - s.dead > 0); if (old) old.dead++; }
+      }
+      if (t % refreshMs === 0 && buffer > 0) {
+        segments.push({ level: 0, docs: buffer, dead: 0 });
+        created++; flushed += buffer; buffer = 0;
+        for (const at of pending) { const d = t - at; delaySum += d * perTick; if (d > delayMax) delayMax = d; }
+        pending.length = 0;
+        while (mergeAt > 0) {
+          let level = -1;
+          for (let l = 0; l < 20 && level < 0; l++) if (segments.filter((s) => s.level === l).length >= mergeAt) level = l;
+          if (level < 0) break;
+          const group = segments.filter((s) => s.level === level).slice(0, mergeAt);
+          const live = group.reduce((n, s) => n + s.docs - s.dead, 0);
+          for (const s of group) segments.splice(segments.indexOf(s), 1);
+          segments.push({ level: level + 1, docs: live, dead: 0 });
+          mergeWritten += live; merges++;
+        }
+      }
+      peak = Math.max(peak, segments.length);
+      if (t % 1000 === 0) series.push(segments.length);
+    }
+    const dead = segments.reduce((n, s) => n + s.dead, 0);
+    return { arrived, created, merges, peak, final: segments.length, delayAvg: Math.floor(delaySum / flushed), delayMax,
+      ampX100: Math.floor((flushed + mergeWritten) * 100 / flushed), written: flushed + mergeWritten, dead, series };
+  }
+
+  document.querySelectorAll<HTMLElement>('[data-sg]').forEach((root) => {
+    const q = query(root);
+    const bars = q('[data-bars]');
+    const SECONDS = END_MS / 1000;
+    const cells = Array.from({ length: SECONDS }, () => { const c = document.createElement('span'); c.className = 'sg-bar'; bars.appendChild(c); return c; });
+    const box = (n: number, good: boolean) => q<HTMLElement>(`[data-b${n}]`).style.setProperty('--c', good ? 'var(--good)' : 'var(--bad)');
+    function draw() {
+      const rate = Number(q<HTMLSelectElement>('[data-rate]').value);
+      const refresh = Number(q<HTMLSelectElement>('[data-refresh]').value);
+      const merge = Number(q<HTMLSelectElement>('[data-merge]').value);
+      const r = simulate(rate, refresh, merge);
+      q('[data-o1]').textContent = `${formatThousands(r.delayAvg)} ms on average`;
+      q('[data-n1]').textContent = `${formatThousands(r.delayMax)} ms at worst: a document waits in the memory buffer until the next refresh makes it a segment`;
+      box(1, r.delayAvg <= 1000);
+      q('[data-o2]').textContent = `peak ${formatThousands(r.peak)}, ${formatThousands(r.final)} at the end`;
+      q('[data-n2]').textContent = `${formatThousands(r.created)} segments created by refreshes, ${formatThousands(r.merges)} merges. A query looks in every segment, so this is its fixed cost per search`;
+      box(2, r.peak <= 30);
+      q('[data-o3]').textContent = (r.ampX100 / 100).toFixed(2);
+      q('[data-n3]').textContent = `${formatThousands(r.written)} documents written to disk for ${formatThousands(r.arrived)} that arrived`;
+      box(3, r.ampX100 <= 300);
+      q('[data-o4]').textContent = formatThousands(r.dead);
+      q('[data-n4]').textContent = merge === 0 ? 'nothing ever rewrites a segment, so every deleted or replaced copy stays' : 'deletes are marks; a merge drops the marked copies when it rewrites their segments';
+      box(4, merge !== 0);
+      const max = Math.max(...r.series, 1);
+      r.series.forEach((v, i) => { cells[i].style.height = `${Math.max(2, Math.round((v / max) * 60))}px`; cells[i].title = `second ${i + 1}: ${v} segments`; });
+      q('[data-n5]').textContent = `One bar per second; the tallest is ${formatThousands(max)} segments. Merging keeps the count in a band; with no merging it climbs for as long as refreshes keep coming.`;
+    }
+    root.addEventListener('change', draw);
+    draw();
+  });
+</script>
+<style is:global>
+  .playground .sg-bars { display: flex; align-items: flex-end; gap: 1px; height: 64px; }
+  .playground .sg-bar { flex: 1 1 0; min-width: 1px; background: var(--accent); border-radius: 1px 1px 0 0; }
+</style>

@@ -1,0 +1,109 @@
+{
+  "name": "Segments and Near-Real-Time Indexing",
+  "area": "search",
+  "difficulty": "intermediate",
+  "intent": "Write a search index as immutable segments: new documents wait in a memory buffer, a refresh makes them searchable as a small new segment, and background merges combine segments and clear out deleted documents.",
+  "scenario": "A shop's search index takes 500 new or changed listings a second. Every 10th write replaces an older listing. Sellers expect a new listing to show up in search within about a second, and a search must stay fast the whole time. In a two-minute window that is 60,000 documents. The team has to choose how often to refresh (100 ms, 1 s, 30 s) and when to merge, and each choice moves a different number: how long a listing waits to appear, how many segments a query visits, and how many times each document is rewritten on disk.",
+  "problem": "An inverted index is a tightly packed structure: sorted term dictionaries, compressed postings lists, per-segment statistics. Inserting one document into it in place means touching a postings list for every word in the document, rewriting compressed blocks, and locking readers out while it happens. Doing that 500 times a second would make writes slow and searches stall. But the opposite extreme has a price too: build the index in big batches and new listings do not appear for minutes or hours. Search needs fast writes, fast reads and fresh results from a structure that is expensive to change.",
+  "howItWorks": [
+    {
+      "title": "Never edit a segment, only add new ones",
+      "text": "A Lucene-style index is a set of segments. Each segment is a complete small inverted index over some of the documents, written once and never changed afterwards. Immutability is the trick: a reader can use a segment with no locks, the operating system can cache its files freely, and a crash cannot leave one half-written. A search runs against every segment and merges the results, so the index is the union of its segments."
+    },
+    {
+      "title": "The buffer and the refresh",
+      "text": "A new document goes into an in-memory buffer (and into a write-ahead log, so a crash does not lose it). It is not searchable yet. A refresh turns the buffer into a new small segment and opens it to searches. The refresh interval is the freshness knob: with a refresh every 100 ms a document is searchable after 50 ms on average, and with one every 30 s, after 15,000 ms on average and up to 29,950 ms. Elasticsearch, for example, refreshes once a second by default, which is why its search is called near-real-time, not real-time."
+    },
+    {
+      "title": "Every refresh adds a segment, and every query pays for it",
+      "text": "Each refresh creates one more segment, and a query must look in all of them: one dictionary lookup per segment per term, then a merge of the answers. Refresh every 100 ms with no merging and the 500 documents a second produce 1,200 segments in two minutes. Each is tiny, but 1,200 lookups per term on every query is slow, and the open files and memory add up. Freshness bought with a short refresh interval is paid for in segment count."
+    },
+    {
+      "title": "Merging: fewer, bigger segments in the background",
+      "text": "A merge policy picks segments and rewrites them as one. A common shape is tiered: when N segments of similar size exist, merge them into one segment about N times bigger. With N = 10 the 120 one-second segments of the example collapse to a peak of 18 and 3 at the end; with N = 4 the peak is 9. The cost is write amplification: every merge rewrites documents that were already on disk. The example writes 164,600 documents for 60,000 that arrived (2.74 times) at N = 10, and 3.39 times at N = 4. Merges run on background threads, so they compete with searches and indexing for disk and CPU."
+    },
+    {
+      "title": "Deletes and updates are marks, merges clean up",
+      "text": "A segment cannot be edited, so deleting a document sets a mark (a bit in a per-segment list of deleted documents). The document stays on disk, is skipped by searches, and still costs space. An update is a delete plus a new document in the next segment. Only a merge, which copies live documents into a new segment and drops the old ones, actually frees the space. With no merging, every replaced copy stays forever. A tiered policy also tends to leave the biggest segments alone for a long time, so a large segment can hold a lot of deleted documents until it is finally merged."
+    }
+  ],
+  "pros": [
+    "Writes are appends, so indexing stays fast while the index grows",
+    "Readers need no locks, and immutable files cache well in the operating system",
+    "Freshness is a setting: a refresh interval trades freshness against segment count",
+    "A crash cannot corrupt a segment, and the write-ahead log replays the buffer"
+  ],
+  "cons": [
+    "Search is never instant: a document is invisible until the next refresh",
+    "Every segment adds to the cost of every query until it is merged away",
+    "Merges rewrite data, so the disk sees several times the writes the application made",
+    "Deleted and replaced documents keep using space until their segment is merged"
+  ],
+  "whenToUse": [
+    "Search or log indexes that take a steady stream of writes and need results within seconds",
+    "Any read-heavy structure that is expensive to update in place and cheap to rebuild in pieces",
+    "Setting refresh intervals for bulk loads or for dashboards that tolerate slightly stale results"
+  ],
+  "whenNotToUse": [
+    "Read-your-own-write guarantees, such as showing a user the document they just saved, unless you ask for a refresh or read from the primary store",
+    "Systems that need the new document visible to every query immediately and cannot tolerate a refresh delay",
+    "A static corpus that changes rarely, where a periodic full rebuild is simpler than tuning merges"
+  ],
+  "pitfalls": [
+    "Setting a very short refresh interval everywhere: the index fills with tiny segments and queries slow down",
+    "Refreshing after every single write to make tests pass, then shipping that setting to production",
+    "Turning merging off, or starving it of disk speed, so segments pile up faster than they are merged",
+    "Treating a delete as freeing space at once: the space returns only when a merge rewrites the segment",
+    "Forgetting the bulk-load case: for a big import, a long refresh interval or none at all is much cheaper, then refresh once at the end",
+    "Ignoring write amplification when sizing disks: the drive writes several times the data the application sent"
+  ],
+  "related": [
+    { "kind": "concept", "slug": "inverted-indexes-and-text-search" },
+    { "kind": "concept", "slug": "lsm-trees-vs-b-trees" },
+    { "kind": "concept", "slug": "write-ahead-log" },
+    { "kind": "concept", "slug": "bm25-and-relevance-ranking" },
+    { "kind": "concept", "slug": "backpressure" }
+  ],
+  "roles": [
+    { "id": "writer", "label": "Indexing client", "description": "Sends new and changed documents to the index." },
+    { "id": "buffer", "label": "Memory buffer", "description": "Holds recent documents that are written to the log but not yet searchable." },
+    { "id": "segments", "label": "Segments on disk", "description": "Immutable mini-indexes. A query reads every one of them." },
+    { "id": "merger", "label": "Merge thread", "description": "Combines similar-sized segments in the background and drops deleted documents." },
+    { "id": "searcher", "label": "Searcher", "description": "Runs a query against all searchable segments and merges the results." }
+  ],
+  "quiz": [
+    {
+      "question": "An application saves a listing and immediately searches for it, but the search does not find it. The index refreshes once a second. What is the most likely cause?",
+      "options": [
+        "The listing is lost, because segments are never updated after they are written.",
+        "The index deleted the listing because the buffer filled up.",
+        "The listing is still in the memory buffer, and the next refresh will make it searchable.",
+        "The search must wait for a merge before it can see new documents."
+      ],
+      "answer": 2,
+      "explanation": "Near-real-time means a new document is searchable only after a refresh turns the buffer into a segment, up to one interval later. Nothing is lost, because the buffer is also protected by a log. A merge only reorganizes segments that are already searchable."
+    },
+    {
+      "question": "A team sets the refresh interval to 100 ms and disables merging to avoid disk writes. After two minutes at 500 documents a second, searches are slow. Why?",
+      "options": [
+        "Short refresh intervals make each document larger on disk.",
+        "Deleted documents are being searched twice.",
+        "The write-ahead log has grown too large to read.",
+        "The index has about 1,200 tiny segments, and every query must look in each one."
+      ],
+      "answer": 3,
+      "explanation": "One refresh makes one segment, so 120 seconds at one refresh per 100 ms makes 1,200, and a query pays a lookup in every segment. Merging is what keeps that number down. Document size, deletes and the log are not affected by the interval in this way."
+    },
+    {
+      "question": "Compared with merging when 10 similar segments exist, merging when only 4 exist does what?",
+      "options": [
+        "Keeps fewer segments at any moment, but rewrites each document more times.",
+        "Keeps more segments, but rewrites each document fewer times.",
+        "Makes new documents searchable sooner, because merges are done sooner.",
+        "Avoids write amplification, because the segments are smaller when merged."
+      ],
+      "answer": 0,
+      "explanation": "A lower threshold merges earlier and more often, so the segment count stays lower (a peak of 9 against 18 in the example) and the same documents are copied through more merges (3.39 against 2.74 times). Merging does not change when a document becomes searchable; that is the refresh."
+    }
+  ]
+}
