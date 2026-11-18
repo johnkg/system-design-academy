@@ -1,0 +1,139 @@
+---
+import PlaygroundShell from '../components/PlaygroundShell.astro';
+---
+<PlaygroundShell title="Simulate it" hint="Two devices edit one record with five fields. Device B goes offline at minute 15 and queues what it does; device A stays online. The scenario ends when B reconnects and replays its queue. Edits are the same every time: A and B each write a value that names who wrote it and when.">
+  <ol class="how">
+    <li>Start with the defaults: <b>Conflict policy</b> is <b>Last writer wins (newest clock)</b>, with an <b>Offline window (minutes)</b> of <b>20</b> and correct clocks. B replays <b>4 mutations</b> (<b>139 bytes</b>) and wins, because its last edit is newest. The record is B's, and <b>2 edits</b> by A (notes and status) are silently lost.</li>
+    <li>Set <b>Device B clock</b> to <b>8 minutes behind</b>: B's edits are now stamped as older than A's, so A wins and <b>4 edits</b> are lost, all of B's, including due and title, which A never touched, although they were made later. Clocks on phones are set by users and drift, so this policy loses data in a way nobody can predict.</li>
+    <li>Set <b>Conflict policy</b> to <b>Merge per field</b> and <b>Device B clock</b> back to <b>Correct</b>: <b>3 edits</b> are merged, including notes joined as <b>A20+B15</b>, and only <b>1 edit</b> is lost (a status, picked by the newest clock). Then set <b>Conflict policy</b> to <b>Ask the user</b>: <b>0 edits</b> lost, <b>2 conflicts</b> go to the user.</li>
+    <li>Set <b>Conflict policy</b> to <b>Server order wins</b>, then tick <b>Device A deletes the record at minute 23</b>: the delete reaches the server first, B's edits hit a deleted record, and the whole record is <b>DELETED</b> with <b>4 edits</b> lost.</li>
+  </ol>
+  <div class="pg sq" data-sq>
+    <div class="pg-row">
+      <label>Conflict policy <select class="pg-in" data-policy><option value="lww" selected>Last writer wins (newest clock)</option><option value="server">Server order wins</option><option value="merge">Merge per field</option><option value="ask">Ask the user</option></select></label>
+      <label>Offline window (minutes) <input class="pg-in" type="number" min="1" max="45" step="1" value="20" data-offline /></label>
+      <label>Device B clock <select class="pg-in" data-skew><option value="0" selected>Correct</option><option value="-8">8 minutes behind</option><option value="-3">3 minutes behind</option><option value="8">8 minutes ahead</option></select></label>
+      <label><input type="checkbox" data-delete /> Device A deletes the record at minute 23</label>
+    </div>
+    <div class="pg-grid">
+      <div class="pg-box" data-b1><h3>Edits silently lost</h3><span class="pg-mono" data-o1></span><span class="pg-note" data-n1></span></div>
+      <div class="pg-box" data-b2><h3>Edits merged</h3><span class="pg-mono" data-o2></span><span class="pg-note" data-n2></span></div>
+      <div class="pg-box" data-b3><h3>Conflicts sent to the user</h3><span class="pg-mono" data-o3></span><span class="pg-note" data-n3></span></div>
+      <div class="pg-box" data-b4><h3>Outbox replayed at reconnect</h3><span class="pg-mono" data-o4></span><span class="pg-note" data-n4></span></div>
+    </div>
+    <div class="pg-box" style="--c: var(--border)">
+      <h3>Final record</h3>
+      <div class="sq-rec" data-rec></div>
+      <span class="pg-note" data-n5></span>
+    </div>
+    <ol class="pg-log" data-log tabindex="0" aria-label="The edits and what the policy did with them"></ol>
+  </div>
+</PlaygroundShell>
+<script>
+  import { query, formatThousands } from '../playground';
+  const FIELDS = ['title', 'notes', 'due', 'status', 'priority'];
+  const BASE: Record<string, string> = { title: 'Buy milk', notes: '-', due: 'Fri', status: 'open', priority: 'low' };
+  const OFFLINE_START = 15; const DELETE_AT = 23; const EDITS = 14; const ACK_LOST_PCT = 25;
+  type Policy = 'lww' | 'server' | 'merge' | 'ask';
+  interface Edit { t: number; device: string; field: string; value: string }
+  interface Result { lost: number; merged: number; toUser: number; queue: number; bytes: number; dupes: number; deleted: boolean; state: Record<string, string>; edits: Edit[]; notes: string[]; end: number; pending: string[] }
+
+  const makeRng = (seed: number) => { let s = seed; return () => { s = (s * 48271) % 2147483647; return s; }; };
+  function timeline(): Edit[] {
+    const next = makeRng(97); const edits: Edit[] = [];
+    for (let k = 0; k < EDITS; k++) {
+      const t = k * 4 + (next() % 4); const device = next() % 2 === 0 ? 'A' : 'B'; const field = FIELDS[next() % FIELDS.length];
+      edits.push({ t, device, field, value: `${device}${t}` });
+    }
+    return edits;
+  }
+  const net = (list: Edit[]) => { const m = new Map<string, Edit>(); for (const e of list) m.set(e.field, e); return [...m.values()]; };
+
+  // The same model as the code samples, plus a list of what the policy decided.
+  function simulate(policy: Policy, offlineMin: number, skew: number, deleteOn: boolean): Result {
+    const end = OFFLINE_START + offlineMin;
+    const deleteInWindow = deleteOn && DELETE_AT < end;
+    const edits = timeline().filter((e) => e.t < end && !(deleteInWindow && e.device === 'A' && e.t >= DELETE_AT));
+    const state: Record<string, string> = { ...BASE };
+    let deleted = false, lost = 0, merged = 0, toUser = 0;
+    const notes: string[] = []; const pending: string[] = [];
+    for (const e of edits) if (e.t < OFFLINE_START) state[e.field] = e.value;
+    const before = { ...state };
+    const aWin = edits.filter((e) => e.device === 'A' && e.t >= OFFLINE_START && e.t < end);
+    const bQueue = edits.filter((e) => e.device === 'B' && e.t >= OFFLINE_START && e.t < end);
+    const aNet = net(aWin), bNet = net(bQueue);
+    for (const e of aNet) state[e.field] = e.value;
+    const bTs = (e: Edit) => e.t + skew;
+    const both = aNet.length > 0 && bNet.length > 0;
+    const aOnly = aNet.filter((a) => !bNet.some((b) => b.field === a.field));
+    const bOnly = bNet.filter((b) => !aNet.some((a) => a.field === b.field));
+    const same = bNet.filter((b) => aNet.some((a) => a.field === b.field));
+    const fieldLevel = () => {
+      if (both) { merged += aOnly.length + bOnly.length; if (aOnly.length + bOnly.length) notes.push(`${aOnly.length + bOnly.length} edits touched different fields on the two devices and are all kept`); }
+      for (const e of bOnly) state[e.field] = e.value;
+      for (const b of same) {
+        const a = aNet.find((x) => x.field === b.field)!;
+        if (policy === 'server') { state[b.field] = b.value; lost++; notes.push(`${b.field}: B's ${b.value} arrived last and overwrote A's ${a.value}`); }
+        else if (policy === 'merge' && b.field === 'notes') { state[b.field] = `${a.value}+${b.value}`; merged++; notes.push(`notes: both texts kept, joined as ${a.value}+${b.value}`); }
+        else if (policy === 'merge') { if (bTs(b) > a.t) state[b.field] = b.value; lost++; notes.push(`${b.field}: B's clock says minute ${bTs(b)}, A's says ${a.t}; the newer stamp wins, the other edit is dropped`); }
+        else { toUser++; pending.push(b.field); notes.push(`${b.field}: A wrote ${a.value} and B wrote ${b.value}; the user is asked which to keep`); }
+      }
+    };
+    if (deleteInWindow && bNet.length > 0) {
+      const bLast = Math.max(...bNet.map(bTs));
+      if (policy === 'lww') {
+        if (DELETE_AT > bLast) { deleted = true; lost += bNet.length; notes.push(`the delete (minute ${DELETE_AT}) is stamped newer than B's last edit (minute ${bLast}), so B's ${bNet.length} edits are dropped`); }
+        else { Object.assign(state, before); for (const e of bNet) state[e.field] = e.value; lost += aNet.length + 1; notes.push(`B's last edit (minute ${bLast}) is newer than the delete (minute ${DELETE_AT}): the record comes back as B left it, and A's edits and the delete are dropped`); }
+      } else if (policy === 'server') { deleted = true; lost += bNet.length; notes.push(`the delete reached the server first, so B's ${bNet.length} edits hit a deleted record and are rejected`); }
+      else { fieldLevel(); if (policy === 'merge') { lost++; notes.push('delete against edits: the edits win, the record is kept and the delete is dropped'); } else { toUser++; pending.push('delete'); notes.push('delete against edits: the user is asked to keep the record or delete it'); } }
+    } else {
+      if (deleteInWindow) { deleted = true; notes.push('A deleted the record and B made no edits meanwhile, so the delete stands'); }
+      if (!both) { for (const e of bNet) state[e.field] = e.value; if (!deleteInWindow) notes.push(aNet.length === 0 && bNet.length === 0 ? 'neither device changed anything while B was offline: nothing to settle' : 'only one device edited while B was offline: nothing conflicts and all its edits apply'); }
+      else if (policy === 'lww') {
+        const aLast = Math.max(...aNet.map((e) => e.t)), bLast = Math.max(...bNet.map(bTs));
+        if (bLast >= aLast) { Object.assign(state, before); for (const e of bNet) state[e.field] = e.value; lost += aNet.length; notes.push(`B's newest stamp (minute ${bLast}) beats A's (minute ${aLast}): B's whole record replaces A's, so A's ${aNet.length} edits are dropped`); }
+        else { lost += bNet.length; notes.push(`A's newest stamp (minute ${aLast}) beats B's (minute ${bLast}): A's record stays, so B's ${bNet.length} edits are dropped`); }
+      } else fieldLevel();
+    }
+    const next = makeRng(17); let bytes = 0, dupes = 0;
+    bQueue.forEach((e, j) => { bytes += `B-${j + 1}`.length + e.field.length + e.value.length + 24; if (next() % 100 < ACK_LOST_PCT) dupes++; });
+    return { lost, merged, toUser, queue: bQueue.length, bytes, dupes, deleted, state, edits, notes, end, pending };
+  }
+
+  document.querySelectorAll<HTMLElement>('[data-sq]').forEach((root) => {
+    const q = query(root);
+    const box = (n: number, good: boolean) => q<HTMLElement>(`[data-b${n}]`).style.setProperty('--c', good ? 'var(--good)' : 'var(--bad)');
+    const plural = (n: number, one: string, many: string) => `${formatThousands(n)} ${n === 1 ? one : many}`;
+    function draw() {
+      const policy = q<HTMLSelectElement>('[data-policy]').value as Policy;
+      const raw = Number(q<HTMLInputElement>('[data-offline]').value);
+      const offline = Number.isFinite(raw) && q<HTMLInputElement>('[data-offline]').value !== '' ? Math.min(45, Math.max(1, Math.round(raw))) : 20;
+      const r = simulate(policy, offline, Number(q<HTMLSelectElement>('[data-skew]').value), q<HTMLInputElement>('[data-delete]').checked);
+      q('[data-o1]').textContent = plural(r.lost, 'edit', 'edits');
+      q('[data-n1]').textContent = r.lost ? 'dropped with no message: the user never learns they were overwritten' : 'nothing was overwritten';
+      box(1, r.lost === 0);
+      q('[data-o2]').textContent = plural(r.merged, 'edit', 'edits');
+      q('[data-n2]').textContent = 'changes from both devices combined in one record';
+      q<HTMLElement>('[data-b2]').style.setProperty('--c', r.merged > 0 ? 'var(--good)' : 'var(--border)');
+      q('[data-o3]').textContent = plural(r.toUser, 'conflict', 'conflicts');
+      q('[data-n3]').textContent = r.toUser ? 'both versions are kept until the user picks one' : 'no one is asked';
+      q<HTMLElement>('[data-b3]').style.setProperty('--c', 'var(--border)');
+      q('[data-o4]').textContent = `${plural(r.queue, 'mutation', 'mutations')}, ${formatThousands(r.bytes)} bytes`;
+      q('[data-n4]').textContent = `each has an id; ${r.dupes} repeat ${r.dupes === 1 ? 'send was' : 'sends were'} ignored because the server had already applied that id`;
+      q<HTMLElement>('[data-b4]').style.setProperty('--c', 'var(--border)');
+      const rec = q('[data-rec]'); rec.textContent = '';
+      if (r.deleted) { const d = document.createElement('div'); d.className = 'pg-mono'; d.textContent = 'DELETED'; rec.appendChild(d); }
+      else for (const f of FIELDS) { const d = document.createElement('div'); d.className = 'pg-mono'; d.textContent = `${f} = ${r.state[f]}${r.pending.includes(f) ? '  (asking the user: A and B disagree)' : ''}`; rec.appendChild(d); }
+      q('[data-n5]').textContent = r.deleted ? 'The record no longer exists.' : r.pending.includes('delete') ? 'A delete is waiting for the user to confirm it.' : `Values read device and minute: A20 is device A at minute 20. B queued ${r.queue} mutations while offline until minute ${r.end}.`;
+      const log = q('[data-log]'); log.textContent = '';
+      for (const e of r.edits) {
+        const queued = e.device === 'B' && e.t >= OFFLINE_START;
+        const li = document.createElement('li'); li.textContent = `Minute ${e.t}, device ${e.device}: set ${e.field} = ${e.value}${queued ? ' (queued in the outbox, B is offline)' : ''}`; log.appendChild(li);
+      }
+      for (const n of r.notes) { const li = document.createElement('li'); li.textContent = `Reconnect: ${n}`; log.appendChild(li); }
+    }
+    root.addEventListener('change', draw);
+    root.addEventListener('input', draw);
+    draw();
+  });
+</script>
