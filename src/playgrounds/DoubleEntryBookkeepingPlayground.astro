@@ -1,0 +1,174 @@
+---
+import PlaygroundShell from '../components/PlaygroundShell.astro';
+---
+<PlaygroundShell title="Simulate it" hint="Four accounts and two ways to keep the books: an append-only journal of balanced entries (balances are summed from it) and a single balance number per account that is updated in place. Press the operations and compare. Amounts are in cents, so 10000 is 100.00.">
+  <ol class="how">
+    <li>Press <b>Card payment</b> with the <b>Fee on a card payment (cents)</b> at <b>300</b>: one journal entry debits cash_at_bank 10000 and credits merchant_payable 9700 and fees_revenue 300. Total debits and total credits are both <b>10000</b>, so the trial balance difference is <b>0</b>.</li>
+    <li>Press <b>Unbalanced entry</b>: the journal rejects it, because debits are 5000 and credits <b>4900</b>, a difference of <b>100</b>, and the journal still has 1 entry. The balance column design has nothing to check the change against, so it applies it, and its columns now add up to <b>100</b> instead of 0.</li>
+    <li>Press <b>Reset</b>, then <b>Two card payments at once</b>. The journal holds both entries and merchant_payable is <b>19400</b>. The balance column read the same old values for both payments, so the second write overwrote the first and it shows only <b>9700</b>: <b>10000</b> cents of cash vanished from its books.</li>
+    <li>Press <b>Reset</b>, <b>Card payment</b>, <b>Payout</b>, then <b>Reverse last entry</b>. Nothing was edited or deleted: the journal now has <b>3 entries</b>, the third undoes the payout, and merchant_payable is back to <b>9700</b>.</li>
+  </ol>
+  <div class="pg de" data-de>
+    <div class="pg-row">
+      <label>Fee on a card payment (cents) <input class="pg-in" type="number" min="0" max="1000" step="1" value="300" data-fee /></label>
+    </div>
+    <div class="pg-row">
+      <button class="btn pg-primary" type="button" data-op="pay">Card payment</button>
+      <button class="btn" type="button" data-op="both">Two card payments at once</button>
+      <button class="btn" type="button" data-op="refund">Refund</button>
+      <button class="btn" type="button" data-op="payout">Payout</button>
+      <button class="btn" type="button" data-op="topup">Wallet top-up</button>
+      <button class="btn" type="button" data-op="bad">Unbalanced entry</button>
+      <button class="btn" type="button" data-op="reverse">Reverse last entry</button>
+      <button class="btn" type="button" data-op="reset">Reset</button>
+    </div>
+    <div class="pg-out" data-msg aria-live="polite"></div>
+    <div class="pg-grid">
+      <div class="pg-box" data-b1><h3>Trial balance (journal)</h3><span class="pg-mono" data-o1></span><span class="pg-note" data-n1></span></div>
+      <div class="pg-box" data-b2><h3>Balance columns added up</h3><span class="pg-mono" data-o2></span><span class="pg-note" data-n2></span></div>
+      <div class="pg-box" data-b3><h3>Journal entries</h3><span class="pg-mono" data-o3></span><span class="pg-note" data-n3></span></div>
+      <div class="pg-box" data-b4><h3>Money the columns got wrong</h3><span class="pg-mono" data-o4></span><span class="pg-note" data-n4></span></div>
+    </div>
+    <div class="pg-box" style="--c: var(--border)">
+      <h3>Balances per account</h3>
+      <div class="de-scroll" tabindex="0" role="region" aria-label="Balances per account"><table class="de-table" data-bal></table></div>
+      <span class="pg-note">The journal balance is summed from the entries; the balance column is a number edited in place.</span>
+    </div>
+    <ol class="pg-log" data-log tabindex="0" aria-label="The journal and rejected entries, in order"></ol>
+  </div>
+</PlaygroundShell>
+<script>
+  import { query } from '../playground';
+
+  interface Line { account: string; amount: number }
+  interface Entry { id: number; memo: string; lines: Line[]; reverses: number }
+  const ACCOUNTS: { id: string; kind: string; normal: 1 | -1 }[] = [
+    { id: 'cash_at_bank', kind: 'asset', normal: 1 },
+    { id: 'customer_wallet', kind: 'liability', normal: -1 },
+    { id: 'merchant_payable', kind: 'liability', normal: -1 },
+    { id: 'fees_revenue', kind: 'revenue', normal: -1 },
+  ];
+  const AMOUNT = 10000;
+  const cardPayment = (amount: number, fee: number): Line[] => [
+    { account: 'cash_at_bank', amount }, { account: 'merchant_payable', amount: -(amount - fee) }, { account: 'fees_revenue', amount: -fee },
+  ];
+  const negate = (lines: Line[]): Line[] => lines.map((l) => ({ account: l.account, amount: -l.amount }));
+
+  // The same model as the code samples, kept between button presses.
+  function makeBooks() {
+    const journal: Entry[] = [];
+    const column: Record<string, number> = Object.fromEntries(ACCOUNTS.map((a) => [a.id, 0]));
+    const log: { text: string; ok: boolean }[] = [];
+    const payments: { entry: number; amount: number; fee: number; refunded: boolean }[] = [];
+    const reversed = new Set<number>();
+    function post(memo: string, lines: Line[], reverses = 0): boolean {
+      const debits = lines.filter((l) => l.amount > 0).reduce((s, l) => s + l.amount, 0);
+      const credits = -lines.filter((l) => l.amount < 0).reduce((s, l) => s + l.amount, 0);
+      if (debits !== credits) { log.push({ ok: false, text: `rejected "${memo}": debits ${debits} but credits ${credits}, difference ${debits - credits}` }); return false; }
+      journal.push({ id: journal.length + 1, memo, lines, reverses });
+      log.push({ ok: true, text: `posted #${journal.length} "${memo}": ${lines.map((l) => `${l.amount > 0 ? 'Dr' : 'Cr'} ${l.account} ${Math.abs(l.amount)}`).join(', ')}` });
+      return true;
+    }
+    const balance = (account: string) => journal.reduce((s, e) => s + e.lines.filter((l) => l.account === account).reduce((t, l) => t + l.amount, 0), 0);
+    const applyInPlace = (lines: Line[]) => { for (const l of lines) column[l.account] += l.amount; };
+    function concurrentInPlace(a: Line[], b: Line[]) {
+      const snapshot = { ...column };
+      for (const lines of [a, b]) for (const l of lines) column[l.account] = snapshot[l.account] + l.amount;
+    }
+    return { journal, column, log, payments, reversed, post, balance, applyInPlace, concurrentInPlace };
+  }
+
+  document.querySelectorAll<HTMLElement>('[data-de]').forEach((root) => {
+    const q = query(root);
+    let books = makeBooks();
+    const box = (n: number, good: boolean) => q<HTMLElement>(`[data-b${n}]`).style.setProperty('--c', good ? 'var(--good)' : 'var(--bad)');
+    const set = (n: number, out: string, note: string) => { q(`[data-o${n}]`).textContent = out; q(`[data-n${n}]`).textContent = note; };
+    const msg = q('[data-msg]');
+    const say = (text: string, bad = false) => { msg.textContent = text; msg.classList.toggle('bad', bad); };
+
+    function run(memo: string, lines: Line[]): boolean {
+      const ok = books.post(memo, lines);
+      books.applyInPlace(lines);
+      return ok;
+    }
+
+    function press(op: string) {
+      const fee = Math.min(1000, Math.max(0, Math.floor(Number(q<HTMLInputElement>('[data-fee]').value) || 0)));
+      if (op === 'reset') { books = makeBooks(); say('All books cleared.'); return; }
+      if (op === 'pay') {
+        run(`card payment 100.00, fee ${fee}`, cardPayment(AMOUNT, fee));
+        books.payments.push({ entry: books.journal.length, amount: AMOUNT, fee, refunded: false });
+        say(`Posted entry #${books.journal.length}: cash comes in, the merchant is owed ${AMOUNT - fee}, the platform earns ${fee}.`);
+      } else if (op === 'both') {
+        const a = cardPayment(AMOUNT, fee), b = cardPayment(AMOUNT, fee);
+        books.post('card payment 100.00 (A)', a); books.post('card payment 100.00 (B)', b);
+        books.payments.push({ entry: books.journal.length - 1, amount: AMOUNT, fee, refunded: false }, { entry: books.journal.length, amount: AMOUNT, fee, refunded: false });
+        books.concurrentInPlace(a, b);
+        say('Both payments were appended to the journal. In the balance column both read the same old balances before writing, so the second write overwrote the first.');
+      } else if (op === 'refund') {
+        const p = [...books.payments].reverse().find((x) => !x.refunded);
+        if (!p) { books.log.push({ ok: false, text: 'rejected refund: there is no payment left to refund' }); say('Rejected: there is no payment left to refund.', true); }
+        else {
+          p.refunded = true;
+          run(`refund of payment #${p.entry} (fee returned)`, [{ account: 'merchant_payable', amount: p.amount - p.fee }, { account: 'fees_revenue', amount: p.fee }, { account: 'cash_at_bank', amount: -p.amount }]);
+          say(`Posted entry #${books.journal.length}: refund of payment #${p.entry}, money goes back out of cash.`);
+        }
+      } else if (op === 'payout') {
+        const owed = -books.balance('merchant_payable');
+        if (owed <= 0) { books.log.push({ ok: false, text: 'rejected payout: nothing is owed to the merchant' }); say('Rejected: nothing is owed to the merchant.', true); }
+        else { run('payout of everything owed to the merchant', [{ account: 'merchant_payable', amount: owed }, { account: 'cash_at_bank', amount: -owed }]); say(`Posted entry #${books.journal.length}: ${owed} paid out to the merchant.`); }
+      } else if (op === 'topup') {
+        run('wallet top-up 50.00', [{ account: 'cash_at_bank', amount: 5000 }, { account: 'customer_wallet', amount: -5000 }]);
+        say(`Posted entry #${books.journal.length}: the customer's wallet is funded with 5000.`);
+      } else if (op === 'bad') {
+        const bad: Line[] = [{ account: 'cash_at_bank', amount: 5000 }, { account: 'merchant_payable', amount: -4900 }];
+        const ok = run('deliberately unbalanced entry', bad);
+        say(ok ? 'Posted.' : 'The journal rejected the entry: debits 5000 but credits 4900. The balance column design applied it anyway and cannot tell.', !ok);
+      } else if (op === 'reverse') {
+        const last = [...books.journal].reverse().find((e) => e.reverses === 0 && !books.reversed.has(e.id));
+        if (!last) { books.log.push({ ok: false, text: 'rejected reversal: no entry to reverse' }); say('Rejected: there is no entry to reverse.', true); }
+        else { books.reversed.add(last.id); run(`reversal of #${last.id}`, negate(last.lines)); books.journal[books.journal.length - 1].reverses = last.id; say(`Posted entry #${books.journal.length}: it undoes #${last.id}. Entry #${last.id} is still in the journal.`); }
+      }
+    }
+
+    function draw() {
+      const debits = books.journal.reduce((s, e) => s + e.lines.filter((l) => l.amount > 0).reduce((t, l) => t + l.amount, 0), 0);
+      const credits = books.journal.reduce((s, e) => s - e.lines.filter((l) => l.amount < 0).reduce((t, l) => t + l.amount, 0), 0);
+      set(1, `debits ${debits}, credits ${credits}, difference ${debits - credits}`, 'every entry balances, so this is always 0');
+      box(1, debits === credits);
+      const colSum = ACCOUNTS.reduce((s, a) => s + books.column[a.id], 0);
+      set(2, String(colSum), colSum === 0 ? 'zero here, but a column cannot prove the books balance' : 'not zero: something was applied that does not balance, and there is no history to find it in');
+      box(2, colSum === 0);
+      const n = books.journal.length;
+      set(3, `${n} ${n === 1 ? 'entry' : 'entries'}`, 'append only: nothing is edited or deleted');
+      box(3, true);
+      const table = q<HTMLTableElement>('[data-bal]');
+      table.textContent = '';
+      const head = table.insertRow();
+      for (const h of ['Account', 'Normal side', 'Journal balance', 'Balance column', 'Column']) { const th = document.createElement('th'); th.textContent = h; head.appendChild(th); }
+      let wrong = 0;
+      for (const a of ACCOUNTS) {
+        const j = a.normal * books.balance(a.id), c = a.normal * books.column[a.id];
+        wrong += Math.abs(j - c);
+        const row = table.insertRow();
+        [a.id, `${a.kind}, ${a.normal === 1 ? 'debit' : 'credit'}`, String(j), String(c), j === c ? 'matches' : `off by ${c - j}`].forEach((v, i) => { const td = row.insertCell(); td.textContent = v; if (i === 4 && j !== c) td.className = 'de-bad'; });
+      }
+      set(4, String(wrong), wrong === 0 ? 'the column design agrees with the journal so far' : 'summed over the accounts, compared with the journal');
+      box(4, wrong === 0);
+      const log = q('[data-log]'); log.textContent = '';
+      for (const l of books.log) { const li = document.createElement('li'); li.textContent = l.text; if (!l.ok) li.className = 'de-bad'; log.appendChild(li); }
+    }
+
+    root.querySelectorAll<HTMLButtonElement>('[data-op]').forEach((b) => b.addEventListener('click', () => { press(b.dataset.op!); draw(); }));
+    say('Press an operation.');
+    draw();
+  });
+</script>
+<style is:global>
+  .playground .de { display: grid; gap: 12px; }
+  .playground .de-scroll { overflow-x: auto; }
+  .playground .de-table { border-collapse: collapse; font: .82rem var(--font-mono); width: 100%; }
+  .playground .de-table th, .playground .de-table td { text-align: left; padding: 4px 10px 4px 0; white-space: nowrap; }
+  .playground .de-table th { color: var(--muted); font-weight: 600; }
+  .playground .de-bad { color: var(--bad-text); font-weight: 700; }
+</style>
