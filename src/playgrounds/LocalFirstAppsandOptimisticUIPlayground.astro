@@ -1,0 +1,111 @@
+---
+import PlaygroundShell from '../components/PlaygroundShell.astro';
+---
+<PlaygroundShell title="Simulate it" hint="A to-do app and 20 taps, the same 20 every time. The server answers after the network latency (plus up to 30% jitter) and rejects the chosen share of requests. The connection drops after the chosen action, and the app is closed while it is still offline.">
+  <ol class="how">
+    <li>Start with the defaults: <b>Mode</b> is wait for the server, with <b>Network latency (ms)</b> at <b>400</b>. The screen changes after <b>1,229 ms</b> on average, because every tap waits for the answer, and the 6 taps made offline are <b>6 lost</b> when the app closes.</li>
+    <li>Set <b>Mode</b> to <b>Optimistic with rollback</b>: the screen changes after <b>16 ms</b>, but <b>3 actions</b> were shown, then rolled back with a message when the server said no. Nothing got safer: the <b>6 lost</b> remain, and now the user saw them succeed.</li>
+    <li>Set <b>Mode</b> to <b>Local-first with sync queue</b>: still <b>16 ms</b>, nothing rolled back, <b>0 lost</b>, and <b>6 actions</b> wait in the saved queue for the next launch.</li>
+    <li>To break it, set <b>Server failure rate (%)</b> to <b>30</b>, set <b>Network latency (ms)</b> to <b>1200</b> and set <b>Mode</b> to <b>Wait for server</b>: <b>1,887 ms</b> on average. Now set <b>Mode</b> to <b>Optimistic with rollback</b>: the screen is instant again, but <b>5 actions</b> flip back after more than a second, which can feel worse than waiting.</li>
+  </ol>
+  <div class="pg lf" data-lf>
+    <div class="pg-row">
+      <label>Mode <select class="pg-in" data-mode><option value="wait" selected>Wait for server</option><option value="optimistic">Optimistic with rollback</option><option value="local">Local-first with sync queue</option></select></label>
+      <label>Network latency (ms) <input class="pg-in" type="number" min="50" max="3000" step="50" value="400" data-latency /></label>
+      <label>Server failure rate (%) <input class="pg-in" type="number" min="0" max="100" step="5" value="15" data-fail /></label>
+      <label>Connection drops after action <input class="pg-in" type="number" min="0" max="20" step="1" value="14" data-offline /></label>
+    </div>
+    <div class="pg-grid">
+      <div class="pg-box" data-b1><h3>Screen changes after (average)</h3><span class="pg-mono" data-o1></span><span class="pg-note" data-n1></span></div>
+      <div class="pg-box" data-b2><h3>Shown wrongly, then rolled back</h3><span class="pg-mono" data-o2></span><span class="pg-note" data-n2></span></div>
+      <div class="pg-box" data-b3><h3>Lost when the app closes offline</h3><span class="pg-mono" data-o3></span><span class="pg-note" data-n3></span></div>
+      <div class="pg-box" data-b4><h3>Waiting in the saved queue</h3><span class="pg-mono" data-o4></span><span class="pg-note" data-n4></span></div>
+    </div>
+    <div class="pg-box" style="--c: var(--border)">
+      <h3>What happened to each of the 20 actions</h3>
+      <div class="lf-strip" data-strip></div>
+      <span class="pg-note">Green: on the server. Amber: the server said no (an error, a rollback, or a retry from the queue). Red: lost. Blue: kept in the queue.</span>
+    </div>
+    <ol class="pg-log" data-log tabindex="0" aria-label="What happened to each action"></ol>
+  </div>
+</PlaygroundShell>
+<script>
+  import { query, formatThousands } from '../playground';
+  const ACTIONS = 20; const UI_MS = 16; const OFFLINE_NOTICE_MS = 3000; const SEED = 2024;
+  type Mode = 'wait' | 'optimistic' | 'local';
+  type Fate = 'saved' | 'rolled' | 'retried' | 'lost' | 'queued' | 'rejected';
+  interface Result { avg: number; rolledBack: number; lost: number; queued: number; failed: number; saved: number; fates: Fate[]; shown: number[] }
+
+  // The same model as the code samples: Park-Miller numbers, integers only.
+  function plan() {
+    let s = SEED; const next = () => { s = (s * 48271) % 2147483647; return s; };
+    return Array.from({ length: ACTIONS }, () => ({ jitter: next() % 31, roll: next() % 100 }));
+  }
+  function simulate(mode: Mode, latencyMs: number, failPct: number, offlineAfter: number): Result {
+    let shownTotal = 0, rolledBack = 0, lost = 0, failed = 0, saved = 0, queued = 0;
+    const fates: Fate[] = []; const shown: number[] = [];
+    plan().forEach((a, i) => {
+      const online = i < offlineAfter;
+      const lat = Math.floor((latencyMs * (100 + a.jitter)) / 100);
+      const fails = online && a.roll < failPct;
+      if (fails) failed++;
+      let t: number; let fate: Fate;
+      if (mode === 'wait') {
+        t = online ? lat : OFFLINE_NOTICE_MS;
+        if (online && !fails) { saved++; fate = 'saved'; } else if (!online) { lost++; fate = 'lost'; } else fate = 'rejected';
+      } else if (mode === 'optimistic') {
+        t = UI_MS;
+        if (fails) { rolledBack++; fate = 'rolled'; } else if (online) { saved++; fate = 'saved'; } else { lost++; fate = 'lost'; }
+      } else {
+        t = UI_MS;
+        if (online) { saved++; fate = fails ? 'retried' : 'saved'; } else { queued++; fate = 'queued'; }
+      }
+      shownTotal += t; shown.push(t); fates.push(fate);
+    });
+    return { avg: Math.floor(shownTotal / ACTIONS), rolledBack, lost, queued, failed, saved, fates, shown };
+  }
+
+  const COLOR: Record<Fate, string> = { saved: 'var(--good)', rolled: 'var(--warn, #d97706)', retried: 'var(--warn, #d97706)', rejected: 'var(--warn, #d97706)', lost: 'var(--bad)', queued: 'var(--accent, #2563eb)' };
+  const TEXT: Record<Fate, string> = {
+    saved: 'reached the server',
+    rolled: 'shown at once, then rolled back with a message: the server said no',
+    retried: 'the request failed, stays in the queue and succeeded on a retry',
+    rejected: 'the server said no and the screen showed an error instead of the change',
+    lost: 'never reached the server, and is gone now that the app is closed',
+    queued: 'saved on the phone in the queue, to be sent at the next launch',
+  };
+
+  document.querySelectorAll<HTMLElement>('[data-lf]').forEach((root) => {
+    const q = query(root);
+    const strip = q('[data-strip]');
+    const cells = Array.from({ length: ACTIONS }, () => { const c = document.createElement('span'); c.className = 'lf-cell'; strip.appendChild(c); return c; });
+    const box = (n: number, good: boolean) => q<HTMLElement>(`[data-b${n}]`).style.setProperty('--c', good ? 'var(--good)' : 'var(--bad)');
+    const num = (sel: string, lo: number, hi: number, dflt: number) => { const v = Number(q<HTMLInputElement>(sel).value); return Number.isFinite(v) && q<HTMLInputElement>(sel).value !== '' ? Math.min(hi, Math.max(lo, Math.round(v))) : dflt; };
+    function draw() {
+      const mode = q<HTMLSelectElement>('[data-mode]').value as Mode;
+      const r = simulate(mode, num('[data-latency]', 50, 3000, 400), num('[data-fail]', 0, 100, 15), num('[data-offline]', 0, 20, 14));
+      q('[data-o1]').textContent = `${formatThousands(r.avg)} ms`;
+      q('[data-n1]').textContent = mode === 'wait' ? 'every tap waits for the server, and a tap made offline waits for a 3,000 ms timeout' : 'the screen is redrawn from the local copy, not from the network';
+      box(1, r.avg <= 100);
+      q('[data-o2]').textContent = `${r.rolledBack} ${r.rolledBack === 1 ? 'action' : 'actions'}`;
+      q('[data-n2]').textContent = mode === 'optimistic' ? 'the user saw a success that never happened, until the rejection arrived' : mode === 'wait' ? 'never shown early, so nothing to undo: failed taps just show an error' : 'a failed sync is retried from the queue, so the screen does not flip back';
+      box(2, r.rolledBack === 0);
+      q('[data-o3]').textContent = `${r.lost} ${r.lost === 1 ? 'action' : 'actions'} lost`;
+      q('[data-n3]').textContent = mode === 'local' ? 'every action was written to the local database before anything was sent' : mode === 'optimistic' ? 'shown as done, but the pending request lived only in memory' : 'the unsent taps lived only in memory';
+      box(3, r.lost === 0);
+      q('[data-o4]').textContent = `${r.queued} ${r.queued === 1 ? 'action' : 'actions'}`;
+      q('[data-n4]').textContent = mode === 'local' ? 'persisted with an id each, so the retry at the next launch is safe to repeat' : 'only the local-first mode keeps a queue on disk';
+      q<HTMLElement>('[data-b4]').style.setProperty('--c', mode === 'local' ? 'var(--good)' : 'var(--border)');
+      r.fates.forEach((f, i) => { cells[i].style.setProperty('--c', COLOR[f]); cells[i].title = `Action ${i + 1}: ${TEXT[f]}`; cells[i].textContent = String(i + 1); });
+      const log = q('[data-log]'); log.textContent = '';
+      r.fates.forEach((f, i) => { const li = document.createElement('li'); li.textContent = `Action ${i + 1}: screen changed after ${formatThousands(r.shown[i])} ms; ${TEXT[f]}`; log.appendChild(li); });
+    }
+    root.addEventListener('change', draw);
+    root.addEventListener('input', draw);
+    draw();
+  });
+</script>
+<style is:global>
+  .playground .lf-strip { display: flex; flex-wrap: wrap; gap: 4px; }
+  .playground .lf-cell { min-width: 26px; height: 26px; display: inline-flex; align-items: center; justify-content: center; border-radius: 4px; background: color-mix(in srgb, var(--c) 16%, transparent); border: 2px solid var(--c); font-size: 12px; font-weight: 600; }
+</style>
