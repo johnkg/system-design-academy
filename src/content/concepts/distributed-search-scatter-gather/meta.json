@@ -1,0 +1,109 @@
+{
+  "name": "Distributed Search: Scatter and Gather",
+  "area": "search",
+  "difficulty": "advanced",
+  "intent": "Split an index across shards, send every query to all of them, let each shard return its own top results, and merge them at a coordinator, knowing that the slowest shard decides the latency and that deep pages multiply the work.",
+  "scenario": "A product index is split into 8 shards. A coordinator node receives each query, sends it to all 8 shards, collects their top results and returns the best 10. A shard normally answers in about 20 ms plus up to 10 ms of jitter, and 1 request in 200 is slow by 200 ms (a garbage-collection pause, a busy disk). The simulation sends 2,000 queries and reports the median (p50) and the 99th percentile (p99) latency, then asks what changes with 1 or 32 shards, with a second replica per shard, with a deep page (from 10,000), and with one shard that holds 3 times the data.",
+  "problem": "One machine cannot hold or search the whole index at the required speed, so the index is split by document across shards. But a document's words can match on any shard, so a query cannot be sent to just one: it must go to all of them. Total work grows with the shard count, and the answer is complete only when the last shard has replied. A slow shard, a deep page or an unbalanced split each turn into user-visible latency, and the more shards there are, the more often one of them is the problem.",
+  "howItWorks": [
+    {
+      "title": "Scatter: the coordinator asks every shard",
+      "text": "Documents are assigned to shards by a hash of their id, so each shard holds a random slice of the data and has its own complete inverted index. A search request reaches any node, which acts as coordinator for that request. It sends the query to one copy (the primary or a replica) of every shard in parallel. Each shard runs the query on its own segments and builds its own top list, sorted by score."
+    },
+    {
+      "title": "Gather: merge the top lists",
+      "text": "Each shard returns only the top from + size entries, as document ids with their scores or sort values, not the full documents. The coordinator merges the lists with a priority queue, keeps the best size, and then asks only the owning shards for the full content of those few documents (a second round, the fetch phase). Searching and fetching in two phases is what keeps the network traffic small for ordinary pages."
+    },
+    {
+      "title": "The slowest shard decides the query",
+      "text": "The coordinator cannot answer until the last shard has replied, so query latency is the maximum over the shards, not the average. If one request in 200 is slow, a query with 1 shard meets a slow request 0.5% of the time, with 8 shards 4.3% of the time, and with 32 shards 15.2% of the time in the simulation. The median barely moves (27 ms, 32 ms, 32 ms) while p99 goes from 32 ms to 230 ms. Adding shards to go faster can make the tail worse."
+    },
+    {
+      "title": "Replicas cut the tail, if you ask two",
+      "text": "Each shard has replica copies for availability and for read capacity. Using them only to spread load does nothing for the tail. Sending each shard request to two replicas and using the first answer (a hedged request) means a query is slow only if both copies are slow at once. With 32 shards and 2 replicas, the simulation's p99 falls from 232 ms to 32 ms. The price is extra load: every request is done twice, so hedging is usually applied to a share of requests or only after a short wait."
+    },
+    {
+      "title": "Deep pages multiply the work, and shards must be balanced",
+      "text": "To return hits 10,001 to 10,010, each shard must find its own top 10,010, because any of them might belong on the page. With 8 shards that is 80,080 entries sent to the coordinator to show 10, and the simulation's median latency rises from 32 ms to 212 ms. Engines therefore cap from + size (Elasticsearch defaults to 10,000) and offer cursor-style paging (search_after, with a point in time) that continues from the last hit instead. Also, if one shard holds 3 times the data, it answers last almost every time, so the whole index runs at the speed of its biggest shard: the median in the simulation goes from 32 ms to 67 ms."
+    }
+  ],
+  "pros": [
+    "Storage and search work are spread over many machines, so the index can grow past one node",
+    "Shards search in parallel, so one query uses the whole cluster for a short time",
+    "Replicas give availability and, when requests are hedged, a much shorter tail",
+    "The two-phase design moves ids and scores for most hits, and full documents only for the page shown"
+  ],
+  "cons": [
+    "Every query touches every shard, so cost per query grows with the shard count",
+    "Latency is set by the slowest shard, so the tail gets worse as shards are added",
+    "Deep pagination moves shards x (from + size) entries and soon becomes impractical",
+    "Relevance can differ by shard: idf statistics are normally local to each shard unless you ask for global ones"
+  ],
+  "whenToUse": [
+    "An index too large or too busy for one node",
+    "Search where each query must consider the whole collection, as in full-text and filtered product search",
+    "Systems with enough replicas that sending a request to two copies is affordable for the tail"
+  ],
+  "whenNotToUse": [
+    "A small index that fits comfortably on one node: extra shards only add coordination and tail latency",
+    "Queries that can be routed by a key to one shard, such as per-tenant data, where a routing key avoids the scatter",
+    "Features that need deep offset paging over millions of hits, which call for cursor paging or an export job instead"
+  ],
+  "pitfalls": [
+    "Creating many small shards by default: each one is another chance for the query to be slow",
+    "Assuming replicas help the tail without hedging or adaptive selection of the faster copy",
+    "Letting users page to from = 10,000 or beyond, so every shard builds and sends a huge top list",
+    "An uneven split, from a skewed routing key or one huge tenant, so one shard sets the latency of every query",
+    "Comparing scores across shards that have different statistics and expecting identical ordering",
+    "Hedging every request during an overload, which doubles the load on a cluster that is already struggling"
+  ],
+  "related": [
+    { "kind": "concept", "slug": "inverted-indexes-and-text-search" },
+    { "kind": "concept", "slug": "hedged-requests-and-tail-latency" },
+    { "kind": "concept", "slug": "database-sharding" },
+    { "kind": "concept", "slug": "pagination" },
+    { "kind": "concept", "slug": "bm25-and-relevance-ranking" },
+    { "kind": "concept", "slug": "segments-and-near-real-time-indexing" }
+  ],
+  "roles": [
+    { "id": "client", "label": "Client", "description": "Sends a search and shows one page of results." },
+    { "id": "coordinator", "label": "Coordinator", "description": "Receives the request, scatters it to every shard and merges the answers." },
+    { "id": "shard", "label": "Shard", "description": "Holds a slice of the documents and searches only that slice." },
+    { "id": "replica", "label": "Replica", "description": "A second copy of a shard, able to answer the same query." }
+  ],
+  "quiz": [
+    {
+      "question": "An index grows from 8 to 32 shards to \"make search faster\". The median query time stays the same, but the 99th percentile gets worse. Why?",
+      "options": [
+        "Each shard now holds fewer documents, so the median must rise to match.",
+        "The coordinator is now merging scores from different analyzers.",
+        "Replicas have been switched off, so the queries run on primaries.",
+        "More shards means more chances that at least one is slow, and the query waits for the slowest."
+      ],
+      "answer": 3,
+      "explanation": "Latency is the maximum over all shards. With a fixed chance of a slow request per shard, the share of queries that meet at least one rises with the shard count (4.3% at 8 shards, 15.2% at 32 in the simulation), which shows up in p99 and barely in the median. Fewer documents per shard does not slow anything."
+    },
+    {
+      "question": "A client asks for results 10,001 to 10,010 from an index with 8 shards. About how many entries do the shards send to the coordinator, and why?",
+      "options": [
+        "10, because the coordinator only needs the page that was asked for.",
+        "About 80,080, because each shard must return its own top 10,010 and any of them could belong to the page.",
+        "About 1,250, because the hits are divided evenly between the shards.",
+        "None, because deep pages are answered from a cache on the coordinator."
+      ],
+      "answer": 1,
+      "explanation": "No shard knows how its hits rank against the other shards' hits, so each must supply its top from + size entries: 8 x 10,010 = 80,080. That is why deep offsets are capped and cursor-style paging is preferred."
+    },
+    {
+      "question": "A team adds a second replica of every shard. p99 does not improve. What change would cut the tail?",
+      "options": [
+        "Send each shard request to a replica chosen at random, and wait for it.",
+        "Add a third replica but keep sending each request to only one copy.",
+        "Send each shard request to two replicas and use whichever answers first.",
+        "Run the merge on the replicas instead of on the coordinator."
+      ],
+      "answer": 2,
+      "explanation": "A request to a single copy is as slow as that copy, however many copies exist. Asking two and taking the first answer makes a shard slow only when both copies are slow together, which is rare (p99 fell from 232 ms to 32 ms with 32 shards in the simulation). The price is doubled request load. Moving the merge does not touch the slow shard."
+    }
+  ]
+}
