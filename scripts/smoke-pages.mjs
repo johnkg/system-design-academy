@@ -7,6 +7,7 @@
 // Needs Playwright (with a Chromium browser: `npx playwright install chromium`) and axe-core; both are pinned in devDependencies. `--font "DejaVu Sans"` forces a wider font to mimic a CI runner or an Android phone.
 import { createRequire } from 'node:module';
 import { spawn } from 'node:child_process';
+import { createServer } from 'node:net';
 import { existsSync, readdirSync, readFileSync, statSync } from 'node:fs';
 import { availableParallelism } from 'node:os';
 import { join, relative } from 'node:path';
@@ -48,8 +49,12 @@ pages.sort();
 const targets = shard.pick(pages.filter((p) => p.includes(only)));
 
 // Serve dist/ with `astro preview` (our own child process, stopped at the end). The site may live under a base path.
-const PORT_BASE = 4400, PORT_SPREAD = 400; // a random port, so parallel runs on one machine do not collide
-const port = PORT_BASE + Math.floor(Math.random() * PORT_SPREAD);
+const PORT_BASE = 4400, PORT_SPREAD = 400; // a random free port, so parallel runs (and left-over servers) on one machine do not collide
+// A port that something else listens on would serve that server's pages instead of this build: pick one nobody uses.
+const freePort = (p) => new Promise((resolve) => { const s = createServer().once('error', () => resolve(false)).listen(p, '127.0.0.1', () => s.close(() => resolve(true))); });
+let port = 0;
+for (let i = 0; i < PORT_SPREAD && !port; i++) { const p = PORT_BASE + Math.floor(Math.random() * PORT_SPREAD); if (await freePort(p)) port = p; }
+if (!port) { console.error('No free port for the preview server.'); process.exit(2); }
 const preview = spawn('npx', ['astro', 'preview', '--port', String(port), '--host', '127.0.0.1'], { cwd: root, stdio: 'ignore' });
 const stop = () => { try { preview.kill('SIGTERM'); } catch { /* already gone */ } };
 process.on('exit', stop);
