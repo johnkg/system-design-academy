@@ -3,6 +3,15 @@ export interface Change { date: string; title: string; items: { text: string; hr
 
 export const changelog: Change[] = [
   {
+    date: '2026-11-18',
+    title: 'Three new areas: search, payments, and mobile and offline',
+    items: [
+      { text: 'Search systems: how BM25 ranks (and why a keyword-stuffed page loses), how new documents become searchable within a second by writing small immutable segments, why one slow shard sets the speed of the whole query, how autocomplete answers within a keystroke, and how to tell whether a ranking change really helped. The inverted-index lesson moves here from Databases.', href: 'concepts/bm25-and-relevance-ranking/' },
+      { text: 'Payments & money: why money is whole numbers and not floats (and how to split $100 three ways), double-entry books that always balance, the life of a card payment from hold to settlement, keeping card numbers off your servers, and matching your records against the provider\'s.', href: 'concepts/money-representation-and-rounding/' },
+      { text: 'Mobile & offline: apps that answer instantly and sync later, what happens when two offline devices edit the same record, push notifications that expire or collapse, a flaky network and ten thousand phones reconnecting at once, and old app versions you cannot update.', href: 'concepts/local-first-and-optimistic-ui/' },
+    ],
+  },
+  {
     date: '2026-11-16',
     title: 'GitOps, cloud costs, and an image pipeline',
     items: [
