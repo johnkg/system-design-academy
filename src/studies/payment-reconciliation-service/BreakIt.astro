@@ -1,0 +1,209 @@
+---
+import PlaygroundShell from '../../components/PlaygroundShell.astro';
+import RangeField from '../../components/RangeField.astro';
+---
+<PlaygroundShell title="Three days of payments, three sources, and the breaks nobody planned" hint="600 card payments over 3 days, seen by the ledger, by three processors' files and by the bank. A seeded set of breaks is injected: one file arrives 2 days late, one is delivered twice, one is re-sent with corrections, some rows are missing or lost their reference, some fees differ by a few cents, and there are refunds and chargebacks. Assumptions of the model: the processors cut their day at UTC, UTC+1 and UTC-8, break rates are far higher than a real company would see so that every effect shows, and 'people' means a finance analyst reading one break.">
+  <ol class="how">
+    <li>Start with the defaults: <b>Single pass on exact id</b>, files <b>Append every delivery</b> and a <b>UTC for everyone</b> cut-off. Only <b>66%</b> of the ledger lines match and <b>364</b> breaks are left for people, with <b>3,276,468</b> cents unexplained. A file delivered twice and a corrected file are both loaded: <b>1,229,220</b> cents are counted twice and <b>5 of 15</b> bank deposits no longer tie to the loaded files.</li>
+    <li>Set <b>Cut-off day</b> to <b>Each processor's time zone</b>: the timing breaks fall from <b>118</b> to <b>57</b>. Then set <b>Files</b> to <b>Idempotent load</b>: nothing is counted twice, all <b>15</b> deposits tie, and the breaks fall to <b>123</b>, with <b>807,864</b> cents unexplained. What is left is real: missing rows, lost references and fee differences.</li>
+    <li>Set <b>Matching</b> to <b>Tiered rules, fuzzy on card tail</b>: <b>68</b> lines are cleared by rules, <b>96%</b> match and only <b>33</b> breaks are left, with <b>248,674</b> cents unexplained. Now set <b>Tolerance in cents</b> to <b>0</b>: every fee difference becomes a break again and the count goes back up to <b>79</b>.</li>
+    <li>The backfire. Set <b>Tolerance in cents</b> to <b>2000</b> and <b>Matching</b> to <b>Tiered rules, loose fuzzy</b>: the breaks fall to <b>14</b> and <b>98%</b> match, which looks better, but <b>10</b> pairs are different payments, and <b>91,258</b> cents are marked reconciled that are not. A wide tolerance with no card tail turns missing money into a false match.</li>
+  </ol>
+  <div class="pg prs" data-prs>
+    <div class="pg-row">
+      <label>Matching <select class="pg-in" data-strategy><option value="single" selected>Single pass on exact id</option><option value="tiered">Tiered rules, fuzzy on card tail</option><option value="loose">Tiered rules, loose fuzzy</option></select></label>
+      <label>Files <select class="pg-in" data-files><option value="append" selected>Append every delivery</option><option value="idem">Idempotent load</option></select></label>
+      <label>Cut-off day <select class="pg-in" data-cutoff><option value="utc" selected>UTC for everyone</option><option value="proc">Each processor's time zone</option></select></label>
+      <RangeField label="Tolerance in cents" name="tol" min="0" max="5000" step="5" value="5" />
+    </div>
+    <div class="pg-grid">
+      <div class="pg-box" data-b1><h3>Matched</h3><span class="pg-mono" data-o1></span><span class="pg-note" data-n1></span></div>
+      <div class="pg-box" data-b2><h3>Breaks for people</h3><span class="pg-mono" data-o2></span><span class="pg-note" data-n2></span></div>
+      <div class="pg-box" data-b3><h3>Unexplained money</h3><span class="pg-mono" data-o3></span><span class="pg-note" data-n3></span></div>
+      <div class="pg-box" data-b4><h3>Counted twice</h3><span class="pg-mono" data-o4></span><span class="pg-note" data-n4></span></div>
+      <div class="pg-box" data-b5><h3>Wrongly reconciled</h3><span class="pg-mono" data-o5></span><span class="pg-note" data-n5></span></div>
+    </div>
+    <div class="pg-box" style="--c: var(--border)">
+      <h3>The breaks left for people, by class</h3>
+      <table class="prs-table"><thead><tr><th scope="col">Class</th><th scope="col">Breaks</th><th scope="col">Cents</th><th scope="col">What it usually is</th></tr></thead><tbody data-classes></tbody></table>
+      <span class="pg-note">Tolerance is ignored by the single pass. Under the tiered rules it is the most a fee or a fuzzy match may differ in cents. The tiered fuzzy rule only looks at rows that lost their reference and also needs the same card tail; the loose one takes any row. Unexplained money counts the cents in the breaks left for people; wrongly reconciled money is not in it, because it looks settled.</span>
+    </div>
+    <p class="pg-out" data-verdict aria-live="polite"></p>
+  </div>
+</PlaygroundShell>
+<script>
+  import { query, formatThousands } from '../../playground';
+  // The same model as the code samples: a seeded set of payments, three sources, and a matcher that works one processor at a time.
+  const DAY = 1440, PER_DAY = 200, DAYS = 3, BUCKETS = 5, SEED = 20260115, REFUND_AFTER = 1500, CHARGEBACK_AFTER = 2900;
+  const OFFSET = [0, 60, -480];
+  type Strategy = 'single' | 'tiered' | 'loose';
+  interface Line { pid: number; type: number; t: number; net: number; tail: number; proc: number; ref: boolean; big: boolean; age: number }
+  let seed = SEED;
+  const next = (n: number) => { seed = (seed * 48271) % 2147483647; return seed % n; };
+  const fee = (amount: number) => Math.floor((amount * 29 + 500) / 1000) + 30;
+  const mk = (pid: number, type: number, t: number, net: number, tail: number, proc: number, ref: boolean, big: boolean): Line => ({ pid, type, t, net, tail, proc, ref, big, age: 0 });
+  const copy = (l: Line, net: number, big: boolean): Line => ({ ...l, net, big, age: 0 });
+  const sum = (ls: Line[], f: (l: Line) => number) => ls.reduce((s, l) => s + f(l), 0);
+  const key = (l: Line) => l.pid * 3 + l.type;
+
+  function generate() {
+    seed = SEED;
+    const ledger: Line[] = [], truth: Line[] = [];
+    for (let i = 0; i < DAYS * PER_DAY; i++) {
+      const day = 1 + Math.floor(i / PER_DAY);
+      const t = day * DAY + next(DAY), amount = 500 + next(19501), tail = next(10000), proc = next(3);
+      const r = next(100), small = 1 + next(4), large = 200 + next(101);
+      let kind = r < 2 ? 'missing' : r < 3 ? 'ghost' : r < 6 ? 'lost' : r < 14 ? 'fee' : r < 15 ? 'bigfee' : r < 17 ? 'chargeback' : r < 20 ? 'refund' : 'normal';
+      if (kind === 'chargeback' && day !== 1) kind = 'normal';
+      if (kind === 'refund' && day > 2) kind = 'normal';
+      const expected = amount - fee(amount);
+      if (kind !== 'ghost') ledger.push(mk(i, 0, t, expected, tail, proc, true, false));
+      if (kind === 'refund') ledger.push(mk(i, 1, t + REFUND_AFTER, -amount, tail, proc, true, false));
+      if (kind !== 'missing') {
+        const net = kind === 'fee' ? expected - small : kind === 'bigfee' ? expected - large : expected;
+        truth.push(mk(i, 0, t, net, tail, proc, kind !== 'lost', kind === 'bigfee'));
+        if (kind === 'refund') truth.push(mk(i, 1, t + REFUND_AFTER, -amount, tail, proc, true, false));
+        if (kind === 'chargeback') truth.push(mk(i, 2, t + CHARGEBACK_AFTER, -amount, tail, proc, true, false));
+      }
+    }
+    return { ledger, truth };
+  }
+
+  const CLASSES = ['timing', 'missing', 'amount', 'duplicate', 'status'] as const;
+  function simulate(strategy: Strategy, tolerance: number, idempotent: boolean, perProcessorCutoff: boolean) {
+    const { ledger, truth } = generate();
+    const grid = () => [0, 1, 2].map(() => Array.from({ length: BUCKETS }, () => [] as Line[]));
+    const Lb = grid(), Tb = grid();
+    for (const l of ledger) Lb[l.proc][Math.floor((l.t + (perProcessorCutoff ? OFFSET[l.proc] : 0)) / DAY)].push(l);
+    for (const l of truth) Tb[l.proc][Math.floor((l.t + OFFSET[l.proc]) / DAY)].push(l);
+    const Pb = Tb.map((row) => row.map((ls) => ls.map((l) => copy(l, l.net, l.big))));
+    let duplicateMoney = 0;
+    if (!idempotent) {
+      Pb[1][3] = Pb[1][3].concat(Pb[1][1]); Pb[1][1] = [];
+      duplicateMoney += sum(Pb[2][2], (l) => Math.abs(l.net));
+      Pb[2][2] = Pb[2][2].concat(Pb[2][2].map((l) => copy(l, l.net, l.big)));
+      Pb[0][2] = Tb[0][2].map((l) => (l.pid % 5 === 0 ? copy(l, l.net + 1000, true) : copy(l, l.net, l.big)));
+      Pb[0][3] = Pb[0][3].concat(Tb[0][2].map((l) => copy(l, l.net, l.big)));
+      duplicateMoney += sum(Tb[0][2], (l) => Math.abs(l.net));
+    }
+    let notTying = 0;
+    for (let p = 0; p < 3; p++) for (let b = 0; b < BUCKETS; b++) if (sum(Pb[p][b], (l) => l.net) !== sum(Tb[p][b], (l) => l.net)) notTying++;
+
+    const single = strategy === 'single', window = single ? 0 : 1;
+    let matched = 0, resolved = 0, falsePairs = 0, wrongMoney = 0;
+    const breaks: [string, number][] = [];
+    for (let p = 0; p < 3; p++) {
+      const paired = new Array<number>(DAYS * PER_DAY * 3).fill(0);
+      let carryL: Line[] = [], carryP: Line[] = [];
+      const miss: Line[] = [], orphan: Line[] = [];
+      for (let b = 0; b < BUCKETS; b++) {
+        const Ls = carryL.concat(Lb[p][b]), Ps = carryP.concat(Pb[p][b]);
+        carryL = []; carryP = [];
+        const uL = Ls.map(() => false), uP = Ps.map(() => false);
+        for (let i = 0; i < Ls.length; i++) {
+          for (let j = 0; j < Ps.length; j++) {
+            if (uP[j] || !Ps[j].ref || key(Ps[j]) !== key(Ls[i])) continue;
+            uL[i] = uP[j] = true;
+            const diff = Math.abs(Ls[i].net - Ps[j].net);
+            if (diff === 0) { matched++; paired[key(Ls[i])] = 1; }
+            else if (!single && diff <= tolerance) { matched++; resolved++; paired[key(Ls[i])] = 1; if (Ps[j].big) wrongMoney += diff; }
+            else { breaks.push(['amount', diff]); paired[key(Ls[i])] = 2; }
+            break;
+          }
+        }
+        for (let j = 0; j < Ps.length; j++) {
+          if (uP[j] || !Ps[j].ref || paired[key(Ps[j])] === 0) continue;
+          uP[j] = true;
+          if (!single && paired[key(Ps[j])] === 1) resolved++; else breaks.push(['duplicate', Math.abs(Ps[j].net)]);
+        }
+        if (!single) {
+          for (let i = 0; i < Ls.length; i++) {
+            if (uL[i]) continue;
+            for (let j = 0; j < Ps.length; j++) {
+              const x = Ps[j];
+              if (uP[j] || x.type !== Ls[i].type || Math.abs(Ls[i].net - x.net) > tolerance) continue;
+              if (strategy === 'tiered' && (x.ref || x.tail !== Ls[i].tail)) continue;
+              uL[i] = uP[j] = true; matched++;
+              if (x.pid !== Ls[i].pid) { falsePairs++; wrongMoney += Math.abs(Ls[i].net); } else resolved++;
+              break;
+            }
+          }
+        }
+        for (let i = 0; i < Ls.length; i++) if (!uL[i]) { if (window && Ls[i].age === 0 && b < BUCKETS - 1) { Ls[i].age = 1; carryL.push(Ls[i]); } else miss.push(Ls[i]); }
+        for (let j = 0; j < Ps.length; j++) if (!uP[j]) { if (window && Ps[j].age === 0 && b < BUCKETS - 1) { Ps[j].age = 1; carryP.push(Ps[j]); } else orphan.push(Ps[j]); }
+      }
+      const used = orphan.map(() => false);
+      for (const l of miss) {
+        const j = orphan.findIndex((x, k) => !used[k] && x.ref && x.pid === l.pid && x.type === l.type);
+        if (j >= 0) { used[j] = true; breaks.push(['timing', Math.abs(l.net)]); } else breaks.push(['missing', Math.abs(l.net)]);
+      }
+      orphan.forEach((x, k) => { if (!used[k]) breaks.push([x.type === 2 ? 'status' : 'missing', Math.abs(x.net)]); });
+    }
+    const byClass = CLASSES.map((c) => ({ c, n: breaks.filter((x) => x[0] === c).length, cents: breaks.filter((x) => x[0] === c).reduce((s, x) => s + x[1], 0) }));
+    return { matched, total: ledger.length, resolved, breaks: breaks.length, unexplained: breaks.reduce((s, x) => s + x[1], 0), duplicateMoney, notTying, falsePairs, wrongMoney, byClass };
+  }
+
+  const USUALLY: Record<string, string> = {
+    timing: 'one side booked it on another day: a time zone cut-off or a late file',
+    missing: 'a payment on one side only, or a row that lost its reference',
+    amount: 'same payment, different money: a fee or a corrected row',
+    duplicate: 'a second row for a payment already paired',
+    status: 'a chargeback line the ledger never recorded',
+  };
+
+  document.querySelectorAll<HTMLElement>('[data-prs]').forEach((root) => {
+    const q = query(root);
+    const tbody = q('[data-classes]');
+    const cells = CLASSES.map((c) => {
+      const tr = document.createElement('tr');
+      const cls = document.createElement('td'), n = document.createElement('td'), cents = document.createElement('td'), why = document.createElement('td');
+      cls.textContent = c; why.textContent = USUALLY[c]; n.className = cents.className = 'prs-num';
+      tr.append(cls, n, cents, why); tbody.appendChild(tr);
+      return { n, cents };
+    });
+    const box = (n: number, colour: string) => q<HTMLElement>(`[data-b${n}]`).style.setProperty('--c', colour);
+    const sel = (s: string) => q<HTMLSelectElement>(s).value;
+    function draw() {
+      const tolerance = Number(q<HTMLInputElement>('[data-tol]').value);
+      q('[data-tolval]').textContent = formatThousands(tolerance);
+      const strategy = sel('[data-strategy]') as Strategy, idem = sel('[data-files]') === 'idem';
+      const r = simulate(strategy, tolerance, idem, sel('[data-cutoff]') === 'proc');
+      const pct = Math.floor((r.matched * 100) / r.total);
+      q('[data-o1]').textContent = `${pct}% matched`;
+      q('[data-n1]').textContent = `${formatThousands(r.matched)} of ${formatThousands(r.total)} ledger lines, ${formatThousands(r.resolved)} cleared by rules`;
+      box(1, pct >= 95 ? 'var(--good)' : pct >= 80 ? 'var(--role-3)' : 'var(--bad)');
+      q('[data-o2]').textContent = `${formatThousands(r.breaks)} breaks`;
+      q('[data-n2]').textContent = 'each one needs a person to read it before the day can close';
+      box(2, r.breaks <= 40 ? 'var(--good)' : r.breaks <= 150 ? 'var(--role-3)' : 'var(--bad)');
+      q('[data-o3]').textContent = `${formatThousands(r.unexplained)} cents`;
+      q('[data-n3]').textContent = 'money in open breaks that nobody has explained yet';
+      box(3, r.unexplained <= 300000 ? 'var(--good)' : r.unexplained <= 1000000 ? 'var(--role-3)' : 'var(--bad)');
+      q('[data-o4]').textContent = `${formatThousands(r.duplicateMoney)} cents`;
+      q('[data-n4]').textContent = `bank deposits not tying to the loaded files: ${r.notTying} of 15`;
+      box(4, r.duplicateMoney === 0 ? 'var(--good)' : 'var(--bad)');
+      q('[data-o5]').textContent = `${formatThousands(r.wrongMoney)} cents`;
+      q('[data-n5]').textContent = `${r.falsePairs} pairs of different payments marked as matched; the rest is fee differences wider than the schedule`;
+      box(5, r.wrongMoney === 0 ? 'var(--good)' : 'var(--bad)');
+      r.byClass.forEach((c, i) => { cells[i].n.textContent = formatThousands(c.n); cells[i].cents.textContent = formatThousands(c.cents); });
+      const v = q('[data-verdict]');
+      const bad = r.wrongMoney > 0 || r.duplicateMoney > 0 || r.breaks > 40;
+      v.classList.toggle('bad', bad);
+      v.textContent = r.falsePairs > 0 ? 'Fewer breaks, but some of the matches are wrong: the money in them looks settled and nobody will look at it.'
+        : r.wrongMoney > 0 ? 'The tolerance is wider than any fee difference should be, so real errors are being absorbed as variance.'
+        : r.duplicateMoney > 0 ? 'The same rows are counted twice, so processor totals no longer tie to the bank.'
+        : r.breaks > 150 ? 'People are reading hundreds of breaks that are really timing and duplicates.'
+        : r.breaks > 40 ? 'The remaining breaks are real, but too many for fee differences and lost references to go to people.'
+        : 'What is left is a short list of real breaks, each with an amount and a class.';
+    }
+    root.addEventListener('change', draw);
+    root.addEventListener('input', draw);
+    draw();
+  });
+</script>
+<style is:global>
+  .playground .prs-table { width: 100%; border-collapse: collapse; font-size: .85rem; }
+  .playground .prs-table th, .playground .prs-table td { text-align: left; padding: 4px 8px; border-bottom: 1px solid var(--border); vertical-align: top; }
+  .playground .prs-table .prs-num { text-align: right; font-family: var(--font-mono); white-space: nowrap; }
+  .playground .prs-table th:nth-child(2), .playground .prs-table th:nth-child(3) { text-align: right; }
+  @media (max-width: 560px) { .playground .prs-table th:nth-child(4), .playground .prs-table td:nth-child(4) { display: none; } }
+</style>
