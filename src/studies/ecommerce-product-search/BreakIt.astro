@@ -1,0 +1,305 @@
+---
+import PlaygroundShell from '../../components/PlaygroundShell.astro';
+---
+<PlaygroundShell title="Prices that change, listings that appear, and the rank that decides" hint="Four hours of a store with 50 million listings, measured on 2,000 sample listings (each stands for 25,000). Assumptions of the model, not measurements: 300,000 price and stock changes a minute, 20,000 searches a second at peak, an indexing shard writes 1,400 whole documents a second at a long refresh interval and fewer when it refreshes often, a side-store lookup adds 4 ms. Shoppers are measured from the second hour on.">
+  <ol class="how">
+    <li>Start with the defaults: changes reach the index in an <b>hourly batch</b>, ranking by <b>text only</b>. <b>18.2%</b> of results show an old price or an item that is sold out (<b>11.4%</b> old price, <b>8.3%</b> sold out). A new listing takes <b>3,636 s</b> to become searchable, and while each hourly export re-indexes up to <b>24,435</b> a second the slowest minute has a p99 of <b>277 ms</b>.</li>
+    <li>Set <b>Update path</b> to <b>Real time, whole documents</b>: old prices disappear (<b>0.0%</b>) and a new listing is searchable after <b>3 s</b>, but every change re-indexes a whole document, <b>15,716</b> a second against a capacity of 24,435. Set <b>Refresh interval</b> to <b>1 s</b> and tick <b>Flash sale</b>: the shards can now write only <b>19,200</b> documents a second, the queue builds, the index ends <b>620 s</b> behind, p99 reaches <b>919 ms</b> and a new listing takes <b>579 s</b>. Wanting fresher results made the index staler.</li>
+    <li>Set <b>Update path</b> to <b>Real time, side lookups</b>: price and stock go to a side store, so the shards re-index only <b>300</b> documents a second, nothing is behind, p99 is <b>40 ms</b> and old prices stay at <b>0.0%</b>. Results that cannot be bought remain (<b>8.1%</b>), because the ranking ignores availability.</li>
+    <li>Untick <b>Flash sale</b> and set <b>Refresh interval</b> to <b>5 s</b>. Set <b>Ranking mix</b> to <b>Text and sales</b>: sold-out results rise to <b>11.9%</b> and relevance falls from <b>79</b> to <b>74</b>, because head queries gain (<b>88</b>) while tail queries lose (<b>60</b>), where new listings have no sales. Set <b>Ranking mix</b> to <b>Text, sales and stock filter</b>: sold-out results go to <b>0.0%</b> and relevance is <b>81</b>. Set <b>Ranking mix</b> to <b>Text, capped sales, new boost and stock filter</b>: relevance reaches <b>90</b> and the tail recovers (<b>98</b>).</li>
+  </ol>
+  <div class="pg eps" data-eps>
+    <div class="pg-row">
+      <label>Update path <select class="pg-in" data-path>
+        <option value="batch" selected>Hourly batch</option>
+        <option value="nrt">Real time, whole documents</option>
+        <option value="side">Real time, side lookups</option>
+      </select></label>
+      <label>Refresh interval <select class="pg-in" data-refresh>
+        <option value="1">1 s</option><option value="5" selected>5 s</option><option value="30">30 s</option><option value="60">60 s</option>
+      </select></label>
+      <label>Shards <select class="pg-in" data-shards>
+        <option value="4">4</option><option value="8" selected>8</option><option value="16">16</option><option value="32">32</option>
+      </select></label>
+      <label>Replicas <select class="pg-in" data-replicas>
+        <option value="0">0</option><option value="1">1</option><option value="2" selected>2</option><option value="3">3</option>
+      </select></label>
+      <label>Ranking mix <select class="pg-in" data-mix>
+        <option value="text" selected>Text only</option>
+        <option value="sales">Text and sales</option>
+        <option value="stock">Text, sales and stock filter</option>
+        <option value="tuned">Text, capped sales, new boost and stock filter</option>
+      </select></label>
+      <label><input type="checkbox" data-storm /> Flash sale</label>
+    </div>
+    <div class="pg-grid">
+      <div class="pg-box" data-b1><h3>Results with an old price or no stock</h3><span class="pg-mono" data-o1></span><span class="pg-note" data-n1></span></div>
+      <div class="pg-box" data-b2><h3>Search p99, slowest minute</h3><span class="pg-mono" data-o2></span><span class="pg-note" data-n2></span></div>
+      <div class="pg-box" data-b3><h3>Indexing load</h3><span class="pg-mono" data-o3></span><span class="pg-note" data-n3></span></div>
+      <div class="pg-box" data-b4><h3>A new listing is searchable after</h3><span class="pg-mono" data-o4></span><span class="pg-note" data-n4></span></div>
+      <div class="pg-box" data-b5><h3>Relevance on 24 judged queries</h3><span class="pg-mono" data-o5></span><span class="pg-note" data-n5></span></div>
+    </div>
+    <div class="pg-box" style="--c: var(--border)">
+      <h3>Every 3 minutes: what shoppers saw, and how old the index was</h3>
+      <div class="eps-chart" data-chart role="img" aria-label="Share of results with an old price or no stock, and the age of the index, in 3 minute steps"></div>
+      <span class="pg-note">Columns: results with an old price or no stock (a full column is 40% or more). Dots: how old the newest data in the index was, out of 2 hours. Shaded columns: the flash sale.</span>
+    </div>
+    <p class="pg-out" data-verdict aria-live="polite"></p>
+  </div>
+</PlaygroundShell>
+<script>
+  import { query, formatThousands } from '../../playground';
+  // The same model as the code samples (code/javascript.js), plus a record every minute for the chart.
+  const END_MIN = 240, FROM_MIN = 60, N = 2000, SCALE = 25000, QUERIES_PER_MIN = 30, CAND = 40, TOP = 10;
+  const PRICE_PPM = 2400, COUNT_PPM = 3000, OUT_PPM = 1000, BACK_PPM = 10000;
+  const STORM_FROM = 120, STORM_TO = 180, STORM_X = 3, NEW_PER_MIN = 6000, DOCS_PER_SHARD = 1400, INDEX_S = 1, SIDE_S = 1;
+  const QPS = 20000, CORES = 32, W_US = 8000, F_US = 1000, FETCH_US = 3000, SIDE_US = 4000, SALES_CAP = 30, NEW_BOOST = 25, IDX_SHARE = 50;
+  const TAIL: Record<number, number> = { 4: 599, 8: 668, 16: 738, 32: 807 };
+  const DISC = [1000, 631, 500, 431, 387, 356, 333, 315, 301, 289];
+  const BUDGET_MS = 150, COLUMN = 3, FULL_SHARE = 400, MAX_AGE = 7200;
+  type Kind = 'price' | 'count' | 'out' | 'back';
+  interface Change { m: number; te: number; i: number; kind: Kind; n: number }
+  interface Cand { t: number; s: number; g: number; fresh: boolean; oos: boolean }
+
+  let seed = 0;
+  const rnd = (n: number) => { seed = (seed * 48271) % 2147483647; return seed % n; };
+  const cube = (x: number) => Math.floor((x * x * x) / 10000000);
+
+  function catalog() {
+    seed = 11;
+    const sales: number[] = [], oos: boolean[] = [];
+    for (let i = 0; i < N; i++) { const x = rnd(1000); sales.push(i % 10 === 3 ? 0 : cube(x)); }
+    for (let i = 0; i < N; i++) oos.push(rnd(100) < 2 + Math.floor(sales[i] / 5));
+    return { sales, oos };
+  }
+  const cat = catalog();
+
+  function changes(storm: boolean) {
+    seed = 23;
+    const oos = cat.oos.slice(), ev: Change[] = [], perMin = new Array<number>(END_MIN).fill(0);
+    for (let m = 0; m < END_MIN; m++) {
+      const x = storm && m >= STORM_FROM && m < STORM_TO ? STORM_X : 1;
+      for (let i = 0; i < N; i++) {
+        const r = rnd(1000000), w = 10 + cat.sales[i];
+        const price = Math.floor((PRICE_PPM * w * x) / 35), count = Math.floor((COUNT_PPM * w) / 35), out = Math.floor((OUT_PPM * w) / 35);
+        let kind: Kind | '' = '';
+        if (oos[i]) { if (r < BACK_PPM) kind = 'back'; else if (r < BACK_PPM + price) kind = 'price'; }
+        else if (r < price) kind = 'price';
+        else if (r < price + count) kind = 'count';
+        else if (r < price + count + out) kind = 'out';
+        if (!kind) continue;
+        if (kind === 'out') oos[i] = true;
+        if (kind === 'back') oos[i] = false;
+        ev.push({ m, te: m * 60 + rnd(59), i, kind, n: ev.length });
+        perMin[m]++;
+      }
+    }
+    return { ev, perMin };
+  }
+  const streams = [changes(false), changes(true)];
+
+  function judged() {
+    seed = 4242;
+    const set: { head: boolean; cands: Cand[] }[] = [];
+    for (let q = 0; q < 24; q++) {
+      const head = q < 12, cands: Cand[] = [];
+      for (let j = 0; j < 30; j++) {
+        const fresh = head ? j % 15 === 7 : j === 1 || j === 2;
+        let s = fresh ? 0 : cube(rnd(1000)), t: number, g: number;
+        if (head) {
+          t = 60 + rnd(36);
+          const quality = t + Math.floor(s / 2) + rnd(21) - 10;
+          g = quality >= 115 ? 3 : quality >= 100 ? 2 : quality >= 85 ? 1 : 0;
+        } else {
+          t = j < 3 ? 85 + rnd(16) : j < 9 ? 40 + rnd(21) : 20 + rnd(51);
+          if (j >= 3 && j < 9) s = 80 + rnd(20);
+          g = t >= 85 ? 3 : t >= 70 ? 2 : t >= 50 ? 1 : 0;
+        }
+        cands.push({ t, s, g, fresh, oos: rnd(100) < 2 + Math.floor(s / 5) });
+      }
+      set.push({ head, cands });
+    }
+    return set;
+  }
+  const judgedSet = judged();
+
+  const key = (mix: string, t: number, s: number, fresh: boolean) => (mix === 'text' ? t : mix === 'tuned' ? 2 * t + Math.min(s, SALES_CAP) + (fresh ? NEW_BOOST : 0) : 2 * t + s);
+  const filters = (mix: string) => mix !== 'text' && mix !== 'sales';
+
+  function relevance(mix: string) {
+    let head = 0, tail = 0;
+    for (const { head: isHead, cands } of judgedSet) {
+      const gain = (c: Cand) => (c.oos ? 0 : (1 << c.g) - 1);
+      const dcg = (list: Cand[]) => list.slice(0, TOP).reduce((a, c, p) => a + gain(c) * DISC[p], 0);
+      const pool = filters(mix) ? cands.filter((c) => !c.oos) : cands;
+      const ranked = pool.map((c, k) => ({ c, k })).sort((a, b) => key(mix, b.c.t, b.c.s, b.c.fresh) - key(mix, a.c.t, a.c.s, a.c.fresh) || a.k - b.k).map((x) => x.c);
+      const ideal = cands.slice().sort((a, b) => gain(b) - gain(a));
+      const score = Math.floor((dcg(ranked) * 100) / Math.max(1, dcg(ideal)));
+      if (isHead) head += score; else tail += score;
+    }
+    return { head: Math.floor(head / 12), tail: Math.floor(tail / 12), all: Math.floor((head + tail) / 24) };
+  }
+  const relevanceByMix: Record<string, ReturnType<typeof relevance>> = {};
+  for (const mix of ['text', 'sales', 'stock', 'tuned']) relevanceByMix[mix] = relevance(mix);
+
+  const tenths = (n: number) => `${Math.floor(n / 10)}.${n % 10}`;
+
+  function simulate(path: string, refresh: number, shards: number, replicas: number, mix: string, storm: boolean) {
+    const { ev, perMin } = streams[storm ? 1 : 0];
+    const ve = new Array<number>(ev.length).fill(0);
+    const copies = 1 + replicas;
+    const cap = Math.floor((shards * DOCS_PER_SHARD * (refresh + 3)) / (refresh + 6));
+    const busy = new Array<number>(END_MIN).fill(0), done = new Array<number>(END_MIN).fill(0), lag = new Array<number>(END_MIN).fill(0);
+    const batches: { start: number; end: number }[] = [];
+    if (path === 'batch') {
+      let prevEnd = 0, exported = -1;
+      for (let k = 1; k <= 4; k++) {
+        const start = Math.max(3600 * k, prevEnd), dirty = new Set<number>();
+        for (const e of ev) if (e.te > exported && e.te <= start) dirty.add(e.i);
+        const total = dirty.size * SCALE + NEW_PER_MIN * 60, end = start + Math.ceil(total / cap);
+        for (const e of ev) if (e.te > exported && e.te <= start) ve[e.n] = end;
+        batches.push({ start, end });
+        exported = start; prevEnd = end;
+      }
+      for (let m = 0; m < END_MIN; m++) {
+        let secs = 0;
+        for (const b of batches) secs += Math.max(0, Math.min(b.end, m * 60 + 60) - Math.max(b.start, m * 60));
+        busy[m] = Math.floor((secs * 100) / 60); done[m] = secs * cap;
+      }
+    } else {
+      let backlog = 0;
+      const arrivals = perMin.map((n) => (path === 'nrt' ? n * SCALE : 0) + NEW_PER_MIN), room = cap * 60, raw: number[] = [];
+      for (let m = 0; m < END_MIN; m++) {
+        const take = Math.min(backlog + arrivals[m], room);
+        raw.push(Math.min(100, Math.floor(((backlog + arrivals[m]) * 100) / room)));
+        let sum = 0;
+        for (let k = Math.max(0, m - 9); k <= m; k++) sum += raw[k];
+        busy[m] = Math.floor(sum / (m - Math.max(0, m - 9) + 1));
+        done[m] = take; backlog = backlog + arrivals[m] - take; lag[m] = Math.ceil(backlog / cap);
+      }
+      const last = new Array<number>(N).fill(0);
+      for (const e of ev) {
+        let v = path === 'side' ? e.te + SIDE_S : Math.ceil((e.te + INDEX_S + lag[e.m]) / refresh) * refresh;
+        v = Math.max(v, last[e.i]); last[e.i] = v; ve[e.n] = v;
+      }
+    }
+    let waited = 0;
+    for (let k = 0; k < 60; k++) {
+      const te = 3600 + k * 170 + ((k * 37) % 60), m = Math.floor(te / 60);
+      const v = path === 'batch' ? batches.find((b) => b.start >= te)!.end : Math.ceil((te + INDEX_S + lag[m]) / refresh) * refresh;
+      waited += v - te;
+    }
+    const truth = cat.oos.slice(), view = cat.oos.slice(), priceVe = new Array<number>(N).fill(0), pend: Change[] = [];
+    let shown = 0, badPrice = 0, badStock = 0, badAny = 0, at = 0;
+    const perm = Array.from({ length: N }, (_, i) => i);
+    const minShown = new Array<number>(END_MIN).fill(0), minBad = new Array<number>(END_MIN).fill(0), age = new Array<number>(END_MIN).fill(0);
+    seed = 99;
+    for (let m = 0; m < END_MIN; m++) {
+      for (; at < ev.length && ev[at].m === m; at++) {
+        const e = ev[at];
+        if (e.kind === 'out') truth[e.i] = true;
+        if (e.kind === 'back') truth[e.i] = false;
+        if (e.kind === 'price') priceVe[e.i] = ve[e.n];
+        if (e.kind === 'out' || e.kind === 'back') pend.push(e);
+      }
+      const tq = m * 60 + 59;
+      pend.sort((a, b) => ve[a.n] - ve[b.n] || a.n - b.n);
+      while (pend.length && ve[pend[0].n] <= tq) { const e = pend.shift()!; view[e.i] = e.kind === 'out'; }
+      if (path === 'batch') { let snap = 0; for (const b of batches) if (b.end <= tq) snap = b.start; age[m] = tq - snap; } else age[m] = lag[m] + INDEX_S;
+      if (m < FROM_MIN) continue;
+      for (let q = 0; q < QUERIES_PER_MIN; q++) {
+        const list: { i: number; t: number; j: number }[] = [];
+        for (let j = 0; j < CAND; j++) { const k = j + rnd(N - j); [perm[j], perm[k]] = [perm[k], perm[j]]; list.push({ i: perm[j], t: rnd(100), j }); }
+        const pool = filters(mix) ? list.filter((c) => !view[c.i]) : list;
+        pool.sort((a, b) => key(mix, b.t, cat.sales[b.i], b.i % 10 === 3) - key(mix, a.t, cat.sales[a.i], a.i % 10 === 3) || a.j - b.j);
+        for (const c of pool.slice(0, TOP)) {
+          const stale = priceVe[c.i] > tq, gone = truth[c.i];
+          shown++; minShown[m]++;
+          if (stale) badPrice++; if (gone) badStock++;
+          if (stale || gone) { badAny++; minBad[m]++; }
+        }
+      }
+    }
+    let worst = 0, peakDocs = 0, sumDocs = 0;
+    const sUs = Math.floor(((Math.floor(W_US / shards) + F_US) * (100 + Math.floor(40 / refresh))) / 100);
+    for (let m = FROM_MIN; m < END_MIN; m++) {
+      const rho = Math.min(98, Math.floor((QPS * sUs * 100) / (1000000 * copies * CORES)) + Math.floor((IDX_SHARE * busy[m]) / 100));
+      const mean = sUs + Math.floor((sUs * rho * rho) / (100 * (100 - rho)));
+      worst = Math.max(worst, Math.floor((mean * TAIL[shards]) / 100) + FETCH_US + (path === 'side' ? SIDE_US : 0));
+      peakDocs = Math.max(peakDocs, Math.floor(done[m] / 60)); sumDocs += done[m];
+    }
+    const columns: { share: number; age: number }[] = [];
+    for (let m = FROM_MIN; m + COLUMN <= END_MIN; m += COLUMN) {
+      let s = 0, b = 0, a = 0;
+      for (let k = m; k < m + COLUMN; k++) { s += minShown[k]; b += minBad[k]; a = Math.max(a, age[k]); }
+      columns.push({ share: Math.floor((b * 1000) / s), age: a });
+    }
+    return {
+      bad: Math.floor((badAny * 1000) / shown), price: Math.floor((badPrice * 1000) / shown), stock: Math.floor((badStock * 1000) / shown),
+      p99: Math.floor(worst / 1000), peak: peakDocs * copies, avg: Math.floor((sumDocs * copies) / ((END_MIN - FROM_MIN) * 60)), cap: cap * copies,
+      behind: lag[END_MIN - 1], fresh: Math.floor(waited / 60), nodes: shards * copies, columns,
+    };
+  }
+
+  document.querySelectorAll<HTMLElement>('[data-eps]').forEach((root) => {
+    const q = query(root);
+    const chartEl = q('[data-chart]');
+    const cols = Array.from({ length: (END_MIN - FROM_MIN) / COLUMN }, () => {
+      const c = document.createElement('span'); c.className = 'eps-col';
+      const bar = document.createElement('span'); bar.className = 'eps-bar';
+      const dot = document.createElement('span'); dot.className = 'eps-dot';
+      c.append(bar, dot); chartEl.appendChild(c); return c;
+    });
+    const box = (n: number, colour: string) => q<HTMLElement>(`[data-b${n}]`).style.setProperty('--c', colour);
+    const sel = (s: string) => q<HTMLSelectElement>(s).value;
+    const good = 'var(--good)', mid = 'var(--role-3)', bad = 'var(--bad)';
+    function draw() {
+      const path = sel('[data-path]'), mix = sel('[data-mix]'), shards = Number(sel('[data-shards]')), replicas = Number(sel('[data-replicas]'));
+      const storm = q<HTMLInputElement>('[data-storm]').checked;
+      const r = simulate(path, Number(sel('[data-refresh]')), shards, replicas, mix, storm);
+      const rel = relevanceByMix[mix];
+      q('[data-o1]').textContent = `${tenths(r.bad)}%`;
+      q('[data-n1]').textContent = `${tenths(r.price)}% show an old price, ${tenths(r.stock)}% are out of stock (some are both). The target is under 1%.`;
+      box(1, r.bad < 10 ? good : r.bad < 100 ? mid : bad);
+      q('[data-o2]').textContent = `${formatThousands(r.p99)} ms`;
+      q('[data-n2]').textContent = `Budget ${BUDGET_MS} ms. ${r.nodes} search nodes of ${CORES} cores (${shards} shards, ${1 + replicas} copies each) at ${formatThousands(QPS)} searches a second.`;
+      box(2, r.p99 <= 100 ? good : r.p99 <= BUDGET_MS ? mid : bad);
+      q('[data-o3]').textContent = `${formatThousands(r.peak)} documents a second at peak`;
+      q('[data-n3]').textContent = `Average ${formatThousands(r.avg)} a second; the shards can write ${formatThousands(r.cap)}, counting every copy of every shard. ${path === 'batch' ? 'The index is rebuilt once an hour, so its newest data is up to an hour old.' : r.behind > 30 ? `The index ends ${formatThousands(r.behind)} s behind the database.` : 'The index keeps up with the database.'}`;
+      box(3, path === 'batch' || r.behind > 30 ? bad : r.avg * 100 > r.cap * 60 ? mid : good);
+      q('[data-o4]').textContent = `${formatThousands(r.fresh)} s`;
+      q('[data-n4]').textContent = 'On average, for a listing created during the measured hours. The target is 10 s.';
+      box(4, r.fresh <= 10 ? good : r.fresh <= 60 ? mid : bad);
+      q('[data-o5]').textContent = `${rel.all} out of 100`;
+      q('[data-n5]').textContent = `Head queries ${rel.head}, tail queries ${rel.tail} (NDCG at 10, a result nobody can buy earns nothing).`;
+      box(5, rel.all >= 85 && rel.tail >= 85 ? good : rel.all >= 78 ? mid : bad);
+      r.columns.forEach((s, i) => {
+        const c = cols[i], from = FROM_MIN + i * COLUMN;
+        (c.children[0] as HTMLElement).style.height = `${Math.min(100, (s.share * 100) / FULL_SHARE)}%`;
+        (c.children[0] as HTMLElement).style.setProperty('--c', s.share > 100 ? 'var(--bad)' : s.share > 10 ? 'var(--role-3)' : 'var(--good)');
+        (c.children[1] as HTMLElement).style.bottom = `${Math.min(100, (s.age * 100) / MAX_AGE)}%`;
+        c.classList.toggle('storm', storm && from >= STORM_FROM && from < STORM_TO);
+        c.title = `Minutes ${from} to ${from + COLUMN}: ${tenths(s.share)}% of results with an old price or no stock, index data up to ${formatThousands(s.age)} s old`;
+      });
+      const v = q('[data-verdict]');
+      const staleTop = r.price > 50, slow = r.p99 > BUDGET_MS, lost = path === 'nrt' && r.behind > 30, buried = rel.tail < 80;
+      v.classList.toggle('bad', staleTop || slow || lost || r.stock > 10 || buried);
+      v.textContent = lost ? 'The indexer cannot keep up: changes queue, so the index falls further behind exactly when prices are moving fastest.'
+        : slow ? `Searches are slower than the ${BUDGET_MS} ms budget: too few copies for the load, or indexing is competing with searching.`
+        : staleTop ? 'Shoppers see prices that are not the prices in the database.'
+        : r.stock > 10 ? 'Out-of-stock items are ranking among the first ten results.'
+        : buried ? 'New and specific listings are buried: head queries improved, tail queries got worse.'
+        : r.bad > 10 ? 'Fast and relevant, but some results still cannot be bought.'
+        : 'Prices and stock are current, searches are inside the budget, and ranking helps head and tail queries.';
+    }
+    root.addEventListener('change', draw);
+    draw();
+  });
+</script>
+<style is:global>
+  .playground .eps-chart { display: grid; grid-template-columns: repeat(60, 1fr); gap: 2px; height: 120px; align-items: end; }
+  .playground .eps-col { position: relative; height: 100%; border-radius: 2px; }
+  .playground .eps-col.storm { background: color-mix(in srgb, var(--role-3) 18%, transparent); }
+  .playground .eps-bar { position: absolute; left: 0; right: 0; bottom: 0; background: var(--c); border-radius: 2px 2px 0 0; opacity: .8; }
+  .playground .eps-dot { position: absolute; left: 50%; width: 5px; height: 5px; margin: 0 0 -2px -2px; border-radius: 50%; background: var(--text); }
+</style>
