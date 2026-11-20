@@ -1,0 +1,117 @@
+---
+import PlaygroundShell from '../components/PlaygroundShell.astro';
+---
+<PlaygroundShell title="Simulate it" hint="30 notifications are sent across one day (a score update or a message), always the same ones. The phone loses its connection at 05:00. The platform holds what arrives meanwhile. Separately, the same 30 are sent to a fleet of 1,000 device tokens, some of them dead. Delays are a model: a normal-priority message may wait up to 15 minutes for a reachable device, a high-priority one barely waits.">
+  <ol class="how">
+    <li>Start with the defaults: the phone is offline for <b>240</b> minutes, <b>Time to live (minutes)</b> is <b>120</b>. <b>28</b> notifications arrive, <b>2</b> expire in the platform's queue and are gone, and the average delay is <b>16 min</b>. In the fleet, <b>10%</b> of the 1,000 tokens are dead: without pruning that is <b>3,000</b> wasted sends out of 30,000, with pruning only <b>100</b>.</li>
+    <li>Tick <b>Collapse score updates</b>: the 2 older score updates in the queue are replaced by the newest one. Now <b>27</b> arrive, only 1 expires, <b>2</b> are collapsed, and the average delay drops to <b>12 min</b>. The user sees the current score instead of three old ones.</li>
+    <li>Untick <b>Collapse score updates</b> and set <b>Priority</b> to <b>High</b>: the average delay falls to <b>8 min</b>, because a reachable device is woken at once. The 2 expired messages are still gone: priority does not help a message the platform already dropped.</li>
+    <li>To break it, set <b>Priority</b> to <b>Normal</b>, set <b>Device offline for (minutes)</b> to <b>600</b>, set <b>Time to live (minutes)</b> to <b>60</b> and set <b>Stale tokens in fleet (%)</b> to <b>25</b>: only <b>19</b> arrive, <b>11</b> expire, and the fleet wastes <b>7,500</b> sends without pruning against <b>250</b> with it.</li>
+  </ol>
+  <div class="pg pn" data-pn>
+    <div class="pg-row">
+      <label>Device offline for (minutes) <input class="pg-in" type="number" min="0" max="1100" step="30" value="240" data-offline /></label>
+      <label>Time to live (minutes) <input class="pg-in" type="number" min="0" max="1440" step="30" value="120" data-ttl /></label>
+      <label><input type="checkbox" data-collapse /> Collapse score updates</label>
+      <label>Priority <select class="pg-in" data-priority><option value="normal" selected>Normal</option><option value="high">High</option></select></label>
+      <label>Stale tokens in fleet (%) <input class="pg-in" type="number" min="0" max="100" step="5" value="10" data-stale /></label>
+    </div>
+    <div class="pg-grid">
+      <div class="pg-box" data-b1><h3>Delivered to the phone</h3><span class="pg-mono" data-o1></span><span class="pg-note" data-n1></span></div>
+      <div class="pg-box" data-b2><h3>Expired in the platform queue</h3><span class="pg-mono" data-o2></span><span class="pg-note" data-n2></span></div>
+      <div class="pg-box" data-b3><h3>Collapsed (replaced)</h3><span class="pg-mono" data-o3></span><span class="pg-note" data-n3></span></div>
+      <div class="pg-box" data-b4><h3>Average delay</h3><span class="pg-mono" data-o4></span><span class="pg-note" data-n4></span></div>
+    </div>
+    <div class="pg-grid">
+      <div class="pg-box" data-b5><h3>Wasted sends, never pruning</h3><span class="pg-mono" data-o5></span><span class="pg-note" data-n5></span></div>
+      <div class="pg-box" data-b6><h3>Wasted sends, pruning invalid tokens</h3><span class="pg-mono" data-o6></span><span class="pg-note" data-n6></span></div>
+    </div>
+    <div class="pg-box" style="--c: var(--border)">
+      <h3>What happened to each of the 30 notifications</h3>
+      <div class="pn-strip" data-strip></div>
+      <span class="pg-note">Green: delivered when the phone was reachable. Blue: held by the platform, delivered at reconnect. Red: expired, gone. Grey: collapsed into a newer one. S is a score update, M a message.</span>
+    </div>
+    <ol class="pg-log" data-log tabindex="0" aria-label="What happened to each notification"></ol>
+  </div>
+</PlaygroundShell>
+<script>
+  import { query, formatThousands } from '../playground';
+  const MINUTES_PER_DAY = 1440; const NOTIFICATIONS = 30; const OFFLINE_START = 300; const FLEET = 1000;
+  type Fate = 'live' | 'held' | 'expired' | 'collapsed';
+  interface Item { t: number; kind: 'score' | 'message'; jitter: number; fate: Fate; delay: number }
+
+  const makeRng = (seed: number) => { let s = seed; return () => { s = (s * 48271) % 2147483647; return s; }; };
+  function stream(): Item[] {
+    const next = makeRng(83); const list: Item[] = [];
+    for (let k = 0; k < NOTIFICATIONS; k++) {
+      const t = k * 48 + (next() % 48); const kind = next() % 10 < 4 ? 'score' : 'message'; const jitter = next() % 16;
+      list.push({ t, kind, jitter, fate: 'live', delay: 0 });
+    }
+    return list;
+  }
+
+  // The same model as the code samples, with a fate per notification for the strip and the log.
+  function simulate(offlineMin: number, ttl: number, collapse: boolean, priority: string, stalePct: number) {
+    const reconnect = Math.min(OFFLINE_START + offlineMin, MINUTES_PER_DAY);
+    let delivered = 0, expired = 0, collapsed = 0, delaySum = 0;
+    const items = stream(); const pending: Item[] = [];
+    for (const n of items) {
+      if (n.t >= OFFLINE_START && n.t < reconnect) { pending.push(n); continue; }
+      delivered++; n.fate = 'live'; n.delay = priority === 'high' ? n.jitter % 2 : n.jitter; delaySum += n.delay;
+    }
+    const lastScore = collapse ? Math.max(-1, ...pending.filter((n) => n.kind === 'score').map((n) => n.t)) : -1;
+    for (const n of pending) {
+      if (collapse && n.kind === 'score' && n.t !== lastScore) { collapsed++; n.fate = 'collapsed'; continue; }
+      if (reconnect - n.t > ttl) { expired++; n.fate = 'expired'; continue; }
+      delivered++; n.fate = 'held'; n.delay = reconnect - n.t; delaySum += n.delay;
+    }
+    const stale = Math.floor((FLEET * stalePct) / 100);
+    return { items, reconnect, delivered, expired, collapsed, held: pending.length, avgDelay: Math.floor(delaySum / Math.max(1, delivered)), stale, sends: NOTIFICATIONS * FLEET, wastedKeep: NOTIFICATIONS * stale, wastedPrune: stale };
+  }
+
+  const COLOR: Record<Fate, string> = { live: 'var(--good)', held: 'var(--accent, #2563eb)', expired: 'var(--bad)', collapsed: 'var(--border)' };
+  const hhmm = (m: number) => `${String(Math.floor(m / 60)).padStart(2, '0')}:${String(m % 60).padStart(2, '0')}`;
+
+  document.querySelectorAll<HTMLElement>('[data-pn]').forEach((root) => {
+    const q = query(root);
+    const strip = q('[data-strip]');
+    const cells = Array.from({ length: NOTIFICATIONS }, () => { const c = document.createElement('span'); c.className = 'pn-cell'; strip.appendChild(c); return c; });
+    const box = (n: number, good: boolean) => q<HTMLElement>(`[data-b${n}]`).style.setProperty('--c', good ? 'var(--good)' : 'var(--bad)');
+    const num = (sel: string, lo: number, hi: number, dflt: number) => { const el = q<HTMLInputElement>(sel); const v = Number(el.value); return Number.isFinite(v) && el.value !== '' ? Math.min(hi, Math.max(lo, Math.round(v))) : dflt; };
+    function draw() {
+      const r = simulate(num('[data-offline]', 0, 1100, 240), num('[data-ttl]', 0, 1440, 120), q<HTMLInputElement>('[data-collapse]').checked, q<HTMLSelectElement>('[data-priority]').value, num('[data-stale]', 0, 100, 10));
+      q('[data-o1]').textContent = `${r.delivered} of ${NOTIFICATIONS}`;
+      q('[data-n1]').textContent = `${r.held} were queued by the platform while the phone was offline until ${hhmm(r.reconnect)}`;
+      box(1, r.delivered === NOTIFICATIONS);
+      q('[data-o2]').textContent = `${r.expired} expired`;
+      q('[data-n2]').textContent = r.expired ? 'older than the time to live when the phone came back: dropped, and the app is never told. Critical data must also be fetchable when the app opens' : 'nothing was held longer than the time to live';
+      box(2, r.expired === 0);
+      q('[data-o3]').textContent = `${r.collapsed} collapsed`;
+      q('[data-n3]').textContent = q<HTMLInputElement>('[data-collapse]').checked ? 'older score updates replaced by the newest one with the same collapse key' : 'collapse is off: every queued score update would be delivered, if it has not expired';
+      q<HTMLElement>('[data-b3]').style.setProperty('--c', 'var(--border)');
+      q('[data-o4]').textContent = `${r.avgDelay} min`;
+      q('[data-n4]').textContent = 'send time to delivery time, averaged over delivered notifications';
+      q<HTMLElement>('[data-b4]').style.setProperty('--c', 'var(--border)');
+      q('[data-o5]').textContent = `${formatThousands(r.wastedKeep)} of ${formatThousands(r.sends)}`;
+      q('[data-n5]').textContent = `${formatThousands(r.stale)} dead tokens, each tried again for all ${NOTIFICATIONS} notifications`;
+      box(5, r.wastedKeep === 0);
+      q('[data-o6]').textContent = `${formatThousands(r.wastedPrune)} of ${formatThousands(r.sends)}`;
+      q('[data-n6]').textContent = 'one send per dead token: the platform answers "invalid token" and the server deletes it';
+      box(6, true);
+      r.items.forEach((n, i) => { const c = cells[i]; c.style.setProperty('--c', COLOR[n.fate]); c.textContent = n.kind === 'score' ? 'S' : 'M'; c.title = `${hhmm(n.t)} ${n.kind}: ${n.fate}`; });
+      const log = q('[data-log]'); log.textContent = '';
+      for (const n of r.items) {
+        const li = document.createElement('li');
+        const what = n.fate === 'live' ? `delivered ${n.delay} min later` : n.fate === 'held' ? `held by the platform, delivered at ${hhmm(r.reconnect)} (${n.delay} min later)` : n.fate === 'expired' ? 'held longer than the time to live and dropped' : 'replaced by a newer score update with the same collapse key';
+        li.textContent = `${hhmm(n.t)} ${n.kind} update: ${what}`; log.appendChild(li);
+      }
+    }
+    root.addEventListener('change', draw);
+    root.addEventListener('input', draw);
+    draw();
+  });
+</script>
+<style is:global>
+  .playground .pn-strip { display: flex; flex-wrap: wrap; gap: 4px; }
+  .playground .pn-cell { min-width: 26px; height: 26px; display: inline-flex; align-items: center; justify-content: center; border-radius: 4px; background: color-mix(in srgb, var(--c) 16%, transparent); border: 2px solid var(--c); font-size: 12px; font-weight: 600; }
+</style>

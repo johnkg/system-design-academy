@@ -1,0 +1,65 @@
+{
+  "actors": [
+    { "id": "client", "label": "Client", "role": "client", "x": 8, "y": 50 },
+    { "id": "coord", "label": "Coordinator", "role": "coordinator", "x": 33, "y": 50 },
+    { "id": "s1", "label": "Shard 1", "role": "shard", "x": 66, "y": 14 },
+    { "id": "s2", "label": "Shard 2", "role": "shard", "x": 66, "y": 50 },
+    { "id": "r2", "label": "Replica of 2", "role": "replica", "x": 90, "y": 82 }
+  ],
+  "linkLabel": "query",
+  "meters": [
+    { "id": "lat", "label": "Query latency", "unit": " ms", "max": 450, "start": 0, "warnAt": 100 },
+    { "id": "moved", "label": "Documents sent to the coordinator", "max": 80080, "start": 0, "warnAt": 8000 }
+  ],
+  "frames": [
+    {
+      "narration": "A client searches. The index is split into 8 shards, each holding a slice of the documents. The coordinator cannot know which shards hold matches, so it asks all of them (two are drawn here).",
+      "messages": [{ "from": "client", "to": "coord", "label": "query, page 1" }],
+      "states": { "coord": "scatter to 8 shards" },
+      "links": { "add": [["coord", "s1"], ["coord", "s2"]] },
+      "highlight": ["client", "coord"]
+    },
+    {
+      "narration": "Each shard searches its own segments and returns its top 10 hits, as ids and scores: 80 entries in all. The coordinator merges them and keeps the best 10.",
+      "messages": [{ "from": "s1", "to": "coord", "label": "top 10" }, { "from": "s2", "to": "coord", "label": "top 10" }],
+      "states": { "s1": "20 to 30 ms", "s2": "20 to 30 ms", "coord": "merge 80 entries" },
+      "highlight": ["s1", "s2"],
+      "meters": { "lat": 32, "moved": 80 }
+    },
+    {
+      "narration": "Shard 2 hits a garbage-collection pause: 200 ms extra. The coordinator needs every answer, so the whole query takes about 230 ms. With 8 shards, 4.3% of queries meet a slow shard; with 32 shards it is 15.2%.",
+      "messages": [{ "from": "coord", "to": "s2", "label": "waiting..." }],
+      "states": { "s2": "paused: 230 ms", "coord": "waits for the slowest" },
+      "highlight": ["s2"],
+      "meters": { "lat": 230 }
+    },
+    {
+      "narration": "Fix the tail: send the request to a replica of shard 2 as well and use the first answer. A slow copy no longer matters unless both are slow, so p99 drops to 32 ms.",
+      "messages": [{ "from": "coord", "to": "r2", "label": "same request" }, { "from": "r2", "to": "coord", "label": "first answer" }],
+      "states": { "r2": "answers in 25 ms", "s2": "ignored", "coord": "uses the first answer" },
+      "links": { "add": [["coord", "r2"]] },
+      "highlight": ["r2", "coord"],
+      "meters": { "lat": 32 }
+    },
+    {
+      "narration": "Break it: a user jumps to results 10,001 to 10,010. Every shard must return its own top 10,010, so 8 shards send 80,080 entries to the coordinator to show 10.",
+      "messages": [{ "from": "client", "to": "coord", "label": "from 10,000" }, { "from": "s1", "to": "coord", "label": "10,010 hits" }, { "from": "s2", "to": "coord", "label": "10,010 hits" }],
+      "states": { "coord": "merge 80,080 entries", "s1": "top 10,010", "s2": "top 10,010" },
+      "highlight": ["coord"],
+      "meters": { "lat": 209, "moved": 80080 }
+    },
+    {
+      "narration": "Cursor paging fixes it: the client sends the sort value of the last hit it saw (search_after), and each shard returns only the next 10 after it. Work stays flat however deep the user goes.",
+      "messages": [{ "from": "client", "to": "coord", "label": "after last hit" }, { "from": "s1", "to": "coord", "label": "next 10" }],
+      "states": { "coord": "merge 80 entries", "s1": "top 10 after cursor", "s2": "top 10 after cursor" },
+      "highlight": ["client", "coord"],
+      "meters": { "lat": 32, "moved": 80 }
+    },
+    {
+      "narration": "One more trap: if shard 1 holds 3 times the data of the others, it answers last every time. The median query time doubles from 32 ms to 67 ms. Latency is set by the biggest shard, so keep shards even.",
+      "states": { "s1": "3x the data: 60 ms", "s2": "20 to 30 ms", "coord": "always waits for shard 1" },
+      "highlight": ["s1"],
+      "meters": { "lat": 67 }
+    }
+  ]
+}

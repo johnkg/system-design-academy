@@ -1,0 +1,116 @@
+---
+import PlaygroundShell from '../components/PlaygroundShell.astro';
+import RangeField from '../components/RangeField.astro';
+---
+<PlaygroundShell title="Simulate it" hint="2,000 queries sent to an index split into shards, with the same random numbers every time. A shard answers in about 20 ms plus a spread, 1 request in 200 is slow (+200 ms), collecting more hits costs 1 ms per 100, and the coordinator spends 1 ms per 1,000 hits it merges. The slowest shard decides each query.">
+  <ol class="how">
+    <li>Set <b>Shards</b> to <b>1</b>: one shard is rarely slow, so p50 is <b>27 ms</b> and p99 is <b>32 ms</b>. Set <b>Shards</b> to <b>8</b>: p50 is <b>32 ms</b>, but <b>4.3%</b> of queries now meet a slow shard, and p99 jumps to <b>230 ms</b>. Set <b>Shards</b> to <b>32</b>: <b>15.2%</b> of queries are slow and p99 is <b>232 ms</b>. The more shards, the likelier one of them is slow.</li>
+    <li>With 32 shards, set <b>Replicas per shard</b> to <b>2</b>. Replicas alone change nothing, but tick <b>Send to two replicas, use the first answer</b>: a query is slow only if both copies are, so p99 falls to <b>32 ms</b> and only <b>0.1%</b> of queries are slow.</li>
+    <li>Break it: set <b>Shards</b> to <b>8</b> and <b>Page</b> to <b>from 10,000, size 10</b>. Every shard must return its top 10,010 hits, so <b>80,080</b> documents reach the coordinator to show 10, and even with hedging the median is <b>209 ms</b>. Set <b>Page</b> to <b>from 1,000, size 10</b>: <b>8,080</b> documents.</li>
+    <li>Set <b>Page</b> to <b>from 0, size 10</b> and <b>Shard sizes</b> to <b>Shard 0 holds 3 times the data</b>: hedging has removed the slow spikes (p99 is <b>71 ms</b>), but the big shard answers last every time, so the median is <b>65 ms</b>. Balance the shards.</li>
+  </ol>
+  <div class="pg sc" data-sc>
+    <div class="pg-row">
+      <RangeField label="Shards" name="shards" min="1" max="32" step="1" value="8" readout="8" />
+      <RangeField label="Replicas per shard" name="replicas" min="1" max="3" step="1" value="1" readout="1" />
+      <label><input type="checkbox" data-hedge /> Send to two replicas, use the first answer</label>
+    </div>
+    <div class="pg-row">
+      <RangeField label="Latency spread (ms)" name="spread" min="0" max="40" step="5" value="10" readout="10" />
+      <label>Page <select class="pg-in" data-page><option value="0" selected>from 0, size 10</option><option value="1000">from 1,000, size 10</option><option value="10000">from 10,000, size 10</option></select></label>
+      <label>Shard sizes <select class="pg-in" data-uneven><option value="0" selected>Even</option><option value="1">Shard 0 holds 3 times the data</option></select></label>
+    </div>
+    <div class="pg-grid">
+      <div class="pg-box" data-b1><h3>Query latency</h3><span class="pg-mono" data-o1></span><span class="pg-note" data-n1></span></div>
+      <div class="pg-box" data-b2><h3>Queries that met a slow shard</h3><span class="pg-mono" data-o2></span><span class="pg-note" data-n2></span></div>
+      <div class="pg-box" data-b3><h3>Documents sent to the coordinator</h3><span class="pg-mono" data-o3></span><span class="pg-note" data-n3></span></div>
+    </div>
+    <div class="pg-box" style="--c: var(--border)">
+      <h3>How the 2,000 queries were spread over latency</h3>
+      <div class="sc-bars" data-bars role="img" aria-label="Number of queries in each latency band"></div>
+      <span class="pg-note" data-n4></span>
+    </div>
+  </div>
+</PlaygroundShell>
+<script>
+  import { query, formatThousands } from '../playground';
+  const QUERIES = 2000, BASE_MS = 20, SLOW_PER_MILLE = 5, SLOW_MS = 200, BIG_SHARD = 3;
+  interface Setup { shards: number; replicas: number; hedge: boolean; spread: number; from: number; size: number; uneven: boolean }
+
+  // Park-Miller generator, as in the code samples: the same seed gives the same queries on every run.
+  function makeRandom(seed: number) { let x = seed; return (n: number) => { x = (x * 48271) % 2147483647; return x % n; }; }
+  const shardTime = (rand: (n: number) => number, base: number, spread: number, depth: number) =>
+    base + rand(spread + 1) + (rand(1000) < SLOW_PER_MILLE ? SLOW_MS : 0) + Math.floor(depth / 100);
+
+  function run(c: Setup) {
+    const rand = makeRandom(12345);
+    const depth = c.from + c.size;
+    const merge = 2 + Math.floor(c.shards * depth / 1000);
+    const times: number[] = [];
+    let slowQueries = 0;
+    for (let q = 0; q < QUERIES; q++) {
+      let worst = 0, hitSlow = false;
+      for (let s = 0; s < c.shards; s++) {
+        const base = c.uneven && s === 0 ? BASE_MS * BIG_SHARD : BASE_MS;
+        const a = shardTime(rand, base, c.spread, depth);
+        const b = shardTime(rand, base, c.spread, depth);
+        const t = c.hedge && c.replicas >= 2 ? Math.min(a, b) : a;
+        if (t >= base + SLOW_MS) hitSlow = true;
+        worst = Math.max(worst, t);
+      }
+      if (hitSlow) slowQueries++;
+      times.push(worst + merge);
+    }
+    times.sort((x, y) => x - y);
+    return { times, p50: times[Math.floor(QUERIES * 50 / 100)], p99: times[Math.floor(QUERIES * 99 / 100)], slowTenths: Math.floor(slowQueries * 1000 / QUERIES), moved: c.shards * depth, merge };
+  }
+
+  const BAND = 40, BANDS = 12;
+  document.querySelectorAll<HTMLElement>('[data-sc]').forEach((root) => {
+    const q = query(root);
+    const bars = q('[data-bars]');
+    const cells = Array.from({ length: BANDS }, (_, i) => {
+      const c = document.createElement('div'); c.className = 'sc-col';
+      const bar = document.createElement('span'); bar.className = 'sc-bar';
+      const lab = document.createElement('span'); lab.className = 'pg-note'; lab.textContent = i % 3 === 0 ? String(i * BAND) : '';
+      c.append(bar, lab); bars.appendChild(c); return bar;
+    });
+    const box = (n: number, good: boolean) => q<HTMLElement>(`[data-b${n}]`).style.setProperty('--c', good ? 'var(--good)' : 'var(--bad)');
+    function draw() {
+      const shards = Number(q<HTMLInputElement>('[data-shards]').value);
+      const replicas = Number(q<HTMLInputElement>('[data-replicas]').value);
+      const spread = Number(q<HTMLInputElement>('[data-spread]').value);
+      const hedge = q<HTMLInputElement>('[data-hedge]').checked;
+      const from = Number(q<HTMLSelectElement>('[data-page]').value);
+      const uneven = q<HTMLSelectElement>('[data-uneven]').value === '1';
+      q('[data-shardsval]').textContent = String(shards);
+      q('[data-replicasval]').textContent = String(replicas);
+      q('[data-spreadval]').textContent = String(spread);
+      const r = run({ shards, replicas, hedge, spread, from, size: 10, uneven });
+      const hedged = hedge && replicas >= 2;
+      q('[data-o1]').textContent = `p50 ${r.p50} ms, p99 ${r.p99} ms`;
+      q('[data-n1]').textContent = (hedged ? 'each shard request goes to two replicas and the first answer counts. ' : hedge ? 'hedging needs at least 2 replicas per shard, so it is not active. ' : '') + `The slowest of ${shards} shard${shards === 1 ? '' : 's'} decides the query, plus ${r.merge} ms for the coordinator to merge.`;
+      box(1, r.p99 <= 100);
+      q('[data-o2]').textContent = `${Math.floor(r.slowTenths / 10)}.${r.slowTenths % 10}%`;
+      q('[data-n2]').textContent = `about 1 request in 200 is slow; with ${shards} shards, a query has ${shards} chances to meet one${hedged ? ' (and both copies must be slow)' : ''}`;
+      box(2, r.slowTenths <= 20);
+      q('[data-o3]').textContent = `${formatThousands(r.moved)} for 10 shown`;
+      q('[data-n3]').textContent = `each of ${shards} shard${shards === 1 ? '' : 's'} returns its top ${formatThousands(from + 10)} hits (from + size); the coordinator keeps 10 and discards ${formatThousands(r.moved - 10)}`;
+      box(3, r.moved <= 1000);
+      const counts = new Array(BANDS).fill(0);
+      for (const t of r.times) counts[Math.min(BANDS - 1, Math.floor(t / BAND))]++;
+      const max = Math.max(...counts);
+      counts.forEach((n, i) => { cells[i].style.height = `${Math.max(1, Math.round((n / max) * 70))}px`; cells[i].title = `${i * BAND} ms and up: ${n} queries`; });
+      q('[data-n4]').textContent = `Bars are 40 ms wide, from 0 ms on the left; the fullest holds ${formatThousands(max)} of 2,000 queries. A second hump to the right is the slow shards.`;
+    }
+    root.addEventListener('input', draw);
+    root.addEventListener('change', draw);
+    draw();
+  });
+</script>
+<style is:global>
+  .playground .sc-bars { display: flex; align-items: flex-end; gap: 4px; }
+  .playground .sc-col { flex: 1 1 0; min-width: 0; display: flex; flex-direction: column; justify-content: flex-end; align-items: stretch; height: 96px; gap: 2px; }
+  .playground .sc-col .pg-note { font-size: .72rem; text-align: center; overflow: visible; white-space: nowrap; min-height: 1em; }
+  .playground .sc-bar { display: block; background: var(--accent); border-radius: 2px 2px 0 0; }
+</style>

@@ -1,0 +1,168 @@
+---
+import PlaygroundShell from '../components/PlaygroundShell.astro';
+---
+<PlaygroundShell title="Simulate it" hint="A screen needs 12 small requests; the first 4 make it usable. The link loses the same attempts every time for a given loss rate. A lost attempt is found out only when its timeout fires. The radio stays awake for 1,000 ms after a transfer, and a request after that wakes it again. Below, a fleet reconnects at once to a server that serves 2,000 requests a second; the rest are rejected and retried.">
+  <ol class="how">
+    <li>Start with the defaults: <b>Packet loss (%)</b> at <b>10</b>, <b>Round-trip time (ms)</b> at <b>300</b>, and the sequential strategy with a fixed 1,000 ms timeout. The screen is usable after <b>6,780 ms</b>, <b>15 requests</b> are sent for 12 needed, and the radio wakes up <b>12</b> times, once per request. Below, <b>10,000</b> phones arriving together hit the server at <b>10,000 requests/s</b> in the first server box, with <b>20,000</b> rejected and the last phone served after <b>15 s</b>. The second server box spreads the same phones out: a peak of <b>1,035 requests/s</b> and none rejected.</li>
+    <li>Set <b>Strategy</b> to <b>Parallel, backoff and jitter</b>: all requests start together and a lost one is retried after a growing, randomised pause. The screen is usable after <b>1,850 ms</b>, still <b>15 requests</b>, but only <b>1</b> radio wake-up.</li>
+    <li>Set <b>Strategy</b> to <b>Batch everything into one call</b>: <b>540 ms</b>, <b>1 request</b>, 1 wake-up. Now set <b>Packet loss (%)</b> to <b>30</b>: the batch needs 2 requests and takes <b>2,380 ms</b>, because its bigger reply is hit twice as often. Set <b>Packet loss (%)</b> to <b>40</b> and it never loads: all 4 attempts fail, while the other strategies still get through.</li>
+    <li>To break the fixed timeout, set <b>Packet loss (%)</b> to <b>10</b>, set <b>Round-trip time (ms)</b> to <b>1200</b> and set <b>Strategy</b> to <b>Sequential, fixed timeout, immediate retry</b>: every reply takes longer than the 1,000 ms timeout, so the screen is <b>never</b> usable and <b>48 requests</b> are sent for nothing. Set <b>Strategy</b> to <b>Parallel, backoff and jitter</b> and it is usable after <b>6,350 ms</b>, because how long it waits follows the round trip.</li>
+  </ol>
+  <div class="pg um" data-um>
+    <div class="pg-row">
+      <label>Strategy <select class="pg-in" data-strategy><option value="sequential" selected>Sequential, fixed timeout, immediate retry</option><option value="parallel">Parallel, backoff and jitter</option><option value="batch">Batch everything into one call</option></select></label>
+      <label>Packet loss (%) <input class="pg-in" type="number" min="0" max="90" step="5" value="10" data-loss /></label>
+      <label>Round-trip time (ms) <input class="pg-in" type="number" min="20" max="3000" step="20" value="300" data-rtt /></label>
+      <label>Phones reconnecting at once <input class="pg-in" type="number" min="1000" max="50000" step="1000" value="10000" data-phones /></label>
+    </div>
+    <div class="pg-grid">
+      <div class="pg-box" data-b1><h3>Time to first usable screen</h3><span class="pg-mono" data-o1></span><span class="pg-note" data-n1></span></div>
+      <div class="pg-box" data-b2><h3>Requests sent</h3><span class="pg-mono" data-o2></span><span class="pg-note" data-n2></span></div>
+      <div class="pg-box" data-b3><h3>Battery cost (radio wake-ups)</h3><span class="pg-mono" data-o3></span><span class="pg-note" data-n3></span></div>
+    </div>
+    <div class="pg-grid">
+      <div class="pg-box" data-b4><h3>Server peak, no jitter</h3><span class="pg-mono" data-o4></span><span class="pg-note" data-n4></span></div>
+      <div class="pg-box" data-b5><h3>Server peak, with jitter</h3><span class="pg-mono" data-o5></span><span class="pg-note" data-n5></span></div>
+    </div>
+    <div class="pg-box" style="--c: var(--border)">
+      <h3>Attempts over time</h3>
+      <div class="um-chart" data-chart role="img" aria-label="Each row is one request; bars are attempts, green if the reply arrived and red if the attempt timed out"></div>
+      <span class="pg-note" data-n6></span>
+    </div>
+  </div>
+</PlaygroundShell>
+<script>
+  import { query, formatThousands } from '../playground';
+  const REQS = 12; const ESSENTIAL = 4; const MAX_ATTEMPTS = 4; const TRANSFER_MS = 20; const RENDER_GAP_MS = 1500; const TAIL_MS = 1000;
+  const FIXED_TIMEOUT_MS = 1000; const BASE_BACKOFF_MS = 500; const MAX_BACKOFF_MS = 8000; const RETRY_BUDGET = 12;
+  const SERVER_CAPACITY = 2000; const FLEET_MAX_ATTEMPTS = 8;
+  type Strategy = 'sequential' | 'parallel' | 'batch';
+  interface Bar { row: number; start: number; end: number; ok: boolean }
+
+  const makeRng = (seed: number) => { let s = seed; return () => { s = (s * 48271) % 2147483647; return s; }; };
+  function linkRolls() {
+    const next = makeRng(150); const rows: { roll: number; jit: number }[][] = [];
+    for (let i = 0; i < REQS; i++) { const row = []; for (let j = 0; j < MAX_ATTEMPTS; j++) row.push({ roll: next() % 100, jit: next() % 100 }); rows.push(row); }
+    return rows;
+  }
+  const backoff = (attempt: number, jit: number) => { const cap = Math.min(MAX_BACKOFF_MS, BASE_BACKOFF_MS * 2 ** attempt); return Math.floor(cap / 2) + Math.floor((Math.floor(cap / 2) * jit) / 100); };
+  function wakeUps(bars: Bar[]) {
+    let last = -Infinity, wakes = 0;
+    for (const b of [...bars].sort((x, y) => x.start - y.start)) { if (b.start - last > TAIL_MS) wakes++; last = Math.max(last, b.end); }
+    return wakes;
+  }
+
+  // The same model as the code samples; every attempt is also kept as a bar for the chart.
+  function loadScreen(strategy: Strategy, lossPct: number, rtt: number) {
+    const rolls = linkRolls(); const bars: Bar[] = [];
+    let attempts = 0, failed = 0, usable = 0, essentialFailed = false;
+    if (strategy === 'sequential') {
+      let t = 0;
+      for (let i = 0; i < REQS; i++) {
+        let ok = false;
+        for (let j = 0; j < MAX_ATTEMPTS && !ok; j++) {
+          attempts++; const dur = rtt + TRANSFER_MS;
+          if (rolls[i][j].roll >= lossPct && dur <= FIXED_TIMEOUT_MS) { bars.push({ row: i, start: t, end: t + dur, ok: true }); t += dur; ok = true; }
+          else { bars.push({ row: i, start: t, end: t + FIXED_TIMEOUT_MS, ok: false }); t += FIXED_TIMEOUT_MS; }
+        }
+        if (!ok) { failed++; if (i < ESSENTIAL) essentialFailed = true; }
+        if (i === ESSENTIAL - 1) usable = t;
+        t += RENDER_GAP_MS;
+      }
+    } else if (strategy === 'parallel') {
+      let budget = RETRY_BUDGET;
+      for (let i = 0; i < REQS; i++) {
+        let t = 0, ok = false; const timeout = 4 * rtt;
+        for (let j = 0; j < MAX_ATTEMPTS && !ok; j++) {
+          attempts++; const dur = rtt + TRANSFER_MS;
+          if (rolls[i][j].roll >= lossPct && dur <= timeout) { bars.push({ row: i, start: t, end: t + dur, ok: true }); t += dur; ok = true; break; }
+          bars.push({ row: i, start: t, end: t + timeout, ok: false }); t += timeout;
+          if (j === MAX_ATTEMPTS - 1 || budget === 0) break;
+          budget--; t += backoff(j, rolls[i][j].jit);
+        }
+        if (!ok) { failed++; if (i < ESSENTIAL) essentialFailed = true; } else if (i < ESSENTIAL) usable = Math.max(usable, t);
+      }
+    } else {
+      let t = 0, ok = false; const timeout = 4 * rtt + 300;
+      for (let j = 0; j < MAX_ATTEMPTS && !ok; j++) {
+        attempts++; const dur = rtt + TRANSFER_MS * REQS;
+        if (rolls[0][j].roll >= Math.min(100, 2 * lossPct) && dur <= timeout) { bars.push({ row: 0, start: t, end: t + dur, ok: true }); t += dur; ok = true; break; }
+        bars.push({ row: 0, start: t, end: t + timeout, ok: false }); t += timeout;
+        if (j === MAX_ATTEMPTS - 1) break;
+        t += backoff(j, rolls[0][j].jit);
+      }
+      if (ok) usable = t; else { failed = REQS; essentialFailed = true; }
+    }
+    return { usable: essentialFailed ? -1 : usable, attempts, failed, wakes: wakeUps(bars), bars };
+  }
+
+  function fleet(phones: number, jitter: boolean) {
+    const next = makeRng(11);
+    const nextAt = new Array<number>(phones).fill(0), attempt = new Array<number>(phones).fill(0), pending = new Set<number>();
+    for (let p = 0; p < phones; p++) { if (jitter) nextAt[p] = next() % 10000; pending.add(p); }
+    let peak = 0, rejected = 0, gaveUp = 0, finished = 0;
+    for (let sec = 0; sec < 300 && pending.size > 0; sec++) {
+      const arrivals = [...pending].filter((p) => Math.floor(nextAt[p] / 1000) === sec).sort((a, b) => nextAt[a] - nextAt[b] || a - b);
+      if (arrivals.length === 0) continue;
+      peak = Math.max(peak, arrivals.length);
+      arrivals.forEach((p, k) => {
+        if (k < SERVER_CAPACITY) { pending.delete(p); finished = sec; return; }
+        rejected++; attempt[p]++;
+        if (attempt[p] >= FLEET_MAX_ATTEMPTS) { gaveUp++; pending.delete(p); return; }
+        const delay = Math.min(60000, 1000 * 2 ** (attempt[p] - 1));
+        nextAt[p] += jitter ? next() % delay : delay;
+      });
+    }
+    return { peak, rejected, gaveUp, finished };
+  }
+
+  document.querySelectorAll<HTMLElement>('[data-um]').forEach((root) => {
+    const q = query(root);
+    const box = (n: number, good: boolean) => q<HTMLElement>(`[data-b${n}]`).style.setProperty('--c', good ? 'var(--good)' : 'var(--bad)');
+    const num = (sel: string, lo: number, hi: number, dflt: number) => { const el = q<HTMLInputElement>(sel); const v = Number(el.value); return Number.isFinite(v) && el.value !== '' ? Math.min(hi, Math.max(lo, Math.round(v))) : dflt; };
+    const fleetCache = new Map<string, ReturnType<typeof fleet>>();
+    const fleetOf = (phones: number, jitter: boolean) => { const key = `${phones}-${jitter}`; if (!fleetCache.has(key)) fleetCache.set(key, fleet(phones, jitter)); return fleetCache.get(key)!; };
+    function draw() {
+      const strategy = q<HTMLSelectElement>('[data-strategy]').value as Strategy;
+      const rtt = num('[data-rtt]', 20, 3000, 300);
+      const r = loadScreen(strategy, num('[data-loss]', 0, 90, 10), rtt);
+      q('[data-o1]').textContent = r.usable < 0 ? 'never' : `${formatThousands(r.usable)} ms`;
+      q('[data-n1]').textContent = r.usable < 0 ? 'the essential requests never completed: the user sees an error or a spinner' : strategy === 'sequential' ? 'each request waits for the previous one and for the screen to render it' : strategy === 'parallel' ? 'the slowest of the 4 essential requests, including its retries' : 'one round trip for everything, plus its retries';
+      box(1, r.usable >= 0 && r.usable <= 2500);
+      q('[data-o2]').textContent = `${formatThousands(r.attempts)} ${r.attempts === 1 ? 'request' : 'requests'}`;
+      q('[data-n2]').textContent = `${r.failed ? `${r.failed} of the 12 gave up. ` : ''}${strategy === 'batch' ? 'the 12 requests travel as one' : '12 needed; the rest are retries'}`;
+      box(2, r.attempts <= 15 && r.failed === 0);
+      q('[data-o3]').textContent = `${r.wakes} ${r.wakes === 1 ? 'wake-up' : 'wake-ups'}`;
+      q('[data-n3]').textContent = 'each time the radio has to power up for a request after a quiet gap, it uses far more battery than a request while already awake';
+      box(3, r.wakes <= 2);
+      const phones = num('[data-phones]', 1000, 50000, 10000);
+      const plain = fleetOf(phones, false), jit = fleetOf(phones, true);
+      q('[data-o4]').textContent = `${formatThousands(plain.peak)} requests/s`;
+      q('[data-n4]').textContent = `${formatThousands(plain.rejected)} rejected, retries come back in step; the last phone is served after ${plain.finished} s${plain.gaveUp ? `, ${formatThousands(plain.gaveUp)} phones gave up` : ''}`;
+      box(4, plain.rejected === 0);
+      q('[data-o5]').textContent = `${formatThousands(jit.peak)} requests/s`;
+      q('[data-n5]').textContent = `${formatThousands(jit.rejected)} rejected; each phone waits a random 0 to 10 s, and retries use a random delay; the last phone is served after ${jit.finished} s`;
+      box(5, jit.rejected === 0);
+      const chart = q('[data-chart]'); chart.textContent = '';
+      const span = Math.max(1000, ...r.bars.map((b) => b.end));
+      const rows = strategy === 'batch' ? 1 : REQS;
+      chart.style.height = `${rows * 9 + 4}px`;
+      for (const b of r.bars) {
+        const d = document.createElement('div'); d.className = `um-bar ${b.ok ? 'um-ok' : 'um-bad'}`;
+        d.style.left = `${(b.start / span) * 100}%`; d.style.width = `${Math.max(0.5, ((b.end - b.start) / span) * 100)}%`; d.style.top = `${b.row * 9 + 2}px`;
+        d.title = `${strategy === 'batch' ? 'Batch' : `Request ${b.row + 1}`}: ${formatThousands(b.start)} to ${formatThousands(b.end)} ms, ${b.ok ? 'reply arrived' : 'timed out'}`;
+        chart.appendChild(d);
+      }
+      q('[data-n6]').textContent = `Time runs left to right over ${formatThousands(span)} ms. Green: the reply arrived. Red: the attempt was lost and waited out its timeout. Gaps are rendering time or backoff.`;
+    }
+    root.addEventListener('change', draw);
+    root.addEventListener('input', draw);
+    draw();
+  });
+</script>
+<style is:global>
+  .playground .um-chart { position: relative; width: 100%; border-bottom: 1px solid var(--border); }
+  .playground .um-bar { position: absolute; height: 7px; border-radius: 2px; }
+  .playground .um-ok { background: var(--good); }
+  .playground .um-bad { background: var(--bad); }
+</style>

@@ -1,0 +1,95 @@
+{
+  "name": "Sync Queues and Conflict Resolution",
+  "area": "mobile",
+  "difficulty": "advanced",
+  "intent": "Keep offline changes as an ordered outbox of mutations with ids, replay it when the connection returns, and decide with an explicit policy what happens when two devices changed the same thing.",
+  "scenario": "A shared to-do record has five fields. Device B goes offline at minute 15 and queues its edits for 20 minutes while device A keeps working online. When B reconnects it replays 4 mutations (139 bytes). A and B both edited the notes and the status. Four policies settle it: last writer wins, server order wins, merge per field, or ask the user. We also skew B's clock and let A delete the record.",
+  "problem": "Offline-capable apps accept edits that the server has not seen. When two devices change the same record before either syncs, someone's edit has to give way. The simplest rule, keep the version with the newest timestamp, looks fair, but it overwrites a whole record when only one field clashed, and it trusts phone clocks, which are set by users and drift. The loser's edits vanish with no message. A retry after a lost response can also apply an edit twice, and a delete on one device can race an edit on another.",
+  "howItWorks": [
+    { "title": "Record changes as an ordered outbox", "text": "Instead of sending the new state of a record, the device stores each change as a mutation: what was changed, to what, and a unique id. Mutations are appended to a queue in the order the user made them, in the same local transaction as the change itself, so the queue survives a restart. While the device is online the queue drains at once; offline it simply grows." },
+    { "title": "Replay with ids so retries are safe", "text": "On reconnect the device sends the mutations in order. A response can be lost after the server applied a mutation, so the device sends it again. The server remembers the ids it has applied and ignores repeats. Without ids, a repeated 'append to notes' or 'add 1' is applied twice. The queue can also be compacted before sending: several edits to the same field by the same device collapse into the last one." },
+    { "title": "Detect a conflict, do not guess", "text": "Two changes conflict when they were made without knowledge of each other, to the same data. Edits to different fields do not conflict if you track changes per field. Edits to the same field do. To tell the cases apart, each mutation carries the version it was based on, or a logical clock, and the server compares that with what it holds instead of comparing wall-clock times." },
+    { "title": "Pick a policy for each kind of data", "text": "Last writer wins by timestamp is simple but needs trustworthy clocks and loses whole edits. Server order wins uses the order mutations arrive, which is consistent but favours whoever reconnects last. Per-field merge keeps changes to different fields and can join text. Asking the user is the only policy that never loses an edit on its own, at the price of interrupting them. Counters, sets and collaborative text can use CRDTs, which merge without conflicts by construction." },
+    { "title": "Treat deletes as edits too", "text": "A delete against an edit is a conflict like any other. Keeping a tombstone, a marker that says the record was deleted at a given version, lets the server tell a delete from a record that never existed. Whether the edit or the delete wins is a product decision: deleting usually wins for private data, and the edit wins when losing work is worse than keeping a stray record. Whichever you pick, the loser should be told." }
+  ],
+  "pros": [
+    "The app keeps accepting work offline, and the server ends up with every change that was made",
+    "Mutation ids make replays and retries safe, so a flaky reconnect does not duplicate anything",
+    "Per-field merging keeps most concurrent work, since people rarely edit the same field",
+    "The policy is explicit, so it can be tested and explained to users"
+  ],
+  "cons": [
+    "Every data type needs a conflict rule, and the right rule differs between a title, a counter and a note",
+    "Timestamps from phones are unreliable, so any policy that compares them can pick the wrong winner",
+    "Asking the user is accurate but adds screens and decisions, and users often do not know the answer",
+    "The queue and the server can drift apart if a mutation is rejected after the user saw it succeed"
+  ],
+  "whenToUse": [
+    "Apps where people edit their own data on several devices, or share records, and may be offline for minutes or days",
+    "Any outbox that is retried over unreliable networks, where each mutation must take effect once",
+    "Records with several independent fields, where per-field merging resolves most conflicts silently"
+  ],
+  "whenNotToUse": [
+    "Data with one writer, where a plain overwrite is enough",
+    "Operations that need a global order or a check against current state, such as payments or seat bookings: send them online and wait",
+    "Real-time collaborative text, where a CRDT or operational transformation is a better fit than hand-written policies"
+  ],
+  "pitfalls": [
+    "Comparing device timestamps and treating the newest as the truth, so a phone with a wrong clock overwrites everything",
+    "Replacing the whole record on a conflict, which drops edits to fields nobody else touched",
+    "Sending mutations without ids, so a lost acknowledgement turns into a duplicate",
+    "Resolving conflicts silently and never telling the user their edit was dropped",
+    "Hard-deleting rows, so a late edit or a replayed mutation cannot tell a deleted record from one that never existed",
+    "Letting one rejected mutation block the whole queue behind it"
+  ],
+  "related": [
+    { "kind": "concept", "slug": "crdts" },
+    { "kind": "concept", "slug": "logical-clocks" },
+    { "kind": "concept", "slug": "idempotency" },
+    { "kind": "concept", "slug": "optimistic-concurrency-and-etags" },
+    { "kind": "concept", "slug": "delivery-guarantees" },
+    { "kind": "concept", "slug": "retries-and-backoff" }
+  ],
+  "roles": [
+    { "id": "devicea", "label": "Device A", "description": "Online all the time; its edits reach the server at once." },
+    { "id": "deviceb", "label": "Device B", "description": "Goes offline, keeps editing and queues mutations in an outbox." },
+    { "id": "outbox", "label": "Outbox", "description": "The ordered queue of mutations, each with an id, stored on the device." },
+    { "id": "server", "label": "Server", "description": "Holds the shared record, applies each mutation id once and detects conflicts." },
+    { "id": "user", "label": "User", "description": "Is asked to decide when the policy cannot." }
+  ],
+  "quiz": [
+    {
+      "question": "Device B's clock is 8 minutes behind. It edits a field at 12:10 by the true time, after device A edited the same field at 12:05. The server resolves by timestamp, newest wins. What happens?",
+      "options": [
+        "B's edit wins, because it was made later in real time.",
+        "The server notices the skew and corrects B's timestamp first.",
+        "A's edit wins, because B stamped its edit as minute 12:02.",
+        "Both edits are kept, because the stamps are too close to compare."
+      ],
+      "answer": 2,
+      "explanation": "The server only sees the stamps. B wrote 12:02, which is older than A's 12:05, so B's later edit is discarded. Clock skew turns timestamp comparison into a guess, which is why version numbers, logical clocks or asking the user are safer."
+    },
+    {
+      "question": "A device sends a queued mutation, the server applies it, and the acknowledgement is lost. The device sends the same mutation again. What makes this safe?",
+      "options": [
+        "Each mutation has a unique id, and the server ignores an id it has already applied.",
+        "The server compares the timestamps and keeps the older copy of the mutation.",
+        "The device waits for a longer timeout so that the duplicate cannot happen.",
+        "The server applies it a second time, since setting a field twice is always harmless."
+      ],
+      "answer": 0,
+      "explanation": "Without an id, the server cannot tell a repeat from a new request. Setting a field to a value is harmless to repeat, but 'append to notes' or 'add 1' is not. A longer timeout reduces repeats but never removes them."
+    },
+    {
+      "question": "Two devices edited different fields of the same record while one was offline. Which policy keeps both edits without asking anyone?",
+      "options": [
+        "Whole-record last writer wins, using the newest clock.",
+        "Whole-record server order, with the last arrival replacing the record.",
+        "Dropping the offline device's queue when it reconnects.",
+        "Per-field merging, where each mutation changes only its own field."
+      ],
+      "answer": 3,
+      "explanation": "When a mutation changes one field, edits to different fields do not clash and both apply. Replacing the whole record keeps only one device's version, and dropping the queue loses every offline edit."
+    }
+  ]
+}
