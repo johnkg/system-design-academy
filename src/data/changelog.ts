@@ -3,6 +3,15 @@ export interface Change { date: string; title: string; items: { text: string; hr
 
 export const changelog: Change[] = [
   {
+    date: '2026-11-20',
+    title: 'Three case studies built on the new areas',
+    items: [
+      { text: 'Design a payment reconciliation service: three sources (your ledger, the processors, the bank) that never agree on the first try. Break it with files that arrive twice, a cut-off in the wrong time zone, and a matching rule loose enough to call two different payments one.', href: 'case-studies/payment-reconciliation-service/' },
+      { text: 'Design a mobile release and rollout system: apps you cannot roll back, store review delays, and users who never update. Compare no monitoring, a daily look at the dashboard and an automatic gate, and see why a gate on too few users halts a healthy release.', href: 'case-studies/mobile-release-and-rollout-system/' },
+      { text: 'Design product search for an online store: prices and stock that change faster than an hourly index, a flash sale that swamps real-time indexing, and a sales boost that buries new products.', href: 'case-studies/ecommerce-product-search/' },
+    ],
+  },
+  {
     date: '2026-11-18',
     title: 'Three new areas: search, payments, and mobile and offline',
     items: [
