@@ -95,5 +95,9 @@ export const aliasGroups: string[][] = [
   ['estimation', 'capacity planning', 'back of the envelope', 'qps', 'napkin math', 'requests per second', 'how many servers', 'latency numbers'],
   ['inverted index', 'full-text search', 'full text', 'postings list', 'tf-idf', 'bm25', 'lucene', 'elasticsearch', 'tokenizer', 'stemming', 'relevance'],
   ['cache eviction', 'lru', 'lfu', 'stampede', 'thundering herd', 'dogpile', 'singleflight', 'request coalescing', 'negative caching', 'write-through', 'write-back', 'ttl jitter'],
+  ['concurrency', 'thread', 'threads', 'race condition', 'deadlock', 'mutex', 'lock', 'atomic', 'compare and swap', 'async', 'await', 'event loop', 'thread pool', 'backpressure', 'bounded queue'],
+  ['testing', 'unit test', 'integration test', 'flaky', 'mock', 'stub', 'fake', 'test coverage', 'mutation testing', 'property-based', 'fuzzing', 'test pyramid', 'qa'],
+  ['plugin', 'extension', 'add-on', 'marketplace', 'sandbox', 'third-party code', 'wasm'],
+  ['regex', 'regular expression', 'redos', 'backtracking', 'string search', 'kmp', 'data structure', 'immutability', 'pure function', 'layering', 'separation of concerns'],
   ['unique id', 'snowflake', 'uuid', 'id generation', 'auto increment', 'ticket server', 'sortable id', 'machine id'],
 ];

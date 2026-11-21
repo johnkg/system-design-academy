@@ -3,6 +3,17 @@ export interface Change { date: string; title: string; items: { text: string; hr
 
 export const changelog: Change[] = [
   {
+    date: '2026-11-22',
+    title: 'Two new areas (concurrency, testing), more depth, two case studies',
+    items: [
+      { text: 'Concurrency and parallelism: race conditions, locks and deadlocks, async and the event loop, thread pool sizing, and bounded queues. Each simulation runs every possible ordering of the same program, so you see how many of them go wrong.', href: 'concepts/race-conditions-and-atomicity/' },
+      { text: 'Testing and quality: the test pyramid, flaky tests, over-mocking, coverage against mutation testing, and property-based testing. Each shows which injected bugs a suite catches, and how a plausible improvement can make it worse.', href: 'concepts/test-pyramid-and-where-to-test/' },
+      { text: 'More depth in design principles and algorithms: separation of concerns, immutability and pure functions, choosing a data structure, and how a regular expression can take 26 days on 50 characters.', href: 'concepts/string-matching-and-regex-backtracking/' },
+      { text: 'Design an LRU cache and eviction policy: an unbounded map that gets killed, a scan that empties the cache, and a frequency policy that cannot follow a moving hot set.', href: 'case-studies/lru-cache-and-eviction-design/' },
+      { text: 'Design a plugin and extension platform: one misbehaving plugin, with and without isolation, and why a long timeout makes it worse.', href: 'case-studies/plugin-and-extension-platform/' },
+    ],
+  },
+  {
     date: '2026-11-21',
     title: 'Two new areas: design principles, and algorithms and complexity',
     items: [
