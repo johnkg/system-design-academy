@@ -1,0 +1,95 @@
+{
+  "name": "Thread Pools and Sizing",
+  "area": "concurrency",
+  "difficulty": "intermediate",
+  "intent": "Choose how many worker threads a pool needs and what to put in front of it, using the arrival rate, the time a job spends in the system and the number of cores, instead of guessing.",
+  "scenario": "A service runs jobs on a pool of worker threads on a 4-core machine. One job arrives every tick. I/O-bound jobs spend 2 ticks on a core and 10 waiting for I/O. CPU-bound jobs need 8 ticks of core time. Fan-out jobs submit a sub-job to the same pool and wait for it. We vary the pool size and the queue in front of it.",
+  "problem": "Too few threads and jobs queue up while cores sit idle waiting on I/O. Too many and CPU-bound jobs just share the same cores more thinly, holding more half-finished work in memory. A pool whose jobs wait on other jobs in the same pool can stop completely. And an unbounded queue hides all of this until latency or memory blows up. There is no universal pool size: it depends on what the jobs do.",
+  "howItWorks": [
+    { "title": "A pool is workers plus a queue", "text": "Instead of starting a thread per job, a pool starts a fixed number of worker threads and puts jobs in a queue. A free worker takes the next job. This caps how many things run at once, avoids the cost of creating threads per request, and gives you one place (the queue) where overload becomes visible." },
+    { "title": "CPU-bound work: about one thread per core", "text": "A CPU-bound job uses a core for its whole run. With 4 cores, 4 threads keep them busy. In the model, 64 threads finish the 60 jobs in 122 ticks, no faster than 4 threads at 123, but the average job takes 62 ticks instead of 36, because 49 jobs are now all half-done and sharing 4 cores." },
+    { "title": "I/O-bound work: size by Little's law", "text": "A job waiting for I/O holds a thread but no core. The threads needed are the arrival rate times the time each job spends in the system (Little's law): 1 job per tick times 12 ticks is 12 threads. A common rule of thumb for saturating the cores is cores times (1 + wait time / compute time), 4 x (1 + 10/2) = 24 here, but this load only needs 12 and keeps the cores half idle. Beyond what the load needs, extra threads are never used." },
+    { "title": "Choose what is in front of the pool", "text": "An unbounded queue never refuses anything, so overload shows up as growing waiting time and memory instead of an error. A bounded queue fails fast: when it is full, new jobs are rejected (or the caller is slowed down), which keeps the time in the system bounded for the jobs that were accepted. Which is better depends on whether a late answer is worth more than no answer." },
+    { "title": "Do not wait inside the pool for the pool", "text": "If a job submits a sub-job to its own pool and blocks until it finishes, enough waiting jobs can occupy every thread, leaving no thread to run the sub-jobs. Nothing is slow and nothing is erroring: the pool is just stuck. Use a separate pool for sub-jobs, make the waiting non-blocking, or size the pool for the worst case of waiting parents plus one." }
+  ],
+  "pros": [
+    "A fixed number of workers caps concurrency, so memory and downstream load stay bounded",
+    "Threads are reused, so the cost of creating one is not paid per job",
+    "The queue gives one visible place to measure overload (its length and the waiting time)",
+    "A bounded queue turns overload into fast rejections instead of slow failures for everyone"
+  ],
+  "cons": [
+    "There is no single right size: it depends on the mix of CPU work and waiting, which changes",
+    "An unbounded queue hides overload until memory or latency fails",
+    "Jobs that depend on other jobs in the same pool can deadlock it",
+    "Many threads cost memory and switching time on a real machine, which this model leaves out"
+  ],
+  "whenToUse": [
+    "Bounding how many requests or tasks run at once against a database or another service",
+    "I/O-heavy work where blocking threads are the simplest code, sized by Little's law",
+    "CPU-heavy work, with about one worker per core, kept apart from the I/O pool"
+  ],
+  "whenNotToUse": [
+    "One pool for everything: a slow job type then starves the fast ones (use separate pools, a bulkhead)",
+    "Jobs that block waiting on other jobs from the same pool",
+    "An unbounded queue in front of a service that must stay responsive under overload"
+  ],
+  "pitfalls": [
+    "Sizing the pool from a rule of thumb and never measuring: the right size follows from the arrival rate and the job time",
+    "Raising the pool size to fix slowness when the bottleneck is the cores or a downstream limit: it only adds waiting threads",
+    "An unbounded queue: the 60 jobs of the model wait politely, and the average job takes 25 ticks instead of failing fast",
+    "Submitting a sub-job to the same pool and waiting for it: with 4 threads and 1 job arriving per tick, the model deadlocks at tick 18",
+    "Mixing slow and fast jobs in one pool, so a burst of slow ones blocks every fast one",
+    "Sizing for the average load and ignoring bursts, when the queue is the only buffer you have"
+  ],
+  "related": [
+    { "kind": "concept", "slug": "queueing-theory-and-littles-law" },
+    { "kind": "concept", "slug": "bulkhead" },
+    { "kind": "concept", "slug": "backpressure" },
+    { "kind": "concept", "slug": "load-shedding" },
+    { "kind": "concept", "slug": "autoscaling" },
+    { "kind": "concept", "slug": "threads-async-and-the-event-loop" }
+  ],
+  "roles": [
+    { "id": "client", "label": "Callers", "description": "Submit jobs, one per tick." },
+    { "id": "queue", "label": "Queue", "description": "Holds jobs until a worker is free." },
+    { "id": "worker", "label": "Worker threads", "description": "A fixed set of threads that run the jobs." },
+    { "id": "cores", "label": "CPU cores", "description": "Only 4 threads can compute at the same moment." },
+    { "id": "downstream", "label": "I/O wait", "description": "Where a job waits for a database or network answer, using no core." }
+  ],
+  "quiz": [
+    {
+      "question": "Jobs arrive at 1 per tick and each spends 12 ticks in the system, mostly waiting for I/O. Roughly how many threads does the pool need so that no queue builds?",
+      "options": [
+        "About 4, one per core, because more threads than cores cannot help.",
+        "About 12: the arrival rate times the time each job spends in the system.",
+        "As many as possible, such as 64, because idle threads cost nothing.",
+        "Exactly 1, because a thread waiting for I/O does no work."
+      ],
+      "answer": 1,
+      "explanation": "Little's law: the number of jobs in the system equals the arrival rate times the time in the system, here 1 x 12 = 12. A thread waiting for I/O still holds its job, so it still counts. Four threads would let the queue grow, and more than 12 would never be used."
+    },
+    {
+      "question": "Every task in a pool of 4 threads submits a subtask to the same pool and waits for its result. Under load, the pool stops completing anything and no error is logged. Why?",
+      "options": [
+        "The queue is too short, and the subtasks are silently discarded when it fills.",
+        "The subtasks run on a different pool by default, which is not started yet.",
+        "All 4 threads hold tasks waiting for subtasks that sit in the queue, so none can run.",
+        "Waiting threads use up all the cores, so the subtasks have no processor time."
+      ],
+      "answer": 2,
+      "explanation": "Each waiting task holds a thread and needs a free thread for its subtask. When waiting tasks fill the pool, the subtasks stay queued and the tasks never finish. A separate pool for subtasks, or not blocking, breaks the cycle. Waiting threads use no core."
+    },
+    {
+      "question": "A CPU-bound service on 4 cores raises its pool from 4 threads to 64. What happens?",
+      "options": [
+        "Throughput stays about the same, since cores are the limit, while many more jobs sit half-done at once.",
+        "Throughput rises sixteen-fold, because there are sixteen times as many threads working.",
+        "Throughput falls to zero, because the machine cannot run more threads than it has cores.",
+        "Each job finishes sooner, because a larger pool gives every job a core of its own."
+      ],
+      "answer": 0,
+      "explanation": "Only 4 threads can compute at once, so the cores stay the bottleneck. In the model the 60 jobs take 122 ticks either way, but with 64 threads the average job takes 62 ticks instead of 36, since many jobs share the cores at the same time. On real machines switching adds cost too."
+    }
+  ]
+}

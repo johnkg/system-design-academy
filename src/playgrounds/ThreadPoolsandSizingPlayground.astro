@@ -1,0 +1,116 @@
+---
+import PlaygroundShell from '../components/PlaygroundShell.astro';
+---
+<PlaygroundShell title="Simulate it" hint="Jobs wait in a queue for a fixed pool of worker threads on a machine with 4 cores. Time moves in ticks (no real threads or clock): a tick is one unit of work. A thread waiting for I/O keeps its place in the pool but uses no core; when more threads want a core than there are cores, the cores are shared in turn. Switching between threads is free here, which real machines do not give you.">
+  <ol class="how">
+    <li>Set <b>Jobs</b> to <b>I/O-bound</b> and <b>Pool size</b> to <b>4</b>. One job arrives every tick and each holds a thread for 12 ticks, so 4 threads cannot keep up: the 60 jobs take <b>183</b> ticks, the queue peaks at <b>40</b> and the average job spends <b>68</b> ticks in the system. Set <b>Pool size</b> to <b>12</b>: <b>71</b> ticks, mean <b>12</b>, queue <b>0</b>. That is Little's law: 1 job per tick times 12 ticks in the system is 12 threads. At <b>64</b> threads nothing improves, and only <b>12</b> are ever busy.</li>
+    <li>Set <b>Jobs</b> to <b>CPU-bound</b>. With <b>Pool size</b> <b>4</b> (one thread per core) the jobs take <b>123</b> ticks and average <b>36</b>. At <b>64</b> threads it is still <b>122</b> ticks, but the average rises to <b>62</b> and <b>49</b> threads are in use at once: more threads on the same 4 cores only share them thinner.</li>
+    <li>Set <b>Jobs</b> to <b>Fan-out</b> (each job submits a sub-job to the same pool and waits for it) and <b>Pool size</b> to <b>4</b>: the pool <b>deadlocks at tick 18</b>. Every thread holds a job that waits for a sub-job stuck in the queue behind them. Set <b>Pool size</b> to <b>12</b> and all 30 jobs finish in <b>40</b> ticks.</li>
+    <li>Set <b>Jobs</b> back to <b>I/O-bound</b>, <b>Pool size</b> to <b>8</b>, and compare <b>Queue in front</b>. <b>Unbounded</b>: nothing is refused, the queue reaches <b>20</b> and jobs average <b>25</b> ticks. <b>Bounded to 10</b>: <b>10</b> jobs are rejected at once, the queue stops at <b>10</b>, and the rest average <b>20</b> ticks.</li>
+  </ol>
+  <div class="pg tp" data-tp>
+    <div class="pg-row">
+      <label>Jobs <select class="pg-in" data-workload>
+        <option value="io" selected>I/O-bound (2 ticks CPU, 10 waiting)</option>
+        <option value="cpu">CPU-bound (8 ticks CPU)</option>
+        <option value="fanout">Fan-out (waits for a sub-job in the same pool)</option>
+      </select></label>
+      <label>Pool size <select class="pg-in" data-pool><option>2</option><option>4</option><option selected>8</option><option>12</option><option>16</option><option>64</option></select></label>
+      <label>Queue in front <select class="pg-in" data-queue><option value="0" selected>Unbounded</option><option value="10">Bounded to 10</option></select></label>
+    </div>
+    <div class="pg-grid">
+      <div class="pg-box" data-b1><h3>Jobs finished</h3><span class="pg-mono" data-o1></span><span class="pg-note" data-n1></span></div>
+      <div class="pg-box" data-b2><h3>Ticks to finish</h3><span class="pg-mono" data-o2></span><span class="pg-note" data-n2></span></div>
+      <div class="pg-box" data-b3><h3>Average time in the system</h3><span class="pg-mono" data-o3></span><span class="pg-note" data-n3></span></div>
+      <div class="pg-box" data-b4><h3>Longest the queue got</h3><span class="pg-mono" data-o4></span><span class="pg-note" data-n4></span></div>
+      <div class="pg-box" data-b5><h3>Most threads in use at once</h3><span class="pg-mono" data-o5></span><span class="pg-note" data-n5></span></div>
+    </div>
+    <div class="pg-box" style="--c: var(--border)"><h3>Sizing rule for these jobs</h3><span class="pg-note" data-rule></span></div>
+  </div>
+</PlaygroundShell>
+<script>
+  import { query } from '../playground';
+  const CORES = 4;
+  const WORKLOADS: Record<string, { jobs: number; gap: number }> = { cpu: { jobs: 60, gap: 1 }, io: { jobs: 60, gap: 1 }, fanout: { jobs: 30, gap: 1 } };
+  interface Job { kind: 'job' | 'child'; arrive: number; parent?: number }
+  interface Th { state: string; rem: number; job: Job | null; last: number; phase: number }
+
+  // The same model as the code samples.
+  function simulate(workload: string, pool: number, qbound: number) {
+    const w = WORKLOADS[workload];
+    const queue: Job[] = [];
+    const th: Th[] = Array.from({ length: pool }, () => ({ state: 'free', rem: 0, job: null, last: -1, phase: 0 }));
+    let next = 0, rejected = 0, done = 0, sumLat = 0, peakQueue = 0, peakThreads = 0, ticks = 0, deadlock = false;
+    const complete = (x: Th, t: number) => {
+      if (x.job!.kind === 'job') { done++; sumLat += t + 1 - x.job!.arrive; }
+      else { const p = th[x.job!.parent!]; p.state = 'cpu'; p.rem = 1; p.phase = 2; }
+      x.state = 'free'; x.job = null;
+    };
+    for (let t = 0; t < 5000; t++) {
+      if (next < w.jobs && t % w.gap === 0) {
+        if (qbound > 0 && queue.length >= qbound) rejected++; else queue.push({ kind: 'job', arrive: t });
+        next++;
+      }
+      for (const x of th) {
+        if (x.state === 'free' && queue.length > 0) {
+          x.job = queue.shift()!; x.phase = 1; x.state = 'cpu';
+          x.rem = workload === 'cpu' ? 8 : workload === 'io' ? 2 : x.job.kind === 'child' ? 3 : 1;
+        }
+      }
+      if (queue.length > peakQueue) peakQueue = queue.length;
+      const busy = th.filter((x) => x.state !== 'free').length;
+      if (busy > peakThreads) peakThreads = busy;
+      const running = th.map((_, i) => i).filter((i) => th[i].state === 'cpu').sort((a, b) => th[a].last - th[b].last || a - b).slice(0, CORES);
+      for (const i of running) { th[i].rem--; th[i].last = t; }
+      for (let i = 0; i < pool; i++) if (th[i].state === 'io') th[i].rem--;
+      for (let i = 0; i < pool; i++) {
+        const x = th[i];
+        if (x.rem !== 0) continue;
+        if (x.state === 'cpu') {
+          if (workload === 'io' && x.phase === 1) { x.phase = 2; x.state = 'io'; x.rem = 10; }
+          else if (workload === 'fanout' && x.job!.kind === 'job' && x.phase === 1) { queue.push({ kind: 'child', arrive: t, parent: i }); x.state = 'blocked'; x.rem = -1; }
+          else complete(x, t);
+        } else if (x.state === 'io') complete(x, t);
+      }
+      ticks = t + 1;
+      if (done === w.jobs - rejected && next === w.jobs) break;
+      if (th.every((x) => x.state === 'blocked')) { deadlock = true; break; }
+    }
+    return { done, rejected, ticks, peakQueue, peakThreads, mean: done ? Math.floor(sumLat / done) : 0, deadlock, jobs: w.jobs };
+  }
+
+  const RULES: Record<string, string> = {
+    io: 'Threads needed is about the arrival rate times the time a job spends in the system: 1 job per tick times 12 ticks is 12 threads. Fewer and a queue builds; more are never used.',
+    cpu: 'CPU work only runs on a core, so about one thread per core keeps the cores busy. More threads just share the same 4 cores and hold more jobs half-finished at once.',
+    fanout: 'A job that waits for a sub-job in its own pool needs a spare thread for the sub-job. If every thread is taken by a waiting parent, nothing can finish. Use a separate pool for sub-jobs, or do not wait inside the pool.',
+  };
+
+  document.querySelectorAll<HTMLElement>('[data-tp]').forEach((root) => {
+    const q = query(root);
+    const setBox = (n: number, good: boolean) => q<HTMLElement>(`[data-b${n}]`).style.setProperty('--c', good ? 'var(--good)' : 'var(--bad)');
+    function draw() {
+      const workload = q<HTMLSelectElement>('[data-workload]').value;
+      const pool = Number(q<HTMLSelectElement>('[data-pool]').value);
+      const qbound = Number(q<HTMLSelectElement>('[data-queue]').value);
+      const r = simulate(workload, pool, qbound);
+      q('[data-o1]').textContent = `${r.done} of ${r.jobs}`;
+      q('[data-n1]').textContent = r.deadlock ? 'the rest are stuck for good' : r.rejected ? `${r.rejected} more were rejected because the queue was full` : 'every job ran';
+      setBox(1, !r.deadlock && r.rejected === 0);
+      q('[data-o2]').textContent = r.deadlock ? `Deadlocked at tick ${r.ticks}` : String(r.ticks);
+      q('[data-n2]').textContent = r.deadlock ? 'every thread holds a job that waits for a sub-job nobody can start' : 'from the first job arriving to the last finishing';
+      setBox(2, !r.deadlock);
+      q('[data-o3]').textContent = r.done ? `${r.mean} ticks` : 'none finished';
+      q('[data-n3]').textContent = 'from arriving to finishing, queue wait included';
+      setBox(3, !r.deadlock && r.mean <= 20);
+      q('[data-o4]').textContent = String(r.peakQueue);
+      q('[data-n4]').textContent = qbound ? 'the bound caps it; the extra jobs were turned away' : 'jobs waiting for a thread: unbounded, so it can only grow';
+      setBox(4, r.peakQueue <= 5);
+      q('[data-o5]').textContent = String(r.peakThreads);
+      q('[data-n5]').textContent = r.peakThreads < pool ? `of ${pool} in the pool: the rest were never needed` : `of ${pool} in the pool: every thread was used`;
+      setBox(5, true);
+      q('[data-rule]').textContent = RULES[workload];
+    }
+    root.addEventListener('change', draw);
+    draw();
+  });
+</script>
