@@ -18,6 +18,9 @@ export const areas = [
   { id: 'mobile', label: 'Mobile & offline', blurb: 'How apps keep working on slow, flaky or missing connections, and on versions you cannot update' },
   { id: 'principles', label: 'Design principles', blurb: 'The rules of thumb that keep code easy to change, SOLID included, and the ways each one is most often misunderstood' },
   { id: 'algorithms', label: 'Algorithms & complexity', blurb: 'How the cost of code grows with its input, and the hidden costs that turn a harmless-looking loop into an outage' },
+  { id: 'concurrency', label: 'Concurrency & parallelism', blurb: 'How code that runs at the same time shares data safely, and the bugs that appear when it does not' },
+  { id: 'testing', label: 'Testing & quality', blurb: 'How to know that code works, what each kind of test can and cannot tell you, and why tests lie' },
+  { id: 'architecture', label: 'Software architecture', blurb: 'How whole systems are divided into parts, which boundaries to draw, and how to change them while they run' },
   { id: 'patterns', label: 'Design patterns', blurb: 'The 23 classic Gang of Four patterns for structuring code' },
 ] as const;
 
