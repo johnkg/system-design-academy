@@ -1,0 +1,102 @@
+---
+import PlaygroundShell from '../components/PlaygroundShell.astro';
+---
+<PlaygroundShell title="Simulate it" hint="A batch job processes 100 records. Some are permanently bad, some fail a few times and then work. Choose what the job does when a record fails and see what ends up correct, wrong, stuck or silently lost.">
+  <ol class="how">
+    <li>Start with <b>Strategy</b> <b>Swallow and continue</b>, <b>Bad records (%)</b> at <b>10</b>, <b>Transient failures (%)</b> at <b>10</b> and <b>Retries</b> at <b>3</b>. The job finishes with <b>80</b> correct and <b>20</b> wrong records, and never raises a single alert.</li>
+    <li>Set <b>Strategy</b> to <b>Fail fast</b>: the first bad record, number <b>11</b>, stops the job with <b>10</b> correct and <b>90</b> not processed. Set <b>Bad records (%)</b> to <b>0</b> and <b>Transient failures (%)</b> to <b>20</b>: it now stops at record <b>2</b> on a blip a retry would absorb. Set <b>Strategy</b> to <b>Retry, then fail fast</b>: all <b>100</b> correct, in <b>141</b> attempts.</li>
+    <li>Set <b>Bad records (%)</b> back to <b>10</b>, <b>Transient failures (%)</b> back to <b>10</b> and <b>Strategy</b> to <b>Dead-letter and continue</b>: <b>90</b> correct and <b>10</b> parked for review, in <b>119</b> attempts. Set <b>Strategy</b> to <b>Retry everything</b>: the same result but <b>149</b> attempts, because bad data is retried too.</li>
+    <li>Break it: set <b>Strategy</b> to <b>Dead-letter and continue</b> and tick <b>Later records depend on earlier ones</b>. Only <b>10</b> records are correct and <b>80</b> are wrong, built on top of a skipped record. Set <b>Strategy</b> to <b>Fail fast</b>: no wrong records at all.</li>
+  </ol>
+  <div class="pg ffe" data-ffe>
+    <div class="pg-row">
+      <label>Strategy <select class="pg-in" data-strategy><option value="swallow" selected>Swallow and continue</option><option value="failfast">Fail fast</option><option value="retry">Retry, then fail fast</option><option value="deadletter">Dead-letter and continue</option><option value="blind">Retry everything</option></select></label>
+      <label>Bad records (%) <input class="pg-in" type="range" min="0" max="30" step="5" value="10" data-bad /> <b data-badv></b></label>
+      <label>Transient failures (%) <input class="pg-in" type="range" min="0" max="30" step="5" value="10" data-trans /> <b data-transv></b></label>
+      <label>Retries <input class="pg-in" type="range" min="0" max="3" step="1" value="3" data-retries /> <b data-retriesv></b></label>
+      <label><input type="checkbox" data-dep /> Later records depend on earlier ones</label>
+    </div>
+    <div class="pg-grid">
+      <div class="pg-box" data-b1><h3>Correct records</h3><span class="pg-mono" data-o1></span><span class="pg-note" data-n1></span></div>
+      <div class="pg-box" data-b2><h3>Wrong records saved</h3><span class="pg-mono" data-o2></span><span class="pg-note" data-n2></span></div>
+      <div class="pg-box" data-b3><h3>Parked for review</h3><span class="pg-mono" data-o3></span><span class="pg-note" data-n3></span></div>
+      <div class="pg-box" data-b4><h3>Not processed</h3><span class="pg-mono" data-o4></span><span class="pg-note" data-n4></span></div>
+      <div class="pg-box" data-b5><h3>Attempts made</h3><span class="pg-mono" data-o5></span><span class="pg-note" data-n5></span></div>
+      <div class="pg-box" data-b6><h3>First noticed at record</h3><span class="pg-mono" data-o6></span><span class="pg-note" data-n6></span></div>
+    </div>
+    <div class="pg-box" style="--c: var(--border)">
+      <h3>Every strategy at these settings</h3>
+      <div class="ffe-scroll" tabindex="0" role="region" aria-label="Results of each strategy at the chosen settings"><table class="ffe-table" data-table></table></div>
+      <span class="pg-note" data-verdict></span>
+    </div>
+  </div>
+</PlaygroundShell>
+<script>
+  import { query } from '../playground';
+  type Strategy = 'swallow' | 'failfast' | 'retry' | 'deadletter' | 'blind';
+  interface R { correct: number; wrong: number; parked: number; unprocessed: number; attempts: number; noticed: number }
+
+  // The same model as the code samples. Record i is permanently bad if (i*37) % 100 < bad%; otherwise, if (i*53 + 11) % 100 < transient%,
+  // it fails its first f attempts (f = 1 + i*7 % 3) and works after that. 37 and 53 are coprime with 100, so the shares are exact.
+  function run(strategy: Strategy, bad: number, trans: number, retries: number, dependent: boolean): R {
+    let attempts = 0, correct = 0, wrong = 0, parked = 0, unprocessed = 0, noticed = 0;
+    let aborted = false, broken = false;
+    const allowed = strategy === 'retry' || strategy === 'deadletter' || strategy === 'blind' ? retries : 0;
+    for (let i = 1; i <= 100; i++) {
+      if (aborted) { unprocessed++; continue; }
+      let failed = true, attempt = 1;
+      while (attempt <= 1 + allowed) {
+        attempts++;
+        if ((i * 37) % 100 < bad) { if (strategy !== 'blind') break; } // a data error will not fix itself: only blind retry tries again
+        else if ((i * 53 + 11) % 100 < trans && attempt <= 1 + ((i * 7) % 3)) { /* transient: try again if allowed */ }
+        else { failed = false; break; }
+        attempt++;
+      }
+      if (!failed) { if (dependent && broken) wrong++; else correct++; } // computed on top of a skipped or faked record
+      else if (strategy === 'swallow') { wrong++; broken = true; }
+      else if (strategy === 'failfast' || strategy === 'retry') { aborted = true; unprocessed++; noticed = i; }
+      else { parked++; broken = true; noticed = noticed || i; }
+    }
+    return { correct, wrong, parked, unprocessed, attempts, noticed };
+  }
+  const NAMES: Record<Strategy, string> = { swallow: 'Swallow and continue', failfast: 'Fail fast', retry: 'Retry, then fail fast', deadletter: 'Dead-letter and continue', blind: 'Retry everything' };
+  const ALL: Strategy[] = ['swallow', 'failfast', 'retry', 'deadletter', 'blind'];
+
+  document.querySelectorAll<HTMLElement>('[data-ffe]').forEach((root) => {
+    const q = query(root);
+    const setBox = (n: number, value: string, note: string, good: boolean | null) => {
+      q(`[data-o${n}]`).textContent = value; q(`[data-n${n}]`).textContent = note;
+      q<HTMLElement>(`[data-b${n}]`).style.setProperty('--c', good === null ? 'var(--border)' : good ? 'var(--good)' : 'var(--bad)');
+    };
+    function draw() {
+      const s = q<HTMLSelectElement>('[data-strategy]').value as Strategy, bad = Number(q<HTMLInputElement>('[data-bad]').value);
+      const trans = Number(q<HTMLInputElement>('[data-trans]').value), retries = Number(q<HTMLInputElement>('[data-retries]').value);
+      const dep = q<HTMLInputElement>('[data-dep]').checked;
+      q('[data-badv]').textContent = `${bad}% (${bad} of 100)`; q('[data-transv]').textContent = `${trans}% (${trans} of 100)`; q('[data-retriesv]').textContent = `${retries}`;
+      const r = run(s, bad, trans, retries, dep);
+      setBox(1, `${r.correct}`, 'saved with the right value', r.correct >= 100 - bad ? true : null);
+      setBox(2, `${r.wrong}`, r.wrong === 0 ? 'nothing wrong was saved' : s === 'swallow' ? 'errors were caught and ignored, a default was saved' : 'built on top of a skipped record', r.wrong === 0);
+      setBox(3, `${r.parked}`, r.parked ? 'set aside with their error, for a person or a fix' : 'no dead-letter queue in this strategy', null);
+      setBox(4, `${r.unprocessed}`, r.unprocessed ? 'the job stopped, so these were never tried' : 'every record was tried', r.unprocessed === 0);
+      setBox(5, `${r.attempts}`, 'tries in all, including retries', null);
+      setBox(6, r.noticed ? `${r.noticed}` : 'never', r.noticed ? 'the first record that raised an alert' : bad + trans > 0 ? 'no alert was raised: someone finds out later, from the data' : 'nothing went wrong', r.noticed > 0 || bad + trans === 0);
+      const table = q('[data-table]'); table.textContent = '';
+      const head = table.insertRow(); ['Strategy', 'Correct', 'Wrong', 'Parked', 'Not processed', 'Attempts', 'Noticed at'].forEach((h) => { const th = document.createElement('th'); th.textContent = h; head.appendChild(th); });
+      ALL.forEach((k) => {
+        const x = run(k, bad, trans, retries, dep), row = table.insertRow(); if (k === s) row.className = 'on';
+        [NAMES[k], `${x.correct}`, `${x.wrong}`, `${x.parked}`, `${x.unprocessed}`, `${x.attempts}`, x.noticed ? `${x.noticed}` : 'never'].forEach((v) => { row.insertCell().textContent = v; });
+      });
+      q('[data-verdict]').textContent = `${NAMES[s]}: ${r.correct} correct, ${r.wrong} wrong, ${r.parked} parked, ${r.unprocessed} not processed, in ${r.attempts} attempts. Stopping suits records that depend on each other; setting a bad record aside suits independent ones; retrying suits only errors that can go away.`;
+    }
+    root.addEventListener('input', draw);
+    root.addEventListener('change', draw);
+    draw();
+  });
+</script>
+<style is:global>
+  .playground .ffe-scroll { overflow-x: auto; }
+  .playground .ffe-table { border-collapse: collapse; font: .82rem var(--font-mono); min-width: 100%; }
+  .playground .ffe-table th, .playground .ffe-table td { padding: 4px 8px; border-bottom: 1px solid var(--border); text-align: right; white-space: nowrap; }
+  .playground .ffe-table th:first-child, .playground .ffe-table td:first-child { text-align: left; }
+  .playground .ffe-table tr.on td { font-weight: 700; background: var(--accent-soft); }
+</style>
