@@ -16,6 +16,8 @@ export const areas = [
   { id: 'search', label: 'Search systems', blurb: 'How text is indexed, ranked, spread over machines, kept fresh and judged, from the first keystroke to the last result' },
   { id: 'payments', label: 'Payments & money', blurb: 'How money is represented, recorded, moved and checked, so that every cent can be accounted for' },
   { id: 'mobile', label: 'Mobile & offline', blurb: 'How apps keep working on slow, flaky or missing connections, and on versions you cannot update' },
+  { id: 'principles', label: 'Design principles', blurb: 'The rules of thumb that keep code easy to change, SOLID included, and the ways each one is most often misunderstood' },
+  { id: 'algorithms', label: 'Algorithms & complexity', blurb: 'How the cost of code grows with its input, and the hidden costs that turn a harmless-looking loop into an outage' },
   { id: 'patterns', label: 'Design patterns', blurb: 'The 23 classic Gang of Four patterns for structuring code' },
 ] as const;
 

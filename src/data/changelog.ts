@@ -3,6 +3,14 @@ export interface Change { date: string; title: string; items: { text: string; hr
 
 export const changelog: Change[] = [
   {
+    date: '2026-11-21',
+    title: 'Two new areas: design principles, and algorithms and complexity',
+    items: [
+      { text: 'Design principles: SOLID one principle at a time, plus DRY, composition over inheritance, and coupling and cohesion. Each lesson covers what people usually get wrong (one reason to change is not one method per class; a Square that inherits Rectangle breaks callers; injecting a concrete class is not dependency inversion) and lets you over-apply the principle to see what that costs.', href: 'concepts/single-responsibility-principle/' },
+      { text: 'Algorithms and complexity: Big O with the traps (a constant factor of 100, O(n²) that hides in a harmless loop, amortized cost and the latency spike it hides), hash tables and how they fail, memoization, sorting and searching, space against time, and trees and graphs in their worst shapes. The simulations count operations, so you can see where the curves cross.', href: 'concepts/big-o-notation-basics/' },
+    ],
+  },
+  {
     date: '2026-11-20',
     title: 'Three case studies built on the new areas',
     items: [
