@@ -126,4 +126,11 @@ export const paths: LearningPath[] = [
     blurb: 'Where to put tests, why they flake, how mocks make broken code pass, what coverage misses and how to find inputs you did not think of.',
     steps: [c('test-pyramid-and-where-to-test'), c('flaky-tests'), c('test-doubles-and-over-mocking'), c('coverage-and-mutation-testing'), c('property-based-testing-and-fuzzing')],
   },
+  {
+    id: 'shaping-a-system',
+    title: 'Shaping a system: where to draw the lines',
+    audience: 'Going deeper',
+    blurb: 'From one deployable to many, and back from many to something sane: what each split costs, how to keep rules away from vendors, how to name boundaries, how events hide coupling, and how to migrate without a big bang.',
+    steps: [c('monolith-modular-monolith-and-microservices'), c('hexagonal-architecture-ports-and-adapters'), c('domain-driven-design-and-bounded-contexts'), c('event-driven-architecture'), c('strangler-fig-and-incremental-migration')],
+  },
 ];

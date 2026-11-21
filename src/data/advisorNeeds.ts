@@ -365,4 +365,18 @@ export const advisorNeeds: Need[] = [
       { kind: 'concept', slug: 'timeouts-and-deadlines', because: 'a plugin that hangs must not hang the host' },
     ],
   },
+  {
+    id: 'architecture-choice',
+    label: 'Deciding how to split an app into parts',
+    why: 'Where you draw the boundaries decides how expensive every later change is. Start with the simplest split that gives each team room, and move to something stronger only when a measured problem asks for it.',
+    words: ['monolith', 'microservices', 'architecture', 'modular', 'rewrite', 'legacy', 'migrate', 'migration', 'domain model', 'bounded context', 'event driven', 'hexagonal', 'clean architecture'],
+    use: [
+      { kind: 'concept', slug: 'monolith-modular-monolith-and-microservices', because: 'what each split costs in deploys, calls and failures' },
+      { kind: 'concept', slug: 'hexagonal-architecture-ports-and-adapters', because: 'keep business rules away from the database and vendors' },
+      { kind: 'concept', slug: 'domain-driven-design-and-bounded-contexts', because: 'where one word should have two meanings' },
+      { kind: 'concept', slug: 'event-driven-architecture', because: 'loose coupling that you can no longer see' },
+      { kind: 'concept', slug: 'strangler-fig-and-incremental-migration', because: 'replace the old system without a big-bang cutover' },
+      { kind: 'study', slug: 'monolith-to-services-migration', because: 'a migration where a plausible shortcut builds a distributed monolith' },
+    ],
+  },
 ];

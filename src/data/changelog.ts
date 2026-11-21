@@ -3,6 +3,15 @@ export interface Change { date: string; title: string; items: { text: string; hr
 
 export const changelog: Change[] = [
   {
+    date: '2026-11-23',
+    title: 'New area: software architecture, and two more case studies',
+    items: [
+      { text: 'Software architecture: monolith, modular monolith and microservices (and the distributed monolith that is worse than both), hexagonal architecture, bounded contexts, event-driven design, and the strangler fig for migrating without a big bang. Each simulation includes the over-applied extreme.', href: 'concepts/monolith-modular-monolith-and-microservices/' },
+      { text: 'Design a monolith-to-services migration: move traffic in slices, keep the two databases in step, and see why keeping the shared database "for now" costs more than it saves.', href: 'case-studies/monolith-to-services-migration/' },
+      { text: 'Design a concurrent job worker service: a noisy tenant, a pool bigger than the machine, a thread per job, and retries that run a side effect twice.', href: 'case-studies/concurrent-worker-pool-service/' },
+    ],
+  },
+  {
     date: '2026-11-22',
     title: 'Two new areas (concurrency, testing), more depth, two case studies',
     items: [

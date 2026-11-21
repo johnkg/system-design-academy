@@ -97,6 +97,8 @@ export const aliasGroups: string[][] = [
   ['cache eviction', 'lru', 'lfu', 'stampede', 'thundering herd', 'dogpile', 'singleflight', 'request coalescing', 'negative caching', 'write-through', 'write-back', 'ttl jitter'],
   ['concurrency', 'thread', 'threads', 'race condition', 'deadlock', 'mutex', 'lock', 'atomic', 'compare and swap', 'async', 'await', 'event loop', 'thread pool', 'backpressure', 'bounded queue'],
   ['testing', 'unit test', 'integration test', 'flaky', 'mock', 'stub', 'fake', 'test coverage', 'mutation testing', 'property-based', 'fuzzing', 'test pyramid', 'qa'],
+  ['architecture', 'monolith', 'microservices', 'modular monolith', 'hexagonal', 'ports and adapters', 'clean architecture', 'ddd', 'domain driven design', 'bounded context', 'event driven', 'choreography', 'orchestration', 'strangler fig', 'rewrite', 'legacy migration'],
+  ['worker', 'workers', 'worker pool', 'job queue', 'background jobs', 'noisy neighbor', 'noisy tenant', 'fair queue', 'job worker'],
   ['plugin', 'extension', 'add-on', 'marketplace', 'sandbox', 'third-party code', 'wasm'],
   ['regex', 'regular expression', 'redos', 'backtracking', 'string search', 'kmp', 'data structure', 'immutability', 'pure function', 'layering', 'separation of concerns'],
   ['unique id', 'snowflake', 'uuid', 'id generation', 'auto increment', 'ticket server', 'sortable id', 'machine id'],
