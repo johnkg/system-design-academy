@@ -1,0 +1,203 @@
+{
+  "name": "Design an LRU Cache and Eviction Policy",
+  "difficulty": "intermediate",
+  "intent": "Keep the hot working set of a read-heavy service in memory, within a fixed budget: choose what to throw out when the cache is full, survive a one-off scan, and then spread the cache over many machines without stampedes.",
+  "prompt": "Design the cache for the product-catalog service of an online store. The catalog has 50 million items of about 2 KB each, but about 85% of reads go to the same 1 million popular items (around 2 GB), and the popular items change as campaigns come and go. Peak traffic is 150,000 reads a second from 300 application servers. The database behind the catalog can serve about 30,000 reads a second, so the cache has to answer at least 80% of reads. Start with a cache inside one process, then make it a shared cache that survives a node dying, a nightly report that reads millions of old items, and a popular item expiring under load.",
+  "codeTitle": "one seeded request stream, four eviction policies, a report scan and a moving hot set",
+  "finalIntro": "One read through the finished cache, a report job that cannot push it out, an expiring hot item, and an update.",
+  "functional": [
+    "get(key) returns the cached item, or reads the database and stores the result",
+    "The cache never uses more memory than its budget, and removes the least useful items to make room",
+    "An item can expire after a time to live, and is removed when the product changes",
+    "Cache nodes can be added or lost without emptying the whole cache",
+    "Applications can see hit rate, evictions and memory use per cache"
+  ],
+  "nonFunctional": [
+    "At least 80% of reads are answered from memory at the 150,000 reads a second peak, so the database sees no more than 30,000",
+    "A cache read takes about 1 ms or less at the 99th percentile, including the network hop to a shared cache",
+    "Memory use is bounded: a cache node is never killed for running out of memory",
+    "A report job or crawler reading millions of old items cannot push the hot working set out",
+    "When one cache node is lost, only its share of the keys miss, and the database stays under 30,000 reads a second",
+    "A changed product is visible within a minute, even if its cache entry was not removed"
+  ],
+  "firstAttempt": {
+    "text": "Each of the 300 application servers keeps a plain hash map in its own process. A read looks in the map; on a miss it reads the database and puts the result in the map. Nothing is ever removed.",
+    "limits": [
+      "Every cold item that is read once stays for ever, so the map only grows until the operating system kills the process, which then restarts with an empty cache",
+      "The same hot items are cached 300 times, once per server: 2 GB of popular data takes about 600 GB of memory across the fleet",
+      "A restarted or newly added server starts cold, and its whole traffic goes to the database until it has warmed up",
+      "An entry is never refreshed, so a changed price can be shown for as long as the process lives",
+      "A heap holding many millions of small objects makes garbage-collection pauses longer, so the cache slows down the application it was meant to speed up"
+    ]
+  },
+  "nodes": [
+    { "id": "app", "label": "Application servers", "kind": "client", "x": 12, "y": 50 },
+    { "id": "map", "label": "Unbounded map in each server", "kind": "data", "x": 37, "y": 50, "at": 0, "until": 1 },
+    { "id": "local", "label": "Bounded in-process cache (LRU)", "kind": "data", "x": 37, "y": 50, "at": 1 },
+    { "id": "db", "label": "Database", "kind": "data", "x": 87, "y": 50 },
+    { "id": "policy", "label": "Eviction policy and TTL", "kind": "compute", "x": 37, "y": 16, "at": 3 },
+    { "id": "guard", "label": "Scan guard (probation segment)", "kind": "compute", "x": 12, "y": 16, "at": 4 },
+    { "id": "events", "label": "Invalidation events", "kind": "async", "x": 62, "y": 84, "at": 3 },
+    { "id": "router", "label": "Router on a consistent-hash ring", "kind": "edge", "x": 62, "y": 50, "at": 5 },
+    { "id": "shards", "label": "Cache shards, each an LRU", "kind": "data", "x": 62, "y": 16, "at": 5 },
+    { "id": "flight", "label": "Single flight and stale serving", "kind": "compute", "x": 87, "y": 16, "at": 6 }
+  ],
+  "edges": [
+    { "from": "app", "to": "map", "at": 0, "until": 1 },
+    { "from": "map", "to": "db", "at": 0, "until": 1 },
+    { "from": "app", "to": "local", "at": 1 },
+    { "from": "local", "to": "db", "at": 1, "until": 5 },
+    { "from": "local", "to": "policy", "at": 3 },
+    { "from": "db", "to": "events", "at": 3 },
+    { "from": "events", "to": "local", "at": 3 },
+    { "from": "guard", "to": "local", "at": 4 },
+    { "from": "app", "to": "guard", "at": 4 },
+    { "from": "local", "to": "router", "at": 5 },
+    { "from": "router", "to": "shards", "at": 5 },
+    { "from": "shards", "to": "db", "at": 5, "until": 6 },
+    { "from": "events", "to": "router", "at": 5 },
+    { "from": "shards", "to": "flight", "at": 6 },
+    { "from": "flight", "to": "db", "at": 6 }
+  ],
+  "steps": [
+    {
+      "title": "Put a limit on the cache and evict when it is full",
+      "problem": "The map grows with every key that is ever read. Most of those keys are read once, so most of the memory holds entries that will never be used again, and the process is killed when it runs out. Each restart throws away the entries that did earn their place.",
+      "fix": "Give the cache a budget, counted in bytes if values vary in size, or in entries if they are about equal. A put that would go over the budget first removes an existing entry, the victim. Every entry carries its own size, so one 500 KB value cannot silently push out hundreds of small ones.",
+      "tradeoff": "Memory use is now a number you choose, and the process stops being killed. The cache must now guess which entry will not be needed, and a wrong guess costs a database read. Even a simple rule such as oldest first (FIFO) keeps the cache alive, but it throws out hot items just as readily as cold ones.",
+      "concepts": [{ "slug": "cache-eviction-stampedes-and-write-policies" }, { "slug": "caching" }, { "slug": "space-time-tradeoffs" }]
+    },
+    {
+      "title": "Evict the least recently used entry in O(1)",
+      "problem": "The best cheap guess for what will be read soon is what was read recently. But finding the least recently used entry by scanning every entry is O(n) on every miss, and with millions of entries that is slower than the database read the cache was saving.",
+      "fix": "Keep a hash map from key to a node in a doubly linked list. A hit moves the node to the front of the list. A miss adds a node at the front and, if the cache is full, removes the node at the tail together with its map entry. The list must be doubly linked so a node in the middle can unlink itself without searching for its neighbour. Every operation touches a constant number of pointers.",
+      "tradeoff": "Get, put and evict are all O(1). The price is two pointers and a map entry of overhead per item, and the fact that a read now changes shared state, so a plain lock on every get becomes a bottleneck. Real caches stripe the lock over several segments, batch the recency updates, or approximate LRU by looking at a small sample of entries instead of keeping a list.",
+      "concepts": [{ "slug": "hash-tables-and-worst-case" }, { "slug": "big-o-notation-basics" }, { "slug": "cache-eviction-stampedes-and-write-policies" }]
+    },
+    {
+      "title": "Pick the policy from the access pattern: LRU, LFU or TTL",
+      "problem": "LRU assumes the past few minutes predict the next few. Some workloads have a stable set of popular items that is better described by how often an item is used than by when. And neither rule says anything about freshness: an entry the policy likes can be wrong for ever.",
+      "fix": "Make the policy a plug-in behind one interface, so LRU, LFU and FIFO can be compared on a recorded stream of real requests. LRU suits traffic whose popular items drift, LFU suits a stable popular set. Add a time to live to every entry, whatever the policy: it bounds how stale an entry can be, and it is a separate job from freeing memory. Publish changes to products as events that delete the entry, so the TTL is only the backstop.",
+      "tradeoff": "The policy can be chosen with data instead of habit, and staleness has a known limit. A short TTL costs hit rate, because entries that were still correct are thrown away: the hit rate falls from 83% to 56% in the simulation when every entry expires after 2,000 requests. A long one leaves stale data. Neither TTL nor LRU can be tuned without a hit rate graph, so the cache must export hits, misses, evictions and memory.",
+      "concepts": [{ "kind": "pattern", "slug": "strategy" }, { "slug": "metrics" }, { "slug": "pub-sub" }, { "slug": "http-caching-headers" }]
+    },
+    {
+      "title": "Stop a one-off scan from pushing out the hot set",
+      "problem": "A nightly report reads 20,000 old items once each, and a crawler does the same all day. Under plain LRU every one of those reads goes to the front of the list as the most recently used entry, and the popular items are pushed towards the tail and out. Right after the scan the hit rate falls even though nothing about real traffic changed.",
+      "fix": "Do not let one read earn a full place. Split the cache into a small probation segment and a protected segment: a new entry goes into probation, and only a second read within a short time promotes it. A scan fills and empties probation and never touches the protected hot items. Callers that know they are scanning, such as the report job, can also pass a no-store flag so their reads bypass the cache altogether.",
+      "tradeoff": "The hot set survives a scan, and a first read still gets a short life in the cache. A key that is genuinely read once and then again after a long gap is now treated as a scan key, so it misses once more than under plain LRU. The segment sizes become two more numbers to tune. Switching to LFU also stops the scan, but it brings a worse problem, covered in the failures below.",
+      "concepts": [{ "slug": "cache-eviction-stampedes-and-write-policies" }, { "slug": "probabilistic-data-structures" }, { "slug": "bulkhead" }]
+    },
+    {
+      "title": "Move the cache out of the servers and shard it with a hash ring",
+      "problem": "A cache in every process holds each hot item 300 times, empties on every deploy, and cannot be told about a change on the other 299 servers. But one big shared cache machine is limited by its memory and by the reads one machine can serve.",
+      "fix": "Run a cache tier of several shards, each with the bounded LRU of the earlier steps, and route each key to a shard by consistent hashing: servers and keys are placed on a ring and a key belongs to the next shard clockwise, with many virtual points per shard so that load is even. Keep a small in-process cache of the hottest items in front of it. Invalidation events go to the router and to every in-process cache.",
+      "tradeoff": "Each hot item is stored once or twice instead of 300 times, and adding or losing a shard moves about 1 in N of the keys (25% of them when going from 3 to 4 shards), where hashing by key modulo the node count would move about 3 in 4. Every miss in the small local cache now costs a network round trip. The tier has to be sized for traffic as well as for memory, and a lost shard still means a burst of misses for its keys.",
+      "concepts": [{ "slug": "consistent-hashing" }, { "slug": "database-sharding" }, { "slug": "horizontal-vs-vertical-scaling" }, { "slug": "latency-and-round-trips" }]
+    },
+    {
+      "title": "Protect the database when entries expire or a shard is lost",
+      "problem": "When a very popular entry expires, every request that arrives before the refill finishes misses together. 1,500 reads a second for one item and a 50 ms database query is about 75 concurrent identical queries. If many popular entries were stored at the same moment, such as after a restart, they all expire at the same moment too.",
+      "fix": "Collapse concurrent misses: the first request for a key goes to the database and the others wait for its answer (single flight, once per process and once per shard). Add random jitter to every TTL so entries do not expire together. Serve the stale value for a few seconds while one request refreshes it in the background. Limit how many refills a cache node may send to the database at a time, so a lost shard slows requests down instead of taking the database down.",
+      "tradeoff": "The database sees one read per expiring key instead of one per waiting request, and a lost shard becomes a ramp rather than a spike. Some readers see data that is a few seconds old, and a request that waits for a refill takes as long as the slowest refill, so the refill needs its own timeout.",
+      "concepts": [{ "slug": "cache-eviction-stampedes-and-write-policies" }, { "slug": "load-shedding" }, { "slug": "timeouts-and-deadlines" }, { "slug": "graceful-degradation" }, { "slug": "rate-limiting" }]
+    }
+  ],
+  "failures": [
+    {
+      "scenario": "A nightly report reads 20,000 old products once, in the middle of the afternoon rush",
+      "impact": "With plain LRU and a cache that holds 2,000 entries, every report read goes to the front of the list. The hit rate for real traffic falls from 83% to 61% while the scan runs, and real traffic sends the database about 4,400 extra reads while the scan runs, on top of the report's own 20,000.",
+      "answer": "New entries go into a probation segment and only a second read promotes them, so the report cycles through probation and the protected hot set is left alone. The report job also sends a flag that says not to store its reads. A bigger cache also helps, but only by making the pollution smaller: at 5,000 entries the same scan costs only a few points.",
+      "concepts": [{ "slug": "cache-eviction-stampedes-and-write-policies" }, { "slug": "bulkhead" }]
+    },
+    {
+      "scenario": "A cache switched to LFU to survive scans, then a new campaign moves the hot set",
+      "impact": "LFU stops the scan, because scan keys have a count of 1. But the old popular items carry high counts from earlier traffic and are never the least frequently used, so a cache of 1,000 entries holds them for ever. The new popular items keep being inserted and thrown out again, and the hit rate falls to single digits.",
+      "answer": "Age the counts: halve every count periodically, or count within a sliding window, so past popularity fades. Or combine the two ideas with a small recency window in front of a frequency-based main area, with a cheap approximate counter deciding whether a new entry may replace a victim. In either case, replay a recorded request stream with a moving hot set before changing the policy in production.",
+      "concepts": [{ "slug": "probabilistic-data-structures" }, { "slug": "cache-eviction-stampedes-and-write-policies" }]
+    },
+    {
+      "scenario": "A very popular product's entry expires at the busiest minute of a sale",
+      "impact": "Every request for the product misses at once: about 75 identical queries at 1,500 reads a second and a 50 ms refill, repeated on every shard and every server that has its own local copy. The database is slow, refills take longer, and more requests pile up behind them.",
+      "answer": "Single flight lets one request refill and the rest wait for its result. TTL jitter spreads expiry times out, and serving the stale value while one request refreshes it keeps the page fast. A short timeout on the refill and a limit on concurrent refills per node keep one slow query from holding every waiter.",
+      "concepts": [{ "slug": "cache-eviction-stampedes-and-write-policies" }, { "slug": "timeouts-and-deadlines" }, { "slug": "load-shedding" }]
+    },
+    {
+      "scenario": "One of 3 cache shards dies, and keys are placed by hash modulo the node count",
+      "impact": "With key hash modulo the number of nodes, going from 3 nodes to 2 changes the home of about 2 in 3 keys, so most of the cache looks empty at once even though two thirds of the data is still sitting in healthy nodes. The database takes a burst of misses far above the 30,000 reads a second it can serve.",
+      "answer": "Place keys on a consistent-hash ring with virtual points: only the dead shard's own share of keys moves, and each goes to the next shard on the ring. A replica per shard can take over the same range at once, and refills are rate limited so the database is protected while the lost keys are loaded again.",
+      "concepts": [{ "slug": "consistent-hashing" }, { "slug": "health-checks" }, { "slug": "failure-detection" }]
+    }
+  ],
+  "alternatives": [
+    {
+      "title": "Which entry to throw out",
+      "options": [
+        { "name": "LRU", "pro": "O(1), simple, adapts when the popular items change", "con": "A scan of items read once pushes the hot items out" },
+        { "name": "LFU", "pro": "Keeps the items that are used most, and ignores a scan", "con": "Old counts keep stale items for ever unless they are aged, and a new popular item has to climb from 1" },
+        { "name": "LRU with a probation segment or an admission filter", "pro": "Keeps what is used often and adapts to change, and a scan cannot get in", "con": "More parts and more numbers to tune, and a slower start for a genuinely new hot item" }
+      ],
+      "pick": "LRU with a probation segment, plus a TTL on every entry. Keep LFU for traffic that is known to be stable, and compare on a recorded stream before changing anything."
+    },
+    {
+      "title": "Where the cache lives",
+      "options": [
+        { "name": "In each application process", "pro": "No network hop, and nothing to operate", "con": "300 copies, a cold start on every deploy, and no way to invalidate in one place" },
+        { "name": "One shared cache tier", "pro": "One copy of each item, and one place to invalidate", "con": "A network round trip on every read, and a tier that has to be sized and kept running" },
+        { "name": "A small in-process cache in front of the shared tier", "pro": "The very hottest items are free, and the shared tier absorbs the rest", "con": "Two levels to invalidate, and local copies that can be a few seconds stale" }
+      ],
+      "pick": "A small in-process cache with a short TTL for the hottest items, in front of a shared, sharded tier that holds the working set."
+    },
+    {
+      "title": "How keys are spread over shards",
+      "options": [
+        { "name": "Hash of the key modulo the node count", "pro": "One line of code, and perfectly even", "con": "Changing the node count moves most of the keys, so the cache looks empty" },
+        { "name": "Consistent hashing with virtual points", "pro": "Adding or losing a node moves only about 1 in N of the keys", "con": "A ring to maintain, and uneven load if there are too few virtual points" },
+        { "name": "A directory that records where each key lives", "pro": "Total control, so hot keys can be moved by hand", "con": "The directory is itself a service to scale and keep available" }
+      ],
+      "pick": "Consistent hashing with virtual points, with extra copies for a few known hot keys."
+    }
+  ],
+  "roles": [
+    { "id": "client", "label": "Application servers", "description": "The 300 servers that read products and use the cache." },
+    { "id": "edge", "label": "Routing", "description": "The library or proxy that maps a key to a shard on the hash ring." },
+    { "id": "compute", "label": "Policy and protection", "description": "Eviction policy, the scan guard, and single flight with stale serving." },
+    { "id": "async", "label": "Invalidation events", "description": "Change events that remove an entry when a product is updated." },
+    { "id": "data", "label": "Caches and database", "description": "The in-process cache, the cache shards, and the database that is the source of truth." }
+  ],
+  "quiz": [
+    {
+      "question": "An LRU cache has a hash map from key to a list node. Why is the list doubly linked?",
+      "options": [
+        "So reads can go through the list from either end, which makes lookups twice as fast.",
+        "So the cache can keep two copies of each entry in case a node is damaged.",
+        "So a node in the middle can unlink itself and move to the front without a search.",
+        "So the least recent entry and the most recent entry can be told apart by their colour."
+      ],
+      "answer": 2,
+      "explanation": "A hit has to take a node out of the middle of the list and put it at the front. With only a next pointer you would have to walk the list to find the node before it, which is O(n). With a previous pointer too, the move is a few pointer changes."
+    },
+    {
+      "question": "A report reads 20,000 old items once each. Hit rate for real traffic then drops, though the traffic did not change. The cache is plain LRU. What is the most likely cause?",
+      "options": [
+        "The scan entries sit at the front of the list as most recent, and push the hot items out.",
+        "The scan makes the database slower, and slower reads are never stored in the cache.",
+        "LRU counts how often an entry is used, and the scan keys have the highest count.",
+        "The cache clears itself whenever more than 10,000 distinct keys have been read."
+      ],
+      "answer": 0,
+      "explanation": "LRU only knows when an entry was last read, not how often. Every key of the scan was just read, so it looks recent and the hot items age towards the tail. A probation segment, an admission filter or a no-store flag keeps the scan out of the main area."
+    },
+    {
+      "question": "A team moves from LRU to LFU to survive scans. Two weeks later a campaign moves the popular items and the hit rate collapses. Why?",
+      "options": [
+        "LFU cannot evict anything once the cache is full, so no new keys can enter.",
+        "LFU needs a timer for each entry, and the timers expire all at once in a campaign.",
+        "A TTL is always shorter than a campaign, so LFU removes every entry too early.",
+        "The old popular items have high counts and are never the least frequently used, so they stay."
+      ],
+      "answer": 3,
+      "explanation": "Counts only go up unless they are aged. The previous favourites keep their lead, while each new favourite is inserted with a count of 1 and is the first thing to be evicted. Halving the counts regularly, or using a recency window in front of the frequency area, fixes it."
+    }
+  ]
+}
