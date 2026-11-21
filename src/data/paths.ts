@@ -98,4 +98,18 @@ export const paths: LearningPath[] = [
     blurb: 'Retrieval, serving, caching, safety and evaluation for language models, from the concepts to full platforms.',
     steps: [c('embeddings-and-vector-search'), c('retrieval-augmented-generation'), c('llm-inference-and-kv-cache'), c('continuous-batching-and-model-serving'), c('llm-caching-and-routing'), c('guardrails-and-prompt-injection'), c('model-evaluation-and-drift'), s('vector-database'), s('rag-platform'), s('llm-inference-gateway'), s('ai-agent-orchestration-platform')],
   },
+  {
+    id: 'solid-and-beyond',
+    title: 'Design principles that people get wrong',
+    audience: 'Writing code',
+    blurb: 'SOLID, DRY and the rest, each with the usual misreading and what it costs to over-apply it. Start with coupling and cohesion, which explain why the five principles exist, then take them one at a time.',
+    steps: [c('coupling-and-cohesion'), c('single-responsibility-principle'), c('open-closed-principle'), c('liskov-substitution-principle'), c('interface-segregation-principle'), c('dependency-inversion-principle'), c('dry-and-the-wrong-abstraction'), c('composition-over-inheritance')],
+  },
+  {
+    id: 'big-o-traps',
+    title: 'Big O and the traps that catch people',
+    audience: 'Writing code',
+    blurb: 'Start with what Big O does and does not say, then the places where cost hides: loops, resizes, hash collisions, deep recursion, worst-case input and memory. Every page counts operations so you can watch the curves cross.',
+    steps: [c('big-o-notation-basics'), c('hidden-complexity-in-loops'), c('amortized-analysis'), c('hash-tables-and-worst-case'), c('recursion-memoization-and-dynamic-programming'), c('sorting-and-searching-complexity'), c('space-time-tradeoffs'), c('trees-graphs-and-worst-case-shapes')],
+  },
 ];
