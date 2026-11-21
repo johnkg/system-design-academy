@@ -1,0 +1,190 @@
+---
+import PlaygroundShell from '../../components/PlaygroundShell.astro';
+---
+<PlaygroundShell title="One misbehaving plugin, with and without isolation" hint="300 seconds of a host that handles 20 requests a second with 40 workers; each request is followed by a call to one of 5 plugins. Plugin 3 misbehaves from 60 s on. A plugin call takes 300 ms, and one call in 25 (a big document) takes 1,500 ms. These are assumed numbers, not measurements.">
+  <ol class="how">
+    <li>Start with the defaults: <b>Isolation</b> is <b>In the host process</b>, every plugin is healthy and the <b>Call timeout</b> is <b>2 s</b>. <b>96%</b> of requests are answered within 1 s, the 95th percentile is <b>500 ms</b>, and nothing fails. Set <b>Misbehaving plugin</b> to <b>Hangs after an update</b>: its calls never return, and each one holds a host worker until the timeout. Only <b>80%</b> are answered within 1 s and the 95th percentile rises to <b>2,200 ms</b>, but the other plugins are unharmed: <b>0</b> of <b>4,640</b> requests for them fail.</li>
+    <li>The timeout looks like the dial to turn. Set <b>Call timeout</b> to <b>1 s</b>: the hung plugin is cut off sooner (<b>1,200 ms</b>), but honest plugins are cut off as well, because a big document takes longer than that: <b>184</b> of the <b>4,640</b> requests for healthy plugins now lose their plugin. Go the other way, to <b>5 s</b>: the 95th percentile is <b>5,200 ms</b>. At <b>10 s</b> the hung calls fill the worker pool: only <b>90%</b> of requests are served, <b>22%</b> within 1 s, and the 95th percentile is <b>20,100 ms</b>. At <b>60 s</b> only <b>47%</b> are served and <b>2,222</b> of the <b>4,640</b> requests for healthy plugins fail. The generous timeout made it worse.</li>
+    <li>With <b>Call timeout</b> still at <b>60 s</b>, set <b>Isolation</b> to <b>Sandbox per plugin</b>. Each plugin has its own 4 slots, and 5 failures in a row switch it off for 60 s. <b>96%</b> of requests are answered within 1 s again, the 95th percentile is <b>500 ms</b>, and <b>0</b> of the <b>4,640</b> requests for healthy plugins fail. Only the hung plugin's own feature is lost.</li>
+    <li>Press <b>Reset</b>, then set <b>Misbehaving plugin</b> to <b>Crashes after an update</b>. In the host process, each crash restarts the whole host for 30 s: <b>8</b> restarts, only <b>20%</b> of requests served, and <b>3,685</b> requests for healthy plugins lost. Set <b>Isolation</b> to <b>Sandbox per plugin</b>: <b>100%</b> served and <b>0</b> restarts. Now set <b>Misbehaving plugin</b> to <b>Snoops after an update</b>: all <b>46,050</b> reads outside its grant are blocked. Set <b>Isolation</b> back to <b>In the host process</b> and <b>46,000</b> records are read that the admin never granted.</li>
+  </ol>
+  <div class="pg ppb" data-ppb>
+    <div class="pg-row">
+      <label>Isolation <select class="pg-in" data-iso><option value="host" selected>In the host process</option><option value="sandbox">Sandbox per plugin</option></select></label>
+      <label>Misbehaving plugin <select class="pg-in" data-bad><option value="none" selected>None</option><option value="hang">Hangs after an update</option><option value="crash">Crashes after an update</option><option value="snoop">Snoops after an update</option></select></label>
+      <label>Call timeout <select class="pg-in" data-to><option value="10">1 s</option><option value="20" selected>2 s</option><option value="50">5 s</option><option value="100">10 s</option><option value="600">60 s</option></select></label>
+      <button type="button" class="btn" data-reset>Reset</button>
+    </div>
+    <div class="pg-grid">
+      <div class="pg-box" data-b1><h3>Answered within 1 s</h3><span class="pg-mono" data-o1></span><span class="pg-note" data-n1></span></div>
+      <div class="pg-box" data-b2><h3>Latency, 95th percentile</h3><span class="pg-mono" data-o2></span><span class="pg-note" data-n2></span></div>
+      <div class="pg-box" data-b3><h3>Requests for the 4 healthy plugins</h3><span class="pg-mono" data-o3></span><span class="pg-note" data-n3></span></div>
+      <div class="pg-box" data-b4><h3>The misbehaving plugin</h3><span class="pg-mono" data-o4></span><span class="pg-note" data-n4></span></div>
+      <div class="pg-box" data-b5><h3>Host and data</h3><span class="pg-mono" data-o5></span><span class="pg-note" data-n5></span></div>
+    </div>
+    <div class="pg-box" style="--c: var(--border)">
+      <h3>Share of requests answered within 1 s, every 10 seconds</h3>
+      <div class="ppb-chart" data-chart role="img" aria-label="Share of requests answered within one second, in each 10 second block of the 290 seconds when requests arrive"></div>
+      <span class="pg-note">Each column is the requests that arrived in 10 seconds. The line marks the update at 60 s. Green is 90% or more, red under 50%.</span>
+    </div>
+    <p class="pg-out" data-verdict aria-live="polite"></p>
+  </div>
+</PlaygroundShell>
+<script>
+  import { query, formatThousands } from '../../playground';
+  // The same model as the code samples, plus the share answered within 1 s for every 10 seconds, for the chart.
+  const TICKS = 3000, ARRIVE_UNTIL = 2900, ARRIVE = 2, WORKERS = 40, HOST = 2, PLUGINS = 5, BAD = 3, BAD_AT = 600;
+  const NORMAL = 3, SLOW = 15, SLOW_EVERY = 25, POOL = 4, BREAK_AFTER = 5, BREAK_FOR = 600, RESTART = 300, SNOOP = 50, PATIENCE = 100;
+  const HANG = 1000000, CRASH = -1, BLOCK = 100;
+  type Bad = 'none' | 'hang' | 'crash' | 'snoop';
+  interface Req { plugin: number; arrived: number }
+  interface Work { r: Req; end: number; stage?: 'host' | 'plugin'; ok?: boolean }
+
+  function simulate(sandbox: boolean, bad: Bad, timeout: number) {
+    let nextId = 0, downUntil = 0, restarts = 0, leaked = 0, denied = 0, badFailed = 0, served = 0, fast = 0, healthyTotal = 0, healthyFailed = 0;
+    let queue: Req[] = [], running: Work[] = [];
+    const calls = Array<number>(PLUGINS).fill(0), used = Array<number>(PLUGINS).fill(0), streak = Array<number>(PLUGINS).fill(0), offUntil = Array<number>(PLUGINS).fill(0);
+    const latency = new Map<number, number>();
+    const blockFast = Array<number>(ARRIVE_UNTIL / BLOCK).fill(0);
+    const finish = (r: Req, t: number, pluginOk: boolean, dropped: boolean) => {
+      if (r.plugin !== BAD) { healthyTotal++; if (dropped || !pluginOk) healthyFailed++; }
+      if (dropped) return;
+      served++;
+      const d = t - r.arrived;
+      latency.set(d, (latency.get(d) ?? 0) + 1);
+      if (d <= 10) { fast++; blockFast[Math.floor(r.arrived / BLOCK)]++; }
+    };
+    const callTicks = (plugin: number, t: number) => {
+      const n = calls[plugin]++;
+      if (plugin === BAD && bad !== 'none' && t >= BAD_AT) {
+        if (bad === 'hang') return HANG;
+        if (bad === 'crash') return CRASH;
+        if (sandbox) denied += SNOOP; else leaked += SNOOP;
+        return NORMAL;
+      }
+      return n % SLOW_EVERY === SLOW_EVERY - 1 ? SLOW : NORMAL;
+    };
+    const failed = (plugin: number, t: number) => {
+      if (plugin === BAD) badFailed++;
+      if (++streak[plugin] >= BREAK_AFTER) offUntil[plugin] = t + BREAK_FOR;
+    };
+    for (let t = 0; t < TICKS; t++) {
+      const arrivals = t < ARRIVE_UNTIL ? ARRIVE : 0;
+      if (!sandbox && t < downUntil) {
+        for (let i = 0; i < arrivals; i++) finish({ plugin: nextId++ % PLUGINS, arrived: t }, t, false, true);
+        continue;
+      }
+      const due = running.filter((x) => x.end === t);
+      running = running.filter((x) => x.end !== t);
+      for (const x of due) {
+        const p = x.r.plugin;
+        if (!sandbox) finish(x.r, t, !!x.ok, false);
+        else if (x.stage === 'plugin') {
+          used[p]--;
+          if (x.ok) streak[p] = 0; else failed(p, t);
+          finish(x.r, t, !!x.ok, false);
+        } else if (t < offUntil[p] || used[p] >= POOL) {
+          if (p === BAD) badFailed++;
+          finish(x.r, t, false, false);
+        } else {
+          const d = callTicks(p, t);
+          if (d === CRASH) { failed(p, t); finish(x.r, t, false, false); }
+          else { used[p]++; running.push({ r: x.r, end: t + Math.min(d, timeout), stage: 'plugin', ok: d <= timeout }); }
+        }
+      }
+      for (let i = 0; i < arrivals; i++) queue.push({ plugin: nextId++ % PLUGINS, arrived: t });
+      while (queue.length > 0 && t - queue[0].arrived > PATIENCE) finish(queue.shift()!, t, false, true);
+      let busy = running.filter((x) => x.stage !== 'plugin').length;
+      while (queue.length > 0 && busy < WORKERS) {
+        const r = queue.shift()!;
+        busy++;
+        if (sandbox) { running.push({ r, end: t + HOST, stage: 'host' }); continue; }
+        const d = callTicks(r.plugin, t);
+        if (d === CRASH) {
+          restarts++; downUntil = t + RESTART;
+          finish(r, t, false, true);
+          for (const x of running) finish(x.r, t, false, true);
+          running = [];
+          for (const q of queue) finish(q, t, false, true);
+          queue = [];
+          break;
+        }
+        if (r.plugin === BAD && d > timeout) badFailed++;
+        running.push({ r, end: t + HOST + Math.min(d, timeout), ok: d <= timeout });
+      }
+    }
+    for (const r of queue) finish(r, TICKS, false, true);
+    for (const x of running) finish(x.r, TICKS, false, true);
+    const total = ARRIVE_UNTIL * ARRIVE;
+    let seen = 0, p95 = 0;
+    for (const d of [...latency.keys()].sort((a, b) => a - b)) {
+      seen += latency.get(d)!;
+      if (seen * 100 >= served * 95) { p95 = d * 100; break; }
+    }
+    return {
+      servedPct: Math.floor((served * 100) / total), fastPct: Math.floor((fast * 100) / total), p95,
+      healthyFailed, healthyTotal, badFailed, restarts, leaked, denied,
+      blocks: blockFast.map((f) => Math.floor((f * 100) / (BLOCK * ARRIVE))),
+    };
+  }
+
+  document.querySelectorAll<HTMLElement>('[data-ppb]').forEach((root) => {
+    const q = query(root);
+    const chartEl = q('[data-chart]');
+    const cols = Array.from({ length: ARRIVE_UNTIL / BLOCK }, (_, b) => {
+      const c = document.createElement('span'); c.className = 'ppb-col';
+      if (b === BAD_AT / BLOCK) c.classList.add('update');
+      const bar = document.createElement('span'); bar.className = 'ppb-bar';
+      c.appendChild(bar); chartEl.appendChild(c); return { c, bar };
+    });
+    const sel = (name: string) => q<HTMLSelectElement>(`[data-${name}]`);
+    const box = (n: number, colour: string) => q<HTMLElement>(`[data-b${n}]`).style.setProperty('--c', colour);
+    const GOOD = 'var(--good)', WARN = 'var(--role-3)', BADC = 'var(--bad)';
+    function draw() {
+      const sandbox = sel('iso').value === 'sandbox', bad = sel('bad').value as Bad, to = Number(sel('to').value);
+      const r = simulate(sandbox, bad, to);
+      q('[data-o1]').textContent = `${r.fastPct}%`;
+      q('[data-n1]').textContent = `${r.servedPct}% of requests were served at all (the target is 95% within 1 s)`;
+      box(1, r.fastPct >= 95 ? GOOD : r.fastPct >= 50 ? WARN : BADC);
+      q('[data-o2]').textContent = `${formatThousands(r.p95)} ms`;
+      q('[data-n2]').textContent = 'of the requests that were served';
+      box(2, r.p95 <= 1000 ? GOOD : r.p95 <= 5000 ? WARN : BADC);
+      q('[data-o3]').textContent = `${formatThousands(r.healthyFailed)} of ${formatThousands(r.healthyTotal)}`;
+      q('[data-n3]').textContent = 'dropped, or answered without their plugin';
+      box(3, r.healthyFailed === 0 ? GOOD : r.healthyFailed * 20 < r.healthyTotal ? WARN : BADC);
+      q('[data-o4]').textContent = bad === 'none' ? 'none' : `${formatThousands(r.badFailed)} calls failed or refused`;
+      q('[data-n4]').textContent = bad === 'none' ? 'all plugins are healthy in this run' : sandbox ? 'the sandbox limits and the breaker stop it from costing more' : 'each one held a host worker until it failed';
+      box(4, bad === 'none' ? GOOD : WARN);
+      q('[data-o5]').textContent = `${r.restarts} restarts`;
+      q('[data-n5]').textContent = `records read outside the grant: ${formatThousands(r.leaked)}, blocked: ${formatThousands(r.denied)}`;
+      box(5, r.restarts > 0 || r.leaked > 0 ? BADC : GOOD);
+      r.blocks.forEach((p, i) => {
+        cols[i].bar.style.height = `${Math.max(2, p)}%`;
+        cols[i].bar.style.setProperty('--c', p >= 90 ? GOOD : p >= 50 ? WARN : BADC);
+        cols[i].c.title = `${i * 10} to ${(i + 1) * 10} s: ${p}% answered within 1 s`;
+      });
+      const v = q('[data-verdict]');
+      const hurt = r.healthyFailed * 20 >= r.healthyTotal || r.leaked > 0 || r.restarts > 0;
+      v.classList.toggle('bad', hurt);
+      v.textContent = r.restarts > 0 ? 'The plugin takes the whole host down every time it runs, and every customer feels it.'
+        : r.leaked > 0 ? 'Nothing is slow and nothing crashes, but the plugin read data it was never granted.'
+        : bad === 'hang' && !sandbox && r.healthyFailed * 20 >= r.healthyTotal ? 'One hung plugin is using up the host workers, and requests for plugins that work are suffering.'
+        : bad === 'none' && r.healthyFailed > 0 ? 'The timeout is shorter than a big document needs, so honest plugins are being cut off.'
+        : bad === 'hang' && !sandbox ? 'The host holds up, but every call to the hung plugin costs a worker for the whole timeout.'
+        : bad === 'none' ? 'All plugins work and the host is as fast as it can be.'
+        : 'The misbehaving plugin loses its own feature, and everything else carries on.';
+    }
+    root.addEventListener('change', draw);
+    q('[data-reset]').addEventListener('click', () => {
+      sel('iso').value = 'host'; sel('bad').value = 'none'; sel('to').value = '20';
+      draw();
+    });
+    draw();
+  });
+</script>
+<style is:global>
+  .playground .ppb-chart { display: grid; grid-template-columns: repeat(29, 1fr); gap: 2px; height: 120px; align-items: end; }
+  .playground .ppb-col { position: relative; height: 100%; }
+  .playground .ppb-col.update { box-shadow: -2px 0 0 0 var(--text); }
+  .playground .ppb-bar { position: absolute; left: 0; right: 0; bottom: 0; background: var(--c); border-radius: 2px 2px 0 0; opacity: .85; }
+</style>

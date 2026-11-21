@@ -112,4 +112,25 @@ export const paths: LearningPath[] = [
     blurb: 'Start with what Big O does and does not say, then the places where cost hides: loops, resizes, hash collisions, deep recursion, worst-case input and memory. Every page counts operations so you can watch the curves cross.',
     steps: [c('big-o-notation-basics'), c('hidden-complexity-in-loops'), c('amortized-analysis'), c('hash-tables-and-worst-case'), c('recursion-memoization-and-dynamic-programming'), c('sorting-and-searching-complexity'), c('space-time-tradeoffs'), c('trees-graphs-and-worst-case-shapes')],
   },
+  {
+    id: 'concurrent-code',
+    title: 'Concurrency without the mystery bugs',
+    audience: 'Writing code',
+    blurb: 'Why two updates at once lose data, what locks fix and what they break, how async differs from threads, and how to size the workers and queues around them. Every page runs the same program under every ordering.',
+    steps: [c('race-conditions-and-atomicity'), c('locks-deadlocks-and-contention'), c('threads-async-and-the-event-loop'), c('thread-pools-and-sizing'), c('producer-consumer-and-bounded-queues')],
+  },
+  {
+    id: 'trustworthy-tests',
+    title: 'Tests you can trust',
+    audience: 'Writing code',
+    blurb: 'Where to put tests, why they flake, how mocks make broken code pass, what coverage misses and how to find inputs you did not think of.',
+    steps: [c('test-pyramid-and-where-to-test'), c('flaky-tests'), c('test-doubles-and-over-mocking'), c('coverage-and-mutation-testing'), c('property-based-testing-and-fuzzing')],
+  },
+  {
+    id: 'shaping-a-system',
+    title: 'Shaping a system: where to draw the lines',
+    audience: 'Going deeper',
+    blurb: 'From one deployable to many, and back from many to something sane: what each split costs, how to keep rules away from vendors, how to name boundaries, how events hide coupling, and how to migrate without a big bang.',
+    steps: [c('monolith-modular-monolith-and-microservices'), c('hexagonal-architecture-ports-and-adapters'), c('domain-driven-design-and-bounded-contexts'), c('event-driven-architecture'), c('strangler-fig-and-incremental-migration')],
+  },
 ];

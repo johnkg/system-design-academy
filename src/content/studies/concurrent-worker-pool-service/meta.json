@@ -1,0 +1,204 @@
+{
+  "name": "Design a Concurrent Job Worker Service",
+  "difficulty": "intermediate",
+  "intent": "Run other people's jobs on a fixed set of cores so that one tenant's burst cannot starve the rest, a crash cannot run a job's side effects twice, and a deploy at peak loses nothing.",
+  "prompt": "Design a service that runs jobs submitted by about 2,000 tenants through an API: report builds, exports and outgoing webhook calls. At the busiest hour it receives about 40 jobs a second, and a typical job needs 2 seconds of CPU on one core. A big tenant can submit 100,000 jobs in one minute. Some jobs fail, a few hang, and some call an outside service (an email, a payment, a webhook) that must not be called twice. The service is deployed several times a day on machines with 16 cores. Design how jobs are accepted, queued, run and retried, not what the jobs compute.",
+  "codeTitle": "a worker pool with bounded or fair queues, retries, a drain on deploy and an autoscaler, on one tick model",
+  "finalIntro": "One job from a quiet tenant, submitted while a noisy tenant is flooding the service and a deploy is on its way.",
+  "functional": [
+    "Accept a job from a tenant and tell them at once whether it was taken or refused",
+    "Run each job on a worker and report its result, or its failure, to the tenant",
+    "Retry jobs that fail, without repeating their side effects",
+    "Keep one tenant from slowing down or locking out the others",
+    "Deploy new code and scale up and down without losing or duplicating jobs"
+  ],
+  "nonFunctional": [
+    "A quiet tenant's job starts within 10 s at the 95th percentile, even while another tenant floods the service",
+    "A job whose side effect happened once never makes it happen a second time, however often it is retried",
+    "Memory stays bounded: a burst is refused at the door, it is not held until a process runs out of memory",
+    "A deploy that restarts every worker loses no job and interrupts none in the middle of its work",
+    "Cost follows the work waiting: capacity grows within a minute of a backlog and shrinks when it is gone"
+  ],
+  "firstAttempt": {
+    "text": "The API starts a new thread for every job it receives, as soon as it arrives, and the thread runs the job to the end. Failed jobs are tried again at once, and a deploy stops the process and starts the new one.",
+    "limits": [
+      "A burst of 100,000 jobs starts 100,000 threads, which is far more than the memory allows, so the process dies and every job in it with it",
+      "Hundreds of threads share 16 cores, so each job runs slowly and a lot of the time goes on switching between them",
+      "There is no fairness: a flood from one tenant takes every core away from the rest",
+      "A job that failed after sending its email is run again and sends it twice",
+      "A deploy kills the process, and every job in the middle of its work is lost"
+    ]
+  },
+  "nodes": [
+    { "id": "client", "label": "Tenants' clients", "kind": "client", "x": 10, "y": 50 },
+    { "id": "api", "label": "Submit API", "kind": "edge", "x": 32, "y": 50 },
+    { "id": "threads", "label": "A new thread for every job", "kind": "compute", "x": 58, "y": 50, "at": 0, "until": 1 },
+    { "id": "pool", "label": "Fixed pool of workers", "kind": "compute", "x": 58, "y": 50, "at": 1 },
+    { "id": "store", "label": "Job results", "kind": "data", "x": 86, "y": 50 },
+    { "id": "queue", "label": "One bounded queue", "kind": "async", "x": 58, "y": 20, "at": 2, "until": 3 },
+    { "id": "fair", "label": "Per-tenant queues and fair scheduler", "kind": "async", "x": 58, "y": 20, "at": 3 },
+    { "id": "keys", "label": "Idempotency keys", "kind": "data", "x": 86, "y": 20, "at": 4 },
+    { "id": "dlq", "label": "Dead-letter queue", "kind": "async", "x": 86, "y": 80, "at": 4 },
+    { "id": "deploy", "label": "Drain on deploy", "kind": "compute", "x": 58, "y": 82, "at": 5 },
+    { "id": "scaler", "label": "Autoscaler on queue age", "kind": "compute", "x": 32, "y": 20, "at": 6 }
+  ],
+  "edges": [
+    { "from": "client", "to": "api", "at": 0 },
+    { "from": "api", "to": "threads", "at": 0, "until": 1 },
+    { "from": "threads", "to": "store", "at": 0, "until": 1 },
+    { "from": "api", "to": "pool", "at": 1, "until": 2 },
+    { "from": "pool", "to": "store", "at": 1 },
+    { "from": "api", "to": "queue", "at": 2, "until": 3 },
+    { "from": "queue", "to": "pool", "at": 2, "until": 3 },
+    { "from": "api", "to": "fair", "at": 3 },
+    { "from": "fair", "to": "pool", "at": 3 },
+    { "from": "pool", "to": "keys", "at": 4 },
+    { "from": "pool", "to": "dlq", "at": 4 },
+    { "from": "pool", "to": "fair", "at": 4 },
+    { "from": "deploy", "to": "pool", "at": 5 },
+    { "from": "deploy", "to": "fair", "at": 5 },
+    { "from": "fair", "to": "scaler", "at": 6 },
+    { "from": "scaler", "to": "pool", "at": 6 }
+  ],
+  "steps": [
+    {
+      "title": "Run jobs on a bounded pool of workers, sized to the work",
+      "problem": "A thread for every job has no ceiling. At 250 or so running jobs the process runs out of memory and dies, and well before that the 16 cores are shared by so many threads that each job crawls and much of the time goes on switching between them. More concurrency made the work slower.",
+      "fix": "Run jobs on a fixed pool of worker threads. For CPU-bound jobs, size it close to the number of cores, since a core can only do one thing at a time. For jobs that mostly wait on an outside service, size it with the waiting included: roughly cores times (CPU time plus waiting time) divided by CPU time. The pool's size is a setting, tested under load, not a guess.",
+      "tradeoff": "Jobs now take as long as they need on the cores they get, and memory is bounded by the pool. When all workers are busy new jobs have to wait somewhere, and a pool that is too small is as wrong as one that is too big.",
+      "concepts": [{ "slug": "thread-pools-and-sizing" }, { "slug": "threads-async-and-the-event-loop" }, { "slug": "queueing-theory-and-littles-law" }, { "slug": "horizontal-vs-vertical-scaling" }]
+    },
+    {
+      "title": "Put a bounded queue in front, and refuse what does not fit",
+      "problem": "With a pool, jobs that find every worker busy need a place to wait. An unbounded list in memory just moves the memory problem to the queue, and it hides the overload: the backlog grows, jobs wait for minutes, and nobody is told.",
+      "fix": "Put a queue between the API and the workers, with a maximum length chosen from the longest wait the service promises: the jobs the pool can finish in that time. When the queue is full, the API answers at once with 'too many requests' and a time to retry after, so the caller slows down. The workers take jobs from the queue only when they are free (producers push, consumers pull).",
+      "tradeoff": "Overload shows up at the door as a refusal, instead of as a crash or a silent delay. The bound is shared by every tenant, so a flood can fill it and the quiet tenants' jobs are refused as well.",
+      "concepts": [{ "slug": "producer-consumer-and-bounded-queues" }, { "slug": "backpressure" }, { "slug": "load-shedding" }, { "slug": "message-queues" }, { "slug": "race-conditions-and-atomicity" }]
+    },
+    {
+      "title": "Give every tenant its own queue and share the workers fairly",
+      "problem": "In one first-in, first-out queue, a tenant that submits 12 jobs a second ahead of three quiet tenants puts its backlog in front of their jobs. With one bounded queue it also fills the queue, so the quiet tenants' jobs are refused while the noisy one's are accepted first.",
+      "fix": "Keep a queue per tenant, each with its own small bound, and let workers take the next job in turn from each tenant that has one waiting (round-robin, or weighted by plan). Add a per-tenant limit on jobs in flight and on submissions per second. A tenant that floods fills only its own queue, and it is the one that gets the refusals.",
+      "tradeoff": "Quiet tenants' jobs wait for a few seconds at most, whatever the noisy tenant does. The scheduler holds a little state per tenant, a tenant's own jobs are no longer strictly in the order they were submitted across tenants, and a single huge tenant may legitimately need a larger share.",
+      "concepts": [{ "slug": "bulkhead" }, { "slug": "rate-limiting" }, { "slug": "ordering-and-partitioning" }, { "slug": "locks-deadlocks-and-contention" }]
+    },
+    {
+      "title": "Retry failures with backoff, and make the side effects idempotent",
+      "problem": "Jobs fail for good and bad reasons: a timeout calling another service, a worker that was killed, a bug in one job. Dropping failures loses work. Retrying at once repeats the side effect when the failure came after it, such as an email that was sent but whose confirmation never arrived, and it hammers a service that is already struggling.",
+      "fix": "Retry failed jobs after a growing delay, with a little random jitter, up to a small number of attempts, then move the job to a dead-letter queue and tell the tenant. Give every job an idempotency key and record it, in the same transaction as the side effect where possible, or pass it on to the outside service that supports one. A retry first checks the key, and if the effect is already done it just reports the result.",
+      "tradeoff": "At-least-once delivery becomes safe: a job can run more than once but its effect happens once. It costs a store of keys that must be kept for as long as retries can happen, and an outside service that ignores idempotency keys can still be called twice.",
+      "concepts": [{ "slug": "retries-and-backoff" }, { "slug": "idempotency" }, { "slug": "delivery-guarantees" }, { "slug": "dead-letter-queues-and-poison-messages" }, { "slug": "timeouts-and-deadlines" }]
+    },
+    {
+      "title": "Shut down gracefully: stop taking jobs, finish the running ones, then exit",
+      "problem": "A deploy that kills the process kills every job in the middle of its work. Those jobs are retried, but some have already called an outside service, and a job that takes 90 seconds may never finish if every deploy restarts it halfway.",
+      "fix": "When a worker receives the signal to stop, it stops taking new jobs and takes itself out of the load balancer, finishes the jobs it is running for up to a grace period longer than the typical job, and only then exits. Jobs still running at the deadline are put back on the queue, released by a lease that expires. Workers are replaced a few at a time, so capacity never drops to zero.",
+      "tradeoff": "A deploy loses nothing and interrupts almost nothing. It takes longer, and the grace period has to be set longer than the jobs, which a very long job can exceed, so those are checkpointed or allowed to be interrupted and resumed.",
+      "concepts": [{ "slug": "blue-green-and-rolling-deployments" }, { "slug": "leases-and-fencing-tokens" }, { "slug": "health-checks" }, { "slug": "containers-and-orchestration" }]
+    },
+    {
+      "title": "Scale the workers on how long jobs wait, not on how busy they are",
+      "problem": "A pool of fixed size is wrong both ways: too small when a tenant floods the service and idle in the night. Scaling on CPU is late and misleading, because workers can be saturated while the queue is empty, or half idle waiting on an outside service while the queue grows.",
+      "fix": "Add machines when the age of the oldest waiting job passes a limit, such as 5 seconds, and remove them when the queues have been empty for a while. Keep a minimum so the quiet tenants always have capacity, and a maximum so a loop of failing jobs cannot run up the bill. Because a new machine takes about a minute to start, the queue bound has to be big enough to hold what arrives in the meantime.",
+      "tradeoff": "Capacity follows the work, and a flood finishes sooner. Scaling out does not help when the jobs share a bottleneck such as one database, and an autoscaler can hide a retry loop by growing to feed it, so the dead-letter queue and a ceiling still matter.",
+      "concepts": [{ "slug": "autoscaling" }, { "slug": "cloud-cost-management" }, { "slug": "slos-and-error-budgets" }, { "slug": "red-use-and-golden-signals" }]
+    }
+  ],
+  "failures": [
+    {
+      "scenario": "A tenant submits 100,000 jobs in a minute",
+      "impact": "Without limits, every core is taken for minutes, the other 1,999 tenants see their jobs wait, and a shared queue is full for everyone.",
+      "answer": "The flood fills only that tenant's own queue, and the API refuses the rest with 'too many requests' and a retry time. Workers take turns between tenants, so quiet tenants still wait seconds, not minutes. The autoscaler sees the age of the oldest job rise and adds machines up to its ceiling, so the tenant's own backlog drains faster.",
+      "concepts": [{ "slug": "bulkhead" }, { "slug": "backpressure" }, { "slug": "autoscaling" }]
+    },
+    {
+      "scenario": "A worker is killed after it sent a customer's email but before it reported success",
+      "impact": "The job looks as if it failed, and a retry would send the same email again.",
+      "answer": "The job's lease runs out and the queue hands it to another worker. That worker looks up the idempotency key, finds that the email step is done, and just records the result. If the email provider supports an idempotency key, it is sent along as well, so even a crash between the call and the record cannot send two emails.",
+      "concepts": [{ "slug": "idempotency" }, { "slug": "leases-and-fencing-tokens" }, { "slug": "delivery-guarantees" }]
+    },
+    {
+      "scenario": "A deploy restarts every worker during the busiest hour",
+      "impact": "Jobs in the middle of their work are killed, the queue grows while the workers are away, and the deploy itself may cause a spike of retries.",
+      "answer": "Workers are replaced a few at a time, and each one stops taking jobs and finishes what it runs before it exits. Whatever is still running at the deadline goes back on the queue and is retried under its idempotency key. The queue bound and the autoscaler absorb the small dip in capacity.",
+      "concepts": [{ "slug": "blue-green-and-rolling-deployments" }, { "slug": "graceful-degradation" }]
+    },
+    {
+      "scenario": "A job hangs for ever, waiting on an outside service that never answers",
+      "impact": "It holds a worker without using a core, and if 16 jobs hang the pool does nothing at all while the queue grows.",
+      "answer": "Every call has a timeout and every job has a deadline, after which the worker abandons it and the job is retried with backoff. After a few attempts it goes to the dead-letter queue and the tenant is told. A circuit breaker on the outside service stops jobs from piling onto it while it is down.",
+      "concepts": [{ "slug": "timeouts-and-deadlines" }, { "slug": "circuit-breaker" }, { "slug": "dead-letter-queues-and-poison-messages" }]
+    }
+  ],
+  "alternatives": [
+    {
+      "title": "How many workers run at once",
+      "options": [
+        { "name": "A thread or task for every job", "pro": "No waiting at all in a small system, and the simplest code", "con": "No ceiling: memory runs out and switching eats the cores" },
+        { "name": "A fixed pool near the number of cores", "pro": "Predictable memory and the best use of CPU-bound work", "con": "Jobs that wait on I/O leave cores idle" },
+        { "name": "A pool sized for the waiting, with a limit on in-flight work per tenant", "pro": "Keeps cores busy when jobs wait on outside services", "con": "Needs measuring, and too big a number brings back the switching cost" }
+      ],
+      "pick": "A bounded pool: near the core count for CPU work, larger only by what the waiting justifies, and measured."
+    },
+    {
+      "title": "How to keep one tenant from starving the others",
+      "options": [
+        { "name": "One queue, first in first out", "pro": "Simplest, and fair for equal tenants", "con": "A flood is ahead of everyone who comes after it" },
+        { "name": "Per-tenant queues served in turn", "pro": "A flood hurts only its owner", "con": "State per tenant, and thousands of small queues to manage" },
+        { "name": "Dedicated workers for big tenants", "pro": "Complete isolation, easy to bill", "con": "Idle capacity in one pool cannot help another" }
+      ],
+      "pick": "Per-tenant queues served in turn, and dedicated capacity only for the few tenants that justify it."
+    },
+    {
+      "title": "What the autoscaler watches",
+      "options": [
+        { "name": "CPU of the workers", "pro": "Available everywhere", "con": "Late, and blind to jobs that wait on I/O" },
+        { "name": "Queue length", "pro": "Directly the work waiting", "con": "Depends on the job size, so the same length means different delays" },
+        { "name": "Age of the oldest waiting job", "pro": "Measures the delay the tenants feel, whatever the job size", "con": "Needs the queue to expose it, and a retry loop also looks like age" }
+      ],
+      "pick": "The age of the oldest waiting job, with a floor, a ceiling and a dead-letter queue to stop a retry loop from looking like demand."
+    }
+  ],
+  "roles": [
+    { "id": "client", "label": "Tenants", "description": "The clients that submit jobs and read their results." },
+    { "id": "edge", "label": "Submit API", "description": "Accepts or refuses each job at the door, with a time to retry." },
+    { "id": "async", "label": "Queues", "description": "The per-tenant queues and the dead-letter queue." },
+    { "id": "compute", "label": "Workers and control", "description": "The pool of workers, the drain on deploy and the autoscaler." },
+    { "id": "data", "label": "Results and keys", "description": "Job results and the idempotency keys that make a retry safe." }
+  ],
+  "quiz": [
+    {
+      "question": "A pool of CPU-bound workers on a 16-core machine is raised from 16 to 64 workers. Jobs per second go down, not up. Why?",
+      "options": [
+        "The queue is now shorter, so there is less work to share among the workers.",
+        "More workers means more locks, and the locks make every job slower to start.",
+        "The cores are shared by 64 jobs, and part of their time goes on switching between them.",
+        "A bigger pool uses more memory, and the memory is the real limit on throughput."
+      ],
+      "answer": 2,
+      "explanation": "CPU-bound jobs cannot run faster than the cores allow. Past the core count extra workers only share the same cores and add the cost of switching. A pool larger than the cores helps only when jobs wait on something else."
+    },
+    {
+      "question": "One bounded queue of 200 jobs is shared by all tenants. A noisy tenant fills it. What happens to a quiet tenant?",
+      "options": [
+        "Their jobs are accepted first, because the queue always favours the smaller tenants.",
+        "Their jobs are refused too, because the queue is full whoever is submitting.",
+        "Their jobs wait a little longer, but none is ever refused until the queue is full of them.",
+        "The noisy tenant's jobs are dropped to make room, as a bounded queue evicts the oldest."
+      ],
+      "answer": 1,
+      "explanation": "A bound shared by everyone protects memory but not fairness: the flood takes all the room and the quiet tenants are turned away. Separate per-tenant bounds, and workers that take turns, put the refusals on the tenant that caused them."
+    },
+    {
+      "question": "A job sent an email and then its worker was killed before it reported success. What makes a retry safe?",
+      "options": [
+        "Retrying after a longer delay, so the first email has time to arrive.",
+        "A rule that a job is never retried, so each email is sent at most once.",
+        "Running the retry on the same worker, which remembers the job in memory.",
+        "A stored idempotency key for the job, checked by the retry before it sends anything."
+      ],
+      "answer": 3,
+      "explanation": "The retry must learn that the effect has already happened, and only a record outside the worker can say so. Never retrying loses jobs that really failed, delay does not tell the retry anything, and a worker that was killed has no memory."
+    }
+  ]
+}

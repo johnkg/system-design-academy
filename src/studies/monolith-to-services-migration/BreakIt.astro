@@ -1,0 +1,134 @@
+---
+import PlaygroundShell from '../../components/PlaygroundShell.astro';
+---
+<PlaygroundShell title="Moving customers to the new service, and what keeps the two databases honest" hint="4,000 requests from 200 customers. 30% of requests are updates. Some customers are routed to the new service, which has its own database. Legacy reports, 30% of reads, still read the monolith's database. Assumptions: a dual write silently fails 10% of the time, the outbox relay copies an update 12 requests later, and four schema changes (one every 800 requests) break the other side when the database is shared.">
+  <ol class="how">
+    <li>Set <b>Traffic on the new service</b> to <b>50%</b> and <b>Keeping the databases in step</b> to <b>Nothing: the new service owns its data</b>. Half the customers now write only to the new database, and the legacy reports still read the old one: <b>337</b> wrong reads out of 2,807 and <b>200</b> customers out of sync. Set <b>Rollback</b> to <b>Roll back at request 2,400</b>: <b>98</b> customers are behind: they have updates the monolith never received, so a rollback would lose data.</li>
+    <li>Set <b>Rollback</b> back to <b>No rollback</b> and <b>Keeping the databases in step</b> to <b>Dual writes from the app</b>. Wrong reads fall to <b>34</b>, but a silent failure of the second write leaves <b>18</b> customers out of sync for good, and nobody is told. Set <b>Parity check</b> to <b>Compare and repair every 1,000 requests</b>: the checks find <b>57</b> mismatches and repair them, and no customer is out of sync at the end.</li>
+    <li>Set <b>Keeping the databases in step</b> to <b>Outbox relay</b> and <b>Parity check</b> to <b>Off</b>: only <b>4</b> wrong reads, all from the short relay delay. Set <b>Traffic on the new service</b> to <b>100%</b> and <b>Parity check</b> to <b>Compare and repair every 1,000 requests</b>: the checks find <b>15</b> mismatches. Set <b>Rollback</b> to <b>Roll back at request 2,400</b>: only <b>4</b> customers are behind.</li>
+    <li>The plausible shortcut: set <b>Traffic on the new service</b> to <b>50%</b>, <b>Keeping the databases in step</b> to <b>Shared database, kept for now</b> and <b>Parity check</b> to <b>Off</b>. Wrong reads are <b>0</b> and nothing is ever out of sync, which looks perfect. But the two sides now break each other: <b>165</b> requests fail during the 4 schema changes, each of which needed both teams to release together. That is a distributed monolith.</li>
+  </ol>
+  <div class="pg mgb" data-mgb>
+    <div class="pg-row">
+      <label>Traffic on the new service <select class="pg-in" data-pct><option value="0">0%</option><option value="10">10%</option><option value="50" selected>50%</option><option value="100">100%</option></select></label>
+      <label>Keeping the databases in step <select class="pg-in" data-mode><option value="none">Nothing: the new service owns its data</option><option value="shared">Shared database, kept for now</option><option value="dual" selected>Dual writes from the app</option><option value="outbox">Outbox relay</option></select></label>
+      <label>Parity check <select class="pg-in" data-parity><option value="off" selected>Off</option><option value="on">Compare and repair every 1,000 requests</option></select></label>
+      <label>Rollback <select class="pg-in" data-rollback><option value="no" selected>No rollback</option><option value="yes">Roll back at request 2,400</option></select></label>
+    </div>
+    <div class="pg-grid">
+      <div class="pg-box" data-b1><h3>Customers shown wrong data</h3><span class="pg-mono" data-o1></span><span class="pg-note" data-n1></span></div>
+      <div class="pg-box" data-b2><h3>Coupling between the teams</h3><span class="pg-mono" data-o2></span><span class="pg-note" data-n2></span></div>
+      <div class="pg-box" data-b3><h3>Databases out of sync</h3><span class="pg-mono" data-o3></span><span class="pg-note" data-n3></span></div>
+      <div class="pg-box" data-b4><h3>Can we go back?</h3><span class="pg-mono" data-o4></span><span class="pg-note" data-n4></span></div>
+    </div>
+    <div class="pg-box" style="--c: var(--border)">
+      <h3>Every 200 requests: wrong reads, and customers out of sync</h3>
+      <div class="mgb-chart" data-chart role="img" aria-label="Wrong reads and customers out of sync, in steps of 200 requests"></div>
+      <span class="pg-note">Columns: wrong reads in those 200 requests (a full column is 10 or more). Dots: customers whose two databases disagree at the end of the step, out of 200.</span>
+    </div>
+    <p class="pg-out" data-verdict aria-live="polite"></p>
+  </div>
+</PlaygroundShell>
+<script>
+  import { query, formatThousands } from '../../playground';
+  // The same model as the code samples, plus a record every 200 requests for the chart.
+  const CUSTOMERS = 200, TICKS = 4000, WRITE_PCT = 30, LEGACY_PCT = 30, DUAL_FAIL_PCT = 10, LAG = 12, CHECK_EVERY = 1000, ROLLBACK_AT = 2400;
+  const CHANGES = [800, 1600, 2400, 3200], CHANGE_LEN = 80, STEP = 200, FULL_WRONG = 10;
+  type Mode = 'none' | 'shared' | 'dual' | 'outbox';
+
+  function simulate(pct: number, mode: Mode, parity: boolean, rollback: boolean) {
+    let seed = 12345;
+    const rnd = () => (seed = (seed * 48271) % 2147483647);
+    const truth = new Array<number>(CUSTOMERS).fill(0), oldDb = new Array<number>(CUSTOMERS).fill(0), newDb = new Array<number>(CUSTOMERS).fill(0);
+    const relay: { due: number; c: number; v: number; toNew: boolean }[] = [];
+    let reads = 0, wrong = 0, failed = 0, found = 0, lastRate = 0, behind = 0, rolled = false, stepWrong = 0;
+    const chart: { wrong: number; drift: number }[] = [];
+    const countDrift = () => { let d = 0; for (let i = 0; i < CUSTOMERS; i++) if (oldDb[i] !== newDb[i]) d++; return pct === 0 ? 0 : d; };
+    for (let t = 0; t < TICKS; t++) {
+      const c = rnd() % CUSTOMERS, isWrite = rnd() % 100 < WRITE_PCT, legacy = rnd() % 100 < LEGACY_PCT, lose = rnd() % 100 < DUAL_FAIL_PCT;
+      for (let i = relay.length - 1; i >= 0; i--) {
+        const m = relay[i];
+        if (m.due <= t) { const db = m.toNew ? newDb : oldDb; db[m.c] = Math.max(db[m.c], m.v); relay.splice(i, 1); }
+      }
+      if (rollback && t === ROLLBACK_AT) { rolled = true; for (let i = 0; i < CUSTOMERS; i++) if (oldDb[i] !== truth[i]) behind++; }
+      const onNew = !rolled && (c * 7919) % 100 < pct;
+      const side = !isWrite && legacy ? 'old' : onNew ? 'new' : 'old';
+      const k = CHANGES.findIndex((s) => t >= s && t < s + CHANGE_LEN);
+      if (mode === 'shared' && pct > 0 && k >= 0 && side === (k % 2 === 0 ? 'new' : 'old')) failed++;
+      else if (isWrite) {
+        const v = ++truth[c];
+        (onNew ? newDb : oldDb)[c] = v;
+        if (pct === 0) { /* nothing to keep in step */ }
+        else if (mode === 'shared') (onNew ? oldDb : newDb)[c] = v;
+        else if (mode === 'none') { /* the new service owns the data */ }
+        else if (mode === 'dual') { if (!lose) (onNew ? oldDb : newDb)[c] = Math.max((onNew ? oldDb : newDb)[c], v); }
+        else relay.push({ due: t + LAG, c, v, toNew: !onNew });
+      } else {
+        reads++;
+        const seen = side === 'new' ? newDb[c] : oldDb[c];
+        if (seen !== truth[c]) { wrong++; stepWrong++; }
+      }
+      if (parity && pct > 0 && (t + 1) % CHECK_EVERY === 0) {
+        let diff = 0;
+        for (let i = 0; i < CUSTOMERS; i++) if (oldDb[i] !== newDb[i]) { diff++; oldDb[i] = newDb[i] = Math.max(oldDb[i], newDb[i]); }
+        found += diff; lastRate = Math.floor((diff * 100) / CUSTOMERS);
+      }
+      if ((t + 1) % STEP === 0) { chart.push({ wrong: stepWrong, drift: countDrift() }); stepWrong = 0; }
+    }
+    const drift = countDrift();
+    const coordinated = mode === 'shared' && pct > 0 ? CHANGES.length : 0;
+    return { reads, wrong, failed, found, lastRate, behind, drift, coordinated, chart };
+  }
+
+  document.querySelectorAll<HTMLElement>('[data-mgb]').forEach((root) => {
+    const q = query(root);
+    const chartEl = q('[data-chart]');
+    const cols = Array.from({ length: TICKS / STEP }, () => {
+      const c = document.createElement('span'); c.className = 'mgb-col';
+      const bar = document.createElement('span'); bar.className = 'mgb-bar';
+      const dot = document.createElement('span'); dot.className = 'mgb-dot';
+      c.append(bar, dot); chartEl.appendChild(c); return { c, bar, dot };
+    });
+    const box = (n: number, colour: string) => q<HTMLElement>(`[data-b${n}]`).style.setProperty('--c', colour);
+    const sel = (s: string) => q<HTMLSelectElement>(s).value;
+    function draw() {
+      const pct = Number(sel('[data-pct]')), mode = sel('[data-mode]') as Mode, parity = sel('[data-parity]') === 'on', rollback = sel('[data-rollback]') === 'yes';
+      const r = simulate(pct, mode, parity, rollback);
+      q('[data-o1]').textContent = `${formatThousands(r.wrong)} wrong reads`;
+      q('[data-n1]').textContent = `out of ${formatThousands(r.reads)} reads, ${(r.wrong * 100) / Math.max(1, r.reads) < 0.5 ? 'under 0.5%' : `about ${Math.round((r.wrong * 100) / r.reads)}%`}`;
+      box(1, r.wrong === 0 ? 'var(--good)' : r.wrong <= 10 ? 'var(--role-3)' : 'var(--bad)');
+      q('[data-o2]').textContent = `${formatThousands(r.failed)} failed requests`;
+      q('[data-n2]').textContent = r.coordinated ? `${r.coordinated} schema changes needed both teams to release together` : 'each team changes its own schema alone';
+      box(2, r.coordinated ? 'var(--bad)' : 'var(--good)');
+      q('[data-o3]').textContent = `${r.drift} of ${CUSTOMERS} customers`;
+      q('[data-n3]').textContent = !parity ? 'no parity check is running' : `the checks found ${formatThousands(r.found)} mismatches; the last one ${r.lastRate}% of customers`;
+      box(3, r.drift === 0 ? 'var(--good)' : r.drift <= 10 ? 'var(--role-3)' : 'var(--bad)');
+      q('[data-o4]').textContent = rollback ? `${r.behind} customers behind` : 'no rollback in this run';
+      q('[data-n4]').textContent = rollback ? 'customers with updates the monolith never received when everyone was sent back to it' : 'choose a rollback at request 2,400 to see what it costs';
+      box(4, !rollback ? 'var(--border)' : r.behind === 0 ? 'var(--good)' : r.behind <= 10 ? 'var(--role-3)' : 'var(--bad)');
+      r.chart.forEach((s, i) => {
+        cols[i].bar.style.height = `${Math.min(100, (s.wrong * 100) / FULL_WRONG)}%`;
+        cols[i].bar.style.setProperty('--c', s.wrong === 0 ? 'var(--good)' : 'var(--bad)');
+        cols[i].dot.style.bottom = `${(s.drift * 100) / CUSTOMERS}%`;
+        cols[i].c.title = `requests ${i * STEP + 1} to ${(i + 1) * STEP}: ${s.wrong} wrong reads, ${s.drift} customers out of sync`;
+      });
+      const v = q('[data-verdict]');
+      const bad = r.wrong > 10 || r.coordinated > 0 || r.drift > 10 || (rollback && r.behind > 10);
+      v.classList.toggle('bad', bad);
+      v.textContent = r.coordinated ? 'No wrong data, but the two services cannot change or fail alone: this is a distributed monolith.'
+        : mode === 'none' && pct > 0 ? 'The new service owns data the monolith cannot see: legacy readers are wrong and a rollback loses updates.'
+        : mode === 'dual' && !parity && pct > 0 ? 'Silent failed second writes pile up as drift, and nothing tells you.'
+        : r.wrong > 10 ? 'Too many customers see stale data.'
+        : pct === 0 ? 'Nothing has moved yet: the safe starting point.'
+        : 'Few wrong reads, drift is found and repaired, and each team can change its own schema.';
+    }
+    root.addEventListener('change', draw);
+    draw();
+  });
+</script>
+<style is:global>
+  .playground .mgb-chart { display: grid; grid-template-columns: repeat(20, 1fr); gap: 3px; height: 120px; align-items: end; }
+  .playground .mgb-col { position: relative; height: 100%; }
+  .playground .mgb-bar { position: absolute; left: 0; right: 0; bottom: 0; background: var(--c); border-radius: 2px 2px 0 0; opacity: .8; }
+  .playground .mgb-dot { position: absolute; left: 50%; width: 6px; height: 6px; margin: 0 0 -3px -3px; border-radius: 50%; background: var(--text); }
+</style>

@@ -1,0 +1,185 @@
+---
+import PlaygroundShell from '../../components/PlaygroundShell.astro';
+---
+<PlaygroundShell title="One noisy tenant, a pool of workers, and everyone else's jobs" hint="500 seconds of a job service with 4 tenants. Three submit one job a second; tenant 0 is the noisy one. A job needs 2 core-seconds and a machine has 16 cores. Assumptions: running more jobs at once than cores shares the cores and wastes some of them on switching, a thread per job dies of memory at 250 running jobs, 10% of runs fail (half of those after their side effect), a new machine takes 20 s to start, and a deploy at 151 s takes 5 s to restart.">
+  <ol class="how">
+    <li>Start with the defaults: <b>16 workers</b>, an <b>Unbounded</b> queue and the noisy tenant bursting. The three quiet tenants wait behind its backlog: <b>p95 81 s</b> for a job that needs 2 s of work. Set <b>Queue</b> to <b>Fair: 50 per tenant</b>: the quiet tenants drop to <b>p95 2 s</b>, and the noisy tenant is the one that pays, with <b>651</b> of its jobs rejected.</li>
+    <li>Set <b>Queue</b> back to <b>Unbounded</b> and <b>Workers</b> to <b>64 workers</b>: more workers sounds like more throughput, but 16 cores shared by 64 jobs waste time on switching, and the quiet tenants get <b>870</b> of 1,500 jobs done and a p95 of <b>over 500 s</b>. Now set <b>Workers</b> to <b>A thread per job</b>: <b>249</b> jobs are running at once, the process dies <b>6</b> times, and <b>1,527</b> jobs are lost.</li>
+    <li>Set <b>Workers</b> to <b>16 workers</b> and <b>Queue</b> to <b>Bounded: 200 for everyone</b>. The p95 falls to <b>23 s</b>, but the noisy tenant fills the shared queue, so <b>181</b> jobs of the quiet tenants are rejected too. A bound on the whole queue is not fairness.</li>
+    <li>Set <b>Queue</b> to <b>Fair: 50 per tenant</b> and <b>Failed jobs</b> to <b>Retried</b>: every job gets an answer (<b>p95 4 s</b>), but a job that failed after its side effect runs twice, <b>102</b> duplicate side effects. Set <b>Failed jobs</b> to <b>Retried with an idempotency key</b>: <b>0</b> duplicates.</li>
+    <li>Set <b>Deploy</b> to <b>Abrupt restart at 151 s</b>: <b>13</b> running jobs are killed and put back for a retry. Set <b>Deploy</b> to <b>Drain, then restart</b>: they finish first, and <b>0</b> are killed.</li>
+    <li>Set <b>Deploy</b> to <b>No deploy</b> and <b>Workers</b> to <b>Autoscaled, 1 to 4 machines</b>: the machines rise to <b>48</b> running jobs when the backlog's age passes 5 s, the noisy tenant gets <b>1,212</b> of its 1,400 jobs done, with <b>188</b> rejected, and the bill is <b>1,580</b> machine-seconds instead of 500.</li>
+  </ol>
+  <div class="pg wpb" data-wpb>
+    <div class="pg-row">
+      <label>Workers <select class="pg-in" data-exec><option value="thread">A thread per job</option><option value="4">4 workers</option><option value="16" selected>16 workers</option><option value="64">64 workers</option><option value="auto">Autoscaled, 1 to 4 machines</option></select></label>
+      <label>Queue <select class="pg-in" data-queue><option value="unbounded" selected>Unbounded</option><option value="bounded">Bounded: 200 for everyone</option><option value="fair">Fair: 50 per tenant</option></select></label>
+      <label>Noisy tenant <select class="pg-in" data-noisy><option value="off">Quiet</option><option value="on" selected>Bursting, 12 jobs a second</option></select></label>
+      <label>Failed jobs <select class="pg-in" data-retry><option value="none" selected>Dropped</option><option value="retry">Retried</option><option value="idem">Retried with an idempotency key</option></select></label>
+      <label>Deploy <select class="pg-in" data-deploy><option value="none" selected>No deploy</option><option value="abrupt">Abrupt restart at 151 s</option><option value="drain">Drain, then restart</option></select></label>
+    </div>
+    <div class="pg-grid">
+      <div class="pg-box" data-b1><h3>The three quiet tenants</h3><span class="pg-mono" data-o1></span><span class="pg-note" data-n1></span></div>
+      <div class="pg-box" data-b2><h3>The noisy tenant</h3><span class="pg-mono" data-o2></span><span class="pg-note" data-n2></span></div>
+      <div class="pg-box" data-b3><h3>Workers and deploy</h3><span class="pg-mono" data-o3></span><span class="pg-note" data-n3></span></div>
+      <div class="pg-box" data-b4><h3>Failed jobs</h3><span class="pg-mono" data-o4></span><span class="pg-note" data-n4></span></div>
+    </div>
+    <div class="pg-box" style="--c: var(--border)">
+      <h3>Every 25 seconds: how long a quiet tenant's job took, and how many ran at once</h3>
+      <div class="wpb-chart" data-chart role="img" aria-label="Longest time of a quiet tenant's job and the number of jobs running, in 25 second steps"></div>
+      <span class="pg-note">Columns: the longest time from submit to answer among quiet tenants' jobs answered in those 25 s (a full column is 60 s or more, red if none was answered). Dots: jobs running at the end of the step, out of 250.</span>
+    </div>
+    <p class="pg-out" data-verdict aria-live="polite"></p>
+  </div>
+</PlaygroundShell>
+<script>
+  import { query, formatThousands } from '../../playground';
+  // The same model as the code samples, plus a record every 25 s for the chart.
+  const TICKS = 500, TENANTS = 4, CORES = 16, COST = 2000, MAX_THREADS = 250;
+  const BURST_AT = 100, BURST_END = 200, BURST = 12, QMAX = 200, FAIR_QMAX = 50;
+  const FAIL_PCT = 10, EFFECT_PCT = 50, MAX_TRIES = 3, RESTART_AT = 151, DRAIN = 10, GAP = 5;
+  const CHECK_EVERY = 10, WAIT_LIMIT = 5, BOOT = 20, MAX_MACHINES = 4, SLICE = 25, FULL_WAIT = 60;
+  interface Job { tenant: number; t0: number; tries: number; prog: number; effect: boolean }
+
+  function rate(n: number, cores: number) {
+    if (n <= cores) return 1000;
+    const ovh = Math.min(600, (n - cores) * 8);
+    return Math.floor((Math.floor((1000 * cores) / n) * (1000 - ovh)) / 1000);
+  }
+
+  function simulate(exec: string, queue: string, noisy: boolean, retry: string, deploy: string) {
+    let seed = 4242;
+    const rnd = () => (seed = (seed * 48271) % 2147483647);
+    const shared: Job[] = [], per: Job[][] = [[], [], [], []], pending: number[] = [];
+    let running: Job[] = [], machines = 1, rr = 0, paused = false, resumeAt = -1, drainEnd = -1;
+    const sub = [0, 0], rej = [0, 0], done = [0, 0];
+    const lat = new Map<number, number>();
+    let lost = 0, lostOthers = 0, crashes = 0, killed = 0, dup = 0, failed = 0, dead = 0, peak = 0, machineTicks = 0, stepWait = -1;
+    const chart: { wait: number; running: number }[] = [];
+    const g = (tenant: number) => (tenant === 0 ? 0 : 1);
+    const queued = () => (queue === 'fair' ? per.reduce((s, q) => s + q.length, 0) : shared.length);
+    const lose = (j: Job) => { lost++; if (j.tenant !== 0) lostOthers++; };
+    const answer = (j: Job, t: number) => { if (j.tenant !== 0) { const d = t - j.t0 + 1; lat.set(d, (lat.get(d) ?? 0) + 1); stepWait = Math.max(stepWait, d); } };
+    const finish = (j: Job, t: number) => { done[g(j.tenant)]++; answer(j, t); };
+    const requeue = (j: Job) => (queue === 'fair' ? per[j.tenant] : shared).push(j);
+    const workers = () => (exec === 'auto' ? CORES * machines : Number(exec));
+    for (let t = 0; t < TICKS; t++) {
+      for (let i = pending.length - 1; i >= 0; i--) if (pending[i] <= t) { machines++; pending.splice(i, 1); }
+      for (let tenant = 0; tenant < TENANTS; tenant++) {
+        const n = tenant === 0 ? (noisy && t >= BURST_AT && t < BURST_END ? BURST : t % 2 === 0 ? 1 : 0) : 1;
+        for (let k = 0; k < n; k++) {
+          const j: Job = { tenant, t0: t, tries: 0, prog: 0, effect: false };
+          sub[g(tenant)]++;
+          if (exec === 'thread') running.push(j);
+          else if (queue === 'fair') { if (per[tenant].length >= FAIR_QMAX) rej[g(tenant)]++; else per[tenant].push(j); }
+          else if (queue === 'bounded' && shared.length >= QMAX) rej[g(tenant)]++;
+          else shared.push(j);
+        }
+      }
+      if (exec === 'thread' && running.length > MAX_THREADS) { crashes++; for (const j of running) lose(j); running = []; }
+      if (t === RESTART_AT && deploy !== 'none') {
+        if (exec === 'thread' || deploy === 'abrupt') {
+          for (const j of running) { killed++; if (exec === 'thread' || retry === 'none') lose(j); else { j.prog = 0; requeue(j); } }
+          running = []; resumeAt = exec === 'thread' ? t : t + GAP;
+        } else { paused = true; drainEnd = t + DRAIN; }
+      }
+      if (paused && (running.length === 0 || t >= drainEnd)) {
+        for (const j of running) { killed++; if (retry === 'none') lose(j); else { j.prog = 0; requeue(j); } }
+        running = []; paused = false; resumeAt = t + GAP;
+      }
+      if (exec === 'auto' && t % CHECK_EVERY === 0) {
+        let oldest = 0;
+        for (const q of queue === 'fair' ? per : [shared]) if (q.length) oldest = Math.max(oldest, t - q[0].t0);
+        if (oldest > WAIT_LIMIT && machines + pending.length < MAX_MACHINES) pending.push(t + BOOT);
+        else if (queued() === 0 && machines > 1 && pending.length === 0) machines--;
+      }
+      if (exec !== 'thread' && !paused && t >= resumeAt) {
+        while (running.length < workers() && queued() > 0) {
+          if (queue === 'fair') {
+            let tenant = rr;
+            while (per[tenant].length === 0) tenant = (tenant + 1) % TENANTS;
+            running.push(per[tenant].shift()!);
+            rr = (tenant + 1) % TENANTS;
+          } else running.push(shared.shift()!);
+        }
+      }
+      machineTicks += exec === 'auto' ? machines : 1;
+      peak = Math.max(peak, running.length);
+      const r = rate(running.length, CORES * (exec === 'auto' ? machines : 1));
+      const still: Job[] = [];
+      for (const j of running) {
+        j.prog += r;
+        if (j.prog < COST) { still.push(j); continue; }
+        if (rnd() % 100 >= FAIL_PCT) { if (j.effect) dup++; j.effect = true; finish(j, t); continue; }
+        if (rnd() % 100 < EFFECT_PCT) { if (j.effect) dup++; j.effect = true; }
+        if (retry === 'none') { failed++; answer(j, t); continue; }
+        if (j.effect && retry === 'idem') { finish(j, t); continue; }
+        j.tries++;
+        if (j.tries >= MAX_TRIES) { dead++; answer(j, t); continue; }
+        j.prog = 0;
+        if (exec === 'thread') still.push(j); else requeue(j);
+      }
+      running = still;
+      if ((t + 1) % SLICE === 0) { chart.push({ wait: stepWait, running: running.length }); stepWait = -1; }
+    }
+    const admitted = sub[1] - rej[1];
+    let seen = 0, p95 = -1;
+    for (const k of [...lat.keys()].sort((a, b) => a - b)) { seen += lat.get(k)!; if (p95 < 0 && seen * 100 >= admitted * 95) p95 = k; }
+    return { p95: p95 > TICKS ? -1 : p95, sub, rej, done, lost, lostOthers, crashes, killed, dup, failed, dead, peak, machineTicks, chart };
+  }
+
+  document.querySelectorAll<HTMLElement>('[data-wpb]').forEach((root) => {
+    const q = query(root);
+    const chartEl = q('[data-chart]');
+    const cols = Array.from({ length: TICKS / SLICE }, () => {
+      const c = document.createElement('span'); c.className = 'wpb-col';
+      const bar = document.createElement('span'); bar.className = 'wpb-bar';
+      const dot = document.createElement('span'); dot.className = 'wpb-dot';
+      c.append(bar, dot); chartEl.appendChild(c); return { c, bar, dot };
+    });
+    const box = (n: number, colour: string) => q<HTMLElement>(`[data-b${n}]`).style.setProperty('--c', colour);
+    const sel = (s: string) => q<HTMLSelectElement>(s).value;
+    function draw() {
+      const retry = sel('[data-retry]'), deploy = sel('[data-deploy]'), noisy = sel('[data-noisy]') === 'on';
+      const r = simulate(sel('[data-exec]'), sel('[data-queue]'), noisy, retry, deploy);
+      const lostText = r.lostOthers ? `, ${formatThousands(r.lostOthers)} lost` : '';
+      q('[data-o1]').textContent = r.p95 < 0 ? 'p95 over 500 s' : `p95 ${r.p95} s`;
+      q('[data-n1]').textContent = `${formatThousands(r.done[1])} of ${formatThousands(r.sub[1])} jobs done, ${formatThousands(r.rej[1])} rejected${lostText}`;
+      box(1, r.p95 >= 0 && r.p95 <= 10 && r.rej[1] === 0 && r.lostOthers === 0 ? 'var(--good)' : r.p95 >= 0 && r.p95 <= 30 ? 'var(--role-3)' : 'var(--bad)');
+      q('[data-o2]').textContent = `${formatThousands(r.done[0])} of ${formatThousands(r.sub[0])} jobs done`;
+      q('[data-n2]').textContent = `${formatThousands(r.rej[0])} rejected at the door`;
+      box(2, !noisy || r.rej[0] > 0 || r.done[0] * 100 >= r.sub[0] * 90 ? 'var(--good)' : 'var(--role-3)');
+      q('[data-o3]').textContent = `peak ${r.peak} running at once`;
+      q('[data-n3]').textContent = `${r.crashes} crashes, ${r.killed} jobs killed by the deploy, ${formatThousands(r.lost)} jobs lost, ${formatThousands(r.machineTicks)} machine-seconds`;
+      box(3, r.crashes > 0 || r.lost > 0 ? 'var(--bad)' : 'var(--good)');
+      q('[data-o4]').textContent = `${r.dup} duplicate side effects`;
+      q('[data-n4]').textContent = retry === 'none' ? `${r.failed} failed jobs dropped` : `${r.dead} given up after ${MAX_TRIES} tries; failed jobs are retried`;
+      box(4, r.dup > 0 || (retry === 'none' && r.failed > 0) ? 'var(--bad)' : 'var(--good)');
+      r.chart.forEach((s, i) => {
+        const answered = s.wait >= 0;
+        cols[i].bar.style.height = `${answered ? Math.min(100, (s.wait * 100) / FULL_WAIT) : 100}%`;
+        cols[i].bar.style.setProperty('--c', !answered || s.wait > 10 ? 'var(--bad)' : 'var(--good)');
+        cols[i].dot.style.bottom = `${Math.min(100, (s.running * 100) / MAX_THREADS)}%`;
+        cols[i].c.title = `${i * SLICE} to ${(i + 1) * SLICE} s: ${answered ? `longest ${s.wait} s` : 'no quiet job answered'}, ${s.running} running`;
+      });
+      const v = q('[data-verdict]');
+      const bad = r.crashes > 0 || r.lost > 0 || r.p95 < 0 || r.p95 > 10 || r.rej[1] > 0 || r.dup > 0;
+      v.classList.toggle('bad', bad);
+      v.textContent = r.crashes > 0 ? 'A thread per job runs out of memory under the burst, and every job in flight dies with it.'
+        : r.p95 < 0 || r.p95 > 30 ? 'Quiet tenants wait behind work that is not theirs, or the cores are wasted on switching.'
+        : r.rej[1] > 0 ? 'The noisy tenant fills a queue everyone shares, so quiet tenants are turned away too.'
+        : r.dup > 0 ? 'Retries without an idempotency key run side effects twice.'
+        : r.killed > 0 && r.lost > 0 ? 'The deploy killed jobs that had no retry.'
+        : retry === 'none' && r.failed > 0 ? 'Quiet tenants are served on time, but failed jobs are simply dropped.'
+        : 'Quiet tenants are served within seconds, and nothing ran twice or was lost.';
+    }
+    root.addEventListener('change', draw);
+    draw();
+  });
+</script>
+<style is:global>
+  .playground .wpb-chart { display: grid; grid-template-columns: repeat(20, 1fr); gap: 3px; height: 120px; align-items: end; }
+  .playground .wpb-col { position: relative; height: 100%; }
+  .playground .wpb-bar { position: absolute; left: 0; right: 0; bottom: 0; background: var(--c); border-radius: 2px 2px 0 0; opacity: .8; }
+  .playground .wpb-dot { position: absolute; left: 50%; width: 6px; height: 6px; margin: 0 0 -3px -3px; border-radius: 50%; background: var(--text); }
+</style>

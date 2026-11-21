@@ -1,0 +1,203 @@
+{
+  "name": "Design a Plugin and Extension Platform",
+  "difficulty": "advanced",
+  "intent": "Let third parties extend a product without being able to read what they should not, take it down, or break their customers with an update: a stable API, sandboxes with permissions and limits, failure isolation, review and signing, and staged rollout.",
+  "prompt": "Design the extension platform for a team-collaboration product, like an editor or a SaaS tool with a marketplace. About 2,000 plugins from 300 outside authors are available to 50,000 customer workspaces, and the average workspace has 6 installed. Plugins add buttons and panels, react to events such as 'document saved' or 'comment added', and call the product's API on behalf of the workspace. At peak the host sends about 3,000 plugin calls a second. Authors ship updates every week. A plugin must not be able to read data it was not granted, a hung or crashing plugin must not slow the product down for customers who do not use it, an update must not break the customers who have installed it, and we must be able to pull a bad plugin within minutes.",
+  "codeTitle": "plugin calls with and without isolation, one hanging, crashing or snooping plugin, and timeouts",
+  "finalIntro": "One plugin event from install to a staged update, with a permission check, a sandbox and a plugin that gets switched off.",
+  "functional": [
+    "A workspace admin can install a plugin, see the permissions it asks for, grant them, and remove it",
+    "Plugins can react to events, add interface elements, and call the product API with the granted permissions",
+    "Authors can publish new versions through a review process and see how an update is doing",
+    "The company can switch off a plugin, or one version of it, for all workspaces",
+    "Admins and authors can see what a plugin did and why a call failed"
+  ],
+  "nonFunctional": [
+    "A plugin can read or change only the data its granted permissions cover, in the installing workspace only",
+    "With one plugin hung, 95% of product requests still answer within 1 s, and workspaces without that plugin see no change",
+    "One plugin crashing or running out of memory never restarts the host process",
+    "A plugin version that was working keeps working for 12 months after the API changes, with a published deprecation notice",
+    "A bad update reaches at most 5% of installs before it is halted automatically, and a plugin can be switched off everywhere within 5 minutes"
+  ],
+  "firstAttempt": {
+    "text": "A plugin is a library that the host loads into its own process. Hooks run inline on the request path, such as before-save, and the plugin gets the host's own objects to work with. An author uploads a package and it is live for every workspace at once.",
+    "limits": [
+      "A plugin that loops for ever or waits on a slow network call holds a host worker, so a few hung calls use up the pool and the whole product slows down",
+      "A crash or an out-of-memory error in a plugin takes down the host process and every customer on it",
+      "The plugin shares memory with the host, so it can read any workspace's data and the host's secrets, whatever the admin granted",
+      "Plugins use internal host objects, so every internal refactor breaks some of them, and the host can never change those parts",
+      "A bad update is live for everyone at once, and the only way to remove it is to deploy the host"
+    ]
+  },
+  "nodes": [
+    { "id": "user", "label": "Users and workspaces", "kind": "client", "x": 10, "y": 50 },
+    { "id": "host", "label": "Host application", "kind": "compute", "x": 30, "y": 50 },
+    { "id": "inproc", "label": "Plugins in the host process", "kind": "data", "x": 60, "y": 50, "at": 0, "until": 2 },
+    { "id": "api", "label": "Versioned plugin API", "kind": "edge", "x": 30, "y": 16, "at": 1 },
+    { "id": "perms", "label": "Permission checks and scoped tokens", "kind": "edge", "x": 60, "y": 16, "at": 2 },
+    { "id": "sandbox", "label": "One sandbox per plugin", "kind": "compute", "x": 60, "y": 50, "at": 2 },
+    { "id": "limits", "label": "CPU, memory, time and call limits", "kind": "compute", "x": 85, "y": 16, "at": 3 },
+    { "id": "queue", "label": "Per-plugin event queues", "kind": "async", "x": 30, "y": 84, "at": 4 },
+    { "id": "breaker", "label": "Circuit breaker and kill switch", "kind": "compute", "x": 60, "y": 84, "at": 4 },
+    { "id": "review", "label": "Review and signing", "kind": "compute", "x": 85, "y": 50, "at": 5 },
+    { "id": "market", "label": "Marketplace of signed packages", "kind": "data", "x": 85, "y": 84, "at": 5 },
+    { "id": "rollout", "label": "Staged rollout and auto-halt", "kind": "compute", "x": 10, "y": 16, "at": 6 }
+  ],
+  "edges": [
+    { "from": "user", "to": "host", "at": 0 },
+    { "from": "host", "to": "inproc", "at": 0, "until": 1 },
+    { "from": "host", "to": "api", "at": 1 },
+    { "from": "api", "to": "inproc", "at": 1, "until": 2 },
+    { "from": "api", "to": "perms", "at": 2 },
+    { "from": "perms", "to": "sandbox", "at": 2 },
+    { "from": "api", "to": "sandbox", "at": 2, "until": 4 },
+    { "from": "limits", "to": "sandbox", "at": 3 },
+    { "from": "host", "to": "queue", "at": 4 },
+    { "from": "queue", "to": "breaker", "at": 4 },
+    { "from": "breaker", "to": "sandbox", "at": 4 },
+    { "from": "review", "to": "market", "at": 5 },
+    { "from": "market", "to": "sandbox", "at": 5 },
+    { "from": "rollout", "to": "host", "at": 6 }
+  ],
+  "steps": [
+    {
+      "title": "Give plugins a small, stable, versioned API",
+      "problem": "Plugins that reach into the host's internal objects depend on everything the host does. Each refactor breaks some of them, authors cannot tell what is safe to rely on, and the host cannot be changed without asking 300 authors to update.",
+      "fix": "Define the plugin API as a separate, documented surface: a facade of events, commands and data calls, which is the only thing a plugin can see. Version it, publish a deprecation policy, and let each plugin declare the API version it was built for in its manifest. The host keeps adapters that translate older versions to the current internals, so an old plugin keeps working while the host moves on.",
+      "tradeoff": "The host can change its internals freely, and authors know what they can count on. The API is a promise: every call you add has to be supported for years, and every adapter for an old version is code to maintain and test. Keep the surface small, and add to it only when several plugins need it.",
+      "concepts": [{ "kind": "pattern", "slug": "facade" }, { "kind": "pattern", "slug": "adapter" }, { "slug": "api-versioning" }, { "slug": "old-app-versions-and-api-compatibility" }, { "slug": "schema-evolution-and-compatibility" }]
+    },
+    {
+      "title": "Run each plugin in a sandbox, behind declared permissions",
+      "problem": "A plugin in the host's process can read the host's memory and call anything the host can. The admin's choice to grant it only 'read documents' means nothing, because nothing enforces it.",
+      "fix": "Run each plugin in its own sandbox: a separate OS process in a locked-down container, a WebAssembly runtime, or a script isolate with no access to the host's memory, files or network. The only way out is the plugin API. Each plugin's manifest lists the permissions it asks for, such as 'documents:read' and 'comments:write', and the admin approves them at install. The API checks every call against what was granted, using a token scoped to that workspace and those permissions, so the check does not depend on the plugin behaving.",
+      "tradeoff": "A plugin can now only do what was granted, in the workspace that granted it. Each call crosses a boundary and costs a serialisation and a hop, typically a fraction of a millisecond to a few milliseconds, and a plugin cannot share objects with the host any more. Permissions that are too coarse get granted without thought, so ask for narrow ones and show what each does.",
+      "concepts": [{ "slug": "access-control-models" }, { "slug": "authentication-and-authorization" }, { "slug": "oauth-and-openid-connect" }, { "slug": "containers-and-orchestration" }, { "slug": "secrets-management" }]
+    },
+    {
+      "title": "Put hard limits on what a plugin may use",
+      "problem": "A sandbox keeps a plugin from reading things, but it can still loop for ever, allocate memory until the machine swaps, or flood the product API. A call that never returns holds a host worker for as long as the host waits for it.",
+      "fix": "Give every plugin a budget: CPU time per call, a memory cap, a wall-clock timeout, a maximum number of calls running at once, a rate limit on its calls to the product API, a size limit on what it returns, and an allowlist of the hosts it may call. When a limit is hit, the call is stopped, the sandbox is killed if needed, and the failure is counted against the plugin. The timeout needs care: set it from what honest plugins really need, not from what feels generous.",
+      "tradeoff": "One plugin cannot use more than its share of the machine. Limits that are too tight break honest plugins on big documents, and limits that are too loose let a misbehaving plugin hold resources for a long time. In the simulation, a 1 s timeout kills 4% of calls to healthy plugins, and a 60 s timeout lets one hung plugin stop the host.",
+      "concepts": [{ "slug": "timeouts-and-deadlines" }, { "slug": "rate-limiting" }, { "slug": "bulkhead" }, { "slug": "queueing-theory-and-littles-law" }]
+    },
+    {
+      "title": "Keep a failing plugin from reaching anyone else",
+      "problem": "Limits make a failure bounded, but the host still waits for the plugin on every request that has a hook. If the plugin is down, every one of those requests pays the timeout, and a plugin that is merely slow ties up workers all the same.",
+      "fix": "Run plugin hooks off the request path wherever the product allows: put events on a per-plugin queue and let the plugin consume them at its own pace, with a dead-letter queue for events it cannot process. Where a plugin must answer inline, give it a short deadline and a circuit breaker: after a few failures in a row the plugin is switched off for a minute, and the host carries on without it ('fail open' for a plugin that only adds, 'fail closed' for one that must approve something). One plugin gets one pool of workers and no more, and a kill switch can switch off a plugin or a version at once.",
+      "tradeoff": "A hung or crashing plugin costs only its own feature, for the workspaces that installed it. Its users see a feature missing, which needs an honest message, and asynchronous plugins cannot change the result of the request that caused the event. Fail-open versus fail-closed is a product decision for each kind of hook.",
+      "concepts": [{ "slug": "circuit-breaker" }, { "slug": "message-queues" }, { "slug": "dead-letter-queues-and-poison-messages" }, { "slug": "graceful-degradation" }, { "slug": "webhooks" }]
+    },
+    {
+      "title": "Review and sign every package",
+      "problem": "Anyone can write a plugin, and some are written to steal. A malicious author, a stolen publisher account, or a compromised dependency can put harmful code in a package, and a runtime check cannot catch what the permissions allow.",
+      "fix": "Check before publishing. Verify the identity of the publisher. Scan the package and its dependencies automatically, compare the permissions with the last version, and send plugins that ask for sensitive permissions, or whose permissions grew, to a human reviewer. The marketplace builds the package, signs it, and records its hash. The host loads a plugin only if the signature and hash match, so nothing can be swapped between the review and the sandbox.",
+      "tradeoff": "Most clearly bad plugins are stopped before any customer sees them, and the host can prove what it is running. Review takes time, so authors wait for it, and review does not find everything: a plugin can behave well in review and badly later. That is why the sandbox, the permissions and the limits stay on after review.",
+      "concepts": [{ "slug": "supply-chain-security" }, { "slug": "encryption" }, { "slug": "secrets-management" }, { "slug": "structured-logging" }]
+    },
+    {
+      "title": "Roll updates out in stages, and be able to pull them back",
+      "problem": "An update that passed review can still hang on one customer's data. Pushed to every workspace at once it reaches 50,000 customers before anyone knows, and an update that asks for new permissions would otherwise get them without anyone saying yes.",
+      "fix": "Release each new version to 1% of installs, then 5%, 25% and 100%, with a wait between stages and the plugin's error, timeout and kill rate compared with the previous version. If the numbers get worse, the rollout halts by itself and the installs on the new version go back to the old one. An update that asks for more permissions is not applied until the workspace admin accepts them. The kill switch removes one version, or the whole plugin, from every workspace within minutes, without a host deploy.",
+      "tradeoff": "A bad update reaches a few percent of installs, not all, and can be pulled quickly. Authors have to wait for a full rollout, several versions can be live at once so support needs to know which one a customer has, and a security fix may need to skip the stages with a clear reason.",
+      "concepts": [{ "slug": "canary-deployments" }, { "slug": "feature-flags" }, { "slug": "blue-green-and-rolling-deployments" }, { "slug": "metrics" }, { "slug": "slos-and-error-budgets" }]
+    }
+  ],
+  "failures": [
+    {
+      "scenario": "An update makes a popular plugin loop for ever when it meets a large document",
+      "impact": "Run inside the host process, each call that never returns holds one of the host's 40 workers. With a 60 s timeout, the pool is full within seconds, only 22% of requests are answered within 1 s, and workspaces that do not even use the plugin see the slowdown.",
+      "answer": "Each plugin runs in its own sandbox with its own pool of slots, so a plugin that hangs can only fill its own. A short call timeout stops each call, a circuit breaker switches the plugin off after a few failures in a row, and the staged rollout halts the update before most workspaces have it. The kill switch removes the version everywhere.",
+      "concepts": [{ "slug": "bulkhead" }, { "slug": "circuit-breaker" }, { "slug": "timeouts-and-deadlines" }, { "slug": "canary-deployments" }]
+    },
+    {
+      "scenario": "A plugin throws an unhandled error, or runs out of memory, on every call",
+      "impact": "In the host process it takes the whole process down. Each restart takes about 30 seconds in the simulation, and with the plugin called every few seconds the host is up for only a fraction of the time: 20% of requests are served.",
+      "answer": "The plugin's sandbox dies and nothing else does. The call fails, the host carries on without the plugin, and the sandbox is restarted by the platform. After a few failures the breaker switches the plugin off for a minute at a time and the author is told. The memory cap means a leak only ever kills the sandbox that has the leak.",
+      "concepts": [{ "slug": "containers-and-orchestration" }, { "slug": "circuit-breaker" }, { "slug": "health-checks" }]
+    },
+    {
+      "scenario": "A plugin the admin granted only 'comments:read' quietly tries to read every document in the workspace",
+      "impact": "With the plugin in the host's process nothing stops it: the grant is a label, and every record it can reach is read. Nobody finds out until a customer asks.",
+      "answer": "The plugin has no access to the host's memory or database, only to the plugin API, and every API call is checked against the permissions in its scoped token. The calls for documents are refused and logged, and the attempts count against the plugin, so repeated denials can trigger a review or the kill switch. Network access is limited to the hosts the manifest names.",
+      "concepts": [{ "slug": "access-control-models" }, { "slug": "authentication-and-authorization" }, { "slug": "structured-logging" }]
+    },
+    {
+      "scenario": "A stolen publisher account pushes a new version of a plugin with 40,000 installs",
+      "impact": "Without review and staging, the new version runs in every workspace within minutes, with every permission those workspaces already granted to the old one.",
+      "answer": "A new version is built and signed by the marketplace after review, and a permission increase is held until each admin accepts it. A staged rollout puts the version on 1% of installs first, where unusual behaviour such as many denied calls shows up in the numbers, the rollout halts by itself, and the kill switch revokes the version, and the publisher's keys, within minutes.",
+      "concepts": [{ "slug": "supply-chain-security" }, { "slug": "canary-deployments" }, { "slug": "secrets-management" }]
+    }
+  ],
+  "alternatives": [
+    {
+      "title": "Where plugin code runs",
+      "options": [
+        { "name": "In the host process", "pro": "Fastest calls, and plugins can use the host's objects directly", "con": "A plugin can crash the host, hang it, and read anything in memory" },
+        { "name": "In a sandbox on the host's machines", "pro": "Cheap calls, strong limits, and nothing shared with the host", "con": "Sandboxes have to be built, patched and watched, and each runtime supports only some languages" },
+        { "name": "On the author's own servers, called over HTTP", "pro": "Total isolation, and the author carries the cost and any language", "con": "Slow and unreliable calls, you cannot see or limit what runs, and the host's data has to be sent out" }
+      ],
+      "pick": "A sandbox per plugin on the host's machines for code that runs inline, and webhook-style remote calls for plugins that need their own backend."
+    },
+    {
+      "title": "How a plugin hook is called",
+      "options": [
+        { "name": "Synchronously, inline on the request", "pro": "The plugin can change or veto the result", "con": "Every request pays for the plugin's slowest call" },
+        { "name": "Asynchronously, through a per-plugin queue", "pro": "A slow plugin only delays itself", "con": "The plugin cannot change the response, and its work finishes later" },
+        { "name": "Inline with a short deadline and a breaker", "pro": "Works for hooks that must act on the request, with bounded cost", "con": "Needs a fail-open or fail-closed choice, and a plugin that is often slow is switched off" }
+      ],
+      "pick": "Asynchronous by default; inline only for the few hooks that must change the result, with a short deadline and a breaker."
+    },
+    {
+      "title": "How strict the gate is before a plugin is published",
+      "options": [
+        { "name": "Open publishing", "pro": "Fast for authors, and a large catalogue", "con": "Harmful plugins reach customers before anyone looks" },
+        { "name": "Manual review of every version", "pro": "Catches things that automated checks miss", "con": "Slow, expensive, and a bottleneck on weekly releases" },
+        { "name": "Automated checks for all, manual review for risky changes", "pro": "Fast for most updates, and attention goes where the risk is", "con": "Needs a good risk rule, and automated checks can be gamed" }
+      ],
+      "pick": "Automated checks for every version, manual review when a plugin is new, asks for sensitive permissions or its permissions grow, and the runtime limits on top of both."
+    }
+  ],
+  "roles": [
+    { "id": "client", "label": "Users", "description": "People in customer workspaces who use the product and the plugins installed there." },
+    { "id": "edge", "label": "API and permissions", "description": "The versioned plugin API, and the checks that enforce granted permissions." },
+    { "id": "compute", "label": "Host and sandboxes", "description": "The host application, the sandbox for each plugin, limits, breakers, review and rollout." },
+    { "id": "async", "label": "Event queues", "description": "A queue per plugin, so a slow plugin only delays its own events." },
+    { "id": "data", "label": "Plugins and packages", "description": "The plugin code, in the host's process at first and later as signed packages in the marketplace." }
+  ],
+  "quiz": [
+    {
+      "question": "A plugin hook runs inline in the host, and one plugin starts hanging. The host has 40 workers and a 60 s call timeout. What happens?",
+      "options": [
+        "Only the plugin's own users notice, because the timeout cuts each call short.",
+        "The host crashes at once, because a hung call always runs out of memory.",
+        "The host switches the plugin off after the first call, because it hangs.",
+        "Hung calls fill the worker pool, and requests for everyone, plugin or not, queue up."
+      ],
+      "answer": 3,
+      "explanation": "Each hung call keeps a worker for the whole 60 s, and new calls arrive faster than the old ones end, so the pool is full and every request waits. A short timeout, a separate pool per plugin and a breaker keep the damage inside the one plugin."
+    },
+    {
+      "question": "An admin grants a plugin 'documents:read' only. Why is checking this inside the plugin's own code not enough?",
+      "options": [
+        "Plugins are written in languages that do not support permissions.",
+        "The platform must enforce it outside the plugin, because plugin code can ignore its own checks.",
+        "Permissions are only meant to be shown to admins, so they are not checked at all.",
+        "A check inside the plugin is too slow, because plugins run on the author's slow servers."
+      ],
+      "answer": 1,
+      "explanation": "A plugin that wants to misbehave will not check itself. The check has to sit on the other side of a boundary the plugin cannot cross: a sandbox with no other way out, and an API that tests each call against a scoped token."
+    },
+    {
+      "question": "A team sets the plugin call timeout to 60 s so honest plugins are never cut off. What is the cost?",
+      "options": [
+        "A hung plugin can hold a host worker for a full minute per call, so the host slows or stops.",
+        "Every healthy call takes 60 s, because the timeout is also the minimum wait.",
+        "The plugin's sandbox is rebuilt on every call, which makes calls slow for everyone.",
+        "The API stops checking permissions on calls that take longer than the usual timeout."
+      ],
+      "answer": 0,
+      "explanation": "A timeout is a ceiling, so healthy calls are not slowed. But a plugin that never answers now costs a worker for the whole 60 s per call. Pick the timeout from what honest calls need, and isolate plugins so that the choice only affects the plugin."
+    }
+  ]
+}

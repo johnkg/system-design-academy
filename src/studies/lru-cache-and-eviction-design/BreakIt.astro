@@ -1,0 +1,170 @@
+---
+import PlaygroundShell from '../../components/PlaygroundShell.astro';
+---
+<PlaygroundShell title="One request stream, four ways to empty a full cache" hint="200,000 requests from a seeded generator, scaled down 1 to 1,000 from the real catalog: 1,000 hot keys get 85% of the requests, 50,000 cold keys get the rest. A process that is not bounded is killed at 10,000 entries (assumed). Hit rates count regular requests only, not the report's own reads.">
+  <ol class="how">
+    <li>Start with the defaults: <b>Policy</b> is an <b>Unbounded map</b>. The hit rate looks excellent at <b>84%</b>, but the map grows to <b>10,000</b> entries, the most the process can hold, and the process is killed 3 times. Each time it restarts with an empty cache. Set <b>Policy</b> to <b>FIFO</b> with <b>Cache size</b> at <b>2,000 entries</b>: memory is bounded but the hit rate falls to <b>75%</b>, because the oldest entry is not the least useful one. Set <b>Policy</b> to <b>LRU</b>: <b>83%</b>.</li>
+    <li>With <b>Policy</b> at <b>LRU</b>, set <b>Cache size</b> to <b>500 entries</b>: <b>43%</b>. Then <b>1,000 entries</b>: <b>71%</b>. Then <b>5,000 entries</b>: <b>85%</b>. Each doubling of the memory buys less, and the hit rate cannot pass about 85%, because the rest of the requests are for cold keys that are rarely asked for twice.</li>
+    <li>Set <b>Cache size</b> to <b>2,000 entries</b> and tick <b>Report scan</b>. While the report reads 20,000 old keys once each, the hit rate for real requests falls to <b>61%</b>, from <b>83%</b> before the scan, and the database takes <b>54,233</b> reads. Set <b>Cache size</b> to <b>5,000 entries</b>: the same scan only costs <b>81%</b>. Set <b>Policy</b> to <b>LFU</b>: the scan keys have used-once counts and are evicted first, so the hit rate is <b>85%</b> during the scan.</li>
+    <li>That looks like a fix. Set <b>Cache size</b> to <b>1,000 entries</b> and tick <b>Hot set moves</b>: the popular keys change at request 140,000. With LFU the last stretch is <b>8%</b>, because the old favourites hold the cache with high counts. Set <b>Policy</b> back to <b>LRU</b>: <b>71%</b>. Press <b>Reset</b>, set <b>Policy</b> to <b>LRU</b> and <b>Entry lifetime</b> to <b>2,000 requests</b>: an expiry that short throws away <b>54,039</b> entries that were still right, and the hit rate is <b>56%</b>.</li>
+  </ol>
+  <div class="pg lcb" data-lcb>
+    <div class="pg-row">
+      <label>Policy <select class="pg-in" data-policy><option value="none" selected>Unbounded map</option><option value="fifo">FIFO</option><option value="lru">LRU</option><option value="lfu">LFU</option></select></label>
+      <label>Cache size <select class="pg-in" data-size><option value="500">500 entries</option><option value="1000">1,000 entries</option><option value="2000" selected>2,000 entries</option><option value="5000">5,000 entries</option></select></label>
+      <label>Entry lifetime <select class="pg-in" data-ttl><option value="0" selected>Never expires</option><option value="10000">10,000 requests</option><option value="2000">2,000 requests</option></select></label>
+      <label class="lcb-check"><input type="checkbox" data-scan /> Report scan</label>
+      <label class="lcb-check"><input type="checkbox" data-shift /> Hot set moves</label>
+      <button type="button" class="btn" data-reset>Reset</button>
+    </div>
+    <div class="pg-grid">
+      <div class="pg-box" data-b1><h3>Hit rate, all requests</h3><span class="pg-mono" data-o1></span><span class="pg-note" data-n1></span></div>
+      <div class="pg-box" data-b2><h3>During the report scan</h3><span class="pg-mono" data-o2></span><span class="pg-note" data-n2></span></div>
+      <div class="pg-box" data-b3><h3>Last stretch, after the hot set may have moved</h3><span class="pg-mono" data-o3></span><span class="pg-note" data-n3></span></div>
+      <div class="pg-box" data-b4><h3>Database reads</h3><span class="pg-mono" data-o4></span><span class="pg-note" data-n4></span></div>
+      <div class="pg-box" data-b5><h3>Memory</h3><span class="pg-mono" data-o5></span><span class="pg-note" data-n5></span></div>
+    </div>
+    <div class="pg-box" style="--c: var(--border)">
+      <h3>Hit rate in each block of 10,000 requests</h3>
+      <div class="lcb-chart" data-chart role="img" aria-label="Hit rate of regular requests in each of 20 blocks of 10,000 requests"></div>
+      <span class="pg-note">Column height is the hit rate of regular requests in that block. Shaded columns are the report scan (80,000 to 120,000); the line marks where the hot set can move (140,000). Green is 80% or more, red under 50%.</span>
+    </div>
+    <p class="pg-out" data-verdict aria-live="polite"></p>
+  </div>
+</PlaygroundShell>
+<script>
+  import { query, formatThousands } from '../../playground';
+  // The same model as the code samples, plus a hit rate for every block of 10,000 requests for the chart.
+  const REQUESTS = 200000, HOT = 1000, HOT_PCT = 85, COLD_BASE = 5000, COLD = 50000, SHIFT_BASE = 2000, SCAN_BASE = 100000;
+  const SCAN_START = 80000, SCAN_END = 120000, SHIFT_AT = 140000, MEMORY_LIMIT = 10000, SEED = 20261121;
+  const BLOCK = 10000, TARGET = 80;
+  type Policy = 'none' | 'fifo' | 'lru' | 'lfu';
+  const DEFAULTS = { policy: 'none', size: '2000', ttl: '0' };
+
+  function simulate(policy: Policy, size: number, scan: boolean, shift: boolean, ttl: number) {
+    let state = SEED;
+    const next = () => (state = (state * 48271) % 2147483647);
+    const lfu = policy === 'lfu';
+    const order = new Map<number, boolean>(), freq = new Map<number, number>(), buckets = new Map<number, Map<number, boolean>>(), born = new Map<number, number>();
+    let minFreq = 1, count = 0, peak = 0, restarts = 0, evictions = 0, expired = 0, dbReads = 0;
+    const hits = [0, 0, 0, 0], asked = [0, 0, 0, 0];
+    const blockHits = new Array<number>(REQUESTS / BLOCK).fill(0), blockAsked = new Array<number>(REQUESTS / BLOCK).fill(0);
+    const oldest = (m: Map<number, boolean>) => m.keys().next().value as number;
+    const bucket = (f: number) => { if (!buckets.has(f)) buckets.set(f, new Map()); return buckets.get(f)!; };
+    const remove = (key: number) => {
+      if (lfu) { const f = freq.get(key)!, b = buckets.get(f)!; b.delete(key); if (b.size === 0) buckets.delete(f); freq.delete(key); } else order.delete(key);
+      born.delete(key); count--;
+    };
+    for (let i = 0; i < REQUESTS; i++) {
+      let key: number;
+      if (scan && i >= SCAN_START && i < SCAN_END && i % 2 === 0) key = SCAN_BASE + (i - SCAN_START) / 2;
+      else if (next() % 100 < HOT_PCT) key = (shift && i >= SHIFT_AT ? SHIFT_BASE : 0) + Math.min(next() % HOT, next() % HOT);
+      else key = COLD_BASE + (next() % COLD);
+      const regular = key < SCAN_BASE;
+      const phase = i < SCAN_START ? 0 : i < SCAN_END ? 1 : i < SHIFT_AT ? 2 : 3;
+      const blk = Math.floor(i / BLOCK);
+      let found = lfu ? freq.has(key) : order.has(key);
+      if (found && ttl > 0 && i - born.get(key)! >= ttl) { expired++; remove(key); found = false; }
+      if (regular) { asked[phase]++; blockAsked[blk]++; }
+      if (found) {
+        if (regular) { hits[phase]++; blockHits[blk]++; }
+        if (lfu) {
+          const f = freq.get(key)!, b = buckets.get(f)!;
+          b.delete(key);
+          if (b.size === 0) { buckets.delete(f); if (minFreq === f) minFreq = f + 1; }
+          freq.set(key, f + 1); bucket(f + 1).set(key, true);
+        } else if (policy === 'lru') { order.delete(key); order.set(key, true); }
+        continue;
+      }
+      dbReads++;
+      if (policy === 'none') {
+        if (count >= MEMORY_LIMIT) { order.clear(); born.clear(); count = 0; restarts++; }
+      } else if (count >= size) {
+        while (lfu && !buckets.has(minFreq)) minFreq++;
+        remove(lfu ? oldest(buckets.get(minFreq)!) : oldest(order));
+        evictions++;
+      }
+      if (lfu) { freq.set(key, 1); bucket(1).set(key, true); minFreq = 1; } else order.set(key, true);
+      born.set(key, i); count++; peak = Math.max(peak, count);
+    }
+    const pct = (h: number, a: number) => (a === 0 ? 0 : Math.floor((h * 100) / a));
+    return {
+      all: pct(hits.reduce((s, v) => s + v, 0), asked.reduce((s, v) => s + v, 0)),
+      before: pct(hits[0], asked[0]), during: pct(hits[1], asked[1]), last: pct(hits[3], asked[3]),
+      dbReads, evictions, expired, count, peak, restarts,
+      blocks: blockHits.map((h, b) => pct(h, blockAsked[b])),
+    };
+  }
+
+  document.querySelectorAll<HTMLElement>('[data-lcb]').forEach((root) => {
+    const q = query(root);
+    const chartEl = q('[data-chart]');
+    const cols = Array.from({ length: REQUESTS / BLOCK }, (_, b) => {
+      const c = document.createElement('span'); c.className = 'lcb-col';
+      if (b * BLOCK >= SCAN_START && (b + 1) * BLOCK <= SCAN_END) c.classList.add('scan');
+      if (b * BLOCK === SHIFT_AT) c.classList.add('shift');
+      const bar = document.createElement('span'); bar.className = 'lcb-bar';
+      c.appendChild(bar); chartEl.appendChild(c); return { c, bar };
+    });
+    const input = (name: string) => q<HTMLInputElement | HTMLSelectElement>(`[data-${name}]`);
+    const box = (n: number, colour: string) => q<HTMLElement>(`[data-b${n}]`).style.setProperty('--c', colour);
+    const colourFor = (p: number) => (p >= TARGET ? 'var(--good)' : p >= 50 ? 'var(--role-3)' : 'var(--bad)');
+    function draw() {
+      const policy = input('policy').value as Policy, size = Number(input('size').value), ttl = Number(input('ttl').value);
+      const scan = q<HTMLInputElement>('[data-scan]').checked, shift = q<HTMLInputElement>('[data-shift]').checked;
+      const r = simulate(policy, size, scan, shift, ttl);
+      q('[data-o1]').textContent = `${r.all}%`;
+      q('[data-n1]').textContent = `of regular requests are answered from memory (the target is ${TARGET}%)`;
+      box(1, colourFor(r.all));
+      q('[data-o2]').textContent = `${r.during}%`;
+      q('[data-n2]').textContent = scan ? `before the scan: ${r.before}%; the report read 20,000 old keys once` : `no scan in this run; before 80,000 requests: ${r.before}%`;
+      box(2, colourFor(r.during));
+      q('[data-o3]').textContent = `${r.last}%`;
+      q('[data-n3]').textContent = shift ? 'the hot set moved to 1,000 other keys at 140,000 requests' : 'the hot set did not move';
+      box(3, colourFor(r.last));
+      q('[data-o4]').textContent = `${formatThousands(r.dbReads)} of ${formatThousands(REQUESTS)}`;
+      q('[data-n4]').textContent = `${formatThousands(r.evictions)} evictions, ${formatThousands(r.expired)} entries expired`;
+      box(4, r.dbReads <= (REQUESTS * (100 - TARGET)) / 100 + (scan ? (SCAN_END - SCAN_START) / 2 : 0) ? 'var(--good)' : 'var(--role-3)');
+      if (policy === 'none') {
+        q('[data-o5]').textContent = `${formatThousands(r.peak)} entries, killed ${r.restarts} times`;
+        q('[data-n5]').textContent = `no size limit; the process is killed at ${formatThousands(MEMORY_LIMIT)} entries and starts again with an empty cache`;
+        box(5, 'var(--bad)');
+      } else {
+        q('[data-o5]').textContent = `${formatThousands(r.peak)} entries at most`;
+        q('[data-n5]').textContent = 'never more than the cache size, so no restarts';
+        box(5, 'var(--good)');
+      }
+      r.blocks.forEach((p, i) => {
+        cols[i].bar.style.height = `${Math.max(2, p)}%`;
+        cols[i].bar.style.setProperty('--c', colourFor(p));
+        cols[i].c.title = `requests ${formatThousands(i * BLOCK)} to ${formatThousands((i + 1) * BLOCK - 1)}: ${p}% hit rate`;
+      });
+      const v = q('[data-verdict]');
+      const worst = Math.min(r.all, scan ? r.during : 100, r.last);
+      v.classList.toggle('bad', policy === 'none' || worst < TARGET);
+      v.textContent = policy === 'none' ? 'The hit rate is fine, but the cache has no limit, so the process keeps being killed and every restart is a cold start.'
+        : shift && policy === 'lfu' && r.last < TARGET ? 'The new popular keys cannot get in: the old favourites hold the cache with high counts, and the hit rate stays low.'
+        : scan && r.during < TARGET ? 'The scan is pushing the hot keys out: real requests miss more while the report runs.'
+        : ttl > 0 && r.all < TARGET ? 'Entries expire while they are still right, so the hit rate falls without any eviction pressure.'
+        : r.all < TARGET ? 'The cache is too small or its policy keeps the wrong entries: the database sees more than it can take.'
+        : 'Bounded memory and at least 80% of requests answered from the cache, in every stretch.';
+    }
+    root.addEventListener('input', draw);
+    root.addEventListener('change', draw);
+    q('[data-reset]').addEventListener('click', () => {
+      Object.entries(DEFAULTS).forEach(([k, v]) => { input(k).value = v; });
+      q<HTMLInputElement>('[data-scan]').checked = false;
+      q<HTMLInputElement>('[data-shift]').checked = false;
+      draw();
+    });
+    draw();
+  });
+</script>
+<style is:global>
+  .playground .lcb-check { display: inline-flex; gap: 6px; align-items: center; }
+  .playground .lcb-chart { display: grid; grid-template-columns: repeat(20, 1fr); gap: 3px; height: 120px; align-items: end; }
+  .playground .lcb-col { position: relative; height: 100%; border-radius: 2px; }
+  .playground .lcb-col.scan { background: color-mix(in srgb, var(--border) 60%, transparent); }
+  .playground .lcb-col.shift { box-shadow: -2px 0 0 0 var(--text); }
+  .playground .lcb-bar { position: absolute; left: 0; right: 0; bottom: 0; background: var(--c); border-radius: 2px 2px 0 0; opacity: .85; }
+</style>

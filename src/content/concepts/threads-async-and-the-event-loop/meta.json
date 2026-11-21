@@ -1,0 +1,95 @@
+{
+  "name": "Threads, Async and the Event Loop",
+  "area": "concurrency",
+  "difficulty": "intermediate",
+  "intent": "Understand how one thread can serve many tasks by switching at await points, why that removes some races but not all, and why one slow piece of CPU work freezes everything queued behind it.",
+  "scenario": "A server handles 8 requests. Each waits 5 ticks for I/O (a database or network call) and then needs CPU time, and a tiny health-check ping arrives at tick 6. We compare a loop that blocks on I/O, one that awaits it, one that slices its CPU work, and one that sends the CPU work to 2 worker threads. A second case has four handlers that read a shared counter, await, and write it back.",
+  "problem": "Async code looks like it runs everything at once, and teams assume it is both fast and race-free. It is neither by magic. One thread runs one piece of code at a time, so a handler that does 40 ticks of CPU work stalls every other task, including health checks. And code that reads shared state, awaits, then writes, still loses updates, because other tasks run during the await.",
+  "howItWorks": [
+    { "title": "One thread, a queue of ready tasks", "text": "An event loop runs on one thread and takes ready tasks from a queue, one at a time. A task runs until it finishes or reaches an await. Nothing interrupts it in between, which is why plain code between two awaits cannot be mixed with another task's code." },
+    { "title": "An await hands the thread back", "text": "At an await the task says 'wake me when this I/O is done' and leaves. The loop runs other ready tasks meanwhile. The waiting is done by the operating system or the network, not by your thread, so thousands of waiting tasks cost almost nothing. That is why async suits I/O-bound work: the waits overlap." },
+    { "title": "Races survive across an await", "text": "Because other tasks run while one awaits, a read before the await can be stale by the time the write after it runs. Four handlers that each read 0, await, and write 1 leave the counter at 1, with one thread and no data race on any single step. Keep the read and the write together, with no await between, or use an async lock." },
+    { "title": "CPU work blocks the loop", "text": "A task doing calculation never reaches an await, so the loop cannot run anything else until it finishes. In the model, 8 requests of 40 ticks of CPU each make a ping wait 320 ticks. Synchronous I/O has the same effect: a blocking call inside the loop holds the thread for the whole wait, so 8 requests take 57 ticks instead of 22." },
+    { "title": "Move CPU work off the loop, or slice it", "text": "Send CPU-heavy work to worker threads or processes (a thread pool, Node worker threads, a process pool) so the loop stays free: in the model the ping waits 1 tick. Or cut the work into slices that yield between pieces, which keeps the loop responsive at the cost of making each request finish later. The right tool depends on whether the work is I/O-bound (await it) or CPU-bound (parallelise it)." }
+  ],
+  "pros": [
+    "Thousands of tasks waiting on I/O cost little, because waiting does not occupy a thread",
+    "Code between awaits is never interrupted by another task, so many races cannot happen",
+    "One thread is easier to reason about than shared-memory threads with locks",
+    "Awaited I/O overlaps: 8 requests with 5 ticks of I/O finish in 22 ticks, not 57"
+  ],
+  "cons": [
+    "One slow or CPU-heavy task delays every other task, so latency for all rises together",
+    "A single thread uses a single core: CPU-bound work needs workers or more processes to use the machine",
+    "Races across await points are real and easy to miss, because the code looks sequential",
+    "Slicing CPU work keeps the loop responsive but makes each request finish later"
+  ],
+  "whenToUse": [
+    "Servers that mostly wait on databases, caches and other services, where waits can overlap",
+    "Many connections that are idle most of the time (chat, streaming, proxies)",
+    "Interfaces and UIs, where one thread must stay free to respond"
+  ],
+  "whenNotToUse": [
+    "Heavy computation (image processing, large parsing, encryption in bulk) on the loop: use workers or processes",
+    "Libraries that block (a synchronous database driver, a blocking file read) inside async code",
+    "Work that really must use many cores at once, unless you add worker threads or processes"
+  ],
+  "pitfalls": [
+    "Calling a blocking function inside an async handler: it freezes the whole loop, not just that request",
+    "Reading shared state, awaiting, then writing it back: the await is the gap where another task changes the value",
+    "Assuming async means parallel: awaited I/O overlaps, but your own code still runs one task at a time on a loop thread",
+    "Running a CPU loop with no await and wondering why timers, health checks and other requests are late",
+    "Believing a single thread is safe from all races: it is safe between awaits only",
+    "Offloading to threads in a runtime where they do not help: in Python, threads typically do not speed up CPU-bound pure-Python code, so use processes there; in C#, code after an await may resume on a different thread, so async there can run in parallel"
+  ],
+  "related": [
+    { "kind": "concept", "slug": "race-conditions-and-atomicity" },
+    { "kind": "concept", "slug": "latency-and-round-trips" },
+    { "kind": "concept", "slug": "timeouts-and-deadlines" },
+    { "kind": "concept", "slug": "profiling-and-flame-graphs" },
+    { "kind": "concept", "slug": "queueing-theory-and-littles-law" },
+    { "kind": "concept", "slug": "real-time-communication" }
+  ],
+  "roles": [
+    { "id": "loop", "label": "Event loop", "description": "The single thread that runs ready tasks one at a time." },
+    { "id": "taskA", "label": "Handler A", "description": "A request handler that reads, awaits I/O, then writes." },
+    { "id": "taskB", "label": "Handler B", "description": "Another handler running the same code." },
+    { "id": "io", "label": "I/O", "description": "The database or network call that completes outside the loop thread." },
+    { "id": "worker", "label": "Worker thread", "description": "Runs CPU-heavy work so the loop stays free." }
+  ],
+  "quiz": [
+    {
+      "question": "Four async handlers each read a shared counter, await a database call, and write back counter + 1. There is one thread, yet the counter ends at 1. Why?",
+      "options": [
+        "The runtime secretly runs each handler on its own thread, so the writes collide.",
+        "Awaiting makes the runtime discard the first three results to save memory.",
+        "Counters in single-threaded runtimes can only hold the value of the last handler to start.",
+        "Each handler read 0 before any wrote, because the others ran while it waited at the await."
+      ],
+      "answer": 3,
+      "explanation": "The loop runs other tasks while one awaits. All four read 0, all four wait, and each then writes 1. Moving the await before the read, or holding an async lock around the whole read-await-write, fixes it."
+    },
+    {
+      "question": "A handler in an async server does 40 ticks of CPU work with no await. What happens to a health check that arrives meanwhile?",
+      "options": [
+        "It runs at once on a spare thread, because async servers always have spare threads.",
+        "It waits until the handler finishes, because the loop thread cannot run anything else.",
+        "It is dropped, because the loop rejects new work while a task is running.",
+        "It interrupts the handler, because the loop gives shorter tasks priority."
+      ],
+      "answer": 1,
+      "explanation": "The loop switches tasks only at awaits. A task that never awaits holds the thread until it is done, and every queued task waits, however small. Moving the CPU work to a worker, or cutting it into slices, frees the loop."
+    },
+    {
+      "question": "A team makes a CPU-heavy handler async by adding the async keyword and awaiting its steps, but the work is still computed in the handler. What does it change?",
+      "options": [
+        "It runs the calculation on several cores at once, so it is faster.",
+        "It frees the loop during the calculation, so other requests are served.",
+        "Nothing for the calculation itself: it still holds the loop thread, and only real waits are overlapped.",
+        "It moves the calculation to the operating system, which finishes it sooner."
+      ],
+      "answer": 2,
+      "explanation": "Async overlaps waiting, not computing. A calculation that never waits on anything keeps the thread for its whole length. To use other cores or free the loop, the work must go to a worker thread or a process."
+    }
+  ]
+}

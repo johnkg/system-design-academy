@@ -1,0 +1,209 @@
+{
+  "name": "Design a Monolith-to-Services Migration",
+  "difficulty": "advanced",
+  "intent": "Move the orders part of a 10-year-old monolith into its own service without a freeze, a big-bang weekend or lost data, with a way back at every step and an end date for the old code.",
+  "prompt": "A 10-year-old e-commerce monolith serves about 3,000 requests a second at peak from one shared database of roughly 400 tables. About 15% of the traffic is orders: placing them, changing them, tracking them. Forty engineers work in the same codebase and a release takes a week of coordination. A rewrite is already 14 months late. The company wants orders to be a separate service owned by one team, with its own database, within about 6 months, while the shop keeps taking money every minute. Legacy reports and a billing job still read the order tables directly. Design the migration, not the final service.",
+  "codeTitle": "routing a share of customers to a new service, and four ways to keep two databases in step",
+  "finalIntro": "One customer's address change, while half of all customers are already on the new orders service.",
+  "functional": [
+    "Route each customer's order requests to either the monolith or the new orders service, and change that share without a deploy",
+    "Keep the monolith and the new service showing the same order data while both are live",
+    "Compare the new service's answers with the monolith's before real customers depend on them",
+    "Send any share of customers back to the monolith at any point",
+    "Remove the old code path, tables and routes when the move is complete"
+  ],
+  "nonFunctional": [
+    "No planned downtime and no write freeze at any point of the migration",
+    "At most 1 in 1,000 reads returns data older than the customer's last update during the move",
+    "Rollback to the monolith at any step takes under 5 minutes and loses no accepted update",
+    "The teams release independently: no schema change needs both of them to ship together",
+    "Every step ships to production on its own, so the migration never sits for months on a branch"
+  ],
+  "firstAttempt": {
+    "text": "A new orders system is written from scratch on a branch, with its own database, while the monolith keeps changing. When it is feature-complete, a weekend is declared: orders are exported from the old database, imported into the new one, and all traffic is switched over at once.",
+    "limits": [
+      "The monolith keeps changing for 14 months, so the rewrite chases a target that moves and is never finished",
+      "Nothing is tested against real traffic until the weekend, so every surprise is found by customers",
+      "The export and import needs a write freeze, and any update made after the export is lost if there is a rollback",
+      "Legacy reports and the billing job read the old tables directly and break the moment the data moves",
+      "There is one all-or-nothing switch, so one defect blocks everything and the way back is a second weekend"
+    ]
+  },
+  "nodes": [
+    { "id": "users", "label": "Customers", "kind": "client", "x": 10, "y": 50 },
+    { "id": "legacy", "label": "Legacy reports and billing", "kind": "client", "x": 10, "y": 85 },
+    { "id": "bigbang", "label": "One big cutover weekend", "kind": "edge", "x": 32, "y": 50, "at": 0, "until": 2 },
+    { "id": "router", "label": "Strangler router", "kind": "edge", "x": 32, "y": 50, "at": 2 },
+    { "id": "mono", "label": "Monolith", "kind": "compute", "x": 58, "y": 80 },
+    { "id": "shared", "label": "Monolith database", "kind": "data", "x": 86, "y": 80 },
+    { "id": "rewrite", "label": "Rewrite built on a branch", "kind": "compute", "x": 58, "y": 20, "at": 0, "until": 1 },
+    { "id": "seam", "label": "Orders module behind an interface", "kind": "compute", "x": 58, "y": 50, "at": 1, "until": 6 },
+    { "id": "orders", "label": "Orders service", "kind": "compute", "x": 58, "y": 20, "at": 3 },
+    { "id": "ordersdb", "label": "Orders database", "kind": "data", "x": 86, "y": 20, "at": 3 },
+    { "id": "outbox", "label": "Outbox and change stream", "kind": "async", "x": 86, "y": 50, "at": 4 },
+    { "id": "parity", "label": "Parity checker and shadow traffic", "kind": "compute", "x": 32, "y": 20, "at": 5 }
+  ],
+  "edges": [
+    { "from": "users", "to": "bigbang", "at": 0, "until": 2 },
+    { "from": "bigbang", "to": "mono", "at": 0, "until": 2 },
+    { "from": "bigbang", "to": "rewrite", "at": 0, "until": 1 },
+    { "from": "mono", "to": "shared", "at": 0 },
+    { "from": "legacy", "to": "shared", "at": 0, "until": 6 },
+    { "from": "mono", "to": "seam", "at": 1, "until": 6 },
+    { "from": "seam", "to": "shared", "at": 1, "until": 6 },
+    { "from": "users", "to": "router", "at": 2 },
+    { "from": "router", "to": "mono", "at": 2 },
+    { "from": "router", "to": "orders", "at": 3 },
+    { "from": "orders", "to": "ordersdb", "at": 3 },
+    { "from": "orders", "to": "mono", "at": 3 },
+    { "from": "orders", "to": "outbox", "at": 4 },
+    { "from": "mono", "to": "outbox", "at": 4, "until": 6 },
+    { "from": "outbox", "to": "ordersdb", "at": 4 },
+    { "from": "outbox", "to": "shared", "at": 4, "until": 6 },
+    { "from": "router", "to": "parity", "at": 5 },
+    { "from": "parity", "to": "ordersdb", "at": 5 },
+    { "from": "parity", "to": "shared", "at": 5, "until": 6 },
+    { "from": "legacy", "to": "orders", "at": 6 }
+  ],
+  "steps": [
+    {
+      "title": "Find the seams and put the orders code behind an interface",
+      "problem": "Orders code is spread through the monolith: other modules join the order tables in their own queries, call each other's internals and share helper classes. There is no line to cut along, so any extraction starts by guessing, and the guess breaks something far away.",
+      "fix": "Work inside the monolith first. List who reads and writes the order tables, then move every access behind one orders interface (create, update, get, list) in the same codebase. Replace cross-module joins with calls to that interface, and add a check to the build that fails when a module reaches into the order tables directly. Nothing runs anywhere new yet; each change ships on its own like any other.",
+      "tradeoff": "This is the cheapest and most useful step, and it pays off even if the migration stops here. It is also the least visible: it takes weeks of work that adds no feature, and the joins it removes may cost some speed.",
+      "concepts": [{ "slug": "coupling-and-cohesion" }, { "slug": "separation-of-concerns-and-layering" }, { "slug": "dry-and-the-wrong-abstraction" }]
+    },
+    {
+      "title": "Strangle: put a router in front and move traffic a slice at a time",
+      "problem": "Even with a clean interface, switching all customers at once is still one big bang, and the new code has never seen real requests.",
+      "fix": "Put a routing layer in front of the monolith. At first it sends everything to the monolith. It then chooses the destination per customer, by a stable hash of the customer id, so the same customer always lands on the same side, and the share is a setting that can be changed in seconds without a deploy. Start at 0%, then 1%, 10%, 50% and 100%, and begin with staff accounts and customers who agreed to try new features.",
+      "tradeoff": "Any slice of traffic can be moved, and moved back, in seconds. The router is a new component that every request crosses, so it must be simple, fast and highly available, and the routing rules need an owner and an end date.",
+      "concepts": [{ "slug": "feature-flags" }, { "slug": "canary-deployments" }, { "slug": "api-gateway" }, { "slug": "proxies" }]
+    },
+    {
+      "title": "Extract one service with its own data, not a shared database",
+      "problem": "A new service that still reads and writes the monolith's tables is only a second program on the same database. Every schema change needs both teams, a slow query from one side stalls the other, and the two cannot be released or scaled apart. That is a distributed monolith: the cost of distribution without the benefit.",
+      "fix": "Build the orders service on top of the orders interface, with its own database that only it can read or write. Anything else it needs, such as the customer's name, it asks the owner for through an API or keeps a small local copy of. Other modules and the legacy reports are told to use the orders API or the change stream, not the tables. Data is moved with a one-time backfill while the service is still off the live path.",
+      "tradeoff": "The service can now change its schema and release on its own. Data is now in two places, joins across them are gone, and every call that used to be a function call is a network call that can fail or be slow.",
+      "concepts": [{ "slug": "database-sharding" }, { "slug": "schema-evolution-and-compatibility" }, { "slug": "timeouts-and-deadlines" }, { "slug": "circuit-breaker" }]
+    },
+    {
+      "title": "Keep both databases in step: an outbox, not dual writes",
+      "problem": "While customers are split between the two sides, an order changed on one side must be visible on the other: the legacy reports read the old tables, and a rollback needs the old database to have everything. Writing to both databases from the app looks easy, but the second write can fail, and the two databases then differ for good without anyone knowing, since there is no transaction across them.",
+      "fix": "Write each change and an event describing it in the same local transaction (a transactional outbox). A relay reads the outbox and applies the event to the other side, retrying until it succeeds, and a version number on every row makes a repeated or late event harmless. The sync works in both directions, so the monolith's updates reach the new database and the new service's reach the old one.",
+      "tradeoff": "Nothing is lost when a copy fails, and a short delay is the only inconsistency. That delay means a read on the other side can briefly be stale, which the legacy reports must accept, and the relay is one more thing to run and monitor.",
+      "concepts": [{ "slug": "transactional-outbox" }, { "slug": "idempotency" }, { "slug": "delivery-guarantees" }, { "slug": "consistency-models" }, { "slug": "two-phase-commit" }]
+    },
+    {
+      "title": "Prove it: shadow traffic, parity checks and a rollback drill",
+      "problem": "Even with a sync in place, nobody knows whether the new service gives the same answers as the monolith: ten years of unwritten rules, such as rounding, discounts, time zones and odd statuses, live in the old code. Customers would find the differences, the hard way.",
+      "fix": "Before a customer depends on the service, copy their reads to it as shadow traffic and compare its answer with the monolith's, logging every difference and ignoring the shadow answer. Run a parity job that compares the two databases on a schedule, reports the mismatch rate and repairs rows by version. Raise the live share only while the mismatch rate stays under the target, and practise the rollback (set the share to 0%) before it is needed.",
+      "tradeoff": "Differences are found while they are cheap to fix, and each step up has a number behind it. Shadow traffic adds load on the new service, and some differences are old bugs that customers rely on, so someone must decide which side is right.",
+      "concepts": [{ "slug": "reconciliation-and-settlement" }, { "slug": "red-use-and-golden-signals" }, { "slug": "distributed-tracing" }, { "slug": "blue-green-and-rolling-deployments" }]
+    },
+    {
+      "title": "Retire the old path: finish the job and delete the code",
+      "problem": "A migration that stops at 100% leaves the old order code, the copy-back sync and the routing rules running for years. Each is a cost and a risk, and the next engineer cannot tell which side is the real one.",
+      "fix": "When the live share has been at 100% with parity clean for a full business cycle, such as a month-end close, move the legacy reports and billing to the orders API or the change stream, stop the copy back to the old database, remove the orders module and its routes from the monolith, and archive the old order tables after a retention period. Turn the router rule into a plain route and delete the flag.",
+      "tradeoff": "The monolith is smaller, the orders team owns its code and data, and the way back is now a restore from an archive rather than a switch, so the step is taken only when the numbers justify it. It also needs a decision and an owner, or it quietly never happens.",
+      "concepts": [{ "slug": "api-versioning" }, { "slug": "old-app-versions-and-api-compatibility" }, { "slug": "online-schema-migrations" }, { "slug": "backups-and-point-in-time-recovery" }]
+    }
+  ],
+  "failures": [
+    {
+      "scenario": "The relay between the databases stops for an hour",
+      "impact": "Updates made on one side do not reach the other, so legacy reports show old orders and a rollback during that hour would lose updates.",
+      "answer": "Updates stay in the outbox table and nothing is lost. An alert fires when the oldest unsent event is more than a minute old. When the relay restarts, it applies the backlog in order and the row versions make any repeated event harmless. The router is told not to raise the share while the lag is high, and the routing share is not moved back unless the new service is itself unhealthy.",
+      "concepts": [{ "slug": "transactional-outbox" }, { "slug": "alerting" }]
+    },
+    {
+      "scenario": "Shadow traffic shows the new service returns a different order total for 0.4% of orders",
+      "impact": "Going live would charge or display the wrong amount to about 1 order in 250, and nobody knows which side is right.",
+      "answer": "Each difference is logged with both answers and the request, and a person decides which is right. Often it is rounding of money or a discount rule that only the old code applied. The fix goes into the new service and the same traffic is replayed. The share stays where it is until the mismatch rate is under the target for a full cycle.",
+      "concepts": [{ "slug": "money-representation-and-rounding" }, { "slug": "reconciliation-and-settlement" }]
+    },
+    {
+      "scenario": "The new service falls over at 50% of traffic",
+      "impact": "Half of all customers get errors when they try to see or change an order.",
+      "answer": "The router drops the share to 0% in seconds, which does not need a deploy. Because the databases were kept in step, the monolith has every update and nothing is lost. A circuit breaker in the router can also fail over by itself to the monolith when the error rate passes a threshold. The cause is fixed, and the share is raised again from 1%.",
+      "concepts": [{ "slug": "feature-flags" }, { "slug": "circuit-breaker" }, { "slug": "graceful-degradation" }]
+    },
+    {
+      "scenario": "A team asks to read the order tables directly 'just for now' because the API lacks one field",
+      "impact": "The next schema change in the orders database breaks their code, and the two teams are tied together again.",
+      "answer": "The missing field is added to the API or the change stream, which is a day's work. The orders database accepts no outside logins other than its own service and the sync, so a direct read is not possible. Exceptions without an end date are how a distributed monolith is built, and the migration's definition of done includes no direct access.",
+      "concepts": [{ "slug": "coupling-and-cohesion" }, { "slug": "secrets-management" }]
+    }
+  ],
+  "alternatives": [
+    {
+      "title": "How to move the code",
+      "options": [
+        { "name": "Big-bang rewrite", "pro": "A clean design, with no compromises for old code", "con": "Years without feedback, a moving target, and one risky switch" },
+        { "name": "Strangler: route a slice at a time", "pro": "Every step ships and can be undone, and learning starts on day one", "con": "A long period with two systems, and a router to run" },
+        { "name": "Make the monolith modular and stop there", "pro": "Most of the benefit for much less risk", "con": "Everything still deploys, scales and fails together" }
+      ],
+      "pick": "Make the monolith modular first, then strangle one slice at a time where independent release or scaling is worth the cost."
+    },
+    {
+      "title": "How to keep two databases in step",
+      "options": [
+        { "name": "Share one database for now", "pro": "No copying and no drift", "con": "Schema and performance coupling, so the teams cannot change or fail alone" },
+        { "name": "Dual writes from the application", "pro": "Simple to write and almost no delay", "con": "A failed second write leaves them different for good, silently" },
+        { "name": "Outbox with a relay and version numbers", "pro": "No lost updates, and repeats are harmless", "con": "A short delay, and a relay to run" }
+      ],
+      "pick": "Use an outbox for each side and put a version on every row, with a parity job to catch what is left."
+    },
+    {
+      "title": "How to decide the new service is ready",
+      "options": [
+        { "name": "Tests and a staging environment", "pro": "Cheap and quick", "con": "Cannot contain the odd data and traffic that ten years of customers produce" },
+        { "name": "Shadow traffic and a parity report", "pro": "Compares real requests with the real answer, with no customer exposed", "con": "Extra load, and differences need a judgement" },
+        { "name": "Straight to a small live share", "pro": "A real test with real customers", "con": "The first customers are the test, and wrong data is visible to them" }
+      ],
+      "pick": "Shadow first, then a small live share, and raise it only while the mismatch rate is under the target."
+    }
+  ],
+  "roles": [
+    { "id": "client", "label": "Customers and legacy readers", "description": "Customers placing orders, and the reports and billing job that still read order data." },
+    { "id": "edge", "label": "The router", "description": "The strangler router that chooses, per customer, which side serves a request." },
+    { "id": "async", "label": "The change stream", "description": "The outbox and relay that keep the two databases in step." },
+    { "id": "compute", "label": "Code on both sides", "description": "The monolith, its orders module, the new orders service and the parity checker." },
+    { "id": "data", "label": "The two databases", "description": "The monolith's database and the orders service's own database." }
+  ],
+  "quiz": [
+    {
+      "question": "The new orders service has been live for a month, but it still reads and writes the monolith's order tables 'until the data is migrated'. What is the main risk?",
+      "options": [
+        "The service will be slower than the monolith because it makes network calls.",
+        "Each team's schema change or slow query can break the other, so they cannot release alone.",
+        "The monolith database will run out of space, because the service stores copies of every order.",
+        "Customers will see two different order histories, one for each system."
+      ],
+      "answer": 1,
+      "explanation": "With a shared database the two programs are coupled through the tables, so it is a distributed monolith: no wrong data, but no independence either. Speed, space and two histories are not the issue, because there is only one set of tables."
+    },
+    {
+      "question": "An app writes an order to the new database and then to the old one. The second write fails on 1 in 10 orders. What does the team see?",
+      "options": [
+        "Nothing, until customers or reports show orders that differ; the two databases differ for good.",
+        "An error for the customer, because the first write is rolled back automatically.",
+        "A retry by the database, which copies the missing orders by itself within minutes.",
+        "A slowdown, since failed writes are put back on a queue and retried one by one."
+      ],
+      "answer": 0,
+      "explanation": "There is no transaction across two databases, so a failed second write leaves the first in place, and unless something compares them nobody is told. An outbox keeps the event until it is applied, and a parity check finds what is left."
+    },
+    {
+      "question": "A rollback at 50% of traffic is needed. Which setup loses no accepted order?",
+      "options": [
+        "The new service owns its database and the monolith will import it later.",
+        "Routing based on a random choice per request, so that no customer is stuck.",
+        "Nothing needs to be done: the monolith's code is still there, so it has the data.",
+        "Both databases kept in step by an outbox, so the monolith already has every update."
+      ],
+      "answer": 3,
+      "explanation": "Going back only helps if the old side has the new side's updates. A sync that retries until applied gives it those, with at most a short delay. Having the old code is not the same as having the data, and a later import still needs a freeze."
+    }
+  ]
+}
