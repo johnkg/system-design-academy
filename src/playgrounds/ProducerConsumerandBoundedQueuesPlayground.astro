@@ -1,0 +1,124 @@
+---
+import PlaygroundShell from '../components/PlaygroundShell.astro';
+---
+<PlaygroundShell title="Simulate it" hint="One producer feeds 3 consumers through a queue, in ticks (no real threads or clock). The producer offers items for 60 ticks. Each consumer needs 2 ticks per item, so together they take 1.5 items per tick. The bars show how many items sit in the queue at each tick.">
+  <ol class="how">
+    <li>Set <b>Producer rate</b> to <b>1 item per tick</b> with an <b>Unbounded</b> queue: the consumers keep up, the queue never holds more than <b>1</b> item and the run ends at tick <b>63</b>. Now set <b>Producer rate</b> to <b>2 items per tick</b>, more than the consumers can take: the unbounded queue grows to <b>31</b> items, the longest wait is <b>21</b> ticks, and the run ends at tick <b>83</b>.</li>
+    <li>Set <b>Queue limit</b> to <b>10</b>. With <b>When full</b> set to <b>Block the producer</b>, the queue stops at <b>10</b>, the longest wait falls to <b>7</b> ticks, nothing is lost, and the producer is held up for <b>28</b> ticks. Switch to <b>Drop the newest item</b>: <b>21</b> items are lost and the first is item <b>37</b>. With <b>Drop the oldest item</b> the same <b>21</b> are lost, but the first is item <b>27</b>.</li>
+    <li>Set <b>Queue limit</b> to <b>1</b> and <b>When full</b> to <b>Block the producer</b>: a bound that is too small starves the consumers, who then take only 1 item per tick, and the run ends at tick <b>123</b> instead of <b>83</b>.</li>
+    <li>Set <b>Queue limit</b> back to <b>10</b>, <b>Block the producer</b>, and tick <b>Failed items go back on the same queue</b>: every 4th item fails once and its consumer puts it back. The pipeline <b>deadlocks at tick 28</b> with <b>21</b> items done: the consumers all wait for room in a full queue that only they can empty. With <b>Drop the newest item</b> instead, it finishes but loses <b>47</b> items.</li>
+  </ol>
+  <div class="pg pc" data-pc>
+    <div class="pg-row">
+      <label>Producer rate <select class="pg-in" data-rate><option value="1">1 item per tick</option><option value="2" selected>2 items per tick</option></select></label>
+      <label>Queue limit <select class="pg-in" data-bound><option value="0" selected>Unbounded</option><option value="1">1</option><option value="10">10</option></select></label>
+      <label>When full <select class="pg-in" data-policy><option value="block" selected>Block the producer</option><option value="dropNew">Drop the newest item</option><option value="dropOld">Drop the oldest item</option></select></label>
+      <label><input type="checkbox" data-retry /> Failed items go back on the same queue</label>
+    </div>
+    <div class="pg-grid">
+      <div class="pg-box" data-b1><h3>Items processed</h3><span class="pg-mono" data-o1></span><span class="pg-note" data-n1></span></div>
+      <div class="pg-box" data-b2><h3>Items lost</h3><span class="pg-mono" data-o2></span><span class="pg-note" data-n2></span></div>
+      <div class="pg-box" data-b3><h3>High-water mark</h3><span class="pg-mono" data-o3></span><span class="pg-note" data-n3></span></div>
+      <div class="pg-box" data-b4><h3>Longest wait in the queue</h3><span class="pg-mono" data-o4></span><span class="pg-note" data-n4></span></div>
+      <div class="pg-box" data-b5><h3>Run ended</h3><span class="pg-mono" data-o5></span><span class="pg-note" data-n5></span></div>
+      <div class="pg-box" data-b6><h3>Producer held up</h3><span class="pg-mono" data-o6></span><span class="pg-note" data-n6></span></div>
+    </div>
+    <div class="pg-box" style="--c: var(--border)">
+      <h3>Items in the queue, tick by tick</h3>
+      <div class="pc-chart" data-chart role="img" aria-label="Queue length at each tick"></div>
+      <span class="pg-note" data-chartnote></span>
+    </div>
+  </div>
+</PlaygroundShell>
+<script>
+  import { query } from '../playground';
+  const TICKS = 60, CONSUMERS = 3, SERVICE = 2;
+  interface Item { id: number; enq: number; failed: boolean }
+  interface Cons { state: string; rem: number; item: Item | null }
+
+  // The same model as the code samples, with the queue length recorded at every tick for the chart.
+  function simulate(rate: number, bound: number, policy: string, retry: boolean) {
+    const total = rate * TICKS;
+    const queue: Item[] = [];
+    const cons: Cons[] = Array.from({ length: CONSUMERS }, () => ({ state: 'idle', rem: 0, item: null }));
+    const series: number[] = [];
+    let firstLost = -1, produced = 0, processed = 0, lost = 0, peak = 0, maxWait = 0, blocked = 0, ticks = 0, deadlock = false;
+    const full = () => bound > 0 && queue.length >= bound;
+    const offer = (item: Item, t: number): boolean => {
+      if (!full()) { item.enq = t; queue.push(item); return true; }
+      if (policy === 'block') return false;
+      if (policy === 'dropNew') { lost++; if (firstLost < 0) firstLost = item.id; return true; }
+      const old = queue.shift()!; lost++; if (firstLost < 0) firstLost = old.id; item.enq = t; queue.push(item); return true;
+    };
+    for (let t = 0; t < 3000; t++) {
+      for (const c of cons) {
+        if (c.state === 'busy' && --c.rem === 0) {
+          if (retry && c.item!.id % 4 === 3 && !c.item!.failed) { c.item!.failed = true; c.state = 'putting'; }
+          else { processed++; c.state = 'idle'; c.item = null; }
+        }
+      }
+      for (const c of cons) if (c.state === 'putting' && offer(c.item!, t)) { c.state = 'idle'; c.item = null; }
+      for (const c of cons) {
+        if (c.state === 'idle' && queue.length > 0) {
+          c.item = queue.shift()!; c.state = 'busy'; c.rem = SERVICE;
+          if (t - c.item.enq > maxWait) maxWait = t - c.item.enq;
+        }
+      }
+      for (let k = 0; k < rate && produced < total; k++) {
+        if (offer({ id: produced, enq: t, failed: false }, t)) produced++; else { blocked++; break; }
+      }
+      if (queue.length > peak) peak = queue.length;
+      series.push(queue.length);
+      ticks = t + 1;
+      if (produced === total && queue.length === 0 && cons.every((c) => c.state === 'idle')) break;
+      if (policy === 'block' && full() && cons.every((c) => c.state === 'putting')) { deadlock = true; break; }
+    }
+    return { total, processed, lost, firstLost, peak, maxWait, blocked, ticks, deadlock, series };
+  }
+
+  document.querySelectorAll<HTMLElement>('[data-pc]').forEach((root) => {
+    const q = query(root);
+    const setBox = (n: number, good: boolean) => q<HTMLElement>(`[data-b${n}]`).style.setProperty('--c', good ? 'var(--good)' : 'var(--bad)');
+    function draw() {
+      const rate = Number(q<HTMLSelectElement>('[data-rate]').value);
+      const bound = Number(q<HTMLSelectElement>('[data-bound]').value);
+      const policy = q<HTMLSelectElement>('[data-policy]').value;
+      const retry = q<HTMLInputElement>('[data-retry]').checked;
+      const r = simulate(rate, bound, policy, retry);
+      q('[data-o1]').textContent = `${r.processed} of ${r.total}`;
+      q('[data-n1]').textContent = r.deadlock ? 'then everything stopped' : r.processed === r.total ? 'every item was handled' : 'the rest were dropped';
+      setBox(1, !r.deadlock && r.processed === r.total);
+      q('[data-o2]').textContent = String(r.lost);
+      q('[data-n2]').textContent = r.lost ? `dropped, not processed; the first was item ${r.firstLost}` : 'nothing was dropped';
+      setBox(2, r.lost === 0);
+      q('[data-o3]').textContent = String(r.peak);
+      q('[data-n3]').textContent = bound ? `the queue was capped at ${bound}` : 'unbounded: memory use follows this number';
+      setBox(3, r.peak <= 10);
+      q('[data-o4]').textContent = `${r.maxWait} ticks`;
+      q('[data-n4]').textContent = 'the longest an item sat before a consumer took it';
+      setBox(4, r.maxWait <= 10);
+      q('[data-o5]').textContent = r.deadlock ? `Deadlock at tick ${r.ticks}` : `Tick ${r.ticks}`;
+      q('[data-n5]').textContent = r.deadlock ? 'all consumers wait to put an item back in a full queue' : 'when the last item was handled';
+      setBox(5, !r.deadlock);
+      q('[data-o6]').textContent = `${r.blocked} ticks`;
+      q('[data-n6]').textContent = 'ticks in which the producer could not hand over all its items';
+      setBox(6, r.blocked === 0 || !r.deadlock);
+      const chart = q('[data-chart]'); chart.textContent = '';
+      const max = Math.max(1, r.peak);
+      r.series.forEach((len, i) => {
+        const bar = document.createElement('span'); bar.className = 'pc-bar';
+        bar.style.height = `${Math.max(2, (len * 100) / max)}%`;
+        bar.title = `tick ${i}: ${len} in the queue`;
+        bar.style.setProperty('--c', bound && len >= bound ? 'var(--bad)' : 'var(--good)');
+        chart.appendChild(bar);
+      });
+      q('[data-chartnote]').textContent = `Tallest bar: ${r.peak} item${r.peak === 1 ? '' : 's'}.${bound ? ' Red: the queue was full.' : ''}`;
+    }
+    root.addEventListener('change', draw);
+    draw();
+  });
+</script>
+<style is:global>
+  .playground .pc-chart { display: flex; align-items: flex-end; gap: 1px; height: 90px; }
+  .playground .pc-bar { flex: 1 1 0; min-width: 1px; background: var(--c); border-radius: 1px 1px 0 0; }
+</style>
