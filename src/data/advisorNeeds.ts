@@ -68,6 +68,7 @@ export const advisorNeeds: Need[] = [
       { kind: 'study', slug: 'payment-system', because: 'charging cards safely, start to finish' },
       { kind: 'study', slug: 'ecommerce-checkout', because: 'cart to confirmed order' },
       { kind: 'study', slug: 'double-entry-ledger', because: 'money records that cannot quietly go wrong' },
+      { kind: 'study', slug: 'payment-reconciliation-service', because: 'prove every morning that the bank, the processors and your ledger agree' },
     ],
   },
   {
@@ -110,6 +111,7 @@ export const advisorNeeds: Need[] = [
       { kind: 'concept', slug: 'database-indexing', because: 'when a plain index is all you need' },
       { kind: 'study', slug: 'search-autocomplete', because: 'suggestions as you type' },
       { kind: 'study', slug: 'search-engine', because: 'the whole pipeline from text to ranked results' },
+      { kind: 'study', slug: 'ecommerce-product-search', because: 'search over prices and stock that change every minute' },
     ],
   },
   {
@@ -322,6 +324,7 @@ export const advisorNeeds: Need[] = [
       { kind: 'concept', slug: 'canary-deployments', because: 'try a release on a few users first' },
       { kind: 'concept', slug: 'online-schema-migrations', because: 'change the database without downtime' },
       { kind: 'concept', slug: 'metrics', because: 'know whether the release made things worse' },
+      { kind: 'study', slug: 'mobile-release-and-rollout-system', because: 'releases to apps you cannot roll back' },
     ],
   },
 ];

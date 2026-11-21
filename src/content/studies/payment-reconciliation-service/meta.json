@@ -1,0 +1,210 @@
+{
+  "name": "Design a Payment Reconciliation Service",
+  "difficulty": "advanced",
+  "intent": "Every morning, prove that the money in the bank equals what the ledger says is owed, and find, explain and repair every difference, even when files arrive late, twice, in pieces, in different formats and in different time zones.",
+  "prompt": "Design the reconciliation service of a payments company. It processes about 5 million card payments a day through 4 acquirers and processors. The next day each processor sends a settlement file with 1 to 2 million lines, in its own format, in its own time zone, and sometimes late, twice, or in parts. The bank sends a statement with the payouts that actually arrived, and the company's own ledger has its view of every payment. Amounts differ by processor fees and currency conversion, refunds and chargebacks come as separate lines, and some payments appear on one side only. Finance must know every morning that the bank balance equals what the ledger says is owed, and every difference must be found, explained and repaired. Design the reconciliation service, not the payment flow.",
+  "codeTitle": "three sources, tiered matching, and the breaks left for people",
+  "finalIntro": "One processor's file for one day, from its arrival twice in the night to the day closing in the morning.",
+  "functional": [
+    "Load settlement files and bank statements in any format, once each, however often they are delivered",
+    "Match every ledger line with the processor's line and the bank's payout, by id first and by fallback rules second",
+    "Classify every difference (timing, missing, duplicate, amount, status) and say how much money it holds",
+    "Route breaks to auto-repair or to a named owner, and track their age until they are closed",
+    "Close a day only when the unexplained money is zero or has been approved, and re-open it safely when a file changes"
+  ],
+  "nonFunctional": [
+    "Loading the same file twice, or in two pieces, changes no total and no match",
+    "Re-running a day with the same files and the same rule version gives exactly the same result",
+    "All matching for a day finishes within 1 hour of the last file arriving",
+    "Fewer than 1 in 10,000 automatic matches pair two different payments, checked by a weekly sample",
+    "No break stays without an owner, and none is older than 3 business days without a decision"
+  ],
+  "firstAttempt": {
+    "text": "A nightly SQL script loads each processor's CSV into a staging table, joins it to the ledger on the payment id and compares the amounts. Every row that does not match exactly goes into a spreadsheet that is emailed to finance. Finance fixes the differences by hand, and when a ledger row is wrong an engineer runs an UPDATE on it. The bank statement is looked at once a month.",
+    "limits": [
+      "A file delivered twice is loaded twice, so every payment in it is counted twice and the totals never tie to the bank",
+      "A processor that cuts the day at its local midnight makes every payment near midnight a break, one third of the rows for some processors",
+      "Fees, refunds and chargebacks make rows differ by design, so the spreadsheet is mostly noise and the real breaks are hidden in it",
+      "A late or corrected file leaves hundreds of false breaks that nobody can re-run, because the script only knows tonight",
+      "Edits to ledger rows leave no trail, and nobody owns a break or knows how old it is"
+    ]
+  },
+  "nodes": [
+    { "id": "procs", "label": "Processors", "kind": "client", "x": 12, "y": 25 },
+    { "id": "bank", "label": "Bank statements", "kind": "client", "x": 12, "y": 50, "at": 1 },
+    { "id": "finance", "label": "Finance team", "kind": "client", "x": 37, "y": 88 },
+    { "id": "script", "label": "Nightly SQL script", "kind": "compute", "x": 37, "y": 37, "at": 0, "until": 3 },
+    { "id": "ledger", "label": "Ledger", "kind": "data", "x": 87, "y": 88 },
+    { "id": "loader", "label": "Idempotent loader", "kind": "edge", "x": 37, "y": 12, "at": 1 },
+    { "id": "files", "label": "Immutable file store", "kind": "data", "x": 62, "y": 12, "at": 1 },
+    { "id": "norm", "label": "Normalizer", "kind": "compute", "x": 62, "y": 37, "at": 2 },
+    { "id": "canon", "label": "Canonical records", "kind": "data", "x": 87, "y": 25, "at": 2 },
+    { "id": "matcher", "label": "Matching engine", "kind": "compute", "x": 62, "y": 63, "at": 3 },
+    { "id": "breaks", "label": "Break queue", "kind": "async", "x": 87, "y": 63, "at": 4 },
+    { "id": "poster", "label": "Adjusting-entry poster and day close", "kind": "compute", "x": 62, "y": 88, "at": 5 },
+    { "id": "scheduler", "label": "Partition scheduler", "kind": "async", "x": 37, "y": 63, "at": 6 }
+  ],
+  "edges": [
+    { "from": "procs", "to": "script", "at": 0, "until": 1 },
+    { "from": "ledger", "to": "script", "at": 0, "until": 3 },
+    { "from": "script", "to": "finance", "at": 0, "until": 3 },
+    { "from": "procs", "to": "loader", "at": 1 },
+    { "from": "bank", "to": "loader", "at": 1 },
+    { "from": "loader", "to": "files", "at": 1 },
+    { "from": "files", "to": "script", "at": 1, "until": 2 },
+    { "from": "files", "to": "norm", "at": 2 },
+    { "from": "ledger", "to": "norm", "at": 2 },
+    { "from": "norm", "to": "canon", "at": 2 },
+    { "from": "canon", "to": "script", "at": 2, "until": 3 },
+    { "from": "canon", "to": "matcher", "at": 3 },
+    { "from": "matcher", "to": "finance", "at": 3, "until": 4 },
+    { "from": "matcher", "to": "breaks", "at": 4 },
+    { "from": "breaks", "to": "finance", "at": 4 },
+    { "from": "finance", "to": "poster", "at": 5 },
+    { "from": "breaks", "to": "poster", "at": 5 },
+    { "from": "poster", "to": "ledger", "at": 5 },
+    { "from": "loader", "to": "scheduler", "at": 6 },
+    { "from": "scheduler", "to": "matcher", "at": 6 }
+  ],
+  "steps": [
+    {
+      "title": "Load every file once, and never change it",
+      "problem": "Processors re-send files. The same file arrives twice, a file arrives in two parts, a corrected file arrives under a new name, and one arrives two days late. A loader that appends every delivery counts those rows twice, and one that overwrites the day can replace a full file with a partial one. Either way the totals no longer tie to the bank, and nobody can say which version of a row was used for a decision.",
+      "fix": "Put every delivery into an immutable file store exactly as received, under its content hash, and record who sent it, which processor and business day it covers, and when it arrived. A second delivery with the same hash is recorded as a duplicate and loads nothing. Rows have an identity (processor, business day, the processor's own row key), so a partial file and the full file that follows add up to one set of rows, and a corrected file supersedes the rows it changes: the older version stays stored, marked as replaced. A loaded row is never updated in place.",
+      "tradeoff": "Re-delivery, partial files and corrections all become boring: loading is a function of the set of files received. The cost is storage for every version, and a rule for what counts as the same row, which has to be agreed per processor.",
+      "concepts": [{ "slug": "idempotency" }, { "slug": "delivery-guarantees" }, { "slug": "event-sourcing" }]
+    },
+    {
+      "title": "Turn every source into one canonical record",
+      "problem": "Each source speaks its own language: one processor sends decimal amounts with a comma, another sends integer cents, a third sends a gross amount and a fee column, and one adds a different sign for refunds. Times come in UTC, in local time without a zone, or as a date only. The ledger has its own ids and timestamps. Comparing them as they are produces differences that are only formatting.",
+      "fix": "A parser per source turns every line into the same record: integer minor units with a currency code (amount gross, fee and net kept separate), a line type (sale, refund, chargeback, fee, payout), the payment reference, a card tail or token fragment, the time in UTC and the business day under the processor's own cut-off and time zone, plus the id of the file and row it came from. The original row is kept untouched next to it. A change to a parser produces a new parser version, and the same stored file can be parsed again.",
+      "tradeoff": "Everything after this point compares like with like, and a business day means what the processor means by it. Parsers need a test file for every processor, and a processor's format change becomes a parser change you notice, not a column that silently shifts.",
+      "concepts": [{ "slug": "money-representation-and-rounding" }, { "slug": "card-payment-lifecycle" }, { "slug": "schema-evolution-and-compatibility" }]
+    },
+    {
+      "title": "Match three ways, in tiers, with versioned rules",
+      "problem": "Matching on exact id and exact amount treats every fee difference as an error, and one row that lost its reference as two breaks. A looser rule hides errors: if the amount is allowed to differ by a lot, the matcher pairs two different payments and marks money as reconciled when it is not. The ledger, the processor and the bank are also three sources, and the processor's totals have to tie to the bank's payouts as well as line by line to the ledger.",
+      "fix": "Run the matcher in tiers, each one stricter in its evidence than the next is loose. First, the same reference and the same amount. Second, the same reference with an amount within a tolerance that comes from the fee schedule, with the difference booked as a variance. Third, for rows that lost their reference, the same type, the same card tail and an amount within the tolerance, one-to-one. Anything left is a break. A separate check ties each processor's file total to the payout that reached the bank. The rules are a versioned configuration: every match records which rule version made it, so a change can be replayed against yesterday's data before it goes live.",
+      "tradeoff": "Most lines match without a person, and every automatic match can be explained by the rule that made it. A wider tolerance or a looser tier always shrinks the break list and always raises the chance of wrong matches, so the tolerance is a decision with an owner and a sample audit, not a tuning knob.",
+      "concepts": [{ "slug": "reconciliation-and-settlement" }, { "slug": "tokenization-and-pci-scope" }, { "slug": "card-payment-lifecycle" }]
+    },
+    {
+      "title": "Classify each break and route it by age and size",
+      "problem": "A flat list of unmatched rows hides what matters. A 40-cent fee difference and a 9,000 chargeback look the same, a payment that will match tomorrow looks like an error today, and nobody knows whose job a break is or how long it has been open.",
+      "fix": "Every break gets a class, a money amount and an owner. The classes are timing (the other side is expected within the cut-off window), missing on one side, duplicate, amount, and status (for example a chargeback the ledger never recorded). Known patterns have a rule: a timing break waits a day before it counts, an exact duplicate is dropped, a small fee variance is booked automatically. The rest goes to a break queue, ordered by money at stake and age, to the team that can act: payments operations, the processor's account manager, or finance. Ageing thresholds raise an alert when a break reaches 1 and 3 business days.",
+      "tradeoff": "People read the few breaks that need judgment, the biggest first, and every break has an owner and a clock. The classes and thresholds have to be kept honest: if automatic rules absorb too much, real errors disappear into 'known patterns'.",
+      "concepts": [{ "slug": "reconciliation-and-settlement" }, { "slug": "message-queues" }, { "slug": "alerting" }]
+    },
+    {
+      "title": "Repair only through the ledger, and close the day on a rule",
+      "problem": "The easy fix for a break is to change the ledger row until it matches. That erases the evidence, can make the books unbalanced, and a repair job that runs twice can post the same correction twice. Meanwhile there has to be a clear moment when yesterday is finished, or finance can never sign off.",
+      "fix": "Reconciliation never edits the ledger. A repair is a proposal: a new balanced entry (a reversal, a variance, a fee adjustment, a recorded chargeback) with the break id as its idempotency key, posted by one service through the ledger's normal path, with the break id on the entry. Small and known repairs post automatically; larger ones wait for an approval whose limit grows with the amount. A day closes when its unexplained money is zero, or the remainder is approved by someone with the authority to carry it, and the close records the rule version, the files used and who approved what.",
+      "tradeoff": "Every correction is visible, reversible and attributable, and the books stay balanced at every step. Repairs are slower than an UPDATE and need a posting path with limits, which is the point.",
+      "concepts": [{ "slug": "double-entry-bookkeeping" }, { "slug": "idempotency" }, { "slug": "transactional-outbox" }, { "slug": "saga" }]
+    },
+    {
+      "title": "Partition by processor and day, and re-run when anything changes",
+      "problem": "Five million payments produce around 10 million rows to compare each day, and files arrive in the small hours in any order. A late or corrected file must be able to change a day that was already closed, and a script that only knows tonight cannot do that. One big job also means one slow processor delays everything.",
+      "fix": "Cut the work into partitions: one per processor and business day, with the payment reference as the join key so that all the lines of a payment are in one place. A scheduler runs each partition as soon as its files are complete, in parallel, and starts it again whenever a new or superseding file lands for it or the rules change. The matching is a pure function of the stored records and the rule version, so a re-run gives the same result and replaces the old one, with the old result kept. A closed day that a late file changes is re-opened, and the difference is repaired with new entries.",
+      "tradeoff": "Matching scales with the number of cores, a slow processor delays only its own days, and late files become routine. The window of open days (a few business days) has to be defined, and the late file that arrives after it needs a human decision.",
+      "concepts": [{ "slug": "ordering-and-partitioning" }, { "slug": "batch-vs-stream-processing" }, { "slug": "windowing-and-watermarks" }, { "slug": "pipeline-orchestration" }]
+    }
+  ],
+  "failures": [
+    {
+      "scenario": "A processor re-sends yesterday's file under a new name, with 3 rows corrected",
+      "impact": "If it is loaded as another file, 1.2 million rows are counted twice, the file total no longer ties to the bank deposit, and the 3 corrected rows exist in two versions.",
+      "answer": "The file's hash is new, but its rows have the same identities as the stored ones. The loader recognises 1.2 million rows as already loaded, stores the 3 changed rows as a newer version that supersedes the old ones, and marks the partition for a re-run. The re-run gives the new result and keeps the old one, and the difference is posted as new ledger entries if the day was already closed.",
+      "concepts": [{ "slug": "idempotency" }, { "slug": "event-sourcing" }]
+    },
+    {
+      "scenario": "One processor's file is 30 hours late, and half of it arrives first",
+      "impact": "At the morning cut the ledger has a day of payments with no matching rows, which is hundreds of thousands of false 'missing' breaks, and the day cannot close honestly.",
+      "answer": "Each processor has an expected arrival time per day. Until its file is complete, its partition is marked waiting instead of failing, and the day shows it as an open item with an owner who chases the processor. The partial file is stored and its rows are matched as they come. When the rest arrives, the same rows add to the first part, the partition re-runs, and the false breaks disappear. A day can still be closed with the late processor as an approved exception, with its money listed.",
+      "concepts": [{ "slug": "windowing-and-watermarks" }, { "slug": "pipeline-orchestration" }]
+    },
+    {
+      "scenario": "A fuzzy rule with a wide tolerance pairs a refund with a different payment of nearly the same size",
+      "impact": "The pair is marked reconciled, so the real refund that was never recorded is no longer a break and the money disappears from every report.",
+      "answer": "The fuzzy tier only looks at rows that have lost their reference, requires the same line type and card tail, and matches one-to-one. The tolerance has an owner and a ceiling, and a weekly sample of automatic matches is checked by a person against the original rows. A new rule version runs in shadow against recent days first, and the report shows how many matches it adds and how many of those a sample finds wrong.",
+      "concepts": [{ "slug": "reconciliation-and-settlement" }, { "slug": "tokenization-and-pci-scope" }]
+    },
+    {
+      "scenario": "The auto-repair job runs twice after a timeout, and one fee adjustment is posted twice",
+      "impact": "The ledger now says a fee was waived twice. The break is closed, the books balance, and the cash is short by the amount, which a later reconciliation reports as a new break.",
+      "answer": "Every repair carries the break id as its idempotency key, so the ledger accepts the second posting as a repeat of the first and returns the first entry. The poster sends its entries through an outbox, written in the same transaction as the break's status, so a repair is posted at least once and applied once. A wrong entry is fixed with a reversal, never an edit.",
+      "concepts": [{ "slug": "idempotency" }, { "slug": "transactional-outbox" }, { "slug": "double-entry-bookkeeping" }]
+    }
+  ],
+  "alternatives": [
+    {
+      "title": "Where the matching runs",
+      "options": [
+        { "name": "SQL joins in the warehouse", "pro": "Familiar to finance engineers, and cheap to start", "con": "Tiered rules, carry-over windows and one-to-one fuzzy matches turn into long queries that are hard to version and test" },
+        { "name": "A stream matcher, row by row", "pro": "Breaks show up within minutes of a file row arriving", "con": "Settlement files are daily batches, and every late or corrected file means unpicking state" },
+        { "name": "A batch matcher per processor and day", "pro": "A pure function of stored records and rule version: easy to re-run, test and compare", "con": "Results appear when a partition finishes, not row by row" }
+      ],
+      "pick": "A batch matcher per processor and business day, re-run whenever a file or the rules change."
+    },
+    {
+      "title": "When a day may close",
+      "options": [
+        { "name": "Only when there are no breaks", "pro": "The simplest possible rule to explain", "con": "Some breaks, like a chargeback awaiting evidence, stay open for weeks, so the books would never close" },
+        { "name": "When unexplained money is zero or approved", "pro": "Open items are visible, owned and limited, and the close says who approved what", "con": "Needs approval limits and a list of what 'explained' may mean" },
+        { "name": "At a fixed time every morning", "pro": "Predictable for the finance calendar", "con": "Closes over missing files and unresolved money, and hides them in the next day's numbers" }
+      ],
+      "pick": "Close when the unexplained money is zero or approved, with the files used and the approver recorded."
+    },
+    {
+      "title": "How a break is repaired",
+      "options": [
+        { "name": "Edit the ledger row", "pro": "Fast, and the next run matches", "con": "Erases the evidence, may unbalance the books, and nobody can tell what changed or why" },
+        { "name": "Staff post manual journal entries", "pro": "Every change is an entry, with human judgment", "con": "Slow and error-prone for thousands of repeated cases, and nothing prevents a double posting" },
+        { "name": "Propose balanced entries, post them with the break id as key", "pro": "Known cases are automatic, others wait for approval, and a repeat posts nothing new", "con": "Needs a posting path with limits and an approval flow to build and maintain" }
+      ],
+      "pick": "Reconciliation proposes balanced entries and a single posting path applies them once, with approvals that grow with the amount."
+    }
+  ],
+  "roles": [
+    { "id": "client", "label": "Sources and people", "description": "The processors and the bank that send files and statements, and the finance team that reads breaks and approves repairs." },
+    { "id": "edge", "label": "Intake", "description": "The loader that receives each file, hashes it and records the delivery." },
+    { "id": "compute", "label": "Processing", "description": "The normalizer, the matching engine, and the poster that applies repairs and closes the day." },
+    { "id": "async", "label": "Queues", "description": "The break queue with owners and ages, and the scheduler that runs a partition when its files are complete." },
+    { "id": "data", "label": "Records", "description": "The immutable file store, the canonical records and the ledger." }
+  ],
+  "quiz": [
+    {
+      "question": "A processor sends the same settlement file twice, 20 minutes apart. The loader appends every file it receives. What goes wrong?",
+      "options": [
+        "Nothing: the matcher pairs each ledger line with one row, so extra rows are ignored.",
+        "Every payment in the file is counted twice, so totals no longer tie to the bank deposit.",
+        "The ledger is updated twice, because the loader writes straight into it.",
+        "The second copy replaces the first, which loses the rows of the earlier load."
+      ],
+      "answer": 1,
+      "explanation": "An appending loader has no idea that the rows are the same, so the second copy doubles the processor's total and the file no longer ties to the payout that reached the bank. Pairing does not ignore extra rows: they show up as duplicate breaks. Loading a file never writes to the ledger, and appending does not replace anything."
+    },
+    {
+      "question": "Finance asks for the exception list to be shorter, so the team raises the fuzzy matching tolerance from 5 cents to 20 dollars and drops the card-tail check. What is the most likely result?",
+      "options": [
+        "Only fee differences are absorbed, since fees are the only amounts that differ.",
+        "The same breaks remain, because a tolerance only changes how they are displayed.",
+        "The list gets shorter, and some different payments are paired and counted as reconciled.",
+        "Matching gets slower, as every row is compared with every other row."
+      ],
+      "answer": 2,
+      "explanation": "A wide tolerance with no second piece of evidence makes any two unmatched lines of similar size look like a pair. The list shrinks, and the money in those wrong pairs is no longer a break, so nobody looks at it. Matching cost does not change much, and a tolerance changes what is matched, not how it is shown."
+    },
+    {
+      "question": "An engineer finds a ledger row that disagrees with the processor by 3 dollars. What is the right way to fix the books?",
+      "options": [
+        "Update the row's amount to the processor's figure so the next run matches.",
+        "Delete the row and let the next load create it again from the processor's file.",
+        "Add a note to the break and leave the ledger as it is until the month closes.",
+        "Post a new balanced entry for the 3 dollars that points to the break, and keep the original row."
+      ],
+      "answer": 3,
+      "explanation": "The ledger is append-only: a new balanced entry corrects the books and keeps the original row and the reason visible. Editing or deleting a row destroys the trail and can unbalance the books, and leaving an unexplained difference open for a month lets the problem grow."
+    }
+  ]
+}

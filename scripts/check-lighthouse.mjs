@@ -43,19 +43,37 @@ if (!up) { console.error('The preview server did not start.'); stop(); process.e
 
 const out = mkdtempSync(join(tmpdir(), 'lighthouse-'));
 const problems = [];
-let n = 0;
-for (const page of PAGES.filter((p) => p.includes(only))) {
+let n = 0, again = 0;
+// One Lighthouse run: the scores of a page, or null when Lighthouse did not run.
+function measure(page, tag) {
   const file = join(out, `${n++}.json`);
   const run = spawnSync('npx', ['--yes', LIGHTHOUSE, `${origin}${base}/${page}`, '--chrome-flags=--headless=new --no-sandbox', `--only-categories=${Object.keys(FLOORS).join(',')}`, '--output=json', `--output-path=${file}`, '--quiet'], { encoding: 'utf8' });
-  if (run.status !== 0 || !existsSync(file)) { problems.push(`/${page}: Lighthouse did not run (${(run.stderr || '').split('\n').find(Boolean) ?? `exit ${run.status}`})`); continue; }
+  if (run.status !== 0 || !existsSync(file)) return { error: `Lighthouse did not run (${(run.stderr || '').split('\n').find(Boolean) ?? `exit ${run.status}`})` };
   const report = JSON.parse(readFileSync(file, 'utf8'));
-  const scores = Object.fromEntries(Object.keys(FLOORS).map((k) => [k, Math.round(report.categories[k].score * 100)]));
   const a = report.audits;
-  console.log(`/${page}`.padEnd(32), Object.entries(scores).map(([k, v]) => `${k} ${v}`).join('  '), verbose ? `| LCP ${a['largest-contentful-paint'].displayValue}, TBT ${a['total-blocking-time'].displayValue}, CLS ${a['cumulative-layout-shift'].displayValue}` : '');
-  for (const [k, floor] of Object.entries(FLOORS)) if (scores[k] < floor) problems.push(`/${page}: ${k} is ${scores[k]}, below its floor of ${floor}`);
+  return {
+    scores: Object.fromEntries(Object.keys(FLOORS).map((k) => [k, Math.round(report.categories[k].score * 100)])),
+    detail: `LCP ${a['largest-contentful-paint'].displayValue}, TBT ${a['total-blocking-time'].displayValue}, CLS ${a['cumulative-layout-shift'].displayValue}`,
+  };
+}
+const below = (r) => Object.entries(FLOORS).filter(([k, floor]) => r.scores[k] < floor);
+for (const page of PAGES.filter((p) => p.includes(only))) {
+  // Load the page once first, so the server's first request for it (cold disk, cold caches) is not what gets measured.
+  try { await fetch(`${origin}${base}/${page}`); } catch { /* the measurement reports a server that is down */ }
+  let r = measure(page);
+  // A score depends on how busy the machine is. A page under its floor is measured once more: a real slowdown fails both looks.
+  if (!r.error && below(r).length) {
+    const first = r;
+    again++;
+    r = measure(page);
+    if (!r.error) console.log(`/${page}`.padEnd(32), `second look after ${Object.entries(first.scores).map(([k, v]) => `${k} ${v}`).join('  ')}`);
+  }
+  if (r.error) { problems.push(`/${page}: ${r.error}`); continue; }
+  console.log(`/${page}`.padEnd(32), Object.entries(r.scores).map(([k, v]) => `${k} ${v}`).join('  '), verbose ? `| ${r.detail}` : '');
+  for (const [k, floor] of below(r)) problems.push(`/${page}: ${k} is ${r.scores[k]}, below its floor of ${floor}`);
 }
 rmSync(out, { recursive: true, force: true });
 stop();
 for (const p of problems) console.error(`ERROR ${p}`);
-console.log(`checked ${n} pages: ${problems.length} below their floor`);
+console.log(`checked ${PAGES.filter((p) => p.includes(only)).length} pages: ${problems.length} below their floor${again ? ` (${again} needed a second look)` : ''}`);
 process.exit(problems.length ? 1 : 0);

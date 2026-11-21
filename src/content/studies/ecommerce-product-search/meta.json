@@ -1,0 +1,206 @@
+{
+  "name": "Design Product Search for an Online Store",
+  "difficulty": "intermediate",
+  "intent": "Make 50 million listings searchable with prices and stock that match the database, new listings visible within seconds, facets and business-aware ranking, and proof that each ranking change helps.",
+  "prompt": "Design the product search of a marketplace with 50 million listings and 20,000 searches a second at peak. Prices and stock change all the time, hundreds of thousands of updates a minute, and during a flash sale three times as many. Sellers want a new listing searchable within seconds. Shoppers filter by brand, price range, size, rating and in stock, and expect a count next to each option. Results should be ranked by relevance mixed with sales, margin and availability, and the team must be able to prove that a ranking change helps before everyone gets it. Design the indexing path, the query path, the ranking and the measurement. Do not design checkout or the product catalog itself.",
+  "codeTitle": "three ways to update the index, shards and replicas, and four ranking mixes on one model",
+  "finalIntro": "One price change, and then one search that sees it.",
+  "functional": [
+    "Find listings from a few free-text words, forgiving typos and suggesting completions while the shopper types",
+    "Filter by brand, price range, size, rating and in stock, with a count next to every option",
+    "Make a new listing searchable within seconds, and show the current price and stock",
+    "Rank by relevance mixed with sales, margin and availability, and give new listings a fair chance",
+    "Let the team compare two rankings offline and in an experiment before launching one"
+  ],
+  "nonFunctional": [
+    "Search p99 under 150 ms at 20,000 searches a second, with filters and facet counts included",
+    "Fewer than 1% of results show a stale price or an item that is out of stock",
+    "A new listing is searchable within 10 s, and the index is never more than 30 s behind the database, even in a flash sale with 3 times the changes",
+    "Losing a node, or one slow shard, does not fail searches: the answer arrives inside the budget, at worst with a flag that it is partial",
+    "A ranking change launches only with evidence: no loss on a judged set of head and tail queries, and a won or neutral experiment"
+  ],
+  "firstAttempt": {
+    "text": "A cluster of search nodes holds a full-text index of the catalog. Every hour a job reads the products that changed from the database and re-indexes them as whole documents, price and stock included. Results come back ranked by text match alone, and filters are applied to the top results afterwards.",
+    "limits": [
+      "A price or stock change takes up to an hour to show: in the model below, 18.2% of results show an old price or an item that is out of stock",
+      "A new listing is invisible for about an hour (3,636 s on average in the model), which is the opposite of what sellers expect",
+      "The hourly batch re-indexes millions of documents at once and slows searches while it runs (a p99 of 277 ms in the slowest minute)",
+      "Ranking by text alone ignores what shoppers buy, and sold-out items rank as high as available ones",
+      "Filters applied after the top results give wrong facet counts and can leave a filtered search with nothing, and nobody can tell whether a ranking change helped"
+    ]
+  },
+  "nodes": [
+    { "id": "shopper", "label": "Shopper's app", "kind": "client", "x": 12, "y": 37 },
+    { "id": "api", "label": "Search API", "kind": "edge", "x": 37, "y": 37 },
+    { "id": "index", "label": "Search index, one copy", "kind": "data", "x": 62, "y": 37, "at": 0, "until": 3 },
+    { "id": "shards", "label": "Index shards with replicas", "kind": "data", "x": 62, "y": 37, "at": 3 },
+    { "id": "db", "label": "Product database", "kind": "data", "x": 87, "y": 63 },
+    { "id": "dump", "label": "Hourly export job", "kind": "async", "x": 62, "y": 63, "at": 0, "until": 1 },
+    { "id": "events", "label": "Change events", "kind": "async", "x": 62, "y": 63, "at": 1 },
+    { "id": "indexer", "label": "Indexer", "kind": "compute", "x": 37, "y": 63, "at": 1 },
+    { "id": "prices", "label": "Price and stock store", "kind": "data", "x": 62, "y": 88, "at": 2 },
+    { "id": "coord", "label": "Query coordinator", "kind": "compute", "x": 62, "y": 12, "at": 3 },
+    { "id": "suggest", "label": "Autocomplete service", "kind": "compute", "x": 12, "y": 12, "at": 4 },
+    { "id": "ranker", "label": "Re-ranker", "kind": "compute", "x": 87, "y": 12, "at": 5 },
+    { "id": "metrics", "label": "Click log and experiments", "kind": "async", "x": 12, "y": 63, "at": 6 }
+  ],
+  "edges": [
+    { "from": "shopper", "to": "api", "at": 0 },
+    { "from": "api", "to": "index", "at": 0, "until": 3 },
+    { "from": "db", "to": "dump", "at": 0, "until": 1 },
+    { "from": "dump", "to": "index", "at": 0, "until": 1 },
+    { "from": "db", "to": "events", "at": 1 },
+    { "from": "events", "to": "indexer", "at": 1 },
+    { "from": "indexer", "to": "index", "at": 1, "until": 3 },
+    { "from": "indexer", "to": "prices", "at": 2 },
+    { "from": "api", "to": "prices", "at": 2, "until": 5 },
+    { "from": "api", "to": "coord", "at": 3 },
+    { "from": "coord", "to": "shards", "at": 3 },
+    { "from": "indexer", "to": "shards", "at": 3 },
+    { "from": "shopper", "to": "suggest", "at": 4 },
+    { "from": "coord", "to": "ranker", "at": 5 },
+    { "from": "ranker", "to": "prices", "at": 5 },
+    { "from": "api", "to": "metrics", "at": 6 }
+  ],
+  "steps": [
+    {
+      "title": "Feed the index from change events, not from an hourly export",
+      "problem": "The product database is the truth, but it is the wrong place to search and the hourly export makes the index a copy that is up to an hour old. A shopper sees a price that is no longer right, a seller cannot find the listing they just created, and the batch itself re-indexes millions of documents in one burst.",
+      "fix": "Treat the search index as a derived copy, built from events. When a listing changes, the database writes an event row in the same transaction (an outbox), a relay publishes it to a log partitioned by listing id, and an indexer applies it to the index. The event carries a version number, and the indexer ignores any event older than what it has already applied, so a late or repeated delivery does nothing. A new listing becomes searchable at the next refresh of the index, typically a few seconds. A slow background job compares the database with the index and repairs any difference.",
+      "tradeoff": "Freshness goes from an hour to seconds and the work is spread out instead of arriving in a burst. The index is now eventually consistent with the database, so its lag must be measured and alerted on, and there must be a way to rebuild it from scratch.",
+      "concepts": [{ "slug": "transactional-outbox" }, { "slug": "cqrs" }, { "slug": "segments-and-near-real-time-indexing" }, { "slug": "ordering-and-partitioning" }, { "slug": "optimistic-concurrency-and-etags" }]
+    },
+    {
+      "title": "Keep price and stock out of the text index",
+      "problem": "Events keep the index fresh, until the changes are as frequent as in a marketplace. An index built from immutable segments typically cannot change one field in place: even a partial update deletes the old document and indexes a whole new one. With 300,000 price and stock changes a minute, and three times that in a flash sale, the shards spend their time re-analysing text that did not change. In the model, a flash sale with a 1 s refresh leaves the index ten minutes behind and searches taking 919 ms.",
+      "fix": "Split the fields by how often they change. Title, description, brand, category and attributes change rarely and stay in the index. Price, stock count and availability go to a side store: a key-value store keyed by listing id, written by the same event stream, where an update is a cheap overwrite. After the shards return their candidates, one batched lookup fetches the current price and stock of those few hundred listings, and that is what the page shows. For filters, the index keeps coarse versions (a price band, an in-stock flag that changes only on sell-out and restock), and the exact check is repeated against the side store, with the shards asked for more candidates than needed so that the check still leaves enough.",
+      "tradeoff": "The documents re-indexed per second fall from thousands to the few hundred that are new listings and text edits, and prices are as fresh as the side store. The cost is a lookup on every search (a few milliseconds, but millions of reads a second), two stores that must agree about which listings exist, and filters that are exact only after the second check.",
+      "concepts": [{ "slug": "segments-and-near-real-time-indexing" }, { "slug": "inverted-indexes-and-text-search" }, { "slug": "lsm-trees-vs-b-trees" }, { "slug": "caching" }, { "slug": "backpressure" }]
+    },
+    {
+      "title": "Shard by listing id, replicate, and give every search a time budget",
+      "problem": "Fifty million listings do not fit one machine's memory and cache, and 20,000 searches a second do not fit one machine's cores. The write rate has the same problem: one shard can only index so many documents a second. A search that has to wait for the slowest of many shards is as slow as its worst shard.",
+      "fix": "Divide the index into shards by a hash of the listing id, so each shard holds an even slice and has its own complete index. Give each shard replicas that answer searches, spread over zones. A coordinator sends each search to one copy of every shard, picking the least busy copy, and merges the shards' top lists. The whole search gets a deadline: if a shard has not answered when a short delay has passed, the coordinator asks another copy of it (a hedged request), and at the deadline it answers with what it has and flags the result as partial.",
+      "tradeoff": "Shards add write capacity and replicas add read capacity, and losing a node costs capacity, not availability. Every search now touches every shard, so more shards means more fixed work per search and a worse tail, and nodes are bought as shards times copies: 8 shards with 3 copies is 24 nodes. In the model, 8 shards with no replicas cannot carry the peak (p99 above 700 ms), and a second copy fixes it.",
+      "concepts": [{ "slug": "distributed-search-scatter-gather" }, { "slug": "database-sharding" }, { "slug": "consistent-hashing" }, { "slug": "hedged-requests-and-tail-latency" }, { "slug": "timeouts-and-deadlines" }, { "slug": "load-balancing" }]
+    },
+    {
+      "title": "Filter before scoring, count facets over the filtered set, and keep zero results rare",
+      "problem": "Shoppers narrow with brand, price, size, rating and in stock, and want a count next to each option that matches what they would get. Filtering after scoring wastes work on documents that are thrown away, counting facets over only the first page gives counts that are wrong, and a facet with a very large number of values, such as the seller, is expensive to count. A search that returns nothing is a lost sale.",
+      "fix": "Run filters as unscored conditions that are intersected with the text match first, so only the survivors are scored, and let the engine cache the common filters. Each shard counts facets over the whole filtered set, reading values from a per-field column layout instead of the documents, and the coordinator adds the shards' counts. For one facet, the count ignores that facet's own filter, so the shopper sees the other brands they could switch to. For fields with very many values, ask each shard for its top values only and accept approximate counts in the tail, and only count the facets the page shows. When a search finds nothing, apply typo tolerance (edit distance 1 or 2 on words long enough), synonyms, and finally a relaxed query that drops the least important word or filter and says so. Autocomplete runs on its own small index of popular queries, cached at the edge, and is never served from the main shards.",
+      "tradeoff": "The counts and the first page agree, and a typo no longer ends the shopper's search. Facet counts cost CPU on every shard, the tail of a big facet is approximate, and a relaxed query shows results that did not match everything, which must be visible to the shopper.",
+      "concepts": [{ "slug": "inverted-indexes-and-text-search" }, { "slug": "database-indexing" }, { "slug": "cardinality-and-sampling" }, { "slug": "columnar-formats-and-partitioning" }, { "slug": "autocomplete-and-typeahead" }, { "slug": "probabilistic-data-structures" }]
+    },
+    {
+      "title": "Rank in two stages, and keep sales from burying new listings",
+      "problem": "Text relevance ignores what shoppers buy, so the business wants sales, margin and availability in the order. Running all of that over every match is too slow, and a naive sales boost has two known failures. Best sellers that are sold out rank first, and new listings, which have no sales yet, never get a chance to earn any, so the rich get richer. In the model, a plain sales boost raises out-of-stock results from 8.3% to 11.9% and drops relevance on specific (tail) queries from 96 to 60.",
+      "fix": "Stage one is cheap and runs on the shards: text relevance and filters, returning a few hundred candidates. Stage two is a re-ranker that fetches the current price, stock and sales for those candidates in one lookup, drops what is out of stock, and scores the rest with a small formula or a learned model. The sales signal is capped, or taken as sales per impression instead of a raw count, so that exposure does not turn into rank on its own, and new listings get a temporary boost so they collect data. If the re-ranker is slow or down, the search falls back to the first-stage order.",
+      "tradeoff": "Heavy signals run on a few hundred listings instead of millions, and sold-out items no longer fill the top. The re-ranker adds a hop and a few milliseconds, can only reorder what stage one retrieved, and puts a business weight in a position to hurt shoppers, so every weight needs an owner and a test.",
+      "concepts": [{ "slug": "bm25-and-relevance-ranking" }, { "slug": "graceful-degradation" }, { "slug": "feature-flags" }, { "slug": "caching" }]
+    },
+    {
+      "title": "Prove ranking changes on judged queries first, then in an experiment",
+      "problem": "A ranking change helps some queries and hurts others, and the way it fails is not visible in a handful of examples or in total revenue. In the model, the sales boost raises relevance on head queries from 62 to 88 and lowers it on tail queries from 96 to 60, so the headline looks like progress while the overall score falls from 79 to 74.",
+      "fix": "Build a judged set: queries sampled from real traffic, head and tail, including ones that returned nothing, with graded results for each. Score every candidate ranking on it with NDCG, split by head and tail and by new and old listings, and block a change that loses on any group. Then run an experiment: assign shoppers (not requests) randomly to the old and new ranking, log what was shown at which position, and compare conversion together with guard metrics such as zero-result rate, out-of-stock clicks and p99. Launch behind a flag, ramp up slowly, and keep the old ranking as the instant rollback.",
+      "tradeoff": "Changes ship with evidence, and a bad one is caught on a few percent of traffic. Judging costs human time and goes stale as the catalog changes, and tail queries need weeks of traffic to show an effect, so some changes can only be judged offline.",
+      "concepts": [{ "slug": "search-quality-evaluation" }, { "slug": "feature-flags" }, { "slug": "canary-deployments" }, { "slug": "slos-and-error-budgets" }]
+    }
+  ],
+  "failures": [
+    {
+      "scenario": "A flash sale reprices millions of listings in half an hour",
+      "impact": "If price lives in the indexed document, every change is a whole-document re-index, the shards cannot keep up, the queue grows and shoppers see old prices while the index spends its time catching up. Searches slow down too, because indexing competes for the same machines.",
+      "answer": "Price and stock go to the side store, so the sale becomes cheap overwrites that the store absorbs. The index sees only the few price-band changes that move a listing between filter buckets. If a backlog still forms, the indexer coalesces events (only the latest per listing matters), indexing runs at a lower priority than searching, and the lag metric alerts before shoppers notice.",
+      "concepts": [{ "slug": "backpressure" }, { "slug": "load-shedding" }, { "slug": "message-queues" }]
+    },
+    {
+      "scenario": "One shard stalls for a few seconds in the middle of the peak, because of a long merge or a garbage collection",
+      "impact": "Every search must wait for every shard, so every search is as slow as that shard, and the stalled node's queue grows.",
+      "answer": "The coordinator hedges: after a short delay it sends the same request to another copy of that shard and takes the first answer. A hard deadline caps the rest, and a search that still lacks a shard is answered from the others, flagged as partial and counted, since a slightly incomplete page is better than a timeout. Health checks take the stalled copy out of rotation, and replicas sit in different zones.",
+      "concepts": [{ "slug": "hedged-requests-and-tail-latency" }, { "slug": "timeouts-and-deadlines" }, { "slug": "graceful-degradation" }]
+    },
+    {
+      "scenario": "The team needs to change how titles are analysed, which means a new mapping for the whole index",
+      "impact": "An existing index cannot change how its fields are analysed in place. Rebuilding while serving means the new index is behind by the time it is ready, and cutting over blindly could change the results of every search at once.",
+      "answer": "Build a new index version in the background from the database, and keep applying the live change events to both, starting from a recorded position in the log. When it has caught up, run the judged queries against both versions and compare. Then switch an alias from the old to the new index in one step, ramp the traffic if wanted, and keep the old one for a day as the rollback. Applications always search the alias, never an index name.",
+      "concepts": [{ "slug": "online-schema-migrations" }, { "slug": "blue-green-and-rolling-deployments" }, { "slug": "schema-evolution-and-compatibility" }, { "slug": "canary-deployments" }]
+    },
+    {
+      "scenario": "A sales boost ships, and sold-out best sellers fill the top while new products disappear",
+      "impact": "Shoppers click items they cannot buy, new listings never get the exposure they need to earn sales, and the catalog slowly narrows to what already sold.",
+      "answer": "The re-ranker drops items that are out of stock using the side store, caps the sales signal (or uses sales per impression) and boosts new listings for a limited time. The judged set already holds new products on its tail queries, so the change would have been blocked there, and the experiment watches the share of new listings in the top 10 as a guard metric. The flag turns the boost off in minutes.",
+      "concepts": [{ "slug": "bm25-and-relevance-ranking" }, { "slug": "search-quality-evaluation" }, { "slug": "feature-flags" }]
+    }
+  ],
+  "alternatives": [
+    {
+      "title": "How price and stock reach the shopper",
+      "options": [
+        { "name": "Re-index the whole document on every change", "pro": "One system, and every filter and sort works on current values", "con": "Write load equals the change rate, which collapses in a flash sale, and a faster refresh makes it worse" },
+        { "name": "A side store read at query time, coarse flags in the index", "pro": "Cheap writes and current values, and the index sees only slow fields", "con": "A lookup on every search, two stores to keep consistent, and filters that need a second check" },
+        { "name": "Update numeric fields in place inside the index, where the engine allows it", "pro": "No re-analysis of text, and filters stay inside one system", "con": "Support differs by engine and is often limited, and the engine's own update path still has a cost" }
+      ],
+      "pick": "A side store for price and stock, with coarse price-band and in-stock flags in the index for filtering and an exact check at query time."
+    },
+    {
+      "title": "Where business signals enter the ranking",
+      "options": [
+        { "name": "A scoring formula inside the shards", "pro": "No extra hop, and it applies to every match", "con": "It runs over every match, needs fast-changing data inside the index, and each change is a deployment" },
+        { "name": "A second-stage re-ranker over a few hundred candidates", "pro": "Heavy features and fresh data on few listings, and it changes without touching the index", "con": "An extra hop, and it can only reorder what the first stage found" },
+        { "name": "Sort the matches by sales or price at the end", "pro": "Trivial to build and easy to explain", "con": "Ignores relevance, so the best sellers outrank listings that actually match" }
+      ],
+      "pick": "Two stages: text and filters on the shards, business signals in the re-ranker over the best few hundred."
+    },
+    {
+      "title": "How to roll out a change that needs a new index",
+      "options": [
+        { "name": "Re-index in place on the live index", "pro": "No second copy to pay for", "con": "Searches see a half-converted index, and there is no way back" },
+        { "name": "Build a new index version and swap an alias", "pro": "Compare before switching, atomic cutover and an instant rollback", "con": "Twice the storage while both exist, and the new one must keep up with live changes while it builds" },
+        { "name": "A second cluster with traffic switched at the load balancer", "pro": "Total isolation, and it can test the whole stack, not only the index", "con": "The most expensive option, and two copies of everything to keep in sync" }
+      ],
+      "pick": "A new index version behind an alias, compared on the judged queries before the swap, with the old one kept for rollback."
+    }
+  ],
+  "roles": [
+    { "id": "client", "label": "Shopper apps", "description": "The apps and web pages where shoppers type, filter and click." },
+    { "id": "edge", "label": "Search API", "description": "The entry point for searches and, in the design, the autocomplete path." },
+    { "id": "compute", "label": "Coordinator, indexer and re-ranker", "description": "The query coordinator, the indexer that applies changes, the re-ranker, and the autocomplete service." },
+    { "id": "async", "label": "Events and logs", "description": "The change events from the database, and the click log that feeds experiments." },
+    { "id": "data", "label": "Database, index and side store", "description": "The product database, the index shards with replicas, and the price and stock store." }
+  ],
+  "quiz": [
+    {
+      "question": "300,000 price and stock changes arrive every minute, and the index is built from immutable segments. Which design keeps the index from falling behind?",
+      "options": [
+        "Send each change as a partial update, because the engine then only touches the price field.",
+        "Re-index each listing that changed once an hour, which merges many changes into one write.",
+        "Move price and stock to a side store, and look them up for each search's top candidates.",
+        "Lower the refresh interval to 1 s, so that each change becomes visible as soon as it is written."
+      ],
+      "answer": 2,
+      "explanation": "An update in an index of immutable segments typically deletes the old document and indexes a whole new one, partial or not, so the write load stays equal to the change rate. A side store takes the fast fields out of the index, so only the slow ones are re-indexed. Hourly batches leave prices an hour old, and a shorter refresh interval adds merge work, which lowers the writes the shards can absorb."
+    },
+    {
+      "question": "After a sales boost ships, sold-out best sellers appear in the top 3 and newly listed products lose clicks. What should the team do?",
+      "options": [
+        "Hide sold-out items, cap sales, boost new listings, and re-check head and tail queries.",
+        "Remove every business signal and rank by text relevance alone from now on, just to be safe.",
+        "Double the sales weight, so that the best sellers settle at the top and stay there.",
+        "Refresh the index every second, so that the best sellers' stock is always exact in it."
+      ],
+      "answer": 0,
+      "explanation": "Both symptoms are known failures of a raw sales boost: items nobody can buy still rank, and new listings never earn the sales that would lift them. Filtering on current stock, capping the signal and giving new listings a boost address them, and the judged set shows whether the tail recovered. Text alone throws away a useful signal, a bigger weight deepens the problem, and a faster refresh does not stop sold-out items from ranking."
+    },
+    {
+      "question": "A new ranking scores higher on a judged set built from the 1,000 most frequent queries, but the A/B test shows no gain. What is the most likely reason?",
+      "options": [
+        "Judges always disagree with shoppers, so judged sets can never predict an experiment.",
+        "An A/B test must show every shopper the same queries on each day of the test.",
+        "The index was refreshed too slowly while the experiment was running its two groups.",
+        "Many searches are rare, specific queries that the judged set barely covers."
+      ],
+      "answer": 3,
+      "explanation": "A judged set made of the most frequent queries describes the head, while many searches, and many listings, sit in the long tail, where a ranking can lose what it gains on the head. Sampling judged queries from all of the traffic, and reporting head and tail separately, closes the gap. Judged sets do predict experiments when they are representative, and experiments do not need identical queries each day."
+    }
+  ]
+}
