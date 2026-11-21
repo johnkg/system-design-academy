@@ -1,0 +1,171 @@
+---
+import PlaygroundShell from '../components/PlaygroundShell.astro';
+---
+<PlaygroundShell title="Simulate it" hint="One thread runs every task, one item at a time, and time moves in ticks (no real timers). Panel 1 shows lost updates with a single thread. Panel 2 sends 8 requests, each waiting 5 ticks for I/O and then needing CPU time, plus a small ping that arrives at tick 6, and shows who waits for whom.">
+  <ol class="how">
+    <li>In <b>Shared counter</b>, start with <b>Read, await, write</b> and <b>Handlers</b> <b>4</b>: there is one thread and no data race, yet the counter ends at <b>1</b> instead of 4. Each handler reads 0, then waits at the await, and the others run while it waits. Set <b>Handler code</b> to <b>Await first, then read and write</b>: the answer is <b>4</b>, because nothing can run between the read and the write.</li>
+    <li>Set <b>Handler code</b> to <b>Read, await, write under an async lock</b>: also <b>4</b>, but it takes <b>20</b> ticks instead of <b>5</b>, because the handlers now go one after another.</li>
+    <li>In <b>Requests and a ping</b>, set <b>CPU per request</b> to <b>2 ticks</b> and <b>Loop</b> to <b>Blocking I/O in the loop</b>: <b>57</b> ticks in total, because the loop sits waiting for I/O. Set <b>Loop</b> to <b>Await the I/O</b>: <b>22</b> ticks, the I/O waits overlap.</li>
+    <li>Set <b>CPU per request</b> to <b>40 ticks</b> and <b>Loop</b> to <b>Await the I/O</b>: awaiting no longer helps much (<b>326</b> ticks) and the ping waits <b>320</b> ticks behind the requests' CPU work. <b>Cut CPU into slices of 5</b> brings the ping down to <b>40</b> ticks, but raises the mean request time from <b>185</b> to <b>308</b>. <b>CPU on 2 worker threads</b> finishes in <b>165</b> ticks and the ping waits <b>1</b>.</li>
+  </ol>
+  <div class="pg el" data-el>
+    <h3 class="el-h">Shared counter</h3>
+    <div class="pg-row">
+      <label>Handler code <select class="pg-in" data-code>
+        <option value="gap" selected>Read, await, write</option>
+        <option value="tight">Await first, then read and write</option>
+        <option value="mutex">Read, await, write under an async lock</option>
+      </select></label>
+      <label>Handlers <select class="pg-in" data-n><option>2</option><option>3</option><option selected>4</option></select></label>
+    </div>
+    <div class="pg-grid">
+      <div class="pg-box" data-ab1><h3>Final counter</h3><span class="pg-mono" data-ao1></span><span class="pg-note" data-an1></span></div>
+      <div class="pg-box" data-ab2><h3>Ticks to finish</h3><span class="pg-mono" data-ao2></span><span class="pg-note" data-an2></span></div>
+    </div>
+
+    <h3 class="el-h">Requests and a ping</h3>
+    <div class="pg-row">
+      <label>Loop <select class="pg-in" data-variant>
+        <option value="blocking">Blocking I/O in the loop</option>
+        <option value="await" selected>Await the I/O</option>
+        <option value="chunked">Cut CPU into slices of 5</option>
+        <option value="workers">CPU on 2 worker threads</option>
+      </select></label>
+      <label>CPU per request <select class="pg-in" data-cpu><option value="2">2 ticks</option><option value="40" selected>40 ticks</option></select></label>
+    </div>
+    <div class="pg-grid">
+      <div class="pg-box" data-bb1><h3>Ticks until everything is done</h3><span class="pg-mono" data-bo1></span><span class="pg-note" data-bn1></span></div>
+      <div class="pg-box" data-bb2><h3>Mean request time</h3><span class="pg-mono" data-bo2></span><span class="pg-note" data-bn2></span></div>
+      <div class="pg-box" data-bb3><h3>Ping answered after</h3><span class="pg-mono" data-bo3></span><span class="pg-note" data-bn3></span></div>
+      <div class="pg-box" data-bb4><h3>Loop busy</h3><span class="pg-mono" data-bo4></span><span class="pg-note" data-bn4></span></div>
+    </div>
+    <div class="pg-box" style="--c: var(--border)">
+      <h3>Ping wait, all four loops</h3>
+      <div class="el-bars" data-bars></div>
+      <span class="pg-note">The ping arrives at tick 6 and needs 1 tick of loop time. The bar is how long it waited behind other work.</span>
+    </div>
+  </div>
+</PlaygroundShell>
+<script>
+  import { query, formatThousands } from '../playground';
+  const IO = 5;
+  const HANDLERS: Record<string, string[]> = { gap: ['R', 'A', 'W'], tight: ['A', 'R', 'W'], mutex: ['L', 'R', 'A', 'W', 'U'] };
+  interface Timer { at: number; seq: number; task: number }
+
+  // The same model as the code samples.
+  function handlers(variant: string, n: number) {
+    const prog = HANDLERS[variant];
+    const pc: number[] = Array(n).fill(0), tmp: number[] = Array(n).fill(0);
+    const ready: number[] = [], waiting: number[] = [];
+    let timers: Timer[] = [];
+    for (let i = 0; i < n; i++) ready.push(i);
+    let counter = 0, now = 0, seq = 0, owner = -1;
+    while (ready.length > 0 || timers.length > 0) {
+      if (ready.length === 0) {
+        now = Math.min(...timers.map((x) => x.at));
+        const due = timers.filter((x) => x.at <= now).sort((a, b) => a.at - b.at || a.seq - b.seq);
+        for (const d of due) ready.push(d.task);
+        timers = timers.filter((x) => x.at > now);
+      }
+      const i = ready.shift()!;
+      let running = true;
+      while (running && pc[i] < prog.length) {
+        const op = prog[pc[i]];
+        if (op === 'R') { tmp[i] = counter; pc[i]++; }
+        else if (op === 'W') { counter = tmp[i] + 1; pc[i]++; }
+        else if (op === 'A') { timers.push({ at: now + IO, seq: seq++, task: i }); pc[i]++; running = false; }
+        else if (op === 'L') { if (owner === -1) { owner = i; pc[i]++; } else { waiting.push(i); pc[i]++; running = false; } }
+        else if (op === 'U') { owner = -1; pc[i]++; if (waiting.length > 0) { owner = waiting.shift()!; ready.push(owner); } }
+      }
+    }
+    return { counter, ticks: now };
+  }
+
+  interface Item { id: number; rem: number }
+  function loopSim(variant: string, R: number, io: number, cpu: number, slice: number, W: number, pingAt: number) {
+    const loopQ: Item[] = [], workQ: Item[] = [];
+    let cur: { item: Item; len: number; end: number } | null = null;
+    let busy = 0, remaining = R + 1, pingDone = -1, total = 0, sum = 0;
+    const workers: ({ id: number; end: number } | null)[] = Array(W).fill(null);
+    const finish = (id: number, t: number) => { remaining--; if (id < 0) pingDone = t; else { sum += t; if (t > total) total = t; } };
+    for (let t = 0; remaining > 0; t++) {
+      if (variant === 'blocking') { if (t === 0) for (let r = 0; r < R; r++) loopQ.push({ id: r, rem: io + cpu }); }
+      else if (t === io) for (let r = 0; r < R; r++) (variant === 'workers' ? workQ : loopQ).push({ id: r, rem: cpu });
+      if (t === pingAt) loopQ.push({ id: -1, rem: 1 });
+      if (cur && cur.end === t) {
+        cur.item.rem -= cur.len;
+        if (cur.item.rem > 0) loopQ.push(cur.item); else finish(cur.item.id, t);
+        cur = null;
+      }
+      for (let w = 0; w < W; w++) { const wk = workers[w]; if (wk && wk.end === t) { finish(wk.id, t); workers[w] = null; } }
+      if (!cur && loopQ.length > 0) {
+        const item = loopQ.shift()!;
+        const len = variant === 'chunked' && item.id >= 0 ? Math.min(item.rem, slice) : item.rem;
+        cur = { item, len, end: t + len };
+      }
+      for (let w = 0; w < W; w++) if (!workers[w] && workQ.length > 0) { const item = workQ.shift()!; workers[w] = { id: item.id, end: t + item.rem }; }
+      if (cur) busy++;
+      if (remaining === 0) total = Math.max(total, pingDone);
+    }
+    return { total, mean: Math.floor(sum / R), ping: pingDone - pingAt, busyPct: Math.floor((busy * 100) / total) };
+  }
+
+  const VARIANTS: [string, string][] = [['blocking', 'Blocking I/O in the loop'], ['await', 'Await the I/O'], ['chunked', 'CPU in slices of 5'], ['workers', 'CPU on 2 workers']];
+  document.querySelectorAll<HTMLElement>('[data-el]').forEach((root) => {
+    const q = query(root);
+    const setBox = (sel: string, good: boolean) => q<HTMLElement>(sel).style.setProperty('--c', good ? 'var(--good)' : 'var(--bad)');
+    const bars = q('[data-bars]');
+    const rows = VARIANTS.map(([, label]) => {
+      const row = document.createElement('div'); row.className = 'el-row';
+      const lab = document.createElement('span'); lab.className = 'el-lab'; lab.textContent = label;
+      const track = document.createElement('span'); track.className = 'el-track';
+      const bar = document.createElement('span'); bar.className = 'el-bar'; track.appendChild(bar);
+      const val = document.createElement('span'); val.className = 'pg-mono el-val';
+      row.append(lab, track, val); bars.appendChild(row);
+      return { row, bar, val };
+    });
+    function drawHandlers() {
+      const n = Number(q<HTMLSelectElement>('[data-n]').value);
+      const r = handlers(q<HTMLSelectElement>('[data-code]').value, n);
+      q('[data-ao1]').textContent = `${r.counter} of ${n}`;
+      q('[data-an1]').textContent = r.counter === n ? 'every increment counted' : `${n - r.counter} updates lost, with one thread and no data race on a single step`;
+      setBox('[data-ab1]', r.counter === n);
+      q('[data-ao2]').textContent = String(r.ticks);
+      q('[data-an2]').textContent = 'each handler waits 5 ticks for I/O; waits overlap unless the lock makes them queue';
+      setBox('[data-ab2]', true);
+    }
+    function drawLoop() {
+      const variant = q<HTMLSelectElement>('[data-variant]').value;
+      const cpu = Number(q<HTMLSelectElement>('[data-cpu]').value);
+      const r = loopSim(variant, 8, IO, cpu, 5, 2, 6);
+      q('[data-bo1]').textContent = formatThousands(r.total);
+      q('[data-bn1]').textContent = '8 requests and the ping, all finished';
+      setBox('[data-bb1]', true);
+      q('[data-bo2]').textContent = formatThousands(r.mean);
+      q('[data-bn2]').textContent = 'average tick at which a request finished (all start at tick 0)';
+      setBox('[data-bb2]', true);
+      q('[data-bo3]').textContent = `${formatThousands(r.ping)} ticks`;
+      q('[data-bn3]').textContent = r.ping <= 5 ? 'the loop was free for it' : 'it queued behind work already waiting on the loop';
+      setBox('[data-bb3]', r.ping <= 5);
+      q('[data-bo4]').textContent = `${r.busyPct}%`;
+      q('[data-bn4]').textContent = 'share of ticks the loop thread was running something';
+      setBox('[data-bb4]', true);
+      const all = VARIANTS.map(([v]) => loopSim(v, 8, IO, cpu, 5, 2, 6));
+      const max = Math.max(...all.map((a) => a.ping));
+      all.forEach((a, k) => { rows[k].bar.style.width = `${Math.max(1, (a.ping * 100) / max)}%`; rows[k].val.textContent = `${formatThousands(a.ping)}`; rows[k].row.classList.toggle('el-on', VARIANTS[k][0] === variant); });
+    }
+    root.addEventListener('change', (e) => { if ((e.target as HTMLElement).hasAttribute('data-code') || (e.target as HTMLElement).hasAttribute('data-n')) drawHandlers(); else drawLoop(); });
+    drawHandlers(); drawLoop();
+  });
+</script>
+<style is:global>
+  .playground .el-h { margin: 14px 0 8px; font-size: 1rem; }
+  .playground .el-bars { display: grid; gap: 6px; }
+  .playground .el-row { display: grid; grid-template-columns: 11em 1fr 4em; gap: 8px; align-items: center; }
+  .playground .el-row.el-on .el-lab { font-weight: 700; }
+  .playground .el-track { display: block; height: 14px; }
+  .playground .el-bar { display: block; height: 100%; border-radius: 3px; background: var(--bad); opacity: .55; }
+  .playground .el-row.el-on .el-bar { opacity: 1; }
+  .playground .el-val { text-align: right; }
+  @media (max-width: 560px) { .playground .el-row { grid-template-columns: 1fr 4em; } .playground .el-track { grid-column: 1 / -1; grid-row: 2; } }
+</style>
