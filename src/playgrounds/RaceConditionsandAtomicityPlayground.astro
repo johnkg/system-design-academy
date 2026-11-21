@@ -1,0 +1,162 @@
+---
+import PlaygroundShell from '../components/PlaygroundShell.astro';
+---
+<PlaygroundShell title="Simulate it" hint="A deterministic scheduler runs every possible interleaving of the threads' steps, so nothing here is random and nothing is a lucky run. A step is one indivisible action; between two steps any other thread that can run may go first.">
+  <ol class="how">
+    <li>Start with the defaults: <b>Counter increments</b>, <b>No protection</b>, <b>2 threads, 1 increment each</b>. The scheduler finds <b>6</b> interleavings and <b>4</b> of them end with 1 instead of 2: both threads read 0, both write 1.</li>
+    <li>Set <b>Size</b> to <b>2 threads, 2 increments each</b>: now <b>70</b> interleavings, and <b>64</b> end with a wrong total (the lowest is 2 instead of 4). Set <b>Protection</b> to <b>Lock around read and write</b>: <b>6</b> schedules remain, and none is wrong.</li>
+    <li>Now the trap. Set <b>Protection</b> to <b>Lock each step separately</b>: it looks locked, but the lock is let go between the read and the write, so there are <b>70</b> interleavings and <b>64</b> wrong ones again. Then try <b>Compare-and-swap retry loop</b>: <b>226</b> schedules, because failed swaps retry, and none is wrong.</li>
+    <li>Set <b>Scenario</b> to <b>Withdraw 80 from 100</b> and <b>Protection</b> to <b>No protection</b>: the check and the withdrawal are separate steps, so <b>18</b> of <b>20</b> schedules pay out twice and the lowest balance is <b>-60</b>.</li>
+  </ol>
+  <div class="pg rc" data-rc>
+    <div class="pg-row">
+      <label>Scenario <select class="pg-in" data-scenario><option value="counter" selected>Counter increments</option><option value="withdraw">Withdraw 80 from 100</option></select></label>
+      <label>Protection <select class="pg-in" data-variant>
+        <option value="unsafe" selected>No protection</option>
+        <option value="lock">Lock around read and write</option>
+        <option value="lockEach">Lock each step separately</option>
+        <option value="atomic">Atomic operation</option>
+        <option value="cas">Compare-and-swap retry loop</option>
+      </select></label>
+      <label>Size <select class="pg-in" data-size></select></label>
+    </div>
+    <div class="pg-grid">
+      <div class="pg-box" data-b1><h3>Interleavings explored</h3><span class="pg-mono" data-o1></span><span class="pg-note" data-n1></span></div>
+      <div class="pg-box" data-b2><h3>Wrong results</h3><span class="pg-mono" data-o2></span><span class="pg-note" data-n2></span></div>
+      <div class="pg-box" data-b3><h3>Lowest final value</h3><span class="pg-mono" data-o3></span><span class="pg-note" data-n3></span></div>
+    </div>
+    <div class="pg-box" style="--c: var(--border)">
+      <h3>Final values across all schedules</h3>
+      <div class="rc-hist" data-hist></div>
+    </div>
+    <div class="pg-box" style="--c: var(--border)">
+      <h3 data-tracetitle>First bad schedule</h3>
+      <ol class="pg-log" data-log tabindex="0" aria-label="A schedule, step by step"></ol>
+    </div>
+  </div>
+</PlaygroundShell>
+<script>
+  import { query, formatThousands } from '../playground';
+  type Scenario = 'counter' | 'withdraw';
+  const LIMIT = 80;
+  interface State { shared: number; owner: number; pc: number[]; tmp: number[] }
+  const PROGRAMS: Record<Scenario, Record<string, string[]>> = {
+    counter: { unsafe: ['R', 'W'], lock: ['L', 'R', 'W', 'U'], lockEach: ['L', 'R', 'U', 'L', 'W', 'U'], atomic: ['A'], cas: ['R', 'C'] },
+    withdraw: { unsafe: ['R', 'K', 'S'], lock: ['L', 'R', 'K', 'S', 'U'], lockEach: ['L', 'R', 'U', 'K', 'L', 'S', 'U'], atomic: ['D'], cas: ['R', 'K', 'X'] },
+  };
+  const program = (scenario: Scenario, variant: string, iters: number): string[] => {
+    let ops: string[] = [];
+    for (let i = 0; i < iters; i++) ops = ops.concat(PROGRAMS[scenario][variant]);
+    return ops;
+  };
+  const runnable = (st: State, prog: string[], i: number) => st.pc[i] < prog.length && !(prog[st.pc[i]] === 'L' && st.owner !== -1);
+
+  // The same model as the code samples. Returns the new state and a plain-English line for the step.
+  function step(st: State, prog: string[], i: number): [State, string] {
+    const s: State = { shared: st.shared, owner: st.owner, pc: st.pc.slice(), tmp: st.tmp.slice() };
+    const op = prog[s.pc[i]];
+    s.pc[i]++;
+    let say = '';
+    if (op === 'R') { s.tmp[i] = s.shared; say = `reads ${s.shared}`; }
+    else if (op === 'W') { s.shared = s.tmp[i] + 1; say = `writes ${s.shared}`; }
+    else if (op === 'A') { s.shared += 1; say = `adds 1 in one atomic step, now ${s.shared}`; }
+    else if (op === 'S') { s.shared -= LIMIT; say = `pays out 80, balance ${s.shared}`; }
+    else if (op === 'D') { if (s.shared >= LIMIT) { s.shared -= LIMIT; say = `checks and pays out 80 in one atomic step, balance ${s.shared}`; } else say = 'checks and finds too little'; }
+    else if (op === 'L') { s.owner = i; say = 'takes the lock'; }
+    else if (op === 'U') { s.owner = -1; say = 'releases the lock'; }
+    else if (op === 'K') { if (s.tmp[i] < LIMIT) { if (s.owner === i) s.owner = -1; s.pc[i] = prog.length; say = `checks its copy (${s.tmp[i]}): too little, stops`; } else say = `checks its copy (${s.tmp[i]}): enough`; }
+    else if (op === 'C') { if (s.shared === s.tmp[i]) { s.shared = s.tmp[i] + 1; say = `swaps ${s.tmp[i]} for ${s.shared}: ok`; } else { s.pc[i] -= 2; say = `swap fails (it holds ${s.tmp[i]}, now ${s.shared}): retries`; } }
+    else if (op === 'X') { if (s.shared === s.tmp[i]) { s.shared -= LIMIT; say = `swaps ${s.tmp[i]} for ${s.shared}: ok`; } else { s.pc[i] -= 3; say = `swap fails (it holds ${s.tmp[i]}, now ${s.shared}): retries`; } }
+    return [s, say];
+  }
+
+  interface Result { total: number; wrong: number; deadlocks: number; lowest: number; example: number[] | null; finals: Map<number, number>; expected: number; prog: string[]; start: State }
+  function explore(scenario: Scenario, variant: string, threads: number, iters: number): Result {
+    const prog = program(scenario, variant, iters);
+    const expected = scenario === 'counter' ? threads * iters : 20;
+    const start: State = { shared: scenario === 'counter' ? 0 : 100, owner: -1, pc: Array(threads).fill(0), tmp: Array(threads).fill(0) };
+    const r: Result = { total: 0, wrong: 0, deadlocks: 0, lowest: 1000000, example: null, finals: new Map(), expected, prog, start };
+    const trail: number[] = [];
+    const walk = (st: State) => {
+      const ready: number[] = [];
+      for (let i = 0; i < threads; i++) if (runnable(st, prog, i)) ready.push(i);
+      if (ready.length === 0) {
+        if (st.pc.some((p) => p < prog.length)) { r.deadlocks++; return; }
+        r.total++;
+        if (st.shared < r.lowest) r.lowest = st.shared;
+        r.finals.set(st.shared, (r.finals.get(st.shared) ?? 0) + 1);
+        if (st.shared !== expected) { r.wrong++; if (!r.example) r.example = trail.slice(); }
+        return;
+      }
+      for (const i of ready) { trail.push(i); walk(step(st, prog, i)[0]); trail.pop(); }
+    };
+    walk(start);
+    return r;
+  }
+
+  const SIZES: Record<Scenario, [number, number, string][]> = {
+    counter: [[2, 1, '2 threads, 1 increment each'], [2, 2, '2 threads, 2 increments each'], [2, 3, '2 threads, 3 increments each'], [3, 1, '3 threads, 1 increment each']],
+    withdraw: [[2, 1, '2 customers'], [3, 1, '3 customers']],
+  };
+  const NAMES = 'ABC';
+
+  document.querySelectorAll<HTMLElement>('[data-rc]').forEach((root) => {
+    const q = query(root);
+    const scenarioEl = q<HTMLSelectElement>('[data-scenario]');
+    const sizeEl = q<HTMLSelectElement>('[data-size]');
+    function fillSizes() {
+      const keep = sizeEl.value;
+      sizeEl.textContent = '';
+      SIZES[scenarioEl.value as Scenario].forEach(([t, k, label]) => { const o = document.createElement('option'); o.value = `${t},${k}`; o.textContent = label; sizeEl.appendChild(o); });
+      if (Array.from(sizeEl.options).some((o) => o.value === keep)) sizeEl.value = keep;
+    }
+    const box = (n: number, good: boolean) => q<HTMLElement>(`[data-b${n}]`).style.setProperty('--c', good ? 'var(--good)' : 'var(--bad)');
+    function draw() {
+      const scenario = scenarioEl.value as Scenario;
+      const variant = q<HTMLSelectElement>('[data-variant]').value;
+      const [threads, iters] = sizeEl.value.split(',').map(Number);
+      const r = explore(scenario, variant, threads, iters);
+      q('[data-o1]').textContent = formatThousands(r.total);
+      q('[data-n1]').textContent = r.total > 0 && variant === 'cas' ? 'more than the plain count: every failed swap adds a retry, and so more possible orders' : variant === 'lock' || variant === 'atomic' ? 'few: a lock or an atomic step removes the orders in which the pieces could mix' : 'every order in which the threads\' steps can be mixed';
+      q('[data-o2]').textContent = `${formatThousands(r.wrong)}${r.total ? ` of ${formatThousands(r.total)}` : ''}`;
+      q('[data-n2]').textContent = r.wrong === 0 ? 'every schedule ends with the right value' : scenario === 'counter' ? `these end below ${r.expected}: updates were lost` : 'these pay out more than once: the balance goes below zero';
+      box(2, r.wrong === 0);
+      q('[data-o3]').textContent = String(r.lowest);
+      q('[data-n3]').textContent = `the right answer is ${r.expected}`;
+      box(3, r.lowest === r.expected);
+      box(1, true);
+      const hist = q('[data-hist]'); hist.textContent = '';
+      const keys = Array.from(r.finals.keys()).sort((a, b) => a - b);
+      const max = Math.max(...r.finals.values());
+      for (const k of keys) {
+        const row = document.createElement('div'); row.className = 'rc-row';
+        const lab = document.createElement('span'); lab.className = 'pg-mono rc-lab'; lab.textContent = String(k);
+        const bar = document.createElement('span'); bar.className = 'rc-bar'; bar.style.width = `${Math.max(2, (r.finals.get(k)! * 100) / max)}%`; bar.style.setProperty('--c', k === r.expected ? 'var(--good)' : 'var(--bad)');
+        const n = document.createElement('span'); n.className = 'pg-note rc-n'; n.textContent = `${formatThousands(r.finals.get(k)!)} schedules${k === r.expected ? ' (right)' : ''}`;
+        row.append(lab, bar, n); hist.appendChild(row);
+      }
+      const log = q('[data-log]'); log.textContent = '';
+      const sched = r.example ?? (() => { const s: number[] = []; let st = r.start; for (;;) { const ready: number[] = []; for (let i = 0; i < threads; i++) if (runnable(st, r.prog, i)) ready.push(i); if (!ready.length) break; s.push(ready[0]); st = step(st, r.prog, ready[0])[0]; } return s; })();
+      q('[data-tracetitle]').textContent = r.example ? `First bad schedule: ${r.example.map((t) => NAMES[t]).join('')}` : 'First schedule (every schedule ends right)';
+      let st = r.start;
+      const shown = sched.slice(0, 26);
+      for (const t of shown) {
+        const [next, say] = step(st, r.prog, t); st = next;
+        const li = document.createElement('li'); li.textContent = `Thread ${NAMES[t]} ${say}`; log.appendChild(li);
+      }
+      if (sched.length > shown.length) { const li = document.createElement('li'); li.textContent = `... ${sched.length - shown.length} more steps, then the run ends at ${(() => { let s = r.start; for (const t of sched) s = step(s, r.prog, t)[0]; return s.shared; })()}`; log.appendChild(li); }
+      else { const li = document.createElement('li'); li.textContent = `End: the value is ${st.shared}, the right answer is ${r.expected}`; log.appendChild(li); }
+    }
+    fillSizes();
+    scenarioEl.addEventListener('change', () => { fillSizes(); draw(); });
+    root.addEventListener('change', draw);
+    draw();
+  });
+</script>
+<style is:global>
+  .playground .rc-hist { display: grid; gap: 6px; }
+  .playground .rc-row { display: grid; grid-template-columns: 3.5em 1fr 11em; gap: 8px; align-items: center; }
+  .playground .rc-lab { text-align: right; }
+  .playground .rc-bar { display: block; height: 14px; border-radius: 3px; background: var(--c); }
+  @media (max-width: 560px) { .playground .rc-row { grid-template-columns: 3em 1fr; } .playground .rc-n { grid-column: 1 / -1; } }
+</style>
