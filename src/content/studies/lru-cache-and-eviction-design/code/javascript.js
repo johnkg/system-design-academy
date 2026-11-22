@@ -2,6 +2,7 @@
 // requests ask for 1,000 hot keys (some hotter than others) and 15% for one of 50,000 cold keys. In one variant a
 // report job reads 20,000 old keys once, between request 80,000 and 120,000. In another the hot set moves to other keys
 // at request 140,000. The requests come from a seeded generator, so the output never changes. Integers only.
+// The model is the catalog of the case study scaled down 1 to 1,000: 1,000 hot keys stand for 1 million, 50,000 cold keys for 50 million.
 const REQUESTS = 200000;
 const HOT = 1000, HOT_PCT = 85;                 // hot keys, and the share of requests that ask for them
 const COLD_BASE = 5000, COLD = 50000;           // the cold keys: 5,000 up to 54,999
