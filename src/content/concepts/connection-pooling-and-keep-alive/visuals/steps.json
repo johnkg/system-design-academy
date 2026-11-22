@@ -1,0 +1,64 @@
+{
+  "actors": [
+    { "id": "app", "label": "App instance", "role": "app", "x": 12, "y": 50 },
+    { "id": "pool", "label": "Connection pool", "role": "pool", "x": 12, "y": 18 },
+    { "id": "lb", "label": "Load balancer (60 s idle)", "role": "lb", "x": 50, "y": 50 },
+    { "id": "server", "label": "Server", "role": "server", "x": 88, "y": 50 }
+  ],
+  "linkLabel": "connection",
+  "meters": [
+    { "id": "lat", "label": "Average latency per request (ms)", "max": 200, "start": 140, "warnAt": 160 },
+    { "id": "conns", "label": "Connections the server sees (limit 100)", "max": 320, "start": 0, "warnAt": 101 }
+  ],
+  "frames": [
+    {
+      "narration": "Without reuse every request opens a connection. At 40 ms RTT, TCP costs one round trip and TLS 1.3 another: 80 ms before the request goes out. The request itself is 40 ms plus 20 ms of service, so the average is 140 ms. With TLS 1.2 it would be 180 ms.",
+      "messages": [
+        { "from": "app", "to": "server", "label": "SYN, TLS hello (80 ms)" },
+        { "from": "app", "to": "server", "label": "request (60 ms)" }
+      ],
+      "meters": { "lat": 140 },
+      "highlight": ["app"]
+    },
+    {
+      "narration": "With a pool the first burst still opens 32 connections (4 instances x 8), then they are reused. Requests cost 60 ms. The average over 6 bursts is 73 ms, and the 6 x 32 = 192 requests need only 32 connections.",
+      "links": { "add": [["app", "lb"], ["lb", "server"]] },
+      "states": { "pool": "8 open, reused" },
+      "meters": { "lat": 73, "conns": 32 },
+      "highlight": ["pool"]
+    },
+    {
+      "narration": "Now traffic is sparse: a burst every 70 seconds. The load balancer drops connections idle for 60 seconds, but the client pool keeps them for 90. The pool hands out a connection the other side already closed.",
+      "states": { "lb": "dropped idle connections", "pool": "thinks they are open" },
+      "highlight": ["pool", "lb"]
+    },
+    {
+      "narration": "The send fails: a reset arrives one round trip later (40 ms wasted), then the client must open a new connection (80 ms) and resend. 160 of 192 requests hit this, and the average rises to 173 ms, worse than never pooling.",
+      "messages": [
+        { "from": "app", "to": "lb", "label": "request on dead connection" },
+        { "from": "lb", "to": "app", "label": "RST" }
+      ],
+      "meters": { "lat": 173 },
+      "highlight": ["app"]
+    },
+    {
+      "narration": "Fix the order: client idle timeout 50 s, below the 60 s remote. The client now closes cleanly and opens a fresh connection each time, with no wasted send. Average 140 ms and 0 stale errors. The fix removes the errors, though not the setup cost: for that the traffic must be dense enough to reuse.",
+      "states": { "pool": "idle timeout 50 s < 60 s" },
+      "meters": { "lat": 140 },
+      "highlight": ["pool"]
+    },
+    {
+      "narration": "Pool size is multiplied by instance count. 40 instances each holding 8 connections want 320; the server accepts 100. Instances after about the first 12 are refused on every burst and 1,320 requests fail.",
+      "messages": [{ "from": "app", "to": "server", "label": "connection refused" }],
+      "states": { "server": "100 of 100 used" },
+      "meters": { "conns": 320 },
+      "highlight": ["server"]
+    },
+    {
+      "narration": "Cap the pool at 2 per instance: 40 x 2 = 80 connections, all served, 0 refused. The cost is queueing inside the instance: the 8-request burst needs 4 waves of 60 ms, so the maximum latency is 240 ms and the average 153 ms. Size from measured concurrency, not from fear.",
+      "states": { "server": "80 of 100 used" },
+      "meters": { "conns": 80, "lat": 153 },
+      "highlight": ["pool", "server"]
+    }
+  ]
+}

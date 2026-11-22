@@ -1,0 +1,117 @@
+{
+  "name": "Connection Pooling and Keep-Alive",
+  "area": "networking",
+  "difficulty": "intermediate",
+  "intent": "Reuse established TCP and TLS connections instead of paying for a new one per request, and keep the idle timeouts of client, load balancer and server in the right order.",
+  "scenario": "4 app instances each send a burst of 8 requests every 30 or 70 seconds to a service behind a load balancer. The path has a 40 ms round trip, the service takes 20 ms per request, TLS 1.3 adds one round trip and the server accepts at most 100 connections.",
+  "problem": "Opening a connection is expensive: one round trip for the TCP handshake, one or two more for TLS, and a slow-start window that begins small. For a 20 ms request over a 40 ms path, a new connection makes it 140 ms instead of 60 ms. Reusing connections removes that cost, but a pool is shared mutable state with its own failure modes: connections that died silently while idle, a pool so big that many app instances exhaust the server, and a pool so small that requests queue.",
+  "howItWorks": [
+    {
+      "title": "A new connection costs round trips before the first byte",
+      "text": "TCP needs one round trip (SYN, SYN-ACK, ACK) before data can flow. TLS 1.3 adds one more, TLS 1.2 typically two. At 40 ms RTT that is 80 ms or 120 ms of setup before the request even leaves. The congestion window also starts small on a fresh connection, so the first response is slower than it would be on a warm one."
+    },
+    {
+      "title": "Keep-alive and pools reuse the connection",
+      "text": "HTTP/1.1 keeps the connection open after a response by default, and HTTP/2 multiplexes many requests over one. A pool is the client-side bookkeeping: a set of open connections, handed out per request and returned afterwards. In the sample, with reuse each request costs 60 ms (one round trip plus 20 ms of service) instead of 140, and only the first burst pays for 32 new connections."
+    },
+    {
+      "title": "Pool size is a concurrency limit, not a speed knob",
+      "text": "A pool of P connections lets P requests per instance run at once; the rest wait for a free one. By Little's law the pool you need is about request rate x time per request. Too small and requests queue (a pool of 2 with a burst of 8 gives a max latency of 240 ms). Too large and, multiplied by the number of app instances, it can exceed what the server accepts."
+    },
+    {
+      "title": "Idle timeouts form a chain and the order matters",
+      "text": "Connections are closed after being idle by the server, by any load balancer or NAT in between (typically around a minute for many cloud load balancers, with idle NAT entries expiring too), and by the client's own pool. The client must give up first: its idle timeout has to be shorter than every timeout downstream. Otherwise the client holds a connection it believes is open while the other side has dropped it."
+    },
+    {
+      "title": "The stale connection error",
+      "text": "When the client sends on a connection the peer already dropped, the send fails with a reset or a broken pipe, or just hangs until a timeout. It happens on sparse traffic, which is why it shows up at night or in low-traffic environments and never in a load test. In the sample, with a client idle timeout of 90 s against 60 s remote, 160 of 192 requests hit a stale connection and the average latency rises to 173 ms, worse than no pooling at all (140 ms). Setting the client timeout to 50 s removes every stale error."
+    },
+    {
+      "title": "Defences: shorter client timeout, validation, retries, limits",
+      "text": "Set client idle timeouts below the shortest timeout in the path. Some pools check a connection before use or send periodic keep-alive probes. Retry idempotent requests that fail on a reused connection, since the server never saw them. Cap total connections per instance so that instances x pool size stays under what the server allows: in the sample 40 instances with a pool of 8 want 320 connections, 100 are accepted and 1,320 requests are refused; a pool of 2 needs 80 and every request is served."
+    }
+  ],
+  "pros": [
+    "Removes 2 to 3 round trips of handshake from most requests",
+    "Keeps the congestion window warm, so large responses start faster",
+    "Reduces CPU spent on TLS handshakes on both ends",
+    "A bounded pool also bounds the load one client can put on a server"
+  ],
+  "cons": [
+    "Connections can die silently while idle, so a pooled one is not guaranteed to work",
+    "Pools add configuration that must be coordinated across client, proxy and server",
+    "Long-lived connections pin traffic to a server, which skews load balancing and delays rebalancing after a deploy",
+    "Multiplied by many instances, a pool that looks small can overwhelm the server"
+  ],
+  "whenToUse": [
+    "Any client that makes repeated requests to the same host: databases, internal APIs, third-party APIs",
+    "Services with TLS, where the handshake is the dominant per-request cost",
+    "Setting pool max sizes from measured concurrency (rate x latency), plus headroom",
+    "Autoscaled fleets, where the server connection limit must be divided across instances"
+  ],
+  "whenNotToUse": [
+    "Very rare requests (one per few minutes), where the connection will idle out before it is reused",
+    "Sizing a pool 'big to be safe' without counting how many instances will run it",
+    "Relying on keep-alive alone to hide a slow server: pooling removes setup cost, not service time",
+    "Reusing connections for non-idempotent requests without a plan for the ambiguous failure"
+  ],
+  "pitfalls": [
+    "Client idle timeout longer than the load balancer or server timeout: every request after a quiet spell hits a dead connection",
+    "Testing only under steady load: stale connections need gaps in traffic and never appear in a load test",
+    "Retrying non-idempotent requests after a reset: the server may have processed the first attempt",
+    "Pool size multiplied by instance count: 40 instances with 8 connections each is 320, not 8",
+    "Pool too small: 8 requests over 2 connections wait in line, and the symptom is latency, not errors",
+    "Keep-alive without a max lifetime: connections stay on old servers after a deploy and traffic stays uneven",
+    "Forgetting that a NAT or firewall in the path has its own idle timeout and silently drops the mapping"
+  ],
+  "related": [
+    { "kind": "concept", "slug": "latency-and-round-trips" },
+    { "kind": "concept", "slug": "tls-and-https" },
+    { "kind": "concept", "slug": "tcp-congestion-control" },
+    { "kind": "concept", "slug": "http-versions" },
+    { "kind": "concept", "slug": "thread-pools-and-sizing" },
+    { "kind": "concept", "slug": "retries-and-backoff" },
+    { "kind": "concept", "slug": "idempotency" }
+  ],
+  "roles": [
+    { "id": "app", "label": "App instance", "description": "The client that owns a pool of connections and hands them to requests." },
+    { "id": "pool", "label": "Connection pool", "description": "Tracks open connections, last use time and the client-side idle timeout." },
+    { "id": "lb", "label": "Load balancer", "description": "Sits between client and server and drops connections that stay idle too long." },
+    { "id": "server", "label": "Server", "description": "Serves requests and limits the number of connections it accepts." }
+  ],
+  "quiz": [
+    {
+      "question": "A client pool keeps idle connections for 90 seconds. The load balancer drops idle connections after 60 seconds. The service has bursts of traffic every 70 seconds. What happens?",
+      "options": [
+        "Each burst starts with requests sent on dead connections that fail or hang",
+        "The pool grows because idle connections are never reused",
+        "The load balancer sends a keep-alive probe on the client's behalf",
+        "The server refuses the connections because the pool is too large"
+      ],
+      "answer": 0,
+      "explanation": "The client still believes the connections are open, but the load balancer dropped them after 60 seconds. The first send after the gap fails with a reset or timeout. The client idle timeout must be shorter than the 60 second limit."
+    },
+    {
+      "question": "40 app instances each use a pool of 8 connections to a service that accepts at most 100. What is the best fix?",
+      "options": [
+        "Raise the pool size so requests never wait",
+        "Lower the per-instance pool so instances x pool stays under the server limit",
+        "Disable keep-alive so connections close after every request",
+        "Increase the client idle timeout"
+      ],
+      "answer": 1,
+      "explanation": "The server sees 40 x 8 = 320 wanted connections against a limit of 100, so many requests are refused. A pool of 2 needs 80. Disabling keep-alive adds handshake cost, and a longer idle timeout makes things worse."
+    },
+    {
+      "question": "A service runs at steady high load in a load test with no errors, then shows connection reset errors at night. Which is the most likely cause?",
+      "options": [
+        "Slow start makes the night-time responses too slow",
+        "The pool is too small for the low traffic",
+        "TLS 1.3 session tickets expire at night",
+        "Idle connections were dropped by the load balancer before the client reused them"
+      ],
+      "answer": 3,
+      "explanation": "Under steady load no connection sits idle long enough to be dropped. With sparse night traffic, connections idle past the remote timeout and the next request lands on a dead one. Shorten the client timeout or validate connections before use."
+    }
+  ]
+}
