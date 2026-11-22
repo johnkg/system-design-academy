@@ -16,12 +16,14 @@ function analyze(design, o) {
     if (o.logBodies) { inScope[5] = true; atRest.push(COMPONENTS[5]); }
     if (o.store && o.backups) { inScope[6] = true; atRest.push(COMPONENTS[6]); }
     if (o.store && o.warehouse) { inScope[7] = true; atRest.push(COMPONENTS[7]); }
-  } else if (design === 'hosted') {
-    inScope[0] = true; // your page serves the code around the provider's fields, so it can still affect them
+  } else {
+    // hosted: your page serves the code around the provider's fields, so it can still affect them
+    // redirect: your page decides where the customer is sent, so a tampered page could send them to a fake payment page
+    inScope[0] = true;
   }
   const count = inScope.filter(Boolean).length;
   const serverSide = inScope.slice(1).some(Boolean);
-  const audit = serverSide ? 'heavy' : count > 0 ? 'light' : 'lightest';
+  const audit = serverSide ? 'heavy' : 'light';
   return { inScope, count, atRest, audit };
 }
 
