@@ -11,6 +11,9 @@ const quizSchema = z.array(z.object({
   explanation: z.string(),
 })).length(QUIZ_QUESTIONS).optional();
 
+// Set once an independent accuracy review of the page has been done (see /accuracy/). The date is that of the review.
+const factChecked = z.string().regex(/^\d{4}-\d{2}-\d{2}$/).optional();
+
 const patterns = defineCollection({
   // One folder per pattern; the folder name is the slug.
   loader: glob({
@@ -34,6 +37,7 @@ const patterns = defineCollection({
     related: z.array(z.string()).default([]),
     roles: z.array(z.object({ id: z.string(), label: z.string(), description: z.string() })),
     quiz: quizSchema,
+    factChecked,
   }),
 });
 
@@ -60,6 +64,7 @@ const concepts = defineCollection({
     related: z.array(z.object({ kind: z.enum(['concept', 'pattern']), slug: z.string() })).default([]),
     roles: z.array(z.object({ id: z.string(), label: z.string(), description: z.string() })),
     quiz: quizSchema,
+    factChecked,
   }),
 });
 
@@ -87,6 +92,7 @@ const studies = defineCollection({
     nodes: z.array(z.object({ id: z.string(), label: z.string(), kind: z.string(), x: z.number(), y: z.number(), at: z.number().default(0), until: z.number().optional() })),
     edges: z.array(z.object({ from: z.string(), to: z.string(), at: z.number().default(0), until: z.number().optional() })),
     quiz: quizSchema,
+    factChecked,
     steps: z.array(z.object({
       title: z.string(),
       problem: z.string(),
