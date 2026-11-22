@@ -51,7 +51,7 @@ public static class Program
             else if (mode == "optimistic")
             {
                 shownTotal += UiMs;                           // the screen changes at once
-                if (fails) rolledBack++;                      // ...and is wrong until the rejection arrives
+                if (fails) rolledBack++;                      // ...and is wrong until the failure arrives
                 if (online && !fails) saved++;
                 if (!online) lost++;                          // the user saw it applied, the pending request dies with the app
             }

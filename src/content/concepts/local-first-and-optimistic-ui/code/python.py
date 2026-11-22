@@ -46,7 +46,7 @@ def run(mode, latency_ms, fail_pct, offline_after):
         elif mode == "optimistic":
             shown_total += UI_MS                                 # the screen changes at once
             if fails:
-                rolled_back += 1                                 # ...and is wrong until the rejection arrives
+                rolled_back += 1                                 # ...and is wrong until the failure arrives
             if online and not fails:
                 saved += 1
             if not online:
