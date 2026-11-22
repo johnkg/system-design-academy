@@ -9,7 +9,7 @@ public static class Program
 {
     static List<int> Bytes(string s) => s.Select(c => (int)c).ToList();
 
-    // The output of this hash is its internal state, with no final step. That is the property length extension needs.
+    // The output of this hash is its internal state, with no final step. That is the property length extension needs (real SHA-256 also pads, so a real forged message carries the padding bytes too).
     static uint Step(uint h, IEnumerable<int> bs)
     {
         foreach (var b in bs) { h ^= (uint)b; h = unchecked(h * 16777619u); }
