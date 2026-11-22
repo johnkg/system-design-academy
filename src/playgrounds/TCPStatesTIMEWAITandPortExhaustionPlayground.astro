@@ -1,0 +1,100 @@
+---
+import PlaygroundShell from '../components/PlaygroundShell.astro';
+---
+<PlaygroundShell title="Simulate it" hint="Three small connection-table models: source ports used up by TIME_WAIT, sockets stuck in CLOSE_WAIT, and an accept queue that overflows.">
+  <ol class="how">
+    <li>In the first panel set <b>New connections per second</b> to <b>600</b> with <b>Who closes first</b> set to Client: <b>15,536</b> attempts fail and TIME_WAIT pins at <b>28,232</b>. Set <b>Source IPs</b> to <b>2</b> and nothing fails. Set <b>Who closes first</b> to Server (1 source IP) and nothing fails either, but the server holds <b>36,000</b> TIME_WAIT entries.</li>
+    <li>In the second panel set <b>Leak per 1000 requests</b> to <b>5</b>: the descriptor limit is reached at tick <b>2,000</b>. Set it to <b>20</b>: tick <b>500</b>, with 1,000 sockets stuck in CLOSE_WAIT.</li>
+    <li>In the third panel with <b>Accept queue size</b> 8 and <b>App accepts per tick</b> 10, <b>154</b> connections are dropped. Set the queue to 32: 0 dropped. Then set <b>App accepts per tick</b> to 5: <b>88</b> dropped again.</li>
+  </ol>
+  <div class="pg tcpst" data-tcpst>
+    <h3>Source ports and TIME_WAIT</h3>
+    <div class="pg-row">
+      <label>New connections per second <select class="pg-in" data-rate><option value="200">200</option><option value="400" selected>400</option><option value="600">600</option><option value="1000">1000</option></select></label>
+      <label>Who closes first <select class="pg-in" data-closer><option value="client" selected>Client</option><option value="server">Server</option></select></label>
+      <label>TIME_WAIT hold <select class="pg-in" data-tw><option value="60" selected>60 s (typical Linux)</option><option value="1">1 s (reuse enabled)</option></select></label>
+      <label>Source IPs <select class="pg-in" data-ips><option value="1" selected>1</option><option value="2">2</option></select></label>
+    </div>
+    <p class="pg-mono" data-life></p>
+    <div class="pg-grid">
+      <div class="pg-box" style="--c: var(--role-1)"><h3>Connections made</h3><span class="pg-mono" data-ok>0</span><span class="pg-note">in 120 seconds</span></div>
+      <div class="pg-box" style="--c: var(--bad)"><h3>Failed (cannot assign address)</h3><span class="pg-mono" data-failed>0</span></div>
+      <div class="pg-box" style="--c: var(--role-3)"><h3>Peak TIME_WAIT on the closing side</h3><span class="pg-mono" data-peak>0</span></div>
+      <div class="pg-box" style="--c: var(--role-4)"><h3>Sustainable rate</h3><span class="pg-mono" data-ceil>0</span><span class="pg-note">new connections per second</span></div>
+    </div>
+    <p class="pg-out" data-verdict aria-live="polite"></p>
+    <h3>CLOSE_WAIT leak</h3>
+    <div class="pg-row">
+      <label>Leak per 1000 requests <select class="pg-in" data-leak><option value="0">0</option><option value="5">5</option><option value="20" selected>20</option></select></label>
+    </div>
+    <p class="pg-out" data-leakout aria-live="polite"></p>
+    <h3>Accept queue</h3>
+    <div class="pg-row">
+      <label>Accept queue size <select class="pg-in" data-qsize><option value="8" selected>8</option><option value="32">32</option></select></label>
+      <label>App accepts per tick <select class="pg-in" data-arate><option value="5">5</option><option value="10" selected>10</option></select></label>
+    </div>
+    <div class="pg-grid">
+      <div class="pg-box" style="--c: var(--role-2)"><h3>Accepted</h3><span class="pg-mono" data-acc>0</span></div>
+      <div class="pg-box" style="--c: var(--bad)"><h3>Dropped</h3><span class="pg-mono" data-drop>0</span><span class="pg-note">of 210 arrivals</span></div>
+    </div>
+    <p class="pg-note">Model: one tick is one second. Source ports are 28,232 (typically 32768 to 60999 on Linux) per source IP to one destination address and port; the closing side keeps each connection in TIME_WAIT for the hold time (60 s is the Linux constant; reuse of TIME_WAIT sockets for outgoing connections, typically needing TCP timestamps, shortens it to about a second). The server holds 100 requests per tick against a 1,024 descriptor limit with 24 already used. The accept queue gets a burst of 30 every third tick for 21 ticks. All values are integers from the same model as the code samples.</p>
+  </div>
+</PlaygroundShell>
+<script>
+  import { query, numberValue, formatThousands } from '../playground';
+  const RANGE = 28232, SECONDS = 120, SYS_TW = 60;
+  function ports(rate: number, tw: number, closer: string, ips: number) {
+    const cap = RANGE * ips;
+    const expiring = new Array(SECONDS + tw + 1).fill(0);
+    let held = 0, ok = 0, failed = 0, peak = 0;
+    for (let t = 0; t < SECONDS; t++) {
+      held -= expiring[t];
+      const got = closer === 'client' ? Math.min(rate, cap - held) : rate;
+      held += got; ok += got; failed += rate - got; expiring[t + tw] += got; peak = Math.max(peak, held);
+    }
+    return { ok, failed, peak };
+  }
+  function leak(perTick: number, perMille: number, limit: number) {
+    const base = 24;
+    for (let t = 1; t <= 5000; t++) {
+      const leaked = Math.floor(perTick * t * perMille / 1000);
+      if (leaked + base >= limit) return { t, leaked };
+    }
+    return null;
+  }
+  function accept(queueSize: number, rate: number) {
+    let queue = 0, dropped = 0, accepted = 0;
+    for (let t = 0; t <= 20; t++) {
+      const arrivals = t % 3 === 0 ? 30 : 0;
+      const room = Math.min(arrivals, queueSize - queue);
+      queue += room; dropped += arrivals - room;
+      const taken = Math.min(rate, queue);
+      queue -= taken; accepted += taken;
+    }
+    return { accepted, dropped };
+  }
+
+  document.querySelectorAll<HTMLElement>('[data-tcpst]').forEach((root) => {
+    const q = query(root); const val = numberValue(q);
+    const setText = (s: string, v: string) => { q(s).textContent = v; };
+    function draw() {
+      const rate = val('[data-rate]'), tw = val('[data-tw]'), ips = val('[data-ips]');
+      const closer = q<HTMLSelectElement>('[data-closer]').value;
+      const r = ports(rate, tw, closer, ips);
+      setText('[data-ok]', formatThousands(r.ok)); setText('[data-failed]', formatThousands(r.failed)); setText('[data-peak]', formatThousands(r.peak));
+      setText('[data-ceil]', formatThousands(Math.floor(RANGE * ips / tw)));
+      setText('[data-life]', closer === 'client'
+        ? 'client: SYN_SENT > ESTABLISHED > FIN_WAIT_1 > FIN_WAIT_2 > TIME_WAIT > CLOSED | server: LISTEN > SYN_RCVD > ESTABLISHED > CLOSE_WAIT > LAST_ACK > CLOSED'
+        : 'client: SYN_SENT > ESTABLISHED > CLOSE_WAIT > LAST_ACK > CLOSED | server: LISTEN > SYN_RCVD > ESTABLISHED > FIN_WAIT_1 > FIN_WAIT_2 > TIME_WAIT > CLOSED');
+      setText('[data-verdict]', r.failed > 0 ? 'The client needs more source ports than exist for this one destination: connects fail. Reuse connections, add source IPs, let the server close, or enable TIME_WAIT reuse.'
+        : closer === 'server' ? `The server holds the TIME_WAIT entries (${formatThousands(r.peak)}), which costs memory but no ports, because its clients all differ.`
+        : tw === SYS_TW && r.peak * 100 > RANGE * ips * 80 ? 'Close to the ceiling: a little more load and connects will fail.' : 'Enough ports for this rate.');
+      const lk = leak(100, val('[data-leak]'), 1024);
+      setText('[data-leakout]', lk ? `The 1,024 descriptor limit is reached at tick ${formatThousands(lk.t)} with ${formatThousands(lk.leaked)} sockets stuck in CLOSE_WAIT. The server then refuses everything.` : 'No leak: CLOSE_WAIT stays empty and the limit is never reached.');
+      const a = accept(val('[data-qsize]'), val('[data-arate]'));
+      setText('[data-acc]', formatThousands(a.accepted)); setText('[data-drop]', formatThousands(a.dropped));
+    }
+    root.querySelectorAll('select').forEach((el) => el.addEventListener('input', draw));
+    draw();
+  });
+</script>

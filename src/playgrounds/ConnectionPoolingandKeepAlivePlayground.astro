@@ -1,0 +1,91 @@
+---
+import PlaygroundShell from '../components/PlaygroundShell.astro';
+---
+<PlaygroundShell title="Simulate it" hint="Six bursts of requests from app instances through a load balancer to a server. Change the pool, the idle timeouts and the fleet size and watch setups, stale errors and refusals.">
+  <ol class="how">
+    <li>With the defaults (<b>Client idle timeout (s)</b> 0, meaning no reuse) every request opens a connection: <b>192</b> new connections and an average of <b>140 ms</b>. Set <b>Client idle timeout (s)</b> to <b>50</b>: only <b>32</b> new connections and an average of <b>73 ms</b>.</li>
+    <li>Set <b>Gap between bursts (s)</b> to <b>70</b> and <b>Client idle timeout (s)</b> to <b>90</b>, above the 60 s remote timeout: <b>160</b> stale errors and an average of <b>173 ms</b>, worse than no reuse. Set the client timeout back to 50 and the stale errors drop to 0.</li>
+    <li>Set <b>Gap between bursts (s)</b> to 30, <b>Client idle timeout (s)</b> to 50, <b>App instances</b> to <b>40</b> and keep the pool at <b>8</b>: the server accepts 100 and <b>1,320</b> requests are refused. Set <b>Pool size per instance</b> to <b>2</b>: 80 connections, none refused, but the maximum latency is <b>240 ms</b>.</li>
+  </ol>
+  <div class="pg cpool" data-cpool>
+    <div class="pg-row">
+      <label>Pool size per instance <select class="pg-in" data-p><option value="1">1</option><option value="2">2</option><option value="4">4</option><option value="8" selected>8</option><option value="16">16</option></select></label>
+      <label>App instances <select class="pg-in" data-a><option value="4" selected>4</option><option value="10">10</option><option value="40">40</option></select></label>
+      <label>Gap between bursts (s) <select class="pg-in" data-gap><option value="30" selected>30</option><option value="70">70</option><option value="300">300</option></select></label>
+      <label>TLS <select class="pg-in" data-tls><option value="1" selected>TLS 1.3 (1 extra round trip)</option><option value="2">TLS 1.2 (2 extra round trips)</option></select></label>
+    </div>
+    <div class="pg-row">
+      <label>Client idle timeout (s) <select class="pg-in" data-cidle><option value="0" selected>0</option><option value="20">20</option><option value="50">50</option><option value="90">90</option></select></label>
+      <label>Remote idle timeout (s) <select class="pg-in" data-ridle><option value="30">30</option><option value="60" selected>60</option><option value="120">120</option></select></label>
+      <label>Server connection limit <select class="pg-in" data-m><option value="50">50</option><option value="100" selected>100</option><option value="400">400</option></select></label>
+      <label>Burst size per instance <select class="pg-in" data-b><option value="2">2</option><option value="8" selected>8</option><option value="16">16</option></select></label>
+    </div>
+    <div class="pg-grid">
+      <div class="pg-box" style="--c: var(--role-1)"><h3>Average latency</h3><span class="pg-mono" data-avg>0 ms</span><span class="pg-note" data-avgnote></span></div>
+      <div class="pg-box" style="--c: var(--role-2)"><h3>Maximum latency</h3><span class="pg-mono" data-max>0 ms</span></div>
+      <div class="pg-box" style="--c: var(--role-3)"><h3>New connections</h3><span class="pg-mono" data-setups>0</span><span class="pg-note" data-setnote></span></div>
+      <div class="pg-box" style="--c: var(--role-4)"><h3>Stale connection errors</h3><span class="pg-mono" data-stale>0</span></div>
+      <div class="pg-box" style="--c: var(--role-5)"><h3>Refused requests</h3><span class="pg-mono" data-refused>0</span></div>
+      <div class="pg-box" style="--c: var(--role-1)"><h3>Peak server connections</h3><span class="pg-mono" data-peak>0</span><span class="pg-note" data-peaknote></span></div>
+    </div>
+    <p class="pg-out" data-verdict aria-live="polite"></p>
+    <p class="pg-note">Model: 6 bursts, one every gap seconds. Round trip 40 ms, service 20 ms per request. A new connection costs 1 TCP round trip plus the TLS round trips before the request. The client closes connections idle for at least its idle timeout; the load balancer and server drop ones idle for the remote timeout without telling the client, so a reuse after that costs a wasted round trip plus a new connection (a stale error). Requests beyond the pool size queue on a connection, one after another. Timeouts in real products vary and are configurable.</p>
+  </div>
+</PlaygroundShell>
+<script>
+  import { query, numberValue, formatThousands } from '../playground';
+  const RTT = 40, SERVICE = 20, BURSTS = 6;
+  function run(P: number, A: number, B: number, gap: number, clientIdle: number, remoteIdle: number, tls: number, M: number) {
+    const pools: number[][] = Array.from({ length: A }, () => []);
+    let served = 0, refused = 0, setups = 0, stale = 0, latSum = 0, latMax = 0, peak = 0;
+    const slots = Math.min(P, B);
+    for (let k = 0; k < BURSTS; k++) {
+      const t = k * gap;
+      for (let i = 0; i < A; i++) pools[i] = pools[i].filter((last) => t - last < clientIdle);
+      let open = 0;
+      for (const pool of pools) for (const last of pool) if (t - last < remoteIdle) open++;
+      for (let i = 0; i < A; i++) {
+        const pool = pools[i];
+        for (let s = 0; s < slots; s++) {
+          const n = Math.ceil((B - s) / slots);
+          let cost = 0;
+          if (s < pool.length && t - pool[s] < remoteIdle) { /* live reuse */ }
+          else {
+            if (s < pool.length) { stale++; cost += RTT; }
+            if (open >= M) { refused += n; continue; }
+            open++; setups++; cost += (1 + tls) * RTT;
+            pool[s] = t;
+          }
+          pool[s] = t;
+          for (let w = 0; w < n; w++) {
+            const lat = (w === 0 ? cost : 0) + (w + 1) * (RTT + SERVICE);
+            latSum += lat; latMax = Math.max(latMax, lat); served++;
+          }
+        }
+      }
+      peak = Math.max(peak, open);
+    }
+    return { served, refused, setups, stale, avg: served === 0 ? 0 : Math.floor(latSum / served), max: latMax, peak };
+  }
+
+  document.querySelectorAll<HTMLElement>('[data-cpool]').forEach((root) => {
+    const q = query(root); const val = numberValue(q);
+    const setText = (s: string, v: string) => { q(s).textContent = v; };
+    function draw() {
+      const P = val('[data-p]'), A = val('[data-a]'), B = val('[data-b]'), M = val('[data-m]'), cidle = val('[data-cidle]'), ridle = val('[data-ridle]');
+      const r = run(P, A, B, val('[data-gap]'), cidle, ridle, val('[data-tls]'), M);
+      setText('[data-avg]', r.avg + ' ms'); setText('[data-max]', r.max + ' ms');
+      setText('[data-avgnote]', `over ${formatThousands(r.served)} served requests`);
+      setText('[data-setups]', formatThousands(r.setups)); setText('[data-setnote]', `each costs ${(1 + val('[data-tls]')) * RTT} ms before the request`);
+      setText('[data-stale]', formatThousands(r.stale)); setText('[data-refused]', formatThousands(r.refused));
+      setText('[data-peak]', formatThousands(r.peak)); setText('[data-peaknote]', `limit ${M}; instances x pool = ${A * Math.min(P, B)}`);
+      setText('[data-verdict]', r.refused > 0 ? `The fleet wants ${A * Math.min(P, B)} connections and the server accepts ${M}: the rest are refused. Lower the pool or the fleet.`
+        : r.stale > 0 ? `The client keeps connections for ${cidle} s but the other side drops them after ${ridle} s: the first send after a quiet spell fails. Set the client timeout below ${ridle} s.`
+        : cidle === 0 ? 'No reuse: every request pays the TCP and TLS round trips.'
+        : r.setups > A * Math.min(P, B) ? 'The gaps are longer than the client timeout, so connections close before they are reused: pooling gives little here.'
+        : 'Connections are reused and no stale or refused requests occur.');
+    }
+    root.querySelectorAll('select').forEach((el) => el.addEventListener('input', draw));
+    draw();
+  });
+</script>

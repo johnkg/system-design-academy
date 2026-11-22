@@ -1,0 +1,94 @@
+---
+import PlaygroundShell from '../components/PlaygroundShell.astro';
+---
+<PlaygroundShell title="Simulate it" hint="Send one TCP transfer over a three-hop path with an optional tunnel. Change the DF bit, ICMP filtering and MSS clamping and watch where the packet is dropped or split.">
+  <ol class="how">
+    <li>With the defaults (no tunnel) the transfer sends <b>69</b> packets and <b>9,900</b> of 10,000 packets survive 1% fragment loss. Set <b>Tunnel overhead (bytes)</b> to <b>100</b>: the path MTU becomes <b>1,400</b>, the MSS drops to <b>1,360</b> and <b>75</b> packets are sent, with 1 extra round trip.</li>
+    <li>Set <b>ICMP</b> to Blocked: the result is stalled with 0 bytes delivered. Set <b>Transfer size</b> to 1,000 bytes and it completes. Set it back to 100,000 and turn <b>MSS clamping</b> On: <b>74</b> packets, nothing wasted.</li>
+    <li>Turn <b>MSS clamping</b> Off and set <b>Don't Fragment bit</b> to Cleared: the tunnel splits each packet, giving <b>138</b> wire fragments and only <b>9,801</b> of 10,000 packets surviving.</li>
+  </ol>
+  <div class="pg mtu" data-mtu>
+    <div class="pg-row">
+      <label>Tunnel overhead (bytes) <select class="pg-in" data-oh><option value="0" selected>0</option><option value="60">60</option><option value="100">100</option><option value="200">200</option></select></label>
+      <label>Don't Fragment bit <select class="pg-in" data-df><option value="1" selected>Set</option><option value="0">Cleared</option></select></label>
+      <label>ICMP <select class="pg-in" data-icmp><option value="1" selected>Allowed</option><option value="0">Blocked</option></select></label>
+      <label>MSS clamping <select class="pg-in" data-clamp><option value="0" selected>Off</option><option value="1">On</option></select></label>
+    </div>
+    <div class="pg-row">
+      <label>Sender MSS <select class="pg-in" data-mss><option value="1460" selected>1,460</option><option value="1360">1,360</option><option value="1200">1,200</option></select></label>
+      <label>Transfer size <select class="pg-in" data-bytes><option value="1000">1,000 bytes</option><option value="100000" selected>100,000 bytes</option></select></label>
+      <label>Fragment loss per 10,000 <select class="pg-in" data-loss><option value="0">0</option><option value="100" selected>100</option></select></label>
+    </div>
+    <h3>First full-size packet, hop by hop</h3>
+    <ol class="mtu-hops" data-hops></ol>
+    <div class="pg-grid">
+      <div class="pg-box" style="--c: var(--role-1)"><h3>Path MTU</h3><span class="pg-mono" data-pmtu>0</span></div>
+      <div class="pg-box" style="--c: var(--role-2)"><h3>MSS used</h3><span class="pg-mono" data-mssout>0</span></div>
+      <div class="pg-box" style="--c: var(--role-3)"><h3>Packets sent</h3><span class="pg-mono" data-packets>0</span><span class="pg-note" data-pnote></span></div>
+      <div class="pg-box" style="--c: var(--role-4)"><h3>Wire fragments</h3><span class="pg-mono" data-frags>0</span></div>
+      <div class="pg-box" style="--c: var(--role-5)"><h3>Packets surviving per 10,000</h3><span class="pg-mono" data-survive>0</span></div>
+      <div class="pg-box" style="--c: var(--role-1)"><h3>Result</h3><span class="pg-mono" data-result></span></div>
+    </div>
+    <p class="pg-out" data-verdict aria-live="polite"></p>
+    <p class="pg-note">Model: three links, the middle one a tunnel with an MTU of 1,500 minus the overhead. IP and TCP headers are 20 bytes each, so a packet is MSS + 40. With DF set, a packet larger than a link is dropped, and the sender shrinks its MSS to the link limit only if ICMP is allowed (one wasted packet, one extra round trip). With DF cleared the router fragments, with data in multiples of 8 bytes, and losing one fragment loses the packet. MSS clamping rewrites the MSS to the smallest MTU minus 40. The tunnel overhead values are round numbers for the toy; real protocols typically add between about 50 and 100 bytes.</p>
+  </div>
+</PlaygroundShell>
+<script>
+  import { query, numberValue, formatThousands } from '../playground';
+  const HDR = 40, IP = 20, ETHERNET_MTU = 1500, FRAG_UNIT = 8, SCALE = 10000;
+  function trace(path: number[], size: number, df: boolean) {
+    const lines: string[] = [];
+    for (let i = 0; i < path.length; i++) {
+      const mtu = path[i];
+      if (size <= mtu) lines.push(`Hop ${i + 1}, MTU ${formatThousands(mtu)}: ${formatThousands(size)} bytes pass`);
+      else if (df) { lines.push(`Hop ${i + 1}, MTU ${formatThousands(mtu)}: ${formatThousands(size)} bytes with DF set, dropped`); break; }
+      else {
+        const per = Math.floor((mtu - IP) / FRAG_UNIT) * FRAG_UNIT;
+        lines.push(`Hop ${i + 1}, MTU ${formatThousands(mtu)}: fragmented into ${Math.ceil((size - IP) / per)} pieces of at most ${formatThousands(per)} data bytes`);
+        size = per + IP;
+      }
+    }
+    return lines;
+  }
+  function transfer(path: number[], mss0: number, bytes: number, df: boolean, icmp: boolean, clamp: boolean, loss: number) {
+    const pmtu = Math.min(...path);
+    let mss = clamp ? Math.min(mss0, pmtu - HDR) : mss0;
+    const size = Math.min(mss, bytes) + HDR;
+    let packets: number, frags = 1, wasted = 0, result: string, ok = true;
+    if (size <= pmtu) { packets = Math.ceil(bytes / mss); result = 'complete'; }
+    else if (!df) { frags = Math.ceil((mss + IP) / (Math.floor((pmtu - IP) / FRAG_UNIT) * FRAG_UNIT)); packets = Math.ceil(bytes / mss); result = 'complete (fragmented)'; }
+    else if (icmp) { mss = pmtu - HDR; packets = Math.ceil(bytes / mss); wasted = 1; result = 'complete after PMTUD'; }
+    else { packets = 0; result = 'stalled, 0 bytes delivered'; ok = false; }
+    let survive = SCALE;
+    for (let k = 0; k < frags; k++) survive = Math.floor(survive * (SCALE - loss) / SCALE);
+    return { pmtu, mss, packets: packets + wasted, frags: packets * frags, wasted, result, survive, ok, size };
+  }
+
+  document.querySelectorAll<HTMLElement>('[data-mtu]').forEach((root) => {
+    const q = query(root); const val = numberValue(q);
+    const setText = (s: string, v: string) => { q(s).textContent = v; };
+    function draw() {
+      const path = [ETHERNET_MTU, ETHERNET_MTU - val('[data-oh]'), ETHERNET_MTU];
+      const df = val('[data-df]') === 1, icmp = val('[data-icmp]') === 1, clamp = val('[data-clamp]') === 1;
+      const mss0 = val('[data-mss]'), bytes = val('[data-bytes]'), loss = val('[data-loss]');
+      const r = transfer(path, mss0, bytes, df, icmp, clamp, loss);
+      const hops = q('[data-hops]'); hops.textContent = '';
+      const first = (clamp ? Math.min(mss0, r.pmtu - HDR) : mss0) + HDR;
+      for (const l of trace(path, Math.min(first, bytes + HDR), df)) { const li = document.createElement('li'); li.textContent = l; hops.appendChild(li); }
+      setText('[data-pmtu]', formatThousands(r.pmtu)); setText('[data-mssout]', formatThousands(r.mss));
+      setText('[data-packets]', formatThousands(r.packets)); setText('[data-pnote]', r.wasted ? '1 wasted, 1 extra round trip' : '');
+      setText('[data-frags]', formatThousands(r.frags)); setText('[data-survive]', r.ok ? `${formatThousands(r.survive)} of ${formatThousands(SCALE)}` : 'none');
+      setText('[data-result]', r.result);
+      setText('[data-verdict]', !r.ok ? 'Black hole: the oversized packet is dropped, the ICMP message that would explain it is filtered, and the sender retries the same size forever. Small requests still work.'
+        : r.result === 'complete (fragmented)' ? 'It works, but every packet becomes several fragments, and losing any one loses the packet.'
+        : r.wasted ? 'Path MTU discovery worked: one packet was wasted and the MSS dropped to the link limit.'
+        : r.pmtu < ETHERNET_MTU ? 'The segments already fit the tunnel, so nothing was dropped.' : 'Every link carries the full-size packet.');
+    }
+    root.querySelectorAll('select').forEach((el) => el.addEventListener('input', draw));
+    draw();
+  });
+</script>
+<style is:global>
+  .playground .mtu .mtu-hops { margin: 8px 0 12px 1.2em; padding: 0; }
+  .playground .mtu .mtu-hops li { margin: 2px 0; overflow-wrap: anywhere; }
+</style>

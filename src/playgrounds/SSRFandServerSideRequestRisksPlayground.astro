@@ -1,0 +1,134 @@
+---
+import PlaygroundShell from '../components/PlaygroundShell.astro';
+---
+<PlaygroundShell title="Simulate it" hint="An image importer fetches a URL a user typed. There is no real network: a fixed table of names and redirects, 3 legitimate URLs and 7 that aim at an internal address. Pick how the fetcher checks the URL and see which ones get through.">
+  <ol class="how">
+    <li>Leave <b>Fetcher</b> on <b>No check</b>: all 3 legitimate URLs work, and <b>6/7</b> attack URLs reach an internal address. The seventh (DNS rebinding) only fetched a public address because there was no check for it to slip past.</li>
+    <li>Choose <b>Deny-list of strings</b>: <b>4/7</b> still get through, because the same address can be written another way, or reached through a name or a redirect. Then choose <b>Deny-list on resolved IP</b>: <b>3/7</b>. The rest are the redirects and the DNS answer that changes between the check and the fetch.</li>
+    <li>Choose <b>Allow-list of hosts</b>: only <b>1/7</b> gets through, the open redirect on an allowed host, but the legitimate partner is refused (<b>2/3</b> served). Tick <b>Add partner.example.org to the allow-list</b> to serve <b>3/3</b>.</li>
+    <li>Choose <b>Allow-list + pinned IP + no redirects</b>: <b>0/7</b> reach the inside. Pick the request <b>c10</b> or <b>c9</b> to read the trace of what each check saw.</li>
+  </ol>
+  <div class="pg sr" data-sr>
+    <div class="pg-row">
+      <label>Fetcher <select class="pg-in" data-variant>
+        <option value="0" selected>No check</option>
+        <option value="1">Deny-list of strings</option>
+        <option value="2">Deny-list on resolved IP</option>
+        <option value="3">Allow-list of hosts</option>
+        <option value="4">Allow-list + pinned IP + no redirects</option>
+      </select></label>
+      <label><input type="checkbox" data-partner /> Add partner.example.org to the allow-list</label>
+      <label>Show the trace of <select class="pg-in" data-case></select></label>
+    </div>
+    <div class="pg-grid">
+      <div class="pg-box" data-b1><h3>Legitimate URLs served</h3><span class="pg-mono" data-o1></span><span class="pg-note" data-n1></span></div>
+      <div class="pg-box" data-b2><h3>Attacks reaching an internal address</h3><span class="pg-mono" data-o2></span><span class="pg-note" data-n2></span></div>
+    </div>
+    <div class="pg-box" style="--c: var(--border)">
+      <h3>What happened to the selected request</h3>
+      <span class="pg-mono" data-res></span>
+      <ol class="pg-log" data-trace tabindex="0" aria-label="Steps the fetcher took"></ol>
+    </div>
+    <div class="pg-box" style="--c: var(--border)">
+      <h3>All 10 requests</h3>
+      <table class="sr-table"><thead><tr><th>Id</th><th>Request</th><th>What it is</th><th>Result</th></tr></thead><tbody data-rows></tbody></table>
+    </div>
+  </div>
+</PlaygroundShell>
+<script>
+  import { query } from '../playground';
+  // The same model as the code samples: a fixed DNS table, fixed redirects, no real network.
+  const DNS: Record<string, string[]> = {
+    'images.example.com': ['203.0.113.10'], 'cdn.example.com': ['203.0.113.11'], 'partner.example.org': ['203.0.113.20'], 'evil.example.net': ['203.0.113.66'],
+    'rebind.example.net': ['203.0.113.50', '10.0.0.5'], 'internal-admin.corp.test': ['10.0.0.5'], localhost: ['127.0.0.1'],
+  };
+  interface Target { host: string; path: string }
+  const META: Target = { host: '169.254.169.254', path: '/latest/meta-data/' };
+  const REDIRECTS: Record<string, Target> = { 'evil.example.net/r': META, 'images.example.com/go': META };
+  const CASES = [
+    { id: 'c1', legit: true, host: 'images.example.com', path: '/cat.png', note: 'allowed image host' },
+    { id: 'c2', legit: true, host: 'cdn.example.com', path: '/logo.png', note: 'allowed CDN' },
+    { id: 'c3', legit: true, host: 'partner.example.org', path: '/hook', note: 'a real partner, not on the list' },
+    { id: 'c4', legit: false, host: '169.254.169.254', path: '/latest/meta-data/', note: 'metadata address typed directly' },
+    { id: 'c5', legit: false, host: 'localhost', path: '/admin', note: "the server's own loopback" },
+    { id: 'c6', legit: false, host: '2130706433', path: '/admin', note: 'loopback written as one decimal number' },
+    { id: 'c7', legit: false, host: 'internal-admin.corp.test', path: '/users', note: 'a name that resolves to a private address' },
+    { id: 'c8', legit: false, host: 'evil.example.net', path: '/r', note: 'a public page that redirects to metadata' },
+    { id: 'c9', legit: false, host: 'images.example.com', path: '/go', note: 'an open redirect on an allowed host' },
+    { id: 'c10', legit: false, host: 'rebind.example.net', path: '/x', note: 'DNS says public when checked, private when fetched' },
+  ];
+  const DENY = ['localhost', '127.0.0.1', '169.254.169.254'];
+  const BASE_ALLOW = ['images.example.com', 'cdn.example.com'];
+  const isPrivate = (ip: string) => {
+    const [a, b] = ip.split('.').map(Number);
+    return a === 0 || a === 10 || a === 127 || (a === 169 && b === 254) || (a === 192 && b === 168) || (a === 172 && b >= 16 && b <= 31);
+  };
+  interface Result { outcome: 'served' | 'blocked' | 'LEAK'; ip: string; trace: string[] }
+  function fetchUrl(variant: number, host: string, path: string, allow: string[]): Result {
+    const trace: string[] = []; const calls: Record<string, number> = {};
+    const resolve = (h: string) => {
+      let ip: string;
+      if (/^\d+$/.test(h)) { const n = Number(h); ip = [Math.floor(n / 16777216) % 256, Math.floor(n / 65536) % 256, Math.floor(n / 256) % 256, n % 256].join('.'); }
+      else if (/^\d+\.\d+\.\d+\.\d+$/.test(h)) ip = h;
+      else { const answers = DNS[h]; const i = calls[h] ?? 0; calls[h] = i + 1; ip = answers[Math.min(i, answers.length - 1)]; }
+      trace.push(`resolve ${h} -> ${ip}`);
+      return ip;
+    };
+    const stop = (why: string): Result => { trace.push(`blocked: ${why}`); return { outcome: 'blocked', ip: '', trace }; };
+    if (variant === 1 && DENY.includes(host)) return stop('host is on the deny-list');
+    if (variant === 2 && isPrivate(resolve(host))) return stop('resolved address is private');
+    if (variant >= 3 && !allow.includes(host)) return stop('host is not on the allow-list');
+    let pinned = '';
+    if (variant === 4) { pinned = resolve(host); if (isPrivate(pinned)) return stop('resolved address is private'); }
+    let cur: Target = { host, path };
+    for (let hops = 0; hops <= 3; hops++) {
+      const ip = variant === 4 ? pinned : resolve(cur.host);
+      trace.push(`connect ${ip}`);
+      if (isPrivate(ip)) return { outcome: 'LEAK', ip, trace };
+      const next = REDIRECTS[cur.host + cur.path];
+      if (!next) return { outcome: 'served', ip, trace };
+      if (variant === 4) return stop('redirects are not followed');
+      trace.push(`redirect to ${next.host}${next.path}, followed without a new check`);
+      cur = next;
+    }
+    return stop('too many redirects');
+  }
+
+  document.querySelectorAll<HTMLElement>('[data-sr]').forEach((root) => {
+    const q = query(root);
+    const sel = q<HTMLSelectElement>('[data-case]');
+    CASES.forEach((c) => { const o = document.createElement('option'); o.value = c.id; o.textContent = c.id; if (c.id === 'c9') o.selected = true; sel.appendChild(o); });
+    const box = (n: number, good: boolean) => q<HTMLElement>(`[data-b${n}]`).style.setProperty('--c', good ? 'var(--good)' : 'var(--bad)');
+    function draw() {
+      const v = Number(q<HTMLSelectElement>('[data-variant]').value);
+      const allow = q<HTMLInputElement>('[data-partner]').checked ? [...BASE_ALLOW, 'partner.example.org'] : BASE_ALLOW;
+      const r = CASES.map((c) => ({ c, ...fetchUrl(v, c.host, c.path, allow) }));
+      const served = r.filter((x) => x.c.legit && x.outcome === 'served').length;
+      const leaks = r.filter((x) => !x.c.legit && x.outcome === 'LEAK').length;
+      q('[data-o1]').textContent = `${served}/3`;
+      q('[data-n1]').textContent = served === 3 ? 'every real use works' : 'a real partner was refused: the list needs maintenance';
+      box(1, served === 3);
+      q('[data-o2]').textContent = `${leaks}/7`;
+      q('[data-n2]').textContent = leaks === 0 ? 'nothing reached the inside' : 'the server fetched an internal address on the attacker\'s behalf';
+      box(2, leaks === 0);
+      const pick = r.find((x) => x.c.id === sel.value)!;
+      q('[data-res]').textContent = `${pick.c.id} (${pick.c.note}): ${pick.outcome}${pick.ip ? ' ' + pick.ip : ''}`;
+      const log = q('[data-trace]'); log.textContent = '';
+      for (const line of pick.trace) { const li = document.createElement('li'); li.textContent = line; log.appendChild(li); }
+      const rows = q('[data-rows]'); rows.textContent = '';
+      for (const x of r) {
+        const tr = document.createElement('tr');
+        const bad = x.outcome === 'LEAK' || (x.c.legit && x.outcome !== 'served');
+        [x.c.id, `${x.c.host}${x.c.path}`, x.c.note, `${x.outcome}${x.ip ? ' ' + x.ip : ''}`].forEach((t) => { const td = document.createElement('td'); td.textContent = t; tr.appendChild(td); });
+        if (bad) tr.style.color = 'var(--bad-text)';
+        rows.appendChild(tr);
+      }
+    }
+    root.addEventListener('input', draw); root.addEventListener('change', draw);
+    draw();
+  });
+</script>
+<style is:global>
+  .playground .sr-table { width: 100%; border-collapse: collapse; font-size: 0.85em; }
+  .playground .sr-table th, .playground .sr-table td { text-align: left; padding: 2px 8px 2px 0; overflow-wrap: anywhere; }
+</style>

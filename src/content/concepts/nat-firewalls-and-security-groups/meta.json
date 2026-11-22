@@ -1,0 +1,116 @@
+{
+  "name": "NAT, Firewalls and Security Groups",
+  "area": "networking",
+  "difficulty": "intermediate",
+  "intent": "How packet filters decide what may enter, why replies get back in, and how NAT shares one public address among many hosts until its port table runs out.",
+  "scenario": "A server in a private subnet listens on ports 443, 22 and 5432. Six connection attempts arrive from the internet and from inside the VPC, and the same six are run against six rule sets. Separately, a NAT gateway with a small port pool serves 4 new outbound connections per tick.",
+  "problem": "Every network edge has to answer two questions for each packet: may it pass, and where does it go? Filters are written by people under time pressure, so they drift toward too open ('allow everything just to test') or too closed (replies silently dropped). NAT adds a hidden table that makes outbound traffic work and inbound traffic impossible, until the table fills and new connections fail with no error on either end.",
+  "howItWorks": [
+    {
+      "title": "A rule matches a packet on address, port and direction",
+      "text": "A rule says allow or deny, a peer address range (CIDR), a port range and a protocol. The firewall checks every packet, or every new connection, against its rule list. If nothing matches, the usual default is deny. In this toy, inbound rules match the sender's address and the local destination port."
+    },
+    {
+      "title": "Stateless filters judge each packet alone",
+      "text": "A stateless filter (a network ACL, a router access list) has no memory. The request 203.0.113.5:50000 to port 443 can be allowed, but the reply from port 443 back to the client's port 50000 is a new packet that needs its own outbound rule, typically covering the whole ephemeral range 1024 to 65535. Forget it and the request arrives and every connection hangs: in the sample, 3 requests reach the server and 0 connections work."
+    },
+    {
+      "title": "Stateful filters remember connections",
+      "text": "A stateful filter (a security group, a conntrack firewall) evaluates only the first packet of a connection. If it is allowed, a table entry is created and every packet of that connection, in both directions, passes without being matched again. You write allow rules for who may start a connection and nothing for replies. Security groups typically have no deny rules at all: a connection is allowed if any rule allows it."
+    },
+    {
+      "title": "Rule order decides when rules can deny",
+      "text": "ACL rules are evaluated in order and the first match wins. Put 'deny 203.0.113.0/24' before 'allow 443 from anywhere' and that network is blocked from the site (2 connections work); put it after and port 443 is allowed first, so the deny only catches the other ports (3 work). The rules are identical and the result differs, which is why ACL changes need a test list of expected allows and denies."
+    },
+    {
+      "title": "NAT rewrites addresses and keeps a table",
+      "text": "Source NAT (SNAT, often called PAT or masquerading) rewrites a private source such as 10.0.2.10:40001 to the gateway's public address and a free port, 198.51.100.1:1024, and stores the pair. The reply is matched against the table and rewritten back. An unsolicited packet to a port with no entry matches nothing and is dropped, which is why NAT looks like a firewall but is not a security control. Destination NAT (DNAT, port forwarding) does the reverse: it maps a public address and port to a private host and port, with a rule written by an administrator."
+    },
+    {
+      "title": "The port table is a finite resource",
+      "text": "A public address has about 64,000 usable ports (typically 1024 to 65535) per destination address and port. Each outbound connection holds one entry until it closes and then a while longer, so the table needs about rate x hold time entries. In the toy: a pool of 20 and 4 new connections per tick held for 3 ticks peaks at 12 and drops nothing; held for 6 ticks it needs 24, so 20 connections are dropped over 30 ticks. A second public address (a pool of 40) fixes it."
+    }
+  ],
+  "pros": [
+    "Stateful filtering means you write rules for who may connect, not for every reply path",
+    "Default deny with narrow allow rules makes the exposed surface easy to list and review",
+    "Source NAT lets thousands of private hosts share one or a few public addresses",
+    "Security groups attach to a workload, so rules follow it when it moves between subnets"
+  ],
+  "cons": [
+    "Stateless ACLs need paired inbound and outbound rules and are easy to get half right",
+    "Order-dependent rule lists are fragile: moving one line changes who gets in",
+    "NAT hides the real client from the server and breaks protocols that embed addresses",
+    "Connection tracking tables and NAT port pools are finite and fail by dropping new connections silently"
+  ],
+  "whenToUse": [
+    "Security groups (stateful, allow-only) as the main control on every workload, referencing other groups instead of address ranges where possible",
+    "Network ACLs as a coarse, subnet-wide backstop, for example to deny a known hostile range",
+    "A NAT gateway so private instances can fetch updates and call external APIs without being reachable inbound",
+    "Several public addresses on the NAT when one service makes very many connections to one destination"
+  ],
+  "whenNotToUse": [
+    "Treating NAT as a firewall: it blocks unsolicited inbound traffic as a side effect, not by policy, and port forwards open it again",
+    "Allowing 0.0.0.0/0 on all ports 'temporarily' on a group attached to a real workload",
+    "Using stateless ACLs for fine-grained per-service rules that a security group would express in one line",
+    "Routing very chatty internal traffic through a NAT gateway when a private endpoint or peering would avoid the table and the per-byte cost"
+  ],
+  "pitfalls": [
+    "Opening 0.0.0.0/0 on all ports to test something: in the sample it exposes 22 and 5432 to the internet, and it is rarely removed because nothing breaks when it stays",
+    "Forgetting the return rule on a stateless ACL: requests arrive, replies vanish, and the symptom is a timeout, not a refusal",
+    "Return rule too narrow: replies go to the client's ephemeral port, so allow 1024 to 65535 (typically), not just 443",
+    "Assuming rule order does not matter: the same three rules give 2 or 3 working connections depending on position",
+    "Believing a private address is protected: reachability is decided by routes and filters, and a port forward or a public IP changes it",
+    "Ignoring NAT port exhaustion: long idle timeouts and short-lived connections to one destination fill the pool, and new connections fail while existing ones look healthy",
+    "Debugging from one side only: a drop can be at the sender's group, a subnet ACL, the receiver's group or the host firewall, and each logs separately"
+  ],
+  "related": [
+    { "kind": "concept", "slug": "cidr-and-subnetting" },
+    { "kind": "concept", "slug": "tcp-vs-udp" },
+    { "kind": "concept", "slug": "access-control-models" },
+    { "kind": "concept", "slug": "proxies" },
+    { "kind": "concept", "slug": "dns" },
+    { "kind": "concept", "slug": "tls-and-https" }
+  ],
+  "roles": [
+    { "id": "client", "label": "Client", "description": "A host that opens connections: outside on the internet or inside the VPC." },
+    { "id": "filter", "label": "Filter", "description": "The ACL or security group deciding whether a packet or new connection may pass." },
+    { "id": "nat", "label": "NAT gateway", "description": "Rewrites addresses and ports and keeps the translation table." },
+    { "id": "server", "label": "Server", "description": "The private workload being protected." }
+  ],
+  "quiz": [
+    {
+      "question": "A stateless network ACL allows inbound TCP 443 from anywhere and nothing outbound. Clients time out. What is the most likely cause?",
+      "options": [
+        "The reply packets from port 443 to the client's ephemeral port have no outbound rule",
+        "The default deny rule has been ordered above the allow rule",
+        "NAT has run out of ports for the inbound clients",
+        "The server must also allow inbound traffic on the ephemeral range"
+      ],
+      "answer": 0,
+      "explanation": "A stateless filter treats the reply as a separate packet. Without an outbound rule for the client's port range, the request arrives and the reply is dropped. Stateful security groups avoid this by tracking the connection."
+    },
+    {
+      "question": "Which statement about a NAT gateway is correct?",
+      "options": [
+        "It blocks all inbound traffic by policy, so no security group is needed",
+        "It stores a translation per outbound connection and drops inbound packets that match no entry",
+        "It encrypts traffic between the private host and the internet",
+        "It gives each private host a permanent public port"
+      ],
+      "answer": 1,
+      "explanation": "NAT rewrites the source and remembers the mapping, so replies are translated back. Unsolicited packets match nothing and are dropped as a side effect. It is not encryption, not a policy engine and mappings are temporary."
+    },
+    {
+      "question": "A service behind a NAT gateway makes 4 new connections per second to one API and each stays in the table for 6 seconds. The pool holds 20 entries. What happens?",
+      "options": [
+        "Nothing, because 4 per second is below the pool size",
+        "Existing connections are closed to make room",
+        "New connections are dropped once about 24 entries are needed and 20 exist",
+        "The gateway allocates extra ports automatically"
+      ],
+      "answer": 2,
+      "explanation": "The table needs roughly rate x hold time entries, here 24. With only 20 available, the excess new connections fail, while existing ones keep working. More public addresses, shorter holds or connection reuse fix it."
+    }
+  ]
+}

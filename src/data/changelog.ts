@@ -3,6 +3,17 @@ export interface Change { date: string; title: string; items: { text: string; hr
 
 export const changelog: Change[] = [
   {
+    date: '2026-11-24',
+    title: '38 new lessons: design principles, algorithms, security and networking',
+    items: [
+      { text: 'Design principles, ten more: KISS and YAGNI, the Law of Demeter, design by contract, fail fast, interface design, command-query separation, technical debt, dependency injection, anemic and rich models, and package design. Each shows what the habit saves and what it costs when overdone.', href: 'concepts/kiss-yagni-and-premature-abstraction/' },
+      { text: 'Algorithms, fourteen more: binary search and its traps, sliding windows, heaps, graph traversal, shortest paths, topological sort, union-find, greedy, backtracking, divide and conquer, tries, balanced trees, randomized algorithms and NP-hard problems. The simulations count operations so you can watch the curves cross.', href: 'concepts/binary-search-and-its-traps/' },
+      { text: 'Security, eight more: threat modeling, SSRF, credential stuffing and MFA, broken object-level authorization, signatures and HMAC, zero trust, content security policy, and logging and incident response.', href: 'concepts/threat-modeling-and-attack-surface/' },
+      { text: 'Networking, six more: NAT and firewalls, connection pooling, TIME_WAIT and port exhaustion, VPCs and VPNs, MTU and fragmentation, and DDoS filtering.', href: 'concepts/connection-pooling-and-keep-alive/' },
+      { text: 'Five new learning paths: design habits, graphs and searching, problem-solving patterns, how attacks work and what stops them, and why network connections misbehave.', href: 'paths/' },
+    ],
+  },
+  {
     date: '2026-11-23',
     title: 'New area: software architecture, and two more case studies',
     items: [
