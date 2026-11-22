@@ -1,7 +1,7 @@
 // A job service for 4 tenants, second by second for 500 seconds. Tenant 0 is the noisy one: it submits a burst of 12
 // jobs a second between 100 s and 200 s. The three others submit one job a second each. A job needs 2 core-seconds on
 // a 16-core machine. Running more jobs at once than there are cores shares the cores and wastes some on switching.
-// Some jobs fail, some after their side effect already happened. A deploy can restart the workers at 300 s.
+// Some jobs fail, some after their side effect already happened. A deploy can restart the workers at 151 s.
 // Everything is integers from a seeded generator, so the output never changes.
 const TICKS = 500, TENANTS = 4;
 const CORES = 16;            // cores per machine
