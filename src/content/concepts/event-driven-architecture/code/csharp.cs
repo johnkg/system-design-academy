@@ -1,7 +1,7 @@
 // Event-driven architecture: one "place an order" flow built four ways, with the same order data, the same outage and the same change.
 // Look for: messages per order, hops until the customer gets an answer vs until the order is done, who the publisher can name, and orders lost or delayed in an outage.
 // A message is (from, to, label, carries_order). A hop is one message that causally follows another (it leaves a service that just received one).
-// Assumptions: every hop costs 5 ms; Payments handles 3 orders per tick when it is up; 10 ticks of arrivals; the workflow gives up on an order after 2 ticks of waiting.
+// Assumptions: every hop costs 5 ms; Payments handles 3 orders per tick when it is up; 10 ticks of arrivals; the workflow gives up on an order after 2 ticks of waiting; direct calls and the workflow answer the customer only when the flow is done (an asynchronous workflow could answer at once, like the event designs).
 using System;
 using System.Collections.Generic;
 using System.Linq;
