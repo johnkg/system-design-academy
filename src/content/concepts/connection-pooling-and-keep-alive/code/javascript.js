@@ -32,7 +32,7 @@ function run(P, A, B, gap, clientIdle, remoteIdle, tls, M) {
         }
         pool[s] = t;
         for (let w = 0; w < n; w++) {
-          const lat = (w === 0 ? cost : 0) + (w + 1) * (RTT + SERVICE);
+          const lat = cost + (w + 1) * (RTT + SERVICE); // queued requests also wait for the setup
           latSum += lat; latMax = Math.max(latMax, lat); served++;
         }
       }

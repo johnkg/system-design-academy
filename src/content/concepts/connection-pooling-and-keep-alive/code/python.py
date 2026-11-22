@@ -44,7 +44,7 @@ def run(P, A, B, gap, client_idle, remote_idle, tls, M):
                         pool.append(t)
                 pool[s] = t
                 for w in range(n):
-                    lat = (cost if w == 0 else 0) + (w + 1) * (RTT + SERVICE)
+                    lat = cost + (w + 1) * (RTT + SERVICE)  # queued requests also wait for the setup
                     lat_sum += lat
                     lat_max = max(lat_max, lat)
                     served += 1

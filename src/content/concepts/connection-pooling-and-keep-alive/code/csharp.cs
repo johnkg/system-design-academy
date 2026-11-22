@@ -42,7 +42,7 @@ string Run(int P, int A, int B, int gap, int clientIdle, int remoteIdle, int tls
                 pool[s] = t;
                 for (int w = 0; w < n; w++)
                 {
-                    int lat = (w == 0 ? cost : 0) + (w + 1) * (Rtt + Service);
+                    int lat = cost + (w + 1) * (Rtt + Service); // queued requests also wait for the setup
                     latSum += lat; latMax = Math.Max(latMax, lat); served++;
                 }
             }
