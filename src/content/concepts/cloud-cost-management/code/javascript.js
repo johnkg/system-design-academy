@@ -1,4 +1,5 @@
 // Cloud cost: the same web service priced several ways. Prices are cents per server-hour; everything is integers.
+// The prices and discounts are illustrative toy figures, not any provider's real rates.
 // LOAD is how many right-sized servers the traffic needs in each hour of a day.
 const LOAD = [4, 3, 3, 3, 3, 4, 6, 9, 12, 14, 15, 16, 16, 15, 15, 14, 13, 12, 11, 10, 9, 7, 6, 5];
 const ON_DEMAND = 20;     // cents per right-sized server-hour, pay as you go

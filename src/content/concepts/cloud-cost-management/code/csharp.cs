@@ -1,4 +1,5 @@
 // Cloud cost: the same web service priced several ways. Prices are cents per server-hour; everything is integers.
+// The prices and discounts are illustrative toy figures, not any provider's real rates.
 // Load is how many right-sized servers the traffic needs in each hour of a day.
 using System;
 using System.Linq;
