@@ -3,8 +3,8 @@
 // A file is [name, team, what it holds, data fields it copies, files it imports]. A change touches tokens; a file is edited if it holds or copies one.
 // Tokens: loyalty, address, payer, requester are the four teams' ideas of "customer"; ".data" is the model's fields, ".rule" is the code using them.
 const ctx = (name, holds, copies) => [
-  [name + "Model", name, holds, copies, []],
-  [name + "Acl", name, [], holds.concat(copies), [name + "Model", "PublishedLanguage"]], // the translation layer maps shared ids into the context's own model
+  [name + "Model", name.toLowerCase(), holds, copies, []], // a context is owned by the team of the same name
+  [name + "Acl", name.toLowerCase(), [], holds.concat(copies), [name + "Model", "PublishedLanguage"]], // the translation layer maps shared ids into the context's own model
 ];
 
 const DESIGNS = [

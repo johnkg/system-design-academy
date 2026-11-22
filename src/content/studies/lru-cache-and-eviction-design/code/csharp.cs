@@ -2,6 +2,7 @@
 // requests ask for 1,000 hot keys (some hotter than others) and 15% for one of 50,000 cold keys. In one variant a
 // report job reads 20,000 old keys once, between request 80,000 and 120,000. In another the hot set moves to other keys
 // at request 140,000. The requests come from a seeded generator, so the output never changes. Integers only.
+// The model is the catalog of the case study scaled down 1 to 1,000: 1,000 hot keys stand for 1 million, 50,000 cold keys for 50 million.
 using System;
 using System.Collections.Generic;
 using System.Linq;

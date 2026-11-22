@@ -6,8 +6,8 @@
 
 def ctx(name, holds, copies):
     return [
-        (name + "Model", name, holds, copies, []),
-        (name + "Acl", name, [], holds + copies, [name + "Model", "PublishedLanguage"]),  # the translation layer maps shared ids into the context's own model
+        (name + "Model", name.lower(), holds, copies, []),
+        (name + "Acl", name.lower(), [], holds + copies, [name + "Model", "PublishedLanguage"]),  # the translation layer maps shared ids into the context's own model
     ]
 
 
