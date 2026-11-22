@@ -78,7 +78,7 @@ console.log('  ' + line("default-src 'none', report-only", evaluate(POLICIES["de
 
 // Other headers: each one stops one kind of attack, none replaces a CSP.
 const ATTACKS = [
-  ['first visit over http, attacker strips the redirect to https', 'hsts', 'HSTS (after a first visit)'],
+  ['a return visit typed as http, attacker strips the redirect to https', 'hsts', 'HSTS (after a first visit)'],
   ['evil.example frames the page to trick clicks', 'frame-ancestors', 'frame-ancestors'],
   ["an uploaded .txt is sniffed and run as script", 'nosniff', 'X-Content-Type-Options: nosniff'],
   ['evil.example posts a form to the shop with the session cookie', 'samesite', 'SameSite=Lax cookie'],
