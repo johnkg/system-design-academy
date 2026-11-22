@@ -228,7 +228,7 @@ public static class Program
                 Console.WriteLine($"{kind} V={v} E={EdgeCount(adj)}: array {sa}, heap {sh} ({pushes} pushes)");
             }
 
-        Console.WriteLine("-- one negative edge weight: Dijkstra (settle each node once) against Bellman-Ford");
+        Console.WriteLine("-- negative edge weights: Dijkstra (settle each node once) against Bellman-Ford");
         foreach (int v in new[] { 100, 1000 })
         {
             var adj = MakeGraph("negative", v);

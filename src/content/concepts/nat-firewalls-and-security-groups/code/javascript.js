@@ -3,7 +3,8 @@
 //         against a stateful security group (allow rules only, replies ride the connection table).
 // Part 2: source NAT: how a reply finds its way back, and what happens when the port pool runs out.
 // Assumptions: IPv4, TCP only. The guarded server listens on 443, 22 and 5432. "Outside" means outside 10.0.0.0/8.
-// Real NAT devices typically have about 64,000 ports per public address; the pool here is tiny so the effect is visible.
+// A public address has at most about 64,000 ports (1024 to 65535) per destination; products set their own limits (an AWS NAT gateway
+// allows up to 55,000 simultaneous connections per address to each unique destination). The pool here is tiny so the effect is visible.
 
 const ipv = (s) => s.split(".").reduce((acc, o) => acc * 256 + Number(o), 0);
 function inCidr(addr, cidr) {

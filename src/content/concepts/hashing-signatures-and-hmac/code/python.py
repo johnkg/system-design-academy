@@ -8,7 +8,7 @@ def to_bytes(s):
 
 
 def step(h, bs):
-    # The output of this hash is its internal state, with no final step. That is the property length extension needs.
+    # The output of this hash is its internal state, with no final step. That is the property length extension needs (real SHA-256 also pads, so a real forged message carries the padding bytes too).
     for b in bs:
         h ^= b
         h = (h * 16777619) & 0xFFFFFFFF

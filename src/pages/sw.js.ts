@@ -12,7 +12,7 @@ export const GET: APIRoute = () => {
   const source = `
 const CACHE = 'sda-${build}';
 const BASE = ${JSON.stringify(base)};
-const CORE = [BASE + '/', BASE + '/offline/', BASE + '/practice/', BASE + '/review/', BASE + '/interview/', BASE + '/progress/', BASE + '/search/'];
+const CORE = [BASE + '/', BASE + '/offline/', BASE + '/practice/', BASE + '/review/', BASE + '/review-data.json', BASE + '/interview/', BASE + '/progress/', BASE + '/search/'];
 
 self.addEventListener('install', (event) => {
   event.waitUntil(caches.open(CACHE).then((c) => Promise.allSettled(CORE.map((u) => c.add(u)))).then(() => self.skipWaiting()));

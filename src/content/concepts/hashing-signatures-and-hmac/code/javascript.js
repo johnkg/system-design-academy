@@ -2,7 +2,7 @@
 // prints the same numbers. It is NOT secure, and neither are the 4-byte tags or the textbook RSA with tiny primes.
 // The point is the structure: what each construction lets an attacker do, not the strength of the numbers.
 const bytes = (s) => Array.from(s, (c) => c.charCodeAt(0));
-// The output of this hash is its internal state, with no final step. That is the property length extension needs.
+// The output of this hash is its internal state, with no final step. That is the property length extension needs (real SHA-256 also pads, so a real forged message carries the padding bytes too).
 const step = (h, bs) => { for (const b of bs) { h ^= b; h = Math.imul(h, 16777619) >>> 0; } return h >>> 0; };
 const H = (bs) => step(2166136261, bs);
 const hex = (h) => h.toString(16).padStart(8, '0');

@@ -40,7 +40,7 @@ class OrderService:  # the rules live in the service
         o.discount = p
 
 
-class RichOrder:  # the rules live in the object, and the fields are only reachable through its methods
+class RichOrder:  # the rules live in the object; the leading underscore marks the fields private (by convention in Python), so callers use its methods
     def __init__(self):
         self._items, self._paid, self._shipped, self._discount = [], False, False, 0
 

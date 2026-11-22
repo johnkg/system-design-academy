@@ -1,5 +1,5 @@
 // A binary min-heap (a priority queue stored in a flat array), with every comparison counted instead of timed.
-// Look for: building a heap bottom-up costs about 1.6n comparisons where pushing one at a time costs up to n log n; top-k
+// Look for: building a heap bottom-up costs under 2n comparisons where pushing one at a time costs up to n log n; top-k
 // with a heap of size k beats a full sort when k is small and loses its edge when k is large; an array kept sorted or
 // unsorted makes one of push and pop cost O(n); decrease-key needs to know where an item is; a priority that never ages starves.
 // A "step" is one element examined (compared, and maybe moved). The lists come from a fixed integer generator.
