@@ -1,7 +1,7 @@
 # A toy hop-by-hop model of MTU, fragmentation and Path MTU Discovery for one TCP transfer over IPv4.
 # Assumptions: IP header 20 bytes, TCP header 20 bytes (no options), so packet size = MSS + 40. The path is a list of link MTUs
 # and a tunnel is modelled as a link whose MTU is 1500 minus its overhead (here 100 bytes, a made-up round number; real tunnels
-# typically add somewhere between 50 and 100 bytes depending on the protocol). TCP typically sets the Don't Fragment (DF) bit.
+# add roughly 20 to 100 bytes depending on the protocol, e.g. GRE 24, VXLAN 50, WireGuard 60 over IPv4). TCP typically sets the Don't Fragment (DF) bit.
 # A router that drops a DF packet typically sends ICMP "fragmentation needed" carrying the next hop's MTU, if ICMP is not filtered.
 # Fragments carry data in multiples of 8 bytes. Losing any one fragment loses the whole packet. Loss is given per 10,000 fragments.
 
