@@ -10,7 +10,7 @@ def fast_hash(password):
 
 
 # Better: a unique salt per user and many iterations, so every guess is slow.
-ITERATIONS = 100_000
+ITERATIONS = 100_000  # kept low so the demo runs fast; OWASP currently recommends 600,000 for PBKDF2-HMAC-SHA256
 KEY_BYTES = 32  # a 256-bit derived key
 
 

@@ -2,7 +2,7 @@
 
 const MINUTES_PER_DAY = 24 * 60;
 const WINDOW_DAYS = 30; // the SLO is measured over a rolling 30-day window
-const PAGE_BURN_RATE = 14; // burning this fast for an hour spends 2% of a 30-day budget: page a human
+const PAGE_BURN_RATE = 14.4; // burning this fast for an hour spends 2% of a 30-day budget (14.4 x 1 h / 720 h): page a human
 
 // How much downtime does an SLO allow over a window?
 function errorBudgetMinutes(slo, windowDays) {
@@ -10,7 +10,7 @@ function errorBudgetMinutes(slo, windowDays) {
 }
 
 // Burn rate: how fast the budget is being spent compared with spending it evenly over the window.
-// 1.0 spends exactly the whole budget by the end of the window; 14 would spend it in about two days.
+// 1.0 spends exactly the whole budget by the end of the window; 14.4 would spend it in about two days (30 / 14.4 = 2.1).
 function burnRate(errorRatio, slo) {
   return errorRatio / (1 - slo);
 }

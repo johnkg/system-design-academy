@@ -94,7 +94,7 @@ public static class Program
         var v2 = Clone(v1);
         v2["server.web-1"]["size"] = "medium"; // in place
         v2.Remove("server.web-2"); v2["server.web-3"] = Web("small"); // a rename is a delete plus a create
-        v2["db.main"]["engine"] = "postgres16"; // immutable: the database is replaced and its data is lost
+        v2["db.main"]["engine"] = "postgres16"; // immutable in this toy provider: the database is replaced and its data is lost (real providers often upgrade versions in place)
         Run("2. edit the code", v2, actual);
 
         actual["server.web-1"]["size"] = "large"; // someone clicked in the console

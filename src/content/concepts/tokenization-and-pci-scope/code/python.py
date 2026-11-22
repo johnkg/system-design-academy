@@ -24,11 +24,13 @@ def analyze(design, o):
         if o.get("store") and o.get("warehouse"):
             in_scope[7] = True
             at_rest.append(COMPONENTS[7])
-    elif design == "hosted":
-        in_scope[0] = True  # your page serves the code around the provider's fields, so it can still affect them
+    else:
+        # hosted: your page serves the code around the provider's fields, so it can still affect them
+        # redirect: your page decides where the customer is sent, so a tampered page could send them to a fake payment page
+        in_scope[0] = True
     count = sum(in_scope)
     server_side = any(in_scope[1:])
-    audit = "heavy" if server_side else ("light" if count > 0 else "lightest")
+    audit = "heavy" if server_side else "light"
     return in_scope, count, at_rest, audit
 
 

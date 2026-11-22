@@ -19,6 +19,14 @@ const has = (kind, slug) => kinds[kind].includes(slug);
 // Language files every code/ folder must have, read from the language config (a missing one leaves that language's readers with no code).
 const langFiles = [...readFileSync(join(root, 'languages.config.ts'), 'utf8').matchAll(/id: '([a-z]+)'.*?ext: '([a-z]+)'/g)].map((m) => `${m[1]}.${m[2]}`);
 
+// 0. The accuracy-review marker: a real calendar date that is not in the future (the badge shows it as written).
+for (const [key, m] of Object.entries(meta)) {
+  if (m.factChecked === undefined) continue;
+  const d = new Date(`${m.factChecked}T00:00:00Z`);
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(m.factChecked) || Number.isNaN(d.getTime()) || d.toISOString().slice(0, 10) !== m.factChecked) err(key, `factChecked "${m.factChecked}" is not a calendar date (YYYY-MM-DD)`);
+  else if (d.getTime() > Date.now() + 86400000) err(key, `factChecked "${m.factChecked}" is in the future`);
+}
+
 // 1. Links between pages.
 for (const s of kinds.concepts) for (const r of meta[`concepts/${s}`].related ?? []) {
   const kind = r.kind === 'pattern' ? 'patterns' : 'concepts';

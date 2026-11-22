@@ -3,6 +3,13 @@ export interface Change { date: string; title: string; items: { text: string; hr
 
 export const changelog: Change[] = [
   {
+    date: '2026-11-25',
+    title: 'Fact-checked badges',
+    items: [
+      { text: 'Lessons that have been through an independent accuracy review now carry a Fact-checked badge with the date. every concept (208) and 4 case studies have it so far; the review found and fixed wrong claims in most of them. The patterns and the other case studies follow. The new page explains what the review covers and what it does not.', href: 'accuracy/' },
+    ],
+  },
+  {
     date: '2026-11-24',
     title: '38 new lessons: design principles, algorithms, security and networking',
     items: [

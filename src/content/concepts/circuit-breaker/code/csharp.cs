@@ -47,7 +47,7 @@ public class CircuitBreaker<T>(Func<Task<T>> call, int failureThreshold, long co
         if (State == "open")
         {
             if (now() - _openedAt < cooldownMs) throw new InvalidOperationException("circuit open: failing fast");
-            State = "half-open"; // cool-down over: allow a trial call
+            State = "half-open"; // cool-down over: allow a trial call (this demo runs calls one at a time; with concurrent callers, also fail fast while the probe is in flight)
         }
         try
         {

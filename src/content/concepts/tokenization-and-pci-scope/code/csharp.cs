@@ -25,13 +25,15 @@ public static class Program
             if (o.Store && o.Backups) { inScope[6] = true; atRest.Add(Components[6]); }
             if (o.Store && o.Warehouse) { inScope[7] = true; atRest.Add(Components[7]); }
         }
-        else if (design == "hosted")
+        else
         {
-            inScope[0] = true; // your page serves the code around the provider's fields, so it can still affect them
+            // hosted: your page serves the code around the provider's fields, so it can still affect them
+            // redirect: your page decides where the customer is sent, so a tampered page could send them to a fake payment page
+            inScope[0] = true;
         }
         int count = inScope.Count(x => x);
         bool serverSide = inScope.Skip(1).Any(x => x);
-        string audit = serverSide ? "heavy" : count > 0 ? "light" : "lightest";
+        string audit = serverSide ? "heavy" : "light";
         return (inScope, count, atRest, audit);
     }
 

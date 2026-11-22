@@ -5,13 +5,13 @@ public static class Program
 {
     const int MinutesPerDay = 24 * 60;
     const int WindowDays = 30; // the SLO is measured over a rolling 30-day window
-    const int PageBurnRate = 14; // burning this fast for an hour spends 2% of a 30-day budget: page a human
+    const double PageBurnRate = 14.4; // burning this fast for an hour spends 2% of a 30-day budget (14.4 x 1 h / 720 h): page a human
 
     // How much downtime does an SLO allow over a window?
     static double ErrorBudgetMinutes(double slo, int windowDays) => (1 - slo) * windowDays * MinutesPerDay;
 
     // Burn rate: how fast the budget is being spent compared with spending it evenly over the window.
-    // 1.0 spends exactly the whole budget by the end of the window; 14 would spend it in about two days.
+    // 1.0 spends exactly the whole budget by the end of the window; 14.4 would spend it in about two days (30 / 14.4 = 2.1).
     static double BurnRate(double errorRatio, double slo) => errorRatio / (1 - slo);
 
     public static void Main()
