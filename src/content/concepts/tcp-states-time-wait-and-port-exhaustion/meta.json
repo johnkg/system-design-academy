@@ -1,0 +1,116 @@
+{
+  "name": "TCP States, TIME_WAIT and Port Exhaustion",
+  "area": "networking",
+  "difficulty": "advanced",
+  "intent": "Read a TCP connection's lifecycle as a table of states, and use it to explain TIME_WAIT pile-ups, ephemeral port exhaustion, CLOSE_WAIT leaks and a full accept queue.",
+  "scenario": "One client IP makes short connections to a single server address and port. With roughly 28,232 usable source ports and a 60 second TIME_WAIT, it can sustain only about 470 new connections per second before 'cannot assign requested address' errors begin.",
+  "problem": "When a service falls over under load, `ss` or `netstat` shows thousands of connections in states with unfamiliar names. Without knowing what each state means and which side is in it, people tune the wrong kernel setting. TIME_WAIT is normal and protective, yet it is blamed for outages; CLOSE_WAIT looks harmless but means the application is not closing its sockets; a full accept queue looks like a network problem and is really a slow app.",
+  "howItWorks": [
+    {
+      "title": "Three-way handshake, four-way close",
+      "text": "The client sends SYN (SYN_SENT), the server replies SYN-ACK (it was in LISTEN, now SYN_RCVD), the client ACKs and both are ESTABLISHED. Closing is a separate step in each direction: each side sends FIN and the other ACKs it. The side that sends the first FIN is the active closer; the other is the passive closer. This is why the two ends are in different states for a while."
+    },
+    {
+      "title": "The active closer ends in TIME_WAIT",
+      "text": "The active closer goes FIN_WAIT_1, FIN_WAIT_2, then TIME_WAIT before CLOSED. The passive side goes CLOSE_WAIT (it has received the FIN, and now waits for its application to close the socket), then LAST_ACK, then CLOSED. TIME_WAIT typically lasts twice the maximum segment lifetime (60 seconds on Linux, fixed in the kernel; other systems differ) so that a late duplicate packet from the old connection cannot be mistaken for a new one and so that the final ACK can be re-sent if lost."
+    },
+    {
+      "title": "A connection is a four-part key, so one pair has only the source port to vary",
+      "text": "A TCP connection is identified by (source IP, source port, destination IP, destination port). A client talking to one server address and port from one source IP can only vary the source port, drawn from the ephemeral range (typically 32768 to 60999 on Linux, 28,232 ports). Every closed-by-me connection holds its port in TIME_WAIT for 60 seconds, so the sustainable rate is about 28,232 / 60, about 470 new connections per second."
+    },
+    {
+      "title": "Port exhaustion: the toy numbers",
+      "text": "At 400 connections per second the client holds 24,000 ports in TIME_WAIT and everything works. At 600 per second it needs 36,000, the table pins at 28,232 and 15,536 connection attempts fail in two minutes. If the server closes first instead, the TIME_WAIT entries are on the server, which sees many different client addresses and ports, and the client's ports are free at once. Enabling reuse of TIME_WAIT sockets for outgoing connections (on Linux, tcp_tw_reuse, typically requiring TCP timestamps) shrinks the effective hold to about a second; a second source IP doubles the space; pooling connections removes the churn."
+    },
+    {
+      "title": "CLOSE_WAIT is the application's bug, not the network's",
+      "text": "A socket sits in CLOSE_WAIT until the local application calls close(). Nothing in the kernel times it out. A pile of CLOSE_WAIT on a server means the code received the peer's FIN and did not close its end, typically an error or timeout path that skips the close. Each stuck socket holds a file descriptor; at a 5 per 1000 leak rate and 100 requests per tick the toy server reaches its 1,024 descriptor limit at tick 2,000, at 20 per 1000 at tick 500."
+    },
+    {
+      "title": "SYN and accept queues sit before accept()",
+      "text": "While a handshake is in progress the server tracks a half-open entry (SYN_RCVD) in the SYN queue; after it completes the connection waits in the accept queue until the application calls accept(). When that queue is full, the kernel drops the final ACK or the SYN and the client retries after a delay, so users see slow connects. A deeper queue absorbs bursts: a burst of 30 every third tick against a queue of 8 loses 154 connections, against 32 loses none. It cannot fix an app that accepts slower than connections arrive: with 5 accepts per tick it still drops 88."
+    }
+  ],
+  "pros": [
+    "State names turn a vague 'connections are broken' into a precise question about which side is where",
+    "TIME_WAIT protects against delayed packets corrupting a later connection on the same ports",
+    "Counting states by type is a cheap health signal that needs no application changes",
+    "Knowing who closes first lets you move the TIME_WAIT cost to the side that can afford it"
+  ],
+  "cons": [
+    "A busy client making short connections to one destination hits a hard ceiling set by the port range and timeout",
+    "The 60 second TIME_WAIT is fixed in Linux, so the only levers are reuse, more address space or fewer connections",
+    "Several tuning flags that appear to help (such as tcp_tw_recycle, removed from Linux in 4.12) broke clients behind NAT",
+    "Queue drops are silent: the client only sees a slow or failed connect"
+  ],
+  "whenToUse": [
+    "Reading `ss -s` or `ss -tan` output during an incident and deciding which side owns the problem",
+    "Sizing connection pools and keep-alive so short-lived connections do not exhaust source ports",
+    "Load tests and proxies that open many connections to one backend: count source ports per destination",
+    "Adding source addresses or backends when one client-to-server pair saturates its port space"
+  ],
+  "whenNotToUse": [
+    "Shortening TIME_WAIT or enabling aggressive reuse as a first reaction, before checking why connections are so short-lived",
+    "Treating a large number of TIME_WAIT sockets as a leak: they expire by themselves and are harmless unless the port space is the limit",
+    "Raising the accept queue size to fix an application that cannot keep up",
+    "Restarting the process to clear CLOSE_WAIT without finding the missing close()"
+  ],
+  "pitfalls": [
+    "Blaming TIME_WAIT for everything: thousands of them on the side that closes first is expected, and only a problem when the port range is the limit",
+    "Ignoring which side is closing: the same traffic can exhaust the client's ports or just add memory use on the server",
+    "Widening the ephemeral range without addressing connection churn: it buys time, and the real fix is reuse or pooling",
+    "Calling CLOSE_WAIT a network problem: it is the application not closing its socket after the peer did",
+    "Missing the per-destination nature of the limit: the same client can open many connections to different servers, and only one pair runs out",
+    "Tuning backlog and somaxconn without checking how fast the app calls accept()",
+    "Adopting old tuning advice (tcp_tw_recycle) that has been removed or that breaks NAT clients"
+  ],
+  "related": [
+    { "kind": "concept", "slug": "tcp-vs-udp" },
+    { "kind": "concept", "slug": "tcp-congestion-control" },
+    { "kind": "concept", "slug": "connection-pooling-and-keep-alive" },
+    { "kind": "concept", "slug": "nat-firewalls-and-security-groups" },
+    { "kind": "concept", "slug": "backpressure" },
+    { "kind": "concept", "slug": "thread-pools-and-sizing" }
+  ],
+  "roles": [
+    { "id": "client", "label": "Client", "description": "Opens connections from one source IP and a limited range of source ports." },
+    { "id": "server", "label": "Server", "description": "Listens, accepts and closes; owns the accept queue and file descriptors." },
+    { "id": "kernel", "label": "Kernel connection table", "description": "Tracks the state of every connection, including TIME_WAIT entries." },
+    { "id": "app", "label": "Application", "description": "Calls accept() and close(); a missed close() leaves CLOSE_WAIT behind." }
+  ],
+  "quiz": [
+    {
+      "question": "A client opens 600 short connections per second to one server address and port, closing each itself. It starts failing with 'cannot assign requested address' after about a minute. What is the most useful change?",
+      "options": [
+        "Raise the server's accept queue size",
+        "Increase the server's file descriptor limit",
+        "Reuse connections with a pool or keep-alive",
+        "Shorten the server's SYN retry interval"
+      ],
+      "answer": 2,
+      "explanation": "The client holds each closed connection's source port in TIME_WAIT for about 60 seconds, so it needs 36,000 ports against a range of 28,232. Reusing connections removes the churn. The server-side settings do not touch the client's port space."
+    },
+    {
+      "question": "`ss` on a server shows 4,000 sockets in CLOSE_WAIT and the count never falls. What does that indicate?",
+      "options": [
+        "The server sent the first FIN and is waiting 60 seconds",
+        "The application received the peer's FIN and is not closing its socket",
+        "The accept queue is full",
+        "The client ran out of ephemeral ports"
+      ],
+      "answer": 1,
+      "explanation": "CLOSE_WAIT means the peer closed and the local application has not yet called close(). The kernel never times it out, so a growing count is an application bug, usually a code path that skips closing."
+    },
+    {
+      "question": "Which side holds a connection in TIME_WAIT?",
+      "options": [
+        "The side that received the first FIN",
+        "Both sides, until the second FIN",
+        "The side that sent the first FIN",
+        "Whichever side has the lower port number"
+      ],
+      "answer": 2,
+      "explanation": "The active closer, the side that sends the first FIN, waits in TIME_WAIT so late packets and a lost final ACK are handled. The passive side goes through CLOSE_WAIT and LAST_ACK."
+    }
+  ]
+}
