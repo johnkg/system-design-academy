@@ -1,0 +1,114 @@
+---
+import PlaygroundShell from '../components/PlaygroundShell.astro';
+---
+<PlaygroundShell title="Simulate it" hint="A toy invoice API with 8 endpoints and 20 invoices owned by 4 users. Bob is logged in correctly, owns 5 invoices, and tries to reach the other 15. Pick how the API checks ownership and what its ids look like.">
+  <ol class="how">
+    <li>Start with <b>Authorization</b> on <b>Login only</b> and <b>Object ids</b> on <b>Sequential</b>: Bob reads, changes and deletes <b>15 of 15</b> other invoices. Set <b>Object ids</b> to <b>Random</b>: still <b>15 of 15</b>, because the list endpoints show everyone's ids.</li>
+    <li>Set <b>Authorization</b> to <b>Lists scoped, id endpoints unchecked</b>. With random ids Bob can reach <b>0 of 15</b>, since he cannot guess an id. Set <b>Object ids</b> back to <b>Sequential</b>: <b>15 of 15</b>, because he just counts. Random ids only hid the objects. Set <b>Object ids</b> back to <b>Random</b> and tick <b>One foreign id has leaked</b>: that one invoice opens.</li>
+    <li>Set <b>Authorization</b> to <b>Checked in GET, PUT and DELETE only</b>. Changing and deleting drop to <b>0 of 15</b>, but reading is still <b>15 of 15</b> through the PDF, bulk export, list, search and per-user endpoints that nobody checked.</li>
+    <li>Set <b>Authorization</b> to <b>One central policy on every endpoint</b>: <b>0 of 15</b> whatever the ids. Compare <b>Checked row by row after fetching everything</b>: also <b>0</b>, but set <b>Table size</b> to <b>100,000</b> and one list request reads <b>100,000</b> rows and makes <b>100,000</b> policy calls, against <b>25,000</b> rows and 1 call for a scoped query.</li>
+  </ol>
+  <div class="pg ido" data-ido>
+    <div class="pg-row">
+      <label>Authorization <select class="pg-in" data-auth>
+        <option value="none" selected>Login only</option>
+        <option value="scoped-lists">Lists scoped, id endpoints unchecked</option>
+        <option value="some">Checked in GET, PUT and DELETE only</option>
+        <option value="central">One central policy on every endpoint</option>
+        <option value="perrow">Checked row by row after fetching everything</option>
+      </select></label>
+      <label>Object ids <select class="pg-in" data-ids><option value="sequential" selected>Sequential (1001, 1002, ...)</option><option value="random">Random (6 hex digits)</option></select></label>
+      <label><input type="checkbox" data-leak /> One foreign id has leaked</label>
+      <label>Table size <select class="pg-in" data-size><option value="20" selected>20</option><option value="1000">1,000</option><option value="100000">100,000</option></select></label>
+    </div>
+    <div class="pg-grid">
+      <div class="pg-box" data-b1><h3>Other users' invoices read</h3><span class="pg-mono" data-o1></span></div>
+      <div class="pg-box" data-b2><h3>Changed</h3><span class="pg-mono" data-o2></span></div>
+      <div class="pg-box" data-b3><h3>Deleted</h3><span class="pg-mono" data-o3></span></div>
+    </div>
+    <div class="pg-box" style="--c: var(--border)">
+      <h3>The 8 endpoints, and how many of the 15 each gives Bob</h3>
+      <table class="ido-table"><thead><tr><th>Endpoint</th><th>Checked?</th><th>Reachable</th></tr></thead><tbody data-rows></tbody></table>
+      <span class="pg-note" data-guess></span>
+    </div>
+    <div class="pg-grid">
+      <div class="pg-box" data-c1><h3>One list request, scoped query</h3><span class="pg-mono" data-scoped></span></div>
+      <div class="pg-box" data-c2><h3>One list request, fetch all then check each row</h3><span class="pg-mono" data-perrow></span></div>
+    </div>
+  </div>
+</PlaygroundShell>
+<script>
+  import { query, formatThousands } from '../playground';
+  // The same model as the code samples: 20 invoices, owner (i mod 4) + 1, Bob is user 2, seeded MINSTD ids.
+  const BOB = 2;
+  let state = 777;
+  const next = () => (state = (state * 48271) % 2147483647);
+  const hex6 = () => (next() % 16777216).toString(16).padStart(6, '0');
+  const makeIds = (kind: string) => {
+    if (kind === 'sequential') return Array.from({ length: 20 }, (_, i) => String(1001 + i));
+    state = 777;
+    return Array.from({ length: 20 }, hex6);
+  };
+  const owner = (i: number) => (i % 4) + 1;
+  interface Endpoint { id: string; name: string; kind: 'id' | 'list'; effect: 'read' | 'change' | 'delete' }
+  const ENDPOINTS: Endpoint[] = [
+    { id: 'E1', name: 'GET /invoices/{id}', kind: 'id', effect: 'read' },
+    { id: 'E2', name: 'PUT /invoices/{id}', kind: 'id', effect: 'change' },
+    { id: 'E3', name: 'DELETE /invoices/{id}', kind: 'id', effect: 'delete' },
+    { id: 'E4', name: 'GET /invoices/{id}/pdf', kind: 'id', effect: 'read' },
+    { id: 'E5', name: 'GET /invoices (list)', kind: 'list', effect: 'read' },
+    { id: 'E6', name: 'GET /search?q=', kind: 'list', effect: 'read' },
+    { id: 'E7', name: 'POST /invoices/export {ids}', kind: 'id', effect: 'read' },
+    { id: 'E8', name: 'GET /users/{userId}/invoices', kind: 'list', effect: 'read' },
+  ];
+  const ALL = ENDPOINTS.map((e) => e.id);
+  const CHECKED: Record<string, string[]> = { none: [], 'scoped-lists': ['E5', 'E6', 'E8'], some: ['E1', 'E2', 'E3'], central: ALL, perrow: ALL };
+
+  function attack(auth: string, idKind: string, leaked: boolean) {
+    const invoiceIds = makeIds(idKind);
+    const foreign = invoiceIds.filter((_, i) => owner(i) !== BOB);
+    let guessed: string[];
+    if (idKind === 'sequential') guessed = foreign;
+    else { const tries = new Set(Array.from({ length: 2000 }, hex6)); guessed = foreign.filter((id) => tries.has(id)); }
+    const candidates = new Set(guessed);
+    if (leaked) candidates.add(foreign[0]);
+    const open = (e: Endpoint) => !CHECKED[auth].includes(e.id);
+    for (const e of ENDPOINTS) if (e.kind === 'list' && open(e)) foreign.forEach((id) => candidates.add(id));
+    const reach = (e: Endpoint) => (!open(e) ? [] : e.kind === 'list' ? foreign : [...candidates]);
+    const exposed: Record<string, number> = {};
+    for (const e of ENDPOINTS) exposed[e.id] = reach(e).length;
+    const count = (effect: string) => new Set(ENDPOINTS.filter((e) => e.effect === effect).flatMap(reach)).size;
+    return { exposed, read: count('read'), change: count('change'), del: count('delete'), guessedValid: guessed.length };
+  }
+
+  document.querySelectorAll<HTMLElement>('[data-ido]').forEach((root) => {
+    const q = query(root);
+    const val = (s: string) => q<HTMLSelectElement>(s).value;
+    const box = (sel: string, bad: boolean) => q<HTMLElement>(sel).style.setProperty('--c', bad ? 'var(--bad)' : 'var(--good)');
+    function draw() {
+      const auth = val('[data-auth]'), idKind = val('[data-ids]'), n = Number(val('[data-size]'));
+      const r = attack(auth, idKind, q<HTMLInputElement>('[data-leak]').checked);
+      q('[data-o1]').textContent = `${r.read} of 15`; box('[data-b1]', r.read > 0);
+      q('[data-o2]').textContent = `${r.change} of 15`; box('[data-b2]', r.change > 0);
+      q('[data-o3]').textContent = `${r.del} of 15`; box('[data-b3]', r.del > 0);
+      const rows = q('[data-rows]'); rows.textContent = '';
+      for (const e of ENDPOINTS) {
+        const tr = document.createElement('tr');
+        const checked = CHECKED[auth].includes(e.id);
+        [`${e.id} ${e.name}`, checked ? 'yes' : 'no', `${r.exposed[e.id]} of 15`].forEach((t) => { const td = document.createElement('td'); td.textContent = t; tr.appendChild(td); });
+        if (r.exposed[e.id] > 0) tr.style.color = 'var(--bad-text)';
+        rows.appendChild(tr);
+      }
+      q('[data-guess]').textContent = idKind === 'sequential' ? 'Sequential ids: Bob counts up and finds all 15.' : `Random ids: Bob made 2,000 guesses and ${r.guessedValid} were valid. He learns ids only from endpoints that show them.`;
+      q('[data-scoped]').textContent = `${formatThousands(n / 4)} rows read, 1 policy call`;
+      q('[data-perrow]').textContent = `${formatThousands(n)} rows read, ${formatThousands(n)} policy calls`;
+      box('[data-c1]', false); box('[data-c2]', auth === 'perrow' && n >= 1000);
+    }
+    root.addEventListener('input', draw); root.addEventListener('change', draw);
+    draw();
+  });
+</script>
+<style is:global>
+  .playground .ido-table { width: 100%; border-collapse: collapse; font-size: 0.9em; }
+  .playground .ido-table th, .playground .ido-table td { text-align: left; padding: 2px 8px 2px 0; overflow-wrap: anywhere; }
+</style>

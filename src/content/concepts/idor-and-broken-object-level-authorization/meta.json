@@ -1,0 +1,95 @@
+{
+  "name": "IDOR and Broken Object-Level Authorization",
+  "area": "security",
+  "difficulty": "intermediate",
+  "intent": "Being logged in does not mean being allowed to touch this particular object. Check, on the server and for every object access, that the caller may act on that exact record.",
+  "scenario": "An invoice API has endpoints to read, edit, delete and download a PDF of an invoice, plus a list, a search, a bulk export and a per-user view. Every caller is logged in; each should see only their own invoices.",
+  "problem": "Authentication answers who you are. Many APIs stop there: the handler loads the invoice named in the URL and returns it. Change the id and you get someone else's invoice. This is an insecure direct object reference (IDOR), also called broken object-level authorization, and it tops API security lists because it is easy to write by accident: every endpoint that takes an identifier needs its own check, and one forgotten endpoint is enough.",
+  "howItWorks": [
+    { "title": "The missing question", "text": "A request carries two things: who is calling (from a session or token) and which object it names (an id in the path, the query or the body). The server must ask a third question each time: may this caller do this action on this object? If the handler only checks that the token is valid, any logged-in user can read, change or delete any object whose id they can supply." },
+    { "title": "Sequential ids are guessable, random ids are only hidden", "text": "With ids 1001, 1002 and so on, an attacker simply counts up. Random or unguessable ids (UUIDs, long random strings) make blind guessing impractical and are a good defence in depth, but they are not an access control. Ids leak through list pages, search results, emails, shared links, logs and referrer headers, and once an id is known the server will serve it unless it checks." },
+    { "title": "Put the check where it cannot be forgotten", "text": "Checking in every handler by hand fails sooner or later. Better: route all object access through one policy function or data-access layer that takes the caller, the action and the object, so a handler that skips it cannot load data at all. Many frameworks support this with policies, scopes or row-level security in the database. Keep the rule in one place: an invoice belongs to its owner, or to staff of the owner's account." },
+    { "title": "Lists, searches and bulk calls are the usual miss", "text": "The single-object endpoint is the one everybody remembers to check. The ones that are missed return many objects or hide the id: a list without an owner filter, a search over all records, a bulk export that takes an array of ids, a per-user endpoint where the user id comes from the URL, a PDF or image download served by a different handler. Scope queries by owner so that other people's rows are never selected, and check each id in a bulk request." },
+    { "title": "Test it as a second user", "text": "The bug is invisible when you test as one user. Add automated tests that log in as user B and request user A's objects on every endpoint, for read, change and delete, and expect not-found or forbidden. Return the same not-found response for 'does not exist' and 'not yours' when existence itself is sensitive, and log denied attempts, since a run of them is an attack in progress." }
+  ],
+  "pros": [
+    "A central policy removes the whole class of bug, including endpoints added later",
+    "Scoping queries by owner means other people's rows are never even loaded",
+    "A second-user test turns an invisible flaw into a failing build",
+    "Unguessable ids add a useful layer when the check is also in place"
+  ],
+  "cons": [
+    "Authorization rules are business rules and can be complicated: teams, delegation, admins, shared links",
+    "Checking every row individually can be slow and chatty on big lists",
+    "Retrofitting a central policy onto an API with many handlers takes real work",
+    "Returning identical errors for missing and forbidden objects can make debugging harder"
+  ],
+  "whenToUse": [
+    "Every endpoint, job and message handler that takes an identifier and returns or changes a record that belongs to someone",
+    "Multi-tenant systems, where one customer must never see another customer's data",
+    "Before launching any public API, and after any new endpoint that touches existing objects"
+  ],
+  "whenNotToUse": [
+    "Truly public objects, such as a published product page, do not need an ownership check, but they still need a rule that says they are public",
+    "Do not treat unguessable ids as the check, even if they are used as a second layer"
+  ],
+  "pitfalls": [
+    "Checking that the user is logged in but not that the object is theirs",
+    "Believing random ids are a control: they hide objects until any endpoint, link or log line shows one",
+    "Checking the obvious GET, PUT and DELETE handlers and forgetting the PDF download, the export, the search and the per-user endpoint",
+    "List and search endpoints that return all rows, or filter by an owner id taken from the request instead of from the session",
+    "Bulk endpoints that check the first id in an array, or none, rather than every id",
+    "Trusting a user id in the URL or body (as in /users/42/invoices) instead of deriving the owner from the authenticated session",
+    "Fetching all rows and checking each one in application code, which is safe but reads the whole table and calls the policy for every row",
+    "Different errors for forbidden and not found, which lets an attacker learn which ids exist",
+    "Testing only as one user, so the flaw never fails a test"
+  ],
+  "related": [
+    { "kind": "concept", "slug": "authentication-and-authorization" },
+    { "kind": "concept", "slug": "access-control-models" },
+    { "kind": "concept", "slug": "threat-modeling-and-attack-surface" },
+    { "kind": "concept", "slug": "api-gateway" },
+    { "kind": "concept", "slug": "graphql-n-plus-one-and-dataloader" }
+  ],
+  "roles": [
+    { "id": "user", "label": "Logged-in user", "description": "Authenticated, and trying ids that are not theirs." },
+    { "id": "api", "label": "API handler", "description": "Loads the object named in the request." },
+    { "id": "policy", "label": "Policy check", "description": "Decides whether this caller may act on this object." },
+    { "id": "store", "label": "Data store", "description": "Holds every customer's records." }
+  ],
+  "quiz": [
+    {
+      "question": "An API uses random UUIDs for invoice ids and has no ownership checks. A tester logged in as user B cannot guess any of user A's ids, so the team calls it safe. A list page at /invoices?page=1 returns all invoices. What is the problem?",
+      "options": [
+        "UUIDs should be replaced with shorter ids so that they are easier to rotate",
+        "The list is paginated, and pagination always leaks ids",
+        "Ids that are hard to guess still work as a key once any endpoint shows them, so each request needs its own ownership check",
+        "The testers should have tried more guesses before concluding anything"
+      ],
+      "answer": 2,
+      "explanation": "Unguessable ids only hide objects. The list page hands out every id, and the other endpoints serve any id they are given. The fix is the ownership check, not shorter ids or more guessing, and pagination is not the cause."
+    },
+    {
+      "question": "A team adds an owner check to GET, PUT and DELETE on /invoices/{id}. A later review finds a user can still download another user's invoice. Which endpoint is the most likely culprit?",
+      "options": [
+        "GET /invoices/{id}/pdf, a separate handler that loads the same record without the check",
+        "PUT /invoices/{id}, because updates are never safe",
+        "The login endpoint, because it creates the session",
+        "The database server, which should refuse the connection"
+      ],
+      "answer": 0,
+      "explanation": "Related endpoints such as PDF downloads, exports and search often load the same object through different code and miss the check. A central policy that every load goes through avoids this. The update handler was checked, and login and the database are not the issue."
+    },
+    {
+      "question": "A list endpoint loads every invoice in the table and then runs the policy check on each row, returning only the permitted ones. It is correct but slow as the table grows. What is the better design?",
+      "options": [
+        "Skip the checks for large tables, because the user probably will not look at the other rows",
+        "Cache the full table in the browser and filter it there",
+        "Run the policy check on the first row only and assume the rest follow",
+        "Scope the query by the caller's account in the database, so that only their rows are read, with the policy still as the rule"
+      ],
+      "answer": 3,
+      "explanation": "Filtering in the query reads only the rows the caller may see, and does so in one step. Checking only the first row, skipping checks, or sending the whole table to the browser each give other users' data away."
+    }
+  ]
+}
