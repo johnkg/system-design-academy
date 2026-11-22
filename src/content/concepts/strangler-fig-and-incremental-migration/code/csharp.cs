@@ -2,7 +2,7 @@
 // Look for: days until real users reach the new system, the most traffic switched in one step, requests hit by bugs before they were noticed,
 // bugs still silent after the migration, and how many data links cross the old/new boundary at the worst moment.
 // Model: each slice has traffic (thousand requests a day) and hidden bugs (each fires on `rate` of every 1,000 requests of its slice).
-// Shadow mode replays real requests to both systems and compares the answers: a bug is caught before any user sees it when it fires at least once in the replay.
+// Shadow mode replays real requests to both systems and compares the answers: a bug counts as caught before any user sees it when its expected number of firings in the replay is at least 1 (a deterministic simplification: real catches are probabilistic).
 // A ramp moves a share of a slice's traffic for one day per step. A monitor alerts when a bug hits 20 or more requests a day. Without rollback, fixing forward takes 5 days.
 // Assumptions: building a slice takes 21 days (7 days for a slice a third the size), the team builds slices one after another, and ramp days overlap with the next build.
 using System;
