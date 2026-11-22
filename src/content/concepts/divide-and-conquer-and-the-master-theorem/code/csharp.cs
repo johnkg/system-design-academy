@@ -1,7 +1,7 @@
 // Divide and conquer: merge sort counted in comparisons and element copies, the cost of splitting unevenly,
 // the master-theorem recurrence T(n) = a T(n/b) + f(n) evaluated level by level, and work against span (parallel potential).
 // Nothing is timed. Look for:
-//   - merge sort costs about n log2 n operations, insertion sort (no divide) about n squared / 4
+//   - merge sort costs about n log2 n operations, insertion sort (no divide) about n squared / 4 comparisons plus as many moves
 //   - a split at a fixed fraction (25%, 10%) is still n log n with a larger constant; peeling off ONE element is quadratic
 //   - which level of the recursion tree dominates decides the total: leaves, every level equally, or the root
 //   - the sequential merge at the top of the tree limits parallel speed-up (span), long before processors run out
