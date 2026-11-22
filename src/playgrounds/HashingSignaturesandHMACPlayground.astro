@@ -1,0 +1,143 @@
+---
+import PlaygroundShell from '../components/PlaygroundShell.astro';
+---
+<PlaygroundShell title="Simulate it" hint="A webhook body is signed, and an attacker who can post to the public endpoint tries three things. The hash is a 32-bit stand-in and the signature is textbook RSA with tiny primes: both are toys, deliberately NOT secure, there only so the structure is visible.">
+  <ol class="how">
+    <li>Set <b>Tag scheme</b> to <b>Plain hash</b> and <b>Attacker move</b> to <b>Edit the amount</b>: the server accepts, because the attacker recomputes the hash too. Switch to <b>HMAC</b> and the same edit is rejected, since the attacker has no key.</li>
+    <li>Set <b>Tag scheme</b> to <b>hash(secret + message)</b> and <b>Attacker move</b> to <b>Append to the message</b>: the server accepts a longer message whose tag was extended without the secret. Switch to <b>HMAC</b> and it is rejected. Now set <b>Attacker move</b> to <b>Receiver forges its own message</b>: HMAC accepts it (the receiver holds the key), the <b>Signature</b> rejects it.</li>
+    <li>Set <b>Tag comparison</b> to <b>Stops at the first difference</b>: an attacker who can measure the work recovers the whole 4-byte tag in <b>1,024</b> guesses instead of trying <b>4,294,967,296</b> tags. With <b>Constant time</b> the attacker sees no signal after <b>256</b> guesses.</li>
+    <li>Set <b>Timestamp window</b> to <b>300 s</b> and leave <b>Remember event ids</b> unticked: a replay after 10 s still works, so the order is credited <b>2</b> times. Tick <b>Remember event ids</b> and it is credited <b>1</b> time. Then untick both <b>Remember event ids</b> and <b>Signature covers the timestamp</b>: the attacker refreshes the timestamp on the captured request, and the order is credited <b>3</b> times.</li>
+  </ol>
+  <div class="pg hs" data-hs>
+    <div class="pg-row">
+      <label>Tag scheme <select class="pg-in" data-scheme><option value="hash">Plain hash</option><option value="naive">hash(secret + message)</option><option value="hmac" selected>HMAC</option><option value="sig">Signature (toy RSA)</option></select></label>
+      <label>Attacker move <select class="pg-in" data-move><option value="edit">Edit the amount</option><option value="extend">Append to the message</option><option value="forge">Receiver forges its own message</option></select></label>
+    </div>
+    <div class="pg-grid">
+      <div class="pg-box" data-b1><h3>Server verdict</h3><span class="pg-mono" data-o1></span><span class="pg-note" data-n1></span></div>
+      <div class="pg-box" data-b2><h3>What the scheme proves</h3><span class="pg-mono" data-o2></span><span class="pg-note" data-n2></span></div>
+    </div>
+    <div class="pg-row">
+      <label>Tag comparison <select class="pg-in" data-cmp><option value="early" selected>Stops at the first difference</option><option value="constant">Constant time</option></select></label>
+    </div>
+    <div class="pg-box" data-b3><h3>Attacker measuring the comparison (4-byte tag)</h3><span class="pg-mono" data-o3></span><span class="pg-note" data-n3></span></div>
+    <div class="pg-row">
+      <label>Timestamp window <select class="pg-in" data-win><option value="0" selected>Not checked</option><option value="300">300 s</option></select></label>
+      <label><input type="checkbox" data-remember /> Remember event ids</label>
+      <label><input type="checkbox" data-covers checked /> Signature covers the timestamp</label>
+    </div>
+    <div class="pg-box" data-b4><h3>Captured request replayed</h3><span class="pg-mono" data-o4></span><span class="pg-note" data-n4></span></div>
+    <ol class="pg-log" data-log tabindex="0" aria-label="Replay attempts, in order"></ol>
+  </div>
+</PlaygroundShell>
+<script>
+  import { query, formatThousands } from '../playground';
+
+  // The same model as the code samples. The hash is a 32-bit FNV-1a STAND-IN (not secure): its output is its internal state.
+  const bytes = (s: string): number[] => Array.from(s, (c) => c.charCodeAt(0));
+  const step = (h: number, bs: number[]): number => { for (const b of bs) { h ^= b; h = Math.imul(h, 16777619) >>> 0; } return h >>> 0; };
+  const H = (bs: number[]): number => step(2166136261, bs);
+  const be = (x: number): number[] => [x >>> 24, (x >>> 16) & 255, (x >>> 8) & 255, x & 255];
+  function hmac(key: string, msg: string): number {
+    const k = bytes(key); while (k.length < 16) k.push(0);
+    const inner = H([...k.map((b) => b ^ 0x36), ...bytes(msg)]);
+    return H([...k.map((b) => b ^ 0x5c), ...be(inner)]);
+  }
+  const naiveMac = (secret: string, msg: string): number => H(bytes(secret + msg));
+  const N = 3233, E = 17, D = 2753;
+  const modpow = (b: number, e: number, m: number): number => { let r = 1; b %= m; while (e > 0) { if (e & 1) r = (r * b) % m; b = (b * b) % m; e >>= 1; } return r; };
+  const sign = (msg: string): number => modpow(H(bytes(msg)) % N, D, N);
+  const verifySig = (msg: string, sig: number): boolean => modpow(sig, E, N) === H(bytes(msg)) % N;
+  const SECRET = 'k3y-s3cret', BODY = 'id=evt77&order=1001&amount=500', EDITED = 'id=evt77&order=1001&amount=9999', EXTRA = '&amount=9999', MINE = 'id=evt78&order=1002&amount=1';
+  type Scheme = 'hash' | 'naive' | 'hmac' | 'sig';
+  type Move = 'edit' | 'extend' | 'forge';
+
+  // Does the server accept what the attacker sends? Returns the message the attacker presents and whether it verifies.
+  function attack(scheme: Scheme, move: Move): { msg: string; accepted: boolean; how: string } {
+    const msg = move === 'edit' ? EDITED : move === 'extend' ? BODY + EXTRA : MINE;
+    if (scheme === 'hash') return { msg, accepted: H(bytes(msg)) === H(bytes(msg)), how: 'the attacker hashes their own message: no secret is involved' };
+    if (scheme === 'naive') {
+      if (move === 'edit') return { msg, accepted: naiveMac(SECRET, msg) === naiveMac('guess', msg), how: 'a tag from a guessed secret does not match' };
+      if (move === 'extend') return { msg, accepted: naiveMac(SECRET, msg) === step(naiveMac(SECRET, BODY), bytes(EXTRA)), how: 'the attacker kept hashing from the captured tag, never seeing the secret' };
+      return { msg, accepted: naiveMac(SECRET, msg) === naiveMac(SECRET, msg), how: 'the receiver knows the secret, so it can tag anything' };
+    }
+    if (scheme === 'hmac') {
+      if (move === 'edit') return { msg, accepted: hmac(SECRET, msg) === hmac('guess', msg), how: 'a tag from a guessed key does not match' };
+      if (move === 'extend') return { msg, accepted: hmac(SECRET, msg) === step(hmac(SECRET, BODY), bytes(EXTRA)), how: 'continuing from an HMAC tag gives a value the outer hash never produced' };
+      return { msg, accepted: hmac(SECRET, msg) === hmac(SECRET, msg), how: 'the receiver holds the shared key, so it can tag anything' };
+    }
+    const old = sign(BODY);
+    if (move === 'forge') return { msg, accepted: verifySig(msg, 1234), how: 'without the private exponent the receiver can only guess a signature' };
+    return { msg, accepted: verifySig(msg, old), how: 'the old signature belongs to the old body' };
+  }
+
+  const early = (a: number[], b: number[]) => { let n = 0; for (let i = 0; i < a.length; i++) { n++; if (a[i] !== b[i]) return { ok: false, n }; } return { ok: true, n }; };
+  const constant = (a: number[], b: number[]) => { let diff = 0; for (let i = 0; i < a.length; i++) diff |= a[i] ^ b[i]; return { ok: diff === 0, n: a.length }; };
+  function recover(compare: typeof early): { done: boolean; guesses: number } {
+    const target = be(hmac(SECRET, BODY)); const known: number[] = []; let guesses = 0;
+    for (let i = 0; i < 4; i++) {
+      let best = -1, bestScore = -1, same = true, first = -1;
+      for (let v = 0; v < 256; v++) {
+        const g = [...known, v, 0, 0, 0].slice(0, 4); guesses++;
+        const r = compare(g, target); const score = r.ok ? 99 : r.n;
+        if (first < 0) first = score;
+        if (score !== first) same = false;
+        if (score > bestScore) { bestScore = score; best = v; }
+      }
+      if (same) return { done: false, guesses };
+      known.push(best);
+    }
+    return { done: true, guesses };
+  }
+
+  function replay(window: number, remember: boolean, covers: boolean): { lines: string[]; credited: number } {
+    const text = (ts: number, body: string) => (covers ? `${ts}.${body}` : body);
+    const seen = new Set<string>(); let credited = 0;
+    const receive = (now: number, ts: number, s: number): string => {
+      if (hmac(SECRET, text(ts, BODY)) !== s) return 'rejected: bad signature';
+      if (window > 0 && now - ts > window) return 'rejected: too old';
+      if (remember) { if (seen.has('evt77')) return 'rejected: already processed'; seen.add('evt77'); }
+      credited++; return 'accepted';
+    };
+    const s0 = hmac(SECRET, text(1000, BODY));
+    const lines = [`first delivery: ${receive(1000, 1000, s0)}`, `replay after 10 s: ${receive(1010, 1000, s0)}`, `replay after 600 s: ${receive(1600, 1000, s0)}`, `replay after 600 s with a fresh timestamp: ${receive(1600, 1600, s0)}`];
+    return { lines, credited };
+  }
+
+  const PROVES: Record<Scheme, string> = {
+    hash: 'Integrity: against accidents only\nAuthenticity: no\nNon-repudiation: no',
+    naive: 'Integrity: only until the message is extended\nAuthenticity: weak, extendable by anyone who sees a tag\nNon-repudiation: no',
+    hmac: 'Integrity: yes\nAuthenticity: yes, a holder of the shared key\nNon-repudiation: no, both sides hold the key',
+    sig: 'Integrity: yes\nAuthenticity: yes\nNon-repudiation: yes, while the private key stays private'
+  };
+
+  document.querySelectorAll<HTMLElement>('[data-hs]').forEach((root) => {
+    const q = query(root);
+    const color = (sel: string, good: boolean) => q<HTMLElement>(sel).style.setProperty('--c', good ? 'var(--good)' : 'var(--bad)');
+    function draw() {
+      const scheme = q<HTMLSelectElement>('[data-scheme]').value as Scheme;
+      const move = q<HTMLSelectElement>('[data-move]').value as Move;
+      const a = attack(scheme, move);
+      q('[data-o1]').textContent = a.accepted ? `ACCEPTED: ${a.msg}` : `REJECTED: ${a.msg}`;
+      q('[data-n1]').textContent = a.how;
+      color('[data-b1]', !a.accepted);
+      q('[data-o2]').textContent = PROVES[scheme];
+      q('[data-n2]').textContent = 'A MAC is not a signature: the verifier can forge. A hash alone is not authentication.';
+      color('[data-b2]', scheme === 'hmac' || scheme === 'sig');
+
+      const r = recover(q<HTMLSelectElement>('[data-cmp]').value === 'early' ? early : constant);
+      q('[data-o3]').textContent = r.done ? `tag recovered in ${formatThousands(r.guesses)} guesses` : `no signal after ${formatThousands(r.guesses)} guesses`;
+      q('[data-n3]').textContent = r.done ? 'About 256 guesses per byte, against 4,294,967,296 possible tags. Real attacks are noisier, but the leak is real.' : 'Every guess costs the same work, so the attacker learns nothing from timing.';
+      color('[data-b3]', !r.done);
+
+      const rep = replay(Number(q<HTMLSelectElement>('[data-win]').value), q<HTMLInputElement>('[data-remember]').checked, q<HTMLInputElement>('[data-covers]').checked);
+      q('[data-o4]').textContent = `Order credited ${rep.credited} ${rep.credited === 1 ? 'time' : 'times'}`;
+      q('[data-n4]').textContent = rep.credited === 1 ? 'Only the real delivery had an effect.' : 'The captured request was valid every time it was sent.';
+      color('[data-b4]', rep.credited === 1);
+      const log = q('[data-log]'); log.textContent = '';
+      for (const line of rep.lines) { const li = document.createElement('li'); li.textContent = line; log.appendChild(li); }
+    }
+    root.addEventListener('change', draw);
+    draw();
+  });
+</script>
