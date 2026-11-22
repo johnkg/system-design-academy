@@ -15,8 +15,8 @@ public static class Program
 
     static F[] Ctx(string name, string[] holds, string[] copies) => new[]
     {
-        new F(name + "Model", name, holds, copies, None),
-        new F(name + "Acl", name, None, holds.Concat(copies).ToArray(), S(name + "Model", "PublishedLanguage")), // the translation layer maps shared ids into the context's own model
+        new F(name + "Model", name.ToLowerInvariant(), holds, copies, None),
+        new F(name + "Acl", name.ToLowerInvariant(), None, holds.Concat(copies).ToArray(), S(name + "Model", "PublishedLanguage")), // the translation layer maps shared ids into the context's own model
     };
 
     static F[] Join(params IEnumerable<F>[] parts) => parts.SelectMany(p => p).ToArray();
