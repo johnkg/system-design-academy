@@ -1,0 +1,113 @@
+---
+import PlaygroundShell from '../components/PlaygroundShell.astro';
+---
+<PlaygroundShell title="Simulate it" hint="Toggle routes and gateways, and read off which pairs can reach each other. Only routing is judged: security groups are assumed open.">
+  <ol class="how">
+    <li>With the defaults the network has <b>4</b> working paths and the database is not reachable from the internet. Untick <b>NAT route in the private subnet</b>: the app loses the internet and the count drops to <b>3</b>.</li>
+    <li>Tick <b>Peering route in VPC A</b> only: the table says the reply has no route back and the count stays at 4. Also tick <b>Peering route back in VPC B</b>: <b>6</b>. Set <b>Peer VPC CIDR</b> to the overlapping option and the peer becomes unreachable (no such host here).</li>
+    <li>Tick <b>VPN route to on-premises</b> (with a distinct peer range): on-premises becomes reachable from web and app. Then tick <b>Database subnet: default route and public IP</b>: the database becomes <b>reachable from the internet</b> and nothing else visibly breaks.</li>
+  </ol>
+  <div class="pg vpcn" data-vpcn>
+    <div class="pg-row">
+      <label><input type="checkbox" data-nat checked /> NAT route in the private subnet</label>
+      <label><input type="checkbox" data-vpn /> VPN route to on-premises</label>
+      <label><input type="checkbox" data-peer /> Peering route in VPC A</label>
+      <label><input type="checkbox" data-back /> Peering route back in VPC B</label>
+      <label><input type="checkbox" data-dbopen /> Database subnet: default route and public IP</label>
+    </div>
+    <div class="pg-row">
+      <label>Peer VPC CIDR <select class="pg-in" data-cidr><option value="10.1.0.0/16" selected>Distinct (second range)</option><option value="10.0.0.0/16">Overlapping (same as VPC A)</option></select></label>
+    </div>
+    <div class="vpcn-wrap" tabindex="0" role="region" aria-label="Reachability from each source to each destination">
+      <table class="vpcn-table">
+        <thead><tr><th scope="col">From \ To</th><th scope="col">Internet</th><th scope="col">Peer VPC</th><th scope="col">On-premises</th><th scope="col">Database</th></tr></thead>
+        <tbody data-rows></tbody>
+      </table>
+    </div>
+    <div class="pg-grid">
+      <div class="pg-box" style="--c: var(--role-1)"><h3>Working paths</h3><span class="pg-mono" data-paths>0</span><span class="pg-note">of 11 source and destination pairs</span></div>
+      <div class="pg-box" style="--c: var(--role-2)"><h3>Internet to web</h3><span class="pg-mono" data-inweb></span></div>
+      <div class="pg-box" style="--c: var(--role-3)"><h3>Internet to database</h3><span class="pg-mono" data-indb></span></div>
+    </div>
+    <p class="pg-out" data-verdict aria-live="polite"></p>
+    <p class="pg-note">Model: VPC A 10.0.0.0/16 holds web (public subnet, public IP), app (private subnet) and db (database subnet). Routes are looked up by longest prefix (ties go to the local route). An internet gateway serves only hosts with a public IP, a NAT gateway serves private hosts, neither carries private destinations, peering needs distinct CIDRs and a route on both sides, and the VPN's far side is assumed to route replies back. Same model as the code samples.</p>
+  </div>
+</PlaygroundShell>
+<script>
+  import { query } from '../playground';
+  type Table = [string, string][];
+  const VPC = '10.0.0.0/16';
+  const HOSTS: Record<string, string> = { web: '10.0.1.10', app: '10.0.2.10', db: '10.0.3.10' };
+  const OCTET = 256, IPV4_BITS = 32;
+  const ipv = (s: string) => s.split('.').reduce((acc, o) => acc * OCTET + Number(o), 0);
+  const parse = (cidr: string) => { const [b, n] = cidr.split('/'); const bits = Number(n); return { base: ipv(b), bits, size: 2 ** (IPV4_BITS - bits) }; };
+  const contains = (cidr: string, ip: string) => { const c = parse(cidr); const a = ipv(ip); return a >= c.base && a < c.base + c.size; };
+  const overlaps = (x: string, y: string) => { const a = parse(x), b = parse(y); return a.base < b.base + b.size && b.base < a.base + a.size; };
+  const isPrivate = (ip: string) => contains('10.0.0.0/8', ip) || contains('172.16.0.0/12', ip) || contains('192.168.0.0/16', ip);
+  function lookup(table: Table, ip: string) {
+    let best: { bits: number; target: string } | null = null;
+    for (const [cidr, target] of table) if (contains(cidr, ip) && (best === null || parse(cidr).bits > best.bits)) best = { bits: parse(cidr).bits, target };
+    return best === null ? null : best.target;
+  }
+  interface Cfg { nat: boolean; vpn: boolean; peerRoute: boolean; peerBack: boolean; peerCidr: string; dbOpen: boolean }
+  function buildTables(c: Cfg): Record<string, Table> {
+    const extra: Table = [];
+    if (c.vpn) extra.push(['192.168.0.0/16', 'vpn']);
+    if (c.peerRoute) extra.push([c.peerCidr, 'peering']);
+    return {
+      web: [[VPC, 'local'], ['0.0.0.0/0', 'igw'], ...extra],
+      app: [[VPC, 'local'], ...(c.nat ? [['0.0.0.0/0', 'nat'] as [string, string]] : []), ...extra],
+      db: [[VPC, 'local'], ...(c.dbOpen ? [['0.0.0.0/0', 'igw'] as [string, string]] : [])],
+    };
+  }
+  function reach(c: Cfg, tables: Record<string, Table>, src: string, dest: string) {
+    const target = lookup(tables[src], dest);
+    const hasPublicIp = src === 'web' || (src === 'db' && c.dbOpen);
+    if (target === null) return 'no route';
+    if (target === 'local') return Object.values(HOSTS).includes(dest) ? 'ok (local)' : 'no such host here';
+    if (target === 'igw') return !hasPublicIp ? 'no public IP' : isPrivate(dest) ? 'private address dropped' : 'ok (internet gateway)';
+    if (target === 'nat') return isPrivate(dest) ? 'private address dropped' : 'ok (NAT gateway)';
+    if (target === 'peering') return overlaps(VPC, c.peerCidr) ? 'peering impossible (overlap)' : !c.peerBack ? 'reply has no route back' : 'ok (peering)';
+    return 'ok (VPN)';
+  }
+
+  document.querySelectorAll<HTMLElement>('[data-vpcn]').forEach((root) => {
+    const q = query(root);
+    const setText = (s: string, v: string) => { q(s).textContent = v; };
+    const checked = (s: string) => q<HTMLInputElement>(s).checked;
+    function draw() {
+      const c: Cfg = { nat: checked('[data-nat]'), vpn: checked('[data-vpn]'), peerRoute: checked('[data-peer]'), peerBack: checked('[data-back]'), peerCidr: q<HTMLSelectElement>('[data-cidr]').value, dbOpen: checked('[data-dbopen]') };
+      const tables = buildTables(c);
+      const o = c.peerCidr.split('/')[0].split('.');
+      const dests: [string, string][] = [['internet', '8.8.8.8'], ['peer', `${o[0]}.${o[1]}.${o[2]}.10`], ['onprem', '192.168.5.5'], ['db', HOSTS.db]];
+      const rows = q('[data-rows]'); rows.textContent = '';
+      let ok = 0;
+      for (const src of ['web', 'app', 'db']) {
+        const tr = document.createElement('tr');
+        const th = document.createElement('th'); th.scope = 'row'; th.textContent = src; tr.appendChild(th);
+        for (const [label, ip] of dests) {
+          const r = src === 'db' && label === 'db' ? '-' : reach(c, tables, src, ip);
+          if (r.startsWith('ok')) ok++;
+          const td = document.createElement('td'); td.textContent = r; tr.appendChild(td);
+        }
+        rows.appendChild(tr);
+      }
+      const inWeb = lookup(tables.web, '203.0.113.9') === 'igw';
+      const inDb = c.dbOpen && lookup(tables.db, '203.0.113.9') === 'igw';
+      setText('[data-paths]', String(ok)); setText('[data-inweb]', inWeb ? 'reachable' : 'no path'); setText('[data-indb]', inDb ? 'reachable' : 'no path');
+      setText('[data-verdict]', inDb ? 'The database is reachable from the internet. Routing no longer protects it: only its security group stands in the way.'
+        : c.peerRoute && !c.peerBack && !overlaps(VPC, c.peerCidr) ? 'Requests reach the peer but replies have no route back: connections hang.'
+        : c.peerRoute && overlaps(VPC, c.peerCidr) ? 'Overlapping ranges: the local route captures the traffic and peering cannot be created. Renumber one side.'
+        : !c.nat ? 'The private subnet has no route to the internet: updates and external API calls time out.'
+        : 'Private hosts stay off the internet; only web is exposed.');
+    }
+    root.querySelectorAll('select, input').forEach((el) => el.addEventListener('input', draw));
+    draw();
+  });
+</script>
+<style is:global>
+  .playground .vpcn .vpcn-wrap { overflow-x: auto; margin: 12px 0; }
+  .playground .vpcn .vpcn-table { border-collapse: collapse; width: 100%; font-size: .85rem; }
+  .playground .vpcn .vpcn-table th, .playground .vpcn .vpcn-table td { border-bottom: 1px solid var(--border); padding: 6px 10px; text-align: left; white-space: nowrap; }
+  .playground .vpcn .pg-row label { display: flex; align-items: flex-start; gap: 6px; }
+</style>
