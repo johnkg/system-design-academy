@@ -11,7 +11,7 @@
     { "title": "Backfill (fill the new columns for existing rows) in small, throttled batches", "text": "A job walks the primary key in ranges of a few thousand rows: UPDATE users SET first_name = ..., last_name = ... WHERE id BETWEEN a AND b AND first_name IS NULL. Each batch is a short transaction (hundreds of milliseconds), so row locks are brief and the WAL or binlog (the log of changes that replicas replay) is produced in small pieces. Between batches it sleeps while replica lag (how far a replica is behind the primary) is above a threshold, so replicas and any lag-sensitive reads are not sacrificed. The WHERE first_name IS NULL guard means the job never overwrites a value the application wrote moments ago." },
     { "title": "Verify, switch reads, stop writing the old column", "text": "Count rows where the new columns are NULL or differ from the split of full_name, and wait until replicas have caught up. Then flip reads to the new columns behind a flag. Keep dual-writing for a while so you can flip back. When confident, deploy the version that no longer touches full_name." },
     { "title": "Contract: drop the old column", "text": "DROP COLUMN full_name once no deployed code, job, report or replica consumer references it. In PostgreSQL this is metadata only; in MySQL it can rewrite the table, so use INSTANT where available or a shadow-table tool. Each step is its own deploy and can be reverted on its own." },
-    { "title": "Shadow-table tools for changes that must rewrite the table", "text": "gh-ost and pt-online-schema-change create an empty copy with the new schema, copy rows in chunks (INSERT IGNORE ... SELECT), and capture ongoing changes (gh-ost reads the binlog, pt-osc uses triggers) to replay on the copy. When the copy has caught up, a short atomic rename swaps the tables. They throttle on replica lag, but they cannot compute a column from other columns. Splitting full_name still needs a backfill, which is why the expand and contract pattern is the usual answer here." }
+    { "title": "Shadow-table tools for changes that must rewrite the table", "text": "gh-ost and pt-online-schema-change create an empty copy with the new schema, copy rows in chunks (INSERT IGNORE ... SELECT), and capture ongoing changes (gh-ost reads the binlog, pt-osc uses triggers) to replay on the copy. When the copy has caught up, a short atomic rename swaps the tables. They throttle on replica lag, but they copy existing columns as they are and do not compute a new column's values from other columns. Splitting full_name with them still needs a backfill afterwards, or a custom copy job built on the same shadow-table idea (which is what the simulation below models), which is why the expand and contract pattern is the usual answer here." }
   ],
   "pros": [
     "No long table lock: the only blocking moments are millisecond metadata changes and, for shadow tools, a rename of around a second",
@@ -32,16 +32,16 @@
   ],
   "whenNotToUse": [
     "Small tables, or a service with a maintenance window, where a plain ALTER finishes in seconds and the ceremony costs more than the risk",
-    "Changes the database already does online and cheaply: PostgreSQL ADD COLUMN with a constant default, MySQL 8 INSTANT operations, CREATE INDEX CONCURRENTLY",
+    "Changes the database already does online and cheaply: PostgreSQL 11+ ADD COLUMN with a constant default, MySQL 8 INSTANT operations, CREATE INDEX CONCURRENTLY",
     "Pre-launch tables with no traffic and no data worth preserving"
   ],
   "pitfalls": [
     "Starting the backfill before dual-write is live everywhere: rows written behind the cursor keep a stale split silently",
     "A backfill that reads a row, computes in the app, and writes it back unconditionally: it overwrites a concurrent update with stale data. Compute in SQL, in one statement, and guard with IS NULL or a version",
-    "ALTER TABLE ... ADD COLUMN ... NOT NULL DEFAULT on an old engine, or with a volatile default, rewrites the whole table under an exclusive lock. Adding NOT NULL later takes a full scan under lock unless you first add a validated CHECK constraint (PostgreSQL) and then set NOT NULL",
+    "ALTER TABLE ... ADD COLUMN ... NOT NULL DEFAULT on an old engine, or with a volatile default, rewrites the whole table under an exclusive lock. Adding NOT NULL later takes a full scan under lock unless you first add a CHECK (col IS NOT NULL) constraint as NOT VALID, validate it, and then set NOT NULL (PostgreSQL 12+ then skips the scan)",
     "CREATE INDEX without CONCURRENTLY (PostgreSQL) blocks all writes for the duration of the build; CONCURRENTLY is slower, cannot run inside a transaction, and leaves an INVALID index if it fails",
     "Renaming a column or changing its type in one step breaks every running app instance that still uses the old name or type. Add a new column and migrate instead",
-    "Waiting for a metadata lock behind a long transaction: the ALTER queues, every later query queues behind the ALTER, and the whole table stalls. Always set lock_timeout and retry",
+    "Waiting for a metadata lock behind a long transaction: the ALTER queues, every later query queues behind the ALTER, and the whole table stalls. Always set a short lock timeout (lock_timeout in PostgreSQL, lock_wait_timeout in MySQL) and retry",
     "Ignoring replica lag: finishing the backfill on the primary does not mean replicas have the data. Switching reads to the new columns while a replica is 20 minutes behind returns NULL names",
     "One huge batch because it is faster: the batch holds locks for seconds, produces a single large replication event, and a failure rolls back all the work"
   ],
