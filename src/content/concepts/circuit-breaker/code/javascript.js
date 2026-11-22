@@ -19,7 +19,7 @@ class CircuitBreaker {
   async run(...args) {
     if (this.state === "open") {
       if (this.now() - this.#openedAt < this.cooldownMs) throw new Error("circuit open: failing fast");
-      this.state = "half-open"; // cool-down over: allow a trial call
+      this.state = "half-open"; // cool-down over: allow a trial call (this demo runs calls one at a time; with concurrent callers, also fail fast while the probe is in flight)
     }
     try {
       const result = await this.call(...args);

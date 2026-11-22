@@ -21,7 +21,7 @@ class CircuitBreaker:
         if self.state == "open":
             if self.now() - self._opened_at < self.cooldown_ms:
                 raise RuntimeError("circuit open: failing fast")
-            self.state = "half-open"  # cool-down over: allow a trial call
+            self.state = "half-open"  # cool-down over: allow a trial call (this demo runs calls one at a time; with concurrent callers, also fail fast while the probe is in flight)
         try:
             result = self.call(*args)
             self.state = "closed"  # success (also closes from half-open)
