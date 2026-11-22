@@ -1,0 +1,130 @@
+---
+import PlaygroundShell from '../components/PlaygroundShell.astro';
+---
+<PlaygroundShell title="Simulate it" hint="Pick a kind of flood and a defence. The table compares all seven defences against the attack you chose, so you can see who each one helps and who it hurts.">
+  <ol class="how">
+    <li>Choose <b>Attack</b> Volumetric flood and <b>Defence</b> None: only <b>19%</b> of legitimate requests get through the saturated link. Choose <b>Edge scrubbing (anycast)</b>: <b>98%</b>. Set <b>Attack size</b> to 2x and the edge saturates too: <b>78%</b>.</li>
+    <li>Choose <b>Attack</b> SYN flood with <b>Attack size</b> 1x: None gives <b>6%</b>, <b>SYN cookies</b> gives <b>100%</b>, and blocking IPs does nothing because the sources are spoofed.</li>
+    <li>Choose <b>Attack</b> HTTP flood: None gives <b>27%</b>. <b>Block the 10 busiest IPs</b> makes it worse (<b>17%</b>) because the office NAT address is the busiest. <b>Per-IP limit of 3</b> gives <b>22%</b>. <b>Challenge</b> gives <b>95%</b>, at a cost of 5% of real users.</li>
+  </ol>
+  <div class="pg ddos" data-ddos>
+    <div class="pg-row">
+      <label>Attack <select class="pg-in" data-attack><option value="volumetric" selected>Volumetric flood</option><option value="syn">SYN flood</option><option value="http">HTTP flood</option></select></label>
+      <label>Defence <select class="pg-in" data-defense>
+        <option value="none" selected>None</option>
+        <option value="block">Block the 10 busiest IPs</option>
+        <option value="limit3">Per-IP limit of 3</option>
+        <option value="limit1">Per-IP limit of 1</option>
+        <option value="edge">Edge scrubbing (anycast)</option>
+        <option value="cookies">SYN cookies</option>
+        <option value="challenge">Challenge</option>
+      </select></label>
+      <label>Attack size <select class="pg-in" data-scale><option value="1" selected>1x</option><option value="2">2x</option></select></label>
+    </div>
+    <div class="pg-grid">
+      <div class="pg-box" style="--c: var(--role-1)"><h3>Legitimate requests served</h3><span class="pg-mono" data-served>0%</span></div>
+      <div class="pg-box" style="--c: var(--role-2)"><h3>Dropped by the filter itself</h3><span class="pg-mono" data-filtered>0%</span><span class="pg-note">collateral damage</span></div>
+      <div class="pg-box" style="--c: var(--role-3)"><h3>Attack reaching the service</h3><span class="pg-mono" data-through>0</span><span class="pg-note">per tick, on average</span></div>
+    </div>
+    <p class="pg-out" data-verdict aria-live="polite"></p>
+    <div class="ddos-wrap" tabindex="0" role="region" aria-label="All defences against the chosen attack">
+      <table class="ddos-table">
+        <thead><tr><th scope="col">Defence</th><th scope="col">Legit served</th><th scope="col">Dropped by filter</th><th scope="col">Attack through</th></tr></thead>
+        <tbody data-rows></tbody>
+      </table>
+    </div>
+    <p class="pg-note">Model: 10 ticks, seeded intensity of 90 to 110 percent. Legitimate load is 200 requests per tick: 60 home users with their own IP (2 each) and one office behind one NAT IP (80). Volumetric: a 1,000 unit link offered about 5,000 units. SYN flood: 3,000 spoofed SYNs per tick into a 1,024 entry table, entries held 5 ticks. HTTP flood: 500 bot IPs at 4 valid requests each against capacity 600. Edge scrubbing: 8 sites of 1,000 units, removes 95% of volumetric traffic, proxies SYNs, drops 30% of bot requests, wrongly drops 2% of real traffic. A challenge is passed by 95% of users and 10% of bots. All figures are made up to show shapes, not to predict real systems.</p>
+  </div>
+</PlaygroundShell>
+<script>
+  import { query, numberValue } from '../playground';
+  const TICKS = 10, HOMES = 60, HOME_RATE = 2, OFFICE = 80, LEGIT = HOMES * HOME_RATE + OFFICE;
+  const LINK_CAP = 1000, VOLUME = 5000, SYN_RATE = 3000, TABLE = 1024, SYN_HOLD = 5;
+  const BOTS = 500, BOT_RATE = 4, APP_CAP = 600, POPS = 8, POP_CAP = 1000, BLOCKLIST = 10;
+  const LIMITS: Record<string, number> = { limit3: 3, limit1: 1 };
+  const NAMES: Record<string, string> = { none: 'None', block: 'Block the 10 busiest IPs', limit3: 'Per-IP limit of 3', limit1: 'Per-IP limit of 1', edge: 'Edge scrubbing (anycast)', cookies: 'SYN cookies', challenge: 'Challenge' };
+  const SEED = 7, RNG_MUL = 48271, RNG_MOD = 2147483647, JITTER_BASE = 90, JITTER_SPAN = 21;
+  function makeRng(seed: number) { let s = seed; return () => { s = (s * RNG_MUL) % RNG_MOD; return s; }; }
+  function legitAfter(defense: string, stage: string) {
+    if (defense === 'block') return LEGIT - OFFICE;
+    if (defense in LIMITS) return HOMES * Math.min(HOME_RATE, LIMITS[defense]) + Math.min(OFFICE, LIMITS[defense]);
+    if (defense === 'challenge') return stage === 'app' ? Math.floor(LEGIT * 95 / 100) : LEGIT;
+    if (defense === 'edge') return Math.floor(LEGIT * 98 / 100);
+    return LEGIT;
+  }
+  function sim(attack: string, defense: string, scale: number) {
+    const rng = makeRng(SEED);
+    const expiring = new Array(TICKS + SYN_HOLD + 1).fill(0);
+    let used = 0, served = 0, filtered = 0, through = 0;
+    for (let t = 0; t < TICKS; t++) {
+      const m = JITTER_BASE + (rng() % JITTER_SPAN);
+      const legit = legitAfter(defense, attack === 'http' ? 'app' : 'ip');
+      filtered += LEGIT - legit;
+      let l = legit, at = 0;
+      if (attack === 'volumetric') {
+        const a = Math.floor(VOLUME * scale * m / 100);
+        if (defense === 'edge') {
+          at = Math.floor(a * 5 / 100);
+          const cap = POPS * POP_CAP;
+          if (a + LEGIT > cap) { l = Math.floor(l * cap / (a + LEGIT)); at = Math.floor(at * cap / (a + LEGIT)); }
+        } else {
+          const offered = a + LEGIT;
+          const share = offered > LINK_CAP ? Math.floor(LEGIT * LINK_CAP / offered) : LEGIT;
+          l = Math.floor(share * legit / LEGIT);
+          at = offered > LINK_CAP ? Math.floor(a * LINK_CAP / offered) : a;
+        }
+      } else if (attack === 'syn') {
+        const a = Math.floor(SYN_RATE * scale * m / 100);
+        if (defense !== 'edge' && defense !== 'cookies') {
+          used -= expiring[t];
+          const arrivals = a + legit;
+          const admitted = Math.min(TABLE - used, arrivals);
+          l = Math.floor(admitted * legit / arrivals);
+          at = admitted - l;
+          used += admitted; expiring[t + SYN_HOLD] += admitted;
+        }
+      } else {
+        const n = Math.floor(BOTS * scale * m / 100);
+        if (defense === 'block') at = Math.max(0, n - (BLOCKLIST - 1)) * BOT_RATE;
+        else if (defense in LIMITS) at = n * Math.min(BOT_RATE, LIMITS[defense]);
+        else if (defense === 'edge') at = Math.floor(n * BOT_RATE * 70 / 100);
+        else if (defense === 'challenge') at = Math.floor(n * BOT_RATE * 10 / 100);
+        else at = n * BOT_RATE;
+        const arrivals = at + legit;
+        if (arrivals > APP_CAP) { l = Math.floor(APP_CAP * legit / arrivals); at = Math.floor(APP_CAP * at / arrivals); }
+      }
+      served += l; through += at;
+    }
+    const pct = (x: number) => Math.floor(x * 100 / (LEGIT * TICKS));
+    return { served: pct(served), filtered: pct(filtered), through: Math.floor(through / TICKS) };
+  }
+
+  document.querySelectorAll<HTMLElement>('[data-ddos]').forEach((root) => {
+    const q = query(root); const val = numberValue(q);
+    const setText = (s: string, v: string) => { q(s).textContent = v; };
+    function draw() {
+      const attack = q<HTMLSelectElement>('[data-attack]').value, defense = q<HTMLSelectElement>('[data-defense]').value, scale = val('[data-scale]');
+      const r = sim(attack, defense, scale);
+      setText('[data-served]', r.served + '%'); setText('[data-filtered]', r.filtered + '%'); setText('[data-through]', String(r.through));
+      const none = sim(attack, 'none', scale);
+      setText('[data-verdict]', r.served >= 90 ? 'This defence matches the layer the attack works at: most legitimate traffic is served.'
+        : r.served <= none.served && defense !== 'none' ? 'This defence does not help against this attack (or makes it worse): it acts at a layer the flood does not use, or it hits real users.'
+        : defense === 'none' ? 'No defence: the attacked resource is shared out between real and attack traffic.'
+        : 'A small gain: the attack is still using up most of the resource.');
+      const rows = q('[data-rows]'); rows.textContent = '';
+      for (const d of Object.keys(NAMES)) {
+        const x = sim(attack, d, scale);
+        const tr = document.createElement('tr');
+        [NAMES[d], x.served + '%', x.filtered + '%', String(x.through)].forEach((t, i) => { const c = document.createElement(i === 0 ? 'th' : 'td'); if (i === 0) (c as HTMLTableCellElement).scope = 'row'; c.textContent = t; tr.appendChild(c); });
+        rows.appendChild(tr);
+      }
+    }
+    root.querySelectorAll('select').forEach((el) => el.addEventListener('input', draw));
+    draw();
+  });
+</script>
+<style is:global>
+  .playground .ddos .ddos-wrap { overflow-x: auto; margin-top: 12px; }
+  .playground .ddos .ddos-table { border-collapse: collapse; width: 100%; font-size: .9rem; }
+  .playground .ddos .ddos-table th, .playground .ddos .ddos-table td { border-bottom: 1px solid var(--border); padding: 6px 10px; text-align: left; white-space: nowrap; }
+</style>
