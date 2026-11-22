@@ -6,7 +6,7 @@ export const changelog: Change[] = [
     date: '2026-11-25',
     title: 'Fact-checked badges',
     items: [
-      { text: 'Lessons that have been through an independent accuracy review now carry a Fact-checked badge with the date. 96 concepts and 4 case studies have it so far; the review found and fixed wrong claims in nearly all of them, and the rest of the site follows in rounds. The new page explains what the review covers and what it does not.', href: 'accuracy/' },
+      { text: 'Lessons that have been through an independent accuracy review now carry a Fact-checked badge with the date. 144 concepts and 4 case studies have it so far; the review found and fixed wrong claims in nearly all of them, and the rest of the site follows in rounds. The new page explains what the review covers and what it does not.', href: 'accuracy/' },
     ],
   },
   {
