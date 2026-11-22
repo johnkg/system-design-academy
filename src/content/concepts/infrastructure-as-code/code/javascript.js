@@ -72,7 +72,7 @@ run("1. first apply", v1, actual);
 const v2 = clone(v1);
 v2["server.web-1"].size = "medium"; // in place
 delete v2["server.web-2"]; v2["server.web-3"] = web("small"); // a rename is a delete plus a create
-v2["db.main"].engine = "postgres16"; // immutable: the database is replaced and its data is lost
+v2["db.main"].engine = "postgres16"; // immutable in this toy provider: the database is replaced and its data is lost (real providers often upgrade versions in place)
 run("2. edit the code", v2, actual);
 
 actual["server.web-1"].size = "large"; // someone clicked in the console
