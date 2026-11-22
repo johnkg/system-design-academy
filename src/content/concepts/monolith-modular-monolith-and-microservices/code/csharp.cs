@@ -1,5 +1,5 @@
 // Monolith, modular monolith and microservices: one shop (6 modules) cut into deployable units five ways, hit by the same four changes.
-// Look for: deploys per change, teams that must release together, network calls per checkout, and how many modules fail when Payments misbehaves.
+// Look for: deploys per change, teams that must ship a release (in one deployable that is every team; with separate services each ships on its own schedule unless they share a database), network calls per checkout, and how many modules fail when Payments misbehaves.
 // A design says how modules map to deployables (together = one process), whether the database is shared, whether module internals leak to callers,
 // whether callers have fallbacks, and how many separate services one module is split into (1 or 3: api, logic, store).
 // Assumption for latency: every network call costs the same fixed number of milliseconds (here 2).
@@ -106,7 +106,7 @@ public static class Program
             {
                 var (m, dp, t) = Analyse(d, c);
                 i++;
-                Console.WriteLine($"  C{i} {c.Text}: edit {m} modules, {dp} deploys, {t} teams release together");
+                Console.WriteLine($"  C{i} {c.Text}: edit {m} modules, {dp} deploys, {t} teams must ship");
                 tm += m; td += dp; tt += t;
             }
             Console.WriteLine($"  four changes: {tm} modules edited, {td} deploys, {tt} team-releases");
