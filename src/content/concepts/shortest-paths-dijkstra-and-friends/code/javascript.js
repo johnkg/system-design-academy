@@ -144,7 +144,7 @@ for (const kind of ["sparse", "dense", "adversarial"]) {
   }
 }
 
-console.log("-- one negative edge weight: Dijkstra (settle each node once) against Bellman-Ford");
+console.log("-- negative edge weights: Dijkstra (settle each node once) against Bellman-Ford");
 for (const v of [100, 1000]) {
   const adj = makeGraph("negative", v);
   const [bf, relax, rounds] = bellmanFord(adj, 0);

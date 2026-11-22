@@ -153,7 +153,7 @@ for kind in ["sparse", "dense", "adversarial"]:
             raise Exception("the two implementations disagree")
         print(f"{kind} V={v} E={e}: array {sa}, heap {sh} ({pushes} pushes)")
 
-print("-- one negative edge weight: Dijkstra (settle each node once) against Bellman-Ford")
+print("-- negative edge weights: Dijkstra (settle each node once) against Bellman-Ford")
 for v in [100, 1000]:
     adj = make_graph("negative", v)
     e = sum(len(x) for x in adj)
