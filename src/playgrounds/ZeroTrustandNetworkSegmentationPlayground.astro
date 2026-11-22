@@ -1,0 +1,111 @@
+---
+import PlaygroundShell from '../components/PlaygroundShell.astro';
+---
+<PlaygroundShell title="Simulate it" hint="Twelve hosts, 23 calls the system really needs, and one compromised host. Worst case is assumed: any host the attacker can open a connection to can be taken over next, so the count is what they could end up on by pivoting.">
+  <ol class="how">
+    <li>Set <b>Network policy</b> to <b>Flat network</b> and <b>Compromised host</b> to <b>search</b>: all <b>132</b> connections are allowed, the attacker reaches <b>11</b> hosts and all <b>3</b> of the crown jewels (the two databases and payments).</li>
+    <li>Switch to <b>Segmented zones</b>: <b>75</b> connections remain and search reaches <b>7</b> hosts, still including the databases because the app zone may reach the data zone. Switch to <b>Identity-based (mTLS)</b>: only the <b>23</b> needed connections remain, search reaches <b>1</b> host, and no crown jewel.</li>
+    <li>Now set <b>Compromised host</b> to <b>ci</b>: even with identity-based rules the CI runner reaches <b>9</b> hosts, because it is allowed to deploy to services that in turn reach the databases. Over all 12 entry points, identity-based rules allow <b>41</b> takeovers against <b>132</b> on the flat network.</li>
+    <li>Set <b>Network policy</b> to <b>Over-applied: reviewed flows only</b>: only <b>19</b> of the <b>23</b> needed flows work. Tick <b>Grant broad exceptions</b> to fix that and every flow works, but <b>8</b> connections nobody needs appear, and after setting <b>Compromised host</b> back to <b>search</b> it reaches <b>3</b> hosts again.</li>
+  </ol>
+  <div class="pg zt" data-zt>
+    <div class="pg-row">
+      <label>Network policy <select class="pg-in" data-policy><option value="flat" selected>Flat network</option><option value="segmented">Segmented zones</option><option value="identity">Identity-based (mTLS)</option><option value="strict">Over-applied: reviewed flows only</option></select></label>
+      <label>Compromised host <select class="pg-in" data-host></select></label>
+      <label><input type="checkbox" data-exc /> Grant broad exceptions for blocked flows</label>
+    </div>
+    <div class="pg-grid">
+      <div class="pg-box" data-b1><h3>Connections allowed</h3><span class="pg-mono" data-o1></span><span class="pg-note" data-n1></span></div>
+      <div class="pg-box" data-b2><h3>Needed flows working</h3><span class="pg-mono" data-o2></span><span class="pg-note" data-n2></span></div>
+      <div class="pg-box" data-b3><h3>Hosts the attacker reaches</h3><span class="pg-mono" data-o3></span><span class="pg-note" data-n3></span></div>
+      <div class="pg-box" data-b4><h3>Crown jewels reached</h3><span class="pg-mono" data-o4></span><span class="pg-note" data-n4></span></div>
+    </div>
+    <div class="pg-box" style="--c: var(--border)">
+      <h3>The 12 hosts</h3>
+      <div class="zt-strip" data-strip></div>
+      <span class="pg-note" data-n5></span>
+    </div>
+  </div>
+</PlaygroundShell>
+<script>
+  import { query } from '../playground';
+  // The same model as the code samples: allowed connections per policy, then a breadth-first search for what a compromised host can pivot to.
+  const HOSTS = ['web', 'bff', 'orders', 'payments', 'inventory', 'search', 'users', 'orders-db', 'users-db', 'cache', 'ci', 'monitor'];
+  const ZONE: Record<string, string> = { web: 'edge', bff: 'edge', orders: 'app', payments: 'app', inventory: 'app', search: 'app', users: 'app', 'orders-db': 'data', 'users-db': 'data', cache: 'data', ci: 'ops', monitor: 'ops' };
+  const JEWELS = ['orders-db', 'users-db', 'payments'];
+  const FLOWS: [string, string, number][] = [
+    ['web', 'orders', 1], ['web', 'search', 1], ['web', 'users', 1], ['bff', 'orders', 1], ['bff', 'users', 0],
+    ['orders', 'payments', 1], ['orders', 'inventory', 1], ['orders', 'orders-db', 1], ['orders', 'cache', 1],
+    ['users', 'users-db', 1], ['users', 'cache', 1], ['search', 'cache', 0],
+    ['ci', 'web', 1], ['ci', 'orders', 1], ['ci', 'users', 0],
+    ...['web', 'bff', 'orders', 'payments', 'inventory', 'users', 'cache'].map((h): [string, string, number] => ['monitor', h, 1]), ['monitor', 'search', 0],
+  ];
+  const ZONE_RULES: Record<string, string[]> = { edge: ['edge', 'app'], app: ['app', 'data'], data: ['data'], ops: ['ops', 'edge', 'app', 'data'] };
+  type Variant = 'flat' | 'segmented' | 'identity' | 'strict';
+
+  function allowed(variant: Variant, exceptions: boolean): Set<string> {
+    const set = new Set<string>();
+    for (const a of HOSTS) for (const b of HOSTS) {
+      if (a === b) continue;
+      if (variant === 'flat' || (variant === 'segmented' && ZONE_RULES[ZONE[a]].includes(ZONE[b]))) set.add(a + '>' + b);
+    }
+    if (variant === 'identity' || variant === 'strict') {
+      for (const [a, b, ok] of FLOWS) {
+        if (variant === 'identity' || ok) set.add(a + '>' + b);
+        else if (exceptions) for (const c of HOSTS) if (ZONE[c] === ZONE[b] && c !== a) set.add(a + '>' + c);
+      }
+    }
+    return set;
+  }
+  function reach(edges: Set<string>, start: string): Set<string> {
+    const seen = new Set([start]); const queue = [start];
+    while (queue.length) { const a = queue.shift()!; for (const b of HOSTS) if (edges.has(a + '>' + b) && !seen.has(b)) { seen.add(b); queue.push(b); } }
+    seen.delete(start); return seen;
+  }
+
+  document.querySelectorAll<HTMLElement>('[data-zt]').forEach((root) => {
+    const q = query(root);
+    const hostSel = q<HTMLSelectElement>('[data-host]');
+    for (const h of HOSTS) { const o = document.createElement('option'); o.value = h; o.textContent = h; if (h === 'search') o.selected = true; hostSel.appendChild(o); }
+    const strip = q('[data-strip]');
+    const chips = HOSTS.map((h) => { const c = document.createElement('span'); c.className = 'zt-chip'; c.textContent = h; strip.appendChild(c); return c; });
+    const color = (n: number, good: boolean) => q<HTMLElement>(`[data-b${n}]`).style.setProperty('--c', good ? 'var(--good)' : 'var(--bad)');
+    function draw() {
+      const variant = q<HTMLSelectElement>('[data-policy]').value as Variant;
+      const exc = q<HTMLInputElement>('[data-exc]').checked;
+      const host = hostSel.value;
+      const edges = allowed(variant, exc);
+      const working = FLOWS.filter(([a, b]) => edges.has(a + '>' + b)).length;
+      const r = reach(edges, host);
+      const direct = HOSTS.filter((b) => edges.has(host + '>' + b)).length;
+      const jewels = JEWELS.filter((j) => r.has(j)).length;
+      let total = 0; for (const h of HOSTS) total += reach(edges, h).size;
+      q('[data-o1]').textContent = `${edges.size} of 132`;
+      q('[data-n1]').textContent = `${edges.size - working} of them nobody needs`;
+      color(1, edges.size - working <= 2);
+      q('[data-o2]').textContent = `${working} of ${FLOWS.length}`;
+      q('[data-n2]').textContent = working < FLOWS.length ? 'blocked flows are outages, and each one tempts someone to add an exception' : 'every call the system needs goes through';
+      color(2, working === FLOWS.length);
+      q('[data-o3]').textContent = `${r.size} of 11`;
+      q('[data-n3]').textContent = `${direct} directly, the rest by pivoting. Summed over all 12 entry points: ${total} of 132`;
+      color(3, r.size <= 2);
+      q('[data-o4]').textContent = `${jewels} of ${JEWELS.length}`;
+      q('[data-n4]').textContent = 'orders-db, users-db and payments';
+      color(4, jewels === 0);
+      HOSTS.forEach((h, i) => {
+        const hit = h === host ? 'compromised' : r.has(h) ? 'reached' : 'safe';
+        chips[i].style.setProperty('--c', hit === 'safe' ? 'var(--good)' : 'var(--bad)');
+        chips[i].classList.toggle('zt-start', hit === 'compromised');
+        chips[i].title = `${h} (${ZONE[h]}): ${hit}${JEWELS.includes(h) ? ', crown jewel' : ''}`;
+      });
+      q('[data-n5]').textContent = 'Red: the attacker can end up here. Outlined: the host you compromised. Green: out of reach.';
+    }
+    root.addEventListener('change', draw);
+    draw();
+  });
+</script>
+<style is:global>
+  .playground .zt-strip { display: flex; flex-wrap: wrap; gap: 6px; }
+  .playground .zt-chip { padding: 4px 10px; border-radius: 6px; border: 2px solid var(--c); background: color-mix(in srgb, var(--c) 18%, var(--surface)); font: .82rem var(--font-mono); }
+  .playground .zt-start { outline: 3px solid var(--text); outline-offset: 2px; }
+</style>
