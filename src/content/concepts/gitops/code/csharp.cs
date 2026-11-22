@@ -6,7 +6,7 @@ using System.Collections.Generic;
 public static class Program
 {
     const int End = 900;        // seconds simulated
-    const int Poll = 180;       // how often the controller looks at Git (3 minutes is a common default)
+    const int Poll = 180;       // how often the controller looks at Git (3 minutes is Argo CD's default; Flux sets an interval per source)
     const int React = 5;        // a webhook, or a change the controller sees in the cluster, is acted on this many seconds later
     const int AlertAfter = 60;  // a broken version is noticed, and reverted in Git, this long after it goes live
     const int HandEditAt = 200; // someone runs "kubectl scale --replicas=10" by hand
