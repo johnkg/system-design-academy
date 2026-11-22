@@ -8,7 +8,7 @@ const hex = (buffer) => buffer.toString("hex");
 const fastHash = (password) => hex(createHash("sha256").update(password).digest());
 
 // Better: a unique salt per user and many iterations, so every guess is slow.
-const ITERATIONS = 100_000;
+const ITERATIONS = 100_000; // kept low so the demo runs fast; OWASP currently recommends 600,000 for PBKDF2-HMAC-SHA256
 const KEY_BYTES = 32; // a 256-bit derived key
 const slowHash = (password, salt) => pbkdf2Sync(password, salt, ITERATIONS, KEY_BYTES, "sha256");
 

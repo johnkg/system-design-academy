@@ -6,7 +6,7 @@ using System.Text;
 
 public static class Program
 {
-    const int Iterations = 100_000;
+    const int Iterations = 100_000; // kept low so the demo runs fast; OWASP currently recommends 600,000 for PBKDF2-HMAC-SHA256
     const int KeyBytes = 32; // a 256-bit derived key
 
     static string Hex(byte[] bytes) => Convert.ToHexString(bytes).ToLowerInvariant();
