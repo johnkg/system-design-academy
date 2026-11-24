@@ -8,13 +8,13 @@ public static class Program
     {
         decimal[] cart = { 30m, 20m };
         var checkout = new Checkout(new RegularPrice());
-        Console.WriteLine(checkout.Total(cart)); // 50
+        Console.WriteLine(checkout.Total(cart).ToString("0.##")); // 50
 
         checkout.Strategy = new PercentOff(20);  // swap at runtime
-        Console.WriteLine(checkout.Total(cart)); // 40
+        Console.WriteLine(checkout.Total(cart).ToString("0.##")); // 40
 
         checkout.Strategy = new FlatOff(15);
-        Console.WriteLine(checkout.Total(cart)); // 35
+        Console.WriteLine(checkout.Total(cart).ToString("0.##")); // 35
     }
 }
 

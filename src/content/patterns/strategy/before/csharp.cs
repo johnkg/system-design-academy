@@ -8,9 +8,9 @@ public static class Program
     {
         var checkout = new Checkout();
         decimal[] cart = { 30m, 20m };
-        Console.WriteLine(checkout.Total(cart, "regular"));
-        Console.WriteLine(checkout.Total(cart, "percent20"));
-        Console.WriteLine(checkout.Total(cart, "flat15"));
+        Console.WriteLine(checkout.Total(cart, "regular").ToString("0.##"));
+        Console.WriteLine(checkout.Total(cart, "percent20").ToString("0.##"));
+        Console.WriteLine(checkout.Total(cart, "flat15").ToString("0.##"));
     }
 }
 
