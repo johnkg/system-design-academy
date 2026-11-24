@@ -1,9 +1,9 @@
 // Memento in JavaScript. The player makes and restores snapshots; the manager only stores them.
 
-class Snapshot { // Memento: immutable and opaque to everyone but Player
+class Snapshot { // Memento: immutable; opaque by convention (JS has no way to let only Player call read())
   #state;
   constructor(state) { this.#state = Object.freeze({ ...state }); }
-  static read(snapshot) { return snapshot.#state; } // only Player's code path uses this
+  static read(snapshot) { return snapshot.#state; } // by convention, only Player calls this
 }
 
 class Player { // Originator
