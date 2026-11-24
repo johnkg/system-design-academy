@@ -7,7 +7,7 @@ const NODES = 5, MAJORITY = 3;
 const TRIALS = 8, SEED_BASE = 1000;
 const MIN_CRASH = 40, CRASH_SPREAD = 20; // the primary dies after 40..59 writes
 const SLOW_NODE = 4, SLOW_STEPS = 2, STEPS = 3; // per tick a secondary copies 0..2 entries, the slow one 0..1
-const ELECTION_TIMEOUT = 150; // election timeouts are random in 0..149 ms
+const ELECTION_TIMEOUT = 150; // election timeouts are random in 0..149 ms (a toy spread that only sets the order; MongoDB's default timeout is 10 s)
 // A small seeded random number generator, so that every run gives the same output.
 let seed = 0;
 const next = (n) => { seed = (Math.imul(seed, 1664525) + 1013904223) >>> 0; return (seed >>> 8) % n; };

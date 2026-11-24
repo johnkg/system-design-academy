@@ -7,7 +7,7 @@ NODES, MAJORITY = 5, 3
 TRIALS, SEED_BASE = 8, 1000
 MIN_CRASH, CRASH_SPREAD = 40, 20  # the primary dies after 40..59 writes
 SLOW_NODE, SLOW_STEPS, STEPS = 4, 2, 3  # per tick a secondary copies 0..2 entries, the slow one 0..1
-ELECTION_TIMEOUT = 150  # election timeouts are random in 0..149 ms
+ELECTION_TIMEOUT = 150  # election timeouts are random in 0..149 ms (a toy spread that only sets the order; MongoDB's default timeout is 10 s)
 seed = 0
 
 

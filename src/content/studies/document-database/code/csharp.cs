@@ -9,7 +9,7 @@ const int Nodes = 5, Majority = 3;
 const int Trials = 8, SeedBase = 1000;
 const int MinCrash = 40, CrashSpread = 20; // the primary dies after 40..59 writes
 const int SlowNode = 4, SlowSteps = 2, Steps = 3; // per tick a secondary copies 0..2 entries, the slow one 0..1
-const int ElectionTimeout = 150; // election timeouts are random in 0..149 ms
+const int ElectionTimeout = 150; // election timeouts are random in 0..149 ms (a toy spread that only sets the order; MongoDB's default timeout is 10 s)
 uint seed = 0;
 int Next(int n) { seed = unchecked(seed * 1664525u + 1013904223u); return (int)((seed >> 8) % (uint)n); }
 
