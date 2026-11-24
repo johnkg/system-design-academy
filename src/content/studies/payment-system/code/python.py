@@ -25,7 +25,7 @@ class Payment:
     charge_id: str | None = None
 
 
-# A pretend payment provider. Like real ones it remembers the key of each charge, and its reply can be lost after the money moved.
+# A pretend payment provider. Like many real ones (Stripe and Adyen, for example) it remembers the key of each charge, and its reply can be lost after the money moved.
 class Provider:
     def __init__(self):
         self.charges: dict[str, Charge] = {}
