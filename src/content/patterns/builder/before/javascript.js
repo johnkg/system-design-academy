@@ -10,4 +10,4 @@ class Pizza {
 const a = new Pizza("large", "thick", true, ["ham", "olives"], true, false);
 const b = new Pizza("medium", "thin", true, ["mozzarella", "basil"], false, false);
 console.log(a, b);
-// Adding "stuffedCrust" later means a seventh argument at every call site.
+// Adding "stuffedCrust" later means a seventh positional argument (or another constructor) to keep in order.

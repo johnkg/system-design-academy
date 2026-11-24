@@ -29,4 +29,4 @@ def show(pizza):  # formats the object like the JavaScript console.log does
 a = Pizza("large", "thick", True, ["ham", "olives"], True, False)
 b = Pizza("medium", "thin", True, ["mozzarella", "basil"], False, False)
 print(show(a), show(b))
-# Adding "stuffed_crust" later means a seventh argument at every call site.
+# Adding "stuffed_crust" later means a seventh positional argument to keep in order.
