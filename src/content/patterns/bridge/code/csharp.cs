@@ -10,7 +10,7 @@ public static class Program
             var remote = new AdvancedRemote(device); // any remote works with any device
             remote.TogglePower();
             remote.VolumeUp();
-            Console.WriteLine($"{device.Name}: on={device.IsEnabled} volume={device.Volume}");
+            Console.WriteLine($"{device.Name}: on={(device.IsEnabled ? "true" : "false")} volume={device.Volume}");
             remote.Mute();
             Console.WriteLine($"{device.Name}: volume={device.Volume}");
         }

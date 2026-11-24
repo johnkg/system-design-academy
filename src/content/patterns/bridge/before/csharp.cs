@@ -11,7 +11,7 @@ public static class Program
         var remote = new TvAdvancedRemote();
         remote.TogglePower();
         remote.Mute();
-        Console.WriteLine($"on={remote.On} volume={remote.Volume}");
+        Console.WriteLine($"{remote.GetType().Name} {{ on: {(remote.On ? "true" : "false")}, volume: {remote.Volume} }}");
     }
 }
 
