@@ -19,10 +19,10 @@ class TreeTypeFactory:  # Flyweight Factory
     _cache = {}
 
     @classmethod
-    def get(cls, name, color, texture):
+    def get(cls, name, color):
         key = f"{name}|{color}"
-        if key not in cls._cache:
-            cls._cache[key] = TreeType(name, color, texture)
+        if key not in cls._cache:  # the big texture is loaded only on a cache miss
+            cls._cache[key] = TreeType(name, color, "x" * TEXTURE_SIZE)
         return cls._cache[key]
 
     @classmethod
@@ -45,7 +45,7 @@ class Forest:  # Client
         self._trees = []
 
     def plant(self, x, y, name, color):
-        tree_type = TreeTypeFactory.get(name, color, "x" * TEXTURE_SIZE)  # big texture, created once per species
+        tree_type = TreeTypeFactory.get(name, color)  # big texture, created once per species
         self._trees.append(Tree(x, y, tree_type))
 
     @property
