@@ -3,6 +3,14 @@ export interface Change { date: string; title: string; items: { text: string; hr
 
 export const changelog: Change[] = [
   {
+    date: '2026-11-26',
+    title: 'Fact-checked: all 23 design patterns and 21 case studies of real systems',
+    items: [
+      { text: 'The design patterns have been reviewed against the Gang of Four book and by running their samples. Corrections include a Prototype page that called a one-level copy deep, a Flyweight sample that rebuilt the shared object every time, and an Undo in the Command sample that wiped the document when undoing an empty insert.', href: 'patterns/command/' },
+      { text: 'The case studies of real systems (Dynamo, Bigtable, Spanner, Borg, GFS, MapReduce, Chubby, Dapper, Dremel, Percolator, Maglev, Discord, Dropbox, Facebook, Cloudflare and Figma) were checked against the papers and engineering posts. Fixes include a sampling rate that the Dapper paper measured as costing 2%, not nothing, and a Maglev health check that belongs to the forwarder, not the controller.', href: 'accuracy/' },
+    ],
+  },
+  {
     date: '2026-11-25',
     title: 'Fact-checked badges',
     items: [
