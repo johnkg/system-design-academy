@@ -9,8 +9,8 @@ ALLOWED = {
     'evidence_submitted': ['won', 'lost'],
     'won': [], 'lost': [], 'accepted': [],
 }
-FEE = 1500       # the network's dispute fee, charged when a dispute opens
-LIMIT_KB = 4500  # the network's cap on the whole evidence packet
+FEE = 1500       # the dispute fee (an assumed figure, charged by the acquirer or processor) when a dispute opens
+LIMIT_KB = 4500  # an assumed cap on the whole evidence packet; real limits differ by network and processor
 
 
 def new_store():
