@@ -1,6 +1,6 @@
 // Maglev-style consistent hashing for a load balancer, in C#:
 // every balancer builds the same lookup table from the backend names, so any of them sends a flow to the same backend,
-// and when a backend leaves only the flows that were on it have to move. A connection-tracking table then pins live flows.
+// and when a backend leaves the flows that were on it move, plus only a few percent of the others. A connection-tracking table then pins live flows.
 using System;
 using System.Collections.Generic;
 using System.Linq;

@@ -1,6 +1,6 @@
 // Maglev-style consistent hashing for a load balancer, in JavaScript:
 // every balancer builds the same lookup table from the backend names, so any of them sends a flow to the same backend,
-// and when a backend leaves only the flows that were on it have to move. A connection-tracking table then pins live flows.
+// and when a backend leaves the flows that were on it move, plus only a few percent of the others. A connection-tracking table then pins live flows.
 
 const M = 997; // table size, a prime number (Maglev uses 65,537 or more)
 
