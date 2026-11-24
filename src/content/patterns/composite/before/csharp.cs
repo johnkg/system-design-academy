@@ -10,7 +10,7 @@ public static class Program
         object project = new FolderData("project", new List<object>
         {
             new FileData("readme.md", 10),
-            new FolderData("src", new List<object> { new FileData("app.cs", 40), new FileData("util.cs", 15) }),
+            new FolderData("src", new List<object> { new FileData("app.js", 40), new FileData("util.js", 15) }),
         });
         Console.WriteLine(TotalSize(project));
     }

@@ -10,8 +10,8 @@ public static class Program
         var project = new Folder("project")
             .Add(new FileItem("readme.md", 10))
             .Add(new Folder("src")
-                .Add(new FileItem("app.cs", 40))
-                .Add(new FileItem("util.cs", 15)));
+                .Add(new FileItem("app.js", 40))
+                .Add(new FileItem("util.js", 15)));
 
         project.Print();
         Console.WriteLine(project.GetSize()); // 65: the client never checks file vs folder
