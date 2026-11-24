@@ -1,7 +1,8 @@
 // A miniature of Haystack from Facebook's "Needle in a haystack: efficient storage of billions of photos" (2009), in JavaScript
 // (a teaching model, not Facebook's code): photos are needles appended to one big store file, an in-memory index maps a photo and
-// size to the needle's offset so a read costs one disk I/O, a delete only sets a flag, compaction copies the live needles into
-// a new store, and a restarted server rebuilds its index from the store. Everything is deterministic.
+// size to the needle's offset so a read costs one disk I/O in this model, a delete only sets a flag, compaction copies the live needles into
+// a new store, and a restarted server rebuilds its index by scanning the store
+// (the post's slower fallback: normally it reloads a small index file). Everything is deterministic.
 
 const SIZES = { large: 100, medium: 40, small: 20, thumb: 8 }; // bytes of image data per size (made up)
 const HEADER = 16, FOOTER = 8; // bytes of needle overhead (made up)
