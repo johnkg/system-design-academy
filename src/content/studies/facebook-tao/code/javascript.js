@@ -44,7 +44,7 @@ function assocDelete(id1, type, id2) {
   del(id1, type, id2);
   del(id2, INVERSE[type], id1);
 }
-const count = (id1, type) => range(id1, type, Infinity).length; // TAO keeps a count so this is constant time; here it is the list length
+const count = (id1, type) => range(id1, type, Infinity).length; // TAO can optionally keep a count so this is constant time; here it is the list length
 const point = (id1, type, id2) => range(id1, type, Infinity).some((e) => e.id2 === id2);
 const names = (list) => list.map((e) => `${objectGet(e.id2).name}@${e.time}`).join(', ') || 'none';
 

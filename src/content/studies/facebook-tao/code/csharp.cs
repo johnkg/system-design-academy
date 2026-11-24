@@ -59,7 +59,7 @@ void AssocDelete(int id1, string type, int id2)
     Del(id1, type, id2);
     Del(id2, inverse[type], id1);
 }
-int AssocCount(int id1, string type) => AssocRange(id1, type).Count; // TAO keeps a count so this is constant time; here it is the list length
+int AssocCount(int id1, string type) => AssocRange(id1, type).Count; // TAO can optionally keep a count so this is constant time; here it is the list length
 bool AssocPoint(int id1, string type, int id2) => AssocRange(id1, type).Any(e => e.Id2 == id2);
 string Names(List<Edge> list) => list.Count == 0 ? "none" : string.Join(", ", list.Select(e => $"{ObjectGet(e.Id2).Name}@{e.Time}"));
 

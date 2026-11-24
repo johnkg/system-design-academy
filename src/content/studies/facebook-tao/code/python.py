@@ -75,7 +75,7 @@ def assoc_delete(id1, kind, id2):
     delete(id2, INVERSE[kind], id1)
 
 
-def count(id1, kind):  # TAO keeps a count so this is constant time; here it is the list length
+def count(id1, kind):  # TAO can optionally keep a count so this is constant time; here it is the list length
     return len(assoc_range(id1, kind))
 
 
