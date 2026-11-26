@@ -1,4 +1,4 @@
-// Generating short codes in C#: a counter, scrambled so it is not guessable, encoded in base62.
+// Generating short codes in C#: a counter, scrambled so it does not look sequential (obfuscation, not security), encoded in base62.
 using System;
 using System.Collections.Generic;
 using System.Numerics;
