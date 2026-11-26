@@ -9,6 +9,7 @@ BOOT_S, QUEUE_PER_REPLICA = 6, 8  # fixed start-up time; queued requests one rep
 MODEL_MB, NETWORK_MBPS, LOCAL_MBPS = 14000, 1000, 5000
 
 # 32-bit FNV-1a hash, used here as the checksum of the weights and as the traffic-split hash.
+# A toy: FNV-1a only catches accidental corruption. A real registry uses a cryptographic hash such as SHA-256, which also resists deliberate tampering.
 def fnv(s):
     h = 0x811C9DC5
     for ch in s:

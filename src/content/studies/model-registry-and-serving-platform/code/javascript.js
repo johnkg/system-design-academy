@@ -7,6 +7,7 @@ const BOOT_S = 6, QUEUE_PER_REPLICA = 8; // fixed start-up time; queued requests
 const MODEL_MB = 14000, NETWORK_MBPS = 1000, LOCAL_MBPS = 5000;
 
 // 32-bit FNV-1a hash, used here as the checksum of the weights and as the traffic-split hash.
+// A toy: FNV-1a only catches accidental corruption. A real registry uses a cryptographic hash such as SHA-256, which also resists deliberate tampering.
 const fnv = (s) => { let h = 0x811c9dc5; for (let i = 0; i < s.length; i++) { h ^= s.charCodeAt(i); h = Math.imul(h, 16777619) >>> 0; } return h >>> 0; };
 const checksum = (weights) => fnv(weights).toString(16).padStart(8, '0');
 

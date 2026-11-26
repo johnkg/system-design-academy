@@ -67,11 +67,11 @@ def run(name, lanes, workers, bulk, poison, backoff, autoscale):
                     burned += c
                     b["tries"] += 1
                     if not backoff:
-                        q.append({**b, "n": 1})  # retry at once, for ever
+                        waiting.append({"ready": t + POISON_COST, "b": {**b, "n": 1}})  # back on the queue the moment the worker gives up, for ever
                     elif b["tries"] >= MAX_TRIES:
                         dlq += 1  # give up: a person looks at it
                     else:
-                        waiting.append({"ready": t + BACKOFF * 2 ** (b["tries"] - 1), "b": {**b, "n": 1}})
+                        waiting.append({"ready": t + POISON_COST + BACKOFF * 2 ** (b["tries"] - 1), "b": {**b, "n": 1}})  # after the failed run, then the delay
                 if b["n"] == 0:
                     q.pop(0)
         if not live and not batch:
@@ -103,6 +103,6 @@ base = {"lanes": False, "workers": 30, "bulk": 100000, "poison": 0, "backoff": F
 run("one queue, 30 workers", **base)
 run("separate lanes", **{**base, "lanes": True})
 run("separate lanes, autoscaled", **{**base, "lanes": True, "autoscale": True})
-run("separate lanes, 5 broken images retried at once", **{**base, "lanes": True, "poison": 5})
-run("separate lanes, 5 broken images, backoff and a dead-letter queue", **{**base, "lanes": True, "poison": 5, "backoff": True})
-run("separate lanes, autoscaled, 5 broken images retried at once", **{**base, "lanes": True, "autoscale": True, "poison": 5})
+run("separate lanes, 20 broken images retried at once", **{**base, "lanes": True, "poison": 20})
+run("separate lanes, 20 broken images, backoff and a dead-letter queue", **{**base, "lanes": True, "poison": 20, "backoff": True})
+run("separate lanes, autoscaled, 20 broken images retried at once", **{**base, "lanes": True, "autoscale": True, "poison": 20})

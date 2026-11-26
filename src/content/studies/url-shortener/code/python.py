@@ -1,4 +1,4 @@
-# Generating short codes in Python: a counter, scrambled so it is not guessable, encoded in base62.
+# Generating short codes in Python: a counter, scrambled so it does not look sequential (obfuscation, not security), encoded in base62.
 
 ALPHABET = "0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ"
 BASE = 62  # digits, lower case and upper case letters

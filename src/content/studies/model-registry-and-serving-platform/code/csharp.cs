@@ -47,6 +47,7 @@ class Registry
     List<Ver> versions = new();
 
     // 32-bit FNV-1a hash, used here as the checksum of the weights and as the traffic-split hash.
+    // A toy: FNV-1a only catches accidental corruption. A real registry uses a cryptographic hash such as SHA-256, which also resists deliberate tampering.
     public static uint Fnv(string s) { uint h = 2166136261; foreach (char c in s) { h ^= c; h *= 16777619; } return h; }
     public static string Checksum(string weights) => Fnv(weights).ToString("x8");
 

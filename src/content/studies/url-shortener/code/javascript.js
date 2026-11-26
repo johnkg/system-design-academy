@@ -1,4 +1,4 @@
-// Generating short codes in JavaScript: a counter, scrambled so it is not guessable, encoded in base62.
+// Generating short codes in JavaScript: a counter, scrambled so it does not look sequential (obfuscation, not security), encoded in base62.
 
 const ALPHABET = "0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ";
 const BASE = 62n; // digits, lower case and upper case letters

@@ -1,5 +1,6 @@
 {
   "name": "Design an Image-Processing Pipeline",
+  "factChecked": "2026-11-26",
   "difficulty": "intermediate",
   "intent": "Turn every uploaded photo into the sizes and formats a store needs, quickly for the person waiting and cheaply for the rest, even when a big seller imports 100,000 photos at once or a broken file arrives.",
   "prompt": "Design the image pipeline of an online marketplace. Sellers upload about 2 million product photos a day, mostly one at a time while editing a listing, but a big seller can bulk-import 100,000 or more at once. Every photo needs 6 variants (3 sizes in WebP and AVIF) and a moderation check. A seller must see their new photo on the listing within about 10 seconds, even during someone else's import. Twice a year the design team adds a new size, which means reprocessing about 400 million existing photos. Design the processing pipeline, not the storefront.",
@@ -75,8 +76,8 @@
     },
     {
       "title": "Make every job safe to run twice",
-      "problem": "Queues deliver at least once: a worker that crashes or times out has its job handed to another worker, and the first one may still be writing. Writing variants under the photo's id lets a late or partial run overwrite good files.",
-      "fix": "Name each output by what it is made from: a hash of the original's bytes, the variant spec (size, format, quality) and the pipeline version. Write to a temporary key and rename only when the file is complete. A second run of the same job produces the same names with the same bytes, and the photo record is updated with a conditional write that only moves forward. Duplicate uploads of the same file are found by the hash and processed once.",
+      "problem": "Most job queues deliver at least once: a worker that crashes or times out has its job handed to another worker, and the first one may still be writing. Writing variants under the photo's id lets a late or partial run overwrite good files.",
+      "fix": "Name each output by what it is made from: a hash of the original's bytes, the variant spec (size, format, quality) and the pipeline version. Make each file visible only when it is complete: an upload to object storage such as S3 appears whole or not at all (object stores have no rename), and on a file system the worker writes a temporary name and renames it. A second run of the same job produces the same names with the same bytes, and the photo record is updated with a conditional write that only moves forward. Duplicate uploads of the same file are found by the hash and processed once.",
       "tradeoff": "Retries and duplicate deliveries become harmless, and a pipeline change produces new names instead of silently replacing files. Old versions take storage until a cleanup removes them.",
       "concepts": [{ "slug": "idempotency" }, { "slug": "delivery-guarantees" }, { "slug": "optimistic-concurrency-and-etags" }]
     },
@@ -89,7 +90,7 @@
     },
     {
       "title": "Contain broken images: limits, backoff and a dead-letter queue",
-      "problem": "Some files are broken or hostile: a corrupt header, a 50,000 by 50,000 pixel image that expands to gigabytes when decoded, a format the decoder chokes on. Such a job makes a worker run until it times out. Retried at once, it comes straight back, and five of them can keep a whole small fleet busy for ever.",
+      "problem": "Some files are broken or hostile: a corrupt header, a 50,000 by 50,000 pixel image that expands to gigabytes when decoded, a format the decoder chokes on. Such a job makes a worker run until it times out. Retried at once, it is back on the queue the moment its worker gives up, so twenty of them hold two thirds of a 30-worker fleet for ever.",
       "fix": "Check before decoding: the declared dimensions, the pixel count and the file type. Decode in a sandbox with a memory limit and a time limit. When a job fails, retry it after a growing delay (10 s, then 20 s), and after 3 attempts move it to a dead-letter queue, mark the photo failed and alert. Moderation runs as a separate step with its own retry, so a slow moderation service never blocks resizing.",
       "tradeoff": "A poison image costs a bounded amount of work and lands where a person can look at it. Some genuine photos will be refused by the limits, so the seller needs a clear message.",
       "concepts": [{ "slug": "retries-and-backoff" }, { "slug": "dead-letter-queues-and-poison-messages" }, { "slug": "timeouts-and-deadlines" }, { "slug": "injection-and-xss" }]
@@ -113,7 +114,7 @@
     {
       "scenario": "A worker crashes halfway through writing a photo's variants",
       "impact": "The photo is stuck in 'processing', and some variant files may be half written.",
-      "answer": "The queue hands the job to another worker after its visibility timeout (the time a taken job stays hidden from others). Outputs are written to temporary keys and renamed only when complete, under names that come from the content, so the second run writes the same files again and nothing half-written is ever served. The photo record moves to 'ready' with a conditional write.",
+      "answer": "The queue hands the job to another worker after its visibility timeout (the time a taken job stays hidden from others). Each output becomes visible only when it is complete (an object-storage upload is all or nothing), under names that come from the content, so the second run writes the same files again and nothing half-written is ever served. The photo record moves to 'ready' with a conditional write.",
       "concepts": [{ "slug": "idempotency" }, { "slug": "message-queues" }]
     },
     {
@@ -184,15 +185,15 @@
       "explanation": "The seller is waiting behind the import, not behind slow workers. A separate interactive lane takes the import out of their way whatever its size. More workers or faster jobs only shorten the line, and sellers splitting imports still put every batch ahead of whoever comes next."
     },
     {
-      "question": "Five corrupt images each make a worker run for 30 seconds before timing out, and failed jobs are retried at once. With 30 workers, what happens?",
+      "question": "Twenty corrupt images each make a worker run for 30 seconds before timing out, and failed jobs are retried at once. With 30 workers, of which live uploads need about 20, what happens?",
       "options": [
-        "Nothing much: 5 failing jobs out of thousands are a rounding error.",
+        "Nothing much: 20 failing jobs out of thousands are a rounding error.",
         "The queue drops them after the first timeout, as all queues do by default.",
         "They come back at once and keep taking workers, so live uploads slow down.",
         "The workers learn to skip them, because they fail in the same way every time."
       ],
       "answer": 2,
-      "explanation": "A job retried at once is back in seconds, so five of them can keep a large part of a small fleet busy for ever. Backoff spreads the retries out and a dead-letter queue stops them after a few attempts. Queues do not drop jobs by default, and workers do not remember which ones failed."
+      "explanation": "A job retried at once is back on the queue as soon as its worker gives up, so twenty of them hold twenty of the 30 workers for ever and leave too few for live uploads. Backoff spreads the retries out and a dead-letter queue stops them after a few attempts. Queues do not drop jobs by default, and workers do not remember which ones failed."
     },
     {
       "question": "Why name each variant by a hash of the original, the variant spec and the pipeline version instead of by the photo's id?",
