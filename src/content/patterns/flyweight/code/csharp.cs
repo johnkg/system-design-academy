@@ -29,11 +29,11 @@ public static class TreeTypeFactory // Flyweight Factory
 {
     private static readonly Dictionary<string, TreeType> _cache = new();
 
-    public static TreeType Get(string name, string color, string texture)
+    public static TreeType Get(string name, string color)
     {
         string key = $"{name}|{color}";
-        if (!_cache.TryGetValue(key, out var type))
-            _cache[key] = type = new TreeType(name, color, texture);
+        if (!_cache.TryGetValue(key, out var type)) // the big texture is loaded only on a cache miss
+            _cache[key] = type = new TreeType(name, color, new string('x', Program.TextureSize));
         return type;
     }
 
@@ -51,7 +51,7 @@ public class Forest // Client
 
     public void Plant(int x, int y, string name, string color)
     {
-        var type = TreeTypeFactory.Get(name, color, new string('x', Program.TextureSize)); // created once per species
+        var type = TreeTypeFactory.Get(name, color); // big texture, created once per species
         _trees.Add(new Tree(x, y, type));
     }
 

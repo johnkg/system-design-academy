@@ -24,7 +24,7 @@ class InsertCommand(Command):  # Concrete Command
         self.doc.text += self.text
 
     def undo(self):
-        self.doc.text = self.doc.text[:-len(self.text)]
+        self.doc.text = self.doc.text[:len(self.doc.text) - len(self.text)]
 
 
 class UppercaseCommand(Command):  # Concrete Command

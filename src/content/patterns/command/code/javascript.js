@@ -7,7 +7,7 @@ class Document { // Receiver
 class InsertCommand { // Concrete Command
   constructor(doc, text) { this.doc = doc; this.text = text; }
   execute() { this.doc.text += this.text; }
-  undo() { this.doc.text = this.doc.text.slice(0, -this.text.length); }
+  undo() { this.doc.text = this.doc.text.slice(0, this.doc.text.length - this.text.length); }
 }
 
 class UppercaseCommand { // Concrete Command

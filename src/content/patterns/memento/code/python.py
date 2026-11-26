@@ -4,7 +4,7 @@ from __future__ import annotations
 from types import MappingProxyType
 
 
-class Snapshot:  # Memento: immutable and opaque to everyone but Player
+class Snapshot:  # Memento: immutable; opaque by convention (Python cannot limit read() to Player)
     __slots__ = ("_state",)
 
     def __init__(self, state: dict):
@@ -14,7 +14,7 @@ class Snapshot:  # Memento: immutable and opaque to everyone but Player
         raise AttributeError("Snapshot is immutable")
 
     @staticmethod
-    def read(snapshot: Snapshot):  # only Player's code path uses this
+    def read(snapshot: Snapshot):  # by convention, only Player calls this
         return snapshot._state
 
 

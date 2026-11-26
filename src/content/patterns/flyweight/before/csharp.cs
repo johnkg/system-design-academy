@@ -13,7 +13,7 @@ public static class Program
             bool oak = i % 2 == 1;
             trees.Add(new Tree(i, i * 2, oak ? "Oak" : "Pine", oak ? "green" : "dark green", new string('x', TextureChars)));
         }
-        Console.WriteLine($"{trees.Count} trees each holding its own 10,000-char texture");
+        Console.WriteLine($"{trees.Count} trees, each with its own 10,000-character texture field");
         // Memory scales with the number of trees, not the number of species.
     }
 }

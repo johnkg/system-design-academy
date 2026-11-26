@@ -27,21 +27,23 @@ public class Player // Originator
     public void LevelUp() => _level++;
     public string Describe() => $"HP {_hp}, level {_level}";
 
-    public Snapshot Save() => new(_hp, _level);
-    public void Restore(Snapshot s) { _hp = s.Hp; _level = s.Level; }
+    public IPlayerSnapshot Save() => new Snapshot(_hp, _level);
+    public void Restore(IPlayerSnapshot s) { var snap = (Snapshot)s; _hp = snap.Hp; _level = snap.Level; }
 
-    // Memento: nested so only Player can read its fields. Everyone else sees an opaque object.
-    public sealed class Snapshot
+    // Memento: a private nested class, so only Player can see its fields.
+    // Everyone else only gets the empty IPlayerSnapshot interface.
+    private sealed class Snapshot(int hp, int level) : IPlayerSnapshot
     {
-        internal int Hp { get; }
-        internal int Level { get; }
-        internal Snapshot(int hp, int level) { Hp = hp; Level = level; }
+        public int Hp { get; } = hp;
+        public int Level { get; } = level;
     }
 }
 
+public interface IPlayerSnapshot { } // the narrow, opaque view the caretaker holds
+
 public class CheckpointManager // Caretaker: stores, never inspects
 {
-    private readonly Stack<Player.Snapshot> _stack = new();
+    private readonly Stack<IPlayerSnapshot> _stack = new();
     public void Save(Player player) => _stack.Push(player.Save());
     public void LoadLast(Player player) { if (_stack.TryPop(out var s)) player.Restore(s); }
 }

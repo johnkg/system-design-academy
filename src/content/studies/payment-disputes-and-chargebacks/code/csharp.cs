@@ -32,8 +32,8 @@ public static class Engine
         ["evidence_submitted"] = new[] { "won", "lost" },
         ["won"] = new string[0], ["lost"] = new string[0], ["accepted"] = new string[0],
     };
-    public const int Fee = 1500;      // the network's dispute fee, charged when a dispute opens
-    public const int LimitKb = 4500;  // the network's cap on the whole evidence packet
+    public const int Fee = 1500;      // the dispute fee (an assumed figure, charged by the acquirer or processor) when a dispute opens
+    public const int LimitKb = 4500;  // an assumed cap on the whole evidence packet; real limits differ by network and processor
 
     static void Post(Store s, string did, string kind, int cents) => s.Ledger.Add(new Entry { Did = did, Kind = kind, Cents = cents });
     public static Dispute? Find(Store s, string did) => s.Disputes.FirstOrDefault(d => d.Id == did);

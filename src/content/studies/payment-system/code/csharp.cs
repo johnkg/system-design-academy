@@ -17,7 +17,7 @@ public class Payment
     public string? ChargeId;
 }
 
-// A pretend payment provider. Like real ones it remembers the key of each charge, and its reply can be lost after the money moved.
+// A pretend payment provider. Like many real ones (Stripe and Adyen, for example) it remembers the key of each charge, and its reply can be lost after the money moved.
 public class Provider
 {
     public readonly Dictionary<string, Charge> Charges = new();

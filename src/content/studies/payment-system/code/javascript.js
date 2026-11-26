@@ -6,7 +6,7 @@ const REQUESTS = 3;     // the same request arrives three times
 
 class TimeoutError extends Error {}
 
-// A pretend payment provider. Like real ones it remembers the key of each charge, and its reply can be lost after the money moved.
+// A pretend payment provider. Like many real ones (Stripe and Adyen, for example) it remembers the key of each charge, and its reply can be lost after the money moved.
 class Provider {
   constructor() { this.charges = new Map(); this.loseNextReply = true; }
   charge(key, amountCents) {

@@ -12,10 +12,10 @@ class TreeType { // Flyweight: intrinsic, immutable, shared
 
 class TreeTypeFactory { // Flyweight Factory
   static #cache = new Map();
-  static get(name, color, texture) {
+  static get(name, color) {
     const key = `${name}|${color}`;
-    if (!TreeTypeFactory.#cache.has(key)) {
-      TreeTypeFactory.#cache.set(key, new TreeType(name, color, texture));
+    if (!TreeTypeFactory.#cache.has(key)) { // the big texture is loaded only on a cache miss
+      TreeTypeFactory.#cache.set(key, new TreeType(name, color, "x".repeat(TEXTURE_SIZE)));
     }
     return TreeTypeFactory.#cache.get(key);
   }
@@ -30,7 +30,7 @@ class Tree { // Context: extrinsic state (x, y) + a reference to the shared type
 class Forest { // Client
   #trees = [];
   plant(x, y, name, color) {
-    const type = TreeTypeFactory.get(name, color, "x".repeat(TEXTURE_SIZE)); // big texture, created once per species
+    const type = TreeTypeFactory.get(name, color); // big texture, created once per species
     this.#trees.push(new Tree(x, y, type));
   }
   get size() { return this.#trees.length; }

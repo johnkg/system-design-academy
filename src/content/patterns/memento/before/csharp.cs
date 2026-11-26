@@ -16,7 +16,7 @@ public static class Program
         var last = saves.Pop();
         player.Hp = last.Hp;                    // and write each one back
         player.Level = last.Level;
-        Console.WriteLine($"HP {player.Hp}, level {player.Level}");
+        Console.WriteLine($"Player {{ hp: {player.Hp}, level: {player.Level} }}");
 
         // Add "Inventory" to Player and forget to update the saver: saves silently lose it.
         // Any code can also set player.Hp = 9999 directly.
