@@ -5,6 +5,8 @@ const hex = (buf) => buf.toString('hex');
 const sha256 = (s) => hex(crypto.createHash('sha256').update(s).digest());
 
 // 1. Slow salted hash. Every user has their own salt, and the iteration count is the price an attacker pays per guess.
+// PBKDF2 is used because it is in the standard library; production should prefer argon2id. 20,000 iterations is a toy count so the
+// sample runs fast: OWASP currently suggests about 600,000 iterations for PBKDF2-HMAC-SHA256.
 const ITERATIONS = 20000;
 const KEY_BYTES = 32; // a 256-bit derived key
 const TOTP_STEP_SECONDS = 30, TOTP_DIGITS = 6;
@@ -28,6 +30,7 @@ const verifyTotp = (secret, seconds, given) => [-TOTP_STEP_SECONDS, 0, TOTP_STEP
 // 3. Refresh tokens rotate: each one is used once and replaced. Using an old one means a copy was stolen, so the whole family dies.
 class TokenService {
   constructor(key) { this.key = key; this.counter = 0; this.byHash = new Map(); this.families = new Map(); }
+  // Tokens here are derived from a counter so the output is repeatable; real ones come from a secure random generator.
   mint(family) { // the server stores only the hash of a token, like a password
     const token = sha256(`${this.key}:${++this.counter}`).slice(0, TOKEN_HEX_CHARS);
     this.byHash.set(sha256(token), { family, used: false });

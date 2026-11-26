@@ -9,6 +9,8 @@ using System.Text;
 static string Lower(bool b) => b ? "true" : "false";
 
 // 1. Slow salted hash. Every user has their own salt, and the iteration count is the price an attacker pays per guess.
+// PBKDF2 is used because it is in the standard library; production should prefer argon2id. 20,000 iterations is a toy count so the
+// sample runs fast: OWASP currently suggests about 600,000 iterations for PBKDF2-HMAC-SHA256.
 const int Iterations = 20000;
 const int KeyBytes = 32; // a 256-bit derived key
 const int TotpStepSeconds = 30, TotpDigits = 6;
@@ -67,6 +69,7 @@ class TokenService(string key)
     readonly Dictionary<string, (string Family, bool Used)> byHash = new();
     readonly Dictionary<string, string> families = new();
 
+    // Tokens here are derived from a counter so the output is repeatable; real ones come from a secure random generator.
     string Mint(string family) // the server stores only the hash of a token, like a password
     {
         var token = Sha256($"{key}:{++counter}")[..TokenHexChars];

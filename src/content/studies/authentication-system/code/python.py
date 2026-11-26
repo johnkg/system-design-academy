@@ -11,6 +11,8 @@ def sha256(s):
 
 
 # 1. Slow salted hash. Every user has their own salt, and the iteration count is the price an attacker pays per guess.
+# PBKDF2 is used because it is in the standard library; production should prefer argon2id. 20,000 iterations is a toy count so the
+# sample runs fast: OWASP currently suggests about 600,000 iterations for PBKDF2-HMAC-SHA256.
 ITERATIONS = 20000
 KEY_BYTES = 32  # a 256-bit derived key
 TOTP_STEP_SECONDS, TOTP_DIGITS = 30, 6
@@ -47,6 +49,7 @@ class TokenService:
         self.by_hash = {}
         self.families = {}
 
+    # Tokens here are derived from a counter so the output is repeatable; real ones come from a secure random generator.
     def mint(self, family):  # the server stores only the hash of a token, like a password
         self.counter += 1
         token = sha256(f'{self.key}:{self.counter}')[:TOKEN_HEX_CHARS]
