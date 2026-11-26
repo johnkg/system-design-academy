@@ -4,7 +4,7 @@
   "intent": "Let hundreds of application instances share a few dozen database connections, queue the excess politely, send reads to replicas, and ride out a failover without dropping requests.",
   "codeTitle": "a transaction-mode pooler with a bounded wait queue",
   "finalIntro": "One write and one read going through the pooler, and then a failover.",
-  "prompt": "Design a proxy that sits between 300 application instances and a PostgreSQL primary with 2 read replicas, like PgBouncer, ProxySQL or RDS Proxy. Each instance wants a pool of 20 connections, the database allows 500, and the team keeps adding instances. The proxy must keep the database healthy under bursts, behave well when the primary fails over, and never become the thing that takes the site down.",
+  "prompt": "Design a proxy that sits between 300 application instances and a PostgreSQL primary with 2 read replicas, like PgBouncer or RDS Proxy (ProxySQL plays the same role for MySQL). Each instance wants a pool of 20 connections, the database allows 500, and the team keeps adding instances. The proxy must keep the database healthy under bursts, behave well when the primary fails over, and never become the thing that takes the site down.",
   "functional": [
     "Accept thousands of client connections and run their queries over a small set of server connections",
     "Offer pooling modes (session, transaction, statement) with clear rules about what each one breaks",
@@ -15,7 +15,7 @@
   ],
   "nonFunctional": [
     "Added latency under 1 ms when a server connection is free",
-    "Support at least 10,000 client connections per proxy with a few MB of memory in total",
+    "Support at least 10,000 client connections per proxy with a few tens of MB of memory in total",
     "The database never sees more active connections than it can run well, which is a few dozen",
     "A primary failover costs seconds of errors at most, not minutes",
     "Reads are never staler than a configured lag, and a client always sees its own writes",
@@ -26,7 +26,7 @@
     "limits": [
       "A connection is expensive: a TCP and TLS handshake, authentication, and in PostgreSQL a whole operating system process that uses several MB of memory, so thousands of them waste memory that could be cache",
       "Instances times pool size passes max_connections as soon as the fleet grows, and new instances get 'too many clients' errors at start-up",
-      "Most connections are idle most of the time, but they still cost memory and slow shared work such as taking snapshots",
+      "Most connections are idle most of the time, but they still cost memory and slow shared work such as taking snapshots, notably before PostgreSQL 14, which made snapshots much cheaper with many idle connections",
       "In a burst every connection becomes active at once, and a database with 16 cores running 400 queries at once spends its time switching between them, so throughput falls as load rises",
       "A deploy or an autoscaling event opens thousands of new connections in a few seconds, which can knock over the database that was healthy a moment ago",
       "Nothing sends reads to replicas, and every application has to handle a failover on its own"
@@ -197,8 +197,8 @@
     {
       "title": "Choose the pooling mode, knowing what it breaks",
       "problem": "When can the pooler take a server connection back from a client? Take it too late and nothing is saved, take it too early and the client's session state vanishes under it.",
-      "fix": "Session mode lends a server connection for the whole life of the client connection, which keeps every feature but saves nothing for apps that stay connected. Transaction mode lends it from BEGIN to COMMIT and takes it back, so a few dozen connections can serve thousands of clients; this is the mode that fixes the connection count. Statement mode lends it for a single statement and forbids multi-statement transactions. In transaction mode anything that lives in the session breaks: SET without LOCAL, temporary tables, session advisory locks, LISTEN and NOTIFY, WITH HOLD cursors and, in older versions, server-side prepared statements. ProxySQL and RDS Proxy 'pin' a client to a server connection when they see such state, which keeps it correct and removes the saving.",
-      "tradeoff": "Transaction mode multiplies capacity by 100 or more, but the app must keep its state inside transactions: use SET LOCAL, transaction-level advisory locks and a direct connection for LISTEN. The bugs from getting this wrong are intermittent, because they depend on which server connection a transaction happens to get.",
+      "fix": "Session mode lends a server connection for the whole life of the client connection, which keeps every feature but saves nothing for apps that stay connected. Transaction mode lends it from BEGIN to COMMIT and takes it back, so a few dozen connections can serve thousands of clients; this is the mode that fixes the connection count. Statement mode lends it for a single statement and forbids multi-statement transactions. In transaction mode anything that lives in the session breaks: SET without LOCAL, temporary tables, session advisory locks, LISTEN, WITH HOLD cursors, SQL-level PREPARE and, in PgBouncer before version 1.21, protocol-level prepared statements. RDS Proxy, and ProxySQL on MySQL, 'pin' a client to a server connection when they see such state, which keeps it correct and removes the saving.",
+      "tradeoff": "Transaction mode can serve 100 or more clients per server connection when transactions are short, but the app must keep its state inside transactions: use SET LOCAL, transaction-level advisory locks and a direct connection for LISTEN. The bugs from getting this wrong are intermittent, because they depend on which server connection a transaction happens to get.",
       "concepts": [
         {
           "slug": "mvcc-and-isolation-levels"
@@ -240,7 +240,7 @@
     {
       "title": "Route reads to replicas that are fresh enough",
       "problem": "The primary does all the work, while the replicas sit nearly idle, and an application that sends reads there itself must deal with lag and failover on its own.",
-      "fix": "A router behind the pooler sends each statement to the primary or to a replica. Statements outside a transaction that start with SELECT go to a replica, and everything else goes to the primary; ProxySQL does this with query rules, and applications can also ask for a replica with a separate port or user. The router knows each replica's replication lag from heartbeat rows or the replay position, and skips a replica that is over the limit, say 500 ms. A client that has just written is kept on the primary for a short time, or until a replica has replayed the position of its write, so it always reads its own writes.",
+      "fix": "A router behind the pooler sends each statement to the primary or to a replica. Statements outside a transaction that start with SELECT go to a replica, and everything else goes to the primary; ProxySQL does this for MySQL with query rules, Pgpool-II offers similar load balancing for PostgreSQL, and applications can also ask for a replica with a separate port or user. The router knows each replica's replication lag from heartbeat rows or the replay position, and skips a replica that is over the limit, say 500 ms. A client that has just written is kept on the primary for a short time, or until a replica has replayed the position of its write, so it always reads its own writes.",
       "tradeoff": "The primary is relieved of most of the read traffic, and replicas can be added or removed behind the proxy. Parsing SQL to find reads is imperfect: a SELECT that calls a function with side effects goes to the wrong place unless the app marks it. Reads can still be a little stale, which is the price of replication.",
       "concepts": [
         {
@@ -399,7 +399,7 @@
           "con": "Total connections are instances times pool size, and a deploy opens them all at once"
         },
         {
-          "name": "A central pooler (PgBouncer, ProxySQL)",
+          "name": "A central pooler (PgBouncer, or ProxySQL for MySQL)",
           "pro": "One small set of server connections for the whole fleet",
           "con": "A new component that must be redundant and monitored"
         },
