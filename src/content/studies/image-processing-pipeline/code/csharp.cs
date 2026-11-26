@@ -57,9 +57,9 @@ public static class Program
                     {
                         burned += c;
                         b.Tries++;
-                        if (!backoff) q.Add(b.With(1));                 // retry at once, for ever
+                        if (!backoff) waiting.Add((t + PoisonCost, b.With(1))); // back on the queue the moment the worker gives up, for ever
                         else if (b.Tries >= MaxTries) dlq++;            // give up: a person looks at it
-                        else waiting.Add((t + Backoff * (1 << (b.Tries - 1)), b.With(1)));
+                        else waiting.Add((t + PoisonCost + Backoff * (1 << (b.Tries - 1)), b.With(1))); // after the failed run, then the delay
                     }
                     if (b.N == 0) q.RemoveAt(0);
                 }
@@ -87,8 +87,8 @@ public static class Program
         Run("one queue, 30 workers", false, 30, 100000, 0, false, false);
         Run("separate lanes", true, 30, 100000, 0, false, false);
         Run("separate lanes, autoscaled", true, 30, 100000, 0, false, true);
-        Run("separate lanes, 5 broken images retried at once", true, 30, 100000, 5, false, false);
-        Run("separate lanes, 5 broken images, backoff and a dead-letter queue", true, 30, 100000, 5, true, false);
-        Run("separate lanes, autoscaled, 5 broken images retried at once", true, 30, 100000, 5, false, true);
+        Run("separate lanes, 20 broken images retried at once", true, 30, 100000, 20, false, false);
+        Run("separate lanes, 20 broken images, backoff and a dead-letter queue", true, 30, 100000, 20, true, false);
+        Run("separate lanes, autoscaled, 20 broken images retried at once", true, 30, 100000, 20, false, true);
     }
 }

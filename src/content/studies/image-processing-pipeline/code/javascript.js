@@ -42,9 +42,9 @@ function run(name, { lanes, workers, bulk, poison, backoff, autoscale }) {
         if (b.kind === 'poison') {
           burned += c;
           b.tries++;
-          if (!backoff) q.push({ ...b, n: 1 });                   // retry at once, for ever
+          if (!backoff) waiting.push({ ready: t + POISON_COST, b: { ...b, n: 1 } }); // back on the queue the moment the worker gives up, for ever
           else if (b.tries >= MAX_TRIES) dlq++;                   // give up: a person looks at it
-          else waiting.push({ ready: t + BACKOFF * 2 ** (b.tries - 1), b: { ...b, n: 1 } });
+          else waiting.push({ ready: t + POISON_COST + BACKOFF * 2 ** (b.tries - 1), b: { ...b, n: 1 } }); // after the failed run, then the delay
         }
         if (b.n === 0) q.shift();
       }
@@ -69,6 +69,6 @@ const base = { lanes: false, workers: 30, bulk: 100000, poison: 0, backoff: fals
 run('one queue, 30 workers', base);
 run('separate lanes', { ...base, lanes: true });
 run('separate lanes, autoscaled', { ...base, lanes: true, autoscale: true });
-run('separate lanes, 5 broken images retried at once', { ...base, lanes: true, poison: 5 });
-run('separate lanes, 5 broken images, backoff and a dead-letter queue', { ...base, lanes: true, poison: 5, backoff: true });
-run('separate lanes, autoscaled, 5 broken images retried at once', { ...base, lanes: true, autoscale: true, poison: 5 });
+run('separate lanes, 20 broken images retried at once', { ...base, lanes: true, poison: 20 });
+run('separate lanes, 20 broken images, backoff and a dead-letter queue', { ...base, lanes: true, poison: 20, backoff: true });
+run('separate lanes, autoscaled, 20 broken images retried at once', { ...base, lanes: true, autoscale: true, poison: 20 });
