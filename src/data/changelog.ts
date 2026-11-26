@@ -3,6 +3,13 @@ export interface Change { date: string; title: string; items: { text: string; hr
 
 export const changelog: Change[] = [
   {
+    date: '2026-11-27',
+    title: 'Fact-checked: 49 more case studies',
+    items: [
+      { text: 'Security and identity, observability, delivery, data and analytics, ML and AI, and search and media systems have been reviewed. 112 of the 165 case studies now carry the Fact-checked badge. The image-processing pipeline study had a model bug (a retried job re-entered the queue instantly and ran on many workers at once); it is fixed, and its break-it numbers changed. The ad-click aggregation design now saves its seen-click set with its checkpoints, so a crash cannot lose replayed clicks.', href: 'accuracy/' },
+    ],
+  },
+  {
     date: '2026-11-26',
     title: 'Fact-checked: all 23 design patterns and 63 case studies',
     items: [
