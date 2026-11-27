@@ -27,7 +27,7 @@ VENDORS = [
 ]
 
 
-def scatter_gather(workers: list[Vendor], deadline: int) -> tuple[str, int]:
+def scatter_gather(workers: list[Vendor], deadline: int) -> tuple[str, int] | None:
     print(f"Scatter: asking {len(workers)} vendors, deadline {deadline} ms")
     gathered: list[tuple[str, int]] = []
     for worker in sorted(workers, key=lambda w: w.latency):  # all were asked at time 0; Gatherer handles arrivals in order
@@ -41,8 +41,10 @@ def scatter_gather(workers: list[Vendor], deadline: int) -> tuple[str, int]:
         except RuntimeError as error:
             print(f"  {worker.name} failed at {worker.latency} ms: {error}")
     print(f"Gathered {len(gathered)} of {len(workers)} answers")
+    if not gathered:  # nothing arrived in time: the caller decides what to show
+        return None
     return min(gathered, key=lambda g: g[1])
 
 
-name, price = scatter_gather(VENDORS, 300)
-print(f"Best price: {price} ({name})")
+best = scatter_gather(VENDORS, 300)
+print(f"Best price: {best[1]} ({best[0]})" if best else "No answers arrived before the deadline")

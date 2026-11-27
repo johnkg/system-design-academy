@@ -1,6 +1,6 @@
 // Reactor in C#. One loop asks which connections are ready and dispatches each to its handler.
 // The demultiplexer is simulated with fixed batches so that the output is the same on every run;
-// real servers use the operating system's event notification (.NET sockets do this for you).
+// real servers use the operating system's event notification (epoll on Linux, kqueue on macOS; .NET's socket layer wraps these, and uses completion ports on Windows).
 using System;
 using System.Collections.Generic;
 

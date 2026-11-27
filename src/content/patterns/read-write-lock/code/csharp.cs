@@ -34,6 +34,7 @@ public static class Program
     }
 }
 
+// Illustration only: this class is NOT thread-safe. It models the rules; use ReaderWriterLockSlim as a real lock.
 public class ReadWriteLock
 {
     private bool _writer;

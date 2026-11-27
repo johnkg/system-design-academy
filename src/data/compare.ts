@@ -300,4 +300,16 @@ export const confusions: Confusion[] = [
     ],
     rule: 'Many reads, few writes, ever-changing data? Read-Write Lock. Create once, read for ever? Double-checked locking, or better, the language\'s lazy tool.',
   },
+  {
+    title: 'Singleton vs Double-Checked Locking',
+    blurb: 'Double-checked locking is not a rival of Singleton. It is one way to create a lazy Singleton safely when many threads ask at once.',
+    patterns: ['singleton', 'double-checked-locking'],
+    rows: [
+      { aspect: 'What it answers', values: ['How do I make sure there is only one instance?', 'How do I create that one instance lazily, without a lock on every call?'] },
+      { aspect: 'Level', values: ['A design: one instance, one access point', 'A technique: check, lock, check again'] },
+      { aspect: 'Needed in single-threaded code', values: ['Yes, if you want one instance', 'No: a plain check is enough'] },
+      { aspect: 'Safer alternative', values: ['Dependency injection of a single shared instance', 'The language\'s lazy tool, such as Lazy<T>'] },
+    ],
+    rule: 'Deciding that there is only one? Singleton. Deciding how to build it safely and lazily under threads? Double-checked locking, or the built-in lazy tool.',
+  },
 ];

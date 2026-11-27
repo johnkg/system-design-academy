@@ -18,7 +18,7 @@ async function show(stockFails) {
     const stock = await lookupStock(stockFails); // only now does the second lookup start
     console.log(`got stock ${stock}`);
   } catch (error) {
-    console.log(`page failed: ${error.message}`); // the price that had arrived is not shown
+    console.log(`page failed: ${error.message}`); // the page fails, and the price that had arrived is thrown away
   }
 }
 

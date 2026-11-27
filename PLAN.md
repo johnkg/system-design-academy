@@ -4,7 +4,7 @@
 A visual, interactive site that teaches how software systems are designed: scaling, data, messaging, reliability, and the classic design patterns. Each concept is taught with a diagram, a step-by-step animation, something to play with, and code only where code actually helps.
 
 ## Direction change (recorded so the history makes sense)
-The project began as "Design Patterns Academy" covering the 23 Gang of Four patterns. It is now a broader collection of system design concepts, and the GoF patterns are kept as one area.
+The project began as "Design Patterns Academy" covering the 23 Gang of Four patterns. It is now a broader collection of system design concepts, and the design patterns (the 23 GoF plus enterprise, distributed and concurrency patterns) are kept as one area.
 
 ## Decisions
 | Topic | Decision |

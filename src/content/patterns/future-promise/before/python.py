@@ -23,7 +23,7 @@ async def show(stock_fails):
         stock = await lookup_stock(stock_fails)  # only now does the second lookup start
         print(f"got stock {stock}")
     except RuntimeError as error:
-        print(f"page failed: {error}")  # the price that had arrived is not shown
+        print(f"page failed: {error}")  # the page fails, and the price that had arrived is thrown away
 
 
 async def main():

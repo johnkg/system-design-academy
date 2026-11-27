@@ -2,6 +2,7 @@
 # with try-style calls; real code would block instead of returning False.
 
 
+# Illustration only: this class is NOT thread-safe. It models the rules; do not use it as a lock.
 class ReadWriteLock:
     def __init__(self) -> None:
         self.readers = 0

@@ -36,6 +36,21 @@ class InMemoryOrderRepository:  # Concrete repository: the only place that knows
         return [o for o in self._orders.values() if o.customer == customer and o.status == "open"]
 
 
+class SqlOrderRepository:  # Another concrete repository: the service is not edited to use it
+    def __init__(self) -> None:
+        self._rows: dict[int, Order] = {}
+
+    def add(self, order: Order) -> None:
+        self._rows[order.id] = order
+
+    def get(self, order_id: int) -> Order:
+        return self._rows[order_id]
+
+    def find_open_for(self, customer: str) -> list[Order]:
+        print(f"SQL: SELECT * FROM orders WHERE customer = '{customer}' AND status = 'open'")
+        return [o for o in self._rows.values() if o.customer == customer and o.status == "open"]
+
+
 class OrderService:  # Client: depends on the repository's methods only
     def __init__(self, orders: OrderRepository) -> None:
         self.orders = orders
@@ -61,3 +76,10 @@ service = OrderService(orders)
 service.list_open("ada")
 service.cancel(1)
 service.list_open("ada")
+
+print("--- same service, SQL repository ---")
+sql_orders = SqlOrderRepository()
+sql_orders.add(Order(1, "ada", 40))
+sql_orders.add(Order(2, "grace", 25))
+sql_orders.add(Order(3, "ada", 15))
+OrderService(sql_orders).list_open("ada")

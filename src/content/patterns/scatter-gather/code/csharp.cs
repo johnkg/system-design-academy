@@ -17,11 +17,11 @@ public static class Program
             new("E", 60, null, "out of stock feed"),
         };
 
-        var (name, price) = ScatterGather(vendors, 300);
-        Console.WriteLine($"Best price: {price} ({name})");
+        var best = ScatterGather(vendors, 300);
+        Console.WriteLine(best is { } b ? $"Best price: {b.Price} ({b.Name})" : "No answers arrived before the deadline");
     }
 
-    private static (string Name, int Price) ScatterGather(List<Vendor> workers, int deadline)
+    private static (string Name, int Price)? ScatterGather(List<Vendor> workers, int deadline)
     {
         Console.WriteLine($"Scatter: asking {workers.Count} vendors, deadline {deadline} ms");
         var gathered = new List<(string Name, int Price)>();
@@ -44,6 +44,7 @@ public static class Program
             }
         }
         Console.WriteLine($"Gathered {gathered.Count} of {workers.Count} answers");
+        if (gathered.Count == 0) return null; // nothing arrived in time: the caller decides what to show
         return gathered.MinBy(g => g.Price);
     }
 }

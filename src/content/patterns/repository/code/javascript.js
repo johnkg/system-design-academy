@@ -14,6 +14,16 @@ class InMemoryOrderRepository { // Concrete repository: the only place that know
   }
 }
 
+class SqlOrderRepository { // Another concrete repository: the service is not edited to use it
+  #rows = new Map();
+  add(order) { this.#rows.set(order.id, order); }
+  get(id) { return this.#rows.get(id); }
+  findOpenFor(customer) {
+    console.log(`SQL: SELECT * FROM orders WHERE customer = '${customer}' AND status = 'open'`);
+    return [...this.#rows.values()].filter((o) => o.customer === customer && o.status === "open");
+  }
+}
+
 class OrderService { // Client: depends on the repository's methods only
   constructor(orders) { this.orders = orders; }
   listOpen(customer) {
@@ -37,3 +47,10 @@ const service = new OrderService(orders);
 service.listOpen("ada");
 service.cancel(1);
 service.listOpen("ada");
+
+console.log("--- same service, SQL repository ---");
+const sqlOrders = new SqlOrderRepository();
+sqlOrders.add(new Order(1, "ada", 40));
+sqlOrders.add(new Order(2, "grace", 25));
+sqlOrders.add(new Order(3, "ada", 15));
+new OrderService(sqlOrders).listOpen("ada");

@@ -32,8 +32,9 @@ function scatterGather(workers, deadline) {
     }
   }
   console.log(`Gathered ${gathered.length} of ${workers.length} answers`);
+  if (gathered.length === 0) return null; // nothing arrived in time: the caller decides what to show
   return gathered.reduce((best, g) => (g.price < best.price ? g : best));
 }
 
 const best = scatterGather(vendors, 300);
-console.log(`Best price: ${best.price} (${best.name})`);
+console.log(best ? `Best price: ${best.price} (${best.name})` : "No answers arrived before the deadline");

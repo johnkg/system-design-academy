@@ -16,6 +16,13 @@ public static class Program
         service.ListOpen("ada");
         service.Cancel(1);
         service.ListOpen("ada");
+
+        Console.WriteLine("--- same service, SQL repository ---");
+        var sqlOrders = new SqlOrderRepository();
+        sqlOrders.Add(new Order(1, "ada", 40));
+        sqlOrders.Add(new Order(2, "grace", 25));
+        sqlOrders.Add(new Order(3, "ada", 15));
+        new OrderService(sqlOrders).ListOpen("ada");
     }
 }
 
@@ -43,6 +50,19 @@ public class InMemoryOrderRepository : IOrderRepository // Concrete repository: 
     public Order Get(int id) => _orders[id];
     public IReadOnlyList<Order> FindOpenFor(string customer) =>
         _orders.Values.Where(o => o.Customer == customer && o.Status == "open").ToList();
+}
+
+public class SqlOrderRepository : IOrderRepository // Another concrete repository: the service is not edited to use it
+{
+    private readonly Dictionary<int, Order> _rows = new();
+
+    public void Add(Order order) => _rows[order.Id] = order;
+    public Order Get(int id) => _rows[id];
+    public IReadOnlyList<Order> FindOpenFor(string customer)
+    {
+        Console.WriteLine($"SQL: SELECT * FROM orders WHERE customer = '{customer}' AND status = 'open'");
+        return _rows.Values.Where(o => o.Customer == customer && o.Status == "open").ToList();
+    }
 }
 
 public class OrderService(IOrderRepository orders) // Client: depends on the repository's methods only

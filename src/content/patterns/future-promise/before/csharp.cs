@@ -26,7 +26,7 @@ public static class Program
         }
         catch (InvalidOperationException error)
         {
-            Console.WriteLine($"page failed: {error.Message}"); // the price that had arrived is not shown
+            Console.WriteLine($"page failed: {error.Message}"); // the page fails, and the price that had arrived is thrown away
         }
     }
 

@@ -1,6 +1,7 @@
 // Read-Write Lock in JavaScript. Plain JavaScript has no shared-memory threads, so this models the lock's rules
 // with try-style calls; real code would block instead of returning false.
 
+// Illustration only: this class is NOT thread-safe. It models the rules; do not use it as a lock.
 class ReadWriteLock {
   #readers = 0;
   #writer = false;
