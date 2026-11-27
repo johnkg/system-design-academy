@@ -1,5 +1,6 @@
 import { defineCollection, z } from 'astro:content';
 import { glob } from 'astro/loaders';
+import { patternCategoryIds } from './data/patternCategories';
 
 // Self-check shown at the end of a page: scenario questions with one best answer each.
 const QUIZ_QUESTIONS = 3; // per page
@@ -23,7 +24,7 @@ const patterns = defineCollection({
   }),
   schema: z.object({
     name: z.string(),
-    category: z.enum(['creational', 'structural', 'behavioral']),
+    category: z.enum(patternCategoryIds),
     difficulty: z.enum(['beginner', 'intermediate', 'advanced']),
     intent: z.string(), // one-line summary
     scenario: z.string(), // the example every language implements
