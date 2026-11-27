@@ -110,7 +110,7 @@ export const paths: LearningPath[] = [
     title: 'Building with language models',
     audience: 'Going deeper',
     blurb: 'Choose between prompting, retrieval and fine-tuning, get reliable output, add tools, and keep the whole system trustworthy. Ends with two platform designs.',
-    steps: [c('prompting-vs-fine-tuning-vs-rag'), c('structured-output-and-function-calling'), c('agents-and-tool-use'), c('retrieval-augmented-generation'), c('fine-tuning-and-lora'), c('vector-index-internals'), c('training-serving-skew'), c('model-evaluation-and-drift'), c('guardrails-and-prompt-injection'), s('rag-platform'), s('llm-inference-gateway')],
+    steps: [c('prompting-vs-fine-tuning-vs-rag'), c('structured-output-and-function-calling'), c('agents-and-tool-use'), c('retrieval-augmented-generation'), c('fine-tuning-and-lora'), c('vector-index-internals'), c('training-serving-skew'), c('model-evaluation-and-drift'), c('guardrails-and-prompt-injection'), s('rag-platform'), s('llm-inference-gateway'), s('model-fine-tuning-pipeline'), s('code-assistant-backend')],
   },
   {
     id: 'solid-and-beyond',

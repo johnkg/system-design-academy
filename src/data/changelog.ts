@@ -3,6 +3,14 @@ export interface Change { date: string; title: string; items: { text: string; hr
 
 export const changelog: Change[] = [
   {
+    date: '2026-12-06',
+    title: 'Two new AI case studies',
+    items: [
+      { text: 'Design a Model Fine-Tuning Pipeline covers versioned data, a shared GPU pool, checkpoints and resuming, an evaluation gate, a model registry and gradual rollout, with a calculator for run cost and a simulation of a crash at hour 30.', href: 'case-studies/model-fine-tuning-pipeline/' },
+      { text: 'Design a Code Assistant Backend covers debouncing and cancelling requests, building a small context, indexing a repository by branch, two model paths, prefix caching, keeping secrets out of prompts and measuring whether suggestions help.', href: 'case-studies/code-assistant-backend/' },
+    ],
+  },
+  {
     date: '2026-12-05',
     title: 'Six more AI concepts: building with language models',
     items: [
