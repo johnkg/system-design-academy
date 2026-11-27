@@ -3,6 +3,14 @@ export interface Change { date: string; title: string; items: { text: string; hr
 
 export const changelog: Change[] = [
   {
+    date: '2026-11-30',
+    title: 'Six distributed and cloud design patterns',
+    items: [
+      { text: 'A second new family: Distributed. Sidecar, Ambassador, Anti-Corruption Layer, Backends for Frontends, Scatter-Gather and Claim Check show how services cooperate across processes and networks. Each has a diagram, an animation, a simulation that prices the trade-off, before and after code in JavaScript, Python and C#, and a quiz. They have not been fact-checked yet.', href: 'patterns/sidecar/' },
+      { text: 'The compare page has new rows, including Sidecar vs Ambassador vs Proxy and Anti-Corruption Layer vs Adapter vs Facade.', href: 'compare/' },
+    ],
+  },
+  {
     date: '2026-11-29',
     title: 'Six enterprise design patterns',
     items: [

@@ -96,6 +96,19 @@ export const problems: Problem[] = [
   { text: 'Reuse expensive objects, such as connections, and cap how many exist', patterns: [
     { slug: 'object-pool', why: 'Borrow and return a limited set instead of creating one per use.' },
     { slug: 'flyweight', why: 'When the thing to share is immutable data, not a resource that is lent out.' } ] },
+  { text: 'Give every service the same retry, logging and encryption, whatever language it uses', patterns: [
+    { slug: 'sidecar', why: 'A helper process beside each service, upgraded on its own.' },
+    { slug: 'ambassador', why: 'The helper speaks for one remote service on the client\'s behalf.' } ] },
+  { text: 'Keep a legacy system\'s model and quirks out of a new design', patterns: [
+    { slug: 'anti-corruption-layer', why: 'Translates meaning and protects the new model at one boundary.' },
+    { slug: 'adapter', why: 'When only the interface differs and the models already agree.' } ] },
+  { text: 'Give a phone and a website each the data it needs from the same services', patterns: [
+    { slug: 'backends-for-frontends', why: 'One small backend per client that shapes and combines data.' },
+    { slug: 'facade', why: 'One simpler interface over a subsystem, when clients do not differ.' } ] },
+  { text: 'Ask many sources at once and combine whatever answers arrive in time', patterns: [
+    { slug: 'scatter-gather', why: 'Fan out, gather until a deadline, merge, and say how many answers were used.' } ] },
+  { text: 'Move a large payload through a channel with small message limits', patterns: [
+    { slug: 'claim-check', why: 'Store the payload elsewhere and send only a ticket.' } ] },
 ];
 
 export const confusions: Confusion[] = [
@@ -227,5 +240,29 @@ export const confusions: Confusion[] = [
       { aspect: 'Does it do real work', values: ['No, by design', 'Yes', 'Yes'] },
     ],
     rule: 'Absent and fine to ignore? Null Object. Interchangeable algorithm? Strategy. Behaviour that follows the object\'s own mode? State.',
+  },
+  {
+    title: 'Sidecar vs Ambassador vs Proxy',
+    blurb: 'All three put a process or object in front of a call. They differ in where it runs and whose side it is on.',
+    patterns: ['sidecar', 'ambassador', 'proxy'],
+    rows: [
+      { aspect: 'Where it runs', values: ['Beside each service instance, on the same host', 'Beside a client, on the same host', 'Anywhere: in the same program or on its own machine'] },
+      { aspect: 'Whose job it does', values: ['Shared plumbing for the service: logging, retries, TLS', 'Speaks for one remote service on behalf of the client', 'Controls access to one object by standing in for it'] },
+      { aspect: 'Direction of calls', values: ['Mostly outbound, sometimes inbound too', 'Outbound to the remote service', 'Either'] },
+      { aspect: 'Does the caller know it is there', values: ['It points at localhost, and does not know the rest', 'It asks the ambassador as if it were the remote service', 'No: it holds the proxy as if it were the real object'] },
+    ],
+    rule: 'Plumbing for the service itself? Sidecar. Representing one remote service for a client? Ambassador. Controlling access to one object? Proxy.',
+  },
+  {
+    title: 'Anti-Corruption Layer vs Adapter vs Facade',
+    blurb: 'All three sit between two pieces of code and change what the caller sees.',
+    patterns: ['anti-corruption-layer', 'adapter', 'facade'],
+    rows: [
+      { aspect: 'What it changes', values: ['The meaning: models, codes and formats', 'The interface: method names and shapes', 'The size: many calls become a few simple ones'] },
+      { aspect: 'Why it exists', values: ['To protect a new design from a legacy model', 'To make an existing class fit the interface a caller expects', 'To make a complicated subsystem easy to use'] },
+      { aspect: 'Can it refuse input', values: ['Yes, it rejects what it cannot translate', 'Rarely', 'No'] },
+      { aspect: 'Typical size', values: ['A layer, with its own tests and ownership', 'One small class', 'One class in front of a subsystem'] },
+    ],
+    rule: 'Protecting a model from another model? Anti-Corruption Layer. Different method names only? Adapter. Hiding a big subsystem? Facade.',
   },
 ];
