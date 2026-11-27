@@ -133,7 +133,7 @@ public static class Program
             var opt = TwoOpt(nn.order); int optLen = TourLength(opt.order);
             var bf = BruteForce(n); var bb = BranchAndBound(n, nnLen + 1);
             if (bf.best != bb.best) throw new Exception("exact methods disagree");
-            Console.WriteLine($"n={n}: optimum {bf.best}; brute force {bf.tours} tours, {bf.steps} steps; branch and bound {bb.steps} steps; " +
+            Console.WriteLine($"n={n}: optimum {bf.best}; brute force {bf.tours} orders, {bf.steps} steps; branch and bound {bb.steps} steps; " +
                 $"nearest neighbour {nnLen} ({nnLen * 100 / bf.best}% of optimum, {nn.steps} steps); with 2-opt {optLen} ({optLen * 100 / bf.best}%, {opt.moves} moves, {opt.steps} steps)");
         }
     }

@@ -7,13 +7,13 @@ using System;
 using System.Collections.Generic;
 using System.Linq;
 
-public class Address(string country) { public string Country = country; public string GetCountry() { Program.Calls++; return Country; } }
-public class Customer(Address address) { public Address Addr = address; public Address GetAddress() { Program.Calls++; return Addr; } }
+public class Address(string country) { public string Country = country; public string GetCountry() { Program.Calls++; return Country; } public string CountryName() => Country; }
+public class Customer(Address address) { public Address Addr = address; public Address GetAddress() { Program.Calls++; return Addr; } public string CountryName() => Addr.CountryName(); }
 public class Cart(Customer customer) // a cart may know its own customer; callers should not have to
 {
     public Customer Cust = customer;
     public Customer GetCustomer() { Program.Calls++; return Cust; }
-    public string ShippingCountry() { Program.Calls++; return Cust.Addr.Country; }
+    public string ShippingCountry() { Program.Calls++; return Cust.CountryName(); } // narrow: asks Customer, which asks Address; no private field is read
 }
 public class State(Cart cart) { public Cart TheCart = cart; public Cart GetCart() { Program.Calls++; return TheCart; } }
 
@@ -22,7 +22,7 @@ public record Edge(string A, string B, string Kind);
 
 public static class Program
 {
-    public static int Calls = 0; // every call made on an object from outside it
+    public static int Calls = 0; // every call the reading code makes on an object; the hand-offs Cart makes inside ShippingCountry() are Cart's own business and are not counted
 
     // An edge a -> b means a depends on b, with a kind from loosest to tightest.
     static readonly Dictionary<string, int> Weight = new() { ["data"] = 1, ["stamp"] = 2, ["control"] = 3, ["common"] = 4, ["content"] = 5 };

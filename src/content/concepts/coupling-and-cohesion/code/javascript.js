@@ -3,13 +3,13 @@
 // feature built four ways, as a module graph whose edges have a coupling kind; for three change requests it counts the other
 // modules that must change and the modules and responsibilities to re-test. Look for: the chain lengths, and what a one-module
 // design does to "modules that change" and to the size of what is re-tested.
-let calls = 0; // every call made on an object from outside it
-class Address { constructor(country) { this._country = country; } getCountry() { calls++; return this._country; } }
-class Customer { constructor(address) { this._address = address; } getAddress() { calls++; return this._address; } }
+let calls = 0; // every call the reading code makes on an object; the hand-offs Cart makes inside shippingCountry() are Cart's own business and are not counted
+class Address { constructor(country) { this._country = country; } getCountry() { calls++; return this._country; } country() { return this._country; } }
+class Customer { constructor(address) { this._address = address; } getAddress() { calls++; return this._address; } country() { return this._address.country(); } }
 class Cart { // a cart may know its own customer; callers should not have to
   constructor(customer) { this._customer = customer; }
   getCustomer() { calls++; return this._customer; }
-  shippingCountry() { calls++; return this._customer._address._country; }
+  shippingCountry() { calls++; return this._customer.country(); } // narrow: asks Customer, which asks Address; no private field is read
 }
 class State { constructor(cart) { this._cart = cart; } getCart() { calls++; return this._cart; } }
 const cart = new Cart(new Customer(new Address('DE'))), GLOBAL = new State(cart);
