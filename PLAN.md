@@ -61,7 +61,7 @@ Simulation ideas: caching (hit/miss ratio with eviction policies), sharding and 
 - Walkthrough check: a few steps still quote a rounded figure that the check accepts (the time-series database study says "45 GB" where the page shows 45.3 GB); find out why and decide whether to tighten it
 
 ## Status
-- Design patterns: all 26 built, with JS, Python and C# samples (verified by `npm run check:samples`)
+- Design patterns: all 27 built, with JS, Python and C# samples (verified by `npm run check:samples`)
 - Site generalised: area-based catalog with search and filters, concept pages, breadcrumbs, `/compare/` for patterns
 - Accessibility pass done (axe-core clean in light and dark, keyboard checks)
 - Plan an idea (`/advisor/`): describe an app or a page and see which of 24 needs it has, what to use for each and the closest case studies. Word matching in the browser, no AI. Ideas for later: more needs, a need-by-need comparison of options, and an optional AI mode where the reader brings their own key
