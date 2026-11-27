@@ -109,6 +109,17 @@ export const problems: Problem[] = [
     { slug: 'scatter-gather', why: 'Fan out, gather until a deadline, merge, and say how many answers were used.' } ] },
   { text: 'Move a large payload through a channel with small message limits', patterns: [
     { slug: 'claim-check', why: 'Store the payload elsewhere and send only a ticket.' } ] },
+  { text: 'Let many threads read shared data together, and make a writer exclusive', patterns: [
+    { slug: 'read-write-lock', why: 'Readers share the lock; a writer needs it alone.' } ] },
+  { text: 'Create an expensive shared object on first use, safely, without a lock on every call', patterns: [
+    { slug: 'double-checked-locking', why: 'Check without the lock, then lock, check again and create. Prefer the language\'s lazy tool.' } ] },
+  { text: 'Start slow work now and use its result later, or combine several results', patterns: [
+    { slug: 'future-promise', why: 'A placeholder for a value that has not arrived yet.' },
+    { slug: 'active-object', why: 'When the work should also run in order on one thread, behind an object.' } ] },
+  { text: 'Serve thousands of mostly idle connections with a few threads', patterns: [
+    { slug: 'reactor', why: 'One loop waits for events and dispatches each to a quick handler.' } ] },
+  { text: 'Use a not-thread-safe object from many threads without locking it everywhere', patterns: [
+    { slug: 'active-object', why: 'Queue the calls and run them on one worker that owns the object.' } ] },
 ];
 
 export const confusions: Confusion[] = [
@@ -264,5 +275,29 @@ export const confusions: Confusion[] = [
       { aspect: 'Typical size', values: ['A layer, with its own tests and ownership', 'One small class', 'One class in front of a subsystem'] },
     ],
     rule: 'Protecting a model from another model? Anti-Corruption Layer. Different method names only? Adapter. Hiding a big subsystem? Facade.',
+  },
+  {
+    title: 'Reactor vs Active Object vs Future/Promise',
+    blurb: 'All three are about doing work without a caller waiting for it. They solve different halves of the problem.',
+    patterns: ['reactor', 'active-object', 'future-promise'],
+    rows: [
+      { aspect: 'What it organises', values: ['Waiting for many event sources on one thread', 'Calls to one object, run in order on its own thread', 'A value that will exist later'] },
+      { aspect: 'Who runs the work', values: ['The loop calls a handler when an event is ready', 'One worker thread owned by the object', 'Whatever started the work: a task, a thread or the loop'] },
+      { aspect: 'Main benefit', values: ['Thousands of connections on a few threads', 'No locks around the object\'s state, and no blocked callers', 'Independent work in parallel, and results that can be combined'] },
+      { aspect: 'Main danger', values: ['A blocking handler stalls every connection on the loop', 'A queue that grows without limit, or a request that waits for itself', 'Errors nobody awaits, and too much started at once'] },
+    ],
+    rule: 'Many sources, one waiting loop? Reactor. One object, calls queued onto its own thread? Active Object. A result that arrives later? Future/Promise. They combine: an active object returns futures, and a reactor hands slow work to workers.',
+  },
+  {
+    title: 'Read-Write Lock vs Double-Checked Locking',
+    blurb: 'Both are ways to cut the cost of locking, for opposite shapes of work.',
+    patterns: ['read-write-lock', 'double-checked-locking'],
+    rows: [
+      { aspect: 'Shape of the work', values: ['Frequent reads, rare writes, for the whole life of the program', 'One creation, then reads for the rest of the program'] },
+      { aspect: 'What it saves', values: ['Readers no longer wait for each other', 'Callers skip the lock once the object exists'] },
+      { aspect: 'Main trap', values: ['Writers starve if readers never stop', 'Without safe publication, a half-built object can be seen'] },
+      { aspect: 'Safer alternative', values: ['An immutable snapshot that is swapped in', 'The language\'s own lazy facility, such as Lazy<T>'] },
+    ],
+    rule: 'Many reads, few writes, ever-changing data? Read-Write Lock. Create once, read for ever? Double-checked locking, or better, the language\'s lazy tool.',
   },
 ];

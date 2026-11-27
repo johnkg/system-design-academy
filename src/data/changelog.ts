@@ -3,6 +3,14 @@ export interface Change { date: string; title: string; items: { text: string; hr
 
 export const changelog: Change[] = [
   {
+    date: '2026-12-01',
+    title: 'Five concurrency design patterns',
+    items: [
+      { text: 'The third new family is Concurrency: how code that runs at the same time is structured. Active Object, Reactor, Read-Write Lock, Double-Checked Locking and Future/Promise each have a diagram, an animation, a simulation, before and after code in JavaScript, Python and C#, and a quiz. That brings the design patterns to 40. Double-Checked Locking states what is safe in each language and recommends the built-in lazy tools. They have not been fact-checked yet.', href: 'patterns/reactor/' },
+      { text: 'New compare rows: Reactor vs Active Object vs Future/Promise, and Read-Write Lock vs Double-Checked Locking.', href: 'compare/' },
+    ],
+  },
+  {
     date: '2026-11-30',
     title: 'Six distributed and cloud design patterns',
     items: [
