@@ -3,6 +3,14 @@ export interface Change { date: string; title: string; items: { text: string; hr
 
 export const changelog: Change[] = [
   {
+    date: '2026-12-07',
+    title: 'Accuracy review of the newest pages',
+    items: [
+      { text: 'The 14 AI concepts, the 2 AI case studies and the 17 newest design patterns were each checked by an independent reviewer against the cited papers or the standard references, and now carry the accuracy badge.', href: 'accuracy/' },
+      { text: 'Fixes from the review: claims now match what the papers actually found (LoRA, Lost in the Middle, ReAct, HNSW, Chinchilla), checkpoint sizes and caching are described more precisely, and several simulations now state the assumptions they make.' },
+    ],
+  },
+  {
     date: '2026-12-06',
     title: 'Two new AI case studies',
     items: [

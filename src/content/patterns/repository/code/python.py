@@ -47,7 +47,7 @@ class SqlOrderRepository:  # Another concrete repository: the service is not edi
         return self._rows[order_id]
 
     def find_open_for(self, customer: str) -> list[Order]:
-        print(f"SQL: SELECT * FROM orders WHERE customer = '{customer}' AND status = 'open'")
+        print(f"SQL: SELECT * FROM orders WHERE customer = ? AND status = 'open'")
         return [o for o in self._rows.values() if o.customer == customer and o.status == "open"]
 
 

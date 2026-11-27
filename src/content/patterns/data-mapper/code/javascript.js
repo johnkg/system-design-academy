@@ -16,7 +16,7 @@ class Table { // Storage: rows are plain column-to-value objects
   }
 }
 
-class UserMapper { // Mapper: the only place that knows the column names
+class UserMapper { // Mapper: the only class that reads or writes the columns; their names are configured where it is built
   constructor(table, columns) { this.table = table; this.columns = columns; }
   find(id) {
     const row = this.table.get(id);

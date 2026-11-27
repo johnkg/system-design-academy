@@ -60,7 +60,7 @@ public class SqlOrderRepository : IOrderRepository // Another concrete repositor
     public Order Get(int id) => _rows[id];
     public IReadOnlyList<Order> FindOpenFor(string customer)
     {
-        Console.WriteLine($"SQL: SELECT * FROM orders WHERE customer = '{customer}' AND status = 'open'");
+        Console.WriteLine($"SQL: SELECT * FROM orders WHERE customer = ? AND status = 'open'");
         return _rows.Values.Where(o => o.Customer == customer && o.Status == "open").ToList();
     }
 }
