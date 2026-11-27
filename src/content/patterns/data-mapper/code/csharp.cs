@@ -49,7 +49,7 @@ public class Table // Storage: rows are plain column-to-value dictionaries
     }
 }
 
-public class UserMapper(Table table, string nameColumn, string emailColumn) // Mapper: the only place that knows the column names
+public class UserMapper(Table table, string nameColumn, string emailColumn) // Mapper: the only class that reads or writes the columns; their names are configured where it is built
 {
     public User Find(int id)
     {

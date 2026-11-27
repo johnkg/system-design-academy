@@ -7,7 +7,7 @@ public static class Program
     public static void Main()
     {
         const long d = 4096;
-        const long bytesPerTrainableWeight = 16; // 16-bit weight + 16-bit gradient + 32-bit Adam states, as in the ZeRO accounting
+        const long bytesPerTrainableWeight = 16; // 16-bit weight + 16-bit gradient + 32-bit weight copy, momentum and variance, as in the ZeRO accounting
 
         var full = d * d;
         Console.WriteLine($"full matrix: {d} x {d} = {full} trainable weights");

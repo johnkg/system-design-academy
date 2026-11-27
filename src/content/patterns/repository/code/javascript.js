@@ -19,7 +19,7 @@ class SqlOrderRepository { // Another concrete repository: the service is not ed
   add(order) { this.#rows.set(order.id, order); }
   get(id) { return this.#rows.get(id); }
   findOpenFor(customer) {
-    console.log(`SQL: SELECT * FROM orders WHERE customer = '${customer}' AND status = 'open'`);
+    console.log(`SQL: SELECT * FROM orders WHERE customer = ? AND status = 'open'`);
     return [...this.#rows.values()].filter((o) => o.customer === customer && o.status === "open");
   }
 }

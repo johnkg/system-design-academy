@@ -29,7 +29,7 @@ class Table:  # Storage: rows are plain column-to-value dicts
             self.rows[row_id] = {(new if k == old else k): v for k, v in row.items()}
 
 
-class UserMapper:  # Mapper: the only place that knows the column names
+class UserMapper:  # Mapper: the only class that reads or writes the columns; their names are configured where it is built
     def __init__(self, table: Table, columns: dict[str, str]) -> None:
         self.table, self.columns = table, columns
 

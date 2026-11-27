@@ -31,7 +31,7 @@ for attempt, reply in enumerate(REPLIES, start=1):
 # 2. A token mask: only the tokens the grammar allows can be chosen.
 TOKENS = ["4", "7", "x", '"', "}"]
 LOGITS = [1.0, 2.0, 3.0, 2.5, 0.5]
-ALLOWED = {"4", "7"}  # after '{"order_id": ' only a digit is valid
+ALLOWED = {"4", "7"}  # after '{"order_id": ' only a digit (or a minus sign) is valid; this toy vocabulary has no minus sign
 print(f"unconstrained pick: {TOKENS[max(range(len(TOKENS)), key=lambda i: LOGITS[i])]}")
 masked = [score if token in ALLOWED else -math.inf for token, score in zip(TOKENS, LOGITS)]
 print("allowed here: " + ", ".join(t for t in TOKENS if t in ALLOWED))

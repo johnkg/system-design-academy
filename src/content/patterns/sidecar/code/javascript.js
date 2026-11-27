@@ -17,6 +17,7 @@ class Sidecar { // Runs beside the app; the app talks to it as if it were the ne
         console.log(`[sidecar] attempt ${attempt} ok`);
         return reply;
       } catch (error) {
+        if (error.message !== "timeout") throw error; // retry only timeouts, not every error
         console.log(`[sidecar] attempt ${attempt} failed: ${error.message}`);
       }
     }
