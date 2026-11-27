@@ -99,6 +99,20 @@ export const paths: LearningPath[] = [
     steps: [c('embeddings-and-vector-search'), c('retrieval-augmented-generation'), c('llm-inference-and-kv-cache'), c('continuous-batching-and-model-serving'), c('llm-caching-and-routing'), c('guardrails-and-prompt-injection'), c('model-evaluation-and-drift'), s('vector-database'), s('rag-platform'), s('llm-inference-gateway'), s('ai-agent-orchestration-platform')],
   },
   {
+    id: 'how-llms-work',
+    title: 'How a language model works',
+    audience: 'Going deeper',
+    blurb: 'From text to tokens, through attention and training, to sampling, memory and the limits of what a model knows. Then the systems that serve it.',
+    steps: [c('tokens-and-tokenization'), c('attention-and-transformers'), c('how-models-are-trained'), c('sampling-temperature-and-decoding'), c('context-windows-and-long-context'), c('llm-inference-and-kv-cache'), c('quantization-and-model-compression'), c('scaling-laws-and-model-size'), c('hallucination-and-grounding'), c('retrieval-augmented-generation')],
+  },
+  {
+    id: 'building-with-llms',
+    title: 'Building with language models',
+    audience: 'Going deeper',
+    blurb: 'Choose between prompting, retrieval and fine-tuning, get reliable output, add tools, and keep the whole system trustworthy. Ends with two platform designs.',
+    steps: [c('prompting-vs-fine-tuning-vs-rag'), c('structured-output-and-function-calling'), c('agents-and-tool-use'), c('retrieval-augmented-generation'), c('fine-tuning-and-lora'), c('vector-index-internals'), c('training-serving-skew'), c('model-evaluation-and-drift'), c('guardrails-and-prompt-injection'), s('rag-platform'), s('llm-inference-gateway'), s('model-fine-tuning-pipeline'), s('code-assistant-backend')],
+  },
+  {
     id: 'solid-and-beyond',
     title: 'Design principles that people get wrong',
     audience: 'Writing code',

@@ -242,6 +242,24 @@ export const problems: Problem[] = [
     { slug: 'canary-deployments', why: 'Send a small share of real traffic to the new version before everyone gets it.' } ] },
   { text: 'A model does not fit on one GPU, or training takes too long', patterns: [
     { slug: 'distributed-training-and-parallelism', why: 'Split data, state and layers across GPUs, balance memory against communication, and checkpoint so a failed machine costs minutes, not days.' } ] },
+  { text: 'My assistant needs private or frequently changing knowledge', patterns: [
+    { slug: 'retrieval-augmented-generation', why: 'Fetch the relevant documents at question time, so updating a document updates the answers.' },
+    { slug: 'prompting-vs-fine-tuning-vs-rag', why: 'Check whether a prompt or fine-tuning would fix your problem more cheaply.' },
+    { slug: 'hallucination-and-grounding', why: 'Make answers cite sources, check claims against them, and decline when nothing supports an answer.' } ] },
+  { text: 'A program must use the model\'s output, or the model must call my code', patterns: [
+    { slug: 'structured-output-and-function-calling', why: 'Validate or constrain the output, and treat every tool call as untrusted input.' } ] },
+  { text: 'A task with many steps fails more often than I expected, and costs more', patterns: [
+    { slug: 'agents-and-tool-use', why: 'Success multiplies across steps and cost grows with the square of the steps, so add checks and budgets.' } ] },
+  { text: 'A model does not fit in my GPU memory', patterns: [
+    { slug: 'quantization-and-model-compression', why: 'Store the weights in fewer bits, or use a smaller distilled model.' },
+    { slug: 'llm-inference-and-kv-cache', why: 'The KV cache needs memory on top of the weights, and grows with every request.' },
+    { slug: 'fine-tuning-and-lora', why: 'If the problem is training memory, train small adapters instead of every weight.' } ] },
+  { text: 'A model scores well offline and badly in production', patterns: [
+    { slug: 'training-serving-skew', why: 'Compare the features the serving path used with what training computed.' },
+    { slug: 'model-evaluation-and-drift', why: 'Measure with a test set that looks like live traffic, and watch it over time.' } ] },
+  { text: 'Search over millions of vectors must be fast and fit in memory', patterns: [
+    { slug: 'vector-index-internals', why: 'IVF, HNSW and product quantization trade a little recall for speed and memory.' },
+    { slug: 'embeddings-and-vector-search', why: 'Start with how embeddings turn meaning into distance.' } ] },
 ];
 
 export const confusions: Confusion[] = [
@@ -516,5 +534,29 @@ export const confusions: Confusion[] = [
       { aspect: 'Typical failure', values: ['Similar but wrong neighbours, or recall lost to aggressive compression', 'The right passage never retrieved, so a confident answer cites the wrong text', 'A near-duplicate question served a stale or another tenant\'s answer'] },
     ],
     rule: 'Vector search finds candidates, retrieval decides what the model sees, and caching decides whether the call is needed at all. A RAG system usually uses all three, and each needs its own tests.',
+  },
+  {
+    title: 'Retrieval, fine-tuning or a better prompt?',
+    blurb: 'Three levers for a model that does not do what you need. They change different things, so the right choice depends on the problem.',
+    patterns: ['prompting-vs-fine-tuning-vs-rag', 'retrieval-augmented-generation', 'fine-tuning-and-lora'],
+    rows: [
+      { aspect: 'What it changes', values: ['The instructions and examples sent with each request', 'The documents the model sees at question time', 'The model\'s own weights'] },
+      { aspect: 'How fast an update takes effect', values: ['At once, by editing the prompt', 'At once, by updating the documents or the index', 'After new data, a training run and an evaluation'] },
+      { aspect: 'Good for', values: ['Format, tone and a first attempt at almost anything', 'Private, large or changing facts, with sources the user can check', 'Consistent behaviour or a narrow skill at high volume'] },
+      { aspect: 'Typical failure', values: ['A long fragile prompt that nobody dares to change', 'The right passage is never retrieved, and the answer is confident anyway', 'Trained-in facts go stale, and general ability drops on narrow data'] },
+    ],
+    rule: 'Missing or changing knowledge needs retrieval. Behaviour that must hold at scale may need fine-tuning. Start with the prompt, measure, and add the next lever only for a gap you can see.',
+  },
+  {
+    title: 'Quantization, LoRA or scaling laws?',
+    blurb: 'Three ideas about memory and compute for models. They answer different questions, at different stages.',
+    patterns: ['quantization-and-model-compression', 'fine-tuning-and-lora', 'scaling-laws-and-model-size'],
+    rows: [
+      { aspect: 'Question it answers', values: ['How can I store and serve this model in less memory?', 'How can I adapt this model without training every weight?', 'How should a training budget be split between size and data?'] },
+      { aspect: 'Stage', values: ['After training, when serving', 'After pretraining, when adapting', 'Before training, when planning'] },
+      { aspect: 'What it saves', values: ['Memory and traffic for the weights', 'Gradient and optimizer memory, and storage per task', 'Wasted compute from a badly balanced run'] },
+      { aspect: 'Main caution', values: ['Accuracy can drop, so measure it on your own tasks', 'A narrow adapter can reduce general ability', 'The ratios are fitted rules of thumb, not laws'] },
+    ],
+    rule: 'Serving memory points to quantization, adaptation cost to LoRA, and planning a training run to scaling laws. They combine: QLoRA trains adapters on top of a quantized base.',
   },
 ];

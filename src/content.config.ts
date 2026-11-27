@@ -51,7 +51,7 @@ const concepts = defineCollection({
   }),
   schema: z.object({
     name: z.string(),
-    area: z.enum(['scaling', 'data', 'messaging', 'reliability', 'api', 'security', 'observability', 'networking', 'distributed', 'deployment', 'databases', 'dataengineering', 'aiml', 'search', 'payments', 'mobile', 'principles', 'algorithms', 'concurrency', 'testing', 'architecture']),
+    area: z.enum(['scaling', 'data', 'messaging', 'reliability', 'api', 'security', 'observability', 'networking', 'distributed', 'deployment', 'databases', 'dataengineering', 'aifoundations', 'aiml', 'search', 'payments', 'mobile', 'principles', 'algorithms', 'concurrency', 'testing', 'architecture']),
     difficulty: z.enum(['beginner', 'intermediate', 'advanced']),
     intent: z.string(), // one-line summary
     scenario: z.string(), // the running example used in the animation and simulation
@@ -64,6 +64,8 @@ const concepts = defineCollection({
     pitfalls: z.array(z.string()),
     related: z.array(z.object({ kind: z.enum(['concept', 'pattern']), slug: z.string() })).default([]),
     roles: z.array(z.object({ id: z.string(), label: z.string(), description: z.string() })),
+    // Primary sources the page's claims rest on (papers, specifications). Shown at the end of the page; check:content requires https links.
+    sources: z.array(z.object({ title: z.string(), publisher: z.string(), year: z.number().int(), url: z.string().url() })).optional(),
     quiz: quizSchema,
     factChecked,
   }),

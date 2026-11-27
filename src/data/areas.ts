@@ -12,6 +12,7 @@ export const areas = [
   { id: 'deployment', label: 'Cloud & deployment', blurb: 'How code reaches production safely, and how infrastructure grows, heals and survives a region failing' },
   { id: 'databases', label: 'Databases & storage', blurb: 'How a database stores, protects, queries and changes your data underneath the SQL' },
   { id: 'dataengineering', label: 'Data engineering', blurb: 'How data is moved, transformed and kept trustworthy at scale, in batches and in streams' },
+  { id: 'aifoundations', label: 'How AI models work', blurb: 'How a language model turns text into numbers, learns from data and produces text, and what that means for what it can and cannot do' },
   { id: 'aiml', label: 'AI & ML systems', blurb: 'How models are served, fed with context, evaluated and kept safe in production, and how the machines that train them are used' },
   { id: 'search', label: 'Search systems', blurb: 'How text is indexed, ranked, spread over machines, kept fresh and judged, from the first keystroke to the last result' },
   { id: 'payments', label: 'Payments & money', blurb: 'How money is represented, recorded, moved and checked, so that every cent can be accounted for' },

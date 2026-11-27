@@ -87,6 +87,9 @@ for (const s of kinds.studies) {
   if (!meta[`studies/${s}`].quiz) err(`studies/${s}`, 'no quiz');
   for (const src of meta[`studies/${s}`].sources ?? []) if (!/^https:\/\//.test(src.url)) err(`studies/${s}`, `source "${src.title}" must use an https link`);
 }
+for (const s of kinds.concepts) {
+  for (const src of meta[`concepts/${s}`].sources ?? []) if (!/^https:\/\//.test(src.url)) err(`concepts/${s}`, `source "${src.title}" must use an https link`);
+}
 for (const s of kinds.patterns) if (!meta[`patterns/${s}`].quiz) err(`patterns/${s}`, 'no quiz');
 
 // 3. Quiz sanity (the schema already checks shapes: this is about meaning and style).

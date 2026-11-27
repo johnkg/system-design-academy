@@ -3,6 +3,31 @@ export interface Change { date: string; title: string; items: { text: string; hr
 
 export const changelog: Change[] = [
   {
+    date: '2026-12-06',
+    title: 'Two new AI case studies',
+    items: [
+      { text: 'Design a Model Fine-Tuning Pipeline covers versioned data, a shared GPU pool, checkpoints and resuming, an evaluation gate, a model registry and gradual rollout, with a calculator for run cost and a simulation of a crash at hour 30.', href: 'case-studies/model-fine-tuning-pipeline/' },
+      { text: 'Design a Code Assistant Backend covers debouncing and cancelling requests, building a small context, indexing a repository by branch, two model paths, prefix caching, keeping secrets out of prompts and measuring whether suggestions help.', href: 'case-studies/code-assistant-backend/' },
+    ],
+  },
+  {
+    date: '2026-12-05',
+    title: 'Six more AI concepts: building with language models',
+    items: [
+      { text: 'The AI & ML systems area now covers choosing between prompting, retrieval and fine-tuning, fine-tuning and LoRA, structured output and function calling, agents and tool use, how vector indexes (IVF, HNSW, product quantization) work, and training-serving skew. Each has a simulation, code in JavaScript, Python and C#, and a list of sources. They have not been fact-checked yet.', href: 'concepts/prompting-vs-fine-tuning-vs-rag/' },
+      { text: 'A new learning path, Building with language models, and two new compare entries: Retrieval, fine-tuning or a better prompt, and Quantization, LoRA or scaling laws.', href: 'paths/' },
+    ],
+  },
+  {
+    date: '2026-12-04',
+    title: 'A new area: how AI models work',
+    items: [
+      { text: 'Eight new concepts explain the machine itself: tokens and tokenization, attention and transformers, how models are trained, sampling and temperature, context windows, scaling laws, quantization, and why models hallucinate and how grounding helps. Each has a simulation whose numbers are worked out from stated assumptions, code in JavaScript, Python and C# where code helps, and a list of the primary sources behind it.', href: 'concepts/tokens-and-tokenization/' },
+      { text: 'A new learning path, How a language model works, takes you from text to tokens to attention, training, sampling and serving.', href: 'paths/' },
+      { text: 'Concept pages can now show a Sources list. These pages have not been fact-checked yet.', href: 'concepts/attention-and-transformers/' },
+    ],
+  },
+  {
     date: '2026-12-03',
     title: 'Five concurrency design patterns',
     items: [
