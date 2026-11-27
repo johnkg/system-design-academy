@@ -3,6 +3,15 @@ export interface Change { date: string; title: string; items: { text: string; hr
 
 export const changelog: Change[] = [
   {
+    date: '2026-12-04',
+    title: 'A new area: how AI models work',
+    items: [
+      { text: 'Eight new concepts explain the machine itself: tokens and tokenization, attention and transformers, how models are trained, sampling and temperature, context windows, scaling laws, quantization, and why models hallucinate and how grounding helps. Each has a simulation whose numbers are worked out from stated assumptions, code in JavaScript, Python and C# where code helps, and a list of the primary sources behind it.', href: 'concepts/tokens-and-tokenization/' },
+      { text: 'A new learning path, How a language model works, takes you from text to tokens to attention, training, sampling and serving.', href: 'paths/' },
+      { text: 'Concept pages can now show a Sources list. These pages have not been fact-checked yet.', href: 'concepts/attention-and-transformers/' },
+    ],
+  },
+  {
     date: '2026-12-03',
     title: 'Five concurrency design patterns',
     items: [

@@ -99,6 +99,13 @@ export const paths: LearningPath[] = [
     steps: [c('embeddings-and-vector-search'), c('retrieval-augmented-generation'), c('llm-inference-and-kv-cache'), c('continuous-batching-and-model-serving'), c('llm-caching-and-routing'), c('guardrails-and-prompt-injection'), c('model-evaluation-and-drift'), s('vector-database'), s('rag-platform'), s('llm-inference-gateway'), s('ai-agent-orchestration-platform')],
   },
   {
+    id: 'how-llms-work',
+    title: 'How a language model works',
+    audience: 'Going deeper',
+    blurb: 'From text to tokens, through attention and training, to sampling, memory and the limits of what a model knows. Then the systems that serve it.',
+    steps: [c('tokens-and-tokenization'), c('attention-and-transformers'), c('how-models-are-trained'), c('sampling-temperature-and-decoding'), c('context-windows-and-long-context'), c('llm-inference-and-kv-cache'), c('quantization-and-model-compression'), c('scaling-laws-and-model-size'), c('hallucination-and-grounding'), c('retrieval-augmented-generation')],
+  },
+  {
     id: 'solid-and-beyond',
     title: 'Design principles that people get wrong',
     audience: 'Writing code',
