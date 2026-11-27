@@ -3,6 +3,14 @@ export interface Change { date: string; title: string; items: { text: string; hr
 
 export const changelog: Change[] = [
   {
+    date: '2026-11-29',
+    title: 'Six enterprise design patterns',
+    items: [
+      { text: 'Design patterns now have more than the 23 Gang of Four. The first new family is Enterprise: how code organises data access and domain logic. Repository, Unit of Work, Specification, Null Object, Data Mapper and Object Pool each have a diagram, an animation, a simulation, before and after code in JavaScript, Python and C#, and a quiz. They are new and have not been fact-checked yet.', href: 'patterns/repository/' },
+      { text: 'The compare page has new rows for them, including Repository vs Data Mapper vs Unit of Work.', href: 'compare/' },
+    ],
+  },
+  {
     date: '2026-11-28',
     title: 'Every lesson is now fact-checked',
     items: [

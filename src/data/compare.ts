@@ -84,6 +84,18 @@ export const problems: Problem[] = [
     { slug: 'strategy', why: 'Inject a fake algorithm.' },
     { slug: 'factory-method', why: 'Override the creation step to return a fake.' },
     { slug: 'abstract-factory', why: 'Hand the client a factory of test doubles.' } ] },
+  { text: 'Keep domain code free of database details, so it can be tested without a database', patterns: [
+    { slug: 'repository', why: 'A collection-like interface in the language of the domain.' },
+    { slug: 'data-mapper', why: 'Domain objects stay plain; one mapper knows the columns.' } ] },
+  { text: 'Save several changes made by one business action together, or not at all', patterns: [
+    { slug: 'unit-of-work', why: 'Collect the changes and write them in one transaction.' } ] },
+  { text: 'Reuse a business rule in many places and combine rules with and, or and not', patterns: [
+    { slug: 'specification', why: 'Each rule is an object that can be named, tested and combined.' } ] },
+  { text: 'Stop checking for null before every call to an optional collaborator', patterns: [
+    { slug: 'null-object', why: 'A stand-in that does nothing, chosen once.' } ] },
+  { text: 'Reuse expensive objects, such as connections, and cap how many exist', patterns: [
+    { slug: 'object-pool', why: 'Borrow and return a limited set instead of creating one per use.' },
+    { slug: 'flyweight', why: 'When the thing to share is immutable data, not a resource that is lent out.' } ] },
 ];
 
 export const confusions: Confusion[] = [
@@ -192,5 +204,28 @@ export const confusions: Confusion[] = [
       { aspect: 'Result', values: ['The handler\'s answer', 'The combined effect of all layers'] },
     ],
     rule: 'First capable one wins? Chain of Responsibility. Everyone contributes? Decorator.',
+  },
+  {
+    title: 'Repository vs Data Mapper vs Unit of Work',
+    blurb: 'All three sit between domain code and the database. Each answers a different question.',
+    patterns: ['repository', 'data-mapper', 'unit-of-work'],
+    rows: [
+      { aspect: 'Question it answers', values: ['How does the domain ask for and save objects?', 'How does an object become a row, and back?', 'When are the changes written, and together?'] },
+      { aspect: 'Who calls it', values: ['Domain and application code', 'Usually the repository', 'The business action, at the end'] },
+      { aspect: 'What it knows', values: ['The domain language of queries', 'Table and column names', 'Which objects changed'] },
+      { aspect: 'Can you have one without the others', values: ['Yes, over an ORM or a mapper', 'Yes, called directly', 'Yes, but it needs something to write with'] },
+    ],
+    rule: 'Asking for objects? Repository. Translating rows? Data Mapper. Saving a group of changes together? Unit of Work.',
+  },
+  {
+    title: 'Null Object vs Strategy vs State',
+    blurb: 'All three replace an if with an object. They differ in what the object stands for.',
+    patterns: ['null-object', 'strategy', 'state'],
+    rows: [
+      { aspect: 'What the object is', values: ['A harmless stand-in for "nothing here"', 'One way of doing a job', 'The mode the owner is in right now'] },
+      { aspect: 'Who picks it', values: ['Chosen once, where the object is created', 'The client, from outside', 'The state objects, as transitions'] },
+      { aspect: 'Does it do real work', values: ['No, by design', 'Yes', 'Yes'] },
+    ],
+    rule: 'Absent and fine to ignore? Null Object. Interchangeable algorithm? Strategy. Behaviour that follows the object\'s own mode? State.',
   },
 ];

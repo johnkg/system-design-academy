@@ -28,7 +28,7 @@ Use `src/content/concepts/load-balancing/` as the template. New areas are added 
 
 Create `src/content/patterns/<slug>/` containing:
 
-- `meta.json`: text content (validated by `src/content.config.ts`)
+- `meta.json`: text content (validated by `src/content.config.ts`; `category` is an id from `src/data/patternCategories.ts`, which also sets the groups on the home, compare and cheat-sheet pages, so a new family is one entry there)
 - `code/<language-id>.<ext>`: the "after" sample, one file per language
 - `before/<language-id>.<ext>`: the naive sample for the before/after view
 - `visuals/diagram.json`: UML classes and edges
