@@ -13,7 +13,7 @@ public static class Program
 
 public static class Network
 {
-    private static readonly Dictionary<string, string> Replies = new() { ["inventory"] = "reserved", ["payments"] = "charged" };
+    private static readonly Dictionary<string, string> Replies = new() { ["fraud-check"] = "clear", ["catalog"] = "in stock" };
 
     public static string Call(string target, int attempt)
     {
@@ -34,7 +34,7 @@ public class PaymentsService
         return null;
     }
 
-    public void Run() => Console.WriteLine($"payments: inventory answered \"{Call("inventory")}\"");
+    public void Run() => Console.WriteLine($"payments: fraud-check answered \"{Call("fraud-check")}\"");
 }
 
 public class OrdersService
@@ -49,5 +49,5 @@ public class OrdersService
         return null;
     }
 
-    public void Run() => Console.WriteLine($"orders: payments answered \"{Call("payments")}\"");
+    public void Run() => Console.WriteLine($"orders: catalog answered \"{Call("catalog")}\"");
 }

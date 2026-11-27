@@ -1,6 +1,6 @@
 // Without the pattern: every service carries its own copy of the retry and logging code.
 
-const replies = { inventory: "reserved", payments: "charged" };
+const replies = { "fraud-check": "clear", catalog: "in stock" };
 function network(target, attempt) {
   if (attempt === 1) throw new Error("timeout");
   return replies[target];
@@ -13,7 +13,7 @@ class PaymentsService {
       catch (error) { console.log(`[payments] attempt ${attempt} failed: ${error.message}`); }
     }
   }
-  run() { console.log(`payments: inventory answered "${this.call("inventory")}"`); }
+  run() { console.log(`payments: fraud-check answered "${this.call("fraud-check")}"`); }
 }
 
 class OrdersService {
@@ -22,7 +22,7 @@ class OrdersService {
       try { return network(target, attempt); } catch { /* retry */ }
     }
   }
-  run() { console.log(`orders: payments answered "${this.call("payments")}"`); }
+  run() { console.log(`orders: catalog answered "${this.call("catalog")}"`); }
 }
 
 new PaymentsService().run();

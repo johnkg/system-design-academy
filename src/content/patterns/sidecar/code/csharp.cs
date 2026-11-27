@@ -13,7 +13,7 @@ public static class Program
 
 public static class Network // stand-in for the real network: the first attempt always times out
 {
-    private static readonly Dictionary<string, string> Replies = new() { ["inventory"] = "reserved", ["payments"] = "charged" };
+    private static readonly Dictionary<string, string> Replies = new() { ["fraud-check"] = "clear", ["catalog"] = "in stock" };
 
     public static string Call(string target, int attempt)
     {
@@ -49,10 +49,10 @@ public class Sidecar // Runs beside the app; the app talks to it as if it were t
 
 public class PaymentsService(Sidecar sidecar) // Application: business logic only
 {
-    public void Run() => Console.WriteLine($"payments: inventory answered \"{sidecar.Send("inventory")}\"");
+    public void Run() => Console.WriteLine($"payments: fraud-check answered \"{sidecar.Send("fraud-check")}\"");
 }
 
 public class OrdersService(Sidecar sidecar)
 {
-    public void Run() => Console.WriteLine($"orders: payments answered \"{sidecar.Send("payments")}\"");
+    public void Run() => Console.WriteLine($"orders: catalog answered \"{sidecar.Send("catalog")}\"");
 }

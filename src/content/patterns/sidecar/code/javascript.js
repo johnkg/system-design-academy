@@ -1,6 +1,6 @@
 // Sidecar in JavaScript. The app has no networking code: a helper beside it adds logging and retries.
 
-const replies = { inventory: "reserved", payments: "charged" };
+const replies = { "fraud-check": "clear", catalog: "in stock" };
 function network(target, attempt) { // stand-in for the real network: the first attempt always times out
   if (attempt === 1) throw new Error("timeout");
   return replies[target];
@@ -26,12 +26,12 @@ class Sidecar { // Runs beside the app; the app talks to it as if it were the ne
 
 class PaymentsService { // Application: business logic only
   constructor(sidecar) { this.sidecar = sidecar; }
-  run() { console.log(`payments: inventory answered "${this.sidecar.send("inventory")}"`); }
+  run() { console.log(`payments: fraud-check answered "${this.sidecar.send("fraud-check")}"`); }
 }
 
 class OrdersService {
   constructor(sidecar) { this.sidecar = sidecar; }
-  run() { console.log(`orders: payments answered "${this.sidecar.send("payments")}"`); }
+  run() { console.log(`orders: catalog answered "${this.sidecar.send("catalog")}"`); }
 }
 
 new PaymentsService(new Sidecar()).run(); // each instance gets its own sidecar

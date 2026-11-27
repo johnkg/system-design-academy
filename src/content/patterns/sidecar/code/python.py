@@ -1,6 +1,6 @@
 # Sidecar in Python. The app has no networking code: a helper beside it adds logging and retries.
 
-REPLIES = {"inventory": "reserved", "payments": "charged"}
+REPLIES = {"fraud-check": "clear", "catalog": "in stock"}
 
 
 def network(target: str, attempt: int) -> str:  # stand-in for the real network: the first attempt always times out
@@ -32,7 +32,7 @@ class PaymentsService:  # Application: business logic only
         self.sidecar = sidecar
 
     def run(self) -> None:
-        print(f'payments: inventory answered "{self.sidecar.send("inventory")}"')
+        print(f'payments: fraud-check answered "{self.sidecar.send("fraud-check")}"')
 
 
 class OrdersService:
@@ -40,7 +40,7 @@ class OrdersService:
         self.sidecar = sidecar
 
     def run(self) -> None:
-        print(f'orders: payments answered "{self.sidecar.send("payments")}"')
+        print(f'orders: catalog answered "{self.sidecar.send("catalog")}"')
 
 
 PaymentsService(Sidecar()).run()  # each instance gets its own sidecar

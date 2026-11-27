@@ -1,6 +1,6 @@
 # Without the pattern: every service carries its own copy of the retry and logging code.
 
-REPLIES = {"inventory": "reserved", "payments": "charged"}
+REPLIES = {"fraud-check": "clear", "catalog": "in stock"}
 
 
 def network(target, attempt):
@@ -18,7 +18,7 @@ class PaymentsService:
                 print(f"[payments] attempt {attempt} failed: {error}")
 
     def run(self):
-        print(f'payments: inventory answered "{self.call("inventory")}"')
+        print(f'payments: fraud-check answered "{self.call("fraud-check")}"')
 
 
 class OrdersService:
@@ -30,7 +30,7 @@ class OrdersService:
                 pass
 
     def run(self):
-        print(f'orders: payments answered "{self.call("payments")}"')
+        print(f'orders: catalog answered "{self.call("catalog")}"')
 
 
 PaymentsService().run()
