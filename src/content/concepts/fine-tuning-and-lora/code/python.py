@@ -1,6 +1,6 @@
 # Counting trainable weights in Python: full fine-tuning of one d x d matrix against a LoRA update of rank r.
 D = 4096
-BYTES_PER_TRAINABLE_WEIGHT = 16  # 16-bit weight + 16-bit gradient + 32-bit Adam states, as in the ZeRO accounting
+BYTES_PER_TRAINABLE_WEIGHT = 16  # 16-bit weight + 16-bit gradient + 32-bit weight copy, momentum and variance, as in the ZeRO accounting
 
 full = D * D
 print(f"full matrix: {D} x {D} = {full} trainable weights")

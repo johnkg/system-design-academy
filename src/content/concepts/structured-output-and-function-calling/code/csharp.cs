@@ -39,7 +39,7 @@ public static class Program
         // 2. A token mask: only the tokens the grammar allows can be chosen.
         string[] tokens = { "4", "7", "x", "\"", "}" };
         double[] logits = { 1.0, 2.0, 3.0, 2.5, 0.5 };
-        var allowed = new HashSet<string> { "4", "7" }; // after '{"order_id": ' only a digit is valid
+        var allowed = new HashSet<string> { "4", "7" }; // after '{"order_id": ' only a digit (or a minus sign) is valid; this toy vocabulary has no minus sign
         string Best(double[] scores) => tokens[Array.IndexOf(scores, scores.Max())];
         Console.WriteLine($"unconstrained pick: {Best(logits)}");
         var masked = logits.Select((score, i) => allowed.Contains(tokens[i]) ? score : double.NegativeInfinity).ToArray();

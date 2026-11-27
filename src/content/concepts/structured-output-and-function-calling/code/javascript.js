@@ -28,7 +28,7 @@ for (let attempt = 1; attempt <= REPLIES.length; attempt++) {
 // 2. A token mask: only the tokens the grammar allows can be chosen.
 const TOKENS = ["4", "7", "x", '"', "}"];
 const LOGITS = [1.0, 2.0, 3.0, 2.5, 0.5];
-const ALLOWED = new Set(["4", "7"]); // after '{"order_id": ' only a digit is valid
+const ALLOWED = new Set(["4", "7"]); // after '{"order_id": ' only a digit (or a minus sign) is valid; this toy vocabulary has no minus sign
 const best = (scores) => TOKENS[scores.indexOf(Math.max(...scores))];
 console.log(`unconstrained pick: ${best(LOGITS)}`);
 const masked = LOGITS.map((score, i) => (ALLOWED.has(TOKENS[i]) ? score : -Infinity));

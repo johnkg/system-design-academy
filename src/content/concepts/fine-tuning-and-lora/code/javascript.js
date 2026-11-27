@@ -1,6 +1,6 @@
 // Counting trainable weights in JavaScript: full fine-tuning of one d x d matrix against a LoRA update of rank r.
 const D = 4096;
-const BYTES_PER_TRAINABLE_WEIGHT = 16; // 16-bit weight + 16-bit gradient + 32-bit Adam states, as in the ZeRO accounting
+const BYTES_PER_TRAINABLE_WEIGHT = 16; // 16-bit weight + 16-bit gradient + 32-bit weight copy, momentum and variance, as in the ZeRO accounting
 
 const full = D * D;
 console.log(`full matrix: ${D} x ${D} = ${full} trainable weights`);
