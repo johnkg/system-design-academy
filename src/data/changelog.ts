@@ -3,6 +3,14 @@ export interface Change { date: string; title: string; items: { text: string; hr
 
 export const changelog: Change[] = [
   {
+    date: '2026-12-05',
+    title: 'Six more AI concepts: building with language models',
+    items: [
+      { text: 'The AI & ML systems area now covers choosing between prompting, retrieval and fine-tuning, fine-tuning and LoRA, structured output and function calling, agents and tool use, how vector indexes (IVF, HNSW, product quantization) work, and training-serving skew. Each has a simulation, code in JavaScript, Python and C#, and a list of sources. They have not been fact-checked yet.', href: 'concepts/prompting-vs-fine-tuning-vs-rag/' },
+      { text: 'A new learning path, Building with language models, and two new compare entries: Retrieval, fine-tuning or a better prompt, and Quantization, LoRA or scaling laws.', href: 'paths/' },
+    ],
+  },
+  {
     date: '2026-12-04',
     title: 'A new area: how AI models work',
     items: [
