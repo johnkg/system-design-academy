@@ -84,6 +84,42 @@ export const problems: Problem[] = [
     { slug: 'strategy', why: 'Inject a fake algorithm.' },
     { slug: 'factory-method', why: 'Override the creation step to return a fake.' },
     { slug: 'abstract-factory', why: 'Hand the client a factory of test doubles.' } ] },
+  { text: 'Keep domain code free of database details, so it can be tested without a database', patterns: [
+    { slug: 'repository', why: 'A collection-like interface in the language of the domain.' },
+    { slug: 'data-mapper', why: 'Domain objects stay plain; one mapper knows the columns.' } ] },
+  { text: 'Save several changes made by one business action together, or not at all', patterns: [
+    { slug: 'unit-of-work', why: 'Collect the changes and write them in one transaction.' } ] },
+  { text: 'Reuse a business rule in many places and combine rules with and, or and not', patterns: [
+    { slug: 'specification', why: 'Each rule is an object that can be named, tested and combined.' } ] },
+  { text: 'Stop checking for null before every call to an optional collaborator', patterns: [
+    { slug: 'null-object', why: 'A stand-in that does nothing, chosen once.' } ] },
+  { text: 'Reuse expensive objects, such as connections, and cap how many exist', patterns: [
+    { slug: 'object-pool', why: 'Borrow and return a limited set instead of creating one per use.' },
+    { slug: 'flyweight', why: 'When the thing to share is immutable data, not a resource that is lent out.' } ] },
+  { text: 'Give every service the same retry, logging and encryption, whatever language it uses', patterns: [
+    { slug: 'sidecar', why: 'A helper process beside each service, upgraded on its own.' },
+    { slug: 'ambassador', why: 'The helper speaks for one remote service on the client\'s behalf.' } ] },
+  { text: 'Keep a legacy system\'s model and quirks out of a new design', patterns: [
+    { slug: 'anti-corruption-layer', why: 'Translates meaning and protects the new model at one boundary.' },
+    { slug: 'adapter', why: 'When only the interface differs and the models already agree.' } ] },
+  { text: 'Give a phone and a website each the data it needs from the same services', patterns: [
+    { slug: 'backends-for-frontends', why: 'One small backend per client that shapes and combines data.' },
+    { slug: 'facade', why: 'One simpler interface over a subsystem, when clients do not differ.' } ] },
+  { text: 'Ask many sources at once and combine whatever answers arrive in time', patterns: [
+    { slug: 'scatter-gather', why: 'Fan out, gather until a deadline, merge, and say how many answers were used.' } ] },
+  { text: 'Move a large payload through a channel with small message limits', patterns: [
+    { slug: 'claim-check', why: 'Store the payload elsewhere and send only a ticket.' } ] },
+  { text: 'Let many threads read shared data together, and make a writer exclusive', patterns: [
+    { slug: 'read-write-lock', why: 'Readers share the lock; a writer needs it alone.' } ] },
+  { text: 'Create an expensive shared object on first use, safely, without a lock on every call', patterns: [
+    { slug: 'double-checked-locking', why: 'Check without the lock, then lock, check again and create. Prefer the language\'s lazy tool.' } ] },
+  { text: 'Start slow work now and use its result later, or combine several results', patterns: [
+    { slug: 'future-promise', why: 'A placeholder for a value that has not arrived yet.' },
+    { slug: 'active-object', why: 'When the work should also run in order on one thread, behind an object.' } ] },
+  { text: 'Serve thousands of mostly idle connections with a few threads', patterns: [
+    { slug: 'reactor', why: 'One loop waits for events and dispatches each to a quick handler.' } ] },
+  { text: 'Use a not-thread-safe object from many threads without locking it everywhere', patterns: [
+    { slug: 'active-object', why: 'Queue the calls and run them on one worker that owns the object.' } ] },
 ];
 
 export const confusions: Confusion[] = [
@@ -192,5 +228,88 @@ export const confusions: Confusion[] = [
       { aspect: 'Result', values: ['The handler\'s answer', 'The combined effect of all layers'] },
     ],
     rule: 'First capable one wins? Chain of Responsibility. Everyone contributes? Decorator.',
+  },
+  {
+    title: 'Repository vs Data Mapper vs Unit of Work',
+    blurb: 'All three sit between domain code and the database. Each answers a different question.',
+    patterns: ['repository', 'data-mapper', 'unit-of-work'],
+    rows: [
+      { aspect: 'Question it answers', values: ['How does the domain ask for and save objects?', 'How does an object become a row, and back?', 'When are the changes written, and together?'] },
+      { aspect: 'Who calls it', values: ['Domain and application code', 'Usually the repository', 'The business action, at the end'] },
+      { aspect: 'What it knows', values: ['The domain language of queries', 'Table and column names', 'Which objects changed'] },
+      { aspect: 'Can you have one without the others', values: ['Yes, over an ORM or a mapper', 'Yes, called directly', 'Yes, but it needs something to write with'] },
+    ],
+    rule: 'Asking for objects? Repository. Translating rows? Data Mapper. Saving a group of changes together? Unit of Work.',
+  },
+  {
+    title: 'Null Object vs Strategy vs State',
+    blurb: 'All three replace an if with an object. They differ in what the object stands for.',
+    patterns: ['null-object', 'strategy', 'state'],
+    rows: [
+      { aspect: 'What the object is', values: ['A harmless stand-in for "nothing here"', 'One way of doing a job', 'The mode the owner is in right now'] },
+      { aspect: 'Who picks it', values: ['Chosen once, where the object is created', 'The client, from outside', 'The state objects, as transitions'] },
+      { aspect: 'Does it do real work', values: ['No, by design', 'Yes', 'Yes'] },
+    ],
+    rule: 'Absent and fine to ignore? Null Object. Interchangeable algorithm? Strategy. Behaviour that follows the object\'s own mode? State.',
+  },
+  {
+    title: 'Sidecar vs Ambassador vs Proxy',
+    blurb: 'All three put a process or object in front of a call. They differ in where it runs and whose side it is on.',
+    patterns: ['sidecar', 'ambassador', 'proxy'],
+    rows: [
+      { aspect: 'Where it runs', values: ['Beside each service instance, on the same host', 'Beside a client, on the same host', 'Anywhere: in the same program or on its own machine'] },
+      { aspect: 'Whose job it does', values: ['Shared plumbing for the service: logging, retries, TLS', 'Speaks for one remote service on behalf of the client', 'Controls access to one object by standing in for it'] },
+      { aspect: 'Direction of calls', values: ['Mostly outbound, sometimes inbound too', 'Outbound to the remote service', 'Either'] },
+      { aspect: 'Does the caller know it is there', values: ['It points at localhost, and does not know the rest', 'It asks the ambassador as if it were the remote service', 'No: it holds the proxy as if it were the real object'] },
+    ],
+    rule: 'Plumbing for the service itself? Sidecar. Representing one remote service for a client? Ambassador. Controlling access to one object? Proxy.',
+  },
+  {
+    title: 'Anti-Corruption Layer vs Adapter vs Facade',
+    blurb: 'All three sit between two pieces of code and change what the caller sees.',
+    patterns: ['anti-corruption-layer', 'adapter', 'facade'],
+    rows: [
+      { aspect: 'What it changes', values: ['The meaning: models, codes and formats', 'The interface: method names and shapes', 'The size: many calls become a few simple ones'] },
+      { aspect: 'Why it exists', values: ['To protect a new design from a legacy model', 'To make an existing class fit the interface a caller expects', 'To make a complicated subsystem easy to use'] },
+      { aspect: 'Can it refuse input', values: ['Yes, it rejects what it cannot translate', 'Rarely', 'No'] },
+      { aspect: 'Typical size', values: ['A layer, with its own tests and ownership', 'One small class', 'One class in front of a subsystem'] },
+    ],
+    rule: 'Protecting a model from another model? Anti-Corruption Layer. Different method names only? Adapter. Hiding a big subsystem? Facade.',
+  },
+  {
+    title: 'Reactor vs Active Object vs Future/Promise',
+    blurb: 'All three are about doing work without a caller waiting for it. They solve different halves of the problem.',
+    patterns: ['reactor', 'active-object', 'future-promise'],
+    rows: [
+      { aspect: 'What it organises', values: ['Waiting for many event sources on one thread', 'Calls to one object, run in order on its own thread', 'A value that will exist later'] },
+      { aspect: 'Who runs the work', values: ['The loop calls a handler when an event is ready', 'One worker thread owned by the object', 'Whatever started the work: a task, a thread or the loop'] },
+      { aspect: 'Main benefit', values: ['Thousands of connections on a few threads', 'No locks around the object\'s state, and no blocked callers', 'Independent work in parallel, and results that can be combined'] },
+      { aspect: 'Main danger', values: ['A blocking handler stalls every connection on the loop', 'A queue that grows without limit, or a request that waits for itself', 'Errors nobody awaits, and too much started at once'] },
+    ],
+    rule: 'Many sources, one waiting loop? Reactor. One object, calls queued onto its own thread? Active Object. A result that arrives later? Future/Promise. They combine: an active object returns futures, and a reactor hands slow work to workers.',
+  },
+  {
+    title: 'Read-Write Lock vs Double-Checked Locking',
+    blurb: 'Both are ways to cut the cost of locking, for opposite shapes of work.',
+    patterns: ['read-write-lock', 'double-checked-locking'],
+    rows: [
+      { aspect: 'Shape of the work', values: ['Frequent reads, rare writes, for the whole life of the program', 'One creation, then reads for the rest of the program'] },
+      { aspect: 'What it saves', values: ['Readers no longer wait for each other', 'Callers skip the lock once the object exists'] },
+      { aspect: 'Main trap', values: ['Writers starve if readers never stop', 'Without safe publication, a half-built object can be seen'] },
+      { aspect: 'Safer alternative', values: ['An immutable snapshot that is swapped in', 'The language\'s own lazy facility, such as Lazy<T>'] },
+    ],
+    rule: 'Many reads, few writes, ever-changing data? Read-Write Lock. Create once, read for ever? Double-checked locking, or better, the language\'s lazy tool.',
+  },
+  {
+    title: 'Singleton vs Double-Checked Locking',
+    blurb: 'Double-checked locking is not a rival of Singleton. It is one way to create a lazy Singleton safely when many threads ask at once.',
+    patterns: ['singleton', 'double-checked-locking'],
+    rows: [
+      { aspect: 'What it answers', values: ['How do I make sure there is only one instance?', 'How do I create that one instance lazily, without a lock on every call?'] },
+      { aspect: 'Level', values: ['A design: one instance, one access point', 'A technique: check, lock, check again'] },
+      { aspect: 'Needed in single-threaded code', values: ['Yes, if you want one instance', 'No: a plain check is enough'] },
+      { aspect: 'Safer alternative', values: ['Dependency injection of a single shared instance', 'The language\'s lazy tool, such as Lazy<T>'] },
+    ],
+    rule: 'Deciding that there is only one? Singleton. Deciding how to build it safely and lazily under threads? Double-checked locking, or the built-in lazy tool.',
   },
 ];

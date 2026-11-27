@@ -3,6 +3,30 @@ export interface Change { date: string; title: string; items: { text: string; hr
 
 export const changelog: Change[] = [
   {
+    date: '2026-12-03',
+    title: 'Five concurrency design patterns',
+    items: [
+      { text: 'The third new family is Concurrency: how code that runs at the same time is structured. Active Object, Reactor, Read-Write Lock, Double-Checked Locking and Future/Promise each have a diagram, an animation, a simulation, before and after code in JavaScript, Python and C#, and a quiz. That brings the design patterns to 40. Double-Checked Locking states what is safe in each language and recommends the built-in lazy tools. They have not been fact-checked yet.', href: 'patterns/reactor/' },
+      { text: 'New compare rows: Reactor vs Active Object vs Future/Promise, and Read-Write Lock vs Double-Checked Locking.', href: 'compare/' },
+    ],
+  },
+  {
+    date: '2026-12-02',
+    title: 'Six distributed and cloud design patterns',
+    items: [
+      { text: 'A second new family: Distributed. Sidecar, Ambassador, Anti-Corruption Layer, Backends for Frontends, Scatter-Gather and Claim Check show how services cooperate across processes and networks. Each has a diagram, an animation, a simulation that prices the trade-off, before and after code in JavaScript, Python and C#, and a quiz. They have not been fact-checked yet.', href: 'patterns/sidecar/' },
+      { text: 'The compare page has new rows, including Sidecar vs Ambassador vs Proxy and Anti-Corruption Layer vs Adapter vs Facade.', href: 'compare/' },
+    ],
+  },
+  {
+    date: '2026-12-01',
+    title: 'Six enterprise design patterns',
+    items: [
+      { text: 'Design patterns now have more than the 23 Gang of Four. The first new family is Enterprise: how code organises data access and domain logic. Repository, Unit of Work, Specification, Null Object, Data Mapper and Object Pool each have a diagram, an animation, a simulation, before and after code in JavaScript, Python and C#, and a quiz. They are new and have not been fact-checked yet.', href: 'patterns/repository/' },
+      { text: 'The compare page has new rows for them, including Repository vs Data Mapper vs Unit of Work.', href: 'compare/' },
+    ],
+  },
+  {
     date: '2026-11-29',
     title: 'Checked against the documentation itself',
     items: [
