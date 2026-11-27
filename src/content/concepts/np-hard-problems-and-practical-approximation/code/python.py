@@ -129,6 +129,6 @@ for n in [6, 7, 8, 9, 10]:
     bb_best, bb_steps = branch_and_bound(n, nn_len + 1)
     if best != bb_best:
         raise Exception('exact methods disagree')
-    print(f'n={n}: optimum {best}; brute force {bf_tours} tours, {bf_steps} steps; branch and bound {bb_steps} steps; '
+    print(f'n={n}: optimum {best}; brute force {bf_tours} orders, {bf_steps} steps; branch and bound {bb_steps} steps; '
           f'nearest neighbour {nn_len} ({nn_len * 100 // best}% of optimum, {nn_steps} steps); '
           f'with 2-opt {opt_len} ({opt_len * 100 // best}%, {opt_moves} moves, {opt_steps} steps)')

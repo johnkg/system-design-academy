@@ -3,6 +3,14 @@ export interface Change { date: string; title: string; items: { text: string; hr
 
 export const changelog: Change[] = [
   {
+    date: '2026-11-29',
+    title: 'Checked against the documentation itself',
+    items: [
+      { text: 'Eleven claims that earlier reviews could only confirm from memory were re-checked against the primary sources (MDN, SLSA, OWASP, Kubernetes, Firebase, Apple, RabbitMQ, OpenTelemetry, the RFCs). Ten pages changed. Among them: SameSite is Lax by default only in Chromium-based browsers, with a two-minute exception for POST; SLSA Build L3 requires isolated builds and protected signing keys, not reproducible builds; Kubernetes marks a node unhealthy after 50 seconds in current releases; FCM keeps up to 100 pending messages and four collapse keys; APNs returns no delivery receipt.', href: 'accuracy/' },
+      { text: 'Two sample fixes: the NP-hard sample now labels its brute-force count as orders, and the coupling sample\'s narrow-interface example really goes through public methods.', href: 'concepts/coupling-and-cohesion/' },
+    ],
+  },
+  {
     date: '2026-11-28',
     title: 'Every lesson is now fact-checked',
     items: [

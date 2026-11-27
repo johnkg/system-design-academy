@@ -103,6 +103,6 @@ for (const n of [6, 7, 8, 9, 10]) {
   const opt = twoOpt(nn.order), optLen = tourLength(opt.order);
   const bf = bruteForce(n), bb = branchAndBound(n, nnLen + 1);
   if (bf.best !== bb.best) throw new Error('exact methods disagree');
-  console.log(`n=${n}: optimum ${bf.best}; brute force ${bf.tours} tours, ${bf.steps} steps; branch and bound ${bb.steps} steps; ` +
+  console.log(`n=${n}: optimum ${bf.best}; brute force ${bf.tours} orders, ${bf.steps} steps; branch and bound ${bb.steps} steps; ` +
     `nearest neighbour ${nnLen} (${Math.floor((nnLen * 100) / bf.best)}% of optimum, ${nn.steps} steps); with 2-opt ${optLen} (${Math.floor((optLen * 100) / bf.best)}%, ${opt.moves} moves, ${opt.steps} steps)`);
 }

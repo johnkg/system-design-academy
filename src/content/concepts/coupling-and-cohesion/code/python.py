@@ -3,7 +3,7 @@
 # feature built four ways, as a module graph whose edges have a coupling kind; for three change requests it counts the other
 # modules that must change and the modules and responsibilities to re-test. Look for: the chain lengths, and what a one-module
 # design does to "modules that change" and to the size of what is re-tested.
-calls = 0  # every call made on an object from outside it
+calls = 0  # every call the reading code makes on an object; the hand-offs Cart makes inside shipping_country() are Cart's own business and are not counted
 
 
 def counted(f):
@@ -23,6 +23,9 @@ class Address:
     def get_country(self):
         return self._country
 
+    def country(self):
+        return self._country
+
 
 class Customer:
     def __init__(self, address):
@@ -31,6 +34,9 @@ class Customer:
     @counted
     def get_address(self):
         return self._address
+
+    def country(self):
+        return self._address.country()
 
 
 class Cart:  # a cart may know its own customer; callers should not have to
@@ -43,7 +49,7 @@ class Cart:  # a cart may know its own customer; callers should not have to
 
     @counted
     def shipping_country(self):
-        return self._customer._address._country
+        return self._customer.country()  # narrow: asks Customer, which asks Address; no private field is read
 
 
 class State:
